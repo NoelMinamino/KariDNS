@@ -85,6 +85,11 @@ static uint64_t now_ms(void) {
   clock_gettime(CLOCK_MONOTONIC, &ts);
   return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
 }
+static uint64_t now_us(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (uint64_t)ts.tv_sec * 1000000 + (uint64_t)ts.tv_nsec / 1000;
+}
 
 static void rm_rf(const char *path) {
   struct stat st;
@@ -649,9 +654,33 @@ static void test_commit_and_rotation(void) {
   CHECK_EQ(store_tick(s), 0);                                            /* the time-driven commit */
   store_stats(s, &st);
   CHECK_EQ(st.committed_lsn, st.lsn);
-  /* the journal stays bounded: many mutations, the journal is rotated by size */
-  uint64_t cp0 = st.checkpoints;
+  /* with the flusher the journal is cut by size in the background: while the writers go on it may grow past the bound by what they write during one checkpoint (how
+   * long that is depends on the disk); when they stop it is cut back below the bound */
   uint64_t maxj = 0;
+  for (uint32_t i = 0; i < 6000; i++) {
+    CHECK_EQ(put_i(s, 0, i % 500, 10 + i, NULL), 0);
+    store_stats(s, &st);
+    if (st.journal_bytes > maxj) maxj = st.journal_bytes;
+  }
+  for (int w = 0; w < 3000; w++) {
+    store_stats(s, &st);
+    if (st.journal_bytes < 200000) break;
+    usleep(10000);
+  }
+  printf("  with the flusher the journal grew to %" PRIu64 " bytes at most (bound %u), %" PRIu64 " bytes when the writes ended\n", maxj, 200000u, st.journal_bytes);
+  CHECK(st.journal_bytes < 200000);
+  CHECK(st.flusher);
+  CHECK_EQ(store_close(s), 0);
+  /* the journal stays bounded: many mutations, the journal is rotated by size.  Without the flusher the writer makes the checkpoint after its call: the bound holds after every call */
+  atomic_store(&store_test_no_flusher, true);
+  o.create = false;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  atomic_store(&store_test_no_flusher, false);
+  if (!s) { tdir_free(&d); return; }
+  store_stats(s, &st);
+  CHECK(!st.flusher);
+  uint64_t cp0 = st.checkpoints;
+  maxj = 0;
   for (uint32_t i = 0; i < 6000; i++) {
     CHECK_EQ(put_i(s, 0, i % 500, 10 + i, NULL), 0);
     store_stats(s, &st);
@@ -1082,6 +1111,8 @@ static void test_superblock_damage(void) {
   if (pid == 0) {
     store_t *c = NULL;
     if (store_open(d.fd, &o, &c) != 0) _exit(3);
+    /* (no growth and no checkpoint after the puts: the index is made big enough and the checkpoint the growth asks for is made first, so the last record is the last one of the newest journal) */
+    if (store_reserve(c, 2000) != 0 || store_checkpoint(c) != 0) _exit(5);
     for (uint32_t i = 450; i < 700; i++) if (put_i(c, 0, i, 1, NULL) != 0) _exit(4);
     _exit(0);                                                            /* no close, no commit */
   }
@@ -1091,7 +1122,7 @@ static void test_superblock_damage(void) {
   /* find the newest journal and cut it in the middle of a record */
   char jp[700];
   uint32_t best = 0;
-  for (uint32_t g = 1; g < 100; g++) { struct stat sbuf; snprintf(jp, sizeof(jp), "%s/jrn.%u", d.path, g); if (stat(jp, &sbuf) == 0) best = g; }
+  for (uint32_t g = 1; g < 100; g++) { struct stat sbuf; snprintf(jp, sizeof(jp), "%s/jrn.%u", d.path, g); if (stat(jp, &sbuf) == 0 && sbuf.st_size > 64) best = g; }   /* (not the next journal, made ahead and empty) */
   snprintf(jp, sizeof(jp), "%s/jrn.%u", d.path, best);
   struct stat jst;
   CHECK_EQ(stat(jp, &jst), 0);
@@ -1151,12 +1182,22 @@ static void test_superblock_damage(void) {
 typedef struct { uint8_t exists, known; uint16_t flags; uint64_t ver; } mz_t;
 typedef struct { mz_t z[KNZ]; bool cursor_valid; uint64_t cursor; } model_t;
 
-enum { OP_PUT, OP_DEL, OP_KNOWN, OP_FLAGS, OP_CURSOR, OP_CKPT, OP_NONE, OP_COMPACT, OP_SCRUB };
-static int g_kill_mode;                  /* 1: the cleaner, the nx pass and the scrub are operations of the loop too (they change no zone) */
+enum { OP_PUT, OP_DEL, OP_KNOWN, OP_FLAGS, OP_CURSOR, OP_CKPT, OP_NONE, OP_COMPACT, OP_SCRUB, OP_KNOWN_N };
+static int g_kill_mode;                  /* 1: the cleaner, the nx pass and the scrub are operations of the loop too (they change no zone); 2: groups of zones made known in one call (store_set_known_n(): all or none of a group is there) */
 static int op_kind(uint64_t K, uint32_t *i) {
   uint64_t r = mix64(K * 0x9e3779b97f4a7c15ull + 12345);
   *i = (uint32_t)((r >> 16) % KNZ);
   uint32_t p = (uint32_t)(r % 100);
+  if (g_kill_mode == 2) {
+    if (p < 25) return OP_PUT;
+    if (p < 35) return OP_DEL;
+    if (p < 75) return OP_KNOWN_N;
+    if (p < 82) return OP_KNOWN;
+    if (p < 90) return OP_FLAGS;
+    if (p < 95) return OP_CURSOR;
+    if (p < 97) return OP_CKPT;
+    return OP_NONE;
+  }
   if (g_kill_mode == 1) {
     if (p < 40) return OP_PUT;
     if (p < 52) return OP_DEL;
@@ -1177,6 +1218,13 @@ static int op_kind(uint64_t K, uint32_t *i) {
   return OP_NONE;
 }
 static uint16_t op_flags(uint64_t K) { return (uint16_t)((mix64(K) >> 7) & 0x3f); }
+/* the zones of a group of OP_KNOWN_N: 2 to 10 of the same view, one of them twice now and then */
+static unsigned kn_group(uint64_t K, uint32_t i, uint32_t *idx) {
+  unsigned g = 2 + (unsigned)((mix64(K ^ 0x55) >> 9) % 9);
+  for (unsigned j = 0; j < g; j++) idx[j] = (i + 2 * 5 * j) % KNZ;
+  if (K % 3 == 0) idx[g - 1] = idx[0];
+  return g;
+}
 
 static int store_do_op(store_t *s, uint64_t K) {
   uint32_t i;
@@ -1197,6 +1245,25 @@ static int store_do_op(store_t *s, uint64_t K) {
   }
   case OP_DEL: { int r = store_delete_name(s, view, nm, strlen(nm)); return r == -ENOENT ? 0 : r; }
   case OP_KNOWN: return store_set_known(s, view, nm, strlen(nm), &m, NULL);
+  case OP_KNOWN_N: {
+    uint32_t idx[16];
+    unsigned g = kn_group(K, i, idx);
+    char names[16][160];
+    store_meta_t metas[16];
+    store_known_t in[16];
+    int res[16];
+    for (unsigned j = 0; j < g; j++) {
+      name_of(idx[j], names[j], sizeof(names[j]));
+      metas[j] = meta_of(idx[j], K);
+      metas[j].flags = op_flags(K);
+      in[j].name = names[j];
+      in[j].len = strlen(names[j]);
+      in[j].meta = &metas[j];
+    }
+    int r = store_set_known_n(s, view, in, g, res, NULL);
+    for (unsigned j = 0; j < g && r == 0; j++) if (res[j] != 0) r = res[j];
+    return r;
+  }
   case OP_FLAGS: {
     uint32_t z = find_i(s, view, i);
     if (z == STORE_NONE) return 0;
@@ -1210,7 +1277,8 @@ static int store_do_op(store_t *s, uint64_t K) {
   default: return 0;
   }
 }
-static void model_do_op(model_t *m, uint64_t K) {
+/* parts: how many entries of a group (OP_KNOWN_N) are applied (UINT32_MAX: all; the other operations are whole) */
+static void model_do_op_part(model_t *m, uint64_t K, unsigned parts) {
   uint32_t i;
   int k = op_kind(K, &i);
   mz_t *z = &m->z[i];
@@ -1218,10 +1286,22 @@ static void model_do_op(model_t *m, uint64_t K) {
   case OP_PUT: z->exists = 1; z->known = 0; z->ver = K; z->flags = op_flags(K); break;
   case OP_DEL: memset(z, 0, sizeof(*z)); break;
   case OP_KNOWN: z->exists = 1; z->known = 1; z->ver = K; z->flags = op_flags(K); break;
+  case OP_KNOWN_N: {
+    uint32_t idx[16];
+    unsigned g = kn_group(K, i, idx);
+    for (unsigned j = 0; j < g && j < parts; j++) { mz_t *y = &m->z[idx[j]]; y->exists = 1; y->known = 1; y->ver = K; y->flags = op_flags(K); }
+    break;
+  }
   case OP_FLAGS: if (z->exists) z->flags = op_flags(K); break;
   case OP_CURSOR: m->cursor_valid = true; m->cursor = K; break;
   default: break;
   }
+}
+static void model_do_op(model_t *m, uint64_t K) { model_do_op_part(m, K, UINT32_MAX); }
+/* the entries of operation K (a group: its size; otherwise 1) */
+static unsigned model_op_parts(uint64_t K) {
+  uint32_t i, idx[16];
+  return op_kind(K, &i) == OP_KNOWN_N ? kn_group(K, i, idx) : 1;
 }
 /* compare the store with the model; verbose = print the first difference */
 static bool model_matches(store_t *s, const model_t *m, bool verbose) {
@@ -1290,6 +1370,30 @@ static bool model_from_store(store_t *s, model_t *m) {
 
 typedef struct { _Atomic uint64_t begun, done, acked; } shm_t;
 
+/* modes 3 and 4 of the kill loop (0.7 fix A): a step of a checkpoint that runs outside the writer mutex (3: a thread checkpoints all the time, the flush of the tables is made slow) or of a
+ * growth of the index built outside it (4: the build waits before it takes the mutex, so that the writers' changes pile up in its log) is reached while the operations go on, and the child is
+ * killed at the n-th time one step is reached (g_hk_step: 1..4 a checkpoint step, 11..12 a growth step; 0: not by a hook) */
+static _Atomic int g_hk_step, g_hk_n;
+static void hk_kill(int step) {
+  if (atomic_load(&g_hk_step) == step && atomic_fetch_sub(&g_hk_n, 1) == 1) kill(getpid(), SIGKILL);
+}
+static void hk_ckpt(int step) {
+  if (step == 2) usleep(300);
+  hk_kill(step);
+}
+static void hk_regrow(int step) {
+  if (step == 1) usleep(3000);
+  hk_kill(10 + step);
+}
+static void *ckthr_main(void *arg) {
+  store_t *s = arg;
+  for (;;) {
+    (void)store_checkpoint(s);
+    usleep(300);
+  }
+  return NULL;
+}
+
 static void child_main(const char *path, shm_t *shm, uint64_t K0, uint64_t count, uint64_t boot, long countdown) {
   int fd = open(path, O_RDONLY | O_DIRECTORY);
   if (fd < 0) _exit(10);
@@ -1305,8 +1409,15 @@ static void child_main(const char *path, shm_t *shm, uint64_t K0, uint64_t count
   o.scrub_interval_s = UINT32_MAX;
   if (g_kill_mode == 1) { o.compact_rate = UINT64_MAX; o.nx_reclaim_min = 256; }
   store_test_crash_countdown = countdown;
+  if (g_kill_mode == 3) atomic_store(&store_test_ckpt_hook, hk_ckpt);
+  if (g_kill_mode == 4) atomic_store(&store_test_regrow_hook, hk_regrow);
   store_t *s = NULL;
   if (store_open(fd, &o, &s) != 0) _exit(11);
+  if (g_kill_mode == 3) {
+    pthread_t th;
+    if (pthread_create(&th, NULL, ckthr_main, s) != 0) _exit(14);
+    pthread_detach(th);
+  }
   for (uint64_t K = K0; K < K0 + count; K++) {
     atomic_store(&shm->begun, K + 1);
     if (store_do_op(s, K) != 0) _exit(12);
@@ -1321,18 +1432,20 @@ static void child_main(const char *path, shm_t *shm, uint64_t K0, uint64_t count
 
 static void test_kill_loop(int iters, int mode) {
   g_kill_mode = mode;
-  printf("[kill -9 loop%s: %d iterations]\n", mode == 1 ? " with the cleaner, the nx pass and the scrub" : "", iters);
+  printf("[kill -9 loop%s: %d iterations]\n", mode == 1 ? " with the cleaner, the nx pass and the scrub" : mode == 2 ? " with groups of zones made known in one record (store_set_known_n)" :
+         mode == 3 ? " with a thread that checkpoints all the time (a fuzzy checkpoint killed at its steps)" : mode == 4 ? " with growths of the index built outside the mutex (killed at their steps)" : "", iters);
+  int hk_kills = 0;
   tdir_t d;
   tdir_new(&d, "kill");
   shm_t *shm = mmap(NULL, sizeof(*shm), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0);
   CHECK(shm != MAP_FAILED);
   if (shm == MAP_FAILED) { tdir_free(&d); return; }
-  model_t *model = calloc(1, sizeof(*model)), *tmp = calloc(1, sizeof(*tmp));
+  model_t *model = calloc(1, sizeof(*model)), *tmp = calloc(1, sizeof(*tmp)), *tmp2 = calloc(1, sizeof(*tmp2)), *tmp3 = calloc(1, sizeof(*tmp3));
   uint64_t K0 = 0, boot = 42, rng = 20261114;
-  int fresh = 0, crashed = 0, countdown_hits = 0, tampered = 0, older = 0, torn = 0, exact = 0, replayed_total = 0, lost_ops = 0, with_free = 0;
+  int fresh = 0, crashed = 0, countdown_hits = 0, tampered = 0, older = 0, torn = 0, exact = 0, replayed_total = 0, lost_ops = 0, with_free = 0, part_groups = 0;
   uint32_t max_segs = 0;
   for (int it = 0; it < iters; it++) {
-    if (it % 25 == 0) {
+    if (it % (mode == 4 ? 2 : 25) == 0) {                             /* (mode 4: a new store often, so that the index grows from its smallest size again) */
       /* a new store: the first iterations grow the index through several generations */
       tdir_free(&d);
       tdir_new(&d, "kill");
@@ -1352,6 +1465,13 @@ static void test_kill_loop(int iters, int mode) {
     rng = mix64(rng);
     bool use_countdown = (rng & 1) != 0;
     long cd = use_countdown ? 1 + (long)((rng >> 8) % 24000) : 0;
+    atomic_store(&g_hk_step, 0);
+    if (mode >= 3 && use_countdown && ((rng >> 5) & 1)) {             /* (half of the planned kills at a step of the new code instead of a crash point) */
+      atomic_store(&g_hk_step, mode == 3 ? 1 + (int)((rng >> 8) % 4) : 11 + (int)((rng >> 8) % 2));
+      atomic_store(&g_hk_n, 1 + (int)((rng >> 12) % (mode == 3 ? 12 : 2)));
+      cd = 0;
+      hk_kills++;
+    }
     uint64_t count = 700 + (rng >> 40) % 400;
     atomic_store(&shm->begun, K0);
     atomic_store(&shm->done, K0);
@@ -1379,7 +1499,7 @@ static void test_kill_loop(int iters, int mode) {
     if (tamper) {
       uint32_t best = 0;
       char jp[700];
-      for (uint32_t g = 1; g < 400; g++) { struct stat sbuf; snprintf(jp, sizeof(jp), "%s/jrn.%u", d.path, g); if (stat(jp, &sbuf) == 0) best = g; }
+      for (uint32_t g = 1; g < 400; g++) { struct stat sbuf; snprintf(jp, sizeof(jp), "%s/jrn.%u", d.path, g); if (stat(jp, &sbuf) == 0 && sbuf.st_size > 64) best = g; }   /* (not the next journal, made ahead and empty) */
       snprintf(jp, sizeof(jp), "%s/jrn.%u", d.path, best);
       struct stat jst;
       if (best && stat(jp, &jst) == 0 && jst.st_size > 200) {
@@ -1414,14 +1534,27 @@ static void test_kill_loop(int iters, int mode) {
       K0 = begun;                                                       /* absolute ops: the generator needs no state */
     } else {
       CHECK(!st.recovery.rebuilt);
-      /* the state must be the model after n ops, acked <= n <= begun */
+      /* the state must be the model after n ops, acked <= n <= begun, or (mode 2) after n ops and the first entries of op n: store_set_known_n() writes a group as more than one record
+       * when an entry needs the index (or a table) to grow first, or names a zone pending in the group, and a kill between those records keeps the first ones (each record is whole or
+       * not there; the call is not one unit, see dns_store.h) */
       memcpy(tmp, model, sizeof(*tmp));
       for (uint64_t K = K0; K < acked; K++) model_do_op(tmp, K);
       uint64_t found = UINT64_MAX;
+      unsigned found_part = 0;
       for (uint64_t n = acked; n <= begun && found == UINT64_MAX; n++) {
-        if (model_matches(s, tmp, false)) found = n;
-        else if (n < begun) model_do_op(tmp, n);
+        if (model_matches(s, tmp, false)) { found = n; break; }
+        if (n == begun) break;
+        const unsigned np = model_op_parts(n);
+        if (np > 1) memcpy(tmp3, tmp, sizeof(*tmp3));
+        model_do_op(tmp, n);
+        for (unsigned j = 1; j < np && found == UINT64_MAX; j++) {
+          memcpy(tmp2, tmp3, sizeof(*tmp2));
+          model_do_op_part(tmp2, n, j);
+          if (memcmp(tmp2, tmp, sizeof(*tmp2)) == 0) continue;          /* (the rest of the group changes nothing: a zone of the group twice) */
+          if (model_matches(s, tmp2, false)) { found = n; found_part = j; }
+        }
       }
+      if (found_part) part_groups++;
       if (found == UINT64_MAX) {
         printf("  iteration %d: no prefix matches (K0=%" PRIu64 " acked=%" PRIu64 " done=%" PRIu64 " begun=%" PRIu64 ", killed=%d, countdown=%ld)\n", it, K0, acked, done, begun, killed, cd);
         /* print the difference against the model at 'begun' and at 'acked' */
@@ -1438,6 +1571,7 @@ static void test_kill_loop(int iters, int mode) {
       /* rebuild the model at `found` */
       memcpy(tmp, model, sizeof(*tmp));
       for (uint64_t K = K0; K < found; K++) model_do_op(tmp, K);
+      if (found_part) model_do_op_part(tmp, found, found_part);        /* (the next child runs op `found` again, whole: its entries are absolute values) */
       memcpy(model, tmp, sizeof(*model));
       K0 = found;
     }
@@ -1450,8 +1584,13 @@ static void test_kill_loop(int iters, int mode) {
   printf("  %d stores, %d children killed (%d at a crash point), %d journal tails cut (rebuild path), %d older-superblock opens, %d torn tails,\n"
          "  %d replayed records in total, %d exact-end matches, %d begun-but-lost operations; %d opens found removed segments (%u segment numbers at the most)\n",
          fresh, crashed, countdown_hits, tampered, older, torn, replayed_total, exact, lost_ops, with_free, max_segs);
+  if (mode >= 3) printf("  %d kills planned at a step of a %s\n", hk_kills, mode == 3 ? "checkpoint" : "growth");
+  if (mode == 2) printf("  %d recoveries found a group of entries applied in part (a kill between the records of one call)\n", part_groups);
+  atomic_store(&g_hk_step, 0);
   free(model);
   free(tmp);
+  free(tmp2);
+  free(tmp3);
   munmap(shm, sizeof(*shm));
   tdir_free(&d);
   g_kill_mode = 0;
@@ -2050,8 +2189,11 @@ static void test_reuse_after_grace(void) {
 
 /* L4: the sync after the journal record of a generation switch fails: the journal names the new generation, so the live index is the new one too (and a replay of
  * what was left gives the same store) */
+/* 0.7 fix A: a growth no longer syncs inside the writer's call; the checkpoint that follows it does, without the mutex.  When that sync fails the growth stays (its record is in the
+ * journal and the memory follows it), the error is counted, the journal before the switch is kept open and synced by the next checkpoint, and nothing is lost: the next open (no close)
+ * names the same generation and every zone.  Without a flusher thread the writer makes the due checkpoint after its call: deterministic here. */
 static void test_growth_sync_fails(void) {
-  printf("[an index growth whose sync fails]\n");
+  printf("[an index growth whose checkpoint sync fails]\n");
   tdir_t d;
   tdir_new(&d, "growfail");
   store_opts_t o;
@@ -2063,33 +2205,40 @@ static void test_growth_sync_fails(void) {
   fflush(stdout);
   pid_t pid = fork();
   if (pid == 0) {
+    atomic_store(&store_test_no_flusher, true);
     store_t *c = NULL;
     if (store_open(d.fd, &o, &c) != 0) _exit(2);
     store_view_add(c, "default");
     int rc = 0;
     uint32_t n = 0;
     for (uint32_t i = 0; i < 5000; i++) {
-      store_test_fail_commit = 1;
+      store_test_fail_commit = 1;                                        /* (every checkpoint after a growth fails its sync: the superblocks stay, the journal chain grows) */
       rc = put_i(c, 0, i, 1, NULL);
       store_test_fail_commit = 0;
       if (rc != 0) break;
       n++;
     }
+    /* a growth of the index that a put started is built on a thread of its own (no flusher does not stop that) and may put its generation in after the last put: wait for it, or the
+     * generation read here is older than the one its journal record names (store_reserve() waits for a build that runs, and with 0 zones does nothing else) */
+    if (store_reserve(c, 0) != 0) _exit(4);
     store_stats_t st;
     store_stats(c, &st);
-    uint64_t out[4] = { (uint64_t)(int64_t)rc, st.ix_gen, st.zones_stored, n };
+    uint64_t out[6] = { (uint64_t)(int64_t)rc, st.ix_gen, st.zones_stored, n, st.write_errors, st.growths };
     if (write(pfd[1], out, sizeof(out)) != (ssize_t)sizeof(out)) _exit(3);
     _exit(0);                                                            /* no close: what the journal holds is what the next open has */
   }
   int stt = 0;
   waitpid(pid, &stt, 0);
   CHECK(WIFEXITED(stt) && WEXITSTATUS(stt) == 0);
-  uint64_t got[4] = { 0, 0, 0, 0 };
+  uint64_t got[6] = { 0, 0, 0, 0, 0, 0 };
   CHECK(read(pfd[0], got, sizeof(got)) == (ssize_t)sizeof(got));
   close(pfd[0]);
   close(pfd[1]);
-  CHECK_EQ((int64_t)got[0], -EIO);                                       /* (the put that wanted room was refused) */
-  CHECK(got[1] >= 2);                                                    /* (... and the live index is the new generation) */
+  printf("  %" PRIu64 " puts, %" PRIu64 " growths, %" PRIu64 " failed syncs, index generation %" PRIu64 "\n", got[3], got[5], got[4], got[1]);
+  CHECK_EQ((int64_t)got[0], 0);                                          /* (no put was refused: the sync is not the writer's) */
+  CHECK_EQ(got[3], 5000);
+  CHECK(got[1] >= 2);                                                    /* (... and the live index is a new generation) */
+  CHECK(got[4] > 0);                                                     /* (the failures were counted) */
   o.create = false;
   store_t *s = NULL;
   CHECK_EQ(store_open(d.fd, &o, &s), 0);
@@ -2102,6 +2251,348 @@ static void test_growth_sync_fails(void) {
     check_consistent(s, "growth sync");
     for (uint32_t i = 0; i < got[3]; i += 97) CHECK(verify_i(s, 0, i, 1));
     CHECK_EQ(put_i(s, 0, 9000, 1, NULL), 0);
+    CHECK_EQ(store_close(s), 0);
+  }
+  /* with the flusher: its commit fails in the background (counted, tried again after a pause), the writer's call does not see it; the next commit makes everything durable */
+  o.sync_policy = STORE_SYNC_BATCH;
+  o.sync_interval_ms = 20;
+  s = NULL;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (s) {
+    store_stats_t st;
+    store_stats(s, &st);
+    const uint64_t e0 = st.write_errors;
+    store_test_fail_commit = 1;
+    CHECK_EQ(put_i(s, 0, 9001, 1, NULL), 0);
+    for (int w = 0; w < 3000; w++) { store_stats(s, &st); if (st.write_errors > e0) break; usleep(1000); }
+    CHECK(st.write_errors > e0);                                         /* (the flusher's commit failed) */
+    CHECK(st.committed_lsn < st.lsn);
+    CHECK_EQ(store_commit(s), 0);
+    store_stats(s, &st);
+    CHECK_EQ(st.committed_lsn, st.lsn);
+    CHECK(verify_i(s, 0, 9001, 1));
+    CHECK_EQ(store_close(s), 0);
+  }
+  store_test_fail_commit = 0;
+  tdir_free(&d);
+}
+
+/* A growth built outside the mutex is put in after a clean checkpoint was made meanwhile (the stop of a server that a straggler follows): its record is a change after the clean flag,
+ * so the flag is cleared on disk first, as for any writer (the open after a reboot then rebuilds, as after every unclean stop). */
+static store_t *g_cg_store;
+static _Atomic int g_cg_done, g_cg_want, g_cg_idle;
+static void cg_hook(int step) {
+  if (step == 1 && atomic_load(&g_cg_done) == 0) {
+    atomic_store(&g_cg_want, 1);                                         /* (the writer stops first: no put may clear the flag before the growth's record) */
+    for (int w = 0; w < 5000 && !atomic_load(&g_cg_idle); w++) usleep(1000);
+    atomic_store(&g_cg_done, store_checkpoint_clean(g_cg_store) == 0 ? 1 : -1);
+  }
+}
+static void test_clean_then_growth(void) {
+  printf("[a growth built outside the mutex after a clean checkpoint]\n");
+  tdir_t d;
+  tdir_new(&d, "cleangrow");
+  store_opts_t o;
+  small_opts(&o);
+  fflush(stdout);
+  pid_t pid = fork();
+  if (pid == 0) {
+    store_t *s = NULL;
+    if (store_open(d.fd, &o, &s) != 0) _exit(2);
+    store_view_add(s, "default");
+    g_cg_store = s;
+    atomic_store(&store_test_regrow_hook, cg_hook);
+    uint32_t i = 0;
+    while (!atomic_load(&g_cg_want) && i < 20000) {                    /* (until a build begins and its hook asks for the clean checkpoint) */
+      if (put_i(s, 0, i++, 1, NULL) != 0) _exit(3);
+      usleep(200);
+    }
+    atomic_store(&g_cg_idle, 1);
+    for (int w = 0; w < 10000 && atomic_load(&g_cg_done) == 0; w++) usleep(1000);
+    if (atomic_load(&g_cg_done) != 1) _exit(4);
+    store_stats_t st;
+    store_stats(s, &st);
+    for (int w = 0; w < 5000 && st.growths_background == 0; w++) { usleep(1000); store_stats(s, &st); }
+    if (st.growths_background == 0) _exit(5);
+    if (st.clean_flag) _exit(6);                                         /* (the growth's record cleared the flag on disk) */
+    atomic_store(&store_test_regrow_hook, NULL);
+    _exit(i > 255 ? 0 : 7);                                              /* no close */
+  }
+  int stt = 0;
+  waitpid(pid, &stt, 0);
+  CHECK(WIFEXITED(stt) && WEXITSTATUS(stt) == 0);
+  if (WIFEXITED(stt) && WEXITSTATUS(stt) != 0) printf("  child exit %d\n", WEXITSTATUS(stt));
+  o.create = false;
+  o.boot_id = 77;                                                        /* (the host was rebooted) */
+  store_t *s = NULL;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (s) {
+    store_stats_t st;
+    store_stats(s, &st);
+    CHECK(!st.recovery.was_clean);
+    CHECK(st.recovery.rebuilt);
+    check_consistent(s, "clean then growth");
+    CHECK_EQ(store_close(s), 0);
+  }
+  tdir_free(&d);
+}
+
+/* 0.7 fix A: no writer waits for the disk inside the writer mutex.  A checkpoint whose flush of the tables is made slow (400 ms in the hook) and a growth of the index whose build is made
+ * slow before it takes the mutex: puts, groups, deletes, stamp changes and store_commit() all go on meanwhile and each one is quick; afterwards the checkpoint names its position, the new index
+ * holds every change made during the build, and a reopen (after kill -9) has all of it. */
+static _Atomic int g_slow_step;          /* the hook of that step sleeps (ckpt 1..4, growth 11..12) */
+static _Atomic bool g_in_slow;
+static void slow_at(int step) {
+  if (step != atomic_load(&g_slow_step)) return;
+  atomic_store(&g_in_slow, true);
+  usleep(400000);
+  atomic_store(&g_in_slow, false);
+  atomic_store(&g_slow_step, 0);
+}
+static void slow_ckpt(int step) { slow_at(step); }
+static void slow_regrow(int step) { slow_at(10 + step); }
+static void *ckpt_call(void *arg) {
+  (void)store_checkpoint(arg);
+  return NULL;
+}
+static int put_src(store_t *s, uint32_t i, uint64_t ver, int64_t src) {      /* zone i with another source id (a renamed domain id) */
+  char nm[160];
+  name_of(i, nm, sizeof(nm));
+  size_t n = img_len(i, ver);
+  uint8_t *img = malloc(n);
+  img_fill(img, n, i, ver);
+  store_meta_t m = meta_of(i, ver);
+  m.source_id = src;
+  int r = store_put(s, 0, nm, strlen(nm), &m, img, n, NULL);
+  free(img);
+  return r;
+}
+static void test_no_wait_in_lock(int mode) {
+  printf("[no wait for the disk inside the writer mutex: a slow checkpoint flush, a slow growth build (%s)]\n", mode == STORE_MODE_MAP ? "MAP" : "COPY");
+  tdir_t d;
+  tdir_new(&d, "nowait");
+  store_opts_t o;
+  small_opts(&o);
+  o.mode = mode;
+  o.checkpoint_interval_ms = UINT32_MAX;
+  o.scrub_interval_s = UINT32_MAX;
+  int pfd[2];
+  CHECK_EQ(pipe(pfd), 0);
+  fflush(stdout);
+  pid_t pid = fork();
+  if (pid == 0) {
+    store_t *s = NULL;
+    if (store_open(d.fd, &o, &s) != 0) _exit(2);
+    store_view_add(s, "default");
+    for (uint32_t i = 0; i < 300; i++) if (put_i(s, 0, i, 1, NULL) != 0) _exit(3);
+    uint64_t out[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+    /* 1. a checkpoint that is slow in its flush (step 2) */
+    atomic_store(&store_test_ckpt_hook, slow_ckpt);
+    atomic_store(&g_slow_step, 2);
+    pthread_t th;
+    if (pthread_create(&th, NULL, ckpt_call, s) != 0) _exit(4);
+    for (int w = 0; w < 2000 && !atomic_load(&g_in_slow); w++) usleep(1000);
+    if (!atomic_load(&g_in_slow)) _exit(5);
+    store_stats_t st;
+    store_stats(s, &st);
+    const uint64_t ck_before = st.checkpoints;
+    uint64_t worst = 0, ops = 0;
+    for (uint32_t i = 0; i < 300 && atomic_load(&g_in_slow); i++) {
+      uint64_t t0 = now_us();
+      if (put_i(s, 0, i, 2, NULL) != 0) _exit(6);
+      if (i % 50 == 49 && store_commit(s) != 0) _exit(7);              /* (the baton is free while the tables are flushed) */
+      uint64_t dt = now_us() - t0;
+      if (dt > worst) worst = dt;
+      ops++;
+    }
+    const bool still = atomic_load(&g_in_slow);
+    pthread_join(th, NULL);
+    store_stats(s, &st);
+    out[0] = worst;
+    out[1] = ops;
+    out[2] = still;
+    out[3] = st.checkpoints > ck_before && st.ckpt_lsn < st.lsn;          /* (the checkpoint ended at its position: the puts made during its flush come after it) */
+    atomic_store(&store_test_ckpt_hook, NULL);
+    /* 2. a growth whose build waits (step 1) before it takes the mutex: new zones until the build begins, then changes of every kind during the wait */
+    atomic_store(&store_test_regrow_hook, slow_regrow);
+    atomic_store(&g_slow_step, 11);
+    store_stats(s, &st);
+    const uint64_t bg0 = st.growths_background, g0 = st.growths;
+    uint32_t next = 300;
+    while (!atomic_load(&g_in_slow) && next < 90000) {
+      if (put_i(s, 0, next, 1, NULL) != 0) _exit(8);
+      next++;
+      store_stats(s, &st);
+      if (st.ix_used * 8 > st.ix_slots * 3) usleep(2000);             /* (the build began: give it the time to reach its wait before the old index is half full) */
+    }
+    if (!atomic_load(&g_in_slow)) _exit(9);
+    store_stats(s, &st);
+    const uint64_t room = (st.ix_slots / 2 - st.ix_used) / 3;          /* (stay below one half of the old index: no growth inside the mutex) */
+    worst = 0;
+    ops = 0;
+    for (uint64_t k = 0; k < room && atomic_load(&g_in_slow); k++) {
+      uint64_t t0 = now_us();
+      int r = 0;
+      switch (k % 4) {
+      case 0: r = put_i(s, 0, next++, 1, NULL); break;                                  /* a new zone */
+      case 1: { char nm[160]; name_of((uint32_t)(k % 300), nm, sizeof(nm)); r = store_delete_name(s, 0, nm, strlen(nm)); if (r == -ENOENT) r = 0; break; }   /* a zone goes */
+      case 2: r = put_src(s, 100000 + (uint32_t)k, 1, 0); break;                        /* a new zone without a source id */
+      default: r = put_src(s, 100000 + (uint32_t)k - 1, 3, 900000 + (int64_t)k); break;  /* ... gets a source id */
+      }
+      if (r != 0) _exit(10);
+      uint64_t dt = now_us() - t0;
+      if (dt > worst) worst = dt;
+      ops++;
+    }
+    for (int w = 0; w < 5000 && atomic_load(&g_slow_step) != 0; w++) usleep(1000);
+    for (int w = 0; w < 5000; w++) { store_stats(s, &st); if (st.growths_background > bg0) break; usleep(1000); }
+    out[4] = worst;
+    out[5] = ops;
+    out[6] = st.growths_background > bg0 && st.growths == g0 + (st.growths_background - bg0);
+    atomic_store(&store_test_regrow_hook, NULL);
+    /* every zone is where the model says: by name and by source id */
+    bool ok = true;
+    for (uint64_t k = 0; k < room && ok; k++) {
+      const uint32_t i = (uint32_t)(k % 300);
+      if (k % 4 == 1) ok = find_i(s, 0, i) == STORE_NONE;
+      if (ok && k % 4 == 3) {
+        const uint32_t z = find_i(s, 0, 100000 + (uint32_t)k - 1);
+        ok = z != STORE_NONE && store_find_source(s, (uint16_t)((100000 + k - 1) % 4), 900000 + (int64_t)k, 0) == z;
+      }
+      if (ok && k % 4 == 2) ok = find_i(s, 0, 100000 + (uint32_t)k) != STORE_NONE;
+    }
+    for (uint32_t i = 300; i < next && ok; i++) ok = find_i(s, 0, i) != STORE_NONE;
+    store_check_report_t rep;
+    out[7] = ok && store_check(s, &rep) == 0;
+    if (!out[7] && store_check(s, &rep) != 0) printf("  store_check: %s\n", rep.first_error);
+    out[7] |= (uint64_t)next << 8;
+    if (write(pfd[1], out, sizeof(out)) != (ssize_t)sizeof(out)) _exit(11);
+    _exit(0);                                                            /* no close: the journal has it all */
+  }
+  int stt = 0;
+  waitpid(pid, &stt, 0);
+  CHECK(WIFEXITED(stt) && WEXITSTATUS(stt) == 0);
+  if (!WIFEXITED(stt) || WEXITSTATUS(stt) != 0) printf("  child exit %d\n", WIFEXITED(stt) ? WEXITSTATUS(stt) : -1);
+  uint64_t got[8] = { 0 };
+  CHECK(read(pfd[0], got, sizeof(got)) == (ssize_t)sizeof(got));
+  close(pfd[0]);
+  close(pfd[1]);
+  printf("  checkpoint flush held 400 ms: %" PRIu64 " writer calls meanwhile, the slowest %" PRIu64 " us; growth build held 400 ms: %" PRIu64 " calls, the slowest %" PRIu64 " us\n", got[1], got[0], got[5], got[4]);
+  CHECK(got[1] > 0 && got[5] > 0);
+  CHECK(got[2] == 1);                                                    /* (the calls ended while the flush still slept) */
+  CHECK(got[0] < 100000);
+  CHECK(got[4] < 100000);
+  CHECK(got[3] == 1);
+  CHECK(got[6] == 1);                                                    /* (the build was put in: no growth inside the mutex) */
+  CHECK((got[7] & 0xff) == 1);
+  const uint32_t next = (uint32_t)(got[7] >> 8);
+  o.create = false;
+  store_t *s = NULL;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (s) {
+    store_stats_t st;
+    store_stats(s, &st);
+    CHECK(!st.recovery.rebuilt);
+    check_consistent(s, "no wait, reopen");
+    for (uint32_t i = 300; i < next; i += 7) CHECK(find_i(s, 0, i) != STORE_NONE);
+    CHECK_EQ(store_close(s), 0);
+  }
+  tdir_free(&d);
+}
+
+/* 0.7: the bound of the journal and a close during a fuzzy checkpoint.  A checkpoint whose flush is made slow (1 s in the hook, as a disk slower than the writes) while one writer puts
+ * zones as fast as it can: the journal goes past journal_max_bytes (the checkpoint in progress cannot cut it) but never past 2 x journal_max_bytes plus one call; the call that reaches
+ * the bound waits at its end, with the writer mutex released (its longest hold stays short), until the checkpoint is done; the next call cuts the journal; one WARNING.  Then a close
+ * while a fuzzy checkpoint sleeps in its flush leaves that checkpoint (logged) instead of finishing it, and the reopen finds the clean state with every zone. */
+static void log_cb(void *ctx, int level, const char *msg);
+static int log_count(int level, const char *needle);
+static void log_clear(void);
+static _Atomic int g_jb_step, g_jb_ms;
+static _Atomic bool g_jb_in, g_jb_entered;
+static void jb_hook(int step) {
+  if (step != atomic_load(&g_jb_step)) return;
+  atomic_store(&g_jb_step, 0);
+  atomic_store(&g_jb_in, true);
+  atomic_store(&g_jb_entered, true);
+  usleep((useconds_t)atomic_load(&g_jb_ms) * 1000u);
+  atomic_store(&g_jb_in, false);
+}
+static void test_journal_bound(int mode) {
+  printf("[the journal stays below 2 x journal_max_bytes while a checkpoint is slow; a close leaves a fuzzy checkpoint (%s)]\n", mode == STORE_MODE_MAP ? "MAP" : "COPY");
+  tdir_t d;
+  tdir_new(&d, "jbound");
+  store_opts_t o;
+  small_opts(&o);
+  o.mode = mode;
+  o.journal_max_bytes = 64u << 10;
+  o.checkpoint_interval_ms = UINT32_MAX;
+  o.scrub_interval_s = UINT32_MAX;
+  o.log = log_cb;
+  log_clear();
+  store_t *s = NULL;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (!s) { tdir_free(&d); return; }
+  store_view_add(s, "default");
+  store_stats_t st;
+  store_stats(s, &st);
+  CHECK_EQ(st.journal_bound_bytes, 2 * o.journal_max_bytes);
+  CHECK(st.flusher);
+  /* 1. the first fuzzy checkpoint (begun by the put that fills the journal) sleeps 1 s in its flush */
+  atomic_store(&g_jb_entered, false);
+  atomic_store(&g_jb_ms, 1000);
+  atomic_store(&g_jb_step, 2);
+  atomic_store(&store_test_ckpt_hook, jb_hook);
+  uint64_t peak = 0;
+  uint32_t i = 0;
+  bool cut = false;
+  for (; i < 100000 && !cut; i++) {
+    if (put_i(s, 0, i, 1, NULL) != 0) { CHECK(!"put"); break; }
+    (void)store_journal_wait(s, 2);                                     /* (as the reconcile thread does between its groups) */
+    store_stats(s, &st);
+    if (st.journal_bytes > peak) peak = st.journal_bytes;
+    cut = atomic_load(&g_jb_entered) && !atomic_load(&g_jb_in) && st.journal_limit_waits > 0 && st.journal_bytes < o.journal_max_bytes;   /* (waited, the flush ended, the next checkpoint cut it) */
+  }
+  store_stats(s, &st);
+  printf("  %u puts; journal peak %" PRIu64 " bytes (bound %" PRIu64 "), %" PRIu64 " wait(s), the longest %" PRIu64 " us; writer mutex held at most %" PRIu64 " us\n", i, st.journal_peak_bytes,
+         st.journal_bound_bytes, st.journal_limit_waits, st.journal_limit_wait_max_us, st.lock_hold_max_us);
+  CHECK(cut);
+  CHECK(peak >= o.journal_max_bytes);                                     /* (the slow checkpoint did not cut it) */
+  CHECK(st.journal_peak_bytes >= peak && st.journal_peak_bytes <= st.journal_bound_bytes + 4096);   /* (one put is far less than 4 KiB of records) */
+  CHECK(st.journal_limit_waits >= 1);
+  CHECK(st.journal_limit_wait_max_us > 0 && st.journal_limit_wait_us >= st.journal_limit_wait_max_us);
+  CHECK(st.lock_hold_max_us < 500000);                                    /* (the wait is outside the writer mutex; the hook slept 1 s) */
+  CHECK(st.checkpoint_max_us >= 900000);                                  /* (the slow one) */
+  CHECK_EQ(log_count(4, "2 x journal_max_bytes"), 1);                   /* (at most one a minute) */
+  CHECK_EQ(store_close(s), 0);
+  /* 2. a close while a fuzzy checkpoint sleeps in its flush (the hook returns after 1 s; the flush then stops before its first piece).  A journal limit that is far away and a
+   * checkpoint by the interval: no put waits, the close comes while the flusher's checkpoint is in the hook */
+  o.create = false;
+  o.journal_max_bytes = 64u << 20;
+  o.checkpoint_interval_ms = 100;
+  s = NULL;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (!s) { atomic_store(&store_test_ckpt_hook, NULL); tdir_free(&d); return; }
+  for (uint32_t k = 0; k < 500; k++, i++)
+    if (put_i(s, 0, i, 1, NULL) != 0) { CHECK(!"put 2"); break; }
+  atomic_store(&g_jb_entered, false);
+  atomic_store(&g_jb_step, 2);
+  for (int w = 0; w < 5000 && !atomic_load(&g_jb_entered); w++) usleep(1000);
+  CHECK(atomic_load(&g_jb_in));
+  const uint32_t n = i;
+  log_clear();
+  CHECK_EQ(store_close(s), 0);
+  atomic_store(&store_test_ckpt_hook, NULL);
+  CHECK_EQ(log_count(6, "was left for the clean checkpoint that follows"), 1);
+  s = NULL;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (s) {
+    store_stats(s, &st);
+    CHECK(st.recovery.was_clean);
+    CHECK_EQ(st.recovery.records_replayed, 0);
+    CHECK(!st.recovery.rebuilt);
+    for (uint32_t k = 0; k < n; k += 13) CHECK(find_i(s, 0, k) != STORE_NONE);
+    CHECK(find_i(s, 0, n - 1) != STORE_NONE);
+    check_consistent(s, "journal bound, reopen");
     CHECK_EQ(store_close(s), 0);
   }
   tdir_free(&d);
@@ -2846,7 +3337,9 @@ static void test_space(int mode) {
   o.journal_max_bytes = 64u << 10;                                      /* (the journal is part of what the disk holds: it is cut often) */
   log_clear();
   store_t *s = NULL;
+  atomic_store(&store_test_no_flusher, true);                            /* (the free space is measured at the checkpoints: made by the writer after its call, in the order of the puts, not by the flusher at its own time) */
   CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  atomic_store(&store_test_no_flusher, false);
   if (!s) { tdir_free(&d); return; }
   store_view_add(s, "default");
   store_checkpoint(s);
@@ -2874,7 +3367,7 @@ static void test_space(int mode) {
   CHECK_EQ(st.degraded_puts, 0);
   CHECK(st.enospc_events > 0);
   CHECK(!(st.state & STORE_ST_DEGRADED_NOSPC));
-  CHECK_EQ(st.space_level, 0);
+  CHECK(st.space_level < 2);                                             /* (not degraded; "low" is what the free space was at the last checkpoint, which runs on the flusher now: about 400 KB of 1800 KB free is low) */
   for (uint32_t i = 0; i < M; i++) CHECK(verify_i(s, 0, i, 30));
   check_consistent(s, "space 1");
   CHECK_EQ(log_count(3, "no room"), 0);
@@ -2923,7 +3416,9 @@ static void test_space(int mode) {
   CHECK_EQ(store_close(s), 0);
   store_test_fs_free = NULL;
   o.create = false;
+  atomic_store(&store_test_no_flusher, true);
   CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  atomic_store(&store_test_no_flusher, false);
   if (!s) { tdir_free(&d); return; }
   g_fake_cap = dir_usage(d.path) + (int64_t)(256u << 10) / 2;           /* (the reopen starts a new journal, so the files are smaller now: the "disk" is made full again, half of the reserve free) */
   store_test_fs_free = fake_fs_free;
@@ -3973,6 +4468,373 @@ static void test_hot_list(void) {
   tdir_free(&d2);
 }
 
+/* ---- 0.7 M2: group commit (store_set_known_n()) ---- */
+
+/* an entry of a group: a name and the meta of zone i, with some of the traps of a manifest pass (a source id that another zone owns, none, a source number that changed) */
+typedef struct { char nm[200]; store_meta_t m; } gk_t;
+static void gk_make(gk_t *e, uint64_t K, uint32_t npool) {
+  uint64_t r = mix64(K * 0x9e3779b97f4a7c15ull + 777);
+  uint32_t i = (uint32_t)(r % npool);
+  name_of(i, e->nm, sizeof(e->nm));
+  e->m = meta_of(i, K);
+  uint32_t p = (uint32_t)((r >> 20) % 100);
+  if (p < 7) e->m.source_id = (int64_t)((r >> 32) % npool) + 1;          /* an id that another zone owns: a rename (-EEXIST), or the zone's own */
+  else if (p < 10) e->m.source_id = 0;
+  else if (p < 13) e->m.source = (uint16_t)((e->m.source + 1) % 4);
+  e->m.flags = (uint16_t)((r >> 40) & 0x3f);
+}
+
+/* the same zone table: the records by zone id (names, states, flags, stamps, sources) and the counters of the views */
+static bool same_tables(store_t *a, store_t *b, const char *what) {
+  bool ok = true;
+  uint32_t ca = 0, cb = 0;
+  store_zone_t za, zb;
+  store_read_lock();
+  for (;;) {
+    int ra = store_iter(a, &ca, &za), rb = store_iter(b, &cb, &zb);
+    if (ra != rb) { printf("    %s: the tables end at different zones\n", what); ok = false; break; }
+    if (ra <= 0) break;
+    if (za.zid != zb.zid || za.view != zb.view || strcmp(za.name, zb.name) != 0 || za.state != zb.state || za.flags != zb.flags || za.serial != zb.serial || za.settings != zb.settings ||
+        za.stamp_gen != zb.stamp_gen || za.stamp_time != zb.stamp_time || za.source_id != zb.source_id || za.source != zb.source || memcmp(za.digest, zb.digest, STORE_DIGEST_LEN) != 0) {
+      printf("    %s: zone %u (%s) differs\n", what, za.zid, za.name);
+      ok = false;
+      break;
+    }
+    if (store_find(a, za.view, za.name, strlen(za.name)) != store_find(b, zb.view, zb.name, strlen(zb.name)) ||
+        (za.source_id && store_find_source(a, za.source, za.source_id, za.view) != store_find_source(b, zb.source, zb.source_id, zb.view))) {
+      printf("    %s: the indexes lead to different zones for %s\n", what, za.name);
+      ok = false;
+      break;
+    }
+  }
+  store_read_unlock();
+  store_stats_t sa, sb;
+  store_stats(a, &sa);
+  store_stats(b, &sb);
+  if (sa.zones_known != sb.zones_known || sa.zones_stored != sb.zones_stored || sa.zones_rejected != sb.zones_rejected || sa.zones_nonstore != sb.zones_nonstore || sa.zones_free != sb.zones_free ||
+      sa.zt_records != sb.zt_records || sa.nx_used != sb.nx_used || sa.ix_live != sb.ix_live || sa.sx_live != sb.sx_live || sa.nviews != sb.nviews) {
+    printf("    %s: the counters differ: known %" PRIu64 "/%" PRIu64 " stored %" PRIu64 "/%" PRIu64 " free %" PRIu64 "/%" PRIu64 " hwm %" PRIu64 "/%" PRIu64 " ix_live %" PRIu64 "/%" PRIu64 " sx_live %" PRIu64 "/%" PRIu64 "\n",
+           what, sa.zones_known, sb.zones_known, sa.zones_stored, sb.zones_stored, sa.zones_free, sb.zones_free, sa.zt_records, sb.zt_records, sa.ix_live, sb.ix_live, sa.sx_live, sb.sx_live);
+    ok = false;
+  }
+  for (uint32_t v = 0; v < sa.nviews && v < STORE_MAX_VIEWS; v++)
+    if (sa.views[v].known != sb.views[v].known || sa.views[v].stored != sb.views[v].stored || sa.views[v].rejected != sb.views[v].rejected) { printf("    %s: the counters of view %u differ\n", what, v); ok = false; }
+  for (unsigned labels = 1; labels < 8; labels++)
+    for (uint16_t v = 0; v < 2; v++)
+      if (store_view_depth_count(a, v, labels) != store_view_depth_count(b, v, labels)) { printf("    %s: the depth counters differ (view %u, %u labels)\n", what, v, labels); ok = false; }
+  return ok;
+}
+
+static void test_group_commit(int mode) {
+  printf("[group commit: store_set_known_n() against store_set_known(), %s]\n", mode == STORE_MODE_MAP ? "MAP" : "COPY");
+  tdir_t da, db;
+  tdir_new(&da, "gca");
+  tdir_new(&db, "gcb");
+  store_opts_t o;
+  small_opts(&o);
+  o.mode = mode;
+  o.scrub_interval_s = UINT32_MAX;
+  store_t *a = NULL, *b = NULL;
+  atomic_store(&store_test_no_flusher, true);                            /* (the journal sizes are compared below: the checkpoints by size are made by the writer after its call, at the same points in both stores) */
+  CHECK_EQ(store_open(da.fd, &o, &a), 0);
+  CHECK_EQ(store_open(db.fd, &o, &b), 0);
+  atomic_store(&store_test_no_flusher, false);
+  if (!a || !b) { tdir_free(&da); tdir_free(&db); return; }
+  store_view_add(a, "v0"); store_view_add(a, "v1");
+  store_view_add(b, "v0"); store_view_add(b, "v1");
+  /* the same start: stored zones (their images), some deleted (a free list) */
+  for (uint32_t i = 0; i < 160; i++) { CHECK_EQ(put_i(a, (uint16_t)(i & 1), i, 1, NULL), 0); CHECK_EQ(put_i(b, (uint16_t)(i & 1), i, 1, NULL), 0); }
+  for (uint32_t i = 0; i < 160; i += 5) {
+    char nm[160];
+    name_of(i, nm, sizeof(nm));
+    CHECK_EQ(store_delete_name(a, (uint16_t)(i & 1), nm, strlen(nm)), 0);
+    CHECK_EQ(store_delete_name(b, (uint16_t)(i & 1), nm, strlen(nm)), 0);
+  }
+  const uint32_t pool = 420;                                   /* (more names than zones: new, replaced, a name taken over) */
+  uint64_t K = 100, groups = 0, entries = 0, errs = 0, ok_n = 0;
+  uint64_t rng = 99;
+  gk_t *e = malloc(sizeof(*e) * 200);
+  store_known_t in[200];
+  int res[200];
+  uint32_t zb[200];
+  while (entries < 6000) {
+    rng = mix64(rng);
+    unsigned n = 1 + (unsigned)(rng % 150);                    /* (above 64: the call splits it) */
+    uint16_t view = (uint16_t)((rng >> 33) & 1);
+    for (unsigned j = 0; j < n; j++) {
+      gk_make(&e[j], K++, pool);
+      if (((rng >> (8 + j % 20)) & 7) == 0 && j > 0) e[j] = e[j - 1 - (unsigned)((rng >> 50) % j)];      /* the same name, or the same source id, twice in a call */
+      in[j].name = e[j].nm;
+      in[j].len = strlen(e[j].nm);
+      in[j].meta = &e[j].m;
+    }
+    CHECK_EQ(store_set_known_n(b, view, in, n, res, zb), 0);
+    for (unsigned j = 0; j < n; j++) {
+      uint32_t za = STORE_NONE;
+      int ra = store_set_known(a, view, e[j].nm, strlen(e[j].nm), &e[j].m, &za);
+      if (ra != res[j] || (ra == 0 && za != zb[j])) { printf("    group %" PRIu64 " entry %u: %d / zone %u, the group says %d / zone %u; name %s source %u id %lld view %u\n", groups, j, ra, za, res[j], zb[j], e[j].nm, e[j].m.source, (long long)e[j].m.source_id, view);
+        for (unsigned q = 0; q < j; q++) if (e[q].m.source_id == e[j].m.source_id || strcmp(e[q].nm, e[j].nm) == 0) printf("      earlier entry %u: name %s source %u id %lld  (res %d)\n", q, e[q].nm, e[q].m.source, (long long)e[q].m.source_id, res[q]);
+        CHECK(0); }
+      if (ra < 0) errs++; else ok_n++;
+    }
+    groups++;
+    entries += n;
+  }
+  printf("  %" PRIu64 " groups, %" PRIu64 " entries: %" PRIu64 " recorded, %" PRIu64 " refused (the source id of another zone)\n", groups, entries, ok_n, errs);
+  CHECK(errs > 50 && ok_n > 3000);
+  CHECK(same_tables(a, b, "after the calls"));
+  check_consistent(a, "per entry");
+  check_consistent(b, "group");
+  store_stats_t sa, sb;
+  store_stats(a, &sa);
+  store_stats(b, &sb);
+  CHECK(sb.group_records > 0 && sb.group_records < sb.group_entries && sb.group_entries >= ok_n);
+  CHECK(sb.lsn < sa.lsn / 4);                                                      /* (a record a group, not one an entry; the sizes of the current journal files do not compare: a checkpoint after a growth cuts them when it is due) */
+  printf("  journal: %" PRIu64 " records / %" PRIu64 " bytes for the group, %" PRIu64 " / %" PRIu64 " one entry at a time (%" PRIu64 " group records for %" PRIu64 " entries)\n",
+         sb.lsn, sb.journal_bytes, sa.lsn, sa.journal_bytes, sb.group_records, sb.group_entries);
+  /* the group store, closed and opened again, is the same tables */
+  CHECK_EQ(store_close(b), 0);
+  o.create = false;
+  CHECK_EQ(store_open(db.fd, &o, &b), 0);
+  if (b) {
+    CHECK(same_tables(a, b, "after a clean restart"));
+    CHECK_EQ(store_close(b), 0);
+  }
+  CHECK_EQ(store_close(a), 0);
+  free(e);
+  tdir_free(&da);
+  tdir_free(&db);
+
+  /* an entry that fails does not take the others with it: a name that is too long, a source number that does not exist, a view the store does not have, no name, bad arguments */
+  store_opts_t o2;
+  small_opts(&o2);
+  o2.mode = mode;
+  tdir_t dc;
+  tdir_new(&dc, "gcc");
+  store_t *c = NULL;
+  CHECK_EQ(store_open(dc.fd, &o2, &c), 0);
+  if (c) {
+    store_view_add(c, "v0");
+    gk_t g3[5];
+    store_known_t i3[5];
+    int r3[5];
+    uint32_t z3[5];
+    for (unsigned j = 0; j < 5; j++) { gk_make(&g3[j], 5000 + j * 11, 1000); i3[j].name = g3[j].nm; i3[j].len = strlen(g3[j].nm); i3[j].meta = &g3[j].m; }
+    char longname[300];
+    memset(longname, 'a', sizeof(longname) - 1);
+    longname[sizeof(longname) - 1] = '\0';
+    i3[2].name = longname;
+    i3[2].len = strlen(longname);                                              /* (over 255 octets) */
+    g3[3].m.source = 99;                                                       /* (no such source number) */
+    CHECK_EQ(store_set_known_n(c, 0, i3, 5, r3, z3), 0);
+    CHECK_EQ(r3[0], 0); CHECK_EQ(r3[1], 0); CHECK_EQ(r3[2], -EINVAL); CHECK_EQ(r3[3], -EINVAL); CHECK_EQ(r3[4], 0);
+    CHECK(z3[2] == STORE_NONE && z3[3] == STORE_NONE && z3[0] != STORE_NONE && z3[4] != STORE_NONE);
+    CHECK_EQ(store_set_known_n(c, 7, i3, 1, r3, z3), 0);                       /* (a view the store does not have: the entry is refused) */
+    CHECK_EQ(r3[0], -EINVAL);
+    CHECK_EQ(store_set_known_n(c, 0, i3, 0, r3, z3), -EINVAL);                 /* (nothing to do is a call that is wrong) */
+    CHECK_EQ(store_set_known_n(c, 0, i3, 1, NULL, z3), -EINVAL);
+    CHECK_EQ(store_set_known_n(NULL, 0, i3, 1, r3, z3), -EINVAL);
+    i3[1].name = NULL;
+    CHECK_EQ(store_set_known_n(c, 0, i3 + 1, 1, r3, NULL), 0);                 /* (no zid wanted; an entry without a name is refused) */
+    CHECK_EQ(r3[0], -EINVAL);
+    check_consistent(c, "failures");
+    CHECK_EQ(store_close(c), 0);
+  }
+  tdir_free(&dc);
+}
+
+/* the record of a group is the record of a single call: one entry per call, in both ways, writes the same journal bytes (the format did not change), and a group is one record that a torn tail drops whole */
+static int jrn_newest(const tdir_t *d, char *jp, size_t n) {
+  uint32_t best = 0;
+  for (uint32_t g = 1; g < 100; g++) { struct stat sbuf; snprintf(jp, n, "%s/jrn.%u", d->path, g); if (stat(jp, &sbuf) == 0 && sbuf.st_size > 64) best = g; }   /* (not the next journal, made ahead and empty) */
+  snprintf(jp, n, "%s/jrn.%u", d->path, best);
+  return best != 0;
+}
+static bool file_tail_equal(const char *p, const char *q, off_t from) {
+  struct stat sp, sq;
+  if (stat(p, &sp) != 0 || stat(q, &sq) != 0 || sp.st_size != sq.st_size) return false;
+  size_t n = (size_t)(sp.st_size - from);
+  uint8_t *x = malloc(n), *y = malloc(n);
+  bool ok = x && y && read_at(p, from, x, n) == 0 && read_at(q, from, y, n) == 0 && memcmp(x, y, n) == 0;
+  free(x);
+  free(y);
+  return ok;
+}
+
+static void gj_hold_build(int step) { if (step == 1) usleep(5000000); }       /* (a build of the index outside the mutex does not end while the group is written) */
+static void test_group_journal(void) {
+  printf("[group commit: the journal record, a torn record, kill -9]\n");
+  /* 1. a group of one is the record of store_set_known() */
+  {
+    tdir_t da, db;
+    tdir_new(&da, "gja");
+    tdir_new(&db, "gjb");
+    store_opts_t o;
+    small_opts(&o);
+    store_t *a = NULL, *b = NULL;
+    CHECK_EQ(store_open(da.fd, &o, &a), 0);
+    CHECK_EQ(store_open(db.fd, &o, &b), 0);
+    if (a && b) {
+      store_view_add(a, "v0"); store_view_add(b, "v0");
+      for (uint32_t i = 0; i < 40; i++) {
+        gk_t g;
+        gk_make(&g, 300 + i, 90);
+        store_known_t in = { g.nm, strlen(g.nm), &g.m };
+        int r;
+        (void)store_set_known(a, 0, g.nm, strlen(g.nm), &g.m, NULL);
+        CHECK_EQ(store_set_known_n(b, 0, &in, 1, &r, NULL), 0);
+      }
+      store_stats_t sa, sb;
+      store_stats(a, &sa);
+      store_stats(b, &sb);
+      CHECK_EQ(sa.lsn, sb.lsn);
+      char pa[700], pb[700];
+      CHECK(jrn_newest(&da, pa, sizeof(pa)) && jrn_newest(&db, pb, sizeof(pb)));
+      CHECK(file_tail_equal(pa, pb, 4096));                                       /* (past the file header of the journal: the records) */
+      CHECK(same_tables(a, b, "groups of one"));
+      store_close(a);
+      store_close(b);
+    }
+    tdir_free(&da);
+    tdir_free(&db);
+  }
+  /* 2. kill -9 after a group (no close): the replay applies the whole record; a torn tail (the power fails in the write) drops the whole group, none of its zones is there, the zones before it are */
+  for (int torn = 0; torn < 2; torn++) {
+    tdir_t d;
+    tdir_new(&d, "gjk");
+    store_opts_t o;
+    small_opts(&o);
+    store_t *s = NULL;
+    CHECK_EQ(store_open(d.fd, &o, &s), 0);
+    if (!s) { tdir_free(&d); continue; }
+    store_view_add(s, "v0");
+    store_close(s);
+    fflush(stdout);
+    pid_t pid = fork();
+    if (pid == 0) {
+      store_t *c = NULL;
+      if (store_open(d.fd, &o, &c) != 0) _exit(3);
+      for (uint32_t i = 0; i < 10; i++) { store_meta_t m = meta_of(i, 1); char nm[160]; name_of(i, nm, sizeof(nm)); if (store_set_known(c, 0, nm, strlen(nm), &m, NULL) != 0) _exit(4); }
+      gk_t g[64];
+      store_known_t in[64];
+      int r[64];
+      for (unsigned j = 0; j < 64; j++) {
+        name_of(100 + j, g[j].nm, sizeof(g[j].nm));
+        g[j].m = meta_of(100 + j, 1);
+        in[j].name = g[j].nm; in[j].len = strlen(g[j].nm); in[j].meta = &g[j].m;
+      }
+      if (store_set_known_n(c, 0, in, 64, r, NULL) != 0) _exit(5);
+      for (unsigned j = 0; j < 64; j++) if (r[j] != 0) _exit(6);
+      _exit(0);                                                               /* no close, no commit: the record is in the kernel */
+    }
+    int stt = 0;
+    waitpid(pid, &stt, 0);
+    CHECK(WIFEXITED(stt) && WEXITSTATUS(stt) == 0);
+    char jp[700];
+    CHECK(jrn_newest(&d, jp, sizeof(jp)));
+    struct stat jst;
+    CHECK_EQ(stat(jp, &jst), 0);
+    if (torn) {
+      CHECK_EQ(truncate(jp, jst.st_size - 29), 0);                            /* the last record is the group: it is cut in the middle of its last op */
+      o.boot_id = 43;                                                         /* (a lost tail is a power loss: another boot, the tables are rebuilt from zt, which has the cells of the group ahead of the journal) */
+    }
+    o.create = false;
+    CHECK_EQ(store_open(d.fd, &o, &s), 0);
+    if (s) {
+      store_stats_t st;
+      store_stats(s, &st);
+      int found = 0;
+      for (uint32_t j = 0; j < 64; j++) { char nm[160]; name_of(100 + j, nm, sizeof(nm)); store_read_lock(); if (store_find(s, 0, nm, strlen(nm)) != STORE_NONE) found++; store_read_unlock(); }
+      if (torn) {
+        CHECK(st.recovery.journal_torn);
+        for (uint32_t i = 0; i < 10; i++) { char nm[160]; name_of(i, nm, sizeof(nm)); store_read_lock(); CHECK(store_find(s, 0, nm, strlen(nm)) != STORE_NONE); store_read_unlock(); }
+        CHECK_EQ(found, 0);                                                   /* none of the group: it was one record */
+        CHECK_EQ(st.zones_known, 10);
+      } else {
+        CHECK(!st.recovery.rebuilt);
+        CHECK(st.recovery.records_replayed >= 11);                            /* (the ten singles and the group) */
+        CHECK_EQ(found, 64);
+        CHECK_EQ(st.zones_known, 74);
+      }
+      check_consistent(s, torn ? "torn group" : "replayed group");
+      CHECK_EQ(store_close(s), 0);
+    }
+    tdir_free(&d);
+  }
+  /* 3. a group that the index growth splits: the entries past one half of the index wait for the growth (the build outside the mutex is held back here), so the call writes the first
+   * entries as one record, the growth as the next, the rest as a third.  kill -9 at every crash point of the call: after the replay the group's zones are a prefix of the entries in the
+   * order of the call (each record whole or not there), and some kills keep only the first record (the call is not one unit: what the kill -9 loop's model allows) */
+  {
+    int parts = 0, whole = 0, none = 0, bad = 0, runs = 0;
+    for (long c = 1; c < 400 && !bad; c++) {
+      tdir_t d;
+      tdir_new(&d, "gjs");
+      store_opts_t o;
+      small_opts(&o);
+      o.sync_policy = STORE_SYNC_NONE;
+      o.checkpoint_interval_ms = UINT32_MAX;
+      fflush(stdout);
+      pid_t pid = fork();
+      if (pid == 0) {
+        atomic_store(&store_test_no_flusher, true);
+        atomic_store(&store_test_regrow_hook, gj_hold_build);
+        store_t *s = NULL;
+        if (store_open(d.fd, &o, &s) != 0) _exit(3);
+        store_view_add(s, "v0");
+        for (uint32_t i = 0; i < 500; i++) { store_meta_t m = meta_of(i, 1); char nm[160]; name_of(i, nm, sizeof(nm)); if (store_set_known(s, 0, nm, strlen(nm), &m, NULL) != 0) _exit(4); }
+        gk_t g[64];
+        store_known_t in[64];
+        int r[64];
+        for (unsigned j = 0; j < 64; j++) {
+          name_of(1000 + j, g[j].nm, sizeof(g[j].nm));
+          g[j].m = meta_of(1000 + j, 1);
+          in[j].name = g[j].nm; in[j].len = strlen(g[j].nm); in[j].meta = &g[j].m;
+        }
+        store_test_crash_countdown = c;
+        if (store_set_known_n(s, 0, in, 64, r, NULL) != 0) _exit(5);
+        store_test_crash_countdown = 0;
+        for (unsigned j = 0; j < 64; j++) if (r[j] != 0) _exit(6);
+        _exit(0);
+      }
+      int stt = 0;
+      waitpid(pid, &stt, 0);
+      const bool killed = WIFSIGNALED(stt);
+      if (!killed) CHECK(WIFEXITED(stt) && WEXITSTATUS(stt) == 0);
+      o.create = false;
+      store_t *s = NULL;
+      CHECK_EQ(store_open(d.fd, &o, &s), 0);
+      if (s) {
+        unsigned found = 0;
+        bool prefix = true;
+        store_read_lock();
+        for (unsigned j = 0; j < 64; j++) {
+          char nm[160];
+          name_of(1000 + j, nm, sizeof(nm));
+          const bool there = store_find(s, 0, nm, strlen(nm)) != STORE_NONE;
+          if (there && found != j) prefix = false;
+          if (there) found++;
+        }
+        store_read_unlock();
+        store_stats_t st;
+        store_stats(s, &st);
+        if (!prefix || st.zones_known != 500 + found || st.recovery.rebuilt) bad++;
+        if (found == 64) whole++;
+        else if (found == 0) none++;
+        else parts++;
+        check_consistent(s, "split group");
+        CHECK_EQ(store_close(s), 0);
+      }
+      tdir_free(&d);
+      runs++;
+      if (!killed) break;                                                     /* (the countdown is past the call's crash points) */
+    }
+    printf("  a group split by the index growth, killed at each of %d crash points: %d whole, %d none, %d in part (a prefix)\n", runs, whole, none, parts);
+    CHECK_EQ(bad, 0);
+    CHECK(parts > 0);
+    CHECK(whole > 0 && none > 0);
+  }
+}
+
 int main(void) {
   const char *base = getenv("KARIDNS_STORE_TESTDIR");
   snprintf(g_base, sizeof(g_base), "%s/store_test.%d", base && *base ? base : ".", (int)getpid());
@@ -4010,7 +4872,7 @@ int main(void) {
   if (WANT("nosleep")) test_reader_nosleep();
   if (WANT("review")) test_review_fixes();
   if (WANT("growfail")) test_growth_sync_fails();
-  if (WANT("cleanck")) test_clean_checkpoint();
+  if (WANT("cleanck")) { test_clean_checkpoint(); test_clean_then_growth(); }
   if (WANT("full")) test_disk_full();
   if (WANT("compact")) { test_compact(STORE_MODE_MAP); test_compact(STORE_MODE_COPY); test_compact_pinned(); test_compact_tick(); test_compact_open_segment(); test_nx_reclaim(); }
   if (WANT("space")) { test_space(STORE_MODE_MAP); test_space(STORE_MODE_COPY); test_append_fault(); }
@@ -4024,7 +4886,13 @@ int main(void) {
   if (WANT("zfs") && getenv("KARIDNS_STORE_ZFS_128K")) test_zfs_dir(getenv("KARIDNS_STORE_ZFS_128K"), true, "128K dataset");
   if (WANT("zfs") && getenv("KARIDNS_STORE_ZFS_16K")) test_zfs_dir(getenv("KARIDNS_STORE_ZFS_16K"), false, "16K dataset");
   if (WANT("openbench") && getenv("KARIDNS_STORE_OPENBENCH")) test_open_bench(strtoull(getenv("KARIDNS_STORE_OPENBENCH"), NULL, 10));
+  if (WANT("group")) { test_group_commit(STORE_MODE_MAP); test_group_commit(STORE_MODE_COPY); test_group_journal(); }
   if (WANT("kill")) test_kill_loop(iters, 0);
+  if (WANT("kgrp")) test_kill_loop(UNDER_TSAN ? 25 : 50, 2);
+  if (WANT("nowait")) { test_no_wait_in_lock(STORE_MODE_MAP); test_no_wait_in_lock(STORE_MODE_COPY); }
+  if (WANT("jbound")) { test_journal_bound(STORE_MODE_MAP); test_journal_bound(STORE_MODE_COPY); }
+  if (WANT("kfz")) test_kill_loop(UNDER_TSAN ? 25 : 50, 3);
+  if (WANT("kgrow")) test_kill_loop(UNDER_TSAN ? 20 : 50, 4);
   if (WANT("clk")) {
     int citers = getenv("KARIDNS_STORE_KILLC_ITERS") ? atoi(getenv("KARIDNS_STORE_KILLC_ITERS")) : (UNDER_TSAN ? 25 : store_long() ? 100 : 50);
     test_kill_loop(citers, 1);

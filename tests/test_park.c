@@ -1328,7 +1328,7 @@ static void test_claim_race(void) {
 
 /* B1: the claim keeps the name key of the zone its first worker waits for, and the take gives it back */
 static void test_att_tag(void) {
-  printf("[the claim's name key (B1); the lookups in flight (0.7)]\n");
+  printf("[the claim's name key (B1); the lookups (0.7)]\n");
   const uint64_t ka = park_name_key("v1", "old.test."), kb = park_name_key("v1", "new.test.");
   uint64_t tag = 99;
   CHECK(park_att_claim_tag(5, 900, 2, ka) == 1);
@@ -1339,23 +1339,11 @@ static void test_att_tag(void) {
   CHECK(park_att_claim_tag(5, 902, 0, kb) == 1 && park_att_claim_tag(5, 903, 0, ka) == 1);     /* (two claims: each has its own) */
   CHECK(park_att_take_tag(5, 903, &tag) == 1u && tag == ka && park_att_take_tag(5, 902, &tag) == 1u && tag == kb);
 
-  /* the lookups in flight: bounded, and a place given back twice does not make room */
-  CHECK(park_lookup_used() == 0);
-  park_lookup_set_limit(3);
-  CHECK(park_lookup_take() && park_lookup_take() && park_lookup_take());
-  CHECK(!park_lookup_take() && park_lookup_used() == 3);                        /* (a flood of names gets no place beyond the limit) */
-  park_lookup_give();
-  CHECK(park_lookup_used() == 2 && park_lookup_take() && !park_lookup_take());
-  park_lookup_give();
-  park_lookup_give();
-  park_lookup_give();
-  park_lookup_give();                                                           /* (one more than were taken) */
-  CHECK(park_lookup_used() == 0);
-  park_lookup_set_limit(PARK_LOOKUP_MAX);
-  for (uint32_t i = 0; i < PARK_LOOKUP_MAX; i++) CHECK(park_lookup_take());
-  CHECK(!park_lookup_take());
-  for (uint32_t i = 0; i < PARK_LOOKUP_MAX; i++) park_lookup_give();
-  CHECK(park_lookup_used() == 0);
+  /* the lookups (0.7): no fixed window of places any more (the ingest thread gives a lookup a place of fetch-concurrency); what the workers count is the requests they could not make now */
+  const uint64_t tf = park_lookup_take_fails();
+  park_lookup_note_take_fail();
+  park_lookup_note_take_fail();
+  CHECK(park_lookup_take_fails() == tf + 2);
 
   /* B1, the worker's side: a query that waits for the attach of a zone id that another zone has now is asked for its own zone's fetch by the id (park_ask_fetch_zid()), the query for the new zone is woken by its key first */
   park_register_worker(14, -1);
@@ -1388,7 +1376,7 @@ static void test_lookup_mark(void) {
   CHECK(t.e[a].lookup && t.e[b].lookup && t.e[c].lookup && !t.e[d].lookup);
   CHECK(park_retry(&t, "v1", "a.late.test.", 9000) == 1 && t.e[a].lookup);        /* (a retry leaves it waiting, still for the lookup) */
   CHECK(park_wake(&t, "v1", "a.late.test.") == 1 && t.e[a].state == PARK_READY && !t.e[a].lookup);     /* the answer */
-  CHECK(park_fail(&t, "v1", "b.late.test.") == 1 && t.e[b].state == PARK_TIMEOUT && !t.e[b].lookup);   /* the failure */
+  CHECK(park_fail(&t, "v1", "b.late.test.") == 1 && t.e[b].state == PARK_TIMEOUT && t.e[b].lookup && t.e[b].end == PARK_END_FAIL);   /* the failure (the mark stays: the worker answers a failed lookup "not ready") */
   CHECK(park_wake_all(&t) == 2 && t.e[c].state == PARK_READY && t.e[c].lookup && t.e[d].state == PARK_READY && !t.e[d].lookup);   /* no answer: the mark stays */
   park_mark_lookup(&t, c);                                                        /* (not waiting any more: nothing) */
   park_entry_t *e;
@@ -1396,7 +1384,210 @@ static void test_lookup_mark(void) {
   CHECK(t.nfree == t.cap);
   const int32_t a2 = park_udp(&t, 1000, 1500, "v1", "a.late.test.", 3, &ipc, pay, 40);
   CHECK(a2 >= 0 && !t.e[a2].lookup);                                              /* (a new entry has no mark: the slot of an old one is cleared) */
+  park_release(&t, &t.e[a2]);
+  CHECK(t.nlook == 0);                                                            /* (every mark that was set was cleared: by the answer, the failure, the release) */
   park_free(&t);
+}
+
+/* 0.7: the entries that wait for a lookup are counted, and may take three quarters of the table (a flood of names that no zone has must leave room for the queries that wait for a zone) */
+static void test_lookup_room(void) {
+  printf("[the share of the table that the lookups may take]\n");
+  park_table_t t;
+  park_table_t none;
+  memset(&none, 0, sizeof(none));
+  CHECK(!park_lookup_room(&none));                                                /* (no table) */
+  CHECK(park_init(&t, 8));
+  udp_ipc_t ipc = mk_ipc(7);
+  uint8_t pay[40];
+  memset(pay, 1, sizeof(pay));
+  int32_t id[8];
+  int n = 0;
+  char nm[40];
+  while (park_lookup_room(&t)) {
+    snprintf(nm, sizeof(nm), "n%d.late.test.", n);
+    id[n] = park_udp(&t, 1000, 1500, "v1", nm, 3, &ipc, pay, 40);
+    CHECK(id[n] >= 0);
+    park_mark_lookup(&t, id[n]);
+    park_mark_lookup(&t, id[n]);                                                  /* (marked twice: counted once) */
+    n++;
+  }
+  CHECK(n == 6 && t.nlook == 6 && t.nfree == 2);                                  /* (8 entries: 6 for the lookups, 2 for the others) */
+  const int32_t z = park_udp(&t, 1000, 1500, "v1", "zone.test.", 3, &ipc, pay, 40);
+  CHECK(z >= 0 && !park_lookup_room(&t));                                         /* (an entry for a zone does not count, and is not refused) */
+  CHECK(park_wake(&t, "v1", "n0.late.test.") == 1 && t.nlook == 5 && park_lookup_room(&t));       /* (the answer gives the share back) */
+  CHECK(park_fail(&t, "v1", "n1.late.test.") == 1 && t.nlook == 5);                 /* (a failed lookup keeps its mark until the entry is released) */
+  CHECK(park_wake_all(&t) == 5 && t.nlook == 5);                                  /* (a wake that is not an answer keeps the marks: the queries are parked again) */
+  park_entry_t *e;
+  while ((e = park_next_done(&t))) park_release(&t, e);
+  CHECK(t.nlook == 0 && t.nfree == t.cap);
+  park_free(&t);
+}
+
+/* 0.7: why an entry ended: its deadline, a failure, or a drop by the ingest thread (overload); the drops and the failures of the lookups are counted */
+static void test_end_and_counters(void) {
+  printf("[why an entry ended; the counters of the drops]\n");
+  park_table_t t;
+  CHECK(park_init(&t, 8));
+  udp_ipc_t ipc = mk_ipc(7);
+  uint8_t pay[40];
+  memset(pay, 1, sizeof(pay));
+  const int32_t a = park_udp(&t, 1000, 1500, "v1", "a.late.test.", 3, &ipc, pay, 40), b = park_udp(&t, 1000, 3000, "v1", "b.late.test.", 3, &ipc, pay, 40),
+                c = park_udp(&t, 1000, 3000, "v1", "c.zone.test.", 3, &ipc, pay, 40), d = park_udp(&t, 1000, 3000, "v1", "d.zone.test.", 3, &ipc, pay, 40);
+  CHECK(a >= 0 && b >= 0 && c >= 0 && d >= 0);
+  park_mark_lookup(&t, b);
+  CHECK(park_expire(&t, 2600) == 1 && t.e[a].state == PARK_TIMEOUT && t.e[a].end == PARK_END_TIME);      /* (the time is up) */
+  CHECK(park_drop_key(&t, park_name_key("v1", "b.late.test.")) == 1 && t.e[b].state == PARK_TIMEOUT && t.e[b].end == PARK_END_DROP && t.e[b].lookup);   /* (dropped: the lookup queue was full) */
+  CHECK(park_drop_key(&t, park_name_key("v1", "c.zone.test.")) == 1 && t.e[c].state == PARK_TIMEOUT && t.e[c].end == PARK_END_DROP);      /* (a wait queue that was full, for a zone) */
+  CHECK(park_drop_key(&t, park_name_key("v1", "c.zone.test.")) == 0 && park_drop_key(&t, park_name_key("v1", "nobody.test.")) == 0);
+  CHECK(park_fail(&t, "v1", "d.zone.test.") == 1 && t.e[d].end == PARK_END_FAIL);
+  park_entry_t *e;
+  while ((e = park_next_done(&t))) park_release(&t, e);
+  CHECK(t.nfree == t.cap && t.nlook == 0);
+  park_free(&t);
+  uint64_t before[PARK_CNT_N];
+  for (int i = 0; i < PARK_CNT_N; i++) before[i] = park_cnt_get(i);
+  for (int i = 0; i < PARK_CNT_N; i++) {
+    park_cnt_note(i);
+    park_cnt_note(i);
+  }
+  park_cnt_note(-1);                                                              /* (no such counter: nothing) */
+  park_cnt_note(PARK_CNT_N);
+  for (int i = 0; i < PARK_CNT_N; i++) CHECK(park_cnt_get(i) == before[i] + 2);
+  CHECK(park_cnt_get(-1) == 0 && park_cnt_get(PARK_CNT_N) == 0);
+  /* the wake of a drop: the key says so (PARK_ASK_DROP), to every worker or to one */
+  park_register_worker(13, -1);
+  park_register_worker(12, -1);
+  park_key_t k;
+  while (park_wake_pop(park_wake_ring(13), &k)) {}
+  while (park_wake_pop(park_wake_ring(12), &k)) {}
+  park_wake_queue_drop_one(13, "v1", "x.late.test.");
+  CHECK(park_wake_pop(park_wake_ring(13), &k) && k.ask == PARK_ASK_DROP && !k.failed && park_key_is(&k, "v1", "x.late.test.") && !park_wake_pop(park_wake_ring(12), &k));
+  park_wake_queue_drop_all("v1", "y.late.test.");
+  CHECK(park_wake_pop(park_wake_ring(13), &k) && k.ask == PARK_ASK_DROP && park_key_is(&k, "v1", "y.late.test.") && park_wake_pop(park_wake_ring(12), &k) && k.ask == PARK_ASK_DROP);
+  park_wake_queue_drop_one(13, "v1", "");                                         /* (a name that does not fit: nothing) */
+  CHECK(!park_wake_pop(park_wake_ring(13), &k));
+  park_wake_flush();
+  park_unregister_worker(13);
+  park_unregister_worker(12);
+}
+
+/* 0.7: the names whose lookup was shed are remembered (park_shed_*): held for the ttl, renewed by a second shed, forgotten by a release, a full window gives its oldest entry up, a ttl of 0 remembers nothing,
+ * a stamp a little ahead of the reader's clock is not stale, a stamp that is far off is */
+static void test_shed_names(void) {
+  printf("[the shed names]\n");
+  const uint64_t n0 = park_shed_remembered(), r0 = park_shed_releases();
+  const int64_t T = 100000;
+  const uint64_t ka = park_lookup_claim_key("v1", "a.late.test."), kb = park_lookup_claim_key("v1", "b.late.test.");
+  CHECK(ka != kb);
+  park_shed_set_ttl(0);                                                           /* (no ttl: nothing is remembered, nothing held) */
+  park_shed_remember(ka, T);
+  CHECK(!park_shed_held(ka, T) && park_shed_remembered() == n0);
+  park_shed_set_ttl(1500);
+  CHECK(!park_shed_held(ka, T) && !park_shed_held(kb, T));
+  park_shed_remember(ka, T);
+  CHECK(park_shed_held(ka, T) && park_shed_held(ka, T + 1499) && !park_shed_held(ka, T + 1500) && !park_shed_held(kb, T) && park_shed_remembered() == n0 + 1);
+  CHECK(park_shed_held(ka, T - 500) && !park_shed_held(ka, T - 5000));            /* (a clock behind the writer's by a little: the entry is new, not stale; one that is far behind: another age) */
+  park_shed_remember(ka, T + 1000);                                               /* (shed again: the time is renewed, in the same slot) */
+  CHECK(park_shed_held(ka, T + 2499) && !park_shed_held(ka, T + 2500));
+  park_shed_remember(kb, T + 1000);
+  CHECK(park_shed_held(kb, T + 1200) && park_shed_held(ka, T + 1200));
+  park_shed_release(T + 1300);                                                    /* (released: every name remembered until then is free to be asked again) */
+  CHECK(!park_shed_held(ka, T + 1300) && !park_shed_held(kb, T + 1301) && park_shed_releases() == r0 + 1);
+  park_shed_remember(ka, T + 1302);                                               /* (and one that is shed after the release is held) */
+  CHECK(park_shed_held(ka, T + 1400) && !park_shed_held(kb, T + 1400));
+  park_shed_release(T + 1500);
+  park_shed_release(T + 1600);                                                    /* (a release that had nothing to forget is not counted) */
+  CHECK(!park_shed_held(ka, T + 1700) && park_shed_releases() == r0 + 2);
+  /* a window of PARK_SHED_WIN = 8 slots that are all live: the oldest gives its place up.  Keys that point at the same slot (key >> 8 equal) and differ in their high halves. */
+  uint64_t kw[10];
+  for (int i = 0; i < 10; i++) kw[i] = ((uint64_t)(0x1000 + i) << 32) | 0x5500u | 1u;
+  const int64_t W = T + 10000;
+  for (int i = 0; i < 9; i++) park_shed_remember(kw[i], W + i * 10);
+  CHECK(!park_shed_held(kw[0], W + 100) && park_shed_held(kw[1], W + 100) && park_shed_held(kw[8], W + 100));      /* (the first of nine is the oldest: out) */
+  park_shed_remember(kw[9], W + 200);
+  CHECK(park_shed_held(kw[9], W + 200) && !park_shed_held(kw[1], W + 200) && park_shed_held(kw[2], W + 200));
+  park_shed_remember(kw[0], W + 300);                                             /* (every slot is live still: the oldest, kw[2], makes room) */
+  CHECK(park_shed_held(kw[0], W + 300) && !park_shed_held(kw[2], W + 300) && park_shed_held(kw[3], W + 300));
+  park_shed_release(W + 1000);
+  CHECK(!park_shed_held(kw[0], W + 1000) && !park_shed_held(kw[9], W + 1000));
+  park_shed_set_ttl(100);
+  park_shed_remember(kw[3], W + 2000);
+  park_shed_remember(kw[4], W + 2050);
+  CHECK(park_shed_held(kw[3], W + 2099) && !park_shed_held(kw[3], W + 2100) && park_shed_held(kw[4], W + 2100));
+  park_shed_remember(kw[1], W + 2200);                                            /* (a name that is not in the window takes a slot of an entry that is over) */
+  CHECK(park_shed_held(kw[1], W + 2200) && !park_shed_held(kw[4], W + 2200));
+  park_shed_set_ttl(1500);
+}
+
+/* 0.7, PARK_PEND_LOOKUP: the request of a lookup that a full ring refused stays with the entry that waits; when that entry goes first (time, release) the entry for the same name that waits too takesit over;
+ * a lone entry that goes takes it with it */
+static void test_lookup_pending(void) {
+  printf("[a lookup that a full ring refused]\n");
+  park_table_t t;
+  CHECK(park_init(&t, 8));
+  udp_ipc_t ipc = mk_ipc(7);
+  uint8_t pay[40];
+  memset(pay, 1, sizeof(pay));
+  const int32_t p1 = park_udp(&t, 1000, 1500, "v1", "p.late.test.", 3, &ipc, pay, 40), p2 = park_udp(&t, 1000, 3000, "v1", "p.late.test.", 3, &ipc, pay, 40);
+  CHECK(p1 >= 0 && p2 >= 0);
+  park_mark_lookup(&t, p1);
+  park_mark_lookup(&t, p2);
+  park_pending_set(&t, &t.e[p1], PARK_PEND_LOOKUP, 0, 0);
+  CHECK(t.nunsent == 1 && park_pending_head(&t) == &t.e[p1] && t.e[p1].pend == PARK_PEND_LOOKUP && t.e[p2].pend == PARK_PEND_NONE);
+  CHECK(park_expire(&t, 2600) == 1 && t.e[p1].state == PARK_TIMEOUT && t.nunsent == 0);     /* (the first entry's time is up: it is not asked for any more ...) */
+  park_entry_t *e = park_next_done(&t);
+  CHECK(e == &t.e[p1]);
+  park_release(&t, e);                                                            /* (... and the entry that waits for the same name takes its request over) */
+  CHECK(t.nunsent == 1 && park_pending_head(&t) == &t.e[p2] && t.e[p2].pend == PARK_PEND_LOOKUP);
+  park_pending_done(&t, &t.e[p2]);                                                /* (made: the worker's ring had room) */
+  CHECK(t.nunsent == 0 && t.e[p2].pend == PARK_PEND_NONE && park_pending_head(&t) == NULL);
+  park_pending_set(&t, &t.e[p2], PARK_PEND_LOOKUP, 0, 0);
+  park_release(&t, &t.e[p2]);                                                     /* (a lone entry that goes takes the request with it: nothing waits for the name) */
+  CHECK(t.nunsent == 0 && park_pending_head(&t) == NULL && t.nfree == t.cap && t.nlook == 0);
+  park_free(&t);
+}
+
+/* 0.7 review: the claim of a lookup is a key of its own, not the zone's (a lookup of the name "x.test." in flight must not make the fetch of the zone "x.test." a duplicate), and the end of a
+ * claimed request is told to the workers that asked for it, not pushed into the wake ring of every worker (a flood of shed requests overflowed the rings) */
+static void test_lookup_claim_and_workers(void) {
+  printf("[claims: the key of a lookup, the workers of a claim]\n");
+  const uint64_t zk = park_claim_key("v1", "x.test."), lk = park_lookup_claim_key("v1", "x.test.");
+  CHECK(zk != 0 && lk != 0 && zk != lk && lk == park_lookup_claim_key("v1", "x.test.") && lk != park_lookup_claim_key("v2", "x.test."));
+  CHECK(park_claim_mark(lk) && park_claim_held(lk) && !park_claim_held(zk));          /* (the lookup's mark is not the zone's) */
+  CHECK(park_claim_mark(zk) && park_claim_held(zk));                                  /* ... and the zone's fetch may still be claimed */
+  park_claim_clear(lk);
+  CHECK(!park_claim_held(lk) && park_claim_held(zk));
+  park_claim_clear(zk);
+  CHECK(!park_claim_held(zk));
+  /* the workers that asked: only they get the key; the wake rings of the others stay empty */
+  for (int w = 0; w < 5; w++) park_register_worker(w, -1);
+  park_key_t k;
+  for (int w = 0; w < 5; w++) while (park_wake_pop(park_wake_ring(w), &k)) {}
+  CHECK(park_claim_mark(lk));
+  park_claim_note_worker(lk, 1);
+  park_claim_note_worker(lk, 3);
+  park_claim_note_worker(lk, 3);
+  park_claim_note_worker(lk, -1);                                                     /* (not a worker: ignored) */
+  park_claim_note_worker(lk, 99999);
+  park_wake_queue_claim("v1", "x.test.", lk, false, PARK_ASK_DROP);
+  int got[5] = {0};
+  for (int w = 0; w < 5; w++) while (park_wake_pop(park_wake_ring(w), &k)) { got[w]++; CHECK(k.ask == PARK_ASK_DROP && k.key == park_name_key("v1", "x.test.") && !k.failed); }
+  CHECK(got[0] == 0 && got[1] == 1 && got[2] == 0 && got[3] == 1 && got[4] == 0);
+  park_wake_queue_claim("v1", "x.test.", lk, true, 0);                                /* (a failure: the same workers, with the failed flag) */
+  for (int w = 0; w < 5; w++) { int n = 0; while (park_wake_pop(park_wake_ring(w), &k)) { n++; CHECK(k.failed && k.ask == 0); } CHECK(n == ((w == 1 || w == 3) ? 1 : 0)); }
+  park_claim_clear(lk);                                                               /* the claim is over: the set goes with it */
+  park_wake_queue_claim("v1", "x.test.", lk, false, 0);                               /* a claim nobody knows is told to every worker that is registered */
+  for (int w = 0; w < 5; w++) { int n = 0; while (park_wake_pop(park_wake_ring(w), &k)) n++; CHECK(n == 1); }
+  CHECK(park_claim_mark(lk));                                                         /* a claim with no worker noted: every worker too (nothing is known) */
+  park_wake_queue_claim("v1", "x.test.", lk, false, PARK_ASK_DROP);
+  for (int w = 0; w < 5; w++) { int n = 0; while (park_wake_pop(park_wake_ring(w), &k)) n++; CHECK(n == 1); }
+  park_claim_note_worker(lk, 1);
+  park_claim_clear(lk);
+  CHECK(park_claim_mark(lk));                                                         /* a mark that was cleared and made again starts with no worker (a stale bit would limit the wake to worker 1) */
+  park_wake_queue_claim("v1", "x.test.", lk, false, PARK_ASK_DROP);
+  for (int w = 0; w < 5; w++) { int n = 0; while (park_wake_pop(park_wake_ring(w), &k)) n++; CHECK(n == 1); }
+  park_claim_clear(lk);
+  for (int w = 0; w < 5; w++) park_unregister_worker(w);
 }
 
 int main(int argc, char **argv) {
@@ -1424,6 +1615,11 @@ int main(int argc, char **argv) {
   test_att_group_and_ask();
   test_att_tag();
   test_lookup_mark();
+  test_lookup_room();
+  test_end_and_counters();
+  test_shed_names();
+  test_lookup_pending();
+  test_lookup_claim_and_workers();
 #ifdef __FreeBSD__
   test_wake_queue();
   test_sleep_protocol();

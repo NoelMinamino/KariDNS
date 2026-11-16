@@ -34,12 +34,48 @@ zone can carry (settings, ACLs, tags, secondary zones, ALIAS records).
 .PP
 What the loader does while \fBkaridns\fR runs:
 .IP \(bu 2
-\fBStart.\fR It says HELLO (version, drivers), receives the configuration of the
+\fBStart.\fR It says HELLO (version, drivers, the features it has and the
+version of the zone image it builds), receives the configuration of the
 databases from the Backend, asks for the Backend's inventory (the zones it
 already has) and reads every zone. A zone whose content digest equals the
 Backend's version is not sent. The first zones are served as soon as the first
 batch part is published; a line \fBinitial load complete\fR is logged when the
 first batch is done.
+.IP \(bu 2
+\fBZone images (0.7).\fR The loader builds the data of a zone as a \fBzone
+image\fR (\fBdns_zone_image.h\fR, the format the store keeps and the query
+engine reads): the rows are converted to records, the zone is indexed and
+frozen, and the bytes of the image are sent in \fBZONE_IMAGE\fR messages of at
+most 1 MiB between \fBZONE_BEGIN\fR (flag \fBimage\fR, the size of the image,
+the number of RRs in it; the SOA counts once) and \fBZONE_END\fR. The Backend
+checks the image (the zone, the sizes, the counts, the SOA and extension rules,
+the limits of the zone) and installs it as it is: there is no text of RRs to
+parse any more. This moves the work of building a zone to the loader
+(\fBloader\-threads\fR) and takes it from the one thread that reads the
+stream. A Backend takes only a loader that says in HELLO that it sends images
+and which image version it builds (the version of the Backend is checked: a
+loader of another version is refused with a line in the log,
+\fBkaridns\-dbloader\fR and \fBkaridns\fR of one release always agree); there is
+no other way to send the data of a zone. \fBmax\-zone\-bytes\fR is the size of
+the image of one zone, \fBmax\-zone\-records\fR the number of RRs in it (with
+the SOA once: the AXFR counted it twice). The digest of a zone is SHA-256 of the
+image (with the markers of the settings, the profile and a presigned zone), so a
+zone the store holds with the digest of the previous release is sent once more
+at the first start after the upgrade. Measured on 4 vCPU (QEMU), SQLite3, zones
+of 11 records (about 1 KB of image each), an empty store, \fBloader\-threads
+4\fR, the first start of 100,000 and of 200,000 zones until every zone is in the
+store: 3.6 s and 7.2 s (27,700 zones a second), the same as with the
+\fBZONE_DATA\fR stream of 0.6 (3.5 s and 7.2 s). The Backend used less CPU for
+it, 24 microseconds a zone against 34 (with \fBloader\-threads 1\fR: 28 against
+51), of which the check of the image is 2.6 microseconds
+(\fBstore.fill.validate_ns_per_image\fR); the loader used more, about 110
+microseconds a zone against 88 (22 CPU seconds against 17.6 for 200,000 zones:
+the one-zone reads of the fill now also build and freeze the image), and it is
+the loader that bounds the first start (three of the four cores at 4 threads),
+so the time did not change; \fBkaridns\-dbloader \-\-dump\fR of the same 200,000
+zones takes 2.0 s (98,000 zones a second) against 1.7 s (120,000). With
+\fBloader\-threads 1\fR the first start of 200,000 zones takes 18.7 s against
+17.2 s.
 .IP \(bu 2
 \fBReload.\fR \fBkarictl reload\fR makes it compare the databases with the
 inventory: new zones, zones whose SOA serial differs, zones the change log table
@@ -125,7 +161,7 @@ described under "Packages".
 .TP 8
 \fB\-\-dump OUT\fR
 Write the stream exactly as the loader sends it to the Backend (HELLO,
-BATCH_BEGIN, per zone ZONE_BEGIN / ZONE_DATA... / ZONE_END or ZONE_FAILED,
+BATCH_BEGIN, per zone ZONE_BEGIN / ZONE_IMAGE... / ZONE_END or ZONE_FAILED,
 BATCH_END) to the file \fBOUT\fR (\fB\-\fR = standard output). Zones come in
 \fBdomains.id\fR order and the HELLO of a dump carries pid 0, so two runs on one
 database state write the same bytes, whatever the number of
@@ -289,7 +325,32 @@ reload: its own connection and snapshot, no batch, no inventory, no results. A
 request beyond the queue is answered \fBZONE_FAILED\fR "busy" (the first eight;
 more are dropped and the Backend's own time-out ends them).
 .IP \(bu 2
-\fBAnswers.\fR \fBZONE_BEGIN\fR .. \fBZONE_DATA\fR .. \fBZONE_END\fR with the
+\fBBatches (0.7).\fR A worker that finds more requests of the same kind queued
+reads them together: the same view, the same priority (a query that waits is
+never held up by a batch of the background fill) and the same kind, bodies (mode
+0) or lookups (modes 2 and 3); a zone that is in the batch already stays queued
+for the next one. The batch is at most 16 requests and no more than the worker's
+share of what is queued (queued / workers, rounded up), so that the other
+workers of the pool still find requests; with one request alone nothing
+changes. A batch of bodies is one snapshot, one \fBfind_zones_in()\fR for the
+zones (\fBfind_zone()\fR for a name that statement did not give back: the other
+capitalisation on PostgreSQL, a zone that is not there), the keys and the
+profiles once, and one statement per table for the metadata, the records and the
+extension rows (\fBscan_*_in()\fR, the zones in \fBdomains.id\fR order); each
+request is then checked as a single one is (the zone is there and mapped to the
+view, it is the domain id the Backend has) and answered with its own id,
+\fBZONE_FAILED\fR for the ones that cannot be read; a request that got no answer
+because the batch failed (the database could not be read) is answered
+\fBZONE_FAILED\fR with the reason, never left waiting. A batch of lookups is one
+\fBfind_zones_in()\fR for the candidate names of all of them (at most 128
+together) and one \fBLOOKUP_RESULT\fR for each; the lookups of mode 3 that found
+a zone are followed by the bodies of those zones as a batch with the same
+request ids. The Backend keeps at most half of \fBfetch\-concurrency\fR (32)
+background fetches in flight, so a batch of the background fill is a few zones;
+the zones of a request with a deeper queue (a lookup storm,
+\fBfetch\-concurrency\fR raised) go together in larger ones.
+.IP \(bu 2
+\fBAnswers.\fR \fBZONE_BEGIN\fR .. \fBZONE_IMAGE\fR .. \fBZONE_END\fR with the
 request id in \fBZONE_BEGIN\fR (a secondary or catalog zone has no data, as in a
 batch); or the \fBsummary\fR (mode 1, primary zones): \fBZONE_BEGIN\fR with the
 summary flag and \fBZONE_END\fR, carrying the serial, the SOA refresh / retry /
@@ -453,16 +514,50 @@ closest zone the view serves being a secondary or catalog zone is no answer
 id.  The Backend treats the entry as a claim of an untrusted loader: the zone
 must enclose the name that was asked for, and it is recorded as a \fBMANIFEST\fR
 entry (a known zone: its body is fetched as for any zone), so the pass that is
-still going finds it.
+still going finds it.  \fBWith the body (mode 3).\fR A loader whose \fBHELLO\fR
+features have bit 2 (\fBKDB_FEAT_LOOKUP_BODY\fR, 0x4; this loader sends features
+7) is asked with mode 3 (\fBKDB_FETCH_LOOKUP_FULL\fR): when a zone is found, the
+answer is followed on the same stream, with the same request id, by the body of
+that zone (\fBZONE_BEGIN\fR .. \fBZONE_IMAGE\fR .. \fBZONE_END\fR, read as for a
+request of the zone: the same worker, the same snapshot connection kept for the
+next request, the domain id of the answer as the id the zone must still have;
+\fBZONE_FAILED\fR with the name of the zone when it cannot be read), so that a
+zone the Backend did not know is answerable after one round trip, not two (a
+lookup, then a request for the zone).  With nothing found nothing follows.  The
+Backend sends mode 3 only to a loader that announced the bit, and only with no
+\fBfetch\-rate\fR (the rate counts the zones read for queries) and with the
+zones in memory below the hard line of \fBmemory\-limit\fR (the fetches wait for
+room); otherwise it asks mode 2, and a loader of an earlier version gets mode 2
+only.  From the answer on the request is a fetch of that zone in the Backend,
+with the same id and the same place of \fBfetch\-concurrency\fR.  The body is a
+claim of an untrusted loader as the answer is: it must be the zone the answer
+named (the name and the \fBsource_id\fR), it must come after the answer and
+once, and the stamp check at the commit is the one of a fetch (the record the
+answer made holds the stamp the body is installed under); any other body (before
+the answer, for another zone or another id, a second one, one after a mode 2
+answer) is read through and thrown away and counted (\fBbad_body\fR), and the
+stream goes on.  A zone that another request has on its way, or that is in
+memory already, has its body read through and thrown away as well (the loader
+cannot be told not to send it).  The request of a lookup is of the priority 0 of
+a query, so the loader serves it before the bodies of the background fill
+(priority 2), and a request that has waited \fBFQ_AGING_MS\fR goes first, as for
+any priority.  The Backend gives a lookup a place of \fBfetch\-concurrency\fR as
+it gives one to the fetch of a zone (it holds it until the answer, with mode 3
+until the body is installed), at most three quarters of the places for lookups
+at one time, and keeps a lookup that finds none in a queue of its own for
+\fBpark\-timeout\fR; the answer "none" gives its place back at once.  \fBkarictl
+dbstatus\fR and \fBkarictl store\fR count them (\fBstore.lookup.*\fR,
+docs/karictl.md).
 .IP \(bu 2
-\fBBodies.\fR The loader sends no zone body in this protocol. The Backend asks
-for the bodies it lacks (a stamp it does not have) with \fBFETCH_REQ\fR on the
-fetch stream, by name and, with tag 8, by \fBsource_id\fR; a pool of workers
-reads and converts the zone as for any fetch. A name that has another id in the
-database now answers \fBZONE_FAILED\fR ("renamed or created again";
-\fBCHANGES\fR says so). The summary of a fetch (mode 1) looks up the addresses
-of out-of-zone name servers for the NOTIFY of that one zone by query at that
-time; the loader has no list of them.
+\fBBodies.\fR The loader sends no zone body in this protocol (the answer of a
+lookup in mode 3 is followed by the body of the zone it found: see above). The
+Backend asks for the bodies it lacks (a stamp it does not have) with
+\fBFETCH_REQ\fR on the fetch stream, by name and, with tag 8, by
+\fBsource_id\fR; a pool of workers reads and converts the zone as for any
+fetch. A name that has another id in the database now answers \fBZONE_FAILED\fR
+("renamed or created again"; \fBCHANGES\fR says so). The summary of a fetch
+(mode 1) looks up the addresses of out-of-zone name servers for the NOTIFY of
+that one zone by query at that time; the loader has no list of them.
 .IP \(bu 2
 \fBReload requests.\fR \fBreload\fR (scope all) drains the change log; \fBreload
 \-force\fR makes a pass. A reload of one zone is a \fBCHANGES\fR entry with the
@@ -1769,8 +1864,12 @@ whole reload 14-15 s instead of 60 s. \fBbulk\-threshold\fR keeps its meaning
 the changed ones); only the cost of reading below it fell, so the break-even
 moved: for PostgreSQL a higher threshold than 25% may now pay. A reload of one
 zone (\fBkarictl reload <zone>\fR, \fB\-\-zone\fR) is read as before. SQLite3
-reads zone by zone (a statement costs no round trip there). With
-\fBloader\-threads\fR above 1 each worker reads groups of up to 64 zones.
+has the same calls since 0.7 (\fBdomain_id IN (...)\fR with one kept statement
+for each table and size class of 2, 4, ... 128 zones; the ids a call does not
+need are bound NULL): a statement costs no round trip there but a few
+microseconds of CPU, which was a third of the loader's CPU for a zone fetched on
+its own. With \fBloader\-threads\fR above 1 each worker reads groups of up to 64
+zones.
 .IP \(bu 2
 \fBWhat is left.\fR The reload without changes at \fBz1m\fR (4.2 s) is the
 Backend's 1.95 s, the list's 2.0 s and the comparison's 0.25 s; the list could

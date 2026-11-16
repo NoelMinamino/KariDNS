@@ -5,7 +5,7 @@
 # the handshake of the first stream, and then sends FETCH_REQ messages on the second one.  Every answer goes through the state machine of the
 # fetch stream (the rules the Backend applies to hostile input), so a loader that answers wrongly fails here as it would in the server.
 # Checked:
-#   - a request for a zone is answered with ZONE_BEGIN .. ZONE_DATA .. ZONE_END that carries the request id; the zone has the records of the
+#   - a request for a zone is answered with ZONE_BEGIN .. ZONE_IMAGE .. ZONE_END that carries the request id; the zone has the records of the
 #     database; a request for the summary is answered with the summary flag, no data, the serial, the SOA timers and the presigned flag
 #   - a SLAVE zone comes as a secondary (no data); an unknown zone, a PRODUCER zone, a zone without SOA and a range request are answered with
 #     ZONE_FAILED and the reason, never with silence
@@ -66,7 +66,7 @@ echo "== a zone, a summary, a secondary, the refusals"
 run req:1:small.test.:0:0 req:2:small.test.:0:1 req:3:signed.test.:0:1 req:4:slave.test.:0:0 req:5:slave.test.:1:1 req:6:nope.test.:0:0 \
     req:7:producer.test.:0:0 req:8:nosoa.test.:0:0 range:9:small.test.:a.small.test.:m.small.test. wait:9
 [ $RC -eq 0 ] && pass "the harness ran to the end" || { fail "the harness failed (status $RC)"; cat "$T/out" "$T/err" | head -20; }
-has "the zone: id 1, records of the database (SOA, NS, www, closing SOA), serial" '^ANS id=1 zone=small.test. kind=primary summary=0 presigned=0 serial=2024010101 rr=4 data=[1-9]'
+has "the zone: id 1, records of the database (SOA, NS, www: the RRs of the zone image), serial" '^ANS id=1 zone=small.test. kind=primary summary=0 presigned=0 serial=2024010101 rr=3 data=[1-9]'
 has "the summary: no data, the serial and the SOA timers" '^ANS id=2 zone=small.test. kind=primary summary=1 presigned=0 serial=2024010101 rr=0 data=0 timers=3600,600,86400$'
 has "the summary of a presigned zone carries the flag" '^ANS id=3 zone=signed.test. kind=primary summary=1 presigned=1 serial=77 rr=0 data=0'
 has "a SLAVE zone comes as a secondary without data" '^ANS id=4 zone=slave.test. kind=secondary summary=0 .* rr=0 data=0'
@@ -83,7 +83,7 @@ run req:1:big.test.:1:0 begin:1 req:2:small.test.:2:0 req:3:small.test.:1:0 req:
 unset KARIDNS_FETCH_AGING_MS
 order=$(grep -E '^(ANS|FAILED)' "$T/out" | sed -E 's/^[A-Z]+ id=([0-9]+).*/\1/' | tr '\n' ' ')
 [ "$order" = "1 4 3 2 " ] && pass "the answers come in the order 1 (busy), 4 (priority 0), 3 (1), 2 (2)" || { fail "answer order '$order'"; cat "$T/out"; }
-has "the big zone arrived whole" '^ANS id=1 zone=big.test. kind=primary summary=0 .* rr=30004 '
+has "the big zone arrived whole" '^ANS id=1 zone=big.test. kind=primary summary=0 .* rr=30003 '
 
 echo "== aging: a request that waited longer than the bound (200 ms) goes first"
 # one worker, kept busy by 1; 2 (priority 2) waits 600 ms; then 3, 4 (priority 0) and 20 more (priority 1) come: 2 is the only one older than the bound
@@ -119,6 +119,15 @@ has "... with an error status, the restart is the supervisor's" '^DONE answers=0
 run badmain
 has "a FETCH_REQ on the first stream ends the loader" '^LOADER ended$'
 has "... with an error status" '^DONE answers=0 loader=3$'
+
+echo "== keys: a fetch reads the keys of the zones it asks for (zones_with_keys_in), as the full scan did"
+mkzone keyed.test 5
+sqlite3 "$DB" "INSERT INTO cryptokeys (domain_id, flags, active, content) SELECT id, 257, 1, 'x' FROM domains WHERE name IN ('signed.test', 'keyed.test')"
+sqlite3 "$DB" "INSERT INTO cryptokeys (domain_id, flags, active, content) SELECT id, 256, 1, 'y' FROM domains WHERE name IN ('signed.test', 'keyed.test')"
+run req:1:signed.test.:0:0 req:2:keyed.test.:0:0 req:3:small.test.:0:0 wait:3
+has "a signed zone (PRESIGNED, keys) is served with its records" '^ANS id=1 zone=signed.test. kind=primary summary=0 presigned=1 serial=77 rr=3 data=[1-9]'
+has "a zone with keys and no PRESIGNED fails (the keys were read for the zone that was asked for)" '^FAILED id=2 zone=keyed.test. reason=.*cryptokeys but no PRESIGNED'
+has "a zone without keys is served next to them" '^ANS id=3 zone=small.test. kind=primary summary=0 presigned=0 serial=2024010101 rr=3 data=[1-9]'
 
 echo
 echo "$PASS passed, $FAILS failed"

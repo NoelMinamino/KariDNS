@@ -35,6 +35,9 @@ typedef struct {
     bool is_deny;
 } acl_entry_t;
 
+/* Parse a list of ACL rules (CIDR strings, a leading '!' denies) into a calloc()ed array of count entries (an entry that does not parse stays invalid, see cidr_entry_parse()); NULL for an empty list or out of memory */
+acl_entry_t *acl_list_parse(char **acl_list, int count);
+
 /* Parse a CIDR string (e.g., "192.0.2.0/24", "2001:db8::/32", "any", "192.0.2.1") into cidr_entry_t */
 bool cidr_entry_parse(cidr_entry_t *entry, const char *cidr_str);
 

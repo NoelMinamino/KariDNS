@@ -83,7 +83,6 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     memset(&session, 0, sizeof(session));
     session.ext_version = (sel & 3) == 0 ? 0 : (sel & 3) == 1 ? 2 : 3;
     session.is_extended_mode = session.ext_version != 0;
-    session.db_stream = (sel & 4) != 0;
     session.is_ixfr = (sel & 8) != 0;
     session.client_serial = (sel & 8) ? 100 : 0;
 

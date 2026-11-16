@@ -8,11 +8,12 @@
  *   bit 4      (install run only) start inside a batch, so a stream of ZONE_BEGIN .. ZONE_END is a valid input
  *   bit 3      D1a: the state machine of the fetch stream (kdb_sm_init_fetch(): request ids, summaries, no batches)
  *   bit 2      D1a step 7: the rest is not a stream but a hot list state file (kdb_hotl_parse(), the merge, the serializer, the parts encoder)
+ * 0.7 M3: the data of a zone is a zone image (ZONE_BEGIN with the image flag, ZONE_IMAGE messages); the harness checks what the state machine promises about them.
  * The stream is run twice against the loader -> Backend side (whole buffer and the chosen chunking) and must
  * give the same result; once against the Backend -> loader side with the decoder and the entry iterators; and once
- * more through the install path of the Backend (beta design 8.5, milestone B4b): every ZONE_BEGIN / ZONE_DATA /
- * ZONE_END of the stream goes through dns_db_install.c into a scratch zone entry and the DB zone registry, as the
- * ingest thread does it (the thread itself, the sockets and the snapshot are not part of the harness).
+ * more through the install path of the Backend (beta design 8.5, milestone B4b): every ZONE_BEGIN / ZONE_IMAGE /
+ * ZONE_END of the stream goes through the reassembly, zone_image_validate_ex() and dns_db_install.c into a scratch zone entry and the DB zone registry, as the
+ * ingest thread does it (the thread itself, the sockets and the snapshot are not part of the harness; the image frames on their own: fuzz_db_image_frames.c).
  */
 #include <stdint.h>
 #include <stddef.h>
@@ -20,6 +21,7 @@
 #include <string.h>
 
 #include "../../dns_db_stream.h"
+#include "../../dns_zone_image.h"
 #include "../../dns_db_install.h"
 #include "../../dns_axfr_ixfr.h"
 #include "../../dns_snapshot_rcu.h"
@@ -79,7 +81,27 @@ static void run_loader(const uint8_t *p, size_t n, size_t chunk, uint8_t sel, ru
                 mix(&r->sum, m.u.zone_failed.request_id);
                 if (sm.fetch != (m.u.zone_failed.request_id != 0)) abort();
             }
-            if (fr.type == KDB_T_ZONE_DATA) mix(&r->sum, m.u.zone_data.ancount);
+            if (fr.type == KDB_T_ZONE_BEGIN) {              /* 0.7 M3: a zone image is announced as the machine promises: a primary with data, the size of an image within max-zone-bytes */
+                const kdb_zone_begin_t *zb = &m.u.zone_begin;
+                if (((zb->flags & KDB_ZF_IMAGE) != 0) != sm.zone_image || (!sm.zone_image && zb->image_size != 0)) abort();
+                if (sm.zone_image) {
+                    if (zb->image_size != sm.zone_image_size || (zb->image_size & 7) || zb->image_size < sizeof(zone_image_t) + 8 || zb->image_size > 0xFFFFF000u ||
+                        zb->image_size > sm.lim.max_zone_bytes || zb->rr_count == 0 || zb->zone_kind != KDB_ZK_PRIMARY || (zb->flags & KDB_ZF_SUMMARY)) abort();
+                    mix(&r->sum, zb->image_size);
+                }
+            }
+            if (fr.type == KDB_T_ZONE_IMAGE) {              /* the octets come to the size that was announced and never past it; the first message holds the header that says the same as ZONE_BEGIN */
+                if (!sm.zone_image || m.u.zone_image.len == 0 || m.u.zone_image.len > KDB_MAX_BODY || sm.zone_image_have > sm.zone_image_size) abort();
+                if (sm.zone_image_have == m.u.zone_image.len) {                /* (the first message of the image) */
+                    zone_image_t h;
+                    if (m.u.zone_image.len < sizeof(h)) abort();
+                    memcpy(&h, m.u.zone_image.body, sizeof(h));
+                    if (h.magic != ZONE_IMAGE_MAGIC || h.version != ZONE_IMAGE_VERSION || h.total_size != sm.zone_image_size || h.n_rrs != sm.zone_rr_declared) abort();
+                }
+                mix(&r->sum, m.u.zone_image.len + sm.zone_image_have);
+            }
+            if (fr.type == KDB_T_ZONE_END && sm.zone_image && sm.zone_image_have != sm.zone_image_size) abort();
+            if (fr.type == KDB_T_HELLO) mix(&r->sum, m.u.hello.features + m.u.hello.image_version);
             if (fr.type == KDB_T_LOOKUP_RESULT) {            /* 0.7: only the fetch stream carries it; a zone found has its entry, as a manifest entry */
                 const kdb_lookup_result_t *l = &m.u.lookup_result;
                 if (!sm.fetch || l->request_id == 0) abort();
@@ -163,6 +185,52 @@ static void run_loader(const uint8_t *p, size_t n, size_t chunk, uint8_t sel, ru
     if (r->rc != KDB_OK && sm.state != KDB_S_ERROR && f.fail == KDB_OK) abort();   /* an error must be sticky somewhere */
 }
 
+/* 0.7 M2: the same stream with the pages of a pass handed over as the Backend does (kdb_sm_legal_frame() on the stream thread, kdb_man_page() / kdb_man_end() on the reconcile thread, the zones of the pages added to
+ * the machine before BATCH_END): the verdict and the number of frames must be the machine's own */
+static void run_split(const uint8_t *p, size_t n, uint8_t sel, run_t *r) {
+    kdb_framer_t f;
+    kdb_sm_t sm;
+    kdb_msg_t m;
+    kdb_man_t man;
+    kdb_limits_t lim = { KDB_DEFAULT_MAX_ZONE_RECORDS, KDB_DEFAULT_MAX_ZONE_BYTES, 3 };
+    if (sel & 0x20) { lim.max_zone_records = 6; lim.max_zone_bytes = 200; }
+    kdb_framer_init(&f, KDB_FROM_LOADER, g_buf, sizeof(g_buf));
+    if (sel & 0x08) kdb_sm_init_fetch(&sm, &lim);
+    else kdb_sm_init(&sm, &lim);
+    kdb_sm_defer_manifest(&sm);
+    if (sel & 0x40) sm.state = KDB_S_READY;
+    memset(&man, 0, sizeof(man));
+    memset(r, 0, sizeof(*r));
+    uint64_t zones = 0;
+    char why[KDB_REASON_LEN];
+    kdb_rc_t rc = kdb_framer_feed(&f, p, n);
+    while (rc == KDB_OK) {
+        kdb_frame_t fr;
+        rc = kdb_framer_next(&f, &fr);
+        if (rc == KDB_MORE) { rc = KDB_OK; break; }
+        if (rc != KDB_OK) break;
+        if (fr.type == KDB_T_MANIFEST) {
+            rc = kdb_sm_legal_frame(&sm, fr.type);
+            if (rc != KDB_OK) break;
+            rc = kdb_man_page(&man, &fr, &m, why, sizeof(why));
+            if (rc != KDB_OK) break;
+            zones += m.u.manifest.n_entries;
+            r->nframes++;
+            continue;
+        }
+        if (fr.type == KDB_T_BATCH_END || fr.type == KDB_T_BATCH_BEGIN) { sm.n_zones += zones; zones = 0; }
+        rc = kdb_sm_accept(&sm, &fr, &m);
+        if (rc != KDB_OK) break;
+        if (fr.type == KDB_T_MANIFEST_BEGIN) kdb_man_begin(&man, m.u.manifest_begin.batch_id, m.u.manifest_begin.view, sm.lim.view_count);
+        if (fr.type == KDB_T_MANIFEST_END) {
+            rc = kdb_man_end(&man, &m.u.manifest_end, why, sizeof(why));
+            if (rc != KDB_OK) break;
+        }
+        r->nframes++;
+    }
+    r->rc = rc;
+}
+
 static void run_backend(const uint8_t *p, size_t n) {
     kdb_framer_t f;
     kdb_framer_init(&f, KDB_FROM_BACKEND, g_buf, sizeof(g_buf));
@@ -205,8 +273,8 @@ static void run_backend(const uint8_t *p, size_t n) {
             if (k != m.u.hot_list.n_entries || m.u.hot_list.limit > KDB_HOT_MAX) abort();
         } else if (fr.type == KDB_T_FETCH_REQ) {         /* D1a */
             const kdb_fetch_req_t *q = &m.u.fetch_req;
-            if (q->request_id == 0 || q->view >= 3 || strlen(q->name) == 0 || q->priority >= KDB_FETCH_PRIO_N || q->mode > KDB_FETCH_LOOKUP) abort();
-            if (q->mode == KDB_FETCH_LOOKUP && (q->has_range || q->source_id != 0)) abort();      /* 0.7: a lookup has neither */
+            if (q->request_id == 0 || q->view >= 3 || strlen(q->name) == 0 || q->priority >= KDB_FETCH_PRIO_N || q->mode > KDB_FETCH_LOOKUP_FULL) abort();
+            if ((q->mode == KDB_FETCH_LOOKUP || q->mode == KDB_FETCH_LOOKUP_FULL) && (q->has_range || q->source_id != 0)) abort();      /* 0.7: a lookup has neither */
             if (q->has_range && (strlen(q->range_lo) == 0 || strlen(q->range_hi) == 0)) abort();
             if (q->source_id < 0) abort();                  /* 0.7 WP7a */
         }
@@ -272,7 +340,10 @@ static void run_install(const uint8_t *p, size_t n, uint8_t sel) {
         sm.state = (sel & 0x10) ? KDB_S_IN_BATCH : KDB_S_READY;   /* bit 4: start inside a batch (zones right away) */
     }
     if (kdb_framer_feed(&f, p, n) != KDB_OK) return;
-    db_zone_build_t *b = NULL;
+    uint8_t *img = NULL;                       /* the reassembled image (grown with the octets that come, never to the announced size) */
+    size_t img_have = 0, img_cap = 0;
+    bool is_image = false;
+    kdb_zone_begin_t zb = { 0 };
     char zone[DNS_NAME_TEXT_SIZE] = "";
     char view[8] = "default";
     int64_t source_id = 0;
@@ -287,7 +358,11 @@ static void run_install(const uint8_t *p, size_t n, uint8_t sel) {
         if (kdb_sm_accept(&sm, &fr, &m) != KDB_OK) break;
         switch (fr.type) {
         case KDB_T_ZONE_BEGIN:
-            db_zone_build_free(b);
+            free(img);
+            img = NULL;
+            img_have = img_cap = 0;
+            zb = m.u.zone_begin;
+            is_image = (m.u.zone_begin.flags & KDB_ZF_IMAGE) != 0;
             snprintf(zone, sizeof(zone), "%s", m.u.zone_begin.name);
             snprintf(view, sizeof(view), "v%u", (unsigned)(m.u.zone_begin.view % 3));
             source_id = m.u.zone_begin.source_id;
@@ -296,23 +371,32 @@ static void run_install(const uint8_t *p, size_t n, uint8_t sel) {
             zsh = fuzz_settings(&m.u.zone_begin);
             skind = m.u.zone_begin.zone_kind;
             summary = (m.u.zone_begin.flags & KDB_ZF_SUMMARY) != 0;           /* D1a: a summary has no data and installs nothing here */
-            b = (skind == KDB_ZK_PRIMARY && !summary) ? db_zone_build_new(zone, m.u.zone_begin.rr_count, m.u.zone_begin.flags) : NULL;
-            if (b) db_zone_build_set_serial(b, m.u.zone_begin.serial);       /* as the ingest thread does (B8t-2) */
             /* B7b: a secondary zone needs masters in its settings and has no data (job_execute_secondary()) */
             if (summary) failed = false;
-            else if (skind == KDB_ZK_PRIMARY ? !b : !(zsh && zsh->ext.masters_count > 0)) failed = true;
+            else if (skind == KDB_ZK_PRIMARY ? !is_image : !(zsh && zsh->ext.masters_count > 0)) failed = true;
             break;
         case KDB_T_PROFILE:
             g_prof_len = m.u.profile.settings.len < sizeof(g_prof) ? m.u.profile.settings.len : sizeof(g_prof);
             memcpy(g_prof, m.u.profile.settings.p, g_prof_len);
             break;
-        case KDB_T_ZONE_DATA:
-            if (b && !failed && db_zone_build_feed(b, m.u.zone_data.body, m.u.zone_data.len, why, sizeof(why)) != 0)
-                failed = true;
+        case KDB_T_ZONE_IMAGE:
+            if (is_image && !failed) {
+                if (img_have + m.u.zone_image.len > img_cap) {
+                    size_t nc = img_cap ? img_cap * 2 : 65536;
+                    while (nc < img_have + m.u.zone_image.len) nc *= 2;
+                    uint8_t *nb = realloc(img, nc);
+                    if (!nb) { failed = true; break; }
+                    img = nb;
+                    img_cap = nc;
+                }
+                memcpy(img + img_have, m.u.zone_image.body, m.u.zone_image.len);
+                img_have += m.u.zone_image.len;
+            }
             break;
         case KDB_T_ZONE_ABORT:
-            db_zone_build_free(b);
-            b = NULL;
+            free(img);
+            img = NULL;
+            img_have = img_cap = 0;
             break;
         case KDB_T_ZONE_END:
             if (skind != KDB_ZK_PRIMARY && !failed) {
@@ -335,15 +419,20 @@ static void run_install(const uint8_t *p, size_t n, uint8_t sel) {
                 }
             } else if (skind != KDB_ZK_PRIMARY) {
                 (void)dbreg_reject(view, zone, source_id, "rejected");
-            } else if (b && !failed) {
-                zone_db_entry_t *e = dbreg_lookup_entry(view, zone);
+            } else if (is_image && img && !failed) {
+                /* what the ingest thread does: the image against what ZONE_BEGIN said (and the limits of the stream), then the entry */
+                const zone_image_policy_t pol = { zone, zb.serial, zb.rr_count, zb.image_size, sm.lim.max_zone_bytes, sm.lim.max_zone_records, (zb.flags & KDB_ZF_EXTENDED) != 0,
+                                                  (zb.flags & KDB_ZF_TINYDNS) != 0 };
+                bool valid = img_have == zb.image_size && zone_image_validate_ex(img, img_have, &pol, why, sizeof(why)) == 0;
+                zone_db_entry_t *e = valid ? dbreg_lookup_entry(view, zone) : NULL;
                 bool created = false;
                 if (e && e->is_secondary) e = NULL;       /* B7b: a SLAVE that became a primary is replaced */
-                if (!e) {
+                if (valid && !e) {
                     e = scratch_entry(view, zone, zsh, KDB_ZK_PRIMARY);
                     created = e != NULL;
                 }
-                if (e && db_zone_build_install(b, e, NULL, why, sizeof(why)) == 0) {
+                if (valid && e && db_zone_install_image(e, (zone_image_t *)img, NULL, why, sizeof(why)) == 0) {
+                    img = NULL;                                              /* (the entry's version owns it) */
                     uint8_t dg[32] = { 0 };
                     bool sh;
                     if (dbreg_commit(view, zone, e, created, source_id, (uint32_t)atomic_load(&e->serial), dg, &sh) != 0 && created)
@@ -356,8 +445,9 @@ static void run_install(const uint8_t *p, size_t n, uint8_t sel) {
                 (void)dbreg_reject(view, zone, source_id, "rejected");
             }
             summary = false;
-            db_zone_build_free(b);
-            b = NULL;
+            free(img);
+            img = NULL;
+            img_have = img_cap = 0;
             break;
         case KDB_T_ZONE_DELETE:
             (void)dbreg_delete(view, m.u.zone_delete.name, m.u.zone_delete.source_id);
@@ -369,7 +459,7 @@ static void run_install(const uint8_t *p, size_t n, uint8_t sel) {
             break;
         }
     }
-    db_zone_build_free(b);
+    free(img);
     zone_ext_shared_unref(zsh);
     zone_retire_process(true);
     dbreg_reset();
@@ -422,6 +512,9 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     run_loader(p, n, 0, sel, &a);
     run_loader(p, n, chunk, sel, &b);
     if (a.rc != b.rc || a.nframes != b.nframes || a.sum != b.sum || a.state != b.state) abort();
+    run_t c;
+    run_split(p, n, sel, &c);
+    if (c.rc != a.rc || c.nframes != a.nframes) abort();                                  /* (0.7 M2: the stream thread and the reconcile thread give the verdict of the one machine) */
     run_backend(p, n);
     run_install(p, n, sel);
     return 0;

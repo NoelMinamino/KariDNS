@@ -63,7 +63,7 @@ echo "== first fill: a pass over every zone"
 NLIST=$(sqlite3 "$DB" "SELECT count(*) FROM domains WHERE type IN ('NATIVE','MASTER','SLAVE','CONSUMER')")
 run first -- sleep:300
 [ $RC -eq 0 ] && pass "the harness ran to the end (every message went through the Backend's state machine)" || { fail "the harness failed (status $RC)"; cat "$T/first.out" "$T/first.err" | head -20; }
-has "the loader says it has the store protocol (HELLO features 3: the store protocol and the lookup of names)" first.out '^HELLO features=3$'
+has "the loader says it has the store protocol (HELLO features 15: the store protocol, the lookup of names, the body of the zone with the answer of a lookup, and zone images, 0.7 M3)" first.out '^HELLO features=15$'
 is "one pass" "$(cnt first.out '^MB ')" 1
 has "the pass starts with a count, a valid cursor, an identity" first.out "^MB view=0 count=$((NZ + 2)) cursor=[0-9]+ valid=1 ident=sqlite3:[0-9a-f]+:[0-9a-f]+ flags=0$"
 has "the pass ends complete, with every entry counted and the ids in ascending order (ok=1), one zone not offered (PRODUCER)" first.out "^ME view=0 n=$NLIST seen=$NLIST skipped=1 cursor=[0-9]+ valid=1 complete=1 ident=sqlite3:[0-9a-f]+:[0-9a-f]+ ok=1$"

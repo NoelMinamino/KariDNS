@@ -301,6 +301,9 @@ int validate_zone_dname(zone_arena_t *arena, parse_error_t *err);
 int validate_zone_name_lengths(zone_arena_t *arena, parse_error_t *err);
 /* B9a: ALIAS / LUA rules (RDATA, ALIAS beside A/AAAA, ALIAS beside DNSSEC records); -1 with the reason in detail (err->error_message points to it) */
 int validate_zone_pdns_types(const zone_arena_t *arena, parse_error_t *err, char *detail, size_t detail_cap);
+/* the RDATA rules of PowerDNS ALIAS (one uncompressed domain name filling the RDATA) and LUA (a 16-bit type and character-strings), also checked on a zone image (dns_zone_image.c) */
+bool pdns_alias_rdata_ok(const uint8_t *rd, size_t len);
+bool pdns_lua_rdata_ok(const uint8_t *rd, size_t len);
 /* The largest NSEC3 iteration count a zone may carry (NSEC3PARAM or NSEC3 RR): RFC 9276 s3.2, the same limit for a zone file, a transfer, a
  * database zone and a presigned zone.  validate_zone_pdns_types() refuses a zone above it, so the query-time hashing never sees more. */
 #define ZONE_MAX_NSEC3_ITERATIONS 150u

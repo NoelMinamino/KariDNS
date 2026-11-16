@@ -230,13 +230,136 @@ static void run_queries(const zone_image_t *img) {
     ask("\\000.\\255.", 1, 3);
 }
 
+/* ---- 0.7 M3: zone_image_validate_ex() with the policies a stream can announce, and zone_image_check_limits() ----
+ *
+ * Whatever the image and the policy: the verdict of the extended validation is the plain one or stricter; an image it accepts has what the policy says (the harness walks
+ * the image itself and checks every claim of the header of dns_zone_image.h, so a rule that is missing in the validator aborts here); a policy that asks for less accepts
+ * what a stricter one accepts (no extended encoding -> extended, a limit -> none); and the limits of a zone are what a plain recount of the RRs says. */
+static uint32_t xorshift(uint64_t *r);
+
+static bool ex_ext_restricts(const zone_image_ext_t *e) {
+    return e->ttd != 0 || e->loc[0] != 0 || e->loc[1] != 0 || e->ecs_tag_off != 0 || e->loc_tag_off != 0 || (e->flags & ZONE_IMAGE_EXT_COUNTDOWN);
+}
+
+static void ex_check_claims(const zone_image_t *img, const zone_image_policy_t *p) {
+    if ((uint64_t)img->n_rrs != p->rr_count) abort();
+    if (p->announced_size && img->total_size != p->announced_size) abort();
+    if (p->max_bytes && img->total_size > p->max_bytes) abort();
+    if (p->max_records && img->n_rrs > p->max_records) abort();
+    if (((img->flags & ZONE_IMAGE_F_TINYDNS) != 0) != p->tinydns) abort();
+    if (img->apex_name == ZONE_IMAGE_NONE || !domain_names_match_ci(zone_image_name_text(img, img->apex_name), p->apex)) abort();
+    for (uint32_t id = 0; id < img->n_names; id++)
+        if (!domain_name_is_at_or_below(zone_image_name_text(img, id), p->apex)) abort();
+    uint32_t nsoa = 0;
+    for (uint32_t k = 0; k < img->n_rrs; k++) {
+        const zone_image_rr_t *r = &zone_image_rrs(img)[k];
+        if (r->class_val != 1 || r->type == 0 || is_meta_rrtype(r->type)) abort();
+        if (r->ext_idx && !p->extended && ex_ext_restricts(&zone_image_exts(img)[r->ext_idx - 1])) abort();
+        if (r->type != 6) continue;
+        zone_image_soa_t s;
+        if (r->name_id != img->apex_name || zone_image_soa(img, k, NULL, 0, NULL, 0, &s) != 0 || s.serial != p->serial) abort();
+        nsoa++;
+    }
+    if (nsoa == 0 || nsoa > KARIDNS_SOA_SET_MAX || (nsoa > 1 && !p->extended)) abort();
+    if (img->zattr_len && !p->extended) abort();
+    int ntr = 0;
+    (void)zone_image_ecs_trusted(img, &ntr);
+    if (ntr != 0) abort();
+    int nloc = 0;
+    (void)zone_image_locations(img, &nloc);
+    if (nloc > 4096) abort();
+}
+
+/* the limits of the image by a plain recount: per owner, the RRs of one type and the number of types */
+static int ex_limits_slow(const zone_image_t *img, const zone_limits_t *lim) {
+    if (lim->max_records && img->n_rrs > lim->max_records) return -1;
+    for (uint32_t k = 0; k < img->n_rrs; k++)
+        if (lim->max_zone_ttl && zone_image_rrs(img)[k].ttl > lim->max_zone_ttl) return -1;
+    for (uint32_t id = 0; id < img->n_names; id++) {
+        const uint32_t first = zone_image_name_first_rr(img, id), n = zone_image_name_rr_count(img, id);
+        uint32_t ntypes = 0;
+        for (uint32_t i = first; i < first + n; i++) {
+            bool seen = false;
+            uint32_t same = 0;
+            for (uint32_t j = first; j < first + n; j++) {
+                if (zone_image_rr_type(img, j) != zone_image_rr_type(img, i)) continue;
+                if (j < i) seen = true;
+                same++;
+            }
+            if (seen) continue;
+            ntypes++;
+            if (lim->max_per_type && same > lim->max_per_type) return -1;
+        }
+        if (lim->max_types_per_name && ntypes > lim->max_types_per_name) return -1;
+    }
+    return 0;
+}
+
+static void check_policies(const uint8_t *buf, size_t size, bool valid) {
+    const zone_image_t *img = (const zone_image_t *)(const void *)buf;
+    uint64_t r = 0x2545F4914F6CDD1Dull ^ size;
+    for (size_t i = 0; i < size && i < 96; i++) r = r * 1099511628211ull + buf[i];
+    if (r == 0) r = 1;
+    char why[200];
+    const char *apex = "example.com.";
+    uint32_t serial = 0;
+    if (valid && img->apex_name != ZONE_IMAGE_NONE) {
+        apex = zone_image_name_text(img, img->apex_name);
+        uint32_t soa = zone_image_apex_soa(img);
+        zone_image_soa_t s;
+        if (soa != ZONE_IMAGE_NONE && zone_image_soa(img, soa, NULL, 0, NULL, 0, &s) == 0) serial = s.serial;
+    }
+    for (unsigned v = 0; v < 6; v++) {
+        zone_image_policy_t p;
+        memset(&p, 0, sizeof(p));
+        p.apex = (xorshift(&r) % 8 == 0) ? "other.test." : apex;
+        p.serial = (xorshift(&r) % 8 == 0) ? serial + 1 : serial;
+        p.rr_count = img->n_rrs + ((xorshift(&r) % 8 == 0) ? 1 : 0);
+        p.announced_size = (xorshift(&r) % 8 == 0) ? 0 : size + ((xorshift(&r) % 8 == 0) ? 8 : 0);
+        p.max_bytes = (xorshift(&r) % 4 == 0) ? size - (xorshift(&r) % 2) * 8 : 0;
+        p.max_records = (xorshift(&r) % 4 == 0) ? img->n_rrs - (xorshift(&r) % 2) : 0;
+        p.extended = xorshift(&r) % 2;
+        p.tinydns = ((img->flags & ZONE_IMAGE_F_TINYDNS) != 0) ^ (xorshift(&r) % 8 == 0);
+        int rc = zone_image_validate_ex(buf, size, &p, why, sizeof(why));
+        if (!valid && rc == 0) abort();                         /* never more than the plain validation accepts */
+        if (rc == 0) {
+            ex_check_claims(img, &p);
+            zone_image_policy_t q = p;                          /* asking for less accepts it too */
+            q.extended = true;
+            q.max_bytes = q.max_records = 0;
+            if (zone_image_validate_ex(buf, size, &q, why, sizeof(why)) != 0) abort();
+        }
+        if (rc == 0 && !p.extended) {
+            zone_image_policy_t q = p;
+            q.extended = true;
+            if (zone_image_validate_ex(buf, size, &q, why, sizeof(why)) != 0) abort();
+        }
+    }
+    if (valid && img->n_rrs <= 3000 && img->n_names <= 3000) {
+        for (unsigned v = 0; v < 6; v++) {
+            zone_limits_t lim;
+            memset(&lim, 0, sizeof(lim));
+            if (xorshift(&r) % 2) lim.max_records = 1 + xorshift(&r) % (img->n_rrs + 2);
+            if (xorshift(&r) % 2) lim.max_per_type = 1 + xorshift(&r) % 4;
+            if (xorshift(&r) % 2) lim.max_types_per_name = 1 + xorshift(&r) % 6;
+            if (xorshift(&r) % 2) lim.max_zone_ttl = 1 + xorshift(&r) % 100000;
+            char err[300];
+            int a = zone_image_check_limits(img, &lim, err, sizeof(err)), b = ex_limits_slow(img, &lim);
+            if (a == -2) continue;                              /* (out of memory: no verdict) */
+            if ((a < 0) != (b < 0)) abort();
+        }
+    }
+}
+
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     if (size < 8 || size > (4u << 20)) return 0;
     uint8_t *buf = malloc(size);          /* exactly `size` octets, malloc() alignment (>= 8) */
     if (!buf) return 0;
     memcpy(buf, data, size);
     char why[200];
-    if (zone_image_validate(buf, size, why, sizeof(why)) == 0) {
+    const bool valid = zone_image_validate(buf, size, why, sizeof(why)) == 0;
+    if (size >= sizeof(zone_image_t) && (size & 7) == 0) check_policies(buf, size, valid);
+    if (valid) {
         const zone_image_t *img = (const zone_image_t *)(const void *)buf;
         unsigned bad = 0;
         (void)zimg_walk(img, &bad);

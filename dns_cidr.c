@@ -137,3 +137,18 @@ bool cidr_entry_match_str(const cidr_entry_t *net, const char *addr_str) {
     }
     return false;
 }
+
+acl_entry_t *acl_list_parse(char **acl_list, int count) {
+    if (!acl_list || count <= 0) return NULL;
+    acl_entry_t *entries = calloc(count, sizeof(acl_entry_t));
+    if (!entries) return NULL;
+    for (int i = 0; i < count; i++) {
+        char *rule = acl_list[i];
+        if (!rule) continue;
+        bool is_deny = (rule[0] == '!');
+        const char *target = is_deny ? rule + 1 : rule;
+        entries[i].is_deny = is_deny;
+        cidr_entry_parse(&entries[i].cidr, target);
+    }
+    return entries;
+}

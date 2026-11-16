@@ -1851,6 +1851,31 @@ static void tcp_client_close(int kq, int client_fd, tcp_stream_ctx_t *ctx_tcp,
   tcp_client_forget(client_fd, ctx_tcp, ev_list, from, n_events);
 }
 
+/* 0.7: a TCP query that is dropped (overload: no room, the time was up, the ingest thread shed what it waits for) is discarded and counted; the connection is NOT closed (the client may have pipelined queries
+ * for zones that are in memory, RFC 7766 §6.2.1.1).  The state is the one after an answered message: the next message is read from the start. */
+static void tcp_drop_message(tcp_stream_ctx_t *c) {
+  c->state = TCP_STATE_READ_LEN;
+  c->accumulated = 0;
+  c->msg_len = 0;
+  c->resume_len = 0;
+  c->park_deadline_ms = 0;
+  c->not_ready_now = false;
+  c->lookup_failed = false;
+  c->expired = 0;
+  c->lookup_respark = false;
+  c->drop_now = false;
+}
+
+/* The request that was parked is run again (park_service()): a 1 ms timer whose event takes the connection from the top of the loop.  The timer of the idle deadline of the message before is still in
+ * the kqueue (a parked connection's timer events are skipped), so a connection that cannot be started again is closed the whole way (tcp_client_close() deletes both events): a bare close() would leave
+ * that timer to fire on a context that went back to the pool and was given out again. */
+static void tcp_resume_start(int kq, int fd, tcp_stream_ctx_t *c) {
+  struct kevent ev;
+  c->resume_pending = true;
+  EV_SET(&ev, fd, EVFILT_TIMER, EV_ADD | EV_ONESHOT, 0, 1, c);
+  if (kevent(kq, &ev, 1, NULL, 0, NULL) != 0) tcp_client_close(kq, fd, c, NULL, 0, 0);       /* (it cannot be started again: closing is better than a connection nobody looks at) */
+}
+
 /* 次のメッセージの期限までの時間 (ms、最小 1)。RFC 7766 §6.2.3 */
 static uint32_t tcp_ms_until(int64_t deadline_ms, int64_t now_ms) {
   return deadline_ms > now_ms ? (uint32_t)(deadline_ms - now_ms) : 1;
@@ -2411,6 +2436,7 @@ static void park_ask_again(park_table_t *pt, int widx) {
     }
     case PARK_PEND_ATTACH_NAME: ok = park_attach_request_any(park_entry_view(e), park_entry_zone(e)); break;
     case PARK_PEND_FETCH: ok = park_fetch_request(widx, park_entry_view(e), park_entry_zone(e), e->prio, KDB_FETCH_FULL); break;
+    case PARK_PEND_LOOKUP: ok = park_fetch_request(widx, park_entry_view(e), park_entry_zone(e), KDB_FETCH_PRIO_QUERY, KDB_FETCH_LOOKUP); break;     /* (0.7: the lookup of the name the entry is parked for) */
     default: ok = true; break;
     }
     if (!ok) break;
@@ -2421,17 +2447,23 @@ static void park_ask_again(park_table_t *pt, int widx) {
 /* Park the UDP request for the zone of `pel`.  true: parked (the caller answers nothing now). false: not parked (no park table, the time is
  * up, the table is full, the request too big): the caller answers "not ready". */
 static bool udp_park(udp_pass_t *w, const view_snapshot_t *view, const zref_t *pel, const udp_ipc_t *ipc, const uint8_t *req, size_t len) {
+  w->park_drop = 0;
   if (!w->park || !view->name) return false;
   int64_t now = park_now_ms();
   int64_t left = w->woken ? w->woken_deadline_ms - now : (int64_t)w->park_timeout_ms;
-  if (left <= 0) return false;
+  if (left <= 0) {
+    w->park_drop = PARK_CNT_ZONE_TIMEOUT + 1;           /* (0.7: the time of a query that was woken without its zone is up: it is dropped, not answered "not ready") */
+    return false;
+  }
   park_plan_t pp = park_plan(w->park, view, pel, w->woken);
   const char *hv = pp.hv, *zname = pp.name;
   const bool attach = pp.attach;
   const int gate = pp.gate;
+  const uint64_t full0 = w->park->n_full;
   int32_t pi = park_udp(w->park, now, (uint32_t)(attach && left > PARK_ATTACH_DEADLINE_MS ? PARK_ATTACH_DEADLINE_MS : left), hv, zname, w->active_fd, ipc, req, len);
   if (pi < 0) {
     if (gate == FETCH_GATE_TAKEN) park_claim_release(hv, zname);
+    if (w->park->n_full != full0) w->park_drop = PARK_CNT_ZONE_ROOM + 1;       /* (0.7: no room in the park table is overload: the query is dropped and counted, not answered; one that is too big is answered "not ready" as before) */
     return false;
   }
   if (attach) park_mark_attach(w->park, pi, park_now_ns(), now + left);
@@ -2442,11 +2474,13 @@ static bool udp_park(udp_pass_t *w, const view_snapshot_t *view, const zref_t *p
 
 /* ---- 0.7: a query for a name that no zone of the store covers, while the first pass of the view has not listed every zone ----
  * Without this the query is refused as for any name the server does not serve, though the zone may be in the database further down the pass.  Now the worker parks it and asks the loader which zone of
- * the view encloses the name (a lookup: FETCH_REQ mode KDB_FETCH_LOOKUP, dns_db_ingest.c); the ingest thread records the zone it finds, wakes the query by the name, and the query is looked up again as
- * after any wake-up: with a zone it parks for it as for a zone that is out of memory, without one it is refused (the normal answer).  Only the first run of a query does this (a query that comes
- * back after a wake-up or a time-out is not parked again), only for a QUERY of the class IN, and only while the store has no complete list of the zones of the view and the loader answers lookups:
- * once the pass has ended an unknown name is refused at once, with no round trip.  At most PARK_LOOKUP_MAX lookups are out at one time (park_lookup_take()); a query that finds none free, or no room in the
- * ring or the table, is refused at once, as before.  The answer of the lookup (a wake by the name) or its failure makes the query run again, and with no zone for its name it is refused then.  A wake that is not the answer (the wake of every
+ * the view encloses the name (a lookup: FETCH_REQ mode KDB_FETCH_LOOKUP, or KDB_FETCH_LOOKUP_FULL with the body of the zone, dns_db_ingest.c); the ingest thread records the zone it finds, wakes the query by the name (the
+ * body installed, when it came with the answer), and the query is looked up again as after any wake-up: with a zone it parks for it as for a zone that is out of memory (or is answered from it), without one it is refused (the
+ * normal answer).  Only the first run of a query does this (a query that comes back after a wake-up or a time-out is not parked again), only for a QUERY of the class IN, and only while the store has no complete list of the zones
+ * of the view and the loader answers lookups: once the pass has ended an unknown name is refused at once, with no round trip.  A query is never refused for the lack of a place: the ingest thread gives a lookup a place
+ * of fetch-concurrency as to a fetch and keeps it in a queue until it has one, and a request that the worker cannot make now (its ring to the ingest thread is full) leaves the entry parked as pending (PARK_PEND_LOOKUP,
+ * park_ask_again()).  What is bounded is the share of the park table that the lookups may take (park_lookup_room(); a query that finds none is refused as without a lookup), the places and the queue of the ingest thread, and
+ * every wait by park-timeout.  The answer of the lookup (a wake by the name) or its failure makes the query run again, and with no zone for its name it is refused then.  A wake that is not the answer (the wake of every
  * query after a wake ring that overflowed: park_wake_all()) leaves the mark of the entry (park_mark_lookup()), and the query is parked again for the lookup, with its first deadline, and the request is made again
  * (the ingest thread joins a lookup of the same name that is on its way): a zone that exists is never refused for a wake that said nothing.  A lookup that nobody answers ends with park-timeout and the same answer. */
 _Atomic bool dns_core_test_lookup_force;                /* tests (test_park_worker.c, in every build: the coverage of the test programs and of karidns merges): the store says the first pass of the view is going on and the loader does lookups */
@@ -2454,7 +2488,7 @@ static bool lookup_wanted(const view_snapshot_t *view, uint8_t flags_byte, uint1
   const bool force = atomic_load_explicit(&dns_core_test_lookup_force, memory_order_relaxed);
   if (!force && !db_store_directory_wait()) return false;           /* (one load: the first pass of some view is going on) */
   if (((flags_byte >> 3) & 0x0F) != 0 || qclass != 1 || !view || !view->name) return false;
-  return force || (db_ingest_lookup_ready() && db_store_view_pending(zref_view_sid(view)));
+  return force || (db_ingest_lookup_wanted() && db_store_view_pending(zref_view_sid(view)));
 }
 
 /* the name the lookup asks for: the query name in the canonical form the stream wants; for a DS query the parent name (the zone of a DS is the parent's: find_zone_for_query_ex(), RFC 4035 3.1.4.1, as the
@@ -2471,31 +2505,50 @@ static bool lookup_name(const char *qname, uint16_t qtype, char *out, size_t cap
   return r != 0 && r < cap && !(r == 1 && out[0] == '.');
 }
 
-/* the request of a lookup, from the worker's ring: true when one is out, or this worker has one out for the name already (the query joins it).  again: the query was woken without the answer and is
- * parked again: the wait goes on whether or not a new request could be made (the first one may still be on its way, and the park deadline ends the wait either way) */
-static bool lookup_request(park_table_t *pt, int widx, const char *view, const char *lname, bool again) {
-  if (park_has_wait(pt, view, lname)) return true;
-  if (!park_lookup_take()) return again;
-  if (!park_fetch_request(widx, view, lname, KDB_FETCH_PRIO_QUERY, KDB_FETCH_LOOKUP)) {
-    park_lookup_give();
-    return again;
+/* the entry pi (just parked, for the lookup of its name) is marked and its request made: from this worker's ring to the ingest thread.  joined: another entry of this worker waits for the name already, and its request
+ * is out (or pending: it passes to this entry if that one goes first, park_release()), so this one only waits.  A ring that is full leaves the entry pending: the worker asks again (park_ask_again()), the query is
+ * not refused */
+static void lookup_ask(park_table_t *pt, int widx, int32_t pi, bool joined) {
+  park_mark_lookup(pt, pi);
+  if (joined) return;
+  park_entry_t *e = &pt->e[pi];
+  if (!park_fetch_request(widx, park_entry_view(e), park_entry_zone(e), KDB_FETCH_PRIO_QUERY, KDB_FETCH_LOOKUP)) {
+    park_lookup_note_take_fail();
+    park_pending_set(pt, e, PARK_PEND_LOOKUP, 0, KDB_FETCH_PRIO_QUERY);
   }
-  return true;
 }
 
-/* Park the UDP request for a lookup of its name.  true: parked (the caller answers nothing now).  false: not parked: the normal answer follows */
-static bool udp_park_lookup(udp_pass_t *w, const view_snapshot_t *view, const char *qname, uint16_t qtype, const udp_ipc_t *ipc, const uint8_t *req, size_t len) {
+/* Park the UDP request for a lookup of its name.  1: parked (the caller answers nothing now).  0: not parked: the normal answer follows.  -1: dropped (overload: no room in the park table for another lookup, or its time
+ * was up) and counted: the caller answers nothing */
+static int udp_park_lookup(udp_pass_t *w, const view_snapshot_t *view, const char *qname, uint16_t qtype, const udp_ipc_t *ipc, const uint8_t *req, size_t len) {
   char lname[DNS_NAME_TEXT_SIZE];
-  if (!w->park || !view->name || w->park_timeout_ms == 0 || !lookup_name(qname, qtype, lname, sizeof(lname))) return false;
+  if (!w->park || !view->name || w->park_timeout_ms == 0 || !lookup_name(qname, qtype, lname, sizeof(lname))) return 0;
   const int64_t now = park_now_ms();
   const int64_t left = w->woken ? w->woken_deadline_ms - now : (int64_t)w->park_timeout_ms;      /* (a query that is parked again keeps its first deadline) */
-  if (left <= 0 || !lookup_request(w->park, w->worker_idx, view->name, lname, w->woken)) return false;
-  /* (the request is out before the entry is made: this thread is the one that takes the wake-up, and does so after this request; a table that is full leaves a lookup that nobody waits for, which still records the zone) */
+  if (left <= 0) {
+    park_cnt_note(PARK_CNT_LK_TIMEOUT);
+    return -1;
+  }
+  if (park_shed_held(park_lookup_claim_key(view->name, lname), now)) {      /* the ingest thread shed the lookup of this name lately: no request, it would be shed again */
+    park_cnt_note(PARK_CNT_LK_REMEMBERED);
+    return -1;
+  }
+  if (!park_lookup_room(w->park)) {
+    park_cnt_note(PARK_CNT_LK_ROOM);
+    return -1;
+  }
+  const bool joined = park_has_wait(w->park, view->name, lname);
+  const uint64_t full0 = w->park->n_full;
   const int32_t pi = park_udp(w->park, now, (uint32_t)left, view->name, lname, w->active_fd, ipc, req, len);
-  if (pi < 0) return false;
-  park_mark_lookup(w->park, pi);
-  return true;
+  if (pi < 0) {
+    if (w->park->n_full == full0) return 0;              /* (a request that is too big: the normal answer) */
+    park_cnt_note(PARK_CNT_LK_ROOM);
+    return -1;
+  }
+  lookup_ask(w->park, w->worker_idx, pi, joined);
+  return 1;
 }
+
 
 /* One request of the UDP loop of the worker, from the question to the answer in the batch of datagrams to send (or the park table: a zone that
  * is in the directory without its data parks the query).  The first pass and the second one, after a wake-up or a time-out, are the same
@@ -2604,10 +2657,21 @@ STATIC_TEST void udp_one(udp_pass_t *w, udp_ipc_t *ipc_msg, uint8_t *req_buf, ss
             const rate_limit_config_t *rrl_cfg = NULL;
             int res_len = 0;
             bool not_ready = false, answered = false;
-            if (__builtin_expect(!route.entry && !zref_present(&pel) && (!w->woken || w->lookup_woken) && !w->not_ready, 0) && lookup_wanted(route.view, req_buf[2], qclass) &&
-                udp_park_lookup(w, route.view, qname, qtype, ipc_msg, req_buf, (size_t)payload_received)) {
+            if (__builtin_expect(!route.entry && !zref_present(&pel) && (!w->woken || w->lookup_woken) && !w->not_ready, 0) && lookup_wanted(route.view, req_buf[2], qclass)) {
+              if (udp_park_lookup(w, route.view, qname, qtype, ipc_msg, req_buf, (size_t)payload_received) != 0) {
+                rcu_reader_exit(ctx);
+                return;                               /* 0.7: parked for the lookup of its name (answered when the zone is known, or REFUSED when no zone has the name), or dropped (overload: counted) */
+              }
+            }
+            if (__builtin_expect(w->expired == 2, 0) && !route.entry && !zref_present(&pel) && lookup_wanted(route.view, req_buf[2], qclass)) {      /* 0.7: the time of the lookup was up and still no zone has the name: dropped, counted */
+              park_cnt_note(PARK_CNT_LK_TIMEOUT);
               rcu_reader_exit(ctx);
-              return;                                 /* 0.7: parked for the lookup of its name: it is answered when the zone is known, or REFUSED when no zone has the name, or its time is up */
+              return;
+            }
+            if (__builtin_expect(w->lookup_failed, 0) && !route.entry && !zref_present(&pel)) {      /* 0.7: the lookup failed: the answer is "not ready", as for a zone whose fetch failed, built for a name with no zone */
+              char lname[DNS_NAME_TEXT_SIZE];
+              pel.busy = true;
+              if (lookup_name(qname, qtype, lname, sizeof(lname))) snprintf(pel.name, sizeof(pel.name), "%s", lname);
             }
             if (__builtin_expect(!route.entry && zref_present(&pel), 0)) {
               /* D1a: the zone is in the directory and its data is not in memory.  First the question whether this client may ask at all (the
@@ -2627,6 +2691,17 @@ STATIC_TEST void udp_one(udp_pass_t *w, udp_ipc_t *ipc_msg, uint8_t *req_buf, ss
                 if (!w->not_ready && udp_park(w, route.view, &pel, ipc_msg, req_buf, (size_t)payload_received)) {
                   rcu_reader_exit(ctx);
                   return;                                 /* parked: it is answered when the zone is there, or its time is up */
+                }
+                if (w->park_drop) {                       /* 0.7: overload (no room in the park table, or its time is up): the query is dropped and counted, never answered REFUSED or SERVFAIL for a zone the database may have */
+                  park_cnt_note(w->park_drop - 1);
+                  w->park_drop = 0;
+                  rcu_reader_exit(ctx);
+                  return;
+                }
+                if (w->expired) {                         /* 0.7: its time was up and the zone is still not there: dropped, counted (a failure is answered "not ready", below) */
+                  park_cnt_note(w->expired == 2 ? PARK_CNT_LK_TIMEOUT : PARK_CNT_ZONE_TIMEOUT);
+                  rcu_reader_exit(ctx);
+                  return;
                 }
                 not_ready = true;
               }
@@ -2797,6 +2872,8 @@ STATIC_TEST void park_service(udp_pass_t *w, int kq) {
       uint32_t n = park_retry_key(t, k.key, park_now_ms() + (int64_t)w->park_timeout_ms);
       if (k.fetch)                                      /* (only a read from the database counts as one: a zone that another attach or fetch has is waited for) */
         for (uint32_t i = 0; i < n; i++) store_status_note_cold(0, STORE_COLD_FETCH);
+    } else if (k.ask == PARK_ASK_DROP) {                  /* 0.7: the ingest thread dropped the lookup, or the fetch, that they wait for (its queue was full, or it waited too long): they are dropped (below) */
+      (void)park_drop_key(t, k.key);
     } else if (k.failed) {
       (void)park_fail_key(t, k.key);
     } else {
@@ -2811,6 +2888,31 @@ STATIC_TEST void park_service(udp_pass_t *w, int kq) {
   while ((e = park_next_done(t))) {
     bool timed_out = e->state == PARK_TIMEOUT;
     if (e->attach) store_status_note_cold(timed_out ? 0 : (uint64_t)(park_now_ns() - e->t_park_ns), timed_out ? STORE_COLD_TIMEOUT : STORE_COLD_ATTACH);       /* (0.7 store S2) */
+    /* 0.7: a cold query that cannot be served is dropped and counted, like a query that RRL drops: never REFUSED or SERVFAIL for a zone the database may have.  The ingest thread said it dropped what the query waits for
+     * (PARK_END_DROP): dropped now.  The time of the query is up (or a lookup was woken without its answer after that): the request is looked at once more, as the zone may have come with no wake-up; it is answered if it is there
+     * and dropped if it is not (udp_one(), the TCP path: w->expired).  SERVFAIL + EDE 14 is for a failure (the fetch or the lookup failed). */
+    const bool failed = timed_out && e->end == PARK_END_FAIL;
+    const bool lk = e->lookup != 0;
+    const bool late = !timed_out && lk && park_now_ms() >= (e->attach && e->full_ms > e->deadline_ms ? e->full_ms : e->deadline_ms);
+    if (timed_out && e->end == PARK_END_DROP) {
+      park_cnt_note(lk ? PARK_CNT_LK_QUEUE : PARK_CNT_ZONE_QUEUE);
+      if (e->kind == PARK_UDP) {
+        park_release(t, e);
+      } else {
+        uint32_t idx = e->ctx_idx, gen = e->ctx_gen;
+        int fd = e->fd;
+        park_release(t, e);
+        tcp_stream_ctx_t *c = (g_tcp_pool && idx < MAX_TCP_CLIENTS) ? &g_tcp_pool[idx] : NULL;
+        if (c && c->gen == gen && c->parked) {          /* (a TCP query that is dropped is discarded and nothing is said; the connection stays open: the request is run again at once, discarded, and the next message is read) */
+          c->parked = false;
+          c->drop_now = true;
+          tcp_resume_start(kq, fd, c);
+        }
+      }
+      continue;
+    }
+    const uint8_t expired = ((timed_out && !failed) || late) ? (uint8_t)(lk ? 2 : 1) : 0;
+    if (failed && lk) park_cnt_note(PARK_CNT_LK_SERVFAIL);
     if (e->kind == PARK_UDP) {
       udp_ipc_t *ipc = (udp_ipc_t *)w->batch->rx_buffers[0];
       *ipc = *park_entry_ipc(e);
@@ -2819,9 +2921,11 @@ STATIC_TEST void park_service(udp_pass_t *w, int kq) {
       memcpy(req, park_entry_req(e), len);
       w->active_fd = e->fd;
       w->woken = true;
-      w->lookup_woken = e->lookup && !timed_out;          /* (parked for a lookup and woken without its answer: parked again for it) */
+      w->lookup_woken = e->lookup && !timed_out && !late;          /* (parked for a lookup and woken without its answer: parked again for it) */
       w->woken_deadline_ms = e->attach && e->full_ms > e->deadline_ms ? e->full_ms : e->deadline_ms;       /* (an attach park: the park-timeout, not the attach deadline) */
-      w->not_ready = timed_out;
+      w->not_ready = timed_out || late;
+      w->expired = expired;
+      w->lookup_failed = failed && lk;
       park_release(t, e);                                 /* (before the request runs: it may park again, and takes a free entry) */
       w->n_tx = 0;
       udp_one(w, ipc, req, len);
@@ -2832,6 +2936,8 @@ STATIC_TEST void park_service(udp_pass_t *w, int kq) {
       w->woken = false;
       w->lookup_woken = false;
       w->not_ready = false;
+      w->expired = 0;
+      w->lookup_failed = false;
     } else {
       uint32_t idx = e->ctx_idx, gen = e->ctx_gen;
       int fd = e->fd;
@@ -2840,16 +2946,11 @@ STATIC_TEST void park_service(udp_pass_t *w, int kq) {
       tcp_stream_ctx_t *c = (g_tcp_pool && idx < MAX_TCP_CLIENTS) ? &g_tcp_pool[idx] : NULL;
       if (c && c->gen == gen && c->parked) {                /* (the connection is still the one that parked) */
         c->parked = false;
-        c->not_ready_now = timed_out;
-        c->lookup_respark = lookup_woken && !timed_out;
-        c->resume_pending = true;
-        struct kevent ev;
-        EV_SET(&ev, fd, EVFILT_TIMER, EV_ADD | EV_ONESHOT, 0, 1, c);
-        if (kevent(kq, &ev, 1, NULL, 0, NULL) != 0) {        /* it cannot be started again: closing is better than a connection nobody looks at */
-          close(fd);                                         /* (the kqueue forgets the descriptor) */
-          dec_tcp_clients();
-          tcp_ctx_free(c);
-        }
+        c->not_ready_now = timed_out || late;
+        c->expired = expired;
+        c->lookup_failed = failed && lookup_woken;
+        c->lookup_respark = lookup_woken && !timed_out && !late;
+        tcp_resume_start(kq, fd, c);
       }
     }
   }
@@ -3274,6 +3375,10 @@ process_tcp_client: ;
            * not two).  This worker is the only thread that handles the event, so the timer cannot fire in between; a timer event that is already
            * in ev_list is judged against idle_deadline_ms like any early one (above).  The paths that leave without that EV_ADD close the
            * connection (tcp_client_close() deletes the timer), hand it to a thread (which deletes it first) or park it (the timer handler skips it). */
+          if (__builtin_expect(ctx_tcp->drop_now, 0)) {      /* 0.7: park_service() dropped what this request waited for (counted there): it is discarded, the connection stays and the next message is read */
+            tcp_drop_message(ctx_tcp);
+            continue;
+          }
           char qname[DNS_NAME_TEXT_SIZE] = "";
           uint16_t qtype = 0;
           uint16_t qclass = 1;
@@ -3631,6 +3736,17 @@ process_tcp_client: ;
             route.entry = route.view ? find_zone_for_query_zref(route.view, qname, ((msg[2] >> 3) & 0x0F) == 0 ? qtype : 0, &pel) : NULL;
             bool not_ready = false, answered = false;
             int res_len = 0;
+            if (__builtin_expect(ctx_tcp->expired == 2, 0) && !route.entry && !zref_present(&pel) && lookup_wanted(route.view, msg[2], qclass)) {      /* 0.7: as udp_one(): the time of the lookup was up and still no zone has the name: dropped (the connection stays open), counted */
+              park_cnt_note(PARK_CNT_LK_TIMEOUT);
+              tcp_drop_message(ctx_tcp);
+              rcu_reader_exit(ctx);
+              continue;
+            }
+            if (__builtin_expect(ctx_tcp->lookup_failed, 0) && !route.entry && !zref_present(&pel)) {      /* 0.7: the lookup failed: "not ready" for a name with no zone (udp_one()) */
+              char lname[DNS_NAME_TEXT_SIZE];
+              pel.busy = true;
+              if (lookup_name(qname, qtype, lname, sizeof(lname))) snprintf(pel.name, sizeof(pel.name), "%s", lname);
+            }
             if (__builtin_expect(!route.entry && zref_present(&pel), 0)) {
               /* D1a: the zone is in the directory and its data is not in memory.  The client is checked first (allow-query as for a zone in
                * memory, TSIG, a wrong request): a final answer (REFUSED ...) is sent and nothing parks.  Otherwise the connection is parked:
@@ -3649,10 +3765,24 @@ process_tcp_client: ;
               const int64_t left = again ? ctx_tcp->park_deadline_ms - pnow : (int64_t)park_timeout_ms;
               uint32_t cidx = (uint32_t)(ctx_tcp - g_tcp_pool);
               ctx_tcp->lookup_respark = false;
-              if (left > 0 && route.view->name && park_timeout_ms != 0 && lookup_name(qname, qtype, lname, sizeof(lname)) && lookup_request(&park, ctx->thread_id, route.view->name, lname, again)) {
+              if (left > 0 && route.view->name && park_timeout_ms != 0 && lookup_name(qname, qtype, lname, sizeof(lname)) && park_shed_held(park_lookup_claim_key(route.view->name, lname), pnow)) {
+                park_cnt_note(PARK_CNT_LK_REMEMBERED);          /* (the ingest thread shed the lookup of this name lately: as udp_park_lookup(), nothing is asked, the message is dropped) */
+                tcp_drop_message(ctx_tcp);
+                rcu_reader_exit(ctx);
+                continue;
+              }
+              if (route.view->name && park_timeout_ms != 0 && lookup_name(qname, qtype, lname, sizeof(lname)) && (left <= 0 || !park_lookup_room(&park))) {
+                park_cnt_note(left <= 0 ? PARK_CNT_LK_TIMEOUT : PARK_CNT_LK_ROOM);       /* 0.7: overload: nothing is answered (a dropped query); the connection stays open */
+                tcp_drop_message(ctx_tcp);
+                rcu_reader_exit(ctx);
+                continue;
+              }
+              if (left > 0 && route.view->name && park_timeout_ms != 0 && lookup_name(qname, qtype, lname, sizeof(lname))) {
+                const bool joined = park_has_wait(&park, route.view->name, lname);
+                const uint64_t full0 = park.n_full;
                 int32_t pi = park_tcp(&park, pnow, (uint32_t)left, route.view->name, lname, client_fd, cidx, ctx_tcp->gen);
                 if (pi >= 0) {
-                  park_mark_lookup(&park, pi);
+                  lookup_ask(&park, ctx->thread_id, pi, joined);
                   ctx_tcp->park_deadline_ms = pnow + left;
                   ctx_tcp->park_idx = pi;
                   ctx_tcp->park_gen = park.e[pi].gen;
@@ -3661,6 +3791,12 @@ process_tcp_client: ;
                   rcu_reader_exit(ctx);
                   parked_out = true;
                   break;
+                }
+                if (park.n_full != full0) {                       /* (no room in the park table: dropped, as above) */
+                  park_cnt_note(PARK_CNT_LK_ROOM);
+                  tcp_drop_message(ctx_tcp);
+                  rcu_reader_exit(ctx);
+                  continue;
                 }
               }
             }
@@ -3675,8 +3811,15 @@ process_tcp_client: ;
                 const bool attach = pp.attach;
                 const int gate = pp.gate;
                 uint32_t cidx = (uint32_t)(ctx_tcp - g_tcp_pool);
+                const uint64_t zfull0 = park.n_full;
                 int32_t pi = park_tcp(&park, pnow, (uint32_t)(attach && left > PARK_ATTACH_DEADLINE_MS ? PARK_ATTACH_DEADLINE_MS : left), hv, zname, client_fd, cidx, ctx_tcp->gen);
                 if (pi < 0 && gate == FETCH_GATE_TAKEN) park_claim_release(hv, zname);
+                if (pi < 0 && park.n_full != zfull0) {            /* 0.7: no room in the park table: dropped and counted (the connection stays open), not answered "not ready" */
+                  park_cnt_note(PARK_CNT_ZONE_ROOM);
+                  tcp_drop_message(ctx_tcp);
+                  rcu_reader_exit(ctx);
+                  continue;
+                }
                 if (pi >= 0) {
                   if (attach) park_mark_attach(&park, pi, park_now_ns(), pnow + left);
                   if (pp.ask) park_ask(&park, ctx->thread_id, pi, &pp, &pel);
@@ -3691,10 +3834,18 @@ process_tcp_client: ;
                   break;
                 }
               }
+              if (ctx_tcp->expired || (park_on && !ctx_tcp->not_ready_now && left <= 0)) {      /* 0.7: its time was up and the zone is still not there: dropped (the connection stays open), counted */
+                park_cnt_note(ctx_tcp->expired == 2 ? PARK_CNT_LK_TIMEOUT : PARK_CNT_ZONE_TIMEOUT);
+                tcp_drop_message(ctx_tcp);
+                rcu_reader_exit(ctx);
+                continue;
+              }
               not_ready = true;
             }
             ctx_tcp->park_deadline_ms = 0;
             ctx_tcp->not_ready_now = false;
+            ctx_tcp->lookup_failed = false;
+            ctx_tcp->expired = 0;
             ctx_tcp->lookup_respark = false;
             if (route.entry && (route.entry->kind == ZONE_KIND_PROGRAM || route.entry->kind == ZONE_KIND_FORWARD)) {
               /* forward / program ゾーン: 非同期 I/O スレッドへ渡すために要求を複製する

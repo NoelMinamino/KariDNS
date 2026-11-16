@@ -554,40 +554,47 @@ were all taken; \fBring_dropped\fR, requests the workers could not hand to the
 ingest thread because their ring of 128 was full; \fBpark_full\fR, queries that
 found the table of parked queries full (\fBpark\-max\fR); \fBpark_timeout\fR,
 parked queries whose zone was not there before \fBpark\-timeout\fR;
-\fBloader_busy\fR, fetches the loader turned away because its queue was full;
-\fBingest_busy\fR, the share of the last ten seconds the ingest thread was
-working instead of waiting, 0 for the first ten seconds; \fBfill_busy\fR, the
-part of that the bodies of the first fill (the background fetch of the zones the
-store lists without a body) took; \fBhist\fR, the time from the request to the
-install of the fetches that succeeded: up to 1 ms, up to 10 ms, up to 100 ms, up
-to 1 s, more; see "\fBkarictl dbstatus\fR shows it" under "Memory limit (D1a)"
-in \fBkaridns(8)\fR), then (0.7, the first fill of the zone store) \fBlookup of
-names while the first pass has not listed every zone: ready=yes|no in_flight=N
-found=N none=N failed=N refused=N same_name=N\fR (the by-name lookups of queries
-for a name that no stored zone covers while a view's first pass has not listed
-every zone, see "The first fill and the queries (0.7)" in \fBkaridns(8)\fR:
-\fBready\fR, the store protocol is on and the loader answers lookups, which is
-when a query is parked for one; \fBin_flight\fR, the lookups out now (at most
-32, counted from the worker's request to the end of the ingest thread's work on
-it); all the others are counted since the start: \fBfound\fR, lookups that gave
-a zone, which is then known (its query is answered from it); \fBnone\fR, lookups
-that found no zone of the view that encloses the name (the query is REFUSED, as
-for any name the server does not serve); \fBfailed\fR, lookups that ended in a
-failure (the loader or its fetch stream went away, the loader named a zone that
-does not enclose the name, or the zone could not be recorded; each is logged as
-\fB[DB] lookup of the name ... failed\fR, and the query is woken and refused,
-not failed); \fBrefused\fR, requests of the workers that the ingest thread did
-not send (a name the stream does not take, no connection of the fetch stream, no
-free place in the fetch table); \fBsame_name\fR, requests that joined a lookup
-of the same name that was on its way), the NOTIFY of zones that are out of
-memory (D1a: \fBnotify of zones out of memory: queued=N deferred=N\fR, the zones
-whose serial changed while their data was out of memory that were handed to the
-control thread, and the ones that did not fit in the ring of 1024 and are queued
-later), the zone transfers of zones that are out of memory (D1a, \fBtransfers of
-zones out of memory: waited=N loaded=N failed=N summary_answers=N marked=N
-timeout=Nms\fR: transfers that had to wait for the zone, the zones they got, the
-ones that ended with SERVFAIL, the IXFRs answered from the summary without
-reading the zone, the zones marked evict-next, and
+\fBloader_busy\fR, fetches (and lookups) the loader turned away because its
+queue was full (the queries that wait for them are dropped and counted,
+\fBstore.park.drop.queue\fR and \fBstore.lookup.drop.queue\fR, not answered
+SERVFAIL: busy is overload); \fBingest_busy\fR, the share of the last ten
+seconds the ingest thread was working instead of waiting, 0 for the first ten
+seconds; \fBfill_busy\fR, the part of that the bodies of the first fill (the
+background fetch of the zones the store lists without a body) took; \fBhist\fR,
+the time from the request to the install of the fetches that succeeded: up to 1
+ms, up to 10 ms, up to 100 ms, up to 1 s, more; see "\fBkarictl dbstatus\fR
+shows it" under "Memory limit (D1a)" in \fBkaridns(8)\fR), then (0.7, the first
+fill of the zone store) \fBlookup of names while the first pass has not listed
+every zone: ready=yes|no in_flight=N found=N none=N failed=N refused=N
+same_name=N\fR (the by-name lookups of queries for a name that no stored zone
+covers while a view's first pass has not listed every zone, see "The first fill
+and the queries (0.7)" in \fBkaridns(8)\fR: \fBready\fR, the store protocol is
+on and the loader answers lookups, which is when a query is parked for one;
+\fBin_flight\fR, the lookups out now (at most 32, counted from the worker's
+request to the end of the ingest thread's work on it); all the others are
+counted since the start: \fBfound\fR, lookups that gave a zone, which is then
+known (its query is answered from it); \fBnone\fR, lookups that found no zone of
+the view that encloses the name (the query is REFUSED, as for any name the
+server does not serve); \fBfailed\fR, lookups that ended in a failure (the
+loader or its fetch stream went away, the loader named a zone that does not
+enclose the name, the zone could not be recorded, or the zone the lookup found
+could not be read from the database (the body that came with it failed); each is
+logged as \fB[DB] lookup of the name ... failed\fR, and the query is answered
+SERVFAIL + EDE 14, not refused; a loader that said it is busy is overload and
+the query is dropped, see \fBstore.lookup.drop.queue\fR); \fBrefused\fR,
+requests of the workers that the ingest thread did not send because there is
+nothing to ask (a name the stream does not take, a view that takes no database
+zones, a loader that does not look names up; a loader that is only away does not
+count: the lookup waits for it and is dropped at its time); \fBsame_name\fR,
+requests that joined a lookup of the same name that was on its way), the NOTIFY
+of zones that are out of memory (D1a: \fBnotify of zones out of memory: queued=N
+deferred=N\fR, the zones whose serial changed while their data was out of memory
+that were handed to the control thread, and the ones that did not fit in the
+ring of 1024 and are queued later), the zone transfers of zones that are out of
+memory (D1a, \fBtransfers of zones out of memory: waited=N loaded=N failed=N
+summary_answers=N marked=N timeout=Nms\fR: transfers that had to wait for the
+zone, the zones they got, the ones that ended with SERVFAIL, the IXFRs answered
+from the summary without reading the zone, the zones marked evict-next, and
 \fBtransfer\-fetch\-timeout\fR) and the cost of the zone directory (\fBzone
 directory: N elements, B bytes in the registry + I bytes in the indexes of the
 views (P bytes per zone)\fR; the entries and images are not in it), then
@@ -784,11 +791,48 @@ Journal position, last checkpoint, last durable commit, size, generation, the
 size at which a checkpoint is forced (100 MiB: a replay of that takes about a
 second)
 .TP 8
-\fBstore.checkpoint.count\fR, \fB.last_unix\fR, \fB.last_us\fR
-Checkpoints since the open, when the last one ended, how long it took
+\fBstore.journal.bound_bytes\fR, \fB.peak_bytes\fR, \fB.limit_waits\fR, \fB.limit_wait_us\fR, \fB.limit_wait_max_us\fR
+0.7: the bound of the journal (twice \fB.max_bytes\fR), the largest size a
+journal file reached since the open, and the writes that waited at that bound
+for a checkpoint (their number, total and longest wait). When a checkpoint takes
+longer than the writing of \fB.max_bytes\fR of records (the disk does not keep
+up), the pass of the loader (the reconcile thread) waits there for it between
+two groups of entries, with no lock held, and the thread that also answers
+lookups waits only at four times \fB.max_bytes\fR: the journal, the replay after
+a crash and the clean stop stay bounded; a WARNING at most once a
+minute. \fB.limit_waits\fR stays 0 when the disk keeps up
+.TP 8
+\fBstore.checkpoint.count\fR, \fB.last_unix\fR, \fB.last_us\fR, \fB.max_us\fR, \fB.cancelled\fR
+Checkpoints since the open, when the last one ended, how long it took, the
+longest one, and the checkpoints that a stop left in the middle (its clean
+checkpoint flushed everything instead). The flush of the tables runs outside the
+store's writer mutex: writers go on meanwhile
 .TP 8
 \fBstore.writes.commits\fR, \fB.puts\fR, \fB.replaces\fR, \fB.deletes\fR, \fB.growths\fR, \fB.errors\fR
-Writer counters since the open
+Writer counters since the open (\fBerrors\fR counts a commit or a checkpoint
+that failed in the background too; it is tried again)
+.TP 8
+\fBstore.writes.growths_background\fR
+Of \fBgrowths\fR: the index growths that were built outside the writer mutex (a
+growth is made inside it only when the index fills up to one half before the
+build ends)
+.TP 8
+\fBstore.flusher\fR
+1: the store's flusher threads make the commits (every 100 ms while records
+wait) and the checkpoints; 0: the writers make them after their call (no thread
+could be started)
+.TP 8
+\fBstore.lock.writer_holds\fR, \fB.writer_holds_slow\fR, \fB.writer_hold_max_us\fR
+Holds of the store's writer mutex since the open, those of 1 ms or more, and the
+longest one in microseconds. No store I/O wait is made inside it (0.7): a long
+hold means CPU work of one call (an nx pass, a repair, a growth inside the
+mutex)
+.TP 8
+\fBstore.lock.records_holds\fR, \fB.records_holds_slow\fR, \fB.records_hold_max_us\fR, \fB.records_wait_max_us\fR
+The mutex that orders the writers of the records (the reconcile, the commit of a
+body, a lookup's answer): holds since the start, those of 1 ms or more, the
+longest hold and the longest wait for it, in microseconds (the line is there
+when a loader is running)
 .TP 8
 \fBstore.recovery.created\fR, \fB.was_clean\fR, \fB.used_older_super\fR, \fB.rebuilt\fR, \fB.journals_read\fR, \fB.records_replayed\fR, \fB.journal_torn\fR, \fB.rebuilt_zones\fR, \fB.dropped_zones\fR, \fB.open_us\fR
 What the last open found and did, and how long it took
@@ -847,6 +891,73 @@ Zones that a worker attached and a store thread then registered / found in
 memory already, changed or gone (dropped: the answer the worker gave was the
 version the record had)
 .TP 8
+\fBstore.lookup.available\fR, \fB.ready\fR
+0.7, the lookups of the first start (a query for a name that no stored zone
+covers while a view's first pass has not listed every zone): 1 when the figures
+below are there; 1 when the loader answers lookups
+.TP 8
+\fBstore.lookup.asked\fR, \fB.found\fR, \fB.none\fR, \fB.failed\fR
+Requests of the workers that the ingest thread took; how they ended: a zone was
+found and recorded, no zone, a failure (the loader's error, no answer within the
+time, a zone that does not enclose the name)
+.TP 8
+\fBstore.lookup.pending\fR, \fB.pending_peak\fR, \fB.in_flight\fR
+Lookups that wait for a place of \fBfetch\-concurrency\fR now, the most that
+waited, lookups out now (with the bodies that came with them: at most three
+quarters of the places)
+.TP 8
+\fBstore.lookup.take_fail\fR
+How often a worker could not make the request of a lookup because its ring to
+the ingest thread was full: the query stays parked as pending and the worker
+asks again, it is not refused
+.TP 8
+\fBstore.lookup.body_inline\fR
+Zones whose body came with the answer of the lookup (FETCH_REQ mode 3: one round
+trip) and was taken
+.TP 8
+\fBstore.lookup.bad_body\fR, \fB.refused\fR, \fB.same_name\fR, \fB.covered\fR, \fB.shed\fR, \fB.expired\fR
+Bodies thrown away because the answer did not announce them (before the answer,
+another zone or id, a second one); requests not made (no loader that looks up, a
+view without database zones); the same name already on its way; the zone of the
+name was known when it was to go; dropped because the queue was full; dropped
+because they waited \fBpark\-timeout\fR
+.TP 8
+\fBstore.lookup.drop.room\fR, \fB.drop.timeout\fR, \fB.drop.queue\fR, \fB.servfail\fR
+0.7: queries that were dropped (nothing is answered, like a query that
+\fBrate\-limit\fR drops; a TCP connection stays open and its next message is
+read) because the lookup found no room in the worker's park table, its
+\fBpark\-timeout\fR was up before the lookup was answered, or the ingest thread
+dropped the lookup (its queue was full, or it waited there until its time was
+up); and queries answered SERVFAIL + EDE 14 because their lookup failed
+.TP 8
+\fBstore.lookup.remembered\fR, \fB.reask_suppressed\fR, \fB.remember_releases\fR
+0.7: names whose lookup the ingest thread shed (its queue was full, they waited
+there until \fBpark\-timeout\fR, or the loader said it was busy) and put in the
+table of the shed names; queries for such a name that their worker dropped at
+once, with no request, because the request would be shed again (also a drop,
+like \fB.drop.*\fR); times the names were forgotten before their time because
+the ingest thread had caught up (its queue was empty and a place free; at most
+eight times in a \fBpark\-timeout\fR). A name is remembered for
+\fBpark\-timeout\fR
+.TP 8
+\fBstore.lookup.drain.passes\fR, \fB.drain.cut\fR, \fB.drain.pass_max\fR, \fB.drain.pass_max_us\fR
+The passes of the ingest thread over the workers' rings and queues that handled
+a request (a pass runs about 1 ms and then serves the loader's answers); how
+many ended at that time slice with work left; the most requests one pass handled
+and the longest one ran (microseconds), since the start. A \fBpass_max\fR of a
+few thousand with \fBstore.lookup.take_fail\fR and \fBdrop.room\fR still rising
+means the thread does not keep up
+.TP 8
+\fBstore.park.drop.room\fR, \fB.drop.timeout\fR, \fB.drop.queue\fR
+The same for a query that waits for a zone that is out of memory: the park table
+was full (\fBpark\-max\fR), its \fBpark\-timeout\fR was up before the zone was
+there, the wait queue of the ingest thread was full
+.TP 8
+\fBstore.lookup.rtt.p50_us\fR, \fB.p99_us\fR, \fB.max_us\fR, \fB.rtt.hist.*\fR
+The time from the request to the answer (without the body), as the attach times:
+the upper bound of the bucket that holds the percentile, the longest, the
+buckets (<= 1 us, <= 2 us, ... in the JSON and \fB\-k\fR forms)
+.TP 8
 \fBstore.hot.state\fR, \fB.listed\fR, \fB.attached\fR, \fB.skipped\fR, \fB.written_at_stop\fR, \fB.threads\fR, \fB.attached_per_s\fR
 0.7: the hot list of the store: \fBnone\fR, \fBattaching\fR, \fBdone\fR,
 \fBhigh\-mark\fR (stopped at the high mark of \fBmemory\-limit\fR) or \fBoff\fR
@@ -854,9 +965,11 @@ version the record had)
 and the ones it skipped (in memory already, not stored, or that could not be
 attached); the ids written at the last stop (this run); the threads of the list
 (three quarters of the store threads, at most six; they give the attach requests
-of waiting queries at most 0.4 ms before each batch of 32 zones) and the zones a
-second they attached, from the start of the list to now (to its end once it has
-ended)
+of waiting queries at most 0.4 ms before each batch of 32 zones, and only while
+the store threads are taking requests in hand) and the zones a second they
+attached, from the start of the list to now (to its end once it has ended); the
+ids written at the stop are the zones that have answered a query since they came
+into memory
 .TP 8
 \fBstore.compact.runs\fR, \fB.moved_records\fR, \fB.moved_bytes\fR, \fB.segments_freed\fR, \fB.last_unix\fR
 The cleaner (since the open): segments it began to clean, records and bytes it
@@ -1019,6 +1132,47 @@ the start: bodies brought, failed, asked for and not here yet
 .TP 8
 \fBstore.recon.changes.upserts\fR, \fB.deletes\fR
 Entries of the change log applied (upserts and deletes)
+.TP 8
+\fBstore.recon.thread\fR, \fB.busy_pct\fR, \fB.entries_per_s\fR, \fB.queued\fR, \fB.apply_ns_per_entry\fR
+0.7, the reconcile thread (the pages of a manifest pass are decoded and recorded
+on a thread of their own, not on the one that answers the fetches and the
+lookups): 1 when it runs; the share of the last second it was busy, the entries
+it applied a second in that second, the pages that wait for it now (a ring of 8;
+the thread that reads the stream stops reading when it is full), the wall time
+of the apply of an entry (records in groups of up to 64) in the last second that
+had entries
+.TP 8
+\fBstore.recon.thread_entries\fR, \fB.thread_pages\fR, \fB.ring_full_stops\fR
+Since the start: entries and pages the thread applied; how often the thread that
+reads the stream held a page back because the ring was full (the loader's socket
+then fills and the loader waits: the stream is not read, the fetch stream is
+served all the time)
+.TP 8
+\fBstore.recon.group_records\fR, \fB.group_entries\fR
+Journal records the store wrote for groups of entries (one record, one hold of
+the writer's mutex and one decision of the commit for up to 64 new zones) and
+the entries they carried: the entries of a first fill are about 64 to a record,
+and a record that is cut off by a crash is dropped whole
+.TP 8
+\fBstore.ingest.loop_max_us\fR, \fB.stream_max_us\fR
+The longest pass of the ingest thread's loop and the longest read of the
+loader's first stream (the frames of a pass are copies for the reconcile thread,
+so this is short whatever the pass is) in the last 10 to 20 seconds, in
+microseconds. The loop has the bodies of the fill as well (they are built on
+that thread with \fBingest\-threads 1\fR) and the commit at the end of a batch
+.TP 8
+\fBstore.fill.images\fR, \fB.image_bytes\fR, \fB.validate_ns\fR, \fB.validate_ns_per_image\fR
+0.7: zone images the Backend took from the loader since the start (a first fill,
+a reload, a fetch), their size in bytes, the time spent in
+\fBzone_image_validate_ex()\fR (the check that every image passes before it is
+stored or served) in nanoseconds in all and per image
+.TP 8
+\fBstore.fill.invalid\fR, \fB.store_only\fR, \fB.resident\fR
+Images refused by that check (the zone is rejected, \fBkarictl dbstatus
+<zone>\fR says why); images of a zone that was not in memory, which went to the
+store as they are (a background fill: no entry, no registry change; the zone is
+attached from its record when the first query comes); images installed as the
+zone's version in memory
 .TP 8
 \fBstore.recon.guard.held_views\fR
 Views whose sweep the mass-delete guard holds back (0 normally). With 1 or more:

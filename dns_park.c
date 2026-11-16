@@ -187,6 +187,13 @@ static void wait_leave(park_table_t *t, park_entry_t *e) {
   unsent_remove(t, e);
 }
 
+/* the mark of a lookup goes (the answer, the failure, the release of the entry) */
+static void lookup_unmark(park_table_t *t, park_entry_t *e) {
+  if (!e->lookup) return;
+  e->lookup = 0;
+  t->nlook--;
+}
+
 static void done_enter(park_table_t *t, park_entry_t *e, park_state_t st) {
   e->state = (uint8_t)st;
   t->nwait--;
@@ -289,7 +296,7 @@ uint32_t park_wake_key(park_table_t *t, uint64_t key) {
     e->hnext = 0;
     wheel_remove(t, e);
     unsent_remove(t, e);
-    e->lookup = 0;                                       /* (the answer of a lookup, or any other wake by the name) */
+    lookup_unmark(t, e);                                 /* (the answer of a lookup, or any other wake by the name) */
     done_enter(t, e, PARK_READY);
     t->n_woken++;
     n++;
@@ -317,9 +324,30 @@ uint32_t park_fail_key(park_table_t *t, uint64_t key) {
     e->hnext = 0;
     wheel_remove(t, e);
     unsent_remove(t, e);
-    e->lookup = 0;
+    e->end = PARK_END_FAIL;                              /* (the mark of a lookup stays: the worker answers a failed lookup "not ready"; the release clears it) */
     done_enter(t, e, PARK_TIMEOUT);
     t->n_failed++;
+    n++;
+  }
+  return n;
+}
+
+uint32_t park_drop_key(park_table_t *t, uint64_t key) {
+  if (!t->e || t->nwait == 0) return 0;
+  uint32_t n = 0;
+  uint32_t *p = &t->bucket[key & t->bmask];
+  while (*p) {
+    park_entry_t *e = ENT(t, *p);
+    if (e->key != key) {
+      p = &e->hnext;
+      continue;
+    }
+    *p = e->hnext;
+    e->hnext = 0;
+    wheel_remove(t, e);
+    unsent_remove(t, e);
+    e->end = PARK_END_DROP;
+    done_enter(t, e, PARK_TIMEOUT);
     n++;
   }
   return n;
@@ -395,8 +423,9 @@ void park_mark_attach(park_table_t *t, int32_t idx, int64_t now_ns, int64_t full
 }
 
 void park_mark_lookup(park_table_t *t, int32_t idx) {
-  if (!t->e || idx < 0 || (uint32_t)idx >= t->cap || t->e[idx].state != PARK_WAIT) return;
+  if (!t->e || idx < 0 || (uint32_t)idx >= t->cap || t->e[idx].state != PARK_WAIT || t->e[idx].lookup) return;
   t->e[idx].lookup = 1;
+  t->nlook++;
 }
 
 uint32_t park_wake_all(park_table_t *t) {
@@ -431,6 +460,7 @@ static void wheel_slot_expire(park_table_t *t, uint32_t s, int64_t now_ms, uint3
         wheel_add(t, e);
       } else {
         wait_leave(t, e);
+        e->end = PARK_END_TIME;
         done_enter(t, e, PARK_TIMEOUT);
         (*n)++;
       }
@@ -477,6 +507,7 @@ static void pend_abandon(park_table_t *t, park_entry_t *e) {
 void park_release(park_table_t *t, park_entry_t *e) {
   if (!t->e || e < t->e || e >= t->e + t->cap || e->state == PARK_FREE) return;
   if (e->pend) pend_abandon(t, e);
+  lookup_unmark(t, e);
   if (e->state == PARK_WAIT) {
     wait_leave(t, e);
     t->nwait--;
@@ -695,6 +726,19 @@ void park_wake_queue_all(const char *view, const char *zone, bool failed) {
   if (!key_fits(view, zone, &vl, &zl)) return;
   const uint64_t key = name_key(view, zone);
   for (int w = 0; w < PARK_MAX_WORKERS; w++) wake_key_one(w, key, failed, false, false, 0);
+}
+
+void park_wake_queue_drop_all(const char *view, const char *zone) {
+  size_t vl, zl;
+  if (!key_fits(view, zone, &vl, &zl)) return;
+  const uint64_t key = name_key(view, zone);
+  for (int w = 0; w < PARK_MAX_WORKERS; w++) wake_key_one(w, key, false, false, false, PARK_ASK_DROP);
+}
+
+void park_wake_queue_drop_one(int w, const char *view, const char *zone) {
+  size_t vl, zl;
+  if (!key_fits(view, zone, &vl, &zl)) return;
+  wake_key_one(w, name_key(view, zone), false, false, false, PARK_ASK_DROP);
 }
 
 /* the workers of the set: workers 0..30 by their bit, bit 31 every worker from 31 up (a set that park_att_take() returns has the bits 15..31 all set for a worker of 15 and up) */
@@ -1124,6 +1168,11 @@ static _Atomic uint64_t g_claim[PARK_CLAIM_SLOTS];       /* 0: free */
 
 uint64_t park_claim_key(const char *view, const char *zone) { return name_key(view, zone); }
 
+/* a lookup's claim lives in a space of its own (the salt is the one park_bg_attach() uses for its table) */
+uint64_t park_lookup_claim_key(const char *view, const char *name) { return (name_key(view, name) ^ 0x9E3779B97F4A7C15ull) | 1; }
+
+static _Atomic uint64_t g_claim_w[PARK_CLAIM_SLOTS][PARK_MAX_WORKERS / 64];        /* the workers that asked for the claim in the slot (512 KB, untouched until a claim is marked) */
+
 static size_t claim_slot(uint64_t key, unsigned j) { return (size_t)(((key >> 8) + j) & (PARK_CLAIM_SLOTS - 1u)); }
 
 bool park_claim_held(uint64_t key) {
@@ -1145,13 +1194,51 @@ bool park_claim_mark(uint64_t key) {
 
 void park_claim_clear(uint64_t key) {
   for (unsigned j = 0; j < PARK_CLAIM_WIN; j++) {
-    _Atomic uint64_t *s = &g_claim[claim_slot(key, j)];
+    const size_t si = claim_slot(key, j);
+    _Atomic uint64_t *s = &g_claim[si];
+    if (atomic_load_explicit(s, memory_order_acquire) == key)           /* (only the owner of a slot clears it: the set of workers goes with the claim; a worker that notes itself later leaves a bit that costs one more wake) */
+      for (unsigned k = 0; k < PARK_MAX_WORKERS / 64; k++) atomic_store_explicit(&g_claim_w[si][k], 0, memory_order_relaxed);
     uint64_t v = key;
     (void)atomic_compare_exchange_strong_explicit(s, &v, 0, memory_order_acq_rel, memory_order_relaxed);
   }
 }
 
 void park_claim_release(const char *view, const char *zone) { park_claim_clear(name_key(view, zone)); }
+
+void park_claim_note_worker(uint64_t key, int w) {
+  if (key == 0 || w < 0 || w >= PARK_MAX_WORKERS) return;
+  for (unsigned j = 0; j < PARK_CLAIM_WIN; j++) {
+    const size_t si = claim_slot(key, j);
+    if (atomic_load_explicit(&g_claim[si], memory_order_acquire) == key) {
+      atomic_fetch_or_explicit(&g_claim_w[si][w / 64], 1ull << (w % 64), memory_order_relaxed);
+      return;
+    }
+  }
+}
+
+/* the end of the request a claim stands for is told to the workers that asked for it, to every worker when nothing is known (see park_lookup_claim_key() in dns_park.h).  The key of the entries is the name's: name_key(). */
+void park_wake_queue_claim(const char *view, const char *zone, uint64_t ckey, bool failed, uint8_t ask) {
+  size_t vl, zl;
+  if (!key_fits(view, zone, &vl, &zl)) return;
+  const uint64_t key = name_key(view, zone);
+  uint64_t m[PARK_MAX_WORKERS / 64] = {0};
+  bool known = false;
+  for (unsigned j = 0; ckey && j < PARK_CLAIM_WIN && !known; j++) {
+    const size_t si = claim_slot(ckey, j);
+    if (atomic_load_explicit(&g_claim[si], memory_order_acquire) != ckey) continue;
+    for (unsigned k = 0; k < PARK_MAX_WORKERS / 64; k++) {
+      m[k] = atomic_load_explicit(&g_claim_w[si][k], memory_order_relaxed);
+      if (m[k]) known = true;
+    }
+    break;
+  }
+  if (!known) {
+    for (int w = 0; w < PARK_MAX_WORKERS; w++) wake_key_one(w, key, failed, false, false, ask);
+    return;
+  }
+  for (unsigned k = 0; k < PARK_MAX_WORKERS / 64; k++)
+    for (uint64_t b = m[k]; b; b &= b - 1) wake_key_one((int)(k * 64 + (unsigned)__builtin_ctzll(b)), key, failed, false, false, ask);
+}
 
 void park_stats_get(park_stats_t *out) {
   out->full = atomic_load_explicit(&g_park_full, memory_order_relaxed);
@@ -1288,24 +1375,93 @@ bool park_fetch_next(park_fetch_req_t *out) {
   return false;
 }
 
-/* ------------------------------------------------------------------ the by-name lookups in flight (0.7, dns_park.h) */
-static _Atomic uint32_t g_lookups;
-static _Atomic uint32_t g_lookup_lim = PARK_LOOKUP_MAX;
+/* ------------------------------------------------------------------ the by-name lookups (0.7, dns_park.h) */
+static _Atomic uint64_t g_lookup_take_fail;
+static _Atomic uint64_t g_park_cnt[PARK_CNT_N];
+void park_cnt_note(int what) {
+  if (what >= 0 && what < PARK_CNT_N) atomic_fetch_add_explicit(&g_park_cnt[what], 1, memory_order_relaxed);
+}
+uint64_t park_cnt_get(int what) { return what >= 0 && what < PARK_CNT_N ? atomic_load_explicit(&g_park_cnt[what], memory_order_relaxed) : 0; }
 
-bool park_lookup_take(void) {
-  uint32_t v = atomic_load_explicit(&g_lookups, memory_order_relaxed);
-  const uint32_t lim = atomic_load_explicit(&g_lookup_lim, memory_order_relaxed);
-  while (v < lim) {
-    if (atomic_compare_exchange_weak_explicit(&g_lookups, &v, v + 1, memory_order_acq_rel, memory_order_relaxed)) return true;
+/* the entries that wait for a lookup may take three quarters of the table: the rest is for the queries that wait for a zone (a flood of names that no zone has fills no more than that) */
+bool park_lookup_room(const park_table_t *t) { return t->e && t->nlook < t->cap - t->cap / 4; }
+void park_lookup_note_take_fail(void) { atomic_fetch_add_explicit(&g_lookup_take_fail, 1, memory_order_relaxed); }
+uint64_t park_lookup_take_fails(void) { return atomic_load_explicit(&g_lookup_take_fail, memory_order_relaxed); }
+
+/* ---- the shed names (0.7, dns_park.h) ----
+ * One word per slot: the high 32 bits of the lookup claim key of the name, the low 32 bits of the time (ms) it was remembered; 0 is a free slot.  The ingest thread is the only writer; a worker that reads a
+ * word sees a slot as it was before or after a write (one atomic word), and a name that is not told held, or is held a moment too long, costs one more ask or one more drop, never a wrong answer.  A name is
+ * looked for in PARK_SHED_WIN slots from where its key points.  The key's high half is a hash of the name, 32 bits of it: two names that share it and a window are told held for each other, which drops one
+ * query for the time of the entry, at a chance of about 2^-29 per query, and no more than the shed drops it already.  The table is 2 MB of address space; its pages are touched as names are remembered.
+ * An entry is live while its age is under the ttl and it was remembered after the last release (g_shed_floor).  The time compare is modulo 2^32 and a stamp a few ms ahead of the reader's clock (another
+ * thread's reading) is age 0. */
+#define PARK_SHED_SLOTS 262144u                          /* (a power of two) */
+#define PARK_SHED_WIN 8u
+static _Atomic uint64_t g_shed[PARK_SHED_SLOTS];
+static _Atomic int64_t g_shed_floor;                     /* the names remembered before this time (ms) are released */
+static _Atomic uint32_t g_shed_ttl;                      /* ms, 0: nothing is remembered */
+static _Atomic uint64_t g_shed_n, g_shed_rel, g_shed_since;
+
+void park_shed_set_ttl(uint32_t ms) { atomic_store_explicit(&g_shed_ttl, ms, memory_order_relaxed); }
+
+/* the age (ms) of the entry w at now, or -1 when the entry is not live */
+static int64_t shed_age(uint64_t w, int64_t now, uint32_t ttl, int64_t floor) {
+  int32_t d = (int32_t)((uint32_t)now - (uint32_t)w);
+  if (d < -1000 || d >= (int64_t)ttl) return -1;         /* (more than a second ahead: a stamp of another age, not the future) */
+  if (d < 0) d = 0;
+  if (now - d < floor) return -1;                        /* released */
+  return d;
+}
+
+bool park_shed_held(uint64_t key, int64_t now_ms) {
+  const uint32_t ttl = atomic_load_explicit(&g_shed_ttl, memory_order_relaxed);
+  if (ttl == 0) return false;
+  const int64_t floor = atomic_load_explicit(&g_shed_floor, memory_order_relaxed);
+  const uint64_t tag = key >> 32;
+  for (unsigned j = 0; j < PARK_SHED_WIN; j++) {
+    const uint64_t w = atomic_load_explicit(&g_shed[claim_slot(key, j)], memory_order_relaxed);
+    if (w != 0 && (w >> 32) == tag) return shed_age(w, now_ms, ttl, floor) >= 0;
   }
   return false;
 }
 
-void park_lookup_give(void) {
-  uint32_t v = atomic_load_explicit(&g_lookups, memory_order_relaxed);
-  while (v > 0 && !atomic_compare_exchange_weak_explicit(&g_lookups, &v, v - 1, memory_order_acq_rel, memory_order_relaxed)) {
-  }                                                      /* (never below 0: a place given back twice does not make room) */
+void park_shed_remember(uint64_t key, int64_t now_ms) {
+  const uint32_t ttl = atomic_load_explicit(&g_shed_ttl, memory_order_relaxed);
+  if (ttl == 0) return;
+  const int64_t floor = atomic_load_explicit(&g_shed_floor, memory_order_relaxed);
+  const uint64_t tag = key >> 32;
+  size_t pick = 0, oldest = 0;
+  bool have_pick = false;
+  int64_t oldest_age = -1;
+  for (unsigned j = 0; j < PARK_SHED_WIN; j++) {
+    const size_t si = claim_slot(key, j);
+    const uint64_t w = atomic_load_explicit(&g_shed[si], memory_order_relaxed);
+    if (w != 0 && (w >> 32) == tag) {                    /* the name is there: its time is renewed */
+      pick = si;
+      have_pick = true;
+      break;
+    }
+    const int64_t age = w == 0 ? -1 : shed_age(w, now_ms, ttl, floor);
+    if (age < 0) {                                       /* free, over, or released: it can take the name (the first one does) */
+      if (!have_pick) {
+        pick = si;
+        have_pick = true;
+      }
+    } else if (age > oldest_age) {
+      oldest_age = age;
+      oldest = si;
+    }
+  }
+  if (!have_pick) pick = oldest;                         /* (every slot of the window is live: the oldest name makes room) */
+  atomic_store_explicit(&g_shed[pick], (tag << 32) | (uint32_t)now_ms, memory_order_relaxed);
+  atomic_fetch_add_explicit(&g_shed_n, 1, memory_order_relaxed);
+  atomic_fetch_add_explicit(&g_shed_since, 1, memory_order_relaxed);
 }
 
-uint32_t park_lookup_used(void) { return atomic_load_explicit(&g_lookups, memory_order_relaxed); }
-void park_lookup_set_limit(uint32_t limit) { atomic_store_explicit(&g_lookup_lim, limit, memory_order_relaxed); }
+void park_shed_release(int64_t now_ms) {
+  atomic_store_explicit(&g_shed_floor, now_ms + 1, memory_order_relaxed);
+  if (atomic_exchange_explicit(&g_shed_since, 0, memory_order_relaxed) != 0) atomic_fetch_add_explicit(&g_shed_rel, 1, memory_order_relaxed);
+}
+
+uint64_t park_shed_remembered(void) { return atomic_load_explicit(&g_shed_n, memory_order_relaxed); }
+uint64_t park_shed_releases(void) { return atomic_load_explicit(&g_shed_rel, memory_order_relaxed); }

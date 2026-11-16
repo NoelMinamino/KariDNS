@@ -76,6 +76,10 @@ bool db_store_enabled(void);
  * the thread waits for the attach requests of queries, takes at most 20,000 zones a second and stops at the high mark of memory-limit.  db_store_stop() ends it and writes the list of the zones in memory. */
 void db_store_hot_start(void);
 store_t *db_store_handle(void);
+/* 0.7: the bound of the store's journal (store_journal_wait()), for a thread that holds none of this module's locks: the reconcile thread between the groups of a pass
+ * (factor 2), the ingest thread once per pass of its loop (factor 4: it also answers the lookups, so it waits only where the bulk writer did not keep the journal down).
+ * The microseconds waited (0: none, no store). */
+uint64_t db_store_journal_wait(unsigned factor);
 
 /* ---- the ingest threads ---- */
 
@@ -114,6 +118,15 @@ enum { DBR_UNSTORABLE = -2 /* a name the store cannot hold and the heap director
 int db_recon_apply(const char *view, const db_recon_entry_t *e, uint32_t *zid);
 /* a CHANGES upsert: db_recon_apply() and the count */
 int db_recon_change(const char *view, const db_recon_entry_t *e, uint32_t *zid);
+/* the answer of a by-name lookup (the ingest thread): as db_recon_change(), and the record is marked for the pass that is going on: it is newer than the page the loader read before, so an entry of the pass does not change it and the sweep does not delete it (dns_db_store.c, lk_mark()) */
+int db_recon_lookup(const char *view, const db_recon_entry_t *e, uint32_t *zid);
+/* 0.7 M2: n entries (any n) as n calls of db_recon_apply() / db_recon_change() / db_recon_entry(), in order: res[i] and zid[i] are what the call for entry i returns (res: DBR_*) and gives back.  The records that
+ * are new are written in groups of up to 64, one journal record, one hold of the mutex of the writers of the records and one decision of the commit policy for a group (store_set_known_n()); an entry
+ * of a record that exists, a rename or an entry that has the name or the source id of one that waits in the group writes the group first, so the effect is that of the calls one after the other.  The
+ * counters of a pass are counted once per call. */
+void db_recon_apply_n(const char *view, const db_recon_entry_t *e, size_t n, int *res, uint32_t *zid);
+void db_recon_change_n(const char *view, const db_recon_entry_t *e, size_t n, int *res, uint32_t *zid);
+void db_recon_entry_n(const db_recon_entry_t *e, size_t n, int *res, uint32_t *zid);
 /* a pass over one view's source: false (why says why) when the store has no room for the view; force: the operator asked for this pass (the guard does not hold it back) */
 bool db_recon_begin(const char *view, uint64_t estimate, bool force, char *why, size_t whylen);
 /* one entry of the pass */
@@ -140,6 +153,8 @@ void db_recon_scan_retry(uint32_t zid);
 typedef store_recon_t db_recon_status_t;        /* (dns_store_status.h: the report asks for it through a function) */
 void db_recon_status(db_recon_status_t *out);
 void db_recon_note_fetch(int what, uint64_t n);   /* DBR_FETCHED, DBR_FETCH_FAILED, DBR_IN_FLIGHT (a gauge) */
+/* the reconcile thread (dns_db_recon.c) adds its own figures (store.recon.busy_pct ...) to what db_recon_status() gives; NULL: none */
+void db_recon_set_status_fn(void (*fn)(db_recon_status_t *out));
 enum { DBR_FETCHED = 0, DBR_FETCH_FAILED, DBR_IN_FLIGHT };
 
 /* ---- a fetched body is installed only for the stamp it was asked for ----
@@ -183,17 +198,19 @@ extern _Atomic bool db_store_test_not_resident;
 extern _Atomic bool db_store_test_resident;
 extern void (*_Atomic db_store_test_adopt_hook)(void);
 extern _Atomic bool db_store_test_adopt_noview;
+extern void (*_Atomic db_recon_test_entry_hook)(void);   /* called at every entry of a manifest pass (tests: an entry that takes time) */
+extern _Atomic int db_store_test_bits_fail;               /* the bit of the n-th entry of a pass cannot be set (0: off) */
 extern _Atomic int db_store_test_plog_fail;                       /* the log of a growth of the attach table that is being prepared cannot grow (the number of times) */
 extern void (*_Atomic db_store_test_prep_hook)(int where);       /* the thread that prepares the growth of the attach table calls this (where 0) after it has copied the table and before it takes the lock */
 struct dbdir_rec;
 extern void (*_Atomic db_store_test_batch_hook)(struct dbdir_rec *rec);   /* called for the record of every job of a batch of attaches just before the batch is registered */
 extern _Atomic bool db_store_test_hot_pending;                    /* the threads of hot.list see attach requests of queries that wait (tests: they are never starved by them) */
 extern void (*_Atomic db_store_test_hot_hook)(uint32_t zid);   /* called by the threads of hot.list before each zone (tests: the order, and time) */
+extern _Atomic bool db_store_test_hot_stuck;                   /* the threads of hot.list see attach requests that wait and are not served (tests: the list gives way once, not for the whole time) */
+extern _Atomic uint64_t db_store_test_hot_naps;                /* the naps the threads of hot.list took for the queries (tests) */
 #ifdef KARIDNS_UNIT_TEST
 extern int db_store_test_set_fail;                      /* the n-th set_put_slot() of the settings table fails (0: off) */
 extern int db_store_test_attach_reserve_fail;           /* the n-th reserve of room in the attach table fails (0: off) */
-extern void (*db_recon_test_entry_hook)(void);          /* called at every entry of a manifest pass (tests: an entry that takes time) */
-extern int db_store_test_bits_fail;                     /* the bit of the n-th entry of a pass cannot be set (0: off) */
 extern _Atomic(const char *) db_store_test_rec_fault_zone;   /* the store cannot read the record of this zone (name with its trailing dot; NULL: off): a damaged cell */
 #endif
 

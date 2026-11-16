@@ -242,8 +242,9 @@ stop_srv
 
 echo "== zones in memory above the hard limit of memory-limit (two big zones that a transfer holds)"
 # a zone that is being transferred is not taken out of memory and is not counted among the pinned zones, so the zones in memory stay above 110% of the limit
-# for as long as the transfers last: the request for a query waits for room that cannot be made (0.7: it is not shed; the query is answered "not ready" when park-timeout
-# is over), the walk for the apex (summaries) is not held back, and the manager brings the memory down when the transfers end
+# for as long as the transfers last: the request for a query waits for room that cannot be made (0.7: it is not shed; the query is dropped, nothing is answered, and
+# store.park.drop.timeout counts it, when park-timeout is over: never REFUSED or SERVFAIL for a zone the database may have), the walk for the apex (summaries) is not held back,
+# and the manager brings the memory down when the transfers end
 conf "notify no;" "memory-limit 1m;"
 start_srv
 perl tests/db/hold_axfr.pl 127.0.0.1 "$PORT" big.test 120 30 > "$T/hold1.out" 2>&1 &
@@ -256,7 +257,10 @@ grep -q held "$T/hold1.out" && grep -q held "$T/hold2.out" && pass "two big zone
 sleep 1
 LIM=$(stat limit); RES=$(stat resident)
 [ "$RES" -gt $((LIM / 10 * 11)) ] && pass "the zones in memory are above 110% of the limit and stay there ($RES > $LIM)" || fail "resident $RES is not over 110% of $LIM"
-[ -z "$(q www.e.test)" ] && oom e.test && pass "a query for a zone out of memory is answered not ready when park-timeout is over: its request waited for room that could not be made" || fail "www.e.test: $(q www.e.test)"
+DT0=$($KCTL store -k 2>/dev/null | sed -n 's/^store.park.drop.timeout=//p' | head -1)
+EANS=$(q www.e.test)               # (a dropped query: dag prints its timeout, not an address)
+DT1=$($KCTL store -k 2>/dev/null | sed -n 's/^store.park.drop.timeout=//p' | head -1)
+! echo "$EANS" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' && oom e.test && [ "${DT1:-0}" -gt "${DT0:-0}" ] 2>/dev/null && pass "a query for a zone out of memory is dropped when park-timeout is over (no address answered, store.park.drop.timeout $DT0 -> $DT1): its request waited for room that could not be made" || fail "www.e.test: answer '$EANS', store.park.drop.timeout $DT0 -> $DT1"
 W0=$(walks_now)
 conf "" "memory-limit 1m;"
 $KCTL reconfig > /dev/null 2>&1

@@ -929,6 +929,56 @@ static void test_scan_in(void) {
     D->close(c);
 }
 
+/* zones_with_keys_in (0.7): the keys of ids[0..n) are those of the whole table for these ids only, ascending, whatever the order or repeats of ids */
+typedef struct { int64_t v[DB_IN_MAX + 8]; size_t n; } keyset_t;
+static int keyset_add(void *ud, int64_t id) { keyset_t *k = ud; if (k->n < sizeof(k->v) / sizeof(k->v[0])) k->v[k->n++] = id; return 0; }
+static int stop_key(void *ud, int64_t id) { (void)id; ++*(size_t *)ud; return 1; }
+static bool keys_in_same(db_conn_t *c, const int64_t *ids, size_t n) {
+    keyset_t all = { .n = 0 }, in = { .n = 0 }, want = { .n = 0 };
+    int rc = D->zones_with_keys(c, keyset_add, &all);
+    rc |= D->zones_with_keys_in(c, ids, n, keyset_add, &in);
+    for (size_t i = 0; i < all.n; i++)
+        for (size_t j = 0; j < n; j++)
+            if (all.v[i] == ids[j]) {
+                want.v[want.n++] = all.v[i];
+                break;
+            }
+    bool ok = rc == 0 && in.n == want.n && memcmp(in.v, want.v, want.n * sizeof(int64_t)) == 0;
+    if (!ok) printf("    n=%zu rc=%d: %zu keys at once, %zu expected\n", n, rc, in.n, want.n);
+    return ok;
+}
+
+static void test_keys_in(void) {
+    printf("zones_with_keys_in\n");
+    Q("INSERT INTO cryptokeys (domain_id, flags, active, content) VALUES (2, 257, true, 'in-test'), (2, 256, true, 'in-test')");   /* (and the rows of the earlier tests) */
+    db_conn_t *c = open_drv(NULL);
+    if (!c) return;
+    CHECK(D->zones_with_keys_in != NULL);
+    CHECK(D->begin_snapshot(c) == 0);
+    int64_t ids[DB_IN_MAX + 1];
+    static const size_t sizes[] = { 1, 2, 3, 5, 64, 127, 128 };
+    for (size_t k = 0; k < sizeof(sizes) / sizeof(sizes[0]); k++) {
+        for (size_t i = 0; i < sizes[k]; i++) ids[i] = (int64_t)i + 1;
+        CHECK_MSG(keys_in_same(c, ids, sizes[k]), "keys of the first %zu zones", sizes[k]);
+    }
+    int64_t a[] = { 2 }, b[] = { 1 }, d[] = { 142 }, e[] = { 9999, 3, 1, 3, 2 }, g[] = { 9223372036854775807LL, -5, 0 };
+    CHECK(keys_in_same(c, a, 1) && keys_in_same(c, b, 1) && keys_in_same(c, d, 1) && keys_in_same(c, e, 5) && keys_in_same(c, g, 3));
+    keyset_t ks = { .n = 0 };
+    CHECK(D->zones_with_keys_in(c, d, 1, keyset_add, &ks) == 0 && ks.n == 0);          /* not in the database */
+    CHECK(D->zones_with_keys_in(c, e, 5, keyset_add, &ks) == 0 && ks.n >= 1 && ks.n <= 3);          /* the keys of 1, 2, 3 that exist */
+    ks.n = 0;
+    CHECK(D->zones_with_keys_in(c, a, 1, keyset_add, &ks) == 0 && ks.n == 1 && ks.v[0] == 2);          /* two rows, one key */
+    for (size_t i = 0; i < DB_IN_MAX + 1; i++) ids[i] = (int64_t)i + 1;
+    size_t cnt = 0;
+    CHECK(D->zones_with_keys_in(c, ids, 10, stop_key, &cnt) == DB_STOPPED && cnt == 1);
+    CHECK(keys_in_same(c, ids, 10));
+    CHECK(D->zones_with_keys_in(c, ids, 0, keyset_add, &ks) == -1 && strstr(D->errmsg(c), "scan_*_in") != NULL);
+    CHECK(D->zones_with_keys_in(c, ids, DB_IN_MAX + 1, keyset_add, &ks) == -1);
+    D->end_snapshot(c);
+    D->close(c);
+    Q("DELETE FROM cryptokeys WHERE content = 'in-test'");
+}
+
 static void test_search_path(void) {
     printf("schema (search_path)\n");
     Q("CREATE SCHEMA karidns_test_s1");
@@ -2474,6 +2524,7 @@ int main(int argc, char **argv) {
     test_zone_soa();
     test_ext_and_profiles();
     test_scan_in();
+    test_keys_in();
     test_search_path();
     test_changes();
     test_notify();

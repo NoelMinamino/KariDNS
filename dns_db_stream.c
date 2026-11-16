@@ -15,6 +15,9 @@
 #include <sys/stat.h>
 #include "dns_db_stream.h"
 #include "dns_utils.h"
+#include "dns_zone_image.h"      /* the header of an image: magic, version, size, n_rrs (ZONE_IMAGE messages, 0.7 M3) */
+
+_Static_assert(sizeof(zone_image_t) % 8 == 0 && sizeof(zone_image_t) < KDB_MAX_BODY, "KDB_T_ZONE_IMAGE: the first message holds the whole header of the image");
 
 static inline uint16_t be16(const uint8_t *p) { return (uint16_t)((p[0] << 8) | p[1]); }
 static inline uint32_t be32(const uint8_t *p) {
@@ -49,15 +52,16 @@ struct kdb_tdef { const char *name; uint8_t n; const kdb_tspec_t *spec; };
     _Static_assert(sizeof(arr) / sizeof((arr)[0]) <= KDB_MAX_TAGS, "kdb_val_t arrays are KDB_MAX_TAGS long: " nm); \
     static const kdb_tdef_t var = { nm, (uint8_t)(sizeof(arr) / sizeof((arr)[0])), arr }
 
-static const kdb_tspec_t sp_hello[] = { S(KT_U16, KS_REQ, 0), S(KT_STR, KS_REQ, 64), S(KT_STR, KS_REQ, 32), S(KT_U32, KS_REQ, 0), S(KT_U32, 0, 0) };
+static const kdb_tspec_t sp_hello[] = { S(KT_U16, KS_REQ, 0), S(KT_STR, KS_REQ, 64), S(KT_STR, KS_REQ, 32), S(KT_U32, KS_REQ, 0), S(KT_U32, 0, 0), S(KT_U32, 0, 0) };
 static const kdb_tspec_t sp_batch_begin[] = { S(KT_U64, KS_REQ, 0), S(KT_U8, KS_REQ | KS_MAXV, 4), S(KT_U64, KS_REQ, 0), S(KT_U64, 0, 0), S(KT_U64, 0, 0) };
 static const kdb_tspec_t sp_zone_begin[] = {
     S(KT_U16, KS_REQ | KS_VIEW, 0), S(KT_NAME, KS_REQ, 0), S(KT_I64, KS_REQ, 0), S(KT_U8, KS_REQ | KS_MAXV, 2),
-    S(KT_U32, KS_REQ, 0), S(KT_U32, KS_REQ | KS_MAXV, KDB_ZF_PRESIGNED | KDB_ZF_EXTENDED | KDB_ZF_TINYDNS | KDB_ZF_SUMMARY), S(KT_U64, KS_REQ, 0),
+    S(KT_U32, KS_REQ, 0), S(KT_U32, KS_REQ | KS_MAXV, KDB_ZF_PRESIGNED | KDB_ZF_EXTENDED | KDB_ZF_TINYDNS | KDB_ZF_SUMMARY | KDB_ZF_IMAGE), S(KT_U64, KS_REQ, 0),
     S(KT_BYTES, KS_REQ | KS_EXACT, KDB_DIGEST_LEN), S(KT_TEXT, 0, 65535), S(KT_STR, KS_NE, 255), S(KT_U64, 0, 0),
     S(KT_U32, 0, 0), S(KT_U32, 0, 0), S(KT_U32, 0, 0),
     S(KT_NAME, 0, 0), S(KT_NAME, 0, 0), S(KT_U32, KS_MAXV, 2147483647u), S(KT_U32, KS_MAXV, 2147483647u), S(KT_U32, KS_MAXV, 2147483647u),
-    S(KT_BYTES, 0, KDB_APEX_NS_BYTES), S(KT_BYTES, 0, KDB_APEX_GLUE_BYTES), S(KT_BYTES, 0, KDB_NOTIFY_ADDR_BYTES) };
+    S(KT_BYTES, 0, KDB_APEX_NS_BYTES), S(KT_BYTES, 0, KDB_APEX_GLUE_BYTES), S(KT_BYTES, 0, KDB_NOTIFY_ADDR_BYTES),
+    S(KT_U64, 0, 0) };
 static const kdb_tspec_t sp_zone_end[] = { S(KT_U64, KS_REQ, 0) };
 static const kdb_tspec_t sp_zone_abort[] = { S(KT_STR, KS_REQ, 255) };
 static const kdb_tspec_t sp_zone_failed[] = { S(KT_U16, KS_REQ | KS_VIEW, 0), S(KT_NAME, KS_REQ, 0), S(KT_I64, KS_REQ, 0), S(KT_STR, KS_REQ, 255), S(KT_U64, 0, 0) };
@@ -112,7 +116,7 @@ static const kdb_tspec_t sp_batch_result[] = {
 TDEF(td_batch_result, "BATCH_RESULT", sp_batch_result);
 static const kdb_tspec_t sp_fetch_req[] = {
     S(KT_U64, KS_REQ, 0), S(KT_U16, KS_REQ | KS_VIEW, 0), S(KT_NAME, KS_REQ, 0), S(KT_U8, KS_REQ | KS_MAXV, KDB_FETCH_PRIO_N - 1),
-    S(KT_U8, KS_REQ | KS_MAXV, KDB_FETCH_LOOKUP), S(KT_NAME, 0, 0), S(KT_NAME, 0, 0), S(KT_I64, 0, 0) };
+    S(KT_U8, KS_REQ | KS_MAXV, KDB_FETCH_LOOKUP_FULL), S(KT_NAME, 0, 0), S(KT_NAME, 0, 0), S(KT_I64, 0, 0) };
 TDEF(td_fetch_req, "FETCH_REQ", sp_fetch_req);
 /* D1a step 7: HOT_LIST (Backend -> loader) and WARM_LIST (loader -> Backend) have one layout; tag 5 is for the first, 6 and 7 for the second */
 static const kdb_tspec_t sp_hot_entry[] = { S(KT_STR, KS_REQ | KS_NE, 255), S(KT_NAME, KS_REQ, 0) };
@@ -170,7 +174,6 @@ static const kdb_mdef_t mdefs[] = {
     { KDB_T_INVENTORY_REQ, "INVENTORY_REQ", KDB_FROM_LOADER, false, KDB_MAX_BODY, &td_empty },
     { KDB_T_BATCH_BEGIN, "BATCH_BEGIN", KDB_FROM_LOADER, false, KDB_MAX_BODY, &td_batch_begin },
     { KDB_T_ZONE_BEGIN, "ZONE_BEGIN", KDB_FROM_LOADER, false, KDB_MAX_BODY, &td_zone_begin },
-    { KDB_T_ZONE_DATA, "ZONE_DATA", KDB_FROM_LOADER, true, KDB_MAX_ZONE_DATA, NULL },
     { KDB_T_ZONE_END, "ZONE_END", KDB_FROM_LOADER, false, KDB_MAX_BODY, &td_zone_end },
     { KDB_T_ZONE_ABORT, "ZONE_ABORT", KDB_FROM_LOADER, false, KDB_MAX_BODY, &td_zone_abort },
     { KDB_T_ZONE_FAILED, "ZONE_FAILED", KDB_FROM_LOADER, false, KDB_MAX_BODY, &td_zone_failed },
@@ -185,6 +188,7 @@ static const kdb_mdef_t mdefs[] = {
     { KDB_T_MANIFEST_END, "MANIFEST_END", KDB_FROM_LOADER, false, KDB_MAX_BODY, &td_manifest_end },
     { KDB_T_CHANGES, "CHANGES", KDB_FROM_LOADER, false, KDB_MAX_BODY, &td_changes },
     { KDB_T_LOOKUP_RESULT, "LOOKUP_RESULT", KDB_FROM_LOADER, false, KDB_MAX_BODY, &td_lookup_result },
+    { KDB_T_ZONE_IMAGE, "ZONE_IMAGE", KDB_FROM_LOADER, true, KDB_MAX_BODY, NULL },
     { KDB_T_CONFIG, "CONFIG", KDB_FROM_BACKEND, false, KDB_MAX_BODY, &td_config },
     { KDB_T_RELOAD_REQ, "RELOAD_REQ", KDB_FROM_BACKEND, false, KDB_MAX_BODY, &td_reload_req },
     { KDB_T_INVENTORY, "INVENTORY", KDB_FROM_BACKEND, false, KDB_MAX_BODY, &td_inventory },
@@ -226,8 +230,6 @@ const char *kdb_rc_name(kdb_rc_t rc) {
     case KDB_E_RANGE: return "value out of range";
     case KDB_E_STATE: return "message not allowed in this state";
     case KDB_E_VERSION: return "protocol version mismatch";
-    case KDB_E_DNSHDR: return "bad ZONE_DATA DNS header";
-    case KDB_E_OPT: return "OPT outside the first ZONE_DATA";
     case KDB_E_COUNT: return "RR count mismatch";
     case KDB_E_SEQ: return "batch mismatch";
     case KDB_E_LIMIT_BYTES: return "zone byte limit exceeded";
@@ -391,26 +393,12 @@ kdb_rc_t kdb_decode(const kdb_frame_t *fr, uint32_t vc, kdb_msg_t *m, char *why,
     m->type = fr->type;
     m->view_count = vc;
 
-    if (md->raw) {   /* ZONE_DATA: DNS header checks without parsing RRs (RFC 1035 4.1.1, RFC 5936 2.2) */
-        const uint8_t *b = fr->body;
-        if (fr->len < DNS_HEADER_SIZE) FAIL(why, wl, KDB_E_DNSHDR, "ZONE_DATA: %u bytes, shorter than a DNS header", fr->len);
-        uint16_t fl = be16(b + 2), qd = be16(b + 4), an = be16(b + 6), ns = be16(b + 8), ar = be16(b + 10);
-        if (!(fl & 0x8000)) FAIL(why, wl, KDB_E_DNSHDR, "ZONE_DATA: QR is not set");
-        if ((fl >> 11) & 0xF) FAIL(why, wl, KDB_E_DNSHDR, "ZONE_DATA: opcode is not QUERY");
-        if (!(fl & 0x0400)) FAIL(why, wl, KDB_E_DNSHDR, "ZONE_DATA: AA is not set (RFC 5936 2.2.1)");
-        if (fl & 0x0200) FAIL(why, wl, KDB_E_DNSHDR, "ZONE_DATA: TC is set (RFC 5936 2.2.1)");
-        if (fl & 0x000F) FAIL(why, wl, KDB_E_DNSHDR, "ZONE_DATA: RCODE is not 0");
-        if (qd != 0) FAIL(why, wl, KDB_E_DNSHDR, "ZONE_DATA: QDCOUNT is not 0");
-        if (ns != 0) FAIL(why, wl, KDB_E_DNSHDR, "ZONE_DATA: NSCOUNT is not 0 (RFC 5936 2.2.4)");
-        if (ar > 1) FAIL(why, wl, KDB_E_DNSHDR, "ZONE_DATA: ARCOUNT above 1");
-        if (an == 0) FAIL(why, wl, KDB_E_DNSHDR, "ZONE_DATA: no answer RR");
-        m->u.zone_data.body = b;
-        m->u.zone_data.len = fr->len;
-        m->u.zone_data.ancount = an;
-        m->u.zone_data.arcount = ar;
+    if (fr->type == KDB_T_ZONE_IMAGE) {   /* 0.7 M3: raw octets of a zone image; what is in them is the business of the state machine (the sum) and of zone_image_validate_ex() */
+        if (fr->len == 0) FAIL(why, wl, KDB_E_LENGTH, "ZONE_IMAGE: no octets");
+        m->u.zone_image.body = fr->body;
+        m->u.zone_image.len = fr->len;
         return KDB_OK;
     }
-
     kdb_val_t vals[KDB_MAX_TAGS];
     uint32_t nrep = 0;
     kdb_rc_t rc = tlv_parse(md->td, fr->body, fr->len, vc, vals, &nrep, why, wl);
@@ -423,6 +411,9 @@ kdb_rc_t kdb_decode(const kdb_frame_t *fr, uint32_t vc, kdb_msg_t *m, char *why,
         m->u.hello.driver = gstr(&V(3));
         m->u.hello.pid = (uint32_t)V(4).u;
         m->u.hello.features = V(5).present ? (uint32_t)V(5).u : 0;
+        m->u.hello.image_version = V(6).present ? (uint32_t)V(6).u : 0;
+        if (V(6).present != ((m->u.hello.features & KDB_FEAT_IMAGE) != 0))
+            FAIL(why, wl, KDB_E_TLV_MISSING, "HELLO: the image version (tag 6) is there exactly when the features have KDB_FEAT_IMAGE");
         break;
     case KDB_T_INVENTORY_REQ:
         break;
@@ -458,6 +449,15 @@ kdb_rc_t kdb_decode(const kdb_frame_t *fr, uint32_t vc, kdb_msg_t *m, char *why,
             z->soa_refresh = (uint32_t)V(12).u;
             z->soa_retry = (uint32_t)V(13).u;
             z->soa_expire = (uint32_t)V(14).u;
+        }
+        z->image_size = 0;
+        if (z->flags & KDB_ZF_IMAGE) {          /* 0.7 M3: the data is a zone image: its size is announced, a summary and a secondary have no data at all */
+            if (!V(23).present) FAIL(why, wl, KDB_E_TLV_MISSING, "ZONE_BEGIN: the image flag needs the image size (tag 23)");
+            if ((z->flags & KDB_ZF_SUMMARY) || z->zone_kind != KDB_ZK_PRIMARY || V(23).u == 0)
+                FAIL(why, wl, KDB_E_RANGE, "ZONE_BEGIN: the image flag on a zone that is not a primary with data, or an image of no octets");
+            z->image_size = V(23).u;
+        } else if (V(23).present) {
+            FAIL(why, wl, KDB_E_RANGE, "ZONE_BEGIN: an image size without the image flag");
         }
         z->has_apex = false;
         z->naddrs = NULL;
@@ -617,7 +617,7 @@ kdb_rc_t kdb_decode(const kdb_frame_t *fr, uint32_t vc, kdb_msg_t *m, char *why,
         r->mode = (uint8_t)V(5).u;
         r->source_id = V(8).present ? (int64_t)V(8).u : 0;
         if (r->source_id < 0) FAIL(why, wl, KDB_E_RANGE, "FETCH_REQ: negative source id");
-        if (r->mode == KDB_FETCH_LOOKUP && (V(6).present || V(7).present || V(8).present)) FAIL(why, wl, KDB_E_RANGE, "FETCH_REQ: a lookup takes no range and no source id");
+        if ((r->mode == KDB_FETCH_LOOKUP || r->mode == KDB_FETCH_LOOKUP_FULL) && (V(6).present || V(7).present || V(8).present)) FAIL(why, wl, KDB_E_RANGE, "FETCH_REQ: a lookup takes no range and no source id");
         if (V(6).present != V(7).present) FAIL(why, wl, KDB_E_TLV_MISSING, "FETCH_REQ: a range needs both range_lo and range_hi");
         if (V(6).present) {
             r->has_range = true;
@@ -1057,7 +1057,7 @@ static bool sm_legal(const kdb_sm_t *sm, uint16_t t) {
     if (sm->fetch) {
         switch (sm->state) {
         case KDB_S_READY: return t == KDB_T_ZONE_BEGIN || t == KDB_T_ZONE_FAILED || t == KDB_T_PROFILE || t == KDB_T_LOOKUP_RESULT;
-        case KDB_S_IN_ZONE: return t == KDB_T_ZONE_DATA || t == KDB_T_ZONE_END || t == KDB_T_ZONE_ABORT;
+        case KDB_S_IN_ZONE: return t == KDB_T_ZONE_IMAGE || t == KDB_T_ZONE_END || t == KDB_T_ZONE_ABORT;
         default: return false;
         }
     }
@@ -1070,7 +1070,7 @@ static bool sm_legal(const kdb_sm_t *sm, uint16_t t) {
         if (sm->man_open) return t == KDB_T_MANIFEST || t == KDB_T_MANIFEST_END;       /* WP7a: inside a pass nothing but its pages and its end */
         return t == KDB_T_ZONE_BEGIN || t == KDB_T_ZONE_FAILED || t == KDB_T_ZONE_DELETE || t == KDB_T_PROFILE ||
                t == KDB_T_BATCH_END || t == KDB_T_MANIFEST_BEGIN || t == KDB_T_CHANGES;
-    case KDB_S_IN_ZONE: return t == KDB_T_ZONE_DATA || t == KDB_T_ZONE_END || t == KDB_T_ZONE_ABORT;
+    case KDB_S_IN_ZONE: return t == KDB_T_ZONE_IMAGE || t == KDB_T_ZONE_END || t == KDB_T_ZONE_ABORT;
     case KDB_S_ERROR: break;
     }
     return false;
@@ -1079,15 +1079,44 @@ static bool sm_legal(const kdb_sm_t *sm, uint16_t t) {
 #define SMFAIL(sm, rc, ...) do { (sm)->state = KDB_S_ERROR; (sm)->fail = (rc); \
     snprintf((sm)->reason, sizeof((sm)->reason), __VA_ARGS__); return (rc); } while (0)
 
-kdb_rc_t kdb_sm_accept(kdb_sm_t *sm, const kdb_frame_t *fr, kdb_msg_t *m) {
+/* 0.7 M2: the rules of the pages and the end of a manifest pass, once for the state machine (every page decoded in the order it comes) and for the reconcile thread (kdb_man_t: the stream thread only
+ * checks that a page is legal, kdb_sm_legal_frame(), and hands it over; the thread decodes it and applies these rules) */
+static kdb_rc_t man_page_rules(uint64_t batch_id, uint16_t view, uint32_t *page, uint64_t *entries, const kdb_msg_t *m, char *why, size_t wl) {
+    if (m->u.manifest.batch_id != batch_id || m->u.manifest.view != view) { snprintf(why, wl, "MANIFEST: batch or view differs from MANIFEST_BEGIN"); return KDB_E_SEQ; }
+    if (m->u.manifest.page != *page) { snprintf(why, wl, "MANIFEST: page %u, want %u", m->u.manifest.page, *page); return KDB_E_SEQ; }
+    (*page)++;
+    *entries += m->u.manifest.n_entries;
+    return KDB_OK;
+}
+
+static kdb_rc_t man_end_rules(uint64_t batch_id, uint16_t view, uint64_t entries, const kdb_manifest_end_t *e, char *why, size_t wl) {
+    if (e->batch_id != batch_id || e->view != view) { snprintf(why, wl, "MANIFEST_END: batch or view differs from MANIFEST_BEGIN"); return KDB_E_SEQ; }
+    if (e->n_entries != entries) { snprintf(why, wl, "MANIFEST_END: n_entries differs from the entries of the pages"); return KDB_E_COUNT; }
+    return KDB_OK;
+}
+
+kdb_rc_t kdb_sm_legal_frame(kdb_sm_t *sm, uint16_t type) {
     if (sm->state == KDB_S_ERROR) return sm->fail;
-    if (!sm_legal(sm, fr->type)) SMFAIL(sm, KDB_E_STATE, "%s not allowed in state %d", kdb_type_name(fr->type), (int)sm->state);
-    kdb_rc_t rc = kdb_decode(fr, sm->lim.view_count, m, sm->reason, sizeof(sm->reason));
+    if (!sm_legal(sm, type)) SMFAIL(sm, KDB_E_STATE, "%s not allowed in state %d", kdb_type_name(type), (int)sm->state);
+    return KDB_OK;
+}
+
+void kdb_sm_defer_manifest(kdb_sm_t *sm) { sm->man_deferred = true; }
+
+kdb_rc_t kdb_sm_accept(kdb_sm_t *sm, const kdb_frame_t *fr, kdb_msg_t *m) {
+    kdb_rc_t rc = kdb_sm_legal_frame(sm, fr->type);
+    if (rc != KDB_OK) return rc;
+    rc = kdb_decode(fr, sm->lim.view_count, m, sm->reason, sizeof(sm->reason));
     if (rc != KDB_OK) { sm->state = KDB_S_ERROR; sm->fail = rc; return rc; }
 
     switch (fr->type) {
     case KDB_T_HELLO:
         if (m->u.hello.proto != KDB_VERSION) SMFAIL(sm, KDB_E_VERSION, "HELLO: protocol version %u, want %u", m->u.hello.proto, KDB_VERSION);
+        /* 0.7 M3: a zone of the database travels as a zone image, in the format of this build, or not at all (no ZONE_DATA fallback: the loader and the Backend are one package) */
+        if (!(m->u.hello.features & KDB_FEAT_IMAGE))
+            SMFAIL(sm, KDB_E_VERSION, "HELLO: the loader does not send zone images (KDB_FEAT_IMAGE is missing): it is of another version than this Backend");
+        if (m->u.hello.image_version != ZONE_IMAGE_VERSION)
+            SMFAIL(sm, KDB_E_VERSION, "HELLO: the loader builds zone images of version %u, this Backend takes version %u", m->u.hello.image_version, (unsigned)ZONE_IMAGE_VERSION);
         sm->state = KDB_S_READY;
         break;
     case KDB_T_INVENTORY_REQ:
@@ -1113,17 +1142,18 @@ kdb_rc_t kdb_sm_accept(kdb_sm_t *sm, const kdb_frame_t *fr, kdb_msg_t *m) {
         sm->man_entries = 0;
         break;
     case KDB_T_MANIFEST:
-        if (m->u.manifest.batch_id != sm->batch_id || m->u.manifest.view != sm->man_view)
-            SMFAIL(sm, KDB_E_SEQ, "MANIFEST: batch or view differs from MANIFEST_BEGIN");
-        if (m->u.manifest.page != sm->man_page) SMFAIL(sm, KDB_E_SEQ, "MANIFEST: page %u, want %u", m->u.manifest.page, sm->man_page);
-        sm->man_page++;
-        sm->man_entries += m->u.manifest.n_entries;
+        rc = man_page_rules(sm->batch_id, sm->man_view, &sm->man_page, &sm->man_entries, m, sm->reason, sizeof(sm->reason));
+        if (rc != KDB_OK) { sm->state = KDB_S_ERROR; sm->fail = rc; return rc; }
         sm->n_zones += m->u.manifest.n_entries;
         break;
     case KDB_T_MANIFEST_END:
+        /* (man_deferred: the pages did not pass through here, so the sum is the reconcile thread's to check, kdb_man_end(); the batch and the view are checked here as always) */
         if (m->u.manifest_end.batch_id != sm->batch_id || m->u.manifest_end.view != sm->man_view)
             SMFAIL(sm, KDB_E_SEQ, "MANIFEST_END: batch or view differs from MANIFEST_BEGIN");
-        if (m->u.manifest_end.n_entries != sm->man_entries) SMFAIL(sm, KDB_E_COUNT, "MANIFEST_END: n_entries differs from the entries of the pages");
+        if (!sm->man_deferred) {
+            rc = man_end_rules(sm->batch_id, sm->man_view, sm->man_entries, &m->u.manifest_end, sm->reason, sizeof(sm->reason));
+            if (rc != KDB_OK) { sm->state = KDB_S_ERROR; sm->fail = rc; return rc; }
+        }
         sm->man_open = false;
         break;
     case KDB_T_CHANGES: {
@@ -1162,35 +1192,49 @@ kdb_rc_t kdb_sm_accept(kdb_sm_t *sm, const kdb_frame_t *fr, kdb_msg_t *m) {
         if (zk == KDB_ZK_PRIMARY && summary) {
             if (n != 0) SMFAIL(sm, KDB_E_COUNT, "ZONE_BEGIN: a summary has rr_count 0, not %llu", (unsigned long long)n);
         } else if (zk == KDB_ZK_PRIMARY) {
-            if (n < 2) SMFAIL(sm, KDB_E_COUNT, "ZONE_BEGIN: rr_count %llu, an AXFR has at least two SOAs (RFC 5936 2.2)", (unsigned long long)n);
+            /* 0.7 M3: the data of a primary zone is a zone image, always (rr_count is its n_rrs, at least the SOA) */
+            if (!(m->u.zone_begin.flags & KDB_ZF_IMAGE)) SMFAIL(sm, KDB_E_STATE, "ZONE_BEGIN: the data of a primary zone is a zone image (flag KDB_ZF_IMAGE)");
         } else if (n != 0) {
             /* B7b: a secondary / catalog consumer zone carries no data (the Backend transfers it from the masters in the settings) */
             SMFAIL(sm, KDB_E_COUNT, "ZONE_BEGIN: a secondary zone has rr_count 0, not %llu", (unsigned long long)n);
         }
         if (n > sm->lim.max_zone_records) SMFAIL(sm, KDB_E_LIMIT_RECORDS, "ZONE_BEGIN: rr_count above max-zone-records");
+        sm->zone_image = false;
+        sm->zone_image_size = sm->zone_image_have = 0;
+        if (m->u.zone_begin.flags & KDB_ZF_IMAGE) {
+            /* 0.7 M3: the data is an image.  rr_count is its n_rrs (at least the SOA); the size is a cap that is checked here, before one octet of the image is read:
+             * what a zone image can hold at most (zone_image_validate() works in 32 bits), whole 8-octet units, a header and a strings area, and max-zone-bytes */
+            const uint64_t isz = m->u.zone_begin.image_size;
+            if (n < 1) SMFAIL(sm, KDB_E_COUNT, "ZONE_BEGIN: rr_count 0 for a zone image");
+            if (isz < sizeof(zone_image_t) + 8 || isz > 0xFFFFF000u || (isz & 7) != 0) SMFAIL(sm, KDB_E_RANGE, "ZONE_BEGIN: image_size is not the size of an image");
+            if (isz > sm->lim.max_zone_bytes) SMFAIL(sm, KDB_E_LIMIT_BYTES, "ZONE_BEGIN: image_size above max-zone-bytes");
+            sm->zone_image = true;
+            sm->zone_image_size = isz;
+        }
         sm->zone_rr_declared = n;
-        sm->zone_rr_sum = 0;
-        sm->zone_bytes = 0;
-        sm->zone_data_msgs = 0;
         sm->state = KDB_S_IN_ZONE;
         break;
     }
-    case KDB_T_ZONE_DATA: {
-        uint32_t len = m->u.zone_data.len;
-        /* zone_bytes <= max_zone_bytes and zone_rr_sum <= zone_rr_declared hold here: subtract, never add */
-        if ((uint64_t)len > sm->lim.max_zone_bytes - sm->zone_bytes) SMFAIL(sm, KDB_E_LIMIT_BYTES, "ZONE_DATA: zone above max-zone-bytes");
-        if (m->u.zone_data.arcount != 0 && sm->zone_data_msgs != 0)
-            SMFAIL(sm, KDB_E_OPT, "ZONE_DATA: ARCOUNT in a message after the first of the zone");
-        if ((uint64_t)m->u.zone_data.ancount > sm->zone_rr_declared - sm->zone_rr_sum)
-            SMFAIL(sm, KDB_E_COUNT, "ZONE_DATA: more RRs than ZONE_BEGIN declared");
-        sm->zone_bytes += len;
-        sm->zone_rr_sum += m->u.zone_data.ancount;
-        if (sm->zone_data_msgs < UINT32_MAX) sm->zone_data_msgs++;
+    case KDB_T_ZONE_IMAGE: {
+        const uint32_t len = m->u.zone_image.len;
+        if (!sm->zone_image) SMFAIL(sm, KDB_E_STATE, "ZONE_IMAGE: the zone did not announce an image");
+        /* zone_image_have <= zone_image_size <= max_zone_bytes hold here: subtract, never add */
+        if ((uint64_t)len > sm->zone_image_size - sm->zone_image_have) SMFAIL(sm, KDB_E_LIMIT_BYTES, "ZONE_IMAGE: more octets than ZONE_BEGIN announced");
+        if (sm->zone_image_have == 0) {
+            /* the first message: the header of the image says the same as ZONE_BEGIN, so a loader that lies about the size or the count is found before the rest comes */
+            zone_image_t h;
+            if (len < sizeof(h)) SMFAIL(sm, KDB_E_LENGTH, "ZONE_IMAGE: the first message is shorter than the header of an image");
+            memcpy(&h, m->u.zone_image.body, sizeof(h));
+            if (h.magic != ZONE_IMAGE_MAGIC || h.version != ZONE_IMAGE_VERSION) SMFAIL(sm, KDB_E_RANGE, "ZONE_IMAGE: not the header of an image of this version");
+            if ((uint64_t)h.total_size != sm->zone_image_size) SMFAIL(sm, KDB_E_COUNT, "ZONE_IMAGE: the size in the header differs from ZONE_BEGIN");
+            if ((uint64_t)h.n_rrs != sm->zone_rr_declared) SMFAIL(sm, KDB_E_COUNT, "ZONE_IMAGE: the RR count in the header differs from ZONE_BEGIN");
+        }
+        sm->zone_image_have += len;
         break;
     }
     case KDB_T_ZONE_END:
         if (m->u.zone_end.rr_count != sm->zone_rr_declared) SMFAIL(sm, KDB_E_COUNT, "ZONE_END: count differs from ZONE_BEGIN");
-        if (sm->zone_rr_sum != sm->zone_rr_declared) SMFAIL(sm, KDB_E_COUNT, "ZONE_END: ANCOUNT sum differs from the declared count");
+        if (sm->zone_image && sm->zone_image_have != sm->zone_image_size) SMFAIL(sm, KDB_E_COUNT, "ZONE_END: the image is not complete");
         sm->n_zones++;
         if (sm->fetch) sm->n_profiles = 0;
         sm->state = sm->fetch ? KDB_S_READY : KDB_S_IN_BATCH;
@@ -1211,6 +1255,26 @@ kdb_rc_t kdb_sm_accept(kdb_sm_t *sm, const kdb_frame_t *fr, kdb_msg_t *m) {
         SMFAIL(sm, KDB_E_STATE, "%s not allowed from the loader", kdb_type_name(fr->type));
     }
     return KDB_OK;
+}
+
+/* ------------------------------------------------------------------ the pages of a manifest pass, checked off the stream thread (0.7 M2) */
+void kdb_man_begin(kdb_man_t *a, uint64_t batch_id, uint16_t view, uint32_t view_count) {
+    a->batch_id = batch_id;
+    a->view = view;
+    a->page = 0;
+    a->entries = 0;
+    a->view_count = view_count;
+}
+
+kdb_rc_t kdb_man_page(kdb_man_t *a, const kdb_frame_t *fr, kdb_msg_t *m, char *why, size_t whylen) {
+    if (fr->type != KDB_T_MANIFEST) { snprintf(why, whylen, "%s is not a manifest page", kdb_type_name(fr->type)); return KDB_E_STATE; }
+    kdb_rc_t rc = kdb_decode(fr, a->view_count, m, why, whylen);
+    if (rc != KDB_OK) return rc;
+    return man_page_rules(a->batch_id, a->view, &a->page, &a->entries, m, why, whylen);
+}
+
+kdb_rc_t kdb_man_end(const kdb_man_t *a, const kdb_manifest_end_t *e, char *why, size_t whylen) {
+    return man_end_rules(a->batch_id, a->view, a->entries, e, why, whylen);
 }
 
 /* ------------------------------------------------------------------ hot list (D1a step 7, design 8.4) */

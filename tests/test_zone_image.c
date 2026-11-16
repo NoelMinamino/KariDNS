@@ -37,6 +37,7 @@
 #include "../dns_tsig_acl.h"
 #include "../dns_cidr.h"
 #include "zone_image_walk.h"
+#include <sys/wait.h>
 
 int open_via_dir_cache(const char *path, int flags, mode_t mode, bool writable) {
     (void)mode; (void)writable;
@@ -1210,6 +1211,559 @@ static void check_validate(const zone_image_t *img) {
     val_sweep(img, img->n_rrs > 20000 ? 150 : 700);
 }
 
+/* ------------------------------------------------------------------------------------------------ 0.7 M3 step 1
+ * deterministic freeze, zone_image_validate_ex() (the rules of the zone and of the stream), zone_image_check_limits() */
+
+/* the same bytes whenever and wherever the image is made: a zone with every kind of zone level table, frozen twice in this process with the stack and
+ * the heap dirtied in between, and in two children of a fork (another heap, another stack) */
+static const char *M3_PLAIN =
+    "$ORIGIN ex.test.\n$TTL 300\n@ IN SOA ns1 host 7 7200 3600 1209600 300\n@ IN NS ns1\nns1 IN A 192.0.2.1\nwww IN A 192.0.2.2\nwww IN TXT \"x\"\n";
+
+static const char *M3_TEXT =
+    "$ORIGIN ex.test.\n$TTL 300\n"
+    "@ IN SOA ns1 host 7 7200 3600 1209600 300\n@ IN NS ns1\nns1 IN A 192.0.2.1\n"
+    "$LOCATION-TAG office 192.0.2.0/24 198.51.100.0/24\n$ECS-SUBNET-TAG far 203.0.113.0/24 2001:db8::/32\n"
+    "$LOCATION office\nwww IN A 192.0.2.10\n$LOCATION \"\"\n$ECS-SUBNET far\nwww IN A 192.0.2.20\n$ECS-SUBNET \"\"\nwww IN A 192.0.2.30\n"
+    "www IN TXT \"x\"\nmail IN MX 10 www\n";
+
+static void __attribute__((noinline)) dirty_stack(void) {
+    volatile unsigned char junk[16384];
+    for (size_t i = 0; i < sizeof(junk); i++) junk[i] = (unsigned char)(0xA5 ^ i);
+}
+
+static void dirty_heap(void) {
+    void *p[64];
+    for (int i = 0; i < 64; i++) {
+        p[i] = malloc(32 + (size_t)i * 8);
+        if (p[i]) memset(p[i], 0xC3, 32 + (size_t)i * 8);
+    }
+    for (int i = 0; i < 64; i++) free(p[i]);
+}
+
+/* the zone of M3_TEXT with ECS trusted resolvers (the list the builder of an Extended AXFR has) */
+static zone_image_t *m3_det_image(void) {
+    zone_t z;
+    if (!load_zone(&z, M3_TEXT, "ex.test.", NULL, false)) return NULL;
+    z.a.bind_ecs_trusted_resolvers = calloc(2, sizeof(char *));
+    if (z.a.bind_ecs_trusted_resolvers) {
+        z.a.bind_ecs_trusted_resolvers[0] = strdup("192.0.2.0/24");
+        z.a.bind_ecs_trusted_resolvers[1] = strdup("!2001:db8::/32");
+        z.a.bind_ecs_trusted_resolver_count = 2;
+    }
+    dirty_stack();
+    dirty_heap();
+    zone_image_t *img = zone_image_freeze(&z.a, "ex.test.");
+    free_zone(&z);
+    return img;
+}
+
+static void m3_determinism(void) {
+    g_label = "determinism";
+    zone_image_t *a = m3_det_image();
+    zone_image_t *b = m3_det_image();
+    CHECK(a && b && a->total_size == b->total_size && a->zattr_len > 0);
+    if (a && b && a->total_size == b->total_size) CHECK(memcmp(a, b, a->total_size) == 0);
+    /* every zone of the corpus, twice */
+    for (int k = 0; k < 2; k++) {
+        zone_t z;
+        if (!load_zone(&z, M3_TEXT, "ex.test.", NULL, false)) break;
+        zone_image_t *c = zone_image_freeze(&z.a, "ex.test."), *d = zone_image_freeze(&z.a, "ex.test.");
+        CHECK(c && d && c->total_size == d->total_size && memcmp(c, d, c->total_size) == 0);
+        zone_image_free(c);
+        zone_image_free(d);
+        free_zone(&z);
+    }
+    /* two processes */
+    int fd[2];
+    if (a && pipe(fd) == 0) {
+        pid_t pid = fork();
+        if (pid == 0) {
+            close(fd[0]);
+            zone_image_t *c = m3_det_image();
+            size_t n = c ? c->total_size : 0, off = 0;
+            while (c && off < n) {
+                ssize_t w = write(fd[1], (const uint8_t *)c + off, n - off);
+                if (w <= 0) _exit(2);
+                off += (size_t)w;
+            }
+            _exit(c ? 0 : 1);
+        }
+        close(fd[1]);
+        uint8_t *got = malloc(a->total_size + 8);
+        size_t have = 0;
+        ssize_t r;
+        while (got && have < a->total_size + 8 && (r = read(fd[0], got + have, a->total_size + 8 - have)) > 0) have += (size_t)r;
+        close(fd[0]);
+        int st = 0;
+        if (pid > 0) waitpid(pid, &st, 0);
+        CHECK(pid > 0 && st == 0 && got && have == a->total_size && memcmp(got, a, a->total_size) == 0);
+        free(got);
+    }
+    zone_image_free(a);
+    zone_image_free(b);
+}
+
+/* ---- zone_image_validate_ex() ---- */
+static uint8_t *m3_copy(const zone_image_t *img) { return dup_block(img, img->total_size); }
+
+static zone_image_policy_t m3_pol(const zone_image_t *img, const char *apex, uint32_t serial) {
+    zone_image_policy_t p;
+    memset(&p, 0, sizeof(p));
+    p.apex = apex;
+    p.serial = serial;
+    p.rr_count = img->n_rrs;
+    p.announced_size = img->total_size;
+    p.extended = true;
+    p.tinydns = (img->flags & ZONE_IMAGE_F_TINYDNS) != 0;
+    return p;
+}
+
+static int m3_vex(const void *buf, size_t len, const zone_image_policy_t *p, char *why, size_t wl) {
+    why[0] = '\0';
+    return zone_image_validate_ex(buf, len, p, why, wl);
+}
+
+/* the image is refused and the reason names `what` */
+#define M3_NEG(buf, len, polp, what) do { char w_[300]; int r_ = m3_vex((buf), (len), (polp), w_, sizeof(w_)); \
+    CHECK(r_ != 0 && strstr(w_, (what)) != NULL); \
+    if (r_ == 0 || !strstr(w_, (what))) printf("    [%s] wanted '%s', got %d '%s'\n", g_label, (what), r_, w_); } while (0)
+#define M3_POS(buf, len, polp) do { char w_[300]; int r_ = m3_vex((buf), (len), (polp), w_, sizeof(w_)); \
+    CHECK(r_ == 0); if (r_ != 0) printf("    [%s] refused: %s\n", g_label, w_); } while (0)
+
+/* freeze text; origin = the apex.  keep_out_of_zone: the records outside the zone are kept (the zone parser would drop them) */
+static zone_image_t *m3_image_of(const char *text, const char *apex, bool tinydns, bool keep_out_of_zone) {
+    zone_t z;
+    memset(&z, 0, sizeof(z));
+    zone_arena_init(&z.a);
+    parse_error_t err;
+    memset(&err, 0, sizeof(err));
+    parse_context_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.base_dir = ".";
+    ctx.default_origin = apex;
+    ctx.is_standalone_mode = true;
+    ctx.err_out = &err;
+    ctx.shared_ttl_io = &z.root_ttl;
+    ctx.shared_ecs_tag_io = &z.root_ecs;
+    ctx.shared_loc_tag_io = &z.root_loc;
+    char *buf = arena_strdup(&z.a, text);
+    int rc = buf ? (tinydns ? parse_tinydns_data(buf, strlen(buf), &z.a, &ctx) : parse_zone_fast(buf, strlen(buf), &z.a, &ctx)) : -1;
+    zone_image_t *img = NULL;
+    if (rc >= 0) {
+        if (!keep_out_of_zone) zone_arena_drop_out_of_zone(&z.a, apex, silent_report, NULL);
+        zone_arena_drop_unencodable(&z.a, silent_report, NULL);
+        zone_arena_shrink_records(&z.a);
+        if (build_zone_index(&z.a, true) == 0) img = zone_image_freeze(&z.a, apex);
+    }
+    zone_arena_destroy(&z.a);
+    return img;
+}
+
+static void m3_validate_ex(void) {
+    g_label = "validate_ex";
+    char why[300];
+    zone_image_t *img = m3_image_of(M3_PLAIN, "ex.test.", false, false);
+    CHECK(img != NULL);
+    if (!img) return;
+    zone_image_policy_t p = m3_pol(img, "ex.test.", 7);
+    p.extended = false;
+    M3_POS(img, img->total_size, &p);
+    CHECK(zone_image_validate_ex(img, img->total_size, NULL, why, sizeof(why)) == 0);            /* no policy: zone_image_validate() */
+    p.apex = "EX.TEST";                                                                      /* the apex: any case, with or without the root dot */
+    M3_POS(img, img->total_size, &p);
+    p.apex = "ex.test.";
+
+    /* the size: announced and the limit of max-zone-bytes (also when the image is damaged: the size is looked at first) */
+    zone_image_policy_t q = p;
+    q.announced_size = img->total_size + 8;
+    M3_NEG(img, img->total_size, &q, "announced");
+    q = p; q.max_bytes = img->total_size - 8;
+    M3_NEG(img, img->total_size, &q, "max-zone-bytes");
+    q = p; q.max_bytes = img->total_size;
+    M3_POS(img, img->total_size, &q);
+    q = p; q.rr_count = img->n_rrs + 1;
+    M3_NEG(img, img->total_size, &q, "declared");
+    q = p; q.max_records = img->n_rrs - 1;
+    M3_NEG(img, img->total_size, &q, "max-zone-records");
+    q = p; q.max_records = img->n_rrs;
+    M3_POS(img, img->total_size, &q);
+    {   /* a damaged image is the validator's: the policy is not reached */
+        uint8_t *m = m3_copy(img);
+        if (m) {
+            m[0] ^= 1;
+            M3_NEG(m, img->total_size, &p, "magic");
+            free(m);
+        }
+    }
+
+    /* the zone: the apex, the owners, the class, the type */
+    q = p; q.apex = "other.test.";
+    M3_NEG(img, img->total_size, &q, "apex");
+    q = p; q.apex = "sub.ex.test.";
+    M3_NEG(img, img->total_size, &q, "apex");
+    q = p; q.serial = 8;
+    M3_NEG(img, img->total_size, &q, "serial");
+    q = p; q.tinydns = true;
+    M3_NEG(img, img->total_size, &q, "tinydns");
+    {
+        zone_image_t *o = m3_image_of("$ORIGIN ex.test.\n$TTL 300\n@ IN SOA ns1 host 7 7200 3600 1209600 300\n@ IN NS ns1\nns1 IN A 192.0.2.1\nx.other.test. IN A 192.0.2.9\n",
+                                      "ex.test.", false, true);
+        CHECK(o != NULL);
+        if (o) {
+            zone_image_policy_t po = m3_pol(o, "ex.test.", 7);
+            M3_NEG(o, o->total_size, &po, "outside the zone");
+            zone_image_free(o);
+        }
+        o = m3_image_of("$ORIGIN ex.test.\n$TTL 300\n@ IN SOA ns1 host 7 7200 3600 1209600 300\n@ IN NS ns1\nns1 IN A 192.0.2.1\nex.test.x. IN A 192.0.2.9\n",
+                        "ex.test.", false, true);     /* "x.ex.test" is below the apex, "ex.test.x." is not (a label boundary decides) */
+        CHECK(o != NULL);
+        if (o) {
+            zone_image_policy_t po = m3_pol(o, "ex.test.", 7);
+            M3_NEG(o, o->total_size, &po, "outside the zone");
+            zone_image_free(o);
+        }
+        o = m3_image_of("$ORIGIN ex.test.\n$TTL 300\n@ IN SOA ns1 host 7 7200 3600 1209600 300\n@ IN NS ns1\nns1 IN A 192.0.2.1\nsub IN SOA ns1 host 7 7200 3600 1209600 300\n",
+                        "ex.test.", false, false);
+        CHECK(o != NULL);
+        if (o) {
+            zone_image_policy_t po = m3_pol(o, "ex.test.", 7);
+            M3_NEG(o, o->total_size, &po, "SOA outside the apex");
+            zone_image_free(o);
+        }
+        o = m3_image_of("$ORIGIN ex.test.\n$TTL 300\n@ IN NS ns1\nns1 IN A 192.0.2.1\n", "ex.test.", false, false);
+        CHECK(o != NULL);
+        if (o) {
+            zone_image_policy_t po = m3_pol(o, "ex.test.", 7);
+            M3_NEG(o, o->total_size, &po, "no SOA");
+            zone_image_free(o);
+        }
+        o = m3_image_of("$ORIGIN ex.test.\n$TTL 300\nns1 IN A 192.0.2.1\n", "ex.test.", false, false);
+        CHECK(o != NULL);
+        if (o) {
+            zone_image_policy_t po = m3_pol(o, "ex.test.", 7);
+            M3_NEG(o, o->total_size, &po, "apex");           /* no data at the apex at all */
+            zone_image_free(o);
+        }
+        o = m3_image_of("$ORIGIN ex.test.\n$TTL 300\n@ IN SOA ns1 host 7 7200 3600 1209600 300\n@ IN NS ns1\nns1 IN A 192.0.2.1\nch IN CH TXT \"x\"\n",
+                        "ex.test.", false, false);
+        if (o) {                                     /* (whatever the parser makes of a CH record, an image with one is refused) */
+            bool has_ch = false;
+            for (uint32_t k = 0; k < o->n_rrs; k++) if (zone_image_rr_class(o, k) != 1) has_ch = true;
+            if (has_ch) {
+                zone_image_policy_t po = m3_pol(o, "ex.test.", 7);
+                M3_NEG(o, o->total_size, &po, "class");
+            }
+            zone_image_free(o);
+        }
+    }
+    {   /* the class and the type are read from the RR: a CHAOS RR and an ANY RR (meta type) in an otherwise valid image */
+        uint8_t *m = m3_copy(img);
+        const zone_image_t *mi = (const zone_image_t *)(const void *)m;
+        if (m) {
+            zone_image_rr_t *rr = (zone_image_rr_t *)(void *)(m + mi->off_rrs);
+            uint32_t txt = ZONE_IMAGE_NONE;
+            for (uint32_t k = 0; k < mi->n_rrs; k++) if (rr[k].type == 16) txt = k;
+            CHECK(txt != ZONE_IMAGE_NONE);
+            if (txt != ZONE_IMAGE_NONE) {
+                rr[txt].class_val = 3;
+                M3_NEG(m, img->total_size, &p, "class");
+                rr[txt].class_val = 1;
+                rr[txt].type = 255;
+                M3_NEG(m, img->total_size, &p, "cannot be zone data");
+                rr[txt].type = 41;
+                M3_NEG(m, img->total_size, &p, "cannot be zone data");
+                rr[txt].type = 0;
+                M3_NEG(m, img->total_size, &p, "cannot be zone data");
+                rr[txt].type = 16;
+                M3_POS(m, img->total_size, &p);
+            }
+            free(m);
+        }
+    }
+    zone_image_free(img);
+
+    /* the SOA RRs: several need the extended encoding, one serial, different clients, no DNSSEC beside them */
+    {
+        static const char *SET =
+            "%in:127.0.0.1\n%ex:10.0.0.0/8\n"
+            "Zss.test:ns1.in.ss.test.:h.ss.test.:5:7200:3600:1209600:300:300::in\n"
+            "Zss.test:ns1.ex.ss.test.:h.ss.test.:5:7200:3600:1209600:300:300::ex\n"
+            "Zss.test:ns1.all.ss.test.:h.ss.test.:5:7200:3600:1209600:300:300:\n"
+            "&ss.test::ns1.ss.test:300\n+ns1.ss.test:192.0.2.1:300\n'tx.ss.test:x:300\n";
+        zone_image_t *s = m3_image_of(SET, "ss.test.", true, false);
+        CHECK(s != NULL);
+        if (s) {
+            zone_image_policy_t ps = m3_pol(s, "ss.test.", 5);
+            M3_POS(s, s->total_size, &ps);
+            zone_image_policy_t pq = ps;
+            pq.extended = false;
+            M3_NEG(s, s->total_size, &pq, "extended");
+            pq = ps; pq.serial = 6;
+            M3_NEG(s, s->total_size, &pq, "serial");
+            pq = ps; pq.tinydns = false;
+            M3_NEG(s, s->total_size, &pq, "tinydns");
+            /* one SOA of the set at another serial */
+            uint8_t *m = m3_copy(s);
+            const zone_image_t *mi = (const zone_image_t *)(const void *)m;
+            if (m) {
+                zone_image_rr_t *rr = (zone_image_rr_t *)(void *)(m + mi->off_rrs);
+                for (uint32_t k = 0; k < mi->n_rrs; k++) {
+                    if (rr[k].type != 6) continue;
+                    uint8_t *rd = m + mi->off_strings + rr[k].rdata_off;
+                    rd[rr[k].rdata_len - 20 + 3] ^= 1;       /* the last octet of the serial of this SOA */
+                    M3_NEG(m, s->total_size, &ps, "serial");
+                    rd[rr[k].rdata_len - 20 + 3] ^= 1;
+                    break;
+                }
+                M3_POS(m, s->total_size, &ps);
+                /* a signature beside the set: the signature of the SOA RRset would not hold for every client */
+                for (uint32_t k = 0; k < mi->n_rrs; k++)
+                    if (rr[k].type == 16) { rr[k].type = 46; break; }          /* (an RRSIG with the RDATA of a TXT: the policy looks at the type) */
+                M3_NEG(m, s->total_size, &ps, "DNSSEC");
+                free(m);
+            }
+            zone_image_free(s);
+        }
+        /* two SOA RRs that the same clients see */
+        static const char *SAME =
+            "Zdd.test:ns1.a.dd.test.:h.dd.test.:5:7200:3600:1209600:300:300:\n"
+            "Zdd.test:ns1.b.dd.test.:h.dd.test.:5:7200:3600:1209600:300:300:\n"
+            "&dd.test::ns1.dd.test:300\n+ns1.dd.test:192.0.2.1:300\n";
+        s = m3_image_of(SAME, "dd.test.", true, false);
+        if (s) {
+            zone_image_policy_t ps = m3_pol(s, "dd.test.", 5);
+            if (zone_image_rrset_next(s, s->apex_name, 6, zone_image_name_first_rr(s, s->apex_name)) != ZONE_IMAGE_NONE) {
+                uint32_t nsoa = 0;
+                for (uint32_t k = 0; k < s->n_rrs; k++) if (zone_image_rr_type(s, k) == 6) nsoa++;
+                if (nsoa > 1) M3_NEG(s, s->total_size, &ps, "same clients");
+            }
+            zone_image_free(s);
+        }
+    }
+
+    {   /* more SOA records than a zone may have (the limit of the SOA set of the Extended AXFR) */
+        const size_t cap = 4200u * 100u;
+        char *txt = malloc(cap);
+        size_t n = 0;
+        for (int i = 0; txt && i < 4097; i++) n += (size_t)snprintf(txt + n, cap - n, "Zbig.test:ns%d.big.test.:h.big.test.:5:7200:3600:1209600:300:300:\n", i);
+        if (txt) n += (size_t)snprintf(txt + n, cap - n, "&big.test::ns1.big.test:300\n+ns1.big.test:192.0.2.1:300\n");
+        zone_image_t *s = txt ? m3_image_of(txt, "big.test.", true, false) : NULL;
+        if (s) {
+            zone_image_policy_t ps = m3_pol(s, "big.test.", 5);
+            M3_NEG(s, s->total_size, &ps, "more than 4096 SOA");
+            zone_image_free(s);
+        } else {
+            printf("  [note] the tinydns parser does not take 4097 SOA lines: the limit is not reached through it\n");
+        }
+        free(txt);
+    }
+
+    /* tinydns and tag attributes, the zone level tables, trusted resolvers */
+    {
+        zone_image_t *t = m3_image_of(M3_TEXT, "ex.test.", false, false);
+        CHECK(t != NULL && t->zattr_len > 0);
+        if (t) {
+            zone_image_policy_t pt = m3_pol(t, "ex.test.", 7);
+            M3_POS(t, t->total_size, &pt);
+            pt.extended = false;
+            M3_NEG(t, t->total_size, &pt, "extended");
+            zone_image_free(t);
+        }
+        static const char *TD =
+            "%in:127.0.0.1\n%ex:10.0.0.0/8\n"
+            ".tiny.test:127.0.0.1:ns1.tiny.test:2560\n"
+            "+act.tiny.test:192.168.1.10:300:40000000b2d05e00\n+www.tiny.test:192.168.1.10:300::in\n";
+        t = m3_image_of(TD, "tiny.test.", true, false);
+        CHECK(t != NULL);
+        if (t) {
+            zone_image_policy_t pt = m3_pol(t, "tiny.test.", 0);
+            char w2[200];
+            uint32_t ser = 0;
+            zone_image_soa_t sn;
+            if (zone_image_soa(t, zone_image_apex_soa(t), NULL, 0, NULL, 0, &sn) == 0) ser = sn.serial;
+            pt.serial = ser;
+            M3_POS(t, t->total_size, &pt);
+            pt.extended = false;
+            M3_NEG(t, t->total_size, &pt, "extended");
+            pt.extended = true; pt.tinydns = false;
+            M3_NEG(t, t->total_size, &pt, "tinydns");
+            (void)w2;
+            zone_image_free(t);
+        }
+        /* an owner spelled in two cases is an ext[] entry too, but no attribute: no extended encoding needed */
+        static const char *CASE = "$ORIGIN ex.test.\n$TTL 300\n@ IN SOA ns1 host 7 7200 3600 1209600 300\n@ IN NS ns1\nns1 IN A 192.0.2.1\nWww IN A 192.0.2.2\nwww IN TXT \"x\"\n";
+        t = m3_image_of(CASE, "ex.test.", false, false);
+        CHECK(t != NULL && t->n_ext > 0);
+        if (t) {
+            zone_image_policy_t pt = m3_pol(t, "ex.test.", 7);
+            pt.extended = false;
+            M3_POS(t, t->total_size, &pt);
+            zone_image_free(t);
+        }
+        /* ECS trusted resolvers in the image: they would stand in for the zone's own list and pass the acl-ceiling */
+        zone_t z;
+        CHECK(load_zone(&z, M3_TEXT, "ex.test.", NULL, false));
+        if (z.ok) {
+            z.a.bind_ecs_trusted_resolvers = calloc(1, sizeof(char *));
+            z.a.bind_ecs_trusted_resolvers[0] = strdup("192.0.2.0/24");
+            z.a.bind_ecs_trusted_resolver_count = 1;
+            t = zone_image_freeze(&z.a, "ex.test.");
+            CHECK(t != NULL);
+            if (t) {
+                zone_image_policy_t pt = m3_pol(t, "ex.test.", 7);
+                M3_NEG(t, t->total_size, &pt, "trusted");
+                zone_image_free(t);
+            }
+            free_zone(&z);
+        }
+        /* counts: tag definitions, their CIDRs, tinydns locations */
+        struct { const char *what; int kind; } cases[] = { { "tag definitions", 0 }, { "tag definitions", 1 }, { "CIDRs", 2 }, { "tinydns locations", 3 } };
+        for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+            for (int over = 0; over < 2; over++) {                 /* at the limit: accepted, one more: refused */
+                CHECK(load_zone(&z, M3_PLAIN, "ex.test.", NULL, false));
+                if (!z.ok) continue;
+                int kind = cases[c].kind;
+                if (kind <= 1) {
+                    int n = XFR_TAGDEF_MAX + over;
+                    ecs_tag_def_t *defs = calloc((size_t)n, sizeof(*defs));
+                    for (int i = 0; i < n; i++) {
+                        char nm[24];
+                        snprintf(nm, sizeof(nm), "t%d", i);
+                        defs[i].tag = strdup(nm);
+                    }
+                    if (kind == 0) { z.a.bind_location_tags = defs; z.a.bind_location_tag_count = n; }
+                    else { z.a.bind_ecs_tags = defs; z.a.bind_ecs_tag_count = n; }
+                } else if (kind == 2) {
+                    int n = (int)XFR_TAGDEF_CIDR_MAX + over;
+                    ecs_tag_def_t *defs = calloc(1, sizeof(*defs));
+                    defs[0].tag = strdup("big");
+                    defs[0].cidrs = calloc((size_t)n, sizeof(ecs_cidr_entry_t));
+                    defs[0].cidr_count = n;
+                    for (int i = 0; i < n; i++) {
+                        defs[0].cidrs[i].cidr = strdup("192.0.2.0/24");
+                        cidr_entry_parse(&defs[0].cidrs[i].parsed, "192.0.2.0/24");
+                    }
+                    z.a.bind_ecs_tags = defs;
+                    z.a.bind_ecs_tag_count = 1;
+                } else {
+                    int n = 4096 + over;
+                    z.a.locations = calloc((size_t)n, sizeof(tinydns_location_entry_t));
+                    for (int i = 0; i < n; i++) { z.a.locations[i].code[0] = 'a'; z.a.locations[i].code[1] = (char)('a' + i % 26); z.a.locations[i].prefix_bits = 32; }
+                    z.a.location_count = n;
+                }
+                t = zone_image_freeze(&z.a, "ex.test.");
+                CHECK(t != NULL);
+                if (t) {
+                    zone_image_policy_t pt = m3_pol(t, "ex.test.", 7);
+                    if (over) M3_NEG(t, t->total_size, &pt, cases[c].what);
+                    else M3_POS(t, t->total_size, &pt);
+                    zone_image_free(t);
+                }
+                free_zone(&z);
+            }
+        }
+    }
+}
+
+/* ---- zone_image_check_limits() against zone_arena_check_limits() ---- */
+static uint64_t g_lim_cases, g_lim_refused;
+
+static void m3_limits_cmp(const zone_arena_t *a, const zone_image_t *img, const zone_limits_t *lim) {
+    char e1[300] = "", e2[300] = "";
+    int r1 = zone_arena_check_limits(a, lim, e1, sizeof(e1));
+    int r2 = zone_image_check_limits(img, lim, e2, sizeof(e2));
+    g_lim_cases++;
+    if (r1 < 0) g_lim_refused++;
+    int ok = (r1 < 0) == (r2 < 0);
+    CHECK(ok);
+    if (!ok) printf("    [%s] limits %llu/%u/%u/%u: arena %d '%s', image %d '%s'\n", g_label, (unsigned long long)lim->max_records, lim->max_per_type,
+                    lim->max_types_per_name, lim->max_zone_ttl, r1, e1, r2, e2);
+    if (r1 < 0 && r2 < 0 && ((lim->max_records != 0) + (lim->max_per_type != 0) + (lim->max_types_per_name != 0) + (lim->max_zone_ttl != 0)) == 1) {
+        /* one limit set: both name it */
+        const char *key = lim->max_records ? "max-records " : lim->max_per_type ? "max-records-per-type" : lim->max_types_per_name ? "max-types-per-name" : "max-zone-ttl";
+        CHECK(strstr(e1, key) != NULL && strstr(e2, key) != NULL);
+    }
+}
+
+/* the limits that matter for a zone of this size and shape, one at a time and together */
+static void m3_limits_all(const zone_arena_t *a, const zone_image_t *img) {
+    zone_limits_t lim;
+    const uint64_t n = a->count;
+    const uint64_t recs[] = { 0, 1, n > 1 ? n - 1 : 1, n, n + 1 };
+    const uint32_t per[] = { 0, 1, 2, 3, 10 }, types[] = { 0, 1, 2, 3, 6, 20 }, ttls[] = { 0, 1, 60, 300, 3600, 86400, 2147483647u };
+    for (size_t i = 0; i < sizeof(recs) / sizeof(recs[0]); i++) {
+        memset(&lim, 0, sizeof(lim));
+        lim.max_records = recs[i];
+        m3_limits_cmp(a, img, &lim);
+    }
+    for (size_t i = 0; i < sizeof(per) / sizeof(per[0]); i++)
+        for (size_t j = 0; j < sizeof(types) / sizeof(types[0]); j++) {
+            memset(&lim, 0, sizeof(lim));
+            lim.max_per_type = per[i];
+            lim.max_types_per_name = types[j];
+            m3_limits_cmp(a, img, &lim);
+        }
+    for (size_t i = 0; i < sizeof(ttls) / sizeof(ttls[0]); i++) {
+        memset(&lim, 0, sizeof(lim));
+        lim.max_zone_ttl = ttls[i];
+        m3_limits_cmp(a, img, &lim);
+        lim.max_records = n;
+        lim.max_per_type = 2;
+        lim.max_types_per_name = 3;
+        m3_limits_cmp(a, img, &lim);
+    }
+}
+
+static uint64_t g_prng = 88172645463325252ull;
+static uint32_t prng(void) { g_prng ^= g_prng << 13; g_prng ^= g_prng >> 7; g_prng ^= g_prng << 17; return (uint32_t)(g_prng >> 11); }
+
+static void m3_limits_generated(void) {
+    g_label = "limits";
+    for (int iter = 0; iter < 400; iter++) {
+        char *text = malloc(1 << 20);
+        if (!text) return;
+        size_t len = (size_t)snprintf(text, 1 << 20, "$ORIGIN g.test.\n$TTL 300\n@ IN SOA ns1 host 1 7200 3600 1209600 300\n@ IN NS ns1\nns1 IN A 192.0.2.1\n");
+        unsigned owners = 1 + prng() % 30;
+        for (unsigned o = 0; o < owners && len < (1 << 20) - 512; o++) {
+            unsigned nrr = 1 + prng() % 12;
+            for (unsigned k = 0; k < nrr && len < (1 << 20) - 512; k++) {
+                unsigned t = prng() % 6;
+                unsigned ttl = (unsigned[]){ 60, 300, 3600, 86400, 300, 300 }[prng() % 6];
+                switch (t) {
+                case 0: len += (size_t)snprintf(text + len, 512, "o%u %u IN A 192.0.2.%u\n", o, ttl, prng() % 250); break;
+                case 1: len += (size_t)snprintf(text + len, 512, "o%u %u IN AAAA 2001:db8::%x\n", o, ttl, prng() % 4000); break;
+                case 2: len += (size_t)snprintf(text + len, 512, "o%u %u IN TXT \"v%u\"\n", o, ttl, prng() % 1000); break;
+                case 3: len += (size_t)snprintf(text + len, 512, "o%u %u IN MX %u mx%u\n", o, ttl, prng() % 50, prng() % 9); break;
+                case 4: len += (size_t)snprintf(text + len, 512, "o%u %u IN NS ns%u.g.test.\n", o, ttl, prng() % 9); break;
+                default: len += (size_t)snprintf(text + len, 512, "o%u %u IN TXT \"w%u\"\n", o, ttl, prng() % 1000); break;
+                }
+            }
+        }
+        zone_t z;
+        if (load_zone(&z, text, "g.test.", NULL, false)) {
+            zone_image_t *img = zone_image_freeze(&z.a, "g.test.");
+            CHECK(img != NULL);
+            if (img) {
+                m3_limits_all(&z.a, img);
+                zone_image_free(img);
+            }
+            free_zone(&z);
+        }
+        free(text);
+    }
+}
+
+static void run_m3_step1(void) {
+    printf("[TEST] M3: the image is the same bytes whenever and wherever it is made\n");
+    m3_determinism();
+    printf("[TEST] M3: zone_image_validate_ex(): every rule of the zone and of the stream\n");
+    m3_validate_ex();
+    printf("[TEST] M3: zone_image_check_limits() against zone_arena_check_limits() on generated zones\n");
+    m3_limits_generated();
+    printf("  limits: %llu cases, %llu refused\n", (unsigned long long)g_lim_cases, (unsigned long long)g_lim_refused);
+    CHECK(g_lim_cases > 15000 && g_lim_refused > 1000);
+}
+
 /* ------------------------------------------------------------------------------------------------ driver per zone */
 static int g_zones_checked = 0;
 static unsigned long g_rrs_checked = 0;
@@ -1240,6 +1794,7 @@ static void check_zone(const char *label, zone_t *z, const char *apex) {
     check_zattr(a, img);
     check_seq(a, img, map);
     check_validate(img);
+    if (!big) m3_limits_all(a, img);
 
     pass_sequence(a, img, map, 65535, MODE_PLAIN);
     if (!big) {
@@ -1930,8 +2485,192 @@ static void run_singleton_refused(void) {
     }
 }
 
+/* ---- review of 0.7 M3: the rules that every source of a zone has are checked on the image of the loader too ---- */
+static void rv_set_iterations(uint8_t *m, unsigned it) {
+    zone_image_t *H = (zone_image_t *)(void *)m;
+    H->n3_iterations = (uint16_t)it;
+    zone_image_n3chain_t *C3 = (zone_image_n3chain_t *)(void *)(m + H->off_n3chains);
+    for (uint32_t c = 0; c < H->n_n3chains; c++) C3[c].iterations = (uint16_t)it;
+    zone_image_rr_t *R = (zone_image_rr_t *)(void *)(m + H->off_rrs);
+    for (uint32_t k = 0; k < H->n_rrs; k++) {
+        if ((R[k].type != 50 && R[k].type != 51) || R[k].rdata_len < 4) continue;
+        uint8_t *rd = m + H->off_strings + R[k].rdata_off;
+        rd[2] = (uint8_t)(it >> 8);
+        rd[3] = (uint8_t)it;
+    }
+}
+
+/* the same image with a hash table of `hs` slots (a power of two): the sections behind it move up, their offsets and the size follow, the table is made again (linear probing from the hash of the name) */
+static uint8_t *rv_rehash(const zone_image_t *img, uint32_t hs, size_t *len_out) {
+    const size_t old_sz = (size_t)img->hash_size * 4, new_sz = (size_t)hs * 4;
+    const size_t o_hash = img->off_hash, o_next = o_hash + ((old_sz + 7) & ~(size_t)7), n_next = o_hash + ((new_sz + 7) & ~(size_t)7);
+    const size_t nlen = img->total_size - o_next + n_next;
+    uint8_t *b = calloc(1, nlen + 8);
+    if (!b) return NULL;
+    memcpy(b, img, o_hash);
+    memcpy(b + n_next, (const uint8_t *)img + o_next, img->total_size - o_next);
+    zone_image_t *H = (zone_image_t *)(void *)b;
+    const uint32_t d = (uint32_t)(o_next - n_next);
+    H->hash_size = hs;
+    H->off_canon -= d; H->off_nsec -= d; H->off_n3entries -= d; H->off_glue -= d;
+    if (H->off_perm) H->off_perm -= d;
+    H->off_zattr -= d; H->off_strings -= d;
+    H->total_size = (uint32_t)nlen;
+    uint32_t *tab = (uint32_t *)(void *)(b + o_hash);
+    const zone_image_name_t *N = zone_image_names(img);
+    for (uint32_t id = 0; id < img->n_names; id++) {
+        size_t s = N[id].hash & (hs - 1);
+        while (tab[s]) s = (s + 1) & (hs - 1);
+        tab[s] = id + 1;
+    }
+    *len_out = nlen;
+    return b;
+}
+
+static void m3_review_rules(void) {
+    g_label = "review";
+    char why[300];
+    static const char HDR[] = "$ORIGIN rv.test.\n$TTL 60\n@ SOA ns h 7 2 3 4 5\n@ NS ns\nns A 192.0.2.1\n";
+    char text[2000];
+    /* 14. NSEC3 iterations above 150 (RFC 9276 3.2) are refused in the structure check, so the store's attach has it too: the header, the chain and every NSEC3 / NSEC3PARAM RR carry the number and
+     *     all of them are made to say it, so that nothing but the limit is wrong */
+    snprintf(text, sizeof(text), "%s@ NSEC3PARAM 1 0 10 aabbccdd\n"
+             "0P9MHAVEQVM6T7VBL5LOP2U3T2RP3TOM NSEC3 1 1 10 aabbccdd 2T7B4G4VSA5SMI47K61MV5BV1A22BOJR A RRSIG\n"
+             "2T7B4G4VSA5SMI47K61MV5BV1A22BOJR NSEC3 1 1 10 aabbccdd 0P9MHAVEQVM6T7VBL5LOP2U3T2RP3TOM NS SOA RRSIG NSEC3PARAM\n", HDR);
+    zone_image_t *img = m3_image_of(text, "rv.test.", false, false);
+    CHECK(img != NULL && img->n_n3chains >= 1 && img->n3_param_rr != ZONE_IMAGE_NONE);
+    if (img) {
+        zone_image_policy_t p = m3_pol(img, "rv.test.", 7);
+        M3_POS(img, img->total_size, &p);
+        static const unsigned its[] = { 150, 151, 500, 65535 };
+        for (size_t i = 0; i < sizeof(its) / sizeof(its[0]); i++) {
+            uint8_t *m = m3_copy(img);
+            CHECK(m != NULL);
+            if (!m) continue;
+            rv_set_iterations(m, its[i]);
+            if (its[i] <= 150) {
+                M3_POS(m, img->total_size, &p);
+            } else {
+                M3_NEG(m, img->total_size, &p, "iterations");
+                CHECK(zone_image_validate(m, img->total_size, why, sizeof(why)) != 0 && strstr(why, "iterations") != NULL);     /* (the structure check has it: the store scrub and every attach) */
+                /* each place alone is enough */
+                uint8_t *m2 = m3_copy(img);
+                zone_image_t *H = (zone_image_t *)(void *)m2;
+                zone_image_rr_t *R = (zone_image_rr_t *)(void *)(m2 + H->off_rrs);
+                for (uint32_t k = 0; k < H->n_rrs; k++)
+                    if (R[k].type == 50 && R[k].rdata_len >= 4) { uint8_t *rd = m2 + H->off_strings + R[k].rdata_off; rd[2] = (uint8_t)(its[i] >> 8); rd[3] = (uint8_t)its[i]; break; }
+                CHECK(zone_image_validate(m2, img->total_size, why, sizeof(why)) != 0);                                        /* (one NSEC3 RR that says more than the chain: refused, by the cap or by the chain's parameters) */
+                free(m2);
+            }
+            free(m);
+        }
+        zone_image_free(img);
+    }
+
+    /* 15. ALIAS / LUA RDATA, an ALIAS beside A / AAAA or DNSSEC records, CNAME / DNAME / RESINFO twice: refused as validate_zone_pdns_types() refuses them for every other source.  The zone parser would not make
+     *     these images, so TXT RRs with the right bytes are given the type (TXT "x" "" is 01 78 00: a whole name x. and also an ALIAS RDATA; TXT "x" is 01 78: neither) */
+    snprintf(text, sizeof(text), "%swww A 192.0.2.5\nwww TXT \"x\" \"\"\nal TXT \"x\" \"\"\nbad TXT \"x\"\nc TXT \"b\" \"\"\nc TXT \"d\" \"\"\n", HDR);
+    img = m3_image_of(text, "rv.test.", false, false);
+    CHECK(img != NULL);
+    if (img) {
+        zone_image_policy_t p = m3_pol(img, "rv.test.", 7);
+        for (int what = 0; what < 6; what++) {
+            uint8_t *m = m3_copy(img);
+            CHECK(m != NULL);
+            if (!m) continue;
+            zone_image_t *H = (zone_image_t *)(void *)m;
+            zone_image_name_t *N = (zone_image_name_t *)(void *)(m + H->off_names);
+            zone_image_rr_t *R = (zone_image_rr_t *)(void *)(m + H->off_rrs);
+            const char *own = what == 0 ? "www.rv.test." : what == 1 || what == 3 ? "al.rv.test." : what == 2 ? "bad.rv.test." : "c.rv.test.";
+            const uint32_t id = zone_image_find_name(img, own);
+            CHECK(id != ZONE_IMAGE_NONE);
+            if (id == ZONE_IMAGE_NONE) { free(m); continue; }
+            const uint32_t first = N[id].first_rr, last = first + (N[id].rr_count_flags & ZONE_IMAGE_NAME_COUNT_MASK);
+            uint16_t to = what <= 3 ? 65401 : what == 4 ? 5 : 39;                 /* the TXT RRs of the owner become ALIAS, CNAME or DNAME */
+            for (uint32_t k = first; k < last; k++) if (R[k].type == 16) R[k].type = to;
+            if (to == 65401) { N[id].rr_count_flags |= ZONE_IMAGE_NAME_ALIAS; H->flags |= ZONE_IMAGE_F_ALIAS; }
+            if (to == 39) { N[id].rr_count_flags |= ZONE_IMAGE_NAME_DNAME; H->flags |= ZONE_IMAGE_F_DNAME; }
+            if (what == 3) {                                                          /* a DNSKEY RR in the zone (the A of www takes the type: its RDATA is raw) */
+                const uint32_t wid = zone_image_find_name(img, "www.rv.test.");
+                for (uint32_t k = N[wid].first_rr; k < N[wid].first_rr + (N[wid].rr_count_flags & ZONE_IMAGE_NAME_COUNT_MASK); k++) if (R[k].type == 1) { R[k].type = 48; R[k].flags |= ZONE_IMAGE_RR_RAW | ZONE_IMAGE_RR_NO_NAMEWIRE; }
+            }
+            if (what == 0) M3_NEG(m, img->total_size, &p, "ALIAS record and an A or AAAA");      /* www has an A and now an ALIAS */
+            if (what == 1) M3_POS(m, img->total_size, &p);                                      /* al: an ALIAS alone, with a whole name for its RDATA */
+            if (what == 2) M3_NEG(m, img->total_size, &p, "malformed RDATA");                   /* 01 78 is no whole name */
+            if (what == 3) M3_NEG(m, img->total_size, &p, "DNSSEC records");
+            if (what >= 4) M3_NEG(m, img->total_size, &p, "singleton");
+            free(m);
+        }
+        zone_image_free(img);
+    }
+
+    /* 21. the hash table: a load of more than three quarters (the freeze makes tables of at most that load) is refused; the old rule allowed one empty slot */
+    snprintf(text, sizeof(text), "%sa A 192.0.2.2\nb A 192.0.2.3\nc A 192.0.2.4\nd A 192.0.2.5\ne A 192.0.2.6\n", HDR);
+    img = m3_image_of(text, "rv.test.", false, false);
+    CHECK(img != NULL && img->n_names == 7 && img->hash_size == 16);
+    if (img) {
+        size_t nl = 0;
+        uint8_t *b = rv_rehash(img, 16, &nl);                                    /* (the same table again: the helper is right) */
+        CHECK(b != NULL && nl == img->total_size && memcmp(b, img, nl) == 0);
+        free(b);
+        b = rv_rehash(img, 32, &nl);
+        if (b) { zone_image_policy_t p2 = m3_pol((const zone_image_t *)(const void *)b, "rv.test.", 7); M3_POS(b, nl, &p2); }
+        free(b);
+        b = rv_rehash(img, 8, &nl);                                              /* 7 names in 8 slots: one empty slot, a load of 7/8 */
+        CHECK(b != NULL);
+        if (b) {
+            CHECK(zone_image_find_name((const zone_image_t *)(const void *)b, "c.rv.test.") != ZONE_IMAGE_NONE);      /* (a good table: every name is found) */
+            zone_image_policy_t pb = m3_pol((const zone_image_t *)(const void *)b, "rv.test.", 7);
+            M3_NEG(b, nl, &pb, "hash_size");
+        }
+        free(b);
+        zone_image_free(img);
+    }
+
+    /* 20. an owner is printable text: a control octet in it is refused (the log of a refusal names the owner) */
+    snprintf(text, sizeof(text), "%sa A 192.0.2.2\n", HDR);
+    img = m3_image_of(text, "rv.test.", false, false);
+    CHECK(img != NULL);
+    if (img) {
+        zone_image_policy_t p = m3_pol(img, "rv.test.", 7);
+        uint8_t *m = m3_copy(img);
+        zone_image_t *H = (zone_image_t *)(void *)m;
+        zone_image_name_t *N = (zone_image_name_t *)(void *)(m + H->off_names);
+        const uint32_t id = zone_image_find_name(img, "a.rv.test.");
+        CHECK(m != NULL && id != ZONE_IMAGE_NONE);
+        if (m && id != ZONE_IMAGE_NONE) {
+            char *t = (char *)(m + H->off_strings + N[id].text_off);
+            t[0] = '\n';                                                          /* (a line of its own in the log) */
+            if (N[id].wire_off) m[H->off_strings + N[id].wire_off + 1] = '\n';
+            N[id].hash = dns_name_hash_ci(t);                                     /* (the hash fits: nothing but the octet is wrong) */
+            M3_NEG(m, img->total_size, &p, "owner");
+        }
+        free(m);
+        zone_image_free(img);
+    }
+
+    /* 22. the reassembly of the ZONE_IMAGE messages (what job_image() of the Backend and the fuzz harness call): one buffer of the announced size, nothing past it */
+    {
+        uint8_t *buf = NULL;
+        size_t len = 0, cap = 0;
+        uint8_t piece[100];
+        memset(piece, 0xAB, sizeof(piece));
+        CHECK(zone_image_asm_add(&buf, &len, &cap, 0, piece, 8) == -1 && buf == NULL);                  /* (no size announced) */
+        CHECK(zone_image_asm_add(&buf, &len, &cap, 250, piece, 100) == 0 && cap == 250 && len == 100);  /* (the first piece allocates the whole) */
+        uint8_t *first = buf;
+        CHECK(zone_image_asm_add(&buf, &len, &cap, 250, piece, 100) == 0 && buf == first && len == 200);   /* (no realloc: the buffer does not move) */
+        CHECK(zone_image_asm_add(&buf, &len, &cap, 250, piece, 51) == -1 && len == 200);                /* (one octet more than announced) */
+        CHECK(zone_image_asm_add(&buf, &len, &cap, 250, piece, 50) == 0 && len == 250 && cap == 250);
+        CHECK(zone_image_asm_add(&buf, &len, &cap, 250, piece, 1) == -1);                               /* (the image is complete) */
+        free(buf);
+    }
+}
+
 int main(void) {
     printf("=== test_zone_image ===\n");
+    run_m3_step1();
+    printf("[TEST] review of M3: NSEC3 iterations, ALIAS / singleton rules, hash load, owner text, reassembly\n");
+    m3_review_rules();
     printf("[TEST] two CNAMEs on one name are refused at freeze\n");
     run_singleton_refused();
     printf("[TEST] synthetic zones: one line per RR type\n");

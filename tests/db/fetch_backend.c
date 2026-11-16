@@ -16,7 +16,7 @@
  *   badmain                 send a FETCH_REQ on the first stream (a protocol error there); then wait for the loader to end
  *   flood:N:ZONE            send N requests (ids 1000..) for ZONE at once, priority 1
  * Every answer is checked by the state machine of the fetch stream (kdb_sm_init_fetch()) and printed, in the order it arrives:
- *   ANS id=ID zone=NAME kind=primary|secondary|catalog summary=0|1 presigned=0|1 serial=N rr=N data=N timers=R,T,E|-
+ *   ANS id=ID zone=NAME kind=primary|secondary|catalog summary=0|1 presigned=0|1 serial=N rr=N (the RRs of the zone image) data=N (the ZONE_IMAGE messages) timers=R,T,E|-
  *   FAILED id=ID reason=TEXT
  * and at the end `DONE answers=N loader=STATUS`.  A protocol error of the loader prints `PROTOCOL ERROR: ...` and ends with status 1.
  *
@@ -334,7 +334,7 @@ static void fetch_msg(const kdb_msg_t *m) {
         g_begin_seen[g_nbegin++ % (sizeof(g_begin_seen) / sizeof(g_begin_seen[0]))] = z->request_id;      /* (the last 64) */
         break;
     }
-    case KDB_T_ZONE_DATA:
+    case KDB_T_ZONE_IMAGE:
         g_cur.data++;
         break;
     case KDB_T_ZONE_END: {

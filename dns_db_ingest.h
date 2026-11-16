@@ -15,6 +15,9 @@
  * the registry (snapshot_apply_db_delta() makes new zones visible once per batch and at least once per second) and
  * answered with ZONE_RESULT; BATCH_END is answered with BATCH_RESULT.  With `ingest-threads` N > 1, N builder threads
  * parse and publish complete zones while the stream thread keeps reading (at most N zones in flight).
+ *
+ * 0.7 M2: the pages of a manifest pass (the store protocol) are not decoded or recorded by this thread: it checks that a page is legal in the state of the stream and hands it to the reconcile thread
+ * (dns_db_recon.h), which applies the pass in groups; every other frame of the stream waits until that thread has applied what it was given.
  */
 
 #include <stdbool.h>
@@ -44,6 +47,16 @@ bool db_ingest_hold_queries(void);
 /* 0.7: does the loader answer a lookup of a name (FETCH_REQ mode KDB_FETCH_LOOKUP: which zone of the view encloses it?) and is the store protocol on?  A query for a name that no stored zone covers, while a view's first
  * pass has not listed every zone, is parked for a lookup only when this is true; otherwise it is refused at once.  Any thread; no lock. */
 bool db_ingest_lookup_ready(void);
+bool db_ingest_lookup_wanted(void);     /* the loader looks names up, or did and is away: a query for a name that no zone covers waits (0.7) */
+/* the lookups' counters (dns_store_status.h, `store.lookup.*`): fills *out, true.  Any thread; no lock. */
+struct store_lookup;
+struct store_fill;
+bool db_ingest_lookup_stats(struct store_lookup *out);
+/* 0.7 M3: the zone images (store.fill.*) */
+bool db_ingest_fill_stats(struct store_fill *out);
+/* tests: a smaller bound of the lookup queue and of the wait queue (0: the constants of dns_db_ingest.c) */
+extern _Atomic uint32_t db_ingest_test_lq_max, db_ingest_test_wq_max;
+extern _Atomic bool db_ingest_test_recon_poll_off;     /* tests: recon_poll() leaves the protocol error of the reconcile thread to the stream thread */
 
 /* `karictl dbstatus [zone [view]]`: text for the control channel (design 5.2).  Returns the length written to out
  * (always NUL terminated), or 0 when the configuration has no database block.  Control thread. */

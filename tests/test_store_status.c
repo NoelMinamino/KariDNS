@@ -183,6 +183,9 @@ static const char *REQUIRED[] = {
   "store.zones.free", "store.zones.image_bytes", "store.views.count", "store.view.0.name", "store.view.0.stored", "store.tables.zt_records",
   "store.tables.ix_slots", "store.segments.count", "store.segments.used_bytes", "store.segments.live_bytes", "store.segments.dead_pct",
   "store.journal.lsn", "store.checkpoint.count", "store.writes.puts", "store.writes.errors", "store.recovery.created", "store.recovery.open_us",
+  "store.writes.growths_background", "store.flusher", "store.lock.writer_holds", "store.lock.writer_holds_slow", "store.lock.writer_hold_max_us",     /* (0.7 fix A) */
+  "store.journal.bound_bytes", "store.journal.peak_bytes", "store.journal.limit_waits", "store.journal.limit_wait_us", "store.journal.limit_wait_max_us",
+  "store.checkpoint.max_us", "store.checkpoint.cancelled",                                                                                  /* (0.7: the journal bound) */
   "store.cache.kind", "store.attach.count", "store.attach.failed", "store.attach.fail.checksum", "store.attach.fail.record",
   "store.attach.fail.invalid", "store.attach.fail.io", "store.attach.fail.memory", "store.attach.fail.other", "store.attach.p50_us",
   "store.attach.p90_us", "store.attach.p99_us", "store.attach.max_us", "store.attach.hist.le_1us", "store.attach.hist.le_8388608us",
@@ -263,6 +266,19 @@ static void test_threads(void) {
 }
 
 static bool g_recon_guard;
+/* 0.7: the lookups of the first start (store.lookup.*) */
+static bool lookup_fn(store_lookup_t *o) {
+  memset(o, 0, sizeof(*o));
+  o->ready = true;
+  o->asked = 90; o->found = 40; o->none = 45; o->failed = 2; o->pending = 3; o->peak = 17; o->in_flight = 5; o->take_fail = 6; o->body_inline = 38; o->bad_body = 1; o->refused = 4;
+  o->same_name = 7; o->covered = 8; o->shed = 9; o->expired = 10;
+  o->drop_lk_room = 11; o->drop_lk_timeout = 12; o->drop_lk_queue = 13; o->servfail = 14; o->drop_zone_room = 15; o->drop_zone_timeout = 16; o->drop_zone_queue = 17;
+  o->remembered = 18; o->reask_suppressed = 19; o->remember_releases = 20; o->drain_passes = 21; o->drain_cut = 22; o->drain_pass_max = 23; o->drain_pass_max_ns = 24001;
+  o->hist[10] = 90;                                                   /* (<= 1024 us) */
+  o->max_ns = 1000000;
+  return true;
+}
+
 static bool recon_fn(store_recon_t *o) {
   memset(o, 0, sizeof(*o));
   snprintf(o->view, sizeof(o->view), "default");
@@ -336,6 +352,54 @@ static void test_none(void) {
   store_status_format(tx, STORE_STATUS_OUT_MAX, STORE_FMT_TEXT, NULL);
   CHECK(strstr(tx, "recon") != NULL);
   store_status_set_recon_fn(NULL);
+  /* 0.7: the lookups of the first start (store.lookup.*): not there without a function, every figure and the time to the answer with one */
+  store_status_format(buf, STORE_STATUS_OUT_MAX, STORE_FMT_JSON, NULL);
+  CHECK(parse_json(buf));
+  CHECK_EQ(kv_num("store.lookup.available"), 0);
+  CHECK(kv_get("store.lookup.asked") == NULL);
+  store_status_set_lookup_fn(lookup_fn);
+  store_status_format(buf, STORE_STATUS_OUT_MAX, STORE_FMT_JSON, NULL);
+  CHECK(parse_json(buf));
+  CHECK_EQ(kv_num("store.lookup.available"), 1);
+  CHECK_EQ(kv_num("store.lookup.ready"), 1);
+  CHECK_EQ(kv_num("store.lookup.asked"), 90);
+  CHECK_EQ(kv_num("store.lookup.found"), 40);
+  CHECK_EQ(kv_num("store.lookup.none"), 45);
+  CHECK_EQ(kv_num("store.lookup.failed"), 2);
+  CHECK_EQ(kv_num("store.lookup.pending"), 3);
+  CHECK_EQ(kv_num("store.lookup.pending_peak"), 17);
+  CHECK_EQ(kv_num("store.lookup.in_flight"), 5);
+  CHECK_EQ(kv_num("store.lookup.take_fail"), 6);
+  CHECK_EQ(kv_num("store.lookup.body_inline"), 38);
+  CHECK_EQ(kv_num("store.lookup.bad_body"), 1);
+  CHECK_EQ(kv_num("store.lookup.refused"), 4);
+  CHECK_EQ(kv_num("store.lookup.same_name"), 7);
+  CHECK_EQ(kv_num("store.lookup.covered"), 8);
+  CHECK_EQ(kv_num("store.lookup.shed"), 9);
+  CHECK_EQ(kv_num("store.lookup.expired"), 10);
+  CHECK_EQ(kv_num("store.lookup.drop.room"), 11);
+  CHECK_EQ(kv_num("store.lookup.drop.timeout"), 12);
+  CHECK_EQ(kv_num("store.lookup.drop.queue"), 13);
+  CHECK_EQ(kv_num("store.lookup.servfail"), 14);
+  CHECK_EQ(kv_num("store.lookup.remembered"), 18);
+  CHECK_EQ(kv_num("store.lookup.reask_suppressed"), 19);
+  CHECK_EQ(kv_num("store.lookup.remember_releases"), 20);
+  CHECK_EQ(kv_num("store.lookup.drain.passes"), 21);
+  CHECK_EQ(kv_num("store.lookup.drain.cut"), 22);
+  CHECK_EQ(kv_num("store.lookup.drain.pass_max"), 23);
+  CHECK_EQ(kv_num("store.lookup.drain.pass_max_us"), 25);
+  CHECK_EQ(kv_num("store.park.drop.room"), 15);
+  CHECK_EQ(kv_num("store.park.drop.timeout"), 16);
+  CHECK_EQ(kv_num("store.park.drop.queue"), 17);
+  CHECK_EQ(kv_num("store.lookup.rtt.p50_us"), 1024);
+  CHECK_EQ(kv_num("store.lookup.rtt.p99_us"), 1024);
+  CHECK_EQ(kv_num("store.lookup.rtt.max_us"), 1000);
+  CHECK_EQ(kv_num("store.lookup.rtt.hist.le_1024us"), 90);
+  store_status_format(kv, STORE_STATUS_OUT_MAX, STORE_FMT_KV, NULL);
+  CHECK(kv_matches_json(kv) && strstr(kv, "store.lookup.body_inline=38\n") != NULL);
+  store_status_format(tx, STORE_STATUS_OUT_MAX, STORE_FMT_TEXT, NULL);
+  CHECK(strstr(tx, "lookup") != NULL && strstr(tx, "le_1024us") == NULL);
+  store_status_set_lookup_fn(NULL);
   free(buf); free(kv); free(tx);
 }
 

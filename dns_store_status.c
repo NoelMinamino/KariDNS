@@ -120,6 +120,8 @@ static bool (*_Atomic g_att_fn)(uint32_t);
 static uint64_t (*_Atomic g_att_count_fn)(void);
 static bool (*_Atomic g_recon_fn)(store_recon_t *);
 static bool (*_Atomic g_extra_fn)(store_extra_t *);
+static bool (*_Atomic g_lookup_fn)(store_lookup_t *);
+static bool (*_Atomic g_fill_fn)(store_fill_t *);
 
 void store_status_bind(store_t *s) { atomic_store_explicit(&g_store, s, memory_order_release); }
 void store_status_set_memory_fn(bool (*fn)(ma_est_t *out)) { atomic_store_explicit(&g_mem_fn, fn, memory_order_release); }
@@ -127,6 +129,8 @@ void store_status_set_attached_fn(bool (*fn)(uint32_t zid)) { atomic_store_expli
 void store_status_set_attached_count_fn(uint64_t (*fn)(void)) { atomic_store_explicit(&g_att_count_fn, fn, memory_order_release); }
 void store_status_set_extra_fn(bool (*fn)(store_extra_t *out)) { atomic_store_explicit(&g_extra_fn, fn, memory_order_release); }
 void store_status_set_recon_fn(bool (*fn)(store_recon_t *out)) { atomic_store_explicit(&g_recon_fn, fn, memory_order_release); }
+void store_status_set_lookup_fn(bool (*fn)(store_lookup_t *out)) { atomic_store_explicit(&g_lookup_fn, fn, memory_order_release); }
+void store_status_set_fill_fn(bool (*fn)(store_fill_t *out)) { atomic_store_explicit(&g_fill_fn, fn, memory_order_release); }
 
 /* ------------------------------------------------------------------------------------------------------------------------------ */
 /* the entry list                                                                                                                 */
@@ -422,6 +426,24 @@ static void add_recon(list_t *l) {
   U("store.recon.changes.upserts", r->change_upserts);
   U("store.recon.changes.deletes", r->change_deletes);
   U("store.recon.cursors_kept", r->cursors);
+  U("store.recon.thread", r->recon_thread ? 1 : 0);
+  if (r->recon_thread) {
+    U("store.recon.busy_pct", r->rt_busy_pct);
+    U("store.recon.entries_per_s", r->rt_entries_per_s);
+    U("store.recon.queued", r->rt_queued);
+    U("store.recon.apply_ns_per_entry", r->rt_apply_ns_per_entry);
+    U("store.recon.thread_entries", r->rt_entries);
+    U("store.recon.thread_pages", r->rt_pages);
+    U("store.recon.ring_full_stops", r->rt_full_stops);
+  }
+  U("store.recon.group_records", r->rt_group_records);
+  U("store.recon.group_entries", r->rt_group_entries);
+  U("store.ingest.loop_max_us", r->rt_loop_max_us);
+  U("store.ingest.stream_max_us", r->rt_stream_max_us);
+  U("store.lock.records_holds", r->rec_holds);
+  U("store.lock.records_holds_slow", r->rec_holds_slow);
+  U("store.lock.records_hold_max_us", r->rec_hold_max_us);
+  U("store.lock.records_wait_max_us", r->rec_wait_max_us);
   U("store.recon.guard.held_views", r->guard_views);
   if (r->guard_views) {
     add_s(l, "store.recon.guard.view", r->guard_view);
@@ -431,6 +453,67 @@ static void add_recon(list_t *l) {
     add_s(l, "store.recon.guard.release", "karictl reload -force");
   }
   free(r);
+}
+
+/* 0.7 M3: the zone images (the figures are the ingest thread's or a builder's, dns_db_ingest.c) */
+static void add_fill(list_t *l) {
+  bool (*fn)(store_fill_t *) = atomic_load_explicit(&g_fill_fn, memory_order_acquire);
+  store_fill_t f;
+  if (!fn || !fn(&f)) return;
+  U("store.fill.images", f.images);
+  U("store.fill.image_bytes", f.image_bytes);
+  U("store.fill.validate_ns", f.validate_ns);
+  U("store.fill.validate_ns_per_image", f.images ? f.validate_ns / f.images : 0);
+  U("store.fill.invalid", f.invalid);
+  U("store.fill.store_only", f.store_only);
+  U("store.fill.resident", f.resident);
+}
+
+/* 0.7: the by-name lookups of the first start (the figures are the ingest thread's, dns_db_ingest.c) */
+static void add_lookup(list_t *l) {
+  bool (*fn)(store_lookup_t *) = atomic_load_explicit(&g_lookup_fn, memory_order_acquire);
+  store_lookup_t *k = fn ? malloc(sizeof(*k)) : NULL;
+  if (!k || !fn(k)) {
+    free(k);
+    U("store.lookup.available", 0);
+    return;
+  }
+  U("store.lookup.available", 1);
+  U("store.lookup.ready", k->ready ? 1 : 0);
+  U("store.lookup.asked", k->asked);
+  U("store.lookup.found", k->found);
+  U("store.lookup.none", k->none);
+  U("store.lookup.failed", k->failed);
+  U("store.lookup.pending", k->pending);
+  U("store.lookup.pending_peak", k->peak);
+  U("store.lookup.in_flight", k->in_flight);
+  U("store.lookup.take_fail", k->take_fail);
+  U("store.lookup.body_inline", k->body_inline);
+  U("store.lookup.bad_body", k->bad_body);
+  U("store.lookup.refused", k->refused);
+  U("store.lookup.same_name", k->same_name);
+  U("store.lookup.covered", k->covered);
+  U("store.lookup.shed", k->shed);
+  U("store.lookup.expired", k->expired);
+  U("store.lookup.drop.room", k->drop_lk_room);
+  U("store.lookup.drop.timeout", k->drop_lk_timeout);
+  U("store.lookup.drop.queue", k->drop_lk_queue);
+  U("store.lookup.servfail", k->servfail);
+  U("store.lookup.remembered", k->remembered);
+  U("store.lookup.reask_suppressed", k->reask_suppressed);
+  U("store.lookup.remember_releases", k->remember_releases);
+  U("store.lookup.drain.passes", k->drain_passes);
+  U("store.lookup.drain.cut", k->drain_cut);
+  U("store.lookup.drain.pass_max", k->drain_pass_max);
+  U("store.lookup.drain.pass_max_us", (k->drain_pass_max_ns + 999) / 1000);
+  U("store.park.drop.room", k->drop_zone_room);
+  U("store.park.drop.timeout", k->drop_zone_timeout);
+  U("store.park.drop.queue", k->drop_zone_queue);
+  U("store.lookup.rtt.p50_us", store_status_hist_pct(k->hist, 50, k->max_ns));
+  U("store.lookup.rtt.p99_us", store_status_hist_pct(k->hist, 99, k->max_ns));
+  U("store.lookup.rtt.max_us", (k->max_ns + 999) / 1000);
+  add_hist(l, "store.lookup.rtt", k->hist);
+  free(k);
 }
 
 /* the server's own tables: the attach table, the pool of entries (design 4.2: a zone in memory costs one slot), the folded counters and the texts in memory (6.1, 6.7) */
@@ -541,15 +624,27 @@ static void add_store(list_t *l, const store_t *s, const store_attach_stats_t *a
   U("store.journal.bytes", st->journal_bytes);
   U("store.journal.gen", st->journal_gen);
   U("store.journal.max_bytes", st->journal_max_bytes);
+  U("store.journal.bound_bytes", st->journal_bound_bytes);
+  U("store.journal.peak_bytes", st->journal_peak_bytes);
+  U("store.journal.limit_waits", st->journal_limit_waits);
+  U("store.journal.limit_wait_us", st->journal_limit_wait_us);
+  U("store.journal.limit_wait_max_us", st->journal_limit_wait_max_us);
   U("store.checkpoint.count", st->checkpoints);
   U("store.checkpoint.last_unix", st->last_checkpoint_unix);
   U("store.checkpoint.last_us", st->last_checkpoint_us);
+  U("store.checkpoint.max_us", st->checkpoint_max_us);
+  U("store.checkpoint.cancelled", st->checkpoints_cancelled);
   U("store.writes.commits", st->commits);
   U("store.writes.puts", st->puts);
   U("store.writes.replaces", st->replaces);
   U("store.writes.deletes", st->deletes);
   U("store.writes.growths", st->growths);
   U("store.writes.errors", st->write_errors);
+  U("store.writes.growths_background", st->growths_background);
+  U("store.lock.writer_holds", st->lock_holds);
+  U("store.lock.writer_holds_slow", st->lock_holds_slow);
+  U("store.lock.writer_hold_max_us", st->lock_hold_max_us);
+  U("store.flusher", st->flusher ? 1 : 0);
   /* 0.7 WP9: the cleaner (design 3.2) */
   U("store.compact.runs", st->compact_runs);
   U("store.compact.moved_records", st->compact_moved_records);
@@ -718,6 +813,8 @@ size_t store_status_format(char *out, size_t cap, int fmt, const char *zone) {
     add_memory(&l);
     add_extra(&l);
     add_recon(&l);
+    add_lookup(&l);
+    add_fill(&l);
   }
   sb_t b = { out, cap, 0, false };
   if (fmt == STORE_FMT_JSON) write_json(&b, &l);

@@ -150,10 +150,10 @@ SRV=""
 
 # ================================================================ part 2: a loader that breaks the protocol
 echo "== fake loaders"
-cc -O1 -o "$T/fake_dbloader" tests/db/fake_dbloader.c 2>"$T/cc.log" || { echo "SKIP part 2: no C compiler"; cat "$T/cc.log"; }
+[ -x ./fake_dbloader ] && cp ./fake_dbloader "$T/fake_dbloader" || echo "SKIP part 2: ./fake_dbloader is not built (make fake_dbloader)"
 if [ -x "$T/fake_dbloader" ]; then
     chown 0:0 "$T/fake_dbloader"; chmod 755 "$T/fake_dbloader"
-    for mode in bad-magic bad-order bad-view silent; do
+    for mode in bad-magic bad-order bad-view silent hello-no-image hello-version; do
         # the fake takes its mode as an argument: a wrapper script (root-owned) execs it with the fixed -s 3
         printf '#!/bin/sh\nexec "%s/fake_dbloader" -s 3 %s\n' "$T" "$mode" > "$T/fake_$mode"
         chown 0:0 "$T/fake_$mode"; chmod 755 "$T/fake_$mode"

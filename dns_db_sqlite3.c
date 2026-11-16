@@ -67,6 +67,8 @@ struct db_conn {
     bool has_changes;
     sqlite3_stmt *st_apex_all, *st_apex_one, *st_zones, *st_zone_one, *st_rec_all, *st_rec_one, *st_rec_rng, *st_meta_all, *st_meta_one, *st_keys, *st_changes, *st_cmax;
     sqlite3_stmt *st_dv_all, *st_dv_one;
+    sqlite3_stmt *st_zlk[6];    /* 0.7: find_zones_in(), one statement per size class (SQ_ZLK_MIN << i names), kept: the lookup of a name must not parse SQL */
+    sqlite3_stmt *st_in[6][7];  /* 0.7: scan_records_in, scan_metadata_in, scan_ext_in (records, metadata, tags, tinydns, tagdefs), zones_with_keys_in (cryptokeys) x size class (2 << i ids), kept */
     sqlite3_stmt *st_mpage, *st_cpage, *st_cnt, *st_cntv;      /* 0.7 WP3: manifest_page, changes_page, count_domains (all, one view) */
     db_mgroup_t mg;             /* the manifest row being assembled */
     bool has_domain_views;
@@ -136,7 +138,17 @@ static int step_once(db_conn_t *c, sqlite3_stmt **st, const char *sql) {
     return ret;
 }
 
+/* A read statement back to the start.  sqlite3_clear_bindings() is NOT called: for a statement whose plan looked at a bound value (the ORDER BY ones
+ * here) it marks the statement expired, and the next sqlite3_step() then parses it again (sqlite3Reprepare; six times for every zone of a fetch, a
+ * third of the CPU of the loader, dtrace on 300,000 and 10,000,000 zones).  Every user of a read statement binds every one of its parameters before
+ * the first step (a NULL explicitly where a value is absent), so a binding left from the last call is never read; the text a statement keeps is a
+ * copy (SQLITE_TRANSIENT).  The write statements bind SQLITE_STATIC text of the caller: they use wrearm() below, which clears. */
 static void rearm(sqlite3_stmt *st) {
+    sqlite3_reset(st);
+}
+
+/* the write statements of the importer: back to the start and unbound, so that no pointer of a caller (SQLITE_STATIC) outlives its call */
+static void wrearm(sqlite3_stmt *st) {
     sqlite3_reset(st);
     sqlite3_clear_bindings(st);
 }
@@ -304,6 +316,9 @@ static void sq_close(db_conn_t *c) {
     sqlite3_finalize(c->st_rec_rng);
     sqlite3_finalize(c->st_dv_all);
     sqlite3_finalize(c->st_dv_one);
+    for (size_t i = 0; i < sizeof(c->st_zlk) / sizeof(c->st_zlk[0]); i++) sqlite3_finalize(c->st_zlk[i]);
+    for (size_t k = 0; k < sizeof(c->st_in) / sizeof(c->st_in[0]); k++)
+        for (size_t i = 0; i < 7; i++) sqlite3_finalize(c->st_in[k][i]);
     sqlite3_finalize(c->st_prof);
     for (int i = 0; i < 2; i++) {
         sqlite3_finalize(c->st_xt[i]);
@@ -589,18 +604,45 @@ static int sq_begin_snapshot(db_conn_t *c) {
     return 0;
 }
 
-/* every read statement back to the start, so that no cursor keeps the transaction (or the WAL read mark) busy */
-static void rearm_all(db_conn_t *c) {
+/* every kept read statement of the connection, one call of fn each */
+static void each_read_stmt(db_conn_t *c, void (*fn)(sqlite3_stmt *, void *), void *arg) {
     sqlite3_stmt *all[] = { c->st_apex_all, c->st_apex_one, c->st_zones, c->st_zone_one, c->st_rec_all, c->st_rec_one, c->st_rec_rng, c->st_meta_all, c->st_meta_one,
                             c->st_keys, c->st_changes, c->st_cmax, c->st_dv_all, c->st_dv_one, c->st_prof, c->st_mpage, c->st_cpage, c->st_cnt, c->st_cntv };
     for (size_t i = 0; i < sizeof(all) / sizeof(all[0]); i++)
-        if (all[i]) rearm(all[i]);
+        if (all[i]) fn(all[i], arg);
+    for (size_t i = 0; i < sizeof(c->st_zlk) / sizeof(c->st_zlk[0]); i++)
+        if (c->st_zlk[i]) fn(c->st_zlk[i], arg);
+    for (size_t k = 0; k < sizeof(c->st_in) / sizeof(c->st_in[0]); k++)
+        for (size_t i = 0; i < sizeof(c->st_in[0]) / sizeof(c->st_in[0][0]); i++)
+            if (c->st_in[k][i]) fn(c->st_in[k][i], arg);
     for (int i = 0; i < 2; i++) {
-        if (c->st_xt[i]) rearm(c->st_xt[i]);
-        if (c->st_xd[i]) rearm(c->st_xd[i]);
-        if (c->st_xg[i]) rearm(c->st_xg[i]);
+        if (c->st_xt[i]) fn(c->st_xt[i], arg);
+        if (c->st_xd[i]) fn(c->st_xd[i], arg);
+        if (c->st_xg[i]) fn(c->st_xg[i], arg);
     }
 }
+
+static void rearm_cb(sqlite3_stmt *st, void *arg) {
+    (void)arg;
+    rearm(st);
+}
+
+/* every read statement back to the start, so that no cursor keeps the transaction (or the WAL read mark) busy */
+static void rearm_all(db_conn_t *c) {
+    each_read_stmt(c, rearm_cb, NULL);
+}
+
+#ifdef KARIDNS_UNIT_TEST
+/* how often SQLite parsed a kept read statement of the connection again because it had expired (sqlite3_stmt_status): a fetch on a kept connection must have none */
+static void reprepare_cb(sqlite3_stmt *st, void *arg) {
+    *(unsigned long *)arg += (unsigned long)sqlite3_stmt_status(st, SQLITE_STMTSTATUS_REPREPARE, 0);
+}
+unsigned long sq_reprepares(db_conn_t *c) {
+    unsigned long n = 0;
+    each_read_stmt(c, reprepare_cb, &n);
+    return n;
+}
+#endif
 
 static int sq_end_snapshot(db_conn_t *c) {
     if (!c->in_snapshot) return 0;
@@ -688,27 +730,37 @@ static int sq_find_zone(db_conn_t *c, const char *name, db_zone_cb cb, void *ud)
 }
 
 /* 0.7: the zones that have one of the names, closest (longest name) first (dns_db_driver.h find_zones_in()).  The statement has two placeholders for each name (the spellings with and without the dot: an IN list is a
- * SEARCH on the name index even with the explicit collation, as for find_zone()), so its text depends on how many names there are, and it is prepared for the call. */
+ * SEARCH on the name index even with the explicit collation, as for find_zone()), so its text depends on how many names there are.  There is one kept statement for each size class (4, 8, ... 128 names; it
+ * is parsed at the first call of its class, not for every lookup: 3 ms of a lookup was the parse); the placeholders a call does not need are bound NULL, which is equal to no name. */
+#define SQ_ZLK_MIN 4
 static int sq_find_zones_in(db_conn_t *c, const char *const *names, size_t n, db_zone_cb cb, void *ud) {
     if (n == 0 || n > DB_LOOKUP_MAX) {
         set_err(c, "find_zones_in: %zu names (1 to %d)", n, DB_LOOKUP_MAX);
         return -1;
     }
-    char sql[2560];
-    size_t o = (size_t)snprintf(sql, sizeof(sql),
-                                "SELECT d.id, d.name, d.type, d.master, d.catalog, r.content, r.id FROM domains d "
-                                "LEFT JOIN records r ON r.domain_id = d.id AND r.type = 'SOA' AND r.name = d.name AND r.disabled = 0 "
-                                "WHERE d.name COLLATE NOCASE IN (");
-    for (size_t i = 0; i < 2 * n; i++) o += (size_t)snprintf(sql + o, sizeof(sql) - o, "%s?%zu", i ? "," : "", i + 1);
-    snprintf(sql + o, sizeof(sql) - o, ") ORDER BY length(d.name) DESC, d.id, r.id");
-    sqlite3_stmt *st = NULL;
-    int rc = sqlite3_prepare_v2(c->db, sql, -1, &st, NULL);
-    if (rc != SQLITE_OK) return sql_fail(c, rc, "prepare");
+    size_t cls = 0, cap = SQ_ZLK_MIN;
+    while (cap < n) {
+        cap <<= 1;
+        cls++;
+    }
+    if (!c->st_zlk[cls]) {
+        char sql[2560];
+        size_t o = (size_t)snprintf(sql, sizeof(sql),
+                                    "SELECT d.id, d.name, d.type, d.master, d.catalog, r.content, r.id FROM domains d "
+                                    "LEFT JOIN records r ON r.domain_id = d.id AND r.type = 'SOA' AND r.name = d.name AND r.disabled = 0 "
+                                    "WHERE d.name COLLATE NOCASE IN (");
+        for (size_t i = 0; i < 2 * cap; i++) o += (size_t)snprintf(sql + o, sizeof(sql) - o, "%s?%zu", i ? "," : "", i + 1);
+        snprintf(sql + o, sizeof(sql) - o, ") ORDER BY length(d.name) DESC, d.id, r.id");
+        int ret = prep(c, &c->st_zlk[cls], sql);
+        if (ret != 0) return ret;
+    }
+    sqlite3_stmt *st = c->st_zlk[cls];
+    rearm(st);
     char a[1100];                  /* the name without the dot, then the dot for the second spelling (SQLite copies the text: SQLITE_TRANSIENT) */
-    for (size_t i = 0; i < n; i++) {
-        size_t l = strlen(names[i]);
+    for (size_t i = 0; i < cap; i++) {
+        size_t l = i < n ? strlen(names[i]) : 0;
         if (l > 1 && names[i][l - 1] == '.') l--;
-        if (l > sizeof(a) - 2) {                            /* longer than any domain name: it matches nothing (NULL is never equal to a name; an empty text would match the root zone) */
+        if (i >= n || l > sizeof(a) - 2) {                  /* an unused slot, or a name longer than any domain name: it matches nothing (NULL is never equal to a name; an empty text would match the root zone) */
             sqlite3_bind_null(st, (int)(2 * i + 1));
             sqlite3_bind_null(st, (int)(2 * i + 2));
             continue;
@@ -718,9 +770,7 @@ static int sq_find_zones_in(db_conn_t *c, const char *const *names, size_t n, db
         sqlite3_bind_text(st, (int)(2 * i + 1), a, (int)l, SQLITE_TRANSIENT);
         sqlite3_bind_text(st, (int)(2 * i + 2), a, (int)l + 1, SQLITE_TRANSIENT);
     }
-    int ret = sq_zone_loop(c, st, cb, ud);
-    sqlite3_finalize(st);
-    return ret;
+    return sq_zone_loop(c, st, cb, ud);
 }
 
 /* the rows of a prepared records statement (already bound) to the callback */
@@ -909,14 +959,9 @@ static int sq_scan_profiles(db_conn_t *c, db_profile_cb cb, void *ud) {
     return ret;
 }
 
-static int sq_scan_metadata(db_conn_t *c, const int64_t *domain_id, db_meta_cb cb, void *ud) {
-    sqlite3_stmt **slot = domain_id ? &c->st_meta_one : &c->st_meta_all;
-    int ret = prep(c, slot, domain_id ? "SELECT domain_id, kind, content, id FROM domainmetadata WHERE domain_id = ?1 ORDER BY id"
-                                      : "SELECT domain_id, kind, content, id FROM domainmetadata ORDER BY domain_id, id");
-    if (ret != 0) return ret;
-    sqlite3_stmt *st = *slot;
-    rearm(st);
-    if (domain_id) sqlite3_bind_int64(st, 1, *domain_id);
+/* the rows of a prepared domainmetadata statement (already bound) to the callback */
+static int meta_loop(db_conn_t *c, sqlite3_stmt *st, db_meta_cb cb, void *ud) {
+    int ret = 0;
     for (;;) {
         int rc = sqlite3_step(st);
         if (rc == SQLITE_DONE) break;
@@ -943,11 +988,19 @@ static int sq_scan_metadata(db_conn_t *c, const int64_t *domain_id, db_meta_cb c
     return ret;
 }
 
-static int sq_zones_with_keys(db_conn_t *c, db_key_cb cb, void *ud) {
-    int ret = prep(c, &c->st_keys, "SELECT DISTINCT domain_id FROM cryptokeys ORDER BY domain_id");
+static int sq_scan_metadata(db_conn_t *c, const int64_t *domain_id, db_meta_cb cb, void *ud) {
+    sqlite3_stmt **slot = domain_id ? &c->st_meta_one : &c->st_meta_all;
+    int ret = prep(c, slot, domain_id ? "SELECT domain_id, kind, content, id FROM domainmetadata WHERE domain_id = ?1 ORDER BY id"
+                                      : "SELECT domain_id, kind, content, id FROM domainmetadata ORDER BY domain_id, id");
     if (ret != 0) return ret;
-    sqlite3_stmt *st = c->st_keys;
+    sqlite3_stmt *st = *slot;
     rearm(st);
+    if (domain_id) sqlite3_bind_int64(st, 1, *domain_id);
+    return meta_loop(c, st, cb, ud);
+}
+
+static int keys_loop(db_conn_t *c, sqlite3_stmt *st, db_key_cb cb, void *ud) {
+    int ret = 0;
     for (;;) {
         int rc = sqlite3_step(st);
         if (rc == SQLITE_DONE) break;
@@ -963,6 +1016,13 @@ static int sq_zones_with_keys(db_conn_t *c, db_key_cb cb, void *ud) {
     }
     rearm(st);
     return ret;
+}
+
+static int sq_zones_with_keys(db_conn_t *c, db_key_cb cb, void *ud) {
+    int ret = prep(c, &c->st_keys, "SELECT DISTINCT domain_id FROM cryptokeys ORDER BY domain_id");
+    if (ret != 0) return ret;
+    rearm(c->st_keys);
+    return keys_loop(c, c->st_keys, cb, ud);
 }
 
 static int sq_changes_since(db_conn_t *c, uint64_t after, db_change_cb cb, void *ud, uint64_t *last_seq, bool *gap) {
@@ -1217,21 +1277,9 @@ static int sq_report_status(db_conn_t *c, const db_status_t *st) {
 /* B8: karidns_record_tags / karidns_record_tinydns (through records, for the domain id) / karidns_zone_tagdefs.  Each table in its own
  * pass, rows ordered by (domain_id, record_id); the tag definitions by (domain_id, rowid): the order the rows were inserted in is the
  * order of the definitions in a zone file, and the first definition that matches a client wins. */
-static int sq_scan_ext(db_conn_t *c, const int64_t *domain_id, const db_ext_sink_t *sink) {
-    if (!c->has_ext) {
-        set_err(c, "the karidns_record_tags / karidns_record_tinydns / karidns_zone_tagdefs tables do not exist in this database");
-        return DB_ERR_UNAVAILABLE;
-    }
-    const int one = domain_id ? 1 : 0;
-    int ret = prep(c, &c->st_xt[one],
-                   one ? "SELECT r.domain_id, t.record_id, t.location_tag, t.ecs_tag FROM karidns_record_tags t JOIN records r ON r.id = t.record_id "
-                         "WHERE r.domain_id = ?1 ORDER BY t.record_id"
-                       : "SELECT r.domain_id, t.record_id, t.location_tag, t.ecs_tag FROM karidns_record_tags t JOIN records r ON r.id = t.record_id "
-                         "ORDER BY r.domain_id, t.record_id");
-    if (ret != 0) return ret;
-    sqlite3_stmt *st = c->st_xt[one];
-    rearm(st);
-    if (one) sqlite3_bind_int64(st, 1, *domain_id);
+/* the three loops of the extension tables over a prepared statement (already bound): the rows to the sink */
+static int xt_loop(db_conn_t *c, sqlite3_stmt *st, const db_ext_sink_t *sink) {
+    int ret = 0;
     for (;;) {
         int rc = sqlite3_step(st);
         if (rc == SQLITE_DONE) break;
@@ -1255,17 +1303,11 @@ static int sq_scan_ext(db_conn_t *c, const int64_t *domain_id, const db_ext_sink
         }
     }
     rearm(st);
-    if (ret != 0) return ret;
+    return ret;
+}
 
-    ret = prep(c, &c->st_xd[one],
-               one ? "SELECT r.domain_id, t.record_id, t.ttd, t.loc, t.countdown FROM karidns_record_tinydns t JOIN records r ON r.id = t.record_id "
-                     "WHERE r.domain_id = ?1 ORDER BY t.record_id"
-                   : "SELECT r.domain_id, t.record_id, t.ttd, t.loc, t.countdown FROM karidns_record_tinydns t JOIN records r ON r.id = t.record_id "
-                     "ORDER BY r.domain_id, t.record_id");
-    if (ret != 0) return ret;
-    st = c->st_xd[one];
-    rearm(st);
-    if (one) sqlite3_bind_int64(st, 1, *domain_id);
+static int xd_loop(db_conn_t *c, sqlite3_stmt *st, const db_ext_sink_t *sink) {
+    int ret = 0;
     for (;;) {
         int rc = sqlite3_step(st);
         if (rc == SQLITE_DONE) break;
@@ -1291,15 +1333,11 @@ static int sq_scan_ext(db_conn_t *c, const int64_t *domain_id, const db_ext_sink
         }
     }
     rearm(st);
-    if (ret != 0) return ret;
+    return ret;
+}
 
-    ret = prep(c, &c->st_xg[one],
-               one ? "SELECT domain_id, kind, tag, cidr FROM karidns_zone_tagdefs WHERE domain_id = ?1 ORDER BY rowid"
-                   : "SELECT domain_id, kind, tag, cidr FROM karidns_zone_tagdefs ORDER BY domain_id, rowid");
-    if (ret != 0) return ret;
-    st = c->st_xg[one];
-    rearm(st);
-    if (one) sqlite3_bind_int64(st, 1, *domain_id);
+static int xg_loop(db_conn_t *c, sqlite3_stmt *st, const db_ext_sink_t *sink) {
+    int ret = 0;
     for (;;) {
         int rc = sqlite3_step(st);
         if (rc == SQLITE_DONE) break;
@@ -1324,6 +1362,122 @@ static int sq_scan_ext(db_conn_t *c, const int64_t *domain_id, const db_ext_sink
     }
     rearm(st);
     return ret;
+}
+
+static int sq_scan_ext(db_conn_t *c, const int64_t *domain_id, const db_ext_sink_t *sink) {
+    if (!c->has_ext) {
+        set_err(c, "the karidns_record_tags / karidns_record_tinydns / karidns_zone_tagdefs tables do not exist in this database");
+        return DB_ERR_UNAVAILABLE;
+    }
+    const int one = domain_id ? 1 : 0;
+    int ret = prep(c, &c->st_xt[one],
+                   one ? "SELECT r.domain_id, t.record_id, t.location_tag, t.ecs_tag FROM karidns_record_tags t JOIN records r ON r.id = t.record_id "
+                         "WHERE r.domain_id = ?1 ORDER BY t.record_id"
+                       : "SELECT r.domain_id, t.record_id, t.location_tag, t.ecs_tag FROM karidns_record_tags t JOIN records r ON r.id = t.record_id "
+                         "ORDER BY r.domain_id, t.record_id");
+    if (ret != 0) return ret;
+    sqlite3_stmt *st = c->st_xt[one];
+    rearm(st);
+    if (one) sqlite3_bind_int64(st, 1, *domain_id);
+    if ((ret = xt_loop(c, st, sink)) != 0) return ret;
+
+    ret = prep(c, &c->st_xd[one],
+               one ? "SELECT r.domain_id, t.record_id, t.ttd, t.loc, t.countdown FROM karidns_record_tinydns t JOIN records r ON r.id = t.record_id "
+                     "WHERE r.domain_id = ?1 ORDER BY t.record_id"
+                   : "SELECT r.domain_id, t.record_id, t.ttd, t.loc, t.countdown FROM karidns_record_tinydns t JOIN records r ON r.id = t.record_id "
+                     "ORDER BY r.domain_id, t.record_id");
+    if (ret != 0) return ret;
+    st = c->st_xd[one];
+    rearm(st);
+    if (one) sqlite3_bind_int64(st, 1, *domain_id);
+    if ((ret = xd_loop(c, st, sink)) != 0) return ret;
+
+    ret = prep(c, &c->st_xg[one],
+               one ? "SELECT domain_id, kind, tag, cidr FROM karidns_zone_tagdefs WHERE domain_id = ?1 ORDER BY rowid"
+                   : "SELECT domain_id, kind, tag, cidr FROM karidns_zone_tagdefs ORDER BY domain_id, rowid");
+    if (ret != 0) return ret;
+    st = c->st_xg[one];
+    rearm(st);
+    if (one) sqlite3_bind_int64(st, 1, *domain_id);
+    return xg_loop(c, st, sink);
+}
+
+/* ---- several zones in one statement per table (scan_records_in, scan_metadata_in, scan_ext_in) ----
+ * The same rows in the same order as the single-zone calls one after the other (ORDER BY domain_id, then the order of the one-zone statement).  The statement
+ * has an IN list; its text depends on how many ids there are, so there is one kept statement for each table and size class (2, 4, ... 128 = DB_IN_MAX ids; parsed at
+ * the first use of the class); the placeholders a call does not need are bound NULL, which is equal to no id.  Where a one-zone statement is a few microseconds,
+ * a fetch of 64 zones asks the database seven times instead of about 450. */
+enum { IN_REC, IN_META, IN_XT, IN_XD, IN_XG, IN_KEY, IN_KINDS };
+
+static sqlite3_stmt *in_stmt(db_conn_t *c, int kind, const int64_t *ids, size_t n, int *err) {
+    *err = 0;
+    if (n == 0 || n > DB_IN_MAX) {
+        set_err(c, "scan_*_in: %zu zones (1..%u allowed)", n, DB_IN_MAX);
+        *err = -1;
+        return NULL;
+    }
+    size_t cls = 0, cap = 2;
+    while (cap < n) {
+        cap <<= 1;
+        cls++;
+    }
+    sqlite3_stmt **slot = &c->st_in[kind][cls];
+    if (!*slot) {
+        static const struct { const char *head, *col, *tail; } k_in[IN_KINDS] = {
+            [IN_REC] = { "SELECT domain_id, id, name, type, content, ttl, prio, disabled, ordername FROM records WHERE domain_id IN (", "", ") ORDER BY domain_id, id" },
+            [IN_META] = { "SELECT domain_id, kind, content, id FROM domainmetadata WHERE domain_id IN (", "", ") ORDER BY domain_id, id" },
+            [IN_XT] = { "SELECT r.domain_id, t.record_id, t.location_tag, t.ecs_tag FROM karidns_record_tags t JOIN records r ON r.id = t.record_id "
+                        "WHERE r.domain_id IN (", "", ") ORDER BY r.domain_id, t.record_id" },
+            [IN_XD] = { "SELECT r.domain_id, t.record_id, t.ttd, t.loc, t.countdown FROM karidns_record_tinydns t JOIN records r ON r.id = t.record_id "
+                        "WHERE r.domain_id IN (", "", ") ORDER BY r.domain_id, t.record_id" },
+            [IN_XG] = { "SELECT domain_id, kind, tag, cidr FROM karidns_zone_tagdefs WHERE domain_id IN (", "", ") ORDER BY domain_id, rowid" },
+            [IN_KEY] = { "SELECT DISTINCT domain_id FROM cryptokeys WHERE domain_id IN (", "", ") ORDER BY domain_id" },
+        };
+        char sql[1600];
+        size_t o = (size_t)snprintf(sql, sizeof(sql), "%s", k_in[kind].head);
+        for (size_t i = 0; i < cap; i++) o += (size_t)snprintf(sql + o, sizeof(sql) - o, "%s?%zu", i ? "," : "", i + 1);
+        snprintf(sql + o, sizeof(sql) - o, "%s", k_in[kind].tail);
+        if ((*err = prep(c, slot, sql)) != 0) return NULL;
+    }
+    sqlite3_stmt *st = *slot;
+    rearm(st);
+    for (size_t i = 0; i < cap; i++) {
+        if (i < n) sqlite3_bind_int64(st, (int)i + 1, ids[i]);
+        else sqlite3_bind_null(st, (int)i + 1);
+    }
+    return st;
+}
+
+static int sq_scan_records_in(db_conn_t *c, const int64_t *ids, size_t n, db_record_cb cb, void *ud) {
+    int err;
+    sqlite3_stmt *st = in_stmt(c, IN_REC, ids, n, &err);
+    return st ? rec_loop(c, st, cb, ud) : err;
+}
+
+static int sq_scan_metadata_in(db_conn_t *c, const int64_t *ids, size_t n, db_meta_cb cb, void *ud) {
+    int err;
+    sqlite3_stmt *st = in_stmt(c, IN_META, ids, n, &err);
+    return st ? meta_loop(c, st, cb, ud) : err;
+}
+
+static int sq_zones_with_keys_in(db_conn_t *c, const int64_t *ids, size_t n, db_key_cb cb, void *ud) {
+    int err;
+    sqlite3_stmt *st = in_stmt(c, IN_KEY, ids, n, &err);
+    return st ? keys_loop(c, st, cb, ud) : err;
+}
+
+static int sq_scan_ext_in(db_conn_t *c, const int64_t *ids, size_t n, const db_ext_sink_t *sink) {
+    if (!c->has_ext) {
+        set_err(c, "the karidns_record_tags / karidns_record_tinydns / karidns_zone_tagdefs tables do not exist in this database");
+        return DB_ERR_UNAVAILABLE;
+    }
+    int err;
+    sqlite3_stmt *st = in_stmt(c, IN_XT, ids, n, &err);
+    if (!st || (err = xt_loop(c, st, sink)) != 0) return err;
+    st = in_stmt(c, IN_XD, ids, n, &err);
+    if (!st || (err = xd_loop(c, st, sink)) != 0) return err;
+    st = in_stmt(c, IN_XG, ids, n, &err);
+    return st ? xg_loop(c, st, sink) : err;
 }
 
 /* B9: PRAGMA data_version on the persistent connection (it reports commits of other connections only; the loader never
@@ -1369,7 +1523,7 @@ static void bind_txt(sqlite3_stmt *st, int i, const char *s) {
 static int wstep(db_conn_t *c, sqlite3_stmt *st, const char *what) {
     int rc = sqlite3_step(st);
     int ret = rc == SQLITE_DONE ? 0 : sql_fail(c, rc, what);
-    rearm(st);
+    wrearm(st);
     return ret;
 }
 
@@ -1458,7 +1612,7 @@ static int sq_w_rollback(db_conn_t *c) {
     if (!c->in_wtxn) return 0;
     rearm_all(c);
     for (size_t i = 0; i < sizeof(c->st_w) / sizeof(c->st_w[0]); i++)
-        if (c->st_w[i]) rearm(c->st_w[i]);
+        if (c->st_w[i]) wrearm(c->st_w[i]);
     c->in_wtxn = c->in_snapshot = false;
     c->actor_set = false;                       /* the ROLLBACK takes the actor row with the rest */
     return exec(c, "ROLLBACK");
@@ -1889,7 +2043,7 @@ const db_driver_t db_driver_sqlite3 = {
     .schema_findings = sq_schema_findings,      /* B12 */
     .find_zone = sq_find_zone,                  /* B13 */
     .find_zones_in = sq_find_zones_in,          /* 0.7: the lookup of a name */
-    /* B13b scan_records_in, scan_metadata_in, scan_ext_in: PostgreSQL only (a statement costs no round trip here) */
+    .scan_records_in = sq_scan_records_in, .scan_metadata_in = sq_scan_metadata_in, .scan_ext_in = sq_scan_ext_in, .zones_with_keys_in = sq_zones_with_keys_in,      /* B13b; SQLite3 since 0.7: the statements of a fetch of many zones */
     .scan_apex = sq_scan_apex,                  /* D1a step 6 */
     .count_domains = sq_count_domains, .manifest_page = sq_manifest_page, .current_cursor = sq_current_cursor, .changes_page = sq_changes_page,      /* 0.7 store, WP3 */
     /* M2, the ZoneImporter: write access (open_write connections only) */

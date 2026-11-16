@@ -93,6 +93,13 @@ typedef struct store_recon {
   unsigned guard_views;          /* views whose sweep the guard holds back */
   char guard_view[STORE_VIEW_NAME_MAX + 1];
   uint64_t guard_unlisted, guard_total, guard_unix;
+  /* 0.7 M2, the reconcile thread (dns_db_recon.c: the pages of a pass are decoded and applied there, off the thread that answers the fetches and lookups): the share of the last window it was busy, the entries it applied
+   * a second in that window, the pages that wait for it now, the time one entry took (wall time of the apply call over its entries, since the start), the entries and pages since the start, how often the stream
+   * thread had to stop reading the loader because the ring was full, the group records the store wrote and their entries, and the longest pass of the ingest thread's loop in the last window (microseconds) */
+  bool recon_thread;             /* the figures below are there (the thread runs) */
+  uint64_t rt_busy_pct, rt_entries_per_s, rt_queued, rt_apply_ns_per_entry, rt_entries, rt_pages, rt_full_stops, rt_group_records, rt_group_entries, rt_loop_max_us, rt_stream_max_us;
+  /* 0.7 fix A: the mutex of the writers of the records (dns_db_store.c g_rec_mu): holds since the start, those of 1 ms or more, the longest hold, the longest wait for it (microseconds) */
+  uint64_t rec_holds, rec_holds_slow, rec_hold_max_us, rec_wait_max_us;
 } store_recon_t;
 /* fills *out and returns true, or returns false when the server has none (no loader) */
 void store_status_set_recon_fn(bool (*fn)(store_recon_t *out));
@@ -112,6 +119,35 @@ typedef struct store_extra {
   uint64_t hot_threads, hot_per_s;
 } store_extra_t;
 void store_status_set_extra_fn(bool (*fn)(store_extra_t *out));
+
+/* 0.7: the by-name lookups of the first start (dns_db_ingest.c: a query for a name that no stored zone covers, while the first pass has not listed every zone): `store.lookup.*`.  asked: requests of the workers taken by the ingest
+ * thread; found / none / failed: how the lookups ended (found: a zone was recorded); pending: lookups that wait for a place now (a gauge); take_fail: requests that a worker could not make because its ring was full (the query stays
+ * parked as pending and the worker asks again: never a refusal); body_inline: zones whose body came with the answer (one round trip) and was taken; in_flight: lookups out now (and the bodies that came with them); refused: not made (no
+ * loader that looks up, a view without database zones); same_name: the same name was on its way; covered: the zone of the name had become known; shed / expired: dropped because the queue was full / its time was up; bad_body: a body
+ * that the answer did not announce, thrown away; hist: the time from the request to the answer, as the attach histograms. */
+typedef struct store_lookup {
+  bool ready;                    /* the loader answers lookups (HELLO features) and the store protocol is on */
+  uint64_t asked, found, none, failed, refused, same_name, covered, shed, expired, body_inline, bad_body, take_fail;
+  uint64_t pending, in_flight, peak;
+  /* the queries that were dropped (overload: not answered, counted, like a query that RRL drops) and the ones answered "not ready": per lookup by why (no room in the park table, its time was up, the ingest thread's queue was full or it waited
+   * there until its time was up), the lookups that failed (SERVFAIL + EDE 14), and the same drops for a query that waits for a zone that is out of memory */
+  uint64_t drop_lk_room, drop_lk_timeout, drop_lk_queue, servfail, drop_zone_room, drop_zone_timeout, drop_zone_queue;
+  /* remembered: names whose lookup was shed that were put in the table of the shed names (park_shed_remember()); reask_suppressed: queries for such a name that their worker dropped without a request (also a drop,
+   * PARK_CNT_LK_REMEMBERED); remember_releases: times the names were forgotten at once because the ingest thread had caught up.  drain_*: the passes of the ingest thread over the workers' rings and queues
+   * (fetch_issue()) that handled a request: how many, how many ended at the time slice with work left, the most requests one handled, the longest one ran (ns); since the start */
+  uint64_t remembered, reask_suppressed, remember_releases, drain_passes, drain_cut, drain_pass_max, drain_pass_max_ns;
+  uint64_t hist[STORE_STATUS_HIST_BUCKETS];
+  uint64_t max_ns;
+} store_lookup_t;
+void store_status_set_lookup_fn(bool (*fn)(store_lookup_t *out));
+
+/* 0.7 M3: the zone images the loader sent (dns_db_ingest.c): images / image_bytes: checked by zone_image_validate_ex(), validate_ns: the time of that check, invalid: refused;
+ * store_only: put in the store alone (a body that nobody waited for, of a zone with no version here: no entry, attached when a query asks); resident: installed as an entry (a query's fetch,
+ * a changed zone, a zone that is in memory, heap mode) */
+typedef struct store_fill {
+  uint64_t images, image_bytes, validate_ns, invalid, store_only, resident;
+} store_fill_t;
+void store_status_set_fill_fn(bool (*fn)(store_fill_t *out));
 
 /* ---- what the server tells this module ---- */
 /* the open store (NULL: "store not configured", state=none) */

@@ -16,7 +16,9 @@
  * What a caller has to know:
  *
  *  Threads.  One writer thread at a time (every writer function takes the store's writer mutex, so a second thread is safe but
- *  serialised); any number of lock-free readers.  Reader functions (store_find, store_find_source, store_zone_get,
+ *  serialised); any number of lock-free readers.  No writer call waits for the disk inside the mutex (0.7 fix A): the fdatasync of the
+ *  journal and the segments (the commit), the msync of the tables (the checkpoint) and the build of a bigger index run outside it, on the
+ *  store's flusher thread and on a thread of its own for a growth (both started by the store; see the comment at the top of dns_store.c).  Reader functions (store_find, store_find_source, store_zone_get,
  *  store_image_read, store_iter) must be called inside an RCU read section of the project's epoch RCU (dns_epoch_rcu.h):
  *    - a worker thread is already in one while it handles a query (rcu_reader_enter / rcu_reader_exit with its worker_ctx_t);
  *    - any other thread (store threads, the control thread, tests) brackets the calls with store_read_lock() / store_read_unlock()
@@ -40,13 +42,15 @@
  *  Capsicum.  Everything is done through the directory fd: openat (O_CREAT, O_TRUNC; O_RESOLVE_BENEATH when available), pread, pwrite,
  *  pwritev, mmap (rw shared for the tables, ro for segments), msync, madvise, mincore, fsync, fdatasync, ftruncate, posix_fallocate, fstat, fstatfs,
  *  unlinkat (the cleaner removes segments, the open removes old generations); renameat and mkdirat (and readdir) only in store_quarantine(), which the Frontend runs before it hands the fd over.
- *  The store starts one detached thread (the zt read-ahead after the open; store_close() waits for its end).
+ *  The store starts a detached thread for the zt read-ahead after the open, the flusher thread (commits and checkpoints) and, while an index
+ *  grows, a detached thread that builds the bigger index; store_close() waits for all of them.
  *  So the rights to limit the fd to: CAP_LOOKUP, CAP_CREATE, CAP_READ, CAP_WRITE, CAP_SEEK, CAP_MMAP_RW, CAP_FSYNC, CAP_FTRUNCATE,
  *  CAP_FALLOCATE, CAP_FSTAT, CAP_FSTATFS, CAP_UNLINKAT.  The boot id (opts.boot_id) must be passed in: sysctl is not available there.
  *
  *  Durability.  A writer call is applied and visible to readers when it returns.  It is recoverable after kill -9 at once; it
  *  is durable against power loss after the next commit: store_commit() (a "batch end"), the periodic commit of the policy in
- *  store_opts_t (every sync_interval_ms, evaluated at each writer call and by store_tick()), or a checkpoint.
+ *  store_opts_t (every sync_interval_ms, made by the flusher thread), or a checkpoint.  A commit that fails in the background is
+ *  counted (write_errors, STORE_ST_DEGRADED_NOSPC for a full disk) and tried again; store_commit() and STORE_SYNC_EVERY return its error.
  */
 
 #include <stddef.h>
@@ -227,6 +231,7 @@ typedef struct store_stats {
   uint64_t checkpoints, last_checkpoint_unix, last_checkpoint_us;
   uint64_t commits;
   uint64_t puts, replaces, deletes, growths;
+  uint64_t group_records, group_entries;   /* 0.7 M2: journal records written by store_set_known_n() and the entries they carried (one record per group) */
   uint64_t write_errors;
   store_recovery_t recovery;
   uint32_t nviews;
@@ -264,6 +269,19 @@ typedef struct store_stats {
   uint64_t zt_readahead_us;       /* the read-ahead of zt in the background (0 while it runs) */
   bool     zt_readahead_done;
   uint64_t err_total;             /* texts put into err.ring since it was made */
+  /* ---- 0.7 fix A: no I/O inside the writer mutex ---- */
+  uint64_t lock_holds;            /* holds of the writer mutex since the open */
+  uint64_t lock_holds_slow;       /* ... of 1 ms or more */
+  uint64_t lock_hold_max_us;      /* the longest one */
+  uint64_t growths_background;    /* index growths that were built outside the mutex (the others: in it, when the index filled up before the build ended) */
+  bool     flusher;               /* the flusher thread runs (false: the writers make the due commits and checkpoints themselves, after the mutex) */
+  /* ---- 0.7: the flush of a checkpoint converges; the bound of the journal ---- */
+  uint64_t checkpoint_max_us;     /* the longest checkpoint since the open */
+  uint64_t checkpoints_cancelled; /* fuzzy checkpoints that a close left (its clean checkpoint flushed everything instead) */
+  uint64_t journal_peak_bytes;    /* the largest size a journal file reached since the open */
+  uint64_t journal_bound_bytes;   /* the bound: 2 x journal_max_bytes (the writers wait at it for the checkpoint in progress) */
+  uint64_t journal_limit_waits;   /* writer calls that waited at their end for a checkpoint because the journal was at the bound */
+  uint64_t journal_limit_wait_us, journal_limit_wait_max_us;   /* the total and the longest of those waits */
 } store_stats_t;
 
 /* What one store_compact() did. */
@@ -369,6 +387,12 @@ int  store_put(store_t *s, uint16_t view, const char *name, size_t len, const st
                const void *image, size_t image_len, uint32_t *zid);
 /* The zone exists with name and stamp but without an image (state KNOWN); a stored image of the zone is released. */
 int  store_set_known(store_t *s, uint16_t view, const char *name, size_t len, const store_meta_t *meta, uint32_t *zid);
+/* 0.7 M2, group commit: n entries of one view as n calls of store_set_known(), in order, but the journal record, the writer mutex and the commit decision are one per group of up to 64 entries.  res[i] is
+ * what the call for entry i would have returned (0, or -errno: that entry is not recorded, the others are), zid[i] (optional) its zone id.  Every op of the record is a full cell value (the journal format is
+ * the one of a single call), so after kill -9 the group is there whole or not at all (one CRC), and a replay needs nothing new.  An entry that has the name or the source id of one pending in the group, or
+ * that needs a table to grow, ends the group first: the effect is that of the calls one after the other (the slot a pending entry claimed in the name index is probed past).  The return value is 0, or -EINVAL for bad arguments. */
+typedef struct { const char *name; size_t len; const store_meta_t *meta; } store_known_t;
+int  store_set_known_n(store_t *s, uint16_t view, const store_known_t *in, size_t n, int *res, uint32_t *zid);
 int  store_delete(store_t *s, uint32_t zid);
 int  store_delete_name(store_t *s, uint16_t view, const char *name, size_t len);
 /* change zt.flags (set, then clear bits) without touching the image (NOTIFY_DUE, REJECTED_NEW, ...) */
@@ -381,14 +405,20 @@ int  store_set_cursor(store_t *s, uint16_t source, uint64_t cursor, const void *
 int  store_get_cursor(store_t *s, uint16_t source, bool *valid, uint64_t *cursor, void *ident, size_t *ident_len);
 /* announce the number of zones of a first fill: sizes zt / zc / ix / sx once (a checkpoint barrier) */
 int  store_reserve(store_t *s, uint64_t zones);
-/* group commit point: fdatasync the segments written and the journal.  After it every writer call made before is durable. */
+/* group commit point: fdatasync the segments written and the journal.  After it every writer call made before is durable.  It waits for the disk without the writer mutex
+ * (writers go on meanwhile); concurrent callers share one sync. */
 int  store_commit(store_t *s);
-/* the time-driven part: commits when the policy says so and checkpoints when checkpoint_interval_ms has passed (writer calls do the same check), and (0.7 WP9) the work of the
+/* 0.7: the bound of the journal.  A writer that holds no lock of its own (the caller's locks: a thread that waits for one of them would wait with it) calls this between its writes:
+ * while the journal is at factor x journal_max_bytes or more, it wakes the flusher and waits until the journal was switched or a checkpoint ended (one that failed too), and returns
+ * the microseconds it waited (0: no wait).  The bulk writer (the reconcile thread of a pass) uses 2, the thread that also answers lookups 4: the journal stays below 2 x
+ * journal_max_bytes while the disk keeps up with the checkpoints, and below 4 x in any case (store.journal.limit_waits counts the waits).  The store's own calls never wait for it. */
+uint64_t store_journal_wait(store_t *s, unsigned factor);
+/* the time-driven part: the commit and the checkpoint that are due (the flusher thread makes them by itself; without it the tick does), and (0.7 WP9) the work of the
  * background: the cleaner (at opts.compact_rate), the removal of the segments it emptied, the nx pass, the free-space check, the scrub (at opts.scrub_rate).  Call about once per
  * second from the store's thread, which is not inside a read section; a call takes up to about 300 ms when there is work. */
 int  store_tick(store_t *s);
-/* flush the files, write the other superblock copy with the checkpoint LSN, start a new journal, remove what no superblock
- * names any more (design 3.4 with a journal) */
+/* start a new journal, flush the files, write the other superblock copy with the checkpoint LSN, remove what no superblock names any more (design 3.4 with a journal).
+ * The flush runs without the writer mutex (a fuzzy checkpoint: see the top of dns_store.c); the call returns when the superblock is on disk. */
 int  store_checkpoint(store_t *s);
 /* The same, with the clean flag: what store_close() does, but the store stays open and usable (a server that stops while its workers may still look).  The next
  * writer call clears the flag again, durably, before it changes anything. */
@@ -467,14 +497,20 @@ int  store_hot_read(const store_t *s, uint32_t **zids, size_t *n);
  * and live bytes equal the recount, the free list intact, no duplicate names.  For tests, `karictl store verify`, the scrub. */
 int  store_check(store_t *s, store_check_report_t *rep);
 
-/* ---- test support (only compiled into unit-test builds, -DKARIDNS_UNIT_TEST) ---- */
+/* ---- test support ---- */
+/* in every build (0 / NULL = off): called by a checkpoint after each of its steps outside the writer mutex (1: the journal was switched, 2: the journal before the switch is durable,
+ * 3: the tables are flushed, 4: the superblock is written), and by a growth of the index built outside the mutex (1: the bigger index is built, 2: it was put in); tests make a step slow, or kill the process there */
+extern void (*_Atomic store_test_ckpt_hook)(int step);
+extern void (*_Atomic store_test_regrow_hook)(int step);
+/* the stores opened while this is set start no flusher thread (the writers make the due commits and checkpoints after the mutex) */
+extern _Atomic bool store_test_no_flusher;
 #ifdef KARIDNS_UNIT_TEST
-/* SIGKILL the process at the n-th crash point (0 = off); the points lie between every step of a write sequence */
-extern long store_test_crash_countdown;
+/* SIGKILL the process at the n-th crash point (0 = off); the points lie between every step of a write sequence (in every thread of the store) */
+extern _Atomic long store_test_crash_countdown;
 /* called by the writer between the ops of a journal record that publish a zone (cells, indexes) and the counters op of the same record: the window in which a reader can see a new zone before the counters of its segment (0 = off) */
 extern void (*store_test_before_counters)(store_t *s);
-/* commit_locked() fails with -EIO at the n-th call (0 = off): a failed fdatasync */
-extern long store_test_fail_commit;
+/* a commit fails with -EIO at the n-th one (0 = off): a failed fdatasync */
+extern _Atomic long store_test_fail_commit;
 /* a writer (store_put, store_set_known, store_delete, store_set_flags, store_set_stamp, store_set_cursor; `op` is its name without the store_ prefix) returns the errno this returns (not 0) before it changes anything: a full disk, an I/O error (NULL = off) */
 extern int (*store_test_write_fault)(const char *op, uint32_t zid);
 /* called by store_stats() after it has read the index generation (the window in which a writer may retire it) */

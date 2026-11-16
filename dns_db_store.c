@@ -266,6 +266,7 @@ static struct {
   _Atomic uint64_t hot_listed, hot_attached, hot_skipped, hot_written;
   uint32_t *hot_ids;                    /* the list that was read at the start (freed when the thread ends) */
   size_t hot_n;
+  _Atomic uint64_t att_served;          /* the requests of the queries that the store threads have taken in hand (their image read): the list gives way only while this moves (hot_defer()) */
   _Atomic int64_t last_err_log_ns;
 } G = { .wlock = PTHREAD_MUTEX_INITIALIZER, .wcv = PTHREAD_COND_INITIALIZER, .akq = -1 };
 
@@ -279,16 +280,40 @@ bool db_store_enabled(void) { return atomic_load_explicit(&G.st, memory_order_ac
 static pthread_mutex_t g_rec_mu = PTHREAD_MUTEX_INITIALIZER;
 static _Thread_local unsigned t_rec_depth;
 static _Thread_local bool t_put_refuse;        /* the commit of this thread was refused (db_store_commit_begin()): the store takes no version from it */
+static _Atomic unsigned g_rec_waiters;         /* threads that found the mutex taken: the reconcile thread gives them a turn between its groups (db_recon_apply_n()) */
+/* 0.7 fix A: every hold and every wait of the mutex is timed (store.lock.records_*): a hold that waits for the disk shows here */
+static int64_t g_rec_t0;                       /* (g_rec_mu) when the holder took it */
+static _Atomic uint64_t g_rec_holds, g_rec_slow, g_rec_hold_max_us, g_rec_wait_max_us;
+static void rec_max(_Atomic uint64_t *m, uint64_t v) {
+  uint64_t c = atomic_load_explicit(m, memory_order_relaxed);
+  while (v > c && !atomic_compare_exchange_weak_explicit(m, &c, v, memory_order_relaxed, memory_order_relaxed)) {}
+}
 static void rec_lock(void) {
-  if (t_rec_depth++ == 0) pthread_mutex_lock(&g_rec_mu);
+  if (t_rec_depth++ != 0) return;
+  if (pthread_mutex_trylock(&g_rec_mu) != 0) {
+    const int64_t w0 = mono_ns();
+    atomic_fetch_add_explicit(&g_rec_waiters, 1, memory_order_relaxed);
+    pthread_mutex_lock(&g_rec_mu);
+    atomic_fetch_sub_explicit(&g_rec_waiters, 1, memory_order_relaxed);
+    g_rec_t0 = mono_ns();
+    rec_max(&g_rec_wait_max_us, (uint64_t)(g_rec_t0 - w0) / 1000u);
+    return;
+  }
+  g_rec_t0 = mono_ns();
 }
 static void rec_unlock(void) {
-  if (--t_rec_depth == 0) pthread_mutex_unlock(&g_rec_mu);
+  if (--t_rec_depth != 0) return;
+  const uint64_t h = (uint64_t)(mono_ns() - g_rec_t0) / 1000u;
+  atomic_fetch_add_explicit(&g_rec_holds, 1, memory_order_relaxed);
+  if (h >= 1000) atomic_fetch_add_explicit(&g_rec_slow, 1, memory_order_relaxed);
+  rec_max(&g_rec_hold_max_us, h);
+  pthread_mutex_unlock(&g_rec_mu);
 }
 #ifdef KARIDNS_UNIT_TEST
 void (*db_store_test_commit_hook)(int where, const char *zone);
 #endif
 store_t *db_store_handle(void) { return atomic_load_explicit(&G.st, memory_order_acquire); }
+uint64_t db_store_journal_wait(unsigned factor) { return store_journal_wait(atomic_load_explicit(&G.st, memory_order_acquire), factor); }
 
 /* the zones the list has attached in a second, from its start until now (until its end, when it has ended) */
 static uint64_t hot_rate(uint64_t attached) {
@@ -969,6 +994,8 @@ _Atomic bool db_store_test_adopt_noview;                  /* the registration of
 void (*_Atomic db_store_test_batch_hook)(dbdir_rec_t *rec);   /* called for the record of every job of a batch of attaches just before the batch is registered (tests: change the record, as a writer of the store would) */
 _Atomic bool db_store_test_hot_pending;                    /* the threads of hot.list see attach requests of queries that wait (tests: they are never starved by them) */
 void (*_Atomic db_store_test_hot_hook)(uint32_t zid);     /* called by the threads of hot.list before each zone (tests: the order, and time) */
+_Atomic bool db_store_test_hot_stuck;                      /* the threads of hot.list see attach requests that wait and are not served (tests: the list gives way once, not for the whole time) */
+_Atomic uint64_t db_store_test_hot_naps;                   /* the naps the threads of hot.list took for the queries (tests) */
 #define STG_CAP 16384u
 #define STG_PROBE 8u
 static _Atomic(zdir_elem_t *) g_stg[STG_CAP];
@@ -1180,32 +1207,28 @@ static int view_ensure(store_t *st, const char *view) {
   return vid;
 }
 
-/* The version of the entry goes to the store (the install of the loader's zone has made the entry and published its version; the registry commit follows).  *zid: the zone's id.
- * 0, or a negative errno; -ENOTSUP: not a zone the store can hold (the root zone, a name too long, no records, another serial by now). */
-static int dir_put_locked(const char *view, const char *zone, zone_db_entry_t *entry, int64_t source_id, uint32_t serial, const uint8_t digest[32], uint32_t settings, uint32_t *zid_out) {
+/* The flags of the store's record that the image says (the engine and the scan read them without the image). */
+static uint16_t image_store_flags(const zone_image_t *img) {
+  uint16_t flags = 0;
+  if (img->flags & ZONE_IMAGE_F_ALIAS) flags |= STORE_F_ALIAS;
+  if (img->flags & ZONE_IMAGE_F_WILDCARD) flags |= STORE_F_WILDCARD;
+  if (img->n_nsec > 0 || img->n_n3chains > 0) flags |= STORE_F_PRESIGNED;
+  return flags;
+}
+
+/* An image goes to the store (0.7 M3: the loader built it, the stream thread validated it; there is no entry for a zone that a bulk fetch brings).  *zid: the zone's id.
+ * 0, or a negative errno; -ENOTSUP: not a zone the store can hold (the root zone, a name too long, no records). */
+static int dir_put_img_locked(const char *view, const char *zone, const zone_image_t *img, int64_t source_id, uint32_t serial, const uint8_t digest[32], uint32_t settings, uint32_t *zid_out) {
   store_t *st = atomic_load_explicit(&G.st, memory_order_acquire);
   char name[DBS_NAME_MAX];
   size_t nlen;
   if (!st) return -ENODEV;
   if (t_put_refuse) return -ECANCELED;                     /* (the commit was refused: the body is not for the record's stamp any more, db_store_commit_begin()) */
   if (!store_name(zone, name, sizeof(name), &nlen)) return -ENOTSUP;
+  if (img->n_rrs == 0) return -ENOTSUP;
   int vid = view_ensure(st, view);
   if (vid < 0) return vid;
-  /* the version is pinned while it is copied (a dynamic UPDATE or a newer install may replace it meanwhile) */
-  zone_version_t *v = NULL;
-  uint16_t flags = 0;
-  int rc = -ENOTSUP;
-  rcu_aux_read_lock();
-  v = atomic_load_explicit(&entry->rcu.active, memory_order_acquire);
-  if (v && v->image && v->image->n_rrs > 0 && atomic_load_explicit(&entry->serial, memory_order_relaxed) == serial) {
-    atomic_fetch_add_explicit(&v->xfr_refs, 1, memory_order_acq_rel);
-    if (v->image->flags & ZONE_IMAGE_F_ALIAS) flags |= STORE_F_ALIAS;
-    if (v->image->flags & ZONE_IMAGE_F_WILDCARD) flags |= STORE_F_WILDCARD;
-    if (v->image->n_nsec > 0 || v->image->n_n3chains > 0) flags |= STORE_F_PRESIGNED;
-    rc = 0;
-  }
-  rcu_aux_read_unlock();
-  if (rc != 0) return rc;
+  const uint16_t flags = image_store_flags(img);
   store_meta_t m;
   memset(&m, 0, sizeof(m));
   m.source_id = source_id;
@@ -1236,12 +1259,10 @@ static int dir_put_locked(const char *view, const char *zone, zone_db_entry_t *e
     atomic_fetch_add(&G.wt_skipped, 1);
     if (cflags & (STORE_F_STALE | STORE_F_REJECTED_NEW)) (void)store_set_flags(st, zid, 0, STORE_F_STALE | STORE_F_REJECTED_NEW);       /* (the body that was asked for is this version) */
     *zid_out = zid;
-    atomic_fetch_sub_explicit(&v->xfr_refs, 1, memory_order_acq_rel);
     return 0;
   }
   const unsigned labels = store_name_labels(name, nlen);
   dmax_raise(vid, labels);                                  /* (before the zone is in the index: the lookup must ask for it the moment it can be found; again below, after a delete's refresh) */
-  const zone_image_t *img = v->image;
   int r = store_put(st, (uint16_t)vid, name, nlen, &m, img, img->total_size, &zid);
   if (r == -EEXIST && source_id != 0) {                    /* the domain id is another zone of the store (a renamed domain): that one goes, the new name is put */
     /* The old name goes through the registry (dbreg_delete()), not the store alone: the zone may be attached under the old name, and its element and entry would stay (counted resident, reachable by the
@@ -1256,7 +1277,6 @@ static int dir_put_locked(const char *view, const char *zone, zone_db_entry_t *e
     if (oldname[0] && dbreg_delete(view, oldname, source_id) > 0) r = store_put(st, (uint16_t)vid, name, nlen, &m, img, img->total_size, &zid);
     else if (old != STORE_NONE && !oldname[0] && store_delete(st, old) == 0) r = store_put(st, (uint16_t)vid, name, nlen, &m, img, img->total_size, &zid);       /* (a record whose name cannot be read) */
   }
-  atomic_fetch_sub_explicit(&v->xfr_refs, 1, memory_order_acq_rel);
   if (r == 0) {
     dmax_raise(vid, labels);
     atomic_fetch_add(&G.wt_put, 1);
@@ -1264,6 +1284,36 @@ static int dir_put_locked(const char *view, const char *zone, zone_db_entry_t *e
     return 0;
   }
   note_error("the write", zone, r);
+  return r;
+}
+
+
+/* The version of the entry goes to the store (the install of the loader's zone has made the entry and published its version; the registry commit follows).  *zid: the zone's id.
+ * 0, or a negative errno; -ENOTSUP: not a zone the store can hold (the root zone, a name too long, no records, another serial by now). */
+static int dir_put_locked(const char *view, const char *zone, zone_db_entry_t *entry, int64_t source_id, uint32_t serial, const uint8_t digest[32], uint32_t settings, uint32_t *zid_out) {
+  if (!atomic_load_explicit(&G.st, memory_order_acquire)) return -ENODEV;
+  if (t_put_refuse) return -ECANCELED;
+  /* the version is pinned while it is copied (a dynamic UPDATE or a newer install may replace it meanwhile) */
+  zone_version_t *v = NULL;
+  int rc = -ENOTSUP;
+  rcu_aux_read_lock();
+  v = atomic_load_explicit(&entry->rcu.active, memory_order_acquire);
+  if (v && v->image && v->image->n_rrs > 0 && atomic_load_explicit(&entry->serial, memory_order_relaxed) == serial) {
+    atomic_fetch_add_explicit(&v->xfr_refs, 1, memory_order_acq_rel);
+    rc = 0;
+  }
+  rcu_aux_read_unlock();
+  if (rc != 0) return rc;
+  rc = dir_put_img_locked(view, zone, v->image, source_id, serial, digest, settings, zid_out);
+  atomic_fetch_sub_explicit(&v->xfr_refs, 1, memory_order_acq_rel);
+  return rc;
+}
+
+/* the image-only form: for the registry's store-only commit of a body nobody waits for (dbdir_ops_t.put_image) */
+static int dir_put_img(const char *view, const char *zone, const zone_image_t *img, int64_t source_id, uint32_t serial, const uint8_t digest[32], uint32_t settings, uint32_t *zid_out) {
+  rec_lock();
+  int r = dir_put_img_locked(view, zone, img, source_id, serial, digest, settings, zid_out);
+  rec_unlock();
   return r;
 }
 
@@ -1431,6 +1481,7 @@ static const dbdir_ops_t g_ops = {
   .rec_get_nb = dir_rec_get_nb,
   .rec_unchanged = dir_rec_unchanged,
   .put = dir_put,
+  .put_image = dir_put_img,
   .del = dir_del,
   .note_flags = dir_note_flags,
   .attach_reserve = dir_attach_reserve,
@@ -1701,6 +1752,12 @@ static int attach_build(const char *view, const char *zone, uint32_t zid, const 
     const bool timed = (val_n++ % VAL_SAMPLE) == 0;
     const int64_t tv0 = timed ? mono_ns() : 0;
     int vr = zone_image_validate(img.data, img.len, vw, sizeof(vw));
+    /* the rules of the zone and of every source of a zone (RFC 9276 iterations are in the structure check; the owners under the apex, the RRs, the SOA, ALIAS and singleton rules): an image that an older build wrote,
+     * or that was stored before a rule was made, is looked at as an image that comes from the loader now.  The limits of the configuration follow below, when the settings of the zone are known. */
+    if (vr == 0) {
+      const zone_image_policy_t pol = { zone, sz->serial, UINT64_MAX, 0, 0, 0, true, (zi->flags & ZONE_IMAGE_F_TINYDNS) != 0 };
+      vr = zone_image_check_policy(img.data, img.len, &pol, vw, sizeof(vw));
+    }
     if (timed) atomic_fetch_add(&G.validate_ns, (uint64_t)(mono_ns() - tv0) * VAL_SAMPLE);
     atomic_fetch_add(&G.validated, 1);
     if (vr != 0) {
@@ -1736,6 +1793,15 @@ static int attach_build(const char *view, const char *zone, uint32_t zid, const 
       goto fail;
     }
     zone_ext_shared_ref(b->sh);
+  }
+  /* max-records, max-records-per-type, max-types-per-name and max-zone-ttl as they are now: the image was checked against the limits that were in force when its body came, and a limit that was tightened since (a
+   * reload) or an image from an older build must not attach unchecked.  A zone over a limit is read from the database again (the record becomes KNOWN), where the body is refused with the reason and the record is marked
+   * refused, as the zone would be at a first load. */
+  if (zone_limits_gate_settings(view, zone, b->sh, zi, "the attach of the stored zone") != 0) {
+    b->damaged = true;
+    b->cause = STORE_ATT_ERR_INVALID;
+    b->why = "the image is over a limit of the configuration";
+    goto fail;
   }
   entry = db_ingest_new_entry(view, zone, b->sh);
   if (!entry) {
@@ -2189,6 +2255,7 @@ static bool attach_drain(att_job_t *jobs, dbreg_att_item_t *ri) {
         n = 0;
       }
     }
+    atomic_fetch_add_explicit(&G.att_served, 1, memory_order_relaxed);     /* (the request is in hand: its image is read, which is where a store thread waits when the cache is cold) */
   }
   if (n) (void)attach_batch_run(jobs, n, ri);
   return any;
@@ -2228,7 +2295,7 @@ static void *attach_thread(void *arg) {
 /* 0.7 fix 8: hot.list                                                                                            */
 /* ------------------------------------------------------------------------------------------------------------- */
 
-/* At a clean stop the zones that are in memory are written to hot.list of the store (the ids, the most used first, at most STORE_HOT_MAX); the next start reads it and threads of their own attach the
+/* At a clean stop the zones that are in memory and have answered a query since they came are written to hot.list of the store (the ids, the most used first, at most STORE_HOT_MAX and what memory-limit can hold); the next start reads it and threads of their own attach the
  * zones in that order, in the background, while the queries are served: a restart with the page cache of the old run kept answers from memory almost at once, and one with a cold page cache reads the
  * images the queries are going to want in the order they are going to want them.  0.7 M4: there are several threads (three quarters of the store threads, at most six) with no rate cap, and they give the
  * queries only a moment (hot_defer()): a restart on ZFS (COPY mode, where a worker cannot attach a zone itself) has its first second of queries for the hottest zones, and one thread that waited while any
@@ -2244,6 +2311,7 @@ static int hot_cmp(const void *a, const void *b) {         /* the highest score 
 static void hot_write(store_t *st) {
   size_t cap = dir_attach_count() + 4096;
   if (cap > STORE_HOT_MAX) cap = STORE_HOT_MAX;
+  if (dbreg_cache_limit() && cap > dbreg_cache_limit() / 1024) cap = (size_t)(dbreg_cache_limit() / 1024);        /* (what memory-limit can hold, at a kilobyte a zone at the least: the bound the start puts on the list) */
   uint64_t *sc = malloc(cap * sizeof(*sc));
   uint32_t *ids = malloc(cap * sizeof(*ids));
   if (!sc || !ids) {
@@ -2331,11 +2399,19 @@ static void hot_finish(void) {
 /* The queries come first, but the list is never starved by them (the starvation of 0.6.2: it waited for as long as any request waited, and in the rush of first queries after a restart one always did):
  * before a batch a thread gives the requests that wait up to HOT_YIELD_US, in naps, and then goes on whether they have been taken or not.  Measured at 10 million zones on ZFS, restart with the cache
  * warm, 400,000 queries a second from the start: six threads without the nap reach the steady rate in 4 s and 4.8 % of the queries that wait for a store thread wait more than 16 ms; with it 0.5 %. */
-static bool hot_requests_wait(void) { return atomic_load_explicit(&db_store_test_hot_pending, memory_order_relaxed) || park_attach_pending(); }
+static bool hot_requests_wait(void) { return atomic_load_explicit(&db_store_test_hot_pending, memory_order_relaxed) || atomic_load_explicit(&db_store_test_hot_stuck, memory_order_relaxed) || park_attach_pending(); }
+/* 0.7 fix D: the list gives way only while the requests are being served (G.att_served moves: a store thread took one in hand during the nap).  Where the requests wait because the store threads wait for
+ * the disk (a restart on ZFS with a cold ARC: every image is a read of the pool), a nap of the list does not help one of them: it takes the list's own reads, which warm the same ARC, off the pool for as long
+ * as the naps last, and with every batch of 32 zones napping for the whole 0.4 ms the rate of the list fell from 90,000 to 9,000 zones a second (measured on the build host: two stable rates, with the same store). */
 static void hot_defer(void) {
+  uint64_t seen = atomic_load_explicit(&G.att_served, memory_order_relaxed);
   for (int w = 0; w < HOT_YIELD_US && hot_requests_wait(); w += HOT_NAP_US) {
     struct timespec nap = { 0, HOT_NAP_US * 1000L };
+    atomic_fetch_add_explicit(&db_store_test_hot_naps, 1, memory_order_relaxed);
     nanosleep(&nap, NULL);
+    const uint64_t now = atomic_load_explicit(&G.att_served, memory_order_relaxed);
+    if (now == seen && !atomic_load_explicit(&db_store_test_hot_pending, memory_order_relaxed)) break;    /* (nothing was served meanwhile: the requests wait for the disk, not for a thread) */
+    seen = now;
   }
 }
 
@@ -2511,6 +2587,8 @@ static struct {
   int vid;
   char view[STORE_VIEW_NAME_MAX + 1];
   bits_t seen;
+  bits_t lk;                        /* the records that a lookup's answer made or changed during the pass (db_recon_lookup(), the ingest thread, under mu): newer than the page the loader read earlier, and not unlisted (the sweep) */
+  _Atomic bool lk_any;
   bool failed;                      /* an entry of this pass could not be recorded (or its bit could not be set): the pass sweeps nothing and keeps no cursor */
   int64_t t0_ns;
   /* the secondary and catalog records that the scan has asked for since the start (the zone loads once a run unless it changes) */
@@ -2524,9 +2602,7 @@ static struct {
   db_recon_status_t s;
 } RC = { .mu = PTHREAD_MUTEX_INITIALIZER };
 
-#ifdef KARIDNS_UNIT_TEST
-int db_store_test_bits_fail = 0;
-#endif
+_Atomic int db_store_test_bits_fail;
 static void rc_lock(void) { pthread_mutex_lock(&RC.mu); }
 static void rc_unlock(void) { pthread_mutex_unlock(&RC.mu); }
 
@@ -2701,6 +2777,9 @@ void db_recon_note_fetch(int what, uint64_t n) {
   rc_unlock();
 }
 
+static void (*_Atomic g_recon_status_fn)(db_recon_status_t *);
+void db_recon_set_status_fn(void (*fn)(db_recon_status_t *out)) { atomic_store_explicit(&g_recon_status_fn, fn, memory_order_release); }
+
 void db_recon_status(db_recon_status_t *out) {
   rc_lock();
   *out = RC.s;
@@ -2723,9 +2802,17 @@ void db_recon_status(db_recon_status_t *out) {
       store_stats(st, ss);
       store_read_unlock();
       out->known_now = ss->zones_known;
+      out->rt_group_records = ss->group_records;
+      out->rt_group_entries = ss->group_entries;
       free(ss);
     }
   }
+  out->rec_holds = atomic_load_explicit(&g_rec_holds, memory_order_relaxed);
+  out->rec_holds_slow = atomic_load_explicit(&g_rec_slow, memory_order_relaxed);
+  out->rec_hold_max_us = atomic_load_explicit(&g_rec_hold_max_us, memory_order_relaxed);
+  out->rec_wait_max_us = atomic_load_explicit(&g_rec_wait_max_us, memory_order_relaxed);
+  void (*fn)(db_recon_status_t *) = atomic_load_explicit(&g_recon_status_fn, memory_order_acquire);
+  if (fn) fn(out);                                          /* (the reconcile thread's own figures) */
 }
 
 /* the store's cursor of a view: the loader's own part of the identity follows the configuration's DBS_CFGID bytes */
@@ -2771,31 +2858,83 @@ void db_recon_cursor_put(const char *view, uint64_t cursor, const uint8_t *ident
   }
 }
 
-/* One entry (design 5.3, 5.4).  See dns_db_store.h for the rules.  The step (what the record is, what it becomes) is one step for the writers of the records (g_rec_mu). */
-static int recon_apply_locked(const char *view, const db_recon_entry_t *e, uint32_t *zid_out) {
-  store_t *st = atomic_load_explicit(&G.st, memory_order_acquire);
-  if (zid_out) *zid_out = STORE_NONE;
-  if (!st || !view || !e || !e->name) return DBR_ERROR;
+/* One entry (design 5.3, 5.4).  See dns_db_store.h for the rules.  The step (what the record is, what it becomes) is one step for the writers of the records (g_rec_mu).  It has two halves: the look
+ * (the name in the store's form, the records of the entry's name and of its source id) and the decision (what the record becomes); db_recon_apply_n() puts a record that is new, and nothing
+ * else, into a group between the two (0.7 M2) */
+typedef struct {
   char name[DBS_NAME_MAX];
   size_t nlen;
-  if (!store_name(e->name, name, sizeof(name), &nlen)) return un_apply(view, e);        /* (a zone of the heap directory: see un_apply()) */
+  int vid;
+  uint32_t zs, zn;               /* the record of the entry's source id, of its name */
+  store_zone_t rs;               /* ... the first, when it could be read */
+  bool has_s;
+} rc_look_t;
+#define RC_CONT (-1000)          /* recon_look_locked(): nothing is decided yet */
+
+/* *vid: the id of the view in the store, -1 until it is known (the caller keeps it over the entries of a call) */
+static int recon_look_locked(store_t *st, const char *view, int *vid, const db_recon_entry_t *e, uint32_t *zid_out, rc_look_t *lk) {
+  if (zid_out) *zid_out = STORE_NONE;
+  if (!st || !view || !e || !e->name) return DBR_ERROR;
+  if (!store_name(e->name, lk->name, sizeof(lk->name), &lk->nlen)) return un_apply(view, e);        /* (a zone of the heap directory: see un_apply()) */
   if (e->source_id != 0) {                                  /* a zone that had a name the store could not hold: it is a zone of the store now (its heap element goes) */
     char uold[1026];
     if (un_remove(view, e->source_id, NULL, uold, sizeof(uold))) (void)dbreg_delete(view, uold, e->source_id);
   }
-  int vid = view_ensure(st, view);
-  if (vid < 0) return DBR_ERROR;
-  const bool np = e->kind != KDB_ZK_PRIMARY;
-  uint32_t zs = STORE_NONE, zn = STORE_NONE;
-  store_zone_t rs, rn;
-  bool has_s = false, has_n = false;
+  if (*vid < 0) *vid = view_ensure(st, view);
+  if (*vid < 0) return DBR_ERROR;
+  lk->vid = *vid;
+  lk->zs = lk->zn = STORE_NONE;
+  lk->has_s = false;
   store_read_lock();
-  if (e->source_id != 0) zs = store_find_source(st, (uint16_t)vid, e->source_id, (uint16_t)vid);
-  zn = store_find(st, (uint16_t)vid, name, nlen);
-  if (zs != STORE_NONE) has_s = store_zone_get(st, zs, &rs) == 0;
-  if (zn != STORE_NONE && zn != zs) has_n = store_zone_get(st, zn, &rn) == 0;
+  if (e->source_id != 0) lk->zs = store_find_source(st, (uint16_t)*vid, e->source_id, (uint16_t)*vid);
+  lk->zn = store_find(st, (uint16_t)*vid, lk->name, lk->nlen);
+  if (lk->zs != STORE_NONE) lk->has_s = store_zone_get(st, lk->zs, &lk->rs) == 0;
   store_read_unlock();
-  (void)has_n;
+  return RC_CONT;
+}
+
+static void recon_meta(store_meta_t *m, const db_recon_entry_t *e, int vid) {
+  memset(m, 0, sizeof(*m));
+  m->source_id = e->source_id;
+  m->source = (uint16_t)vid;
+  m->flags = e->kind != KDB_ZK_PRIMARY ? STORE_F_NONSTORE : 0;
+  m->stamp_gen = e->stamped ? e->gen : 0;
+  m->stamp_time = e->stamped ? e->time : 0;
+}
+
+/* np_done: the secondary and catalog records the scan has asked for (db_recon_scan(), the ingest thread); under RC.mu, as the reconcile thread clears a bit when a record changes */
+static void np_clear(uint32_t zid) {
+  rc_lock();
+  bits_clear(&RC.np_done, zid);
+  rc_unlock();
+}
+
+/* The reconcile thread applies the entries of a pass (db_recon_entry_n()) while the ingest thread applies the answers of the lookups (db_recon_lookup()): an entry of the pass was read by the loader some time before it
+ * is applied, an answer is read by the loader when it is asked for, so an answer that was applied during the pass is the newer.  The records the answers made are marked (RC.lk); the entry of the pass leaves such a record as it is,
+ * and the sweep does not take it for unlisted (the zone exists in the database: the loader found it). */
+static _Thread_local bool t_pass_apply;
+static bool lk_has(uint32_t zid) {
+  if (zid == STORE_NONE || !atomic_load_explicit(&RC.lk_any, memory_order_acquire)) return false;
+  rc_lock();
+  const bool b = bits_get(&RC.lk, zid);
+  rc_unlock();
+  return b;
+}
+static void lk_mark(const char *view, uint32_t zid) {
+  rc_lock();
+  if (RC.active && zid != STORE_NONE && strcmp(view, RC.view) == 0 && bits_set(&RC.lk, zid)) atomic_store_explicit(&RC.lk_any, true, memory_order_release);
+  rc_unlock();
+}
+
+static int recon_decide_locked(store_t *st, const char *view, const db_recon_entry_t *e, rc_look_t *lk, uint32_t *zid_out) {
+  const char *name = lk->name;
+  const size_t nlen = lk->nlen;
+  const int vid = lk->vid;
+  uint32_t zs = lk->zs;
+  const uint32_t zn = lk->zn;
+  const store_zone_t rs = lk->rs;
+  bool has_s = lk->has_s;
+  const bool np = e->kind != KDB_ZK_PRIMARY;
   bool renamed = false;
   if (zs != STORE_NONE && zs != zn) {                       /* the domain has another name now: the old name goes (its element too), the zone is made under the new one */
     if (has_s) {
@@ -2814,12 +2953,7 @@ static int recon_apply_locked(const char *view, const db_recon_entry_t *e, uint3
     has_s = false;
   }
   store_meta_t m;
-  memset(&m, 0, sizeof(m));
-  m.source_id = e->source_id;
-  m.source = (uint16_t)vid;
-  m.flags = np ? STORE_F_NONSTORE : 0;
-  m.stamp_gen = e->stamped ? e->gen : 0;
-  m.stamp_time = e->stamped ? e->time : 0;
+  recon_meta(&m, e, vid);
   uint32_t zid = STORE_NONE;
   int res = DBR_SAME;
   int r = 0;
@@ -2832,7 +2966,9 @@ static int recon_apply_locked(const char *view, const db_recon_entry_t *e, uint3
     const bool known = rs.state == STORE_STATE_KNOWN, stale = (rs.flags & STORE_F_STALE) != 0, rej = (rs.flags & STORE_F_REJECTED_NEW) != 0;
     const bool kind_eq = ((rs.flags & STORE_F_NONSTORE) != 0) == np;
     const bool stamp_eq = e->stamped && rs.stamp_gen == e->gen && rs.stamp_time == e->time;
-    if (!kind_eq) {                                         /* a primary became a secondary or the other way: the zone is made again (its image is not the new kind's) */
+    if (t_pass_apply && lk_has(zid)) {                      /* the record is what a lookup's answer made during this pass: newer than this entry's page, which stays unapplied */
+      res = DBR_SAME;
+    } else if (!kind_eq) {                                         /* a primary became a secondary or the other way: the zone is made again (its image is not the new kind's) */
       r = store_set_known(st, (uint16_t)vid, name, nlen, &m, &zid);
       res = DBR_CHANGED;
     } else if (np) {                                        /* a secondary or catalog zone: the record is only the memory of it */
@@ -2858,9 +2994,17 @@ static int recon_apply_locked(const char *view, const db_recon_entry_t *e, uint3
     if (zid_out && zid != STORE_NONE) *zid_out = zid;       /* (a record that exists but could not be changed was listed by the database: the pass must not sweep it) */
     return DBR_ERROR;
   }
-  if (np && (res == DBR_NEW || res == DBR_CHANGED || res == DBR_RENAMED)) bits_clear(&RC.np_done, zid);
+  if (np && (res == DBR_NEW || res == DBR_CHANGED || res == DBR_RENAMED)) np_clear(zid);
   if (zid_out) *zid_out = zid;
   return res;
+}
+
+static int recon_apply_locked(const char *view, const db_recon_entry_t *e, uint32_t *zid_out) {
+  store_t *st = atomic_load_explicit(&G.st, memory_order_acquire);
+  rc_look_t lk;
+  int vid = -1;
+  int r = recon_look_locked(st, view, &vid, e, zid_out, &lk);
+  return r != RC_CONT ? r : recon_decide_locked(st, view, e, &lk, zid_out);
 }
 
 int db_recon_apply(const char *view, const db_recon_entry_t *e, uint32_t *zid_out) {
@@ -2868,6 +3012,113 @@ int db_recon_apply(const char *view, const db_recon_entry_t *e, uint32_t *zid_ou
   int r = recon_apply_locked(view, e, zid_out);
   rec_unlock();
   return r;
+}
+
+/* ---- 0.7 M2: a group of entries, one journal record (store_set_known_n()) ----
+ *
+ * The entries that make a record that is NEW (no record of the name, none of the source id: the whole first fill) are kept, in the order they come, and written as one group by
+ * store_set_known_n().  Every other entry (a record exists: the stamp is compared, a rename, a name taken over) first writes the group and then goes the way of db_recon_apply(), so the order
+ * of the effects is the order of the entries and an entry decides from the records its predecessors left.  An entry that has the name or the source id of one waiting in the group writes the group
+ * before it looks (its look would not see the record that waits).  The result of an entry that waits is known when the group is written. */
+#define RG_MAX 64
+typedef struct {
+  unsigned n;
+  store_known_t in[RG_MAX];
+  store_meta_t meta[RG_MAX];
+  char name[RG_MAX][DBS_NAME_MAX];
+  size_t at[RG_MAX];             /* the index of the entry in the call */
+  uint64_t nh[RG_MAX];           /* a hash of the name (names that differ only in case are one name) */
+  int64_t src[RG_MAX];
+  int vid;
+} rc_group_t;
+
+static uint64_t rg_hash(const char *s) {
+  uint64_t h = 1469598103934665603ull;
+  for (; *s; s++) h = (h ^ (uint64_t)(unsigned char)(*s >= 'A' && *s <= 'Z' ? *s + 32 : *s)) * 1099511628211ull;
+  return h;
+}
+
+static void rg_flush(store_t *st, rc_group_t *g, int *res, uint32_t *zid) {
+  if (g->n == 0) return;
+  int sr[RG_MAX];
+  uint32_t sz[RG_MAX];
+  if (store_set_known_n(st, (uint16_t)g->vid, g->in, g->n, sr, sz) < 0) {
+    for (unsigned i = 0; i < g->n; i++) sr[i] = -EINVAL, sz[i] = STORE_NONE;
+  }
+  for (unsigned i = 0; i < g->n; i++) {
+    const size_t k = g->at[i];
+    if (sr[i] < 0) {
+      note_error("the record of the reconcile", g->name[i], sr[i]);
+      res[k] = DBR_ERROR;                                   /* (zid[k] stays STORE_NONE: a record that was new and was not made) */
+      continue;
+    }
+    dmax_raise(g->vid, store_name_labels(g->name[i], g->in[i].len));
+    if (g->meta[i].flags & STORE_F_NONSTORE) np_clear(sz[i]);
+    res[k] = DBR_NEW;
+    zid[k] = sz[i];
+  }
+  g->n = 0;
+}
+
+static void rg_add(rc_group_t *g, const rc_look_t *lk, const db_recon_entry_t *e, size_t at) {
+  const unsigned i = g->n++;
+  memcpy(g->name[i], lk->name, lk->nlen + 1);
+  recon_meta(&g->meta[i], e, lk->vid);
+  g->in[i].name = g->name[i];
+  g->in[i].len = lk->nlen;
+  g->in[i].meta = &g->meta[i];
+  g->at[i] = at;
+  g->nh[i] = rg_hash(e->name);
+  g->src[i] = e->source_id;
+  g->vid = lk->vid;
+}
+
+static bool rg_clash(const rc_group_t *g, const db_recon_entry_t *e) {
+  const uint64_t h = rg_hash(e->name);
+  for (unsigned i = 0; i < g->n; i++)
+    if (g->nh[i] == h || (e->source_id != 0 && g->src[i] == e->source_id)) return true;
+  return false;
+}
+
+void db_recon_apply_n(const char *view, const db_recon_entry_t *e, size_t n, int *res, uint32_t *zid) {
+  rc_group_t *g = malloc(sizeof(*g));                       /* (some 30 KB: not on the stack of every caller) */
+  int vid = -1;
+  size_t done = 0;
+  while (done < n) {
+    const size_t end = n - done > RG_MAX ? done + RG_MAX : n;
+    rec_lock();                                             /* one hold of the mutex for a group: a thread that waits for it (the commit of a body, a lookup's answer) is not kept for a whole page */
+    store_t *st = atomic_load_explicit(&G.st, memory_order_acquire);
+    if (g) g->n = 0;
+    for (size_t i = done; i < end; i++) {
+      res[i] = DBR_ERROR;
+      zid[i] = STORE_NONE;
+      if (!g || !st) {                                      /* no memory for the group: one entry at a time, as before */
+        res[i] = recon_apply_locked(view, &e[i], &zid[i]);
+        continue;
+      }
+      if (e[i].name && g->n && rg_clash(g, &e[i])) rg_flush(st, g, res, zid);
+      rc_look_t lk;
+      int r = recon_look_locked(st, view, &vid, &e[i], &zid[i], &lk);
+      if (r != RC_CONT) {
+        res[i] = r;
+        continue;
+      }
+      if (lk.zs == STORE_NONE && lk.zn == STORE_NONE) {     /* a new record: it waits for the group */
+        rg_add(g, &lk, &e[i], i);
+        continue;
+      }
+      rg_flush(st, g, res, zid);
+      res[i] = recon_decide_locked(st, view, &e[i], &lk, &zid[i]);
+    }
+    if (g && st) rg_flush(st, g, res, zid);
+    rec_unlock();
+    done = end;
+    if (done < n && atomic_load_explicit(&g_rec_waiters, memory_order_relaxed) != 0) {
+      struct timespec ts = { 0, 50000 };                    /* somebody waits for the mutex (the ingest thread: the answer of a lookup, the commit of a body): the mutex is not fair, so give it the turn */
+      nanosleep(&ts, NULL);
+    }
+  }
+  free(g);
 }
 
 static void rc_count(int res, bool in_pass) {
@@ -2887,10 +3138,58 @@ static void rc_count(int res, bool in_pass) {
   rc_unlock();
 }
 
+static void rc_count_n(const int *res, size_t n, bool in_pass) {
+  uint64_t cr = 0, ch = 0, rn = 0, pe = 0, kp = 0, sm = 0, up = 0;
+  for (size_t i = 0; i < n; i++) {
+    switch (res[i]) {
+    case DBR_NEW: cr++; break;
+    case DBR_CHANGED: ch++; break;
+    case DBR_RENAMED: rn++; break;
+    case DBR_PENDING: pe++; break;
+    case DBR_KEPT: kp++; break;
+    case DBR_SAME: sm++; break;
+    default: break;
+    }
+    if (res[i] >= 0) up++;
+  }
+  rc_lock();
+  if (in_pass) {
+    RC.s.entries += n;
+    RC.s.created += cr;
+    RC.s.changed += ch;
+    RC.s.renamed += rn;
+    RC.s.pending += pe;
+    RC.s.kept += kp;
+    RC.s.same += sm;
+  } else {
+    RC.s.change_upserts += up;
+  }
+  RC.s.wanted += cr + ch + rn;
+  rc_unlock();
+}
+
 int db_recon_change(const char *view, const db_recon_entry_t *e, uint32_t *zid) {
   int r = db_recon_apply(view, e, zid);
   rc_count(r, false);
   return r;
+}
+
+/* the answer of a lookup (the ingest thread): as a CHANGES upsert, and the record is marked for the pass that may be going on (see lk_mark()); the mark is made under the mutex of the writers, so the sweep, which
+ * deletes under it, sees the record or the mark */
+int db_recon_lookup(const char *view, const db_recon_entry_t *e, uint32_t *zid) {
+  uint32_t z = STORE_NONE;
+  rec_lock();
+  int r = recon_apply_locked(view, e, &z);
+  if (r >= 0) lk_mark(view, z);
+  rec_unlock();
+  rc_count(r, false);
+  if (zid) *zid = z;
+  return r;
+}
+
+void db_recon_change_n(const char *view, const db_recon_entry_t *e, size_t n, int *res, uint32_t *zid) {
+  db_recon_apply_n(view, e, n, res, zid);
+  rc_count_n(res, n, false);
 }
 
 bool db_recon_begin(const char *view, uint64_t estimate, bool force, char *why, size_t whylen) {
@@ -2921,6 +3220,8 @@ bool db_recon_begin(const char *view, uint64_t estimate, bool force, char *why, 
   un_mark(view);
   rc_lock();
   bits_free(&RC.seen);
+  bits_free(&RC.lk);
+  atomic_store_explicit(&RC.lk_any, false, memory_order_relaxed);
   RC.active = true;
   RC.force = force;
   RC.failed = false;
@@ -2942,25 +3243,35 @@ bool db_recon_begin(const char *view, uint64_t estimate, bool force, char *why, 
   return true;
 }
 
-#ifdef KARIDNS_UNIT_TEST
-void (*db_recon_test_entry_hook)(void);
-#endif
+void (*_Atomic db_recon_test_entry_hook)(void);
+
+/* The entries of one page of a pass (0.7 M2): one group commit (db_recon_apply_n()), the counters under one hold of RC.mu.
+ * A zone the database lists is seen, whatever became of its record: one that could not be recorded (a full disk, an I/O error) and one whose bit could not be set (no memory) must not be swept as
+ * unlisted at the end of the pass.  Either failure also ends the pass without a sweep and without a cursor (db_recon_end()): the next pass has to make it good. */
+void db_recon_entry_n(const db_recon_entry_t *e, size_t n, int *res, uint32_t *zid) {
+  if (!RC.active) {
+    for (size_t i = 0; i < n; i++) res[i] = DBR_ERROR, zid[i] = STORE_NONE;
+    return;
+  }
+  void (*hook)(void) = atomic_load_explicit(&db_recon_test_entry_hook, memory_order_relaxed);
+  if (hook)
+    for (size_t i = 0; i < n; i++) hook();                           /* (tests: an entry of a pass that takes time) */
+  t_pass_apply = true;
+  db_recon_apply_n(RC.view, e, n, res, zid);
+  t_pass_apply = false;
+  for (size_t i = 0; i < n; i++) {
+    bool seen_ok = bits_set(&RC.seen, zid[i]);
+    if (atomic_load_explicit(&db_store_test_bits_fail, memory_order_relaxed) > 0 && atomic_fetch_sub_explicit(&db_store_test_bits_fail, 1, memory_order_relaxed) == 1) seen_ok = false;      /* (tests: the bit of the n-th entry of a pass could not be set: no memory) */
+    if (!seen_ok || res[i] == DBR_ERROR) RC.failed = true;
+  }
+  rc_count_n(res, n, true);
+}
+
 int db_recon_entry(const db_recon_entry_t *e, uint32_t *zid_out) {
   if (!RC.active) return DBR_ERROR;
-#ifdef KARIDNS_UNIT_TEST
-  if (db_recon_test_entry_hook) db_recon_test_entry_hook();         /* (tests: an entry of a pass that takes time) */
-#endif
+  int r;
   uint32_t zid = STORE_NONE;
-  int r = db_recon_apply(RC.view, e, &zid);
-  /* A zone the database lists is seen, whatever became of its record: one that could not be recorded (a full disk, an I/O error) and one whose bit could not be set (no memory) must not be swept as
-   * unlisted at the end of the pass.  Either failure also ends the pass without a sweep and without a cursor (db_recon_end()): the next pass has to make it good. */
-  bool seen_ok = bits_set(&RC.seen, zid);
-#ifdef KARIDNS_UNIT_TEST
-  if (db_store_test_bits_fail > 0 && --db_store_test_bits_fail == 0) seen_ok = false;      /* (tests: the bit of the n-th entry of a pass could not be set: no memory) */
-#endif
-  if (!seen_ok) RC.failed = true;
-  if (r == DBR_ERROR) RC.failed = true;
-  rc_count(r, true);
+  db_recon_entry_n(e, 1, &r, &zid);
   if (zid_out) *zid_out = zid;
   return r;
 }
@@ -2971,6 +3282,8 @@ void db_recon_abort(void) {
     syslog(LOG_WARNING, "[Store] the pass of view '%s' was cut off (the loader's stream ended); nothing is swept, the next pass starts again", RC.view);
     RC.active = false;
     bits_free(&RC.seen);
+    bits_free(&RC.lk);
+    atomic_store_explicit(&RC.lk_any, false, memory_order_relaxed);
   }
   rc_unlock();
 }
@@ -2978,7 +3291,7 @@ void db_recon_abort(void) {
 /* the zones of the view in the store, a few thousand at a time (the read section does not last for a pass over ten million zones) */
 #define RC_CHUNK 4096u
 #define RC_VICTIMS 128u
-typedef struct { char zone[STORE_NAME_MAX + 2]; int64_t sid; } rc_victim_t;
+typedef struct { char zone[STORE_NAME_MAX + 2]; int64_t sid; uint32_t zid; } rc_victim_t;
 
 void db_recon_end(bool complete, uint64_t n_skipped, bool cursor_valid, uint64_t cursor, const uint8_t *ident, size_t ident_len, db_recon_end_t *out) {
   memset(out, 0, sizeof(*out));
@@ -3016,7 +3329,7 @@ void db_recon_end(bool complete, uint64_t n_skipped, bool cursor_valid, uint64_t
       }
       if (more < 0 || z.view != (uint16_t)vid) continue;
       total++;
-      if (!bits_get(&RC.seen, z.zid)) unlisted++;
+      if (!bits_get(&RC.seen, z.zid) && !lk_has(z.zid)) unlisted++;
     }
     store_read_unlock();
   }
@@ -3068,14 +3381,17 @@ void db_recon_end(bool complete, uint64_t n_skipped, bool cursor_valid, uint64_t
             end = true;
             break;
           }
-          if (more < 0 || z.view != (uint16_t)vid || bits_get(&RC.seen, z.zid)) continue;
+          if (more < 0 || z.view != (uint16_t)vid || bits_get(&RC.seen, z.zid) || lk_has(z.zid)) continue;
           snprintf(vic[nv].zone, sizeof(vic[nv].zone), "%s.", z.name);
           vic[nv].sid = z.source_id;
+          vic[nv].zid = z.zid;
           nv++;
         }
         store_read_unlock();
         for (unsigned i = 0; i < nv; i++) {
-          int dr = dbreg_delete(view, vic[i].zone, vic[i].sid);
+          rec_lock();                                     /* every writer of a record's existence holds the mutex for its step (the commit of a body, a lookup's answer, a CHANGES entry run on other threads now): the lookup's mark is looked at again under it */
+          int dr = lk_has(vic[i].zid) ? 0 : dbreg_delete(view, vic[i].zone, vic[i].sid);
+          rec_unlock();
           if (dr > 0) deleted++;
           else if (dr < 0) nfail++;                       /* (the store could not delete it: it stays, and is listed by no database: the next pass tries again) */
         }
@@ -3112,6 +3428,8 @@ done:
   RC.active = false;
   RC.s.duration_ms = out->duration_ms;
   bits_free(&RC.seen);
+  bits_free(&RC.lk);
+  atomic_store_explicit(&RC.lk_any, false, memory_order_relaxed);
   rc_unlock();
 }
 
@@ -3175,12 +3493,25 @@ int db_recon_scan(uint32_t *cursor, unsigned budget, db_scan_item_t *out) {
     if (more < 0) continue;
     const bool np = (z.flags & STORE_F_NONSTORE) != 0;
     bool want;
-    if (np) want = !bits_get(&RC.np_done, z.zid);
+    const char *vn = store_view_name(st, z.view);
+    if (np) {
+      /* (the reconcile thread clears the bit of np_done when a record changes, after it wrote the change: the bit is set first, then the record is read again, so a change that cleared the bit before is in what is read and one that comes after clears it again) */
+      rc_lock();
+      want = vn && !bits_get(&RC.np_done, z.zid) && bits_set(&RC.np_done, z.zid);
+      rc_unlock();
+      if (want) {
+        store_zone_t z2;
+        if (store_zone_get(st, z.zid, &z2) == 0) {
+          z = z2;
+        } else {
+          np_clear(z.zid);                                  /* (the record is gone or cannot be read: asked for again if it comes back) */
+          want = false;
+        }
+      }
+    }
     else if (z.flags & STORE_F_REJECTED_NEW) want = false;
     else want = z.state == STORE_STATE_KNOWN || (z.flags & STORE_F_STALE) != 0;
-    if (!want) continue;
-    const char *vn = store_view_name(st, z.view);
-    if (!vn) continue;
+    if (!want || !vn) continue;
     snprintf(out->view, sizeof(out->view), "%s", vn);
     snprintf(out->zone, sizeof(out->zone), "%s.", z.name);
     out->source_id = z.source_id;
@@ -3188,7 +3519,6 @@ int db_recon_scan(uint32_t *cursor, unsigned budget, db_scan_item_t *out) {
     out->nonstore = np;
     out->stamp_gen = z.stamp_gen;
     out->stamp_time = z.stamp_time;
-    if (np) bits_set(&RC.np_done, z.zid);
     rc = 1;
     break;
   }
@@ -3211,7 +3541,7 @@ void db_recon_scan_retry(uint32_t zid) {
     rc_unlock();
     return;
   }
-  bits_clear(&RC.np_done, zid);
+  np_clear(zid);
 }
 
 /* ---- a fetched body is installed only for the stamp it was asked for ---- */

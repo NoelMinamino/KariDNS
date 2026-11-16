@@ -1028,7 +1028,7 @@ static void analyze_stream(dump_t *d) {
             if (d->n_begin < 16) snprintf(d->begin_name[d->n_begin], 80, "%s", m.u.zone_begin.name);
             d->n_begin++;
             break;
-        case KDB_T_ZONE_DATA: d->n_data++; break;
+        case KDB_T_ZONE_IMAGE: d->n_data++; break;
         case KDB_T_ZONE_END: d->n_end++; break;
         case KDB_T_ZONE_FAILED:
             if (d->n_failed < 16) {
@@ -2109,6 +2109,7 @@ static int ff_scan_records(db_conn_t *c, const int64_t *d, db_record_cb cb, void
 static int ff_scan_range(db_conn_t *c, int64_t lo, int64_t hi, db_record_cb cb, void *ud) { return ff_hit("scan_records_range") ? g_ff_rc : db_driver_sqlite3.scan_records_range(c, lo, hi, cb, ud); }
 static int ff_scan_metadata(db_conn_t *c, const int64_t *d, db_meta_cb cb, void *ud) { return ff_hit("scan_metadata") ? g_ff_rc : db_driver_sqlite3.scan_metadata(c, d, cb, ud); }
 static int ff_keys(db_conn_t *c, db_key_cb cb, void *ud) { return ff_hit("zones_with_keys") ? g_ff_rc : db_driver_sqlite3.zones_with_keys(c, cb, ud); }
+static int ff_keys_in(db_conn_t *c, const int64_t *ids, size_t n, db_key_cb cb, void *ud) { return ff_hit("zones_with_keys") ? g_ff_rc : db_driver_sqlite3.zones_with_keys_in(c, ids, n, cb, ud); }
 static int ff_views(db_conn_t *c, const int64_t *d, db_domain_view_cb cb, void *ud) { return ff_hit("scan_domain_views") ? g_ff_rc : db_driver_sqlite3.scan_domain_views(c, d, cb, ud); }
 static int ff_profiles(db_conn_t *c, db_profile_cb cb, void *ud) { return ff_hit("scan_profiles") ? g_ff_rc : db_driver_sqlite3.scan_profiles(c, cb, ud); }
 static int ff_ext(db_conn_t *c, const int64_t *d, const db_ext_sink_t *s) { return ff_hit("scan_ext") ? g_ff_rc : db_driver_sqlite3.scan_ext(c, d, s); }
@@ -2126,6 +2127,7 @@ static void ff_init(void) {
     g_fdrv.scan_records_range = ff_scan_range;
     g_fdrv.scan_metadata = ff_scan_metadata;
     g_fdrv.zones_with_keys = ff_keys;
+    g_fdrv.zones_with_keys_in = ff_keys_in;
     g_fdrv.scan_domain_views = ff_views;
     g_fdrv.scan_profiles = ff_profiles;
     g_fdrv.scan_ext = ff_ext;
@@ -3381,7 +3383,7 @@ static void test_signer_wait(void) {
     int64_t all[5] = { 0, 1, 2, 3, 4 }, one[1] = { 2 };
     bool yes[5];
     CHECK(db_driver_sqlite3.begin_snapshot(c) == 0);
-    zones_are_signers(&x, all, 5, yes);                                  /* per zone: SQLite3 has no scan_metadata_in */
+    zones_are_signers(&x, all, 5, yes);                                  /* the driver's scan_metadata_in */
     CHECK_MSG(yes[0] && yes[1] && !yes[2] && yes[3] && !yes[4], "%d %d %d %d %d", yes[0], yes[1], yes[2], yes[3], yes[4]);       /* kind without regard to case, blanks around the 1, exactly 1 */
     zones_are_signers(&x, one, 1, yes);
     CHECK(!yes[0]);
@@ -4292,6 +4294,596 @@ static void test_lookup(void) {
 #undef LK
 }
 
+/* ------------------------------------------------------------------ 0.7 (loader reads): scan_*_in of SQLite3, the kept statements, and the fetch batches */
+extern unsigned long sq_reprepares(db_conn_t *c);
+
+typedef struct { char *s; size_t n, cap; } sigbuf_t;
+
+static void sig_add(sigbuf_t *g, const char *fmt, ...) {
+    char t[2048];
+    va_list ap;
+    va_start(ap, fmt);
+    int k = vsnprintf(t, sizeof(t), fmt, ap);
+    va_end(ap);
+    if (k < 0) return;
+    if (g->n + (size_t)k + 1 > g->cap) {
+        g->cap = (g->n + (size_t)k + 1) * 2;
+        g->s = realloc(g->s, g->cap);
+    }
+    memcpy(g->s + g->n, t, (size_t)k + 1);
+    g->n += (size_t)k;
+}
+
+static int mp_count(void *ud, const db_manifest_row_t *r) { (void)ud; (void)r; return 0; }
+static int dv_null(void *ud, int64_t did, const char *vn) { (void)ud; (void)did; (void)vn; return 0; }
+static const char *nz(const char *s) { return s ? s : "-"; }
+static int sg_rec(void *ud, int64_t did, const db_record_row_t *r) {
+    sig_add(ud, "R%lld/%lld/%s/%s/%s/%lld/%lld/%d;", (long long)did, (long long)r->id, nz(r->name), nz(r->type), nz(r->content), (long long)r->ttl, (long long)r->prio, r->disabled);
+    return 0;
+}
+static int sg_meta(void *ud, const db_meta_row_t *m) {
+    sig_add(ud, "M%lld/%s/%s;", (long long)m->domain_id, nz(m->kind), nz(m->content));
+    return 0;
+}
+typedef struct { sigbuf_t tags, td, defs; } sgx_t;
+static int sg_tag(void *ud, int64_t did, const db_tag_row_t *r) {
+    sig_add(&((sgx_t *)ud)->tags, "T%lld/%lld/%s/%s;", (long long)did, (long long)r->record_id, nz(r->location_tag), nz(r->ecs_tag));
+    return 0;
+}
+static int sg_td(void *ud, int64_t did, const db_tinydns_row_t *r) {
+    sig_add(&((sgx_t *)ud)->td, "D%lld/%lld/%lld/%s/%d;", (long long)did, (long long)r->record_id, (long long)r->ttd, nz(r->loc), r->countdown);
+    return 0;
+}
+static int sg_def(void *ud, int64_t did, const db_tagdef_row_t *r) {
+    sig_add(&((sgx_t *)ud)->defs, "G%lld/%s/%s/%s;", (long long)did, nz(r->kind), nz(r->tag), nz(r->cidr));
+    return 0;
+}
+
+/* the rows of the zones ids[0..n) in one call and zone by zone (ascending ids): the same text */
+static bool in_same(db_conn_t *c, const int64_t *ids, size_t n) {
+    const db_driver_t *D = &db_driver_sqlite3;
+    sigbuf_t ra = { 0 }, rb = { 0 }, ma = { 0 }, mb = { 0 };
+    sgx_t xa, xb;
+    memset(&xa, 0, sizeof(xa));
+    memset(&xb, 0, sizeof(xb));
+    db_ext_sink_t sa = { sg_tag, sg_td, sg_def, &xa }, sb = { sg_tag, sg_td, sg_def, &xb };
+    int rc = D->scan_records_in(c, ids, n, sg_rec, &ra);
+    rc |= D->scan_metadata_in(c, ids, n, sg_meta, &ma);
+    rc |= D->scan_ext_in(c, ids, n, &sa);
+    for (size_t i = 0; i < n; i++) {
+        rc |= D->scan_records(c, &ids[i], sg_rec, &rb);
+        rc |= D->scan_metadata(c, &ids[i], sg_meta, &mb);
+        rc |= D->scan_ext(c, &ids[i], &sb);
+    }
+    bool ok = rc == 0 && ra.n == rb.n && ma.n == mb.n && xa.tags.n == xb.tags.n && xa.td.n == xb.td.n && xa.defs.n == xb.defs.n;
+    ok = ok && (ra.n == 0 || strcmp(ra.s, rb.s) == 0) && (ma.n == 0 || strcmp(ma.s, mb.s) == 0) && (xa.tags.n == 0 || strcmp(xa.tags.s, xb.tags.s) == 0) &&
+         (xa.td.n == 0 || strcmp(xa.td.s, xb.td.s) == 0) && (xa.defs.n == 0 || strcmp(xa.defs.s, xb.defs.s) == 0);
+    if (!ok) printf("    n=%zu rc=%d: records %zu/%zu, metadata %zu/%zu, tags %zu/%zu, tinydns %zu/%zu, defs %zu/%zu bytes\n", n, rc, ra.n, rb.n, ma.n, mb.n, xa.tags.n, xb.tags.n,
+                    xa.td.n, xb.td.n, xa.defs.n, xb.defs.n);
+    free(ra.s); free(rb.s); free(ma.s); free(mb.s);
+    free(xa.tags.s); free(xb.tags.s); free(xa.td.s); free(xb.td.s); free(xa.defs.s); free(xb.defs.s);
+    return ok;
+}
+
+/* zones_with_keys_in (0.7): the keys of ids[0..n) are the keys of the whole table, those ids only, in ascending order, whatever the order or the
+ * repeats of ids; an id without keys, or not in the database, gives nothing */
+typedef struct { int64_t v[DB_IN_MAX + 8]; size_t n; } keyset_t;
+static int keyset_add(void *ud, int64_t id) { keyset_t *k = ud; if (k->n < sizeof(k->v) / sizeof(k->v[0])) k->v[k->n++] = id; return 0; }
+static int stop_key(void *ud, int64_t id) { (void)id; ++*(size_t *)ud; return 1; }
+static bool keys_in_same(db_conn_t *c, const int64_t *ids, size_t n) {
+    const db_driver_t *D = &db_driver_sqlite3;
+    keyset_t all = { .n = 0 }, in = { .n = 0 }, want = { .n = 0 };
+    int rc = D->zones_with_keys(c, keyset_add, &all);
+    rc |= D->zones_with_keys_in(c, ids, n, keyset_add, &in);
+    for (size_t i = 0; i < all.n; i++)
+        for (size_t j = 0; j < n; j++)
+            if (all.v[i] == ids[j]) {
+                want.v[want.n++] = all.v[i];
+                break;
+            }
+    bool ok = rc == 0 && in.n == want.n && memcmp(in.v, want.v, want.n * sizeof(int64_t)) == 0;
+    if (!ok) printf("    n=%zu rc=%d: %zu keys at once, %zu expected\n", n, rc, in.n, want.n);
+    return ok;
+}
+
+static void test_scan_in(void) {
+    printf("scan_records_in / scan_metadata_in / scan_ext_in (0.7): the rows of several zones are the rows of the zone-by-zone calls; the kept statements are not parsed again\n");
+    char path[600], err[DB_ERRLEN];
+    sqlite3 *db = make_db("scanin.db", path, sizeof(path));
+    char *ext = slurp(g_ext_path);
+    CHECK(ext != NULL);
+    if (!db || !ext) return;
+    raw_exec(db, ext);
+    free(ext);
+    for (int i = 1; i <= 140; i++) {
+        char nm[40];
+        snprintf(nm, sizeof(nm), "z%d.test", i);
+        add_simple_zone(db, i, 1000 + 10 * i, nm);                          /* records 1000+10i .. +2 */
+        if (i % 7 == 0) sqlf(db, "INSERT INTO domainmetadata (domain_id, kind, content) VALUES (%d, 'X-A', '1'), (%d, 'X-B', 'two')", i, i);
+        if (i % 5 == 0) sqlf(db, "INSERT INTO karidns_record_tags (record_id, location_tag, ecs_tag) VALUES (%d, 'lan', NULL)", 1000 + 10 * i + 2);
+        if (i % 11 == 0) sqlf(db, "INSERT INTO karidns_record_tinydns (record_id, ttd, loc, countdown) VALUES (%d, 99, 'l1', 1)", 1000 + 10 * i + 2);
+        if (i % 13 == 0)
+            sqlf(db, "INSERT INTO karidns_zone_tagdefs (domain_id, kind, tag, cidr) VALUES (%d, 'location', 'a', '192.0.2.0/24'), (%d, 'location', 'a', '198.51.100.0/24')", i, i);
+    }
+    add_zone(db, 141, "empty.test", "NATIVE");                              /* a zone without a row anywhere */
+    for (int i = 3; i <= 140; i += 3) sqlf(db, "INSERT INTO cryptokeys (domain_id, flags, active, content) VALUES (%d, 257, 1, 'x'), (%d, 256, 1, 'y')", i, i);   /* every third zone is signed */
+    raw_exec(db, "ANALYZE");                                                /* (the planner has statistics, as in a database that has been used) */
+    sqlite3_close(db);
+    int rc = 0;
+    db_conn_t *c = open_driver(path, 0, err, sizeof(err), &rc);
+    CHECK(c != NULL && rc == 0);
+    if (!c) return;
+    const db_driver_t *D = &db_driver_sqlite3;
+    db_schema_info_t si;
+    CHECK(D->check_schema(c, &si) == 0 && si.has_ext);
+    CHECK(D->begin_snapshot(c) == 0);
+    CHECK(D->scan_records_in != NULL && D->scan_metadata_in != NULL && D->scan_ext_in != NULL);
+    static const size_t sizes[] = { 1, 2, 3, 4, 5, 8, 9, 16, 17, 33, 64, 65, 127, 128 };       /* the size classes of the kept statements and their edges */
+    for (size_t k = 0; k < sizeof(sizes) / sizeof(sizes[0]); k++) {
+        int64_t ids[DB_IN_MAX];
+        for (size_t i = 0; i < sizes[k]; i++) ids[i] = (int64_t)i + 1;
+        CHECK_MSG(in_same(c, ids, sizes[k]), "the first %zu zones", sizes[k]);
+    }
+    {   /* a zone with no rows (141), a zone that is not there (142, 200), and scattered ids; the order of the ids does not matter for the rows, which are ordered by id */
+        int64_t a[] = { 7, 141, 142 }, b[] = { 141 }, c3[] = { 5, 10, 11, 13, 143, 200 }, d[] = { 142 };
+        CHECK(in_same(c, a, 3));
+        CHECK(in_same(c, b, 1));
+        CHECK(in_same(c, c3, 6));
+        CHECK(in_same(c, d, 1));
+        sigbuf_t s = { 0 };
+        CHECK(D->scan_records_in(c, d, 1, sg_rec, &s) == 0 && s.n == 0);
+        CHECK(D->scan_records_in(c, b, 1, sg_rec, &s) == 0 && s.n == 0);
+        free(s.s);
+    }
+    {   /* a stopped scan leaves the statement usable; more or fewer zones than allowed is an error that says so */
+        int64_t ids[DB_IN_MAX + 1];
+        for (size_t i = 0; i < DB_IN_MAX + 1; i++) ids[i] = (int64_t)i + 1;
+        size_t cnt = 0;
+        CHECK(D->scan_records_in(c, ids, 3, stop_rec, &cnt) == DB_STOPPED && cnt == 1);
+        CHECK(in_same(c, ids, 3));
+        CHECK(D->scan_records_in(c, ids, 0, rec_collect, NULL) == -1 && strstr(D->errmsg(c), "scan_*_in") != NULL);
+        CHECK(D->scan_records_in(c, ids, DB_IN_MAX + 1, rec_collect, NULL) == -1);
+        CHECK(D->scan_metadata_in(c, ids, 0, sg_meta, NULL) == -1 && D->scan_metadata_in(c, ids, DB_IN_MAX + 1, sg_meta, NULL) == -1);
+        sgx_t xs;
+        memset(&xs, 0, sizeof(xs));
+        db_ext_sink_t sk = { sg_tag, sg_td, sg_def, &xs };
+        CHECK(D->scan_ext_in(c, ids, 0, &sk) == -1 && D->scan_ext_in(c, ids, DB_IN_MAX + 1, &sk) == -1);
+    }
+    /* no statement is parsed again for what has been used: the second round of every size is free */
+    {
+        int64_t ids[DB_IN_MAX];
+        for (size_t i = 0; i < DB_IN_MAX; i++) ids[i] = (int64_t)i + 1;
+        unsigned long p0 = g_sq_prepares;
+        for (size_t k = 0; k < sizeof(sizes) / sizeof(sizes[0]); k++) CHECK(in_same(c, ids, sizes[k]));
+        CHECK(g_sq_prepares == p0);
+    }
+    {   /* zones_with_keys_in: the same keys as the full scan for these zones, every size class, scattered ids, ids without keys, ids that are not there */
+        CHECK(D->zones_with_keys_in != NULL);
+        int64_t ids[DB_IN_MAX];
+        for (size_t k = 0; k < sizeof(sizes) / sizeof(sizes[0]); k++) {
+            for (size_t i = 0; i < sizes[k]; i++) ids[i] = (int64_t)i + 1;
+            CHECK_MSG(keys_in_same(c, ids, sizes[k]), "keys of the first %zu zones", sizes[k]);
+        }
+        int64_t a[] = { 3 }, b[] = { 1, 2 }, d[] = { 142 }, e[] = { 141, 142, 9999, 6 }, f[] = { 140, 3, 99, 3, 4 }, g[] = { 9223372036854775807LL, -5, 0, 12 };
+        CHECK(keys_in_same(c, a, 1) && keys_in_same(c, b, 2) && keys_in_same(c, d, 1) && keys_in_same(c, e, 4) && keys_in_same(c, f, 5) && keys_in_same(c, g, 4));
+        keyset_t ks = { .n = 0 };
+        CHECK(D->zones_with_keys_in(c, d, 1, keyset_add, &ks) == 0 && ks.n == 0);          /* not in the database: no key */
+        CHECK(D->zones_with_keys_in(c, b, 2, keyset_add, &ks) == 0 && ks.n == 0);          /* in the database, no key */
+        CHECK(D->zones_with_keys_in(c, e, 4, keyset_add, &ks) == 0 && ks.n == 1 && ks.v[0] == 6);
+        CHECK(D->zones_with_keys_in(c, f, 5, keyset_add, &ks) == 0 && ks.n == 3 && ks.v[1] == 3 && ks.v[2] == 99);          /* (the repeated 3 is one key; 4 has none) */
+        for (size_t i = 0; i < DB_IN_MAX; i++) ids[i] = (int64_t)i + 1;
+        size_t cnt = 0;
+        CHECK(D->zones_with_keys_in(c, ids, 10, stop_key, &cnt) == DB_STOPPED && cnt == 1);          /* a stopped read leaves the statement usable */
+        CHECK(keys_in_same(c, ids, 10));
+        CHECK(D->zones_with_keys_in(c, ids, 0, keyset_add, &ks) == -1 && strstr(D->errmsg(c), "scan_*_in") != NULL);
+        CHECK(D->zones_with_keys_in(c, ids, DB_IN_MAX + 1, keyset_add, &ks) == -1);
+        unsigned long p0 = g_sq_prepares;          /* the kept statements: nothing is parsed again */
+        for (size_t k = 0; k < sizeof(sizes) / sizeof(sizes[0]); k++) CHECK(keys_in_same(c, ids, sizes[k]));
+        CHECK(g_sq_prepares == p0);
+    }
+    CHECK(D->end_snapshot(c) == 0);
+    /* a fetch-like round on a kept connection, many times, on a database with statistics: no statement expires, so none is parsed again (clear_bindings after a reset did that) */
+    {
+        const char *names[] = { "www.z5.test.", "z5.test.", "test." };
+        int64_t one = 5;
+        unsigned long p0 = 0;
+        unsigned long r0 = 0;          /* (SQLite parses a statement of `domain_id = ?1` again when it is bound to 1 or 2 after another value, whatever the planner sees in it: the calls above did that, so the rounds use other ids and count from here) */
+        for (int round = 0; round < 40; round++) {
+            CHECK(D->begin_snapshot(c) == 0);
+            zl_t l;
+            memset(&l, 0, sizeof(l));
+            char nm[32];
+            snprintf(nm, sizeof(nm), "z%d.test.", round % 20 + 20);
+            CHECK(D->find_zone(c, nm, zl_collect, &l) == 0 && l.n == 1);
+            zl_free(&l);
+            CHECK(D->find_zones_in(c, names, 3, zl_collect, &l) == 0 && l.n == 1);
+            zl_free(&l);
+            one = round % 20 + 20;
+            CHECK(D->scan_domain_views(c, &one, dv_null, NULL) == 0);
+            sigbuf_t s = { 0 };
+            sgx_t xs;
+            memset(&xs, 0, sizeof(xs));
+            db_ext_sink_t sk = { sg_tag, sg_td, sg_def, &xs };
+            CHECK(D->scan_metadata(c, &one, sg_meta, &s) == 0 && D->scan_records(c, &one, sg_rec, &s) == 0 && D->scan_ext(c, &one, &sk) == 0);
+            CHECK(D->scan_records_in(c, (int64_t[]){ 3, 5, 7 }, 3, sg_rec, &s) == 0);
+            CHECK(D->zones_with_keys(c, collect_key, &(keys_t){ 0 }) == 0);
+            uint64_t cnt = 0;
+            CHECK(D->count_domains(c, NULL, &cnt) == 0 && cnt == 141);
+            int64_t last = 0;
+            unsigned nr = 0;
+            CHECK(D->manifest_page(c, 0, 10, mp_count, NULL, &last, &nr) == 0 && nr == 10);
+            free(s.s);
+            free(xs.tags.s);
+            free(xs.td.s);
+            free(xs.defs.s);
+            CHECK(D->end_snapshot(c) == 0);
+            if (round == 0) p0 = g_sq_prepares;
+            if (round == 2) r0 = sq_reprepares(c);                  /* (the first rounds may parse a statement again once, as a new statement settles) */
+        }
+        CHECK_MSG(g_sq_prepares == p0, "statements parsed in the later rounds: %lu", g_sq_prepares - p0);
+        CHECK_MSG(sq_reprepares(c) == r0, "statements that expired and were parsed again: %lu", sq_reprepares(c) - r0);
+    }
+    D->close(c);
+
+    /* a database without the extension tables: scan_ext_in says so, the other two work */
+    sqlite3 *pdb = make_db("scanin_plain.db", path, sizeof(path));
+    add_simple_zone(pdb, 1, 10, "a.test");
+    sqlite3_close(pdb);
+    c = open_driver(path, 0, err, sizeof(err), &rc);
+    CHECK(c != NULL);
+    if (!c) return;
+    CHECK(D->check_schema(c, &si) == 0 && !si.has_ext);
+    {
+        int64_t one = 1;
+        sgx_t xs;
+        memset(&xs, 0, sizeof(xs));
+        db_ext_sink_t sk = { sg_tag, sg_td, sg_def, &xs };
+        sigbuf_t s = { 0 };
+        CHECK(D->scan_ext_in(c, &one, 1, &sk) == DB_ERR_UNAVAILABLE);
+        CHECK(D->scan_records_in(c, &one, 1, sg_rec, &s) == 0 && s.n > 0);
+        free(s.s);
+    }
+    D->close(c);
+}
+
+static void test_find_zones_classes(void) {
+    printf("find_zones_in() with kept statements (0.7): every number of names, parsed once for its size class\n");
+    char path[600], err[DB_ERRLEN];
+    sqlite3 *db = make_db("zlk.db", path, sizeof(path));
+    if (!db) return;
+    add_simple_zone(db, 5, 50, "z5.test");
+    add_simple_zone(db, 6, 60, "sub.z5.test");
+    sqlite3_close(db);
+    int rc = 0;
+    db_conn_t *c = open_driver(path, 0, err, sizeof(err), &rc);
+    CHECK(c != NULL);
+    if (!c) return;
+    const db_driver_t *D = &db_driver_sqlite3;
+    CHECK(D->begin_snapshot(c) == 0);
+    static const size_t counts[] = { 1, 2, 3, 4, 5, 8, 9, 16, 17, 32, 33, 64, 65, 127, 128 };
+    char store[DB_LOOKUP_MAX][40];
+    const char *names[DB_LOOKUP_MAX];
+    for (int round = 0; round < 2; round++) {
+        unsigned long p0 = g_sq_prepares;
+        for (size_t k = 0; k < sizeof(counts) / sizeof(counts[0]); k++) {
+            size_t n = counts[k];
+            for (size_t i = 0; i < n; i++) {
+                snprintf(store[i], sizeof(store[i]), "none%zu.invalid.", i);
+                names[i] = store[i];
+            }
+            snprintf(store[n - 1], sizeof(store[n - 1]), "z5.test.");           /* the last name is the zone; with n > 1 another is below it */
+            if (n > 1) snprintf(store[0], sizeof(store[0]), "sub.z5.test");
+            zl_t l;
+            memset(&l, 0, sizeof(l));
+            CHECK_MSG(D->find_zones_in(c, names, n, zl_collect, &l) == 0, "n=%zu", n);
+            CHECK_MSG(n > 1 ? l.n == 2 && l.id[0] == 6 && l.id[1] == 5 : l.n == 1 && l.id[0] == 5, "n=%zu gave %zu zones", n, l.n);
+            zl_free(&l);
+        }
+        if (round == 1) CHECK_MSG(g_sq_prepares == p0, "round 2 parsed %lu statements", g_sq_prepares - p0);
+    }
+    D->end_snapshot(c);
+    D->close(c);
+}
+
+/* ---- the fetch batch (fetch_batch(), fetch_take()) */
+typedef struct { char ev[2048]; int begin[1000], failed[1000], looked[1000], found[1000]; } fbev_t;
+
+static void fb_events(int fd, fbev_t *e) {
+    static uint8_t body[KDB_MAX_BODY];
+    kdb_framer_t f;
+    kdb_sm_t sm;
+    memset(e, 0, sizeof(*e));
+    kdb_framer_init(&f, KDB_FROM_LOADER, body, sizeof(body));
+    kdb_sm_init_fetch(&sm, NULL);
+    uint8_t buf[65536];
+    for (;;) {
+        ssize_t n = recv(fd, buf, sizeof(buf), MSG_DONTWAIT);
+        if (n <= 0) break;
+        if (kdb_framer_feed(&f, buf, (size_t)n) != KDB_OK) {
+            strcat(e->ev, "!feed ");
+            return;
+        }
+        kdb_frame_t fr;
+        while (kdb_framer_next(&f, &fr) == KDB_OK) {
+            kdb_msg_t m;
+            if (kdb_sm_accept(&sm, &fr, &m) != KDB_OK) {
+                printf("    the state machine says: %s\n", sm.reason);
+                strcat(e->ev, "!sm ");
+                return;
+            }
+            char t[48];
+            switch (m.type) {
+            case KDB_T_ZONE_BEGIN:
+                if (m.u.zone_begin.request_id < 1000) e->begin[m.u.zone_begin.request_id]++;
+                snprintf(t, sizeof(t), "B%llu ", (unsigned long long)m.u.zone_begin.request_id);
+                strcat(e->ev, t);
+                break;
+            case KDB_T_ZONE_FAILED:
+                if (m.u.zone_failed.request_id < 1000) e->failed[m.u.zone_failed.request_id]++;
+                snprintf(t, sizeof(t), "F%llu ", (unsigned long long)m.u.zone_failed.request_id);
+                strcat(e->ev, t);
+                break;
+            case KDB_T_LOOKUP_RESULT:
+                if (m.u.lookup_result.request_id < 1000) {
+                    e->looked[m.u.lookup_result.request_id]++;
+                    e->found[m.u.lookup_result.request_id] += m.u.lookup_result.found ? 1 : 0;
+                }
+                snprintf(t, sizeof(t), "L%llu%s ", (unsigned long long)m.u.lookup_result.request_id, m.u.lookup_result.found ? "+" : "-");
+                strcat(e->ev, t);
+                break;
+            default: break;
+            }
+        }
+    }
+}
+
+static void fb_req(struct fbatch *fb, uint64_t id, uint8_t mode, const char *zone, int64_t source_id) {
+    freq_t *q = &fb->rq[fb->n++];
+    memset(q, 0, sizeof(*q));
+    q->id = id;
+    q->view = 1;
+    q->prio = KDB_FETCH_PRIO_BACKGROUND;
+    q->mode = mode;
+    q->source_id = source_id;
+    snprintf(q->zone, sizeof(q->zone), "%s", zone);
+}
+
+/* each request has exactly one answer of the kind, and no other */
+#define FB_ONE_OF(e, id) ((e).begin[id] + (e).failed[id] + (e).looked[id] >= 1)
+
+static void test_fetch_batch(void) {
+    printf("fetch batches (0.7): several requests read in one snapshot, every request answered once with its own id\n");
+    signal(SIGPIPE, SIG_IGN);
+    char path[600];
+    sqlite3 *db = make_db("fbatch.db", path, sizeof(path));
+    char *ext = slurp(g_ext_path);
+    CHECK(ext != NULL);
+    if (!db || !ext) return;
+    raw_exec(db, ext);
+    free(ext);
+    add_simple_zone(db, 1, 10, "a.test");
+    add_simple_zone(db, 2, 20, "b.test");
+    add_simple_zone(db, 3, 30, "c.test");
+    add_zone(db, 4, "nosoa.test", "NATIVE");                               /* its NS only: the zone cannot be converted, ZONE_FAILED */
+    add_rec(db, 40, 4, "nosoa.test", "NS", "ns1.nosoa.test", 3600, -1, 0, NULL);
+    add_zone(db, 5, "empty.test", "NATIVE");                               /* no rows at all */
+    add_simple_zone(db, 6, 60, "UPPER.test");                              /* a name with capitals */
+    add_simple_zone(db, 7, 70, "sub.a.test");
+    int sv[2];
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    struct lio *io = calloc(1, sizeof(*io));
+    struct fbatch *fb = calloc(1, sizeof(*fb));
+    CHECK(io != NULL && fb != NULL);
+    if (!io || !fb) return;
+    io->fd = sv[0];
+    io->is_fetch = true;
+    pthread_mutex_init(&io->wlock, NULL);
+    ctx_t x;
+    memset(&x, 0, sizeof(x));
+    x.io = io;
+    x.fetch = true;
+    kdb_enc_init(&x.enc);
+    lcfg_t lc;
+    memset(&lc, 0, sizeof(lc));
+    snprintf(lc.driver, sizeof(lc.driver), "sqlite3");
+    lc.store_proto = true;
+    lview_t v;
+    memset(&v, 0, sizeof(v));
+    v.index = 1;
+    v.name = "__default__";
+    v.source = path;
+    lc.views = &v;
+    lc.nviews = 1;
+    fbev_t *e = calloc(1, sizeof(*e));
+    CHECK(e != NULL);
+    if (!e) return;
+
+    /* bodies: the zones that are there, a name that is not, a zone that cannot be converted, an empty zone, another domain id than the Backend has, a name with capitals */
+    fb->n = 0;
+    fb->lookup = false;
+    fb_req(fb, 101, KDB_FETCH_FULL, "a.test.", 1);
+    fb_req(fb, 102, KDB_FETCH_FULL, "b.test.", 99);                         /* (the Backend's b.test is domain 99: the zone was made again) */
+    fb_req(fb, 103, KDB_FETCH_FULL, "c.test.", 0);                          /* (any id) */
+    fb_req(fb, 104, KDB_FETCH_FULL, "gone.test.", 0);
+    fb_req(fb, 105, KDB_FETCH_FULL, "nosoa.test.", 4);
+    fb_req(fb, 106, KDB_FETCH_FULL, "empty.test.", 5);
+    fb_req(fb, 107, KDB_FETCH_FULL, "upper.test.", 6);
+    fb_req(fb, 108, KDB_FETCH_FULL, "sub.a.test.", 7);
+    CHECK(fetch_batch(&x, &lc, fb) == 0);
+    fb_events(sv[1], e);
+    CHECK_MSG(strstr(e->ev, "!") == NULL, "events: %s", e->ev);
+    CHECK_MSG(e->begin[101] == 1 && e->begin[103] == 1 && e->begin[107] == 1 && e->begin[108] == 1, "zones sent: %s", e->ev);
+    CHECK_MSG(e->failed[102] == 1 && e->failed[104] == 1 && e->failed[105] == 1 && e->failed[106] == 1, "failures: %s", e->ev);
+    for (int id = 101; id <= 108; id++) CHECK_MSG(e->begin[id] + e->failed[id] == 1, "request %d answered %d times: %s", id, e->begin[id] + e->failed[id], e->ev);
+    CHECK(x.fb == NULL && x.nz == 0);
+
+    /* N = 1: the same function with one request */
+    fb->n = 0;
+    fb_req(fb, 201, KDB_FETCH_FULL, "a.test.", 1);
+    CHECK(fetch_batch(&x, &lc, fb) == 0);
+    fb_events(sv[1], e);
+    CHECK_MSG(e->begin[201] == 1 && e->failed[201] == 0, "%s", e->ev);
+
+    /* a zone deleted between two batches: the next batch does not find it, and the others of the batch are read */
+    raw_exec(db, "DELETE FROM records WHERE domain_id = 3; DELETE FROM domains WHERE id = 3");
+    fb->n = 0;
+    fb_req(fb, 301, KDB_FETCH_FULL, "a.test.", 0);
+    fb_req(fb, 302, KDB_FETCH_FULL, "c.test.", 3);
+    fb_req(fb, 303, KDB_FETCH_FULL, "b.test.", 2);
+    CHECK(fetch_batch(&x, &lc, fb) == 0);
+    fb_events(sv[1], e);
+    CHECK_MSG(e->begin[301] == 1 && e->begin[303] == 1 && e->failed[302] == 1 && e->begin[302] == 0, "%s", e->ev);
+    keep_drop(&x);
+
+    /* lookups: several names in one statement; the answers are those of one lookup at a time; KDB_FETCH_LOOKUP_FULL is followed by the body, with the same request id */
+    fb->n = 0;
+    fb->lookup = true;
+    fb_req(fb, 401, KDB_FETCH_LOOKUP_FULL, "www.a.test.", 0);
+    fb_req(fb, 402, KDB_FETCH_LOOKUP, "x.y.sub.a.test.", 0);                /* (the closest zone is sub.a.test) */
+    fb_req(fb, 403, KDB_FETCH_LOOKUP, "www.nothing.invalid.", 0);
+    fb_req(fb, 404, KDB_FETCH_LOOKUP_FULL, "mail.b.test.", 0);
+    fb_req(fb, 405, KDB_FETCH_LOOKUP_FULL, "q.c.test.", 0);                 /* (deleted above) */
+    fb_req(fb, 406, KDB_FETCH_LOOKUP, ".", 0);
+    CHECK(fetch_batch(&x, &lc, fb) == 0);
+    fb_events(sv[1], e);
+    CHECK_MSG(strstr(e->ev, "!") == NULL, "events: %s", e->ev);
+    CHECK_MSG(e->looked[401] == 1 && e->found[401] == 1 && e->looked[402] == 1 && e->found[402] == 1 && e->looked[403] == 1 && e->found[403] == 0 &&
+                  e->looked[404] == 1 && e->found[404] == 1 && e->looked[405] == 1 && e->found[405] == 0 && e->looked[406] == 1 && e->found[406] == 0,
+              "lookups: %s", e->ev);
+    CHECK_MSG(e->begin[401] == 1 && e->begin[404] == 1 && e->begin[402] == 0 && e->begin[405] == 0, "bodies of the FULL lookups: %s", e->ev);
+    keep_drop(&x);
+
+    /* a database error in the middle: every request that has no answer is failed, none is left waiting */
+    fb->n = 0;
+    fb->lookup = false;
+    fb_req(fb, 501, KDB_FETCH_FULL, "a.test.", 0);
+    fb_req(fb, 502, KDB_FETCH_FULL, "b.test.", 0);
+    v.source = (char *)"/nonexistent/dir/fb.db";
+    CHECK(fetch_batch(&x, &lc, fb) == 0);
+    fb_events(sv[1], e);
+    CHECK_MSG(e->failed[501] == 1 && e->failed[502] == 1 && e->begin[501] == 0, "%s", e->ev);
+    v.source = path;
+    /* a configuration without the view or the driver: every request is failed */
+    fb->n = 0;
+    fb_req(fb, 601, KDB_FETCH_FULL, "a.test.", 0);
+    fb_req(fb, 602, KDB_FETCH_FULL, "b.test.", 0);
+    fb->rq[1].view = 9;
+    fb->rq[0].view = 9;
+    CHECK(fetch_batch(&x, &lc, fb) == 0);
+    fb_events(sv[1], e);
+    CHECK_MSG(e->failed[601] == 1 && e->failed[602] == 1, "%s", e->ev);
+    fb->n = 0;
+    fb->lookup = true;
+    fb_req(fb, 611, KDB_FETCH_LOOKUP, "www.a.test.", 0);
+    lc.store_proto = false;                                                 /* (a lookup needs the store protocol) */
+    CHECK(fetch_batch(&x, &lc, fb) == 0);
+    fb_events(sv[1], e);
+    CHECK_MSG(e->failed[611] == 1, "%s", e->ev);
+    lc.store_proto = true;
+    snprintf(lc.driver, sizeof(lc.driver), "nosuch");
+    CHECK(fetch_batch(&x, &lc, fb) == 0);
+    fb_events(sv[1], e);
+    CHECK_MSG(e->failed[611] == 1, "%s", e->ev);
+    keep_drop(&x);
+    ctx_view_reset(&x);
+    kdb_enc_free(&x.enc);
+    pthread_mutex_destroy(&io->wlock);
+    free(io);
+    free(fb);
+    free(e);
+    close(sv[0]);
+    close(sv[1]);
+    sqlite3_close(db);
+}
+
+static void fq_put(struct lio *io, uint64_t id, uint8_t mode, uint8_t prio, uint16_t view, const char *zone) {
+    freq_t *q = &io->fq[io->nfq++];
+    memset(q, 0, sizeof(*q));
+    q->id = id;
+    q->view = view;
+    q->prio = prio;
+    q->mode = mode;
+    snprintf(q->zone, sizeof(q->zone), "%s", zone);
+}
+
+static void test_fetch_take(void) {
+    printf("fetch batches (0.7): which queued requests join the one a worker took\n");
+    struct lio *io = calloc(1, sizeof(*io));
+    struct fbatch *fb = calloc(1, sizeof(*fb));
+    CHECK(io != NULL && fb != NULL);
+    if (!io || !fb) return;
+    freq_t r;
+    memset(&r, 0, sizeof(r));
+    r.id = 1;
+    r.view = 1;
+    r.prio = KDB_FETCH_PRIO_BACKGROUND;
+    r.mode = KDB_FETCH_FULL;
+    snprintf(r.zone, sizeof(r.zone), "z0.test.");
+    char nm[40];
+    /* 40 queued bodies of the same kind: one worker takes up to FETCH_BATCH_MAX; with four workers it takes its quarter; the others stay */
+    for (int i = 1; i <= 40; i++) {
+        snprintf(nm, sizeof(nm), "z%d.test.", i);
+        fq_put(io, 100 + (uint64_t)i, KDB_FETCH_FULL, KDB_FETCH_PRIO_BACKGROUND, 1, nm);
+    }
+    io->fq_allowed = 1;
+    fetch_take(io, fb, &r, 41);
+    CHECK_MSG(fb->n == (FETCH_BATCH_MAX < 41 ? FETCH_BATCH_MAX : 41) && !fb->lookup && fb->rq[0].id == 1 && io->nfq == 41 - fb->n, "one worker: %zu taken, %zu left", fb->n, io->nfq);
+    size_t left = io->nfq;
+    io->fq_allowed = 4;
+    fetch_take(io, fb, &r, left + 1);
+    CHECK_MSG(fb->n == (left + 1 + 3) / 4 || fb->n == FETCH_BATCH_MAX, "four workers: %zu taken of %zu", fb->n, left + 1);
+    /* nothing queued, or too few for a share of two: the request is read alone */
+    io->nfq = 0;
+    fetch_take(io, fb, &r, 1);
+    CHECK(fb->n == 0);
+    io->fq_allowed = 4;
+    fq_put(io, 7, KDB_FETCH_FULL, KDB_FETCH_PRIO_BACKGROUND, 1, "q.test.");
+    fetch_take(io, fb, &r, 2);
+    CHECK(fb->n == 0 && io->nfq == 1);
+    io->fq_allowed = 1;
+    fetch_take(io, fb, &r, 2);
+    CHECK(fb->n == 2 && io->nfq == 0);
+    /* what does not join: another view, another priority, a range, another kind, a summary, a name that is in the batch already (any capitalisation, with or without the dot) */
+    io->nfq = 0;
+    fq_put(io, 10, KDB_FETCH_FULL, KDB_FETCH_PRIO_BACKGROUND, 2, "v2.test.");
+    fq_put(io, 11, KDB_FETCH_FULL, KDB_FETCH_PRIO_QUERY, 1, "prio.test.");
+    fq_put(io, 12, KDB_FETCH_LOOKUP, KDB_FETCH_PRIO_BACKGROUND, 1, "look.test.");
+    fq_put(io, 13, KDB_FETCH_SUMMARY, KDB_FETCH_PRIO_BACKGROUND, 1, "sum.test.");
+    fq_put(io, 14, KDB_FETCH_FULL, KDB_FETCH_PRIO_BACKGROUND, 1, "Z0.TEST");
+    fq_put(io, 15, KDB_FETCH_FULL, KDB_FETCH_PRIO_BACKGROUND, 1, "rng.test.");
+    io->fq[io->nfq - 1].range = true;
+    fq_put(io, 16, KDB_FETCH_FULL, KDB_FETCH_PRIO_BACKGROUND, 1, "ok.test.");
+    io->fq_allowed = 1;
+    fetch_take(io, fb, &r, 8);
+    CHECK_MSG(fb->n == 2 && fb->rq[1].id == 16 && io->nfq == 6, "joined %zu, left %zu", fb->n, io->nfq);
+    /* a request that is no batch kind (a summary, a range) takes nothing */
+    r.mode = KDB_FETCH_SUMMARY;
+    fetch_take(io, fb, &r, 8);
+    CHECK(fb->n == 0);
+    r.mode = KDB_FETCH_FULL;
+    r.range = true;
+    fetch_take(io, fb, &r, 8);
+    CHECK(fb->n == 0);
+    r.range = false;
+    /* lookups: only lookups, and their candidate names (one for each label) fit one statement of DB_LOOKUP_MAX names */
+    io->nfq = 0;
+    r.mode = KDB_FETCH_LOOKUP_FULL;
+    snprintf(r.zone, sizeof(r.zone), "www.example.test.");
+    fq_put(io, 20, KDB_FETCH_FULL, KDB_FETCH_PRIO_BACKGROUND, 1, "body.test.");
+    fq_put(io, 21, KDB_FETCH_LOOKUP, KDB_FETCH_PRIO_BACKGROUND, 1, "mail.example.test.");
+    char longname[900] = "";
+    for (int i = 0; i < 61; i++) snprintf(longname + strlen(longname), sizeof(longname) - strlen(longname), "l%d.", i);
+    strcat(longname, "test.");                                              /* 62 labels: 62 candidates */
+    fq_put(io, 22, KDB_FETCH_LOOKUP, KDB_FETCH_PRIO_BACKGROUND, 1, longname);
+    fq_put(io, 23, KDB_FETCH_LOOKUP, KDB_FETCH_PRIO_BACKGROUND, 1, longname);   /* (the third batch member would be 3 + 3 + 62 + 62 > 128: it stays) */
+    fq_put(io, 24, KDB_FETCH_LOOKUP_FULL, KDB_FETCH_PRIO_BACKGROUND, 1, "x.example.test.");
+    io->fq_allowed = 1;
+    fetch_take(io, fb, &r, 6);
+    CHECK_MSG(fb->lookup && fb->n == 4 && fb->rq[1].id == 21 && fb->rq[2].id == 22 && fb->rq[3].id == 24 && io->nfq == 2, "lookups: %zu joined, %zu left", fb->n, io->nfq);
+    free(io);
+    free(fb);
+}
+
 int main(int argc, char **argv) {
     const char *dir = argc > 1 ? argv[1] : "tests/db";
     snprintf(g_schema, sizeof(g_schema), "%s/pdns_schema.sqlite3.sql", dir);
@@ -4347,6 +4939,10 @@ int main(int argc, char **argv) {
     test_paged();
     test_store_loader();
     test_lookup();
+    test_scan_in();
+    test_find_zones_classes();
+    test_fetch_batch();
+    test_fetch_take();
     test_manifest_rate();
     test_schema_versions();
     test_audit_actor();

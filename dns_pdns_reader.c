@@ -624,12 +624,8 @@ int pdns_zone_add_record(pdns_zone_t *z, const db_record_row_t *row) {
         }
     }
 
-    /* ZONE_BEGIN rr_count counts both SOAs (RFC 5936 2.2) and the Backend refuses a count above max-zone-records: the
-     * RRs of this zone plus the closing SOA must stay within it, or the loader would send a zone that kills the stream */
-    if ((uint64_t)z->n_rows + 2 > z->opts.max_records) {
-        zfail(z, true, id, "more than %llu records (max-zone-records; the SOA counts twice)", (unsigned long long)z->opts.max_records);
-        return -1;
-    }
+    /* (the rows seen are counted against max-zone-records above: a row is one RR of the zone image, the SOA once as the image has it (0.7 M3; the ZONE_DATA stream counted it twice, RFC 5936 2.2),
+     * so the count that ZONE_BEGIN carries cannot pass the limit that the Backend applies to it) */
 
     /* the line.  The canonical owner unescapes ';' '"' '(' ')' '$' '@' that the row escaped (pdns_text_check() saw them
      * escaped); written as they are they would start a comment or a directive in the line (RFC 1035 5.1) */
@@ -1529,13 +1525,15 @@ static void unenc_report(const dns_record_t *rec, void *ud) {
     u->any = true;
 }
 
-/* The Backend reads the stream with parse_xfr_packet() (parse_resource_record()): a record it refuses rejects the
+/* The wire decoder (parse_resource_record(): what an AXFR and an UPDATE are read with) refuses some RDATA that the zone file parser took; in a zone image such a record would be served as
+ * opaque data (a target that is no name, never followed or compressed), where the stream of an earlier version failed the zone at the Backend.  A record it refuses rejected the
  * whole zone message.  The zone file parser used to accept some RDATA the wire decoder refuses (D15-2; the RFC 3597 generic form
- * "\# 0" of a PTR, "\# 3 010203" of an NS, ...).  Every record is therefore written the way ZONE_DATA writes it and read
+ * "\# 0" of a PTR, "\# 3 010203" of an NS, ...).  Every record is therefore written as the wire form of an RR and read
  * back by the decoder here, so such a row fails the zone with its records.id instead of the whole zone failing later at
  * the Backend.  0 = all records accepted; 1 = *bad is the first refused one (*why says how); -1 = out of memory. */
+#define PDNS_WIRE_MSG 65535u
 static int wire_check_all(const pdns_zone_t *z, size_t *bad, const char **why) {
-    uint8_t *buf = malloc(KDB_MAX_ZONE_DATA);
+    uint8_t *buf = malloc(PDNS_WIRE_MSG);
     if (!buf) return -1;
     zone_arena_t tmp;
     zone_arena_init(&tmp);
@@ -1543,9 +1541,9 @@ static int wire_check_all(const pdns_zone_t *z, size_t *bad, const char **why) {
     for (size_t i = 0; i < z->arena.count && rc == 0; i++) {
         uint16_t off = DNS_HEADER_SIZE;
         memset(buf, 0, DNS_HEADER_SIZE);
-        if (serialize_dns_record(buf, KDB_MAX_ZONE_DATA, &off, &z->arena.records[i], NULL, NULL, 0xFFFFFFFFu) != 0) {
+        if (serialize_dns_record(buf, PDNS_WIRE_MSG, &off, &z->arena.records[i], NULL, NULL, 0xFFFFFFFFu) != 0) {
             *bad = i;
-            *why = "RR does not fit a ZONE_DATA message";
+            *why = "RR does not fit a DNS message";
             rc = 1;
             break;
         }
@@ -1846,143 +1844,6 @@ int pdns_zone_finish(pdns_zone_t *z) {
 /* KDB1 encoding                                                                                                  */
 /* ------------------------------------------------------------------------------------------------------------- */
 
-typedef int (*body_sink_t)(void *ud, const uint8_t *body, size_t len);
-
-/* The ZONE_DATA bodies of the zone, in stream order, each handed to sink.  *rr_total = RRs written.
- *
- * Plain zone: SOA, the other rows in records.id order, SOA.  A zone with Extended AXFR attributes (z->has_ext, B8) is written
- * the way Extended AXFR out writes a zone (dns_axfr_ixfr.c send_axfr_response(), one shared encoder: xext_* in dns_wire.c): the SOA,
- * the tag definitions (location, ECS) and the tinydns location definitions, then the rows with the state records in front
- * of the row that changes the tag in force (a tinydns row with a time stamp or a location as a TINYDNS_WRAP record), the
- * resetting state records, the SOA.  The marker and definition records are RRs of the stream: they count in rr_count.
- *
- * B8t-2: a zone with several SOA rows, or a SOA row with a location, time stamp or tag, is written in the version 3 encoding: the
- * frame is the reference SOA, SOA_SET (the number of SOA rows) follows it, and every SOA row is a body RR in a TINYDNS_WRAP
- * record (also with no tinydns attribute), with the state records of its tags in front. */
-typedef struct {
-    const pdns_zone_t *z;
-    uint8_t *buf;
-    uint16_t off, an;
-    body_sink_t sink;
-    void *ud;
-    char *err;
-    size_t errlen;
-    size_t cur;                     /* arena index of the row being written */
-    uint64_t total;
-    bool sink_failed;
-} gen_t;
-
-static int gen_flush(gen_t *g) {
-    g->buf[6] = (uint8_t)(g->an >> 8);
-    g->buf[7] = (uint8_t)g->an;
-    if (g->sink(g->ud, g->buf, g->off) != 0) {
-        g->sink_failed = true;
-        return -1;
-    }
-    g->off = DNS_HEADER_SIZE;
-    g->an = 0;
-    return 0;
-}
-
-/* one RR into the current message (a new message when it does not fit); xext_emit_fn */
-static int gen_put(void *ud, const dns_record_t *rec) {
-    gen_t *g = ud;
-    for (int attempt = 0;; attempt++) {
-        uint16_t o2 = g->off;
-        if (serialize_dns_record(g->buf, KDB_MAX_ZONE_DATA, &o2, rec, NULL, NULL, 0xFFFFFFFFu) == 0) {
-            g->off = o2;
-            g->an++;
-            g->total++;
-            return 0;
-        }
-        if (g->an == 0 || attempt > 0) {
-            snprintf(g->err, g->errlen, "zone '%s' records.id %lld: RR does not fit a ZONE_DATA message", g->z->name,
-                     (long long)g->z->line_id[g->cur]);
-            return -1;
-        }
-        if (gen_flush(g) != 0) return -1;
-    }
-}
-
-static int gen_bodies(const pdns_zone_t *z, body_sink_t sink, void *ud, uint64_t *rr_total, char *err, size_t errlen) {
-    const bool soa_set = z->n_soa > 1 || dns_record_is_restricted(&z->arena.records[z->soa_index]);
-    if (soa_set && z->n_soa > KARIDNS_SOA_SET_MAX) {
-        snprintf(err, errlen, "zone '%s': more than %u SOA records", z->name, (unsigned)KARIDNS_SOA_SET_MAX);
-        return -1;
-    }
-    gen_t g = { z, malloc(KDB_MAX_ZONE_DATA), DNS_HEADER_SIZE, 0, sink, ud, err, errlen, z->soa_index, 0, false };
-    if (!g.buf) {
-        snprintf(err, errlen, "zone '%s': out of memory", z->name);
-        return -1;
-    }
-    xext_t x;
-    xext_init(&x, z->name, gen_put, &g);
-    const dns_record_t *recs = z->arena.records;
-    int rc = -1;
-    memset(g.buf, 0, DNS_HEADER_SIZE);
-    g.buf[2] = 0x84;                              /* QR=1 AA=1, opcode QUERY, RCODE 0 */
-
-    if (gen_put(&g, &recs[z->soa_index]) != 0) goto out;                 /* SOA first (RFC 5936 2.2) */
-    if (soa_set && xext_emit_soa_set(&x, (uint16_t)z->n_soa) != 0) {
-        snprintf(err, errlen, "zone '%s': the SOA set marker could not be written", z->name);
-        goto out;
-    }
-    if (z->has_ext) {
-        const zone_arena_t *a = &z->arena;
-        for (int i = 0; i < a->bind_location_tag_count; i++)
-            if (xext_emit_tagdef(&x, false, &a->bind_location_tags[i]) != 0) goto defs_failed;
-        for (int i = 0; i < a->bind_ecs_tag_count; i++)
-            if (xext_emit_tagdef(&x, true, &a->bind_ecs_tags[i]) != 0) goto defs_failed;
-        for (int i = 0; i < a->location_count; i++)
-            if (xext_emit_locdef(&x, a->locations[i].code, a->locations[i].prefix_bits, a->locations[i].prefix) != 0) goto defs_failed;
-    }
-    for (size_t idx = 0; idx < z->arena.count; idx++) {
-        if (idx == z->soa_index && !soa_set) continue;
-        const dns_record_t *r = &recs[idx];
-        g.cur = idx;
-        if (!z->has_ext) {
-            if (gen_put(&g, r) != 0) goto out;
-            continue;
-        }
-        if (xext_select(&x, r->bind_location_tag, r->ecs_subnet_tag) != 0) goto out;
-        if (xext_rr_is_tinydns(r->tinydns_loc, (int64_t)r->tinydns_ttd) || (soa_set && r->type_code == 6)) {
-            dns_record_t wrap;
-            uint8_t wbuf[4096];
-            if (!wrap_tinydns_record(r, &wrap, wbuf, sizeof(wbuf))) {
-                snprintf(err, errlen, "zone '%s' records.id %lld: RR with tinydns attributes is too large to be wrapped", z->name,
-                         (long long)z->line_id[idx]);
-                goto out;
-            }
-            if (gen_put(&g, &wrap) != 0) goto out;
-        } else if (gen_put(&g, r) != 0) {
-            goto out;
-        }
-    }
-    g.cur = z->soa_index;
-    if (z->has_ext && xext_finish(&x) != 0) goto out;
-    if (gen_put(&g, &recs[z->soa_index]) != 0) goto out;                 /* SOA last */
-    if (g.an && gen_flush(&g) != 0) goto out;
-    *rr_total = g.total;
-    rc = 0;
-    goto out;
-defs_failed:
-    snprintf(err, errlen, "zone '%s': a tag or location definition does not fit one RR (or out of memory)", z->name);
-out:
-    if (rc != 0 && g.sink_failed) snprintf(err, errlen, "zone '%s': output stopped or size limit exceeded", z->name);
-    xext_free(&x);
-    free(g.buf);
-    return rc;
-}
-
-typedef struct { EVP_MD_CTX *md; uint64_t bytes, limit; } digest_ud_t;
-
-static int digest_sink(void *ud, const uint8_t *body, size_t len) {
-    digest_ud_t *d = ud;
-    d->bytes += len;
-    if (d->bytes > d->limit) return -1;
-    return EVP_DigestUpdate(d->md, body, len) == 1 ? 0 : -1;
-}
-
 typedef struct { kdb_enc_t *enc; pdns_emit_fn emit; void *emit_ud; } emit_ud_t;
 
 static int emit_msg(emit_ud_t *e) {
@@ -1992,90 +1853,69 @@ static int emit_msg(emit_ud_t *e) {
     return rc;
 }
 
-static int data_sink(void *ud, const uint8_t *body, size_t len) {
-    emit_ud_t *e = ud;
-    if (kdb_enc_raw_msg(e->enc, KDB_T_ZONE_DATA, body, len) != 0) return -1;
-    return emit_msg(e);
+/* The settings text, the profile name and the profile text go into the digest (B7a: a metadata-only edit changes it), every field length-prefixed so that two different splits cannot give the
+ * same input.  `kind` is the zone kind of a secondary or catalog zone (SLAVE and CONSUMER with the same masters differ), -1 for a primary.  0, or -1. */
+static int digest_settings(EVP_MD_CTX *md, const pdns_zone_t *z, const pdns_kdb_params_t *p, const char *profile, int kind) {
+    if (!((z->settings && *z->settings) || (profile && *profile))) return 0;
+    const char *parts[3] = { z->settings ? z->settings : "", profile ? profile : "", p->profile_text ? p->profile_text : "" };
+    static const uint8_t tag[] = "KDB1-SETTINGS";
+    if (EVP_DigestUpdate(md, tag, sizeof(tag)) != 1) return -1;
+    if (kind >= 0) {
+        const uint8_t k = (uint8_t)kind;
+        if (EVP_DigestUpdate(md, &k, 1) != 1) return -1;
+    }
+    for (int i = 0; i < 3; i++) {
+        uint64_t n = strlen(parts[i]);
+        uint8_t lb[8];
+        for (int b = 0; b < 8; b++) lb[b] = (uint8_t)(n >> (56 - 8 * b));
+        if (EVP_DigestUpdate(md, lb, 8) != 1 || EVP_DigestUpdate(md, parts[i], (size_t)n) != 1) return -1;
+    }
+    return 0;
 }
 
-int pdns_zone_encode_kdb(const pdns_zone_t *z, const pdns_kdb_params_t *p, pdns_emit_fn emit, void *ud,
-                         char *err, size_t errlen) {
+/* A zone that has rows is a zone image (pdns_zone_encode_image()).  What has no rows, a secondary (SLAVE) or catalog (CONSUMER) zone and the summary of a primary, is ZONE_BEGIN and ZONE_END:
+ *   secondary   zone_kind secondary / catalog, serial 0, flags 0, rr_count 0, the settings text with the masters; the digest covers the settings text, the profile name and the profile text only,
+ *               so a loader that restarts finds the zone up to date (B7b)
+ *   summary     (pdns_zone_set_summary()) ZONE_BEGIN with KDB_ZF_SUMMARY, rr_count 0, a zero digest, the serial and the SOA timers given there (and the apex, D1a step 6, when given), never the gate
+ * Returns 1 (nothing emitted) when p->gate asked to skip the zone.  Fails (-1, *err filled) when a zone that has rows does not make an image (pdns_zone_encode_image()). */
+int pdns_zone_encode_kdb(pdns_zone_t *z, const pdns_kdb_params_t *p, pdns_emit_fn emit, void *ud, char *err, size_t errlen) {
     char dummy[8];
     if (!err || errlen == 0) { err = dummy; errlen = sizeof(dummy); }
     const bool sec = z->zkind != KDB_ZK_PRIMARY;         /* B7b: no rows, the settings text is the zone */
     const bool sum = z->summary && !sec;                 /* D1a: the directory entry of a primary zone: no rows, a zero digest, no gate */
-    const bool norows = sec || sum;
-    if (z->failed || !z->finished || (!z->arena_ready && !norows)) {
+    if (z->failed || !z->finished || (!z->arena_ready && !sec && !sum)) {
         snprintf(err, errlen, "zone '%s': not converted", z->name);
         return -1;
     }
-    uint64_t rr_count = 0;       /* every RR of the stream: both SOAs, the rows, and the Extended AXFR records (B8); known after pass 1 */
-
-    /* pass 1: digest over the bodies */
-    uint8_t digest[KDB_DIGEST_LEN];
-    unsigned dlen = 0;
-    digest_ud_t dd = { EVP_MD_CTX_new(), 0, z->opts.max_zone_bytes };
-    if (!dd.md || EVP_DigestInit_ex(dd.md, EVP_sha256(), NULL) != 1) {
-        EVP_MD_CTX_free(dd.md);
-        snprintf(err, errlen, "zone '%s': out of memory", z->name);
-        return -1;
-    }
+    if (!sec && !sum) return pdns_zone_encode_image(z, p, emit, ud, err, errlen);
     const char *profile = p->profile ? p->profile : z->profile;
-    int rc = norows ? 0 : gen_bodies(z, digest_sink, &dd, &rr_count, err, errlen);
-    if (rc == 0 && rr_count > z->opts.max_records) {
-        snprintf(err, errlen, "zone '%s': %llu records exceed max-zone-records", z->name, (unsigned long long)rr_count);
-        rc = -1;
-    }
-    /* B8: the tinydns flag is part of what the Backend serves (time-dependent TTLs, no response cache) also when no RR carries a time
-     * stamp or a location; the attributes themselves are in the bodies */
-    if (rc == 0 && !norows && (z->flags & PDNS_F_TINYDNS)) {
-        static const uint8_t ftag[] = "KDB1-TINYDNS";
-        if (EVP_DigestUpdate(dd.md, ftag, sizeof(ftag)) != 1) rc = -1;
-    }
-    /* the PRESIGNED flag is sent in ZONE_BEGIN and decides how the Backend serves the zone (the signatures it has, no ALIAS): toggling it
-     * leaves the bodies alone when the zone has nothing the presigned checks change (PS_NONE), and the diff must still see it */
-    if (rc == 0 && !norows && (z->flags & PDNS_F_PRESIGNED)) {
-        static const uint8_t ptag[] = "KDB1-PRESIGNED";
-        if (EVP_DigestUpdate(dd.md, ptag, sizeof(ptag)) != 1) rc = -1;
-    }
-    /* B7a: a metadata-only edit (the settings text, the profile that is named, the text of that profile) must change the
-     * digest, or the diff would find the zone up to date.  Zones without settings and profile keep the digest of the data
-     * alone.  Every field is length-prefixed, so two different splits cannot give the same input. */
-    if (rc == 0 && !sum && ((z->settings && *z->settings) || (profile && *profile))) {
-        const char *parts[3] = { z->settings ? z->settings : "", profile ? profile : "", p->profile_text ? p->profile_text : "" };
-        static const uint8_t tag[] = "KDB1-SETTINGS";
-        if (EVP_DigestUpdate(dd.md, tag, sizeof(tag)) != 1) rc = -1;
-        if (sec && EVP_DigestUpdate(dd.md, &z->zkind, 1) != 1) rc = -1;       /* SLAVE and CONSUMER with the same masters differ */
-        for (int k = 0; rc == 0 && k < 3; k++) {
-            uint64_t n = strlen(parts[k]);
-            uint8_t lb[8];
-            for (int b = 0; b < 8; b++) lb[b] = (uint8_t)(n >> (56 - 8 * b));
-            if (EVP_DigestUpdate(dd.md, lb, 8) != 1 || EVP_DigestUpdate(dd.md, parts[k], (size_t)n) != 1) rc = -1;
-        }
-        if (rc != 0) snprintf(err, errlen, "zone '%s': digest failed", z->name);
-    }
+    uint8_t digest[KDB_DIGEST_LEN];
     if (sum) {
         memset(digest, 0, KDB_DIGEST_LEN);                  /* a zone that is not in memory has no digest (INVENTORY says the same) */
-    } else if (rc == 0 && (EVP_DigestFinal_ex(dd.md, digest, &dlen) != 1 || dlen != KDB_DIGEST_LEN)) {
-        snprintf(err, errlen, "zone '%s': digest failed", z->name);
-        rc = -1;
+    } else {
+        EVP_MD_CTX *md = EVP_MD_CTX_new();
+        unsigned dlen = 0;
+        const bool ok = md && EVP_DigestInit_ex(md, EVP_sha256(), NULL) == 1 && digest_settings(md, z, p, profile, z->zkind) == 0 &&
+                        EVP_DigestFinal_ex(md, digest, &dlen) == 1 && dlen == KDB_DIGEST_LEN;
+        EVP_MD_CTX_free(md);
+        if (!ok) {
+            snprintf(err, errlen, "zone '%s': digest failed", z->name);
+            return -1;
+        }
     }
-    EVP_MD_CTX_free(dd.md);
-    if (rc != 0) return -1;
     if (!sum && p->gate && p->gate(p->gate_ud, z->serial, digest) != 0) return 1;        /* the loader has this version already */
 
-    /* pass 2: the messages */
     kdb_enc_t enc;
     kdb_enc_init(&enc);
     emit_ud_t eu = { &enc, emit, ud };
-    rc = -1;
+    int rc = -1;
     if (kdb_enc_begin(&enc, KDB_T_ZONE_BEGIN) != 0 ||
         kdb_enc_u16(&enc, 1, p->view) != 0 || kdb_enc_name(&enc, 2, z->name) != 0 ||
         kdb_enc_i64(&enc, 3, p->source_id) != 0 || kdb_enc_u8(&enc, 4, sec ? z->zkind : p->zone_kind) != 0 ||
         kdb_enc_u32(&enc, 5, sec ? 0 : z->serial) != 0 ||
         kdb_enc_u32(&enc, 6, sec ? 0 : ((z->flags & PDNS_F_PRESIGNED ? KDB_ZF_PRESIGNED : 0) | (z->has_ext ? KDB_ZF_EXTENDED : 0) |
                                   (z->flags & PDNS_F_TINYDNS ? KDB_ZF_TINYDNS : 0) | (sum ? KDB_ZF_SUMMARY : 0))) != 0 ||
-        kdb_enc_u64(&enc, 7, rr_count) != 0 || kdb_enc_bytes(&enc, 8, digest, KDB_DIGEST_LEN) != 0 ||
+        kdb_enc_u64(&enc, 7, 0) != 0 || kdb_enc_bytes(&enc, 8, digest, KDB_DIGEST_LEN) != 0 ||
         (z->settings && *z->settings && kdb_enc_str(&enc, 9, z->settings) != 0) ||
         (profile && *profile && kdb_enc_str(&enc, 10, profile) != 0) ||
         (p->request_id && kdb_enc_u64(&enc, 11, p->request_id) != 0) ||
@@ -2092,22 +1932,175 @@ int pdns_zone_encode_kdb(const pdns_zone_t *z, const pdns_kdb_params_t *p, pdns_
         snprintf(err, errlen, "zone '%s': ZONE_BEGIN could not be encoded or sent", z->name);
         goto out;
     }
-    if (!norows) {
-        uint64_t again = 0;
-        if (gen_bodies(z, data_sink, &eu, &again, err, errlen) != 0) goto out;
-        if (again != rr_count) {
-            snprintf(err, errlen, "zone '%s': internal error: the second pass wrote %llu RRs, the first %llu", z->name,
-                     (unsigned long long)again, (unsigned long long)rr_count);
-            goto out;
-        }
-    }
-    if (kdb_enc_begin(&enc, KDB_T_ZONE_END) != 0 || kdb_enc_u64(&enc, 1, rr_count) != 0 || kdb_enc_end(&enc) != 0 ||
-        emit_msg(&eu) != 0) {
+    if (kdb_enc_begin(&enc, KDB_T_ZONE_END) != 0 || kdb_enc_u64(&enc, 1, 0) != 0 || kdb_enc_end(&enc) != 0 || emit_msg(&eu) != 0) {
         snprintf(err, errlen, "zone '%s': ZONE_END could not be encoded or sent", z->name);
         goto out;
     }
     rc = 0;
 out:
     kdb_enc_free(&enc);
+    return rc;
+}
+
+/* ------------------------------------------------------------------------------------------------------------- */
+/* 0.7 M3: the zone image the Backend would build, built by the loader                                            */
+/* ------------------------------------------------------------------------------------------------------------- */
+
+/* The image of the zone, built from the arena the reader has: the arena is brought into the form of a zone as the server keeps it (what a zone that was transferred or
+ * read from a file has):
+ *   - the reference SOA is the first RR (a SOA set has no opening SOA in the arena: every SOA is a row), the others keep the order
+ *   - the zone is a tinydns zone when a location definition, or an RR with a tinydns location or time stamp, is there
+ *   - the RRset TTLs are harmonized (RFC 2181 5.2) and the indexes are built again for the new order
+ * The image is frozen with the zone name as its apex. */
+/* The flags of an RR in the image say how its record looked in the builder (zone_image_rr_t.flags): RAW = RDATA octets (generic_data), no text fields; NO_NAMEWIRE = no
+ * preparsed owner wire (rdata_count 0).  A zone that comes by transfer or by UPDATE is read by parse_resource_record(), which decodes only the types below into text fields
+ * and keeps the octets of every other type (RFC 3597 5), also CAA, SSHFP, DS, RRSIG, ...; of those only the DNSSEC types of decode_dnssec_rdata() (R-33) get text fields too,
+ * and so a preparsed owner.  The zone parser makes text fields of every type it knows, so the image of the loader's builder has neither flag for them.  The octets of the RDATA
+ * are the same either way (and so is what is served); the flags are given the value they have in a zone read the other way, which keeps the image of a zone one image
+ * whichever way it came (the same rows as a transfer of the zone give the same bytes). */
+static bool wire_decodes_to_text(uint16_t t) {
+    switch (t) {
+    case 1: case 2: case 3: case 4: case 5: case 6: case 7: case 8: case 9: case 12: case 14: case 15: case 16: case 17: case 18: case 21:
+    case 23: case 26: case 28: case 33: case 35: case 36: case 39: case 107:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool wire_dnssec_text(uint16_t t) { return t == 43 || t == 46 || t == 47 || t == 48 || t == 50 || t == 51; }
+
+/* Kept, it is not dead code: it brings the RR flags of an image frozen from the rows of the database to the form of an image the Backend made from wire RRs (the form of every image the store holds from before M3 and of a
+ * zone that a transfer brings): a type that the wire decoder does not turn into text is RAW, and a RAW RR of a type that is not DNSSEC has no wire name.  Without it the same zone gives other bytes and another digest
+ * depending on the source, the stored images of a zone would change at every reload, and the byte-for-byte differential test of tests/test_pdns_reader.c fails. */
+static void image_wire_form_flags(zone_image_t *img) {
+    zone_image_rr_t *rrs = (zone_image_rr_t *)(void *)((uint8_t *)img + img->off_rrs);
+    for (uint32_t k = 0; k < img->n_rrs; k++) {
+        if (!wire_decodes_to_text(rrs[k].type)) rrs[k].flags |= ZONE_IMAGE_RR_RAW;
+        if ((rrs[k].flags & ZONE_IMAGE_RR_RAW) && !wire_dnssec_text(rrs[k].type)) rrs[k].flags |= ZONE_IMAGE_RR_NO_NAMEWIRE;
+    }
+}
+
+zone_image_t *pdns_zone_build_image(pdns_zone_t *z, char *err, size_t errlen) {
+    char dummy[8];
+    if (!err || errlen == 0) { err = dummy; errlen = sizeof(dummy); }
+    err[0] = '\0';
+    if (z->failed || !z->finished || !z->arena_ready || z->zkind != KDB_ZK_PRIMARY || z->summary || z->arena.count == 0) {
+        snprintf(err, errlen, "zone '%s': not converted, or a zone without rows", z->name);
+        return NULL;
+    }
+    zone_arena_t *a = &z->arena;
+    const bool soa_set = z->n_soa > 1 || dns_record_is_restricted(&a->records[z->soa_index]);
+    if (soa_set && z->n_soa > KARIDNS_SOA_SET_MAX) {
+        snprintf(err, errlen, "zone '%s': more than %u SOA records", z->name, (unsigned)KARIDNS_SOA_SET_MAX);
+        return NULL;
+    }
+    if (!soa_set && z->soa_index != 0) {
+        dns_record_t soa = a->records[z->soa_index];
+        int64_t soa_id = z->line_id[z->soa_index];
+        memmove(a->records + 1, a->records, z->soa_index * sizeof(a->records[0]));
+        memmove(z->line_id + 1, z->line_id, z->soa_index * sizeof(z->line_id[0]));
+        a->records[0] = soa;
+        z->line_id[0] = soa_id;
+        z->soa_index = 0;
+    }
+    bool tinydns = (z->flags & PDNS_F_TINYDNS) != 0 || a->location_count > 0;
+    for (size_t i = 0; i < a->count && !tinydns; i++) {
+        const dns_record_t *r = &a->records[i];
+        const bool wrapped = xext_rr_is_tinydns(r->tinydns_loc, (int64_t)r->tinydns_ttd) || (soa_set && r->type_code == 6);
+        if (wrapped && (r->tinydns_loc[0] || r->tinydns_loc[1] || r->tinydns_ttd || r->tinydns_ttl_countdown)) tinydns = true;
+    }
+    a->is_tinydns_format = tinydns;
+    zone_arena_shrink_records(a);
+    if (build_zone_index(a, true) != 0) {
+        snprintf(err, errlen, "zone '%s': out of memory building the zone index", z->name);
+        return NULL;
+    }
+    zone_image_t *img = zone_image_freeze(a, z->name);
+    if (!img) {
+        snprintf(err, errlen, "zone '%s': the zone image cannot be built (see the log)", z->name);
+        return NULL;
+    }
+    image_wire_form_flags(img);
+    /* what the Backend will check of what it receives, checked here: a zone it would refuse is the loader's failure, with the row's zone named */
+    char why[300];
+    zone_image_policy_t pol = { z->name, z->serial, img->n_rrs, img->total_size, z->opts.max_zone_bytes, z->opts.max_records, z->has_ext, tinydns };
+    if (zone_image_validate_ex(img, img->total_size, &pol, why, sizeof(why)) != 0) {
+        snprintf(err, errlen, "zone '%s': %s", z->name, why);
+        zone_image_free(img);
+        return NULL;
+    }
+    return img;
+}
+
+/* the digest of an image zone: SHA-256 of the image bytes (the same rows give the same bytes), then the markers that decide how the Backend serves the zone
+ * and are not in the image (a PRESIGNED zone), and the settings text, the profile name and the profile text (B7a: a metadata-only edit changes the digest).
+ * The tinydns flag is in the image header.  Every field is length-prefixed, so two different splits cannot give the same input. */
+static int image_digest(const pdns_zone_t *z, const zone_image_t *img, const pdns_kdb_params_t *p, const char *profile, uint8_t digest[KDB_DIGEST_LEN]) {
+    EVP_MD_CTX *md = EVP_MD_CTX_new();
+    int rc = -1;
+    unsigned dlen = 0;
+    if (!md || EVP_DigestInit_ex(md, EVP_sha256(), NULL) != 1 || EVP_DigestUpdate(md, img, img->total_size) != 1) goto out;
+    if (z->flags & PDNS_F_PRESIGNED) {
+        static const uint8_t ptag[] = "KDB1-PRESIGNED";
+        if (EVP_DigestUpdate(md, ptag, sizeof(ptag)) != 1) goto out;
+    }
+    if (digest_settings(md, z, p, profile, -1) != 0) goto out;
+    if (EVP_DigestFinal_ex(md, digest, &dlen) != 1 || dlen != KDB_DIGEST_LEN) goto out;
+    rc = 0;
+out:
+    EVP_MD_CTX_free(md);
+    return rc;
+}
+
+int pdns_zone_encode_image(pdns_zone_t *z, const pdns_kdb_params_t *p, pdns_emit_fn emit, void *ud, char *err, size_t errlen) {
+    char dummy[8];
+    if (!err || errlen == 0) { err = dummy; errlen = sizeof(dummy); }
+    zone_image_t *img = pdns_zone_build_image(z, err, errlen);
+    if (!img) return -1;
+    int rc = -1;
+    kdb_enc_t enc;
+    kdb_enc_init(&enc);
+    emit_ud_t eu = { &enc, emit, ud };
+    uint8_t digest[KDB_DIGEST_LEN];
+    const char *profile = p->profile ? p->profile : z->profile;
+    if (image_digest(z, img, p, profile, digest) != 0) {
+        snprintf(err, errlen, "zone '%s': digest failed", z->name);
+        goto out;
+    }
+    if (p->gate && p->gate(p->gate_ud, z->serial, digest) != 0) {        /* the loader has this version already */
+        rc = 1;
+        goto out;
+    }
+    if (kdb_enc_begin(&enc, KDB_T_ZONE_BEGIN) != 0 ||
+        kdb_enc_u16(&enc, 1, p->view) != 0 || kdb_enc_name(&enc, 2, z->name) != 0 ||
+        kdb_enc_i64(&enc, 3, p->source_id) != 0 || kdb_enc_u8(&enc, 4, p->zone_kind) != 0 ||
+        kdb_enc_u32(&enc, 5, z->serial) != 0 ||
+        kdb_enc_u32(&enc, 6, (z->flags & PDNS_F_PRESIGNED ? KDB_ZF_PRESIGNED : 0) | (z->has_ext ? KDB_ZF_EXTENDED : 0) |
+                             (img->flags & ZONE_IMAGE_F_TINYDNS ? KDB_ZF_TINYDNS : 0) | KDB_ZF_IMAGE) != 0 ||
+        kdb_enc_u64(&enc, 7, img->n_rrs) != 0 || kdb_enc_bytes(&enc, 8, digest, KDB_DIGEST_LEN) != 0 ||
+        (z->settings && *z->settings && kdb_enc_str(&enc, 9, z->settings) != 0) ||
+        (profile && *profile && kdb_enc_str(&enc, 10, profile) != 0) ||
+        (p->request_id && kdb_enc_u64(&enc, 11, p->request_id) != 0) ||
+        kdb_enc_u64(&enc, 23, img->total_size) != 0 || kdb_enc_end(&enc) != 0 || emit_msg(&eu) != 0) {
+        snprintf(err, errlen, "zone '%s': ZONE_BEGIN could not be encoded or sent", z->name);
+        goto out;
+    }
+    for (size_t off = 0; off < img->total_size;) {
+        size_t n = img->total_size - off < KDB_MAX_BODY ? img->total_size - off : KDB_MAX_BODY;
+        if (kdb_enc_raw_msg(&enc, KDB_T_ZONE_IMAGE, (const uint8_t *)img + off, n) != 0 || emit_msg(&eu) != 0) {
+            snprintf(err, errlen, "zone '%s': the zone image could not be sent", z->name);
+            goto out;
+        }
+        off += n;
+    }
+    if (kdb_enc_begin(&enc, KDB_T_ZONE_END) != 0 || kdb_enc_u64(&enc, 1, img->n_rrs) != 0 || kdb_enc_end(&enc) != 0 || emit_msg(&eu) != 0) {
+        snprintf(err, errlen, "zone '%s': ZONE_END could not be encoded or sent", z->name);
+        goto out;
+    }
+    rc = 0;
+out:
+    kdb_enc_free(&enc);
+    zone_image_free(img);
     return rc;
 }

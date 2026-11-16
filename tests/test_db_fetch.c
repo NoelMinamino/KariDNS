@@ -9,7 +9,7 @@
  *   - a request for a zone of a view that takes no database zones, and for a zone that is not in the registry, is answered at once (failed wake)
  *   - a request for a zone that is in memory wakes the worker without a message to the loader
  *   - a request for a zone that is not in memory becomes one FETCH_REQ (a second request for it in flight sends nothing), its answer
- *     (ZONE_BEGIN .. ZONE_DATA .. ZONE_END with the request id) installs the zone, makes it resident again and wakes the worker
+ *     (ZONE_BEGIN .. ZONE_IMAGE .. ZONE_END with the request id) installs the zone, makes it resident again and wakes the worker
  *   - a ZONE_FAILED wakes the worker with the failure; a summary updates the serial and the timers of an element that has no data
  *   - a zone nobody asked for is read and thrown away: no zone appears, the stream goes on
  *   - bytes that are not KDB1 close the fetch stream; a request then is failed at once; a new pair of descriptors over the control socket
@@ -42,10 +42,14 @@
 #include "../dns_server_internal.h"
 #include "../dns_snapshot_rcu.h"
 #include "../dns_utils.h"
+#include "../dns_zone_image.h"
+#include "db/zimg_msgs.h"
 
 static int g_checks = 0, g_failed = 0;
 #define CHECK(cond) do { g_checks++; if (!(cond)) { g_failed++; \
     printf("  [FAIL] %s:%d: %s\n", __FILE__, __LINE__, #cond); } } while (0)
+#define CHECK_MSG(cond, ...) do { g_checks++; if (!(cond)) { g_failed++; \
+    printf("  [FAIL] %s:%d: %s: ", __FILE__, __LINE__, #cond); printf(__VA_ARGS__); printf("\n"); } } while (0)
 
 /* ---------------------------------------------------------------- the loader's end of a stream */
 typedef struct {
@@ -102,99 +106,19 @@ static void ch_send(int fd, kdb_enc_t *e) {
     kdb_enc_reset(e);
 }
 
-/* ---------------------------------------------------------------- zone data (uncompressed RRs, RFC 1035 3.2.1) */
-static size_t put_name(uint8_t *b, const char *name) {
-    size_t o = 0;
-    while (*name) {
-        const char *dot = strchr(name, '.');
-        size_t l = dot ? (size_t)(dot - name) : strlen(name);
-        b[o++] = (uint8_t)l;
-        memcpy(b + o, name, l);
-        o += l;
-        name += l + (dot ? 1 : 0);
-    }
-    b[o++] = 0;
-    return o;
-}
-static size_t put_u16(uint8_t *b, uint16_t v) { b[0] = (uint8_t)(v >> 8); b[1] = (uint8_t)v; return 2; }
-static size_t put_u32(uint8_t *b, uint32_t v) { put_u16(b, (uint16_t)(v >> 16)); put_u16(b + 2, (uint16_t)v); return 4; }
-
-static size_t put_rr_head(uint8_t *b, const char *owner, uint16_t type, size_t rdlen_pos_out[1]) {
-    size_t o = put_name(b, owner);
-    o += put_u16(b + o, type);
-    o += put_u16(b + o, 1);
-    o += put_u32(b + o, 300);
-    rdlen_pos_out[0] = o;
-    return o + 2;
-}
-
-/* ZONE_DATA of the zone `zone` (SOA, NS, A, SOA): four RRs */
-static size_t zone_message(uint8_t *b, const char *zone, uint32_t serial) {
-    memset(b, 0, 12);
-    b[2] = 0x84;
-    put_u16(b + 6, 4);
-    size_t o = 12, rp[1];
-    for (int k = 0; k < 4; k++) {
-        char owner[300], ns[300], mail[300];
-        snprintf(ns, sizeof(ns), "ns1.%s", zone);
-        snprintf(mail, sizeof(mail), "host.%s", zone);
-        snprintf(owner, sizeof(owner), "%s%s", k == 2 ? "www." : "", zone);
-        uint16_t type = (k == 0 || k == 3) ? 6 : k == 1 ? 2 : 1;
-        size_t rd = put_rr_head(b + o, owner, type, rp);
-        size_t start = o + rd;
-        size_t l = 0;
-        if (type == 6) {
-            l += put_name(b + start, ns);
-            l += put_name(b + start + l, mail);
-            l += put_u32(b + start + l, serial);
-            l += put_u32(b + start + l, 3600);
-            l += put_u32(b + start + l, 600);
-            l += put_u32(b + start + l, 86400);
-            l += put_u32(b + start + l, 300);
-        } else if (type == 2) {
-            l += put_name(b + start, ns);
-        } else {
-            b[start] = 192; b[start + 1] = 0; b[start + 2] = 2; b[start + 3] = 80;
-            l = 4;
-        }
-        put_u16(b + o + rp[0], (uint16_t)l);
-        o = start + l;
-    }
-    return o;
-}
-
+/* ---------------------------------------------------------------- zone data: the zone image of a small zone (tests/db/zimg_msgs.h) */
 static void send_zone(int fd, kdb_enc_t *e, uint16_t view, const char *zone, uint32_t serial, uint64_t req, int64_t sid) {
-    uint8_t dig[KDB_DIGEST_LEN];
-    memset(dig, (int)serial, sizeof(dig));
-    kdb_enc_begin(e, KDB_T_ZONE_BEGIN);
-    kdb_enc_u16(e, 1, view); kdb_enc_name(e, 2, zone); kdb_enc_i64(e, 3, sid); kdb_enc_u8(e, 4, KDB_ZK_PRIMARY);
-    kdb_enc_u32(e, 5, serial); kdb_enc_u32(e, 6, 0); kdb_enc_u64(e, 7, 4); kdb_enc_bytes(e, 8, dig, sizeof(dig));
-    if (req) kdb_enc_u64(e, 11, req);
-    kdb_enc_end(e);
-    uint8_t msg[2048];
-    size_t n = zone_message(msg, zone, serial);
-    kdb_enc_raw_msg(e, KDB_T_ZONE_DATA, msg, n);
-    kdb_enc_begin(e, KDB_T_ZONE_END);
-    kdb_enc_u64(e, 1, 4);
-    kdb_enc_end(e);
+    zone_image_t *img = zi_zone(zone, serial, NULL, NULL, 0);
+    zi_zone_msgs(e, view, zone, sid, serial, img, req, NULL, NULL, 0, (int)serial);
+    zone_image_free(img);
     ch_send(fd, e);
 }
 
 /* a zone of a batch that names a profile (the PROFILE message is the caller's) */
 static void send_zone_p(int fd, kdb_enc_t *e, uint16_t view, const char *zone, uint32_t serial, int64_t sid, const char *profile) {
-    uint8_t dig[KDB_DIGEST_LEN];
-    memset(dig, (int)serial, sizeof(dig));
-    kdb_enc_begin(e, KDB_T_ZONE_BEGIN);
-    kdb_enc_u16(e, 1, view); kdb_enc_name(e, 2, zone); kdb_enc_i64(e, 3, sid); kdb_enc_u8(e, 4, KDB_ZK_PRIMARY);
-    kdb_enc_u32(e, 5, serial); kdb_enc_u32(e, 6, 0); kdb_enc_u64(e, 7, 4); kdb_enc_bytes(e, 8, dig, sizeof(dig));
-    if (profile) kdb_enc_str(e, 10, profile);
-    kdb_enc_end(e);
-    uint8_t msg[2048];
-    size_t n = zone_message(msg, zone, serial);
-    kdb_enc_raw_msg(e, KDB_T_ZONE_DATA, msg, n);
-    kdb_enc_begin(e, KDB_T_ZONE_END);
-    kdb_enc_u64(e, 1, 4);
-    kdb_enc_end(e);
+    zone_image_t *img = zi_zone(zone, serial, NULL, NULL, 0);
+    zi_zone_msgs(e, view, zone, sid, serial, img, 0, NULL, profile, 0, (int)serial);
+    zone_image_free(img);
     ch_send(fd, e);
 }
 
@@ -538,7 +462,7 @@ int main(void) {
 
     /* the handshake of the first stream gives the Backend its table of views (CONFIG) */
     kdb_enc_begin(&e, KDB_T_HELLO);
-    kdb_enc_u16(&e, 1, 1); kdb_enc_str(&e, 2, "test-loader"); kdb_enc_str(&e, 3, "sqlite3"); kdb_enc_u32(&e, 4, 4242);
+    kdb_enc_u16(&e, 1, 1); kdb_enc_str(&e, 2, "test-loader"); kdb_enc_str(&e, 3, "sqlite3"); kdb_enc_u32(&e, 4, 4242); kdb_enc_u32(&e, 5, KDB_FEAT_IMAGE); kdb_enc_u32(&e, 6, ZONE_IMAGE_VERSION);
     kdb_enc_end(&e);
     ch_send(a[0], &e);
     CHECK(ch_next(&mainc, &m, 5000) && m.type == KDB_T_CONFIG && m.u.config.n_views == 1);
@@ -568,6 +492,74 @@ int main(void) {
     CHECK(dbreg_lookup_entry("default", "r.test.") != NULL && dbreg_lookup_entry("default", "s.test.") != NULL);
     for (int i = 0; i < 100 && !elem_of("default", "r.test."); i++) usleep(50000);            /* (the view delta runs within a second) */
     CHECK(elem_of("default", "r.test.") != NULL && zdir_entry(elem_of("default", "r.test.")) != NULL);
+
+    /* -- 0.7 M3: the image is the loader's claim.  A zone whose image breaks a rule of zone_image_validate_ex() is rejected as a zone, with the rule in the reason: the stream goes
+     *    on, nothing of the zone is served, the zone that was there stays.  (The rules themselves are tested on the images in test_zone_image; this is the Backend taking them.) */
+    {
+        const struct { const char *what; const char *body; bool keep; int kind; const char *want, *want2; } fc[] = {
+            { "an owner outside the zone", "@ SOA ns host 9 3600 600 86400 300\n@ NS ns\nns A 192.0.2.1\nhost.other.test. A 192.0.2.9\n", true, 0, "outside the zone", NULL },
+            { "an SOA below the apex", "sub SOA ns host 9 3600 600 86400 300\n@ NS ns\nns A 192.0.2.1\n", true, 0, "SOA outside the apex", NULL },
+            { "two SOAs without the extended flag", "@ SOA ns host 9 3600 600 86400 300\n@ SOA ns2 host 9 3600 600 86400 300\n@ NS ns\nns A 192.0.2.1\n", true, 0, "several SOA records", NULL },
+            { "the image of another zone", NULL, false, 3, "outside the zone", "no data at the apex" },
+            { "a class other than IN", "@ SOA ns host 9 3600 600 86400 300\n@ NS ns\nns A 192.0.2.1\nwww A 192.0.2.80\n", false, 4, "class 3", NULL },
+            { "a serial that ZONE_BEGIN did not declare", "@ SOA ns host 9 3600 600 86400 300\n@ NS ns\nns A 192.0.2.1\n", false, 5, "not the one ZONE_BEGIN declared", NULL },
+            { "the tinydns flag of the image only", "@ SOA ns host 9 3600 600 86400 300\n@ NS ns\nns A 192.0.2.1\n", false, 6, "tinydns flag", NULL },
+            { "noise inside the image", "@ SOA ns host 9 3600 600 86400 300\n@ NS ns\nns A 192.0.2.1\nwww A 192.0.2.80\n", false, 7, "the zone image is refused", NULL },
+        };
+        const int nfc = (int)(sizeof(fc) / sizeof(fc[0]));
+        kdb_enc_begin(&e, KDB_T_BATCH_BEGIN);
+        kdb_enc_u64(&e, 1, 90); kdb_enc_u8(&e, 2, KDB_BATCH_DIFF); kdb_enc_u64(&e, 3, 0);
+        kdb_enc_end(&e);
+        ch_send(a[0], &e);
+        for (int k = 0; k < nfc; k++) {
+            char zn[32], text[1200];
+            snprintf(zn, sizeof(zn), "forged%d.test.", k);
+            snprintf(text, sizeof(text), "$ORIGIN %s\n$TTL 300\n%s", fc[k].kind == 3 ? "other.test." : zn, fc[k].kind == 3 ? "@ SOA ns host 9 3600 600 86400 300\n@ NS ns\nns A 192.0.2.1\n" : fc[k].body);
+            zone_image_t *img = zi_from_text_ex(fc[k].kind == 3 ? "other.test." : zn, text, fc[k].keep);
+            CHECK_MSG(img != NULL, "the image of case %d (%s) is made", k, fc[k].what);
+            if (!img) continue;
+            if (fc[k].kind == 4) {
+                zone_image_rr_t *rr = (zone_image_rr_t *)(void *)((uint8_t *)img + img->off_rrs);
+                for (uint32_t q = 0; q < img->n_rrs; q++)
+                    if (rr[q].type == 1) { rr[q].class_val = 3; break; }
+            }
+            if (fc[k].kind == 6) img->flags |= ZONE_IMAGE_F_TINYDNS;
+            if (fc[k].kind == 7) for (size_t q = sizeof(zone_image_t); q < img->total_size; q++) ((uint8_t *)img)[q] = (uint8_t)(q * 37 + 11);
+            zi_zone_msgs(&e, 0, zn, 900 + k, fc[k].kind == 5 ? 10 : 9, img, 0, NULL, NULL, 0, 9);
+            ch_send(a[0], &e);
+            zone_image_free(img);
+        }
+        kdb_enc_begin(&e, KDB_T_BATCH_END);
+        kdb_enc_u64(&e, 1, 90); kdb_enc_u32(&e, 2, (uint32_t)nfc); kdb_enc_u32(&e, 3, 0); kdb_enc_u32(&e, 4, 0);
+        kdb_enc_end(&e);
+        ch_send(a[0], &e);
+        int nrej = 0, nres = 0;
+        bool seen[8] = { false };
+        while (ch_next(&mainc, &m, 5000) && m.type != KDB_T_BATCH_RESULT) {
+            if (m.type != KDB_T_ZONE_RESULT) continue;
+            nres++;
+            for (int k = 0; k < nfc; k++) {
+                char zn[32];
+                snprintf(zn, sizeof(zn), "forged%d.test.", k);
+                if (strcmp(m.u.zone_result.name, zn) != 0) continue;
+                char why[200];
+                size_t n = m.u.zone_result.reason.len < sizeof(why) - 1 ? m.u.zone_result.reason.len : sizeof(why) - 1;
+                memcpy(why, m.u.zone_result.reason.p, n);
+                why[n] = '\0';
+                seen[k] = true;
+                nrej += m.u.zone_result.status == KDB_ST_REJECTED;
+                CHECK_MSG(m.u.zone_result.status == KDB_ST_REJECTED && (strstr(why, fc[k].want) || (fc[k].want2 && strstr(why, fc[k].want2))), "forged image '%s': status %d, reason '%s'", fc[k].what,
+                          (int)m.u.zone_result.status, why);
+            }
+        }
+        CHECK(m.type == KDB_T_BATCH_RESULT && m.u.batch_result.n_rejected == (uint32_t)nfc && nrej == nfc && nres == nfc && m.u.batch_result.n_applied == 0);
+        for (int k = 0; k < nfc; k++) {
+            char zn[32];
+            snprintf(zn, sizeof(zn), "forged%d.test.", k);
+            CHECK_MSG(seen[k] && dbreg_lookup_entry("default", zn) == NULL, "forged image '%s': a result, and no zone in the registry", fc[k].what);
+        }
+        CHECK(dbreg_lookup_entry("default", "r.test.") != NULL && dbreg_lookup_entry("default", "s.test.") != NULL);          /* (the zones that were there are as they were) */
+    }
 
     /* -- a full rebuild of the zone directory (a zone { } block is added to the configuration) keeps a zone that is out of memory in the index: it
      *    still parks, is fetched and answers (it used to leave the index, and so was REFUSED for good) */
@@ -1381,7 +1373,7 @@ int main(void) {
         CHECK(park_fetch_request(0, "default", "r.test.", KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL));        /* (r.test. is out of memory after the failure above) */
         CHECK(ch_next(&fetchc, &m, 5000) && m.type == KDB_T_FETCH_REQ);
         send_failed_why(f[0], &e, 0, "r.test.", m.u.fetch_req.request_id, KDB_FETCH_BUSY_REASON);
-        CHECK(wake_next(&k, 5000) && park_key_is(&k, "default", "r.test.") && k.failed);
+        CHECK(wake_next(&k, 5000) && park_key_is(&k, "default", "r.test.") && !k.failed && k.ask == PARK_ASK_DROP);       /* (0.7: busy is overload: the queries that wait are dropped and counted, not answered SERVFAIL) */
         CHECK(fq_field("loader_busy", 0) == busy0 + 1);                                 /* (counted) */
         CHECK(fq_field("peak", 0) >= 1 && fq_field("in_flight", 0) == 0);
         CHECK(park_fetch_request(0, "default", "r.test.", KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL));
@@ -1407,19 +1399,9 @@ int main(void) {
     kdb_enc_end(&e);
     ch_send(f[0], &e);
     {
-        uint8_t dig[KDB_DIGEST_LEN];
-        memset(dig, 9, sizeof(dig));
-        kdb_enc_begin(&e, KDB_T_ZONE_BEGIN);
-        kdb_enc_u16(&e, 1, 0); kdb_enc_name(&e, 2, "r.test."); kdb_enc_i64(&e, 3, 11); kdb_enc_u8(&e, 4, KDB_ZK_PRIMARY);
-        kdb_enc_u32(&e, 5, 8); kdb_enc_u32(&e, 6, 0); kdb_enc_u64(&e, 7, 4); kdb_enc_bytes(&e, 8, dig, sizeof(dig));
-        kdb_enc_str(&e, 10, "p1"); kdb_enc_u64(&e, 11, id_prof);
-        kdb_enc_end(&e);
-        uint8_t msg[2048];
-        size_t n = zone_message(msg, "r.test.", 8);
-        kdb_enc_raw_msg(&e, KDB_T_ZONE_DATA, msg, n);
-        kdb_enc_begin(&e, KDB_T_ZONE_END);
-        kdb_enc_u64(&e, 1, 4);
-        kdb_enc_end(&e);
+        zone_image_t *img = zi_zone("r.test.", 8, NULL, NULL, 0);
+        zi_zone_msgs(&e, 0, "r.test.", 11, 8, img, id_prof, NULL, "p1", 0, 9);
+        zone_image_free(img);
         ch_send(f[0], &e);
     }
     CHECK(wake_next(&k, 5000) && park_key_is(&k, "default", "r.test.") && !k.failed);
@@ -1429,19 +1411,9 @@ int main(void) {
     CHECK(park_fetch_request(0, "default", "r.test.", KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL));
     CHECK(ch_next(&fetchc, &m, 5000) && m.type == KDB_T_FETCH_REQ);
     {
-        uint8_t dig[KDB_DIGEST_LEN];
-        memset(dig, 9, sizeof(dig));
-        kdb_enc_begin(&e, KDB_T_ZONE_BEGIN);
-        kdb_enc_u16(&e, 1, 0); kdb_enc_name(&e, 2, "r.test."); kdb_enc_i64(&e, 3, 11); kdb_enc_u8(&e, 4, KDB_ZK_PRIMARY);
-        kdb_enc_u32(&e, 5, 9); kdb_enc_u32(&e, 6, 0); kdb_enc_u64(&e, 7, 4); kdb_enc_bytes(&e, 8, dig, sizeof(dig));
-        kdb_enc_str(&e, 10, "p2"); kdb_enc_u64(&e, 11, m.u.fetch_req.request_id);
-        kdb_enc_end(&e);
-        uint8_t msg[2048];
-        size_t n = zone_message(msg, "r.test.", 9);
-        kdb_enc_raw_msg(&e, KDB_T_ZONE_DATA, msg, n);
-        kdb_enc_begin(&e, KDB_T_ZONE_END);
-        kdb_enc_u64(&e, 1, 4);
-        kdb_enc_end(&e);
+        zone_image_t *img = zi_zone("r.test.", 9, NULL, NULL, 0);
+        zi_zone_msgs(&e, 0, "r.test.", 11, 9, img, m.u.fetch_req.request_id, NULL, "p2", 0, 9);
+        zone_image_free(img);
         ch_send(f[0], &e);
     }
     CHECK(wake_next(&k, 5000) && park_key_is(&k, "default", "r.test.") && k.failed);
@@ -2079,13 +2051,13 @@ int main(void) {
             CHECK(ST("fetchq", "queue_dropped") == d0 + 2 && !park_claim_held(park_claim_key("default", cz[16])) && !park_claim_held(park_claim_key("default", cz[17])));
             CHECK(park_places_used() == 2 && ST("cache", "shed") == s0 && ST("cache", "room_timeouts") == to0 && ST("cache", "room_waits") == rw0);   /* (not held up by room) */
             CHECK(!ch_next(&fetch5, &m2, 100));                                      /* (nothing was fetched for them) */
-            for (int w = 0; w < GS_W; w++) {                                         /* every worker is woken (not failed): a query with time left asks again */
+            for (int w = 0; w < GS_W; w++) {                                         /* the workers that asked are woken (not failed): a query with time left asks again; the others are not troubled (the claim knows who asked: worker 0 for cz[16], worker 1 for cz[17]) */
                 int seen = 0;
                 while (wake_ring_next(w, &k1, 300)) {
-                    CHECK(!k1.failed && (park_key_is(&k1, "default", cz[16]) || park_key_is(&k1, "default", cz[17])));
+                    CHECK(!k1.failed && (park_key_is(&k1, "default", cz[w == 0 ? 16 : 17])));
                     seen++;
                 }
-                CHECK(seen == 2);
+                CHECK(seen == (w == 0 || w == 1 ? 1 : 0));
             }
             /* ... and does: a new entry; a place is freed, and the request goes out */
             CHECK(worker_ask(2, COLD_EL(16), "default", cz[16], KDB_FETCH_FULL) == 1);
@@ -2126,6 +2098,34 @@ int main(void) {
             send_failed(f5[0], &e, 0, fl[1].u.fetch_req.name, fl[1].u.fetch_req.request_id);
             send_failed(f5[0], &e, 0, fl[2].u.fetch_req.name, fl[2].u.fetch_req.request_id);
             CHECK(wait_places(0, 5000));
+            drain_wakes();
+        }
+
+        /* ---- 0.7: the wait queue is full (true overload): the request is shed, counted (`queue_full`), and its queries are dropped (the key says PARK_ASK_DROP: the worker answers nothing), not answered "not ready" ---- */
+        {
+            printf("[0.7: a full wait queue sheds the request, the queries are dropped]\n");
+            gate_cfg("fetch-concurrency 2; park-timeout 5000; memory-limit 1024g;", 2, 0, 0);
+            drain_wakes();
+            CHECK(IS_COLD(22) && IS_COLD(23) && IS_COLD(24) && IS_COLD(25));
+            atomic_store(&db_ingest_test_wq_max, 1);
+            kdb_msg_t fl[3];
+            CHECK(worker_ask(0, COLD_EL(22), "default", cz[22], KDB_FETCH_FULL) == 1 && worker_ask(0, COLD_EL(23), "default", cz[23], KDB_FETCH_FULL) == 1);
+            CHECK(req_next(&fetch5, &fl[0], 5000) && req_next(&fetch5, &fl[1], 5000) && park_places_used() == 2);
+            CHECK(worker_ask(0, COLD_EL(24), "default", cz[24], KDB_FETCH_FULL) == 1);                  /* (no place: it waits, the queue holds one) */
+            for (int i = 0; i < 100 && ST("fetchq", "queued") != 1; i++) usleep(2000);
+            CHECK(ST("fetchq", "queued") == 1);
+            const unsigned long long qf0 = ST("fetchq", "queue_full"), sh0 = ST("cache", "shed");
+            CHECK(worker_ask(0, COLD_EL(25), "default", cz[25], KDB_FETCH_FULL) == 1);                  /* (the queue is full: shed) */
+            park_key_t dk;
+            CHECK(wake_ring_next(0, &dk, 5000) && dk.ask == PARK_ASK_DROP && !dk.failed && park_key_is(&dk, "default", cz[25]));
+            CHECK(ST("fetchq", "queue_full") == qf0 + 1 && ST("cache", "shed") == sh0 + 1 && ST("fetchq", "queued") == 1 && !park_claim_held(park_claim_key("default", cz[25])));
+            CHECK(!ch_next(&fetch5, &m2, 100));
+            send_failed(f5[0], &e, 0, fl[0].u.fetch_req.name, fl[0].u.fetch_req.request_id);
+            CHECK(req_next(&fetch5, &fl[2], 5000) && strcmp(fl[2].u.fetch_req.name, cz[24]) == 0);       /* (the one that waited goes when a place is free) */
+            send_failed(f5[0], &e, 0, fl[1].u.fetch_req.name, fl[1].u.fetch_req.request_id);
+            send_failed(f5[0], &e, 0, fl[2].u.fetch_req.name, fl[2].u.fetch_req.request_id);
+            CHECK(wait_places(0, 5000));
+            atomic_store(&db_ingest_test_wq_max, 0);
             drain_wakes();
         }
 
@@ -2558,7 +2558,7 @@ int main(void) {
             ch_init(&main9, a9[0], KDB_FROM_BACKEND);
             ch_init(&fetch9, f9[0], KDB_FROM_BACKEND);
             kdb_enc_begin(&e, KDB_T_HELLO);
-            kdb_enc_u16(&e, 1, 1); kdb_enc_str(&e, 2, "test-loader"); kdb_enc_str(&e, 3, "sqlite3"); kdb_enc_u32(&e, 4, 4243);
+            kdb_enc_u16(&e, 1, 1); kdb_enc_str(&e, 2, "test-loader"); kdb_enc_str(&e, 3, "sqlite3"); kdb_enc_u32(&e, 4, 4243); kdb_enc_u32(&e, 5, KDB_FEAT_IMAGE); kdb_enc_u32(&e, 6, ZONE_IMAGE_VERSION);
             kdb_enc_end(&e);
             ch_send(a9[0], &e);
             CHECK(ch_next(&main9, &m, 5000) && m.type == KDB_T_CONFIG);

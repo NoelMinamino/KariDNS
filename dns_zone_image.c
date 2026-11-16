@@ -164,6 +164,23 @@ static void put_str(sbuf_t *sb, const char *s) {
     sb_add(sb, s, n + 1);
 }
 
+/* M3 step 1: the image of one zone is the same bytes whenever and wherever it is made (the loader builds it, the digest and the byte
+ * comparisons of the tests rest on that).  cidr_entry_t and acl_entry_t have padding (2 bytes after is_any, 3 after the last member), which a
+ * struct copy leaves as it finds it: the entries are written field by field into a zeroed struct.  A member that is added to either type must
+ * be added here (the sizes are asserted, so the compiler says so). */
+_Static_assert(sizeof(cidr_entry_t) == 44, "cidr_entry_t is copied field by field into the zone image (zero padding): see cidr_canon()");
+_Static_assert(sizeof(tinydns_location_entry_t) == 7, "tinydns_location_entry_t has no padding: it is copied into the zone image as it is");
+
+static void cidr_canon(cidr_entry_t *dst, const cidr_entry_t *src) {
+    memset(dst, 0, sizeof(*dst));
+    dst->valid = src->valid;
+    dst->is_any = src->is_any;
+    dst->family = src->family;
+    dst->prefix = src->prefix;
+    memcpy(dst->addr, src->addr, sizeof(dst->addr));
+    memcpy(dst->mask, src->mask, sizeof(dst->mask));
+}
+
 static void put_tags(sbuf_t *sb, const ecs_tag_def_t *tags, int count) {
     sb_u32(sb, (uint32_t)(count > 0 && tags ? count : 0));
     if (count <= 0 || !tags) return;
@@ -173,7 +190,8 @@ static void put_tags(sbuf_t *sb, const ecs_tag_def_t *tags, int count) {
         sb_u32(sb, (uint32_t)nc);
         for (int j = 0; j < nc; j++) {
             put_str(sb, tags[i].cidrs[j].cidr);
-            cidr_entry_t parsed = tags[i].cidrs[j].parsed;
+            cidr_entry_t parsed;
+            cidr_canon(&parsed, &tags[i].cidrs[j].parsed);
             sb_add(sb, &parsed, sizeof(parsed));
         }
     }
@@ -218,7 +236,13 @@ static void build_zattr(sbuf_t *sb, const zone_arena_t *a) {
         static const uint8_t zeros[8] = { 0 };
         size_t pad = (8 - (sb->len & 7)) & 7;
         if (pad) sb_add(sb, zeros, pad);
-        sb_add(sb, parsed, (size_t)ntr * sizeof(acl_entry_t));
+        for (int i = 0; i < ntr; i++) {      /* (zeroed padding: see cidr_canon()) */
+            acl_entry_t e;
+            memset(&e, 0, sizeof(e));
+            cidr_canon(&e.cidr, &parsed[i].cidr);
+            e.is_deny = parsed[i].is_deny;
+            sb_add(sb, &e, sizeof(e));
+        }
     }
     free(own);
 }
@@ -1434,6 +1458,9 @@ static const char *v_cstr(const vstr_t *vs, uint32_t off, size_t maxlen, size_t 
 static const char *v_owner(const vstr_t *vs, uint32_t text_off, uint32_t wire_off) {
     const char *t = v_cstr(vs, text_off, DNS_NAME_TEXT_SIZE - 1, NULL);
     if (!t) return NULL;
+    /* the presentation form is printable: a name is text of the log (the limits, the refusals name the owner) and of the zone data; a space, a control octet or DEL is written as a decimal escape (RFC 1035 section 5.1) */
+    for (const char *p = t; *p; p++)
+        if ((unsigned char)*p <= 0x20 || (unsigned char)*p == 0x7F) return NULL;
     uint8_t w[256];
     long wl = write_uncompressed_name_ext(w, 0, sizeof(w), t, false);
     if (wl <= 0) return NULL;
@@ -1562,6 +1589,7 @@ int zone_image_validate(const void *buf, size_t len, char *why, size_t whylen) {
         /* hash_size: a power of two with an empty slot, or find_name() would not end */
         uint32_t hs = img->hash_size;
         if (hs < 4 || (hs & (hs - 1)) != 0 || hs <= n_names) BAD("hash_size %u", hs);
+        if ((uint64_t)hs * 3 < (uint64_t)n_names * 4) BAD("hash_size %u is too small for %u names (a load of more than 3/4: the probes of a lookup would be long)", hs, n_names);
     }
 
     /* the layout of zone_image_freeze(): each section follows the one before, padded to 8, in this order; with the total size
@@ -1775,6 +1803,18 @@ int zone_image_validate(const void *buf, size_t len, char *why, size_t whylen) {
         if (first != img->n_n3entries) BAD("the NSEC3 chains hold %llu of %u entries", (unsigned long long)first, img->n_n3entries);
     }
 
+    /* NSEC3 iterations above ZONE_MAX_NSEC3_ITERATIONS (RFC 9276 §3.2) are refused for every source of a zone (validate_zone_pdns_types(), the parser): a query never hashes more than that.  The header, the chains and every NSEC3 /
+     * NSEC3PARAM RR are looked at, whatever they say about each other (the RDATA is what the engine reads: iterations are the 16 bits after algorithm and flags). */
+    if (img->n3_iterations > ZONE_MAX_NSEC3_ITERATIONS) BAD("NSEC3 iterations %u in the header, more than %u (RFC 9276 section 3.2)", (unsigned)img->n3_iterations, ZONE_MAX_NSEC3_ITERATIONS);
+    for (uint32_t c = 0; c < img->n_n3chains; c++)
+        if (zone_image_n3chains(img)[c].iterations > ZONE_MAX_NSEC3_ITERATIONS) BAD("NSEC3 chain %u has %u iterations, more than %u (RFC 9276 section 3.2)", c, (unsigned)zone_image_n3chains(img)[c].iterations, ZONE_MAX_NSEC3_ITERATIONS);
+    for (uint32_t k = 0; k < n_rrs; k++) {
+        if ((rrs[k].type != 50 && rrs[k].type != 51) || rrs[k].rdata_len < 4) continue;
+        const uint8_t *rd = vs.s + rrs[k].rdata_off;
+        const unsigned it = (unsigned)((rd[2] << 8) | rd[3]);
+        if (it > ZONE_MAX_NSEC3_ITERATIONS) BAD("RR %u (%s) has %u NSEC3 iterations, more than %u (RFC 9276 section 3.2)", k, rrs[k].type == 50 ? "NSEC3" : "NSEC3PARAM", it, ZONE_MAX_NSEC3_ITERATIONS);
+    }
+
     /* the NSEC3 parameters of the zone (zone_nsec3() in the engine hands salt / chain to the lookups) */
     if (img->n3_param_rr == ZONE_IMAGE_NONE) {
         if (img->n3_chain != ZONE_IMAGE_NONE || img->n3_salt_off || img->n3_iterations || img->n3_algorithm || img->n3_salt_len)
@@ -1830,5 +1870,242 @@ int zone_image_validate(const void *buf, size_t len, char *why, size_t whylen) {
 out:
 #undef BAD
     free(bits);
+    return rc;
+}
+
+/* ------------------------------------------------------------------------------------------------------------
+ * an image from the database loader (0.7 M3): the rules of the zone and of the stream on top of zone_image_validate()
+ * ------------------------------------------------------------------------------------------------------------ */
+static bool ext_tag_eq(const vstr_t *vs, uint32_t a, uint32_t b) {
+    if (!a || !b) return a == b;
+    return strcasecmp((const char *)vs->s + a, (const char *)vs->s + b) == 0;
+}
+
+/* dns_record_same_visibility() on the extras of two RRs of one image (the tags were checked to be strings of the area) */
+static bool img_same_visibility(const vstr_t *vs, const zone_image_ext_t *a, const zone_image_ext_t *b) {
+    zone_image_ext_t z;
+    memset(&z, 0, sizeof(z));
+    if (!a) a = &z;
+    if (!b) b = &z;
+    return a->loc[0] == b->loc[0] && a->loc[1] == b->loc[1] && a->ttd == b->ttd &&
+           (a->flags & ZONE_IMAGE_EXT_COUNTDOWN) == (b->flags & ZONE_IMAGE_EXT_COUNTDOWN) && ext_tag_eq(vs, a->loc_tag_off, b->loc_tag_off) &&
+           ext_tag_eq(vs, a->ecs_tag_off, b->ecs_tag_off);
+}
+
+int zone_image_validate_ex(const void *buf, size_t len, const zone_image_policy_t *pol, char *why, size_t whylen) {
+    if (!pol) return zone_image_validate(buf, len, why, whylen);
+    int rc = 0;
+#define PBAD(...) do { if (why && whylen) snprintf(why, whylen, __VA_ARGS__); return -1; } while (0)
+    /* what costs nothing is looked at before the O(len) pass */
+    if (pol->announced_size && (uint64_t)len != pol->announced_size) PBAD("the image is %zu octets, ZONE_BEGIN announced %llu", len, (unsigned long long)pol->announced_size);
+    if (pol->max_bytes && (uint64_t)len > pol->max_bytes) PBAD("the image is %zu octets, above max-zone-bytes %llu", len, (unsigned long long)pol->max_bytes);
+    rc = zone_image_validate(buf, len, why, whylen);
+    if (rc != 0) return rc;
+    return zone_image_check_policy(buf, len, pol, why, whylen);
+#undef PBAD
+}
+
+int zone_image_check_policy(const void *buf, size_t len, const zone_image_policy_t *pol, char *why, size_t whylen) {
+#define PBAD(...) do { if (why && whylen) snprintf(why, whylen, __VA_ARGS__); return -1; } while (0)
+    const zone_image_t *img = (const zone_image_t *)buf;
+    const uint8_t *base = (const uint8_t *)buf;
+    const vstr_t vs = { base + img->off_strings, len - img->off_strings };
+    const zone_image_name_t *names = zone_image_names(img);
+    const zone_image_rr_t *rrs = zone_image_rrs(img);
+    const zone_image_ext_t *exts = zone_image_exts(img);
+    const uint32_t n_names = img->n_names, n_rrs = img->n_rrs, apex = img->apex_name;
+
+    if (pol->rr_count != UINT64_MAX && (uint64_t)n_rrs != pol->rr_count) PBAD("the image has %u RRs, ZONE_BEGIN declared %llu", n_rrs, (unsigned long long)pol->rr_count);
+    if (pol->max_records && (uint64_t)n_rrs > pol->max_records) PBAD("the image has %u RRs, above max-zone-records %llu", n_rrs, (unsigned long long)pol->max_records);
+    if (((img->flags & ZONE_IMAGE_F_TINYDNS) != 0) != pol->tinydns) PBAD("the tinydns flag of the image differs from ZONE_BEGIN's");
+    if (apex == ZONE_IMAGE_NONE || !pol->apex || !domain_names_match_ci(zone_image_name_text(img, apex), pol->apex))
+        PBAD("the image has no data at the apex of the zone");
+
+    /* owners: the apex or below it (an alternative spelling of an owner is the same name: validate checked) */
+    for (uint32_t id = 0; id < n_names; id++)
+        if (!domain_name_is_at_or_below(zone_image_name_text(img, id), pol->apex)) PBAD("name %u is outside the zone", id);
+
+    /* RRs: class IN, no meta type, SOA only at the apex; what the zone is made of (DNSSEC RRs) and what restricts an RR */
+    bool signed_zone = false, dnssec_rr = false;
+    uint32_t nsoa = 0, n_alias = 0;
+    for (uint32_t k = 0; k < n_rrs; k++) {
+        const zone_image_rr_t *r = &rrs[k];
+        if (r->class_val != 1) PBAD("RR %u: class %u, a zone holds class IN only", k, (unsigned)r->class_val);
+        if (r->type == 0 || is_meta_rrtype(r->type)) PBAD("RR %u: type %u cannot be zone data", k, (unsigned)r->type);
+        if (r->type == 46 || r->type == 48 || r->type == 47 || r->type == 50) signed_zone = true;
+        if (r->type == 46 || r->type == 47 || r->type == 48 || r->type == 50 || r->type == 51) dnssec_rr = true;
+        if (r->type == DNS_TYPE_PDNS_ALIAS || r->type == DNS_TYPE_PDNS_LUA) {      /* validate_zone_pdns_types(): the RDATA is what the type is (PowerDNS ALIAS: one uncompressed name; LUA: a type and character-strings) */
+            const bool alias = r->type == DNS_TYPE_PDNS_ALIAS;
+            const uint8_t *rd = r->rdata_len ? vs.s + r->rdata_off : (const uint8_t *)"";
+            if (!(alias ? pdns_alias_rdata_ok(rd, r->rdata_len) : pdns_lua_rdata_ok(rd, r->rdata_len)))
+                PBAD("RR %u: %s record at '%.200s' has malformed RDATA", k, alias ? "ALIAS" : "LUA", zone_image_name_text(img, r->name_id));
+            if (alias) n_alias++;
+        }
+        if (r->type == 6) {
+            if (r->name_id != apex) PBAD("RR %u: an SOA outside the apex", k);
+            nsoa++;
+        }
+        if (r->ext_idx && !pol->extended && (ext_restricts(&exts[r->ext_idx - 1]) || (exts[r->ext_idx - 1].flags & ZONE_IMAGE_EXT_COUNTDOWN)))
+            PBAD("RR %u: tinydns or tag attributes in a zone that did not announce the extended encoding", k);
+    }
+    if (nsoa == 0) PBAD("the apex has no SOA");
+    if (nsoa > KARIDNS_SOA_SET_MAX) PBAD("more than %u SOA records", (unsigned)KARIDNS_SOA_SET_MAX);
+    if (nsoa > 1 && !pol->extended) PBAD("several SOA records in a zone that did not announce the extended encoding");
+
+    /* what validate_zone_pdns_types() refuses in a zone of any source (the zone file, a transfer, the database): an ALIAS beside DNSSEC records, an ALIAS and an
+     * A or AAAA RRset at one owner (the ALIAS stands for those RRsets), and an owner with two different CNAME, DNAME or RESINFO RRs (singleton types: RFC 1034 §3.6.2,
+     * RFC 6672 §2.4, RFC 9606 §3; two RRs that locations or tags keep apart are not one RRset, the same RR twice is one RR) */
+    if (n_alias && dnssec_rr) PBAD("the zone has ALIAS records and DNSSEC records: an ALIAS answer cannot be signed offline");
+    for (uint32_t id = 0; id < n_names; id++) {
+        const uint32_t first = names[id].first_rr, last = first + (names[id].rr_count_flags & ZONE_IMAGE_NAME_COUNT_MASK);
+        bool has_alias = false, has_addr = false;
+        uint32_t nsingle = 0;
+        for (uint32_t k = first; k < last; k++) {
+            const uint16_t t = rrs[k].type;
+            if (t == DNS_TYPE_PDNS_ALIAS) has_alias = true;
+            else if (t == 1 || t == 28) has_addr = true;
+            else if (t == 5 || t == 39 || t == 261) nsingle++;
+        }
+        if (has_alias && has_addr) PBAD("'%.200s' has an ALIAS record and an A or AAAA record: the ALIAS stands for those RRsets", zone_image_name_text(img, id));
+        if (nsingle < 2) continue;
+        if (nsingle > 1024) PBAD("'%.200s' has %u CNAME, DNAME or RESINFO records", zone_image_name_text(img, id), nsingle);
+        for (uint32_t i = first; i < last; i++) {
+            const uint16_t t = rrs[i].type;
+            if (t != 5 && t != 39 && t != 261) continue;
+            for (uint32_t j = i + 1; j < last; j++) {
+                if (rrs[j].type != t || !img_same_visibility(&vs, rrs[i].ext_idx ? &exts[rrs[i].ext_idx - 1] : NULL, rrs[j].ext_idx ? &exts[rrs[j].ext_idx - 1] : NULL)) continue;
+                bool same = rrs[i].rdata_len == rrs[j].rdata_len;
+                for (uint32_t b = 0; same && b < rrs[i].rdata_len; b++) {
+                    uint8_t x = vs.s[rrs[i].rdata_off + b], y = vs.s[rrs[j].rdata_off + b];
+                    if (t != 261) {                       /* (a name: case does not count; a length octet is below 64 and not a letter) */
+                        if (x >= 'A' && x <= 'Z') x |= 0x20;
+                        if (y >= 'A' && y <= 'Z') y |= 0x20;
+                    }
+                    same = x == y;
+                }
+                if (!same) PBAD("multiple RRs of singleton type: '%.200s' has more than one %s record", zone_image_name_text(img, id), t == 5 ? "CNAME" : t == 39 ? "DNAME" : "RESINFO");
+            }
+        }
+    }
+
+    /* the SOA RRs (RFC 2181 §6.1: one serial; a signature of the SOA RRset holds for every client or for none) */
+    {
+        const zone_image_name_t *an = &names[apex];
+        const uint32_t first = an->first_rr, last = an->first_rr + (an->rr_count_flags & ZONE_IMAGE_NAME_COUNT_MASK);
+        bool restricted = false;
+        for (uint32_t k = first; k < last; k++) {
+            if (rrs[k].type != 6) continue;
+            zone_image_soa_t s;
+            if (zone_image_soa(img, k, NULL, 0, NULL, 0, &s) != 0) PBAD("RR %u: the apex SOA is malformed", k);
+            if (s.serial != pol->serial) PBAD("RR %u: the SOA serial %u is not the one ZONE_BEGIN declared (%u)", k, s.serial, pol->serial);
+            if (rrs[k].ext_idx && ext_restricts(&exts[rrs[k].ext_idx - 1])) restricted = true;
+        }
+        if ((restricted || nsoa > 1) && signed_zone) PBAD("a zone with DNSSEC records and several or restricted SOA records");
+        if (nsoa > 1)
+            for (uint32_t i = first; i < last; i++) {
+                if (rrs[i].type != 6) continue;
+                for (uint32_t j = i + 1; j < last; j++)
+                    if (rrs[j].type == 6 && img_same_visibility(&vs, rrs[i].ext_idx ? &exts[rrs[i].ext_idx - 1] : NULL, rrs[j].ext_idx ? &exts[rrs[j].ext_idx - 1] : NULL))
+                        PBAD("two SOA records for the same clients");
+            }
+    }
+
+    /* the zone level tables */
+    if (img->zattr_len) {
+        if (!pol->extended) PBAD("zone level tables in a zone that did not announce the extended encoding");
+        int ntr = 0;
+        (void)zone_image_ecs_trusted(img, &ntr);
+        if (ntr != 0) PBAD("ECS trusted resolvers in the image (they come from the settings of the zone)");
+        int nloc = 0;
+        (void)zone_image_locations(img, &nloc);
+        if (nloc > 4096) PBAD("more than 4096 tinydns locations");
+        uint64_t cidrs = 0;
+        for (int kind = ZONE_IMAGE_TAGS_LOCATION; kind <= ZONE_IMAGE_TAGS_ECS; kind++) {
+            zone_image_tags_t it;
+            zone_image_tag_t t;
+            zone_image_tags_open(img, kind, &it);
+            if (it.left > (uint32_t)XFR_TAGDEF_MAX) PBAD("more than %d tag definitions", XFR_TAGDEF_MAX);
+            while (zone_image_tags_next(&it, &t)) cidrs += t.cidr_count;
+        }
+        if (cidrs > XFR_TAGDEF_CIDR_MAX) PBAD("more than %u CIDRs in the tag definitions", (unsigned)XFR_TAGDEF_CIDR_MAX);
+    }
+#undef PBAD
+    return 0;
+}
+
+int zone_image_asm_add(uint8_t **buf, size_t *len, size_t *cap, uint64_t announced, const uint8_t *body, size_t n) {
+    if (announced == 0 || (uint64_t)*len > announced || (uint64_t)n > announced - *len) return -1;
+    if (!*buf) {
+        *buf = malloc((size_t)announced);
+        if (!*buf) return -2;
+        *cap = (size_t)announced;
+    }
+    memcpy(*buf + *len, body, n);
+    *len += n;
+    return 0;
+}
+
+static int u16_cmp(const void *a, const void *b) {
+    uint16_t x = *(const uint16_t *)a, y = *(const uint16_t *)b;
+    return x < y ? -1 : x > y;
+}
+
+int zone_image_check_limits(const zone_image_t *img, const zone_limits_t *lim, char *err, size_t errlen) {
+    if (!img || !lim) return 0;
+    if (lim->max_records && (uint64_t)img->n_rrs > lim->max_records) {
+        snprintf(err, errlen, "the zone has %u records, more than max-records %llu", img->n_rrs, (unsigned long long)lim->max_records);
+        return -1;
+    }
+    const zone_image_rr_t *rrs = zone_image_rrs(img);
+    if (lim->max_zone_ttl) {
+        for (uint32_t k = 0; k < img->n_rrs; k++) {
+            if (rrs[k].ttl > lim->max_zone_ttl) {
+                const char *nm = zone_image_name_text(img, rrs[k].name_id);
+                snprintf(err, errlen, "'%.200s' type %u has TTL %u, which exceeds the configured max-zone-ttl %u", nm ? nm : "?", (unsigned)rrs[k].type,
+                         rrs[k].ttl, lim->max_zone_ttl);
+                return -1;
+            }
+        }
+    }
+    if (!lim->max_per_type && !lim->max_types_per_name) return 0;
+    /* an owner with no more RRs than either limit cannot break it (a type count is at most the RR count): only the others are sorted */
+    uint32_t floor_n = UINT32_MAX;
+    if (lim->max_per_type && lim->max_per_type < floor_n) floor_n = lim->max_per_type;
+    if (lim->max_types_per_name && lim->max_types_per_name < floor_n) floor_n = lim->max_types_per_name;
+    uint16_t *types = NULL;
+    size_t types_cap = 0;
+    int rc = 0;
+    const zone_image_name_t *names = zone_image_names(img);
+    for (uint32_t id = 0; id < img->n_names && rc == 0; id++) {
+        const uint32_t n = names[id].rr_count_flags & ZONE_IMAGE_NAME_COUNT_MASK;
+        if (n <= floor_n) continue;
+        if (n > types_cap) {
+            uint16_t *nt = realloc(types, (size_t)n * sizeof(*types));
+            if (!nt) { rc = -2; break; }
+            types = nt;
+            types_cap = n;
+        }
+        for (uint32_t i = 0; i < n; i++) types[i] = rrs[names[id].first_rr + i].type;
+        qsort(types, n, sizeof(*types), u16_cmp);
+        size_t ntypes = 0;
+        for (size_t k = 0; k < n;) {
+            size_t e = k;
+            while (e < n && types[e] == types[k]) e++;
+            ntypes++;
+            if (lim->max_per_type && e - k > lim->max_per_type) {
+                snprintf(err, errlen, "'%.200s' has %zu records of type %u, more than max-records-per-type %u", zone_image_name_text(img, id), e - k,
+                         (unsigned)types[k], lim->max_per_type);
+                rc = -1;
+            }
+            k = e;
+        }
+        if (rc == 0 && lim->max_types_per_name && ntypes > lim->max_types_per_name) {
+            snprintf(err, errlen, "'%.200s' has %zu record types, more than max-types-per-name %u", zone_image_name_text(img, id), ntypes,
+                     lim->max_types_per_name);
+            rc = -1;
+        }
+    }
+    free(types);
+    if (rc == -2) snprintf(err, errlen, "out of memory checking the limits of the zone");
     return rc;
 }

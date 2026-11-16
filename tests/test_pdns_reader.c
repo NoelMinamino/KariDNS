@@ -124,6 +124,57 @@ static bool file_rdata_hex(const char *type, const char *text, char *out, size_t
 /* ------------------------------------------------------------------ 1. zone files */
 static int cmp_names(const void *a, const void *b) { return strcmp(*(char *const *)a, *(char *const *)b); }
 
+/* ---- an independent oracle for the image of the loader (review of 0.7 M3) ----
+ * pdns_roundtrip() compares the loader's image with the loader's own builder, which is the same code twice.  The oracle is the image that the zone FILE path makes of the same zone text (the zone
+ * parser, zone_arena_drop_out_of_zone(), the index, zone_image_freeze(): what a file zone is served from).  The two images are compared on everything the engine reads that does not depend on the order
+ * in which the RRs were fed: the counts, the header flags, the apex, the NSEC3 parameters, the names with their flags and their RRs (type and TTL, as multisets), the canonical order of the names and the
+ * glue list.  The documented normalisation: the order of the RRs inside one owner and the file order (ZONE_IMAGE_F_PERM / off_perm: the loader puts the SOA first), and the RAW / NO_NAMEWIRE flags of the
+ * RRs (image_wire_form_flags() gives the loader's image the form of an image made from wire RRs) are not compared; nor is ZONE_IMAGE_F_EXT: the file keeps the case of an owner as it is written (an ext[] entry with the
+ * spelling, zonemd_a3.zone has NS2.EXAMPLE.), the database holds names in lower case (PowerDNS), and restrictions to some clients are ZONE_IMAGE_F_VIEW, which is compared; a tinydns zone is not in this list (it needs the data file). */
+static int oc_u64_cmp(const void *x, const void *y) { uint64_t a = *(const uint64_t *)x, b = *(const uint64_t *)y; return a < b ? -1 : a > b; }
+
+static bool image_oracle_same(const zone_image_t *a, const zone_image_t *b, char *why, size_t wl) {
+#define OC_BAD(...) do { snprintf(why, wl, __VA_ARGS__); return false; } while (0)
+    if (a->n_names != b->n_names || a->n_rrs != b->n_rrs) OC_BAD("%u names / %u RRs in the loader's image, %u / %u in the file's", a->n_names, a->n_rrs, b->n_names, b->n_rrs);
+    if ((a->flags & ~(uint32_t)(ZONE_IMAGE_F_PERM | ZONE_IMAGE_F_EXT)) != (b->flags & ~(uint32_t)(ZONE_IMAGE_F_PERM | ZONE_IMAGE_F_EXT))) OC_BAD("header flags %x and %x", a->flags, b->flags);
+    if (a->n_nsec != b->n_nsec || a->n_n3chains != b->n_n3chains || a->n_n3entries != b->n_n3entries || a->n_glue != b->n_glue || a->n_canon != b->n_canon)
+        OC_BAD("index sizes: nsec %u/%u, n3chains %u/%u, n3entries %u/%u, glue %u/%u", a->n_nsec, b->n_nsec, a->n_n3chains, b->n_n3chains, a->n_n3entries, b->n_n3entries, a->n_glue, b->n_glue);
+    if (a->apex_name == ZONE_IMAGE_NONE || b->apex_name == ZONE_IMAGE_NONE || strcasecmp(zone_image_name_text(a, a->apex_name), zone_image_name_text(b, b->apex_name)) != 0) OC_BAD("the apex differs");
+    if ((a->n3_param_rr == ZONE_IMAGE_NONE) != (b->n3_param_rr == ZONE_IMAGE_NONE) || a->n3_iterations != b->n3_iterations || a->n3_algorithm != b->n3_algorithm || a->n3_salt_len != b->n3_salt_len ||
+        (a->n3_salt_len && memcmp((const uint8_t *)a + a->off_strings + a->n3_salt_off, (const uint8_t *)b + b->off_strings + b->n3_salt_off, a->n3_salt_len) != 0))
+        OC_BAD("the NSEC3 parameters differ");
+    uint64_t *ra = malloc(sizeof(uint64_t) * (a->n_rrs ? a->n_rrs : 1)), *rb = malloc(sizeof(uint64_t) * (a->n_rrs ? a->n_rrs : 1));
+    bool ok = ra && rb;
+    char msg[300] = "out of memory";
+    for (uint32_t id = 0; ok && id < a->n_names; id++) {
+        const char *t = zone_image_name_text(a, id);
+        const uint32_t jd = zone_image_find_name(b, t);
+        if (jd == ZONE_IMAGE_NONE) { snprintf(msg, sizeof(msg), "'%.150s' is not in the file's image", t); ok = false; break; }
+        if (zone_image_name_flags(a, id) != zone_image_name_flags(b, jd) || zone_image_name_rr_count(a, id) != zone_image_name_rr_count(b, jd)) {
+            snprintf(msg, sizeof(msg), "'%.150s': flags %x / %x, RRs %u / %u", t, zone_image_name_flags(a, id), zone_image_name_flags(b, jd), zone_image_name_rr_count(a, id), zone_image_name_rr_count(b, jd));
+            ok = false;
+            break;
+        }
+        const uint32_t n = zone_image_name_rr_count(a, id);
+        for (uint32_t k = 0; k < n; k++) {
+            const uint32_t x = zone_image_name_first_rr(a, id) + k, y = zone_image_name_first_rr(b, jd) + k;
+            ra[k] = ((uint64_t)zone_image_rr_type(a, x) << 48) ^ ((uint64_t)zone_image_rr_ttl(a, x) << 16) ^ zone_image_rr_rdlen(a, x);
+            rb[k] = ((uint64_t)zone_image_rr_type(b, y) << 48) ^ ((uint64_t)zone_image_rr_ttl(b, y) << 16) ^ zone_image_rr_rdlen(b, y);
+        }
+        qsort(ra, n, sizeof(uint64_t), oc_u64_cmp);
+        qsort(rb, n, sizeof(uint64_t), oc_u64_cmp);
+        if (n && memcmp(ra, rb, n * sizeof(uint64_t)) != 0) { snprintf(msg, sizeof(msg), "'%.150s': the types, TTLs or RDATA lengths of its RRs differ", t); ok = false; }
+    }
+    const uint32_t *ca = zone_image_u32s(a, a->off_canon), *cb = zone_image_u32s(b, b->off_canon);
+    for (uint32_t i = 0; ok && i < a->n_canon; i++)
+        if (strcasecmp(zone_image_name_text(a, ca[i]), zone_image_name_text(b, cb[i])) != 0) { snprintf(msg, sizeof(msg), "canonical order differs at %u", i); ok = false; }
+    free(ra);
+    free(rb);
+    if (!ok) { snprintf(why, wl, "%s", msg); return false; }
+    return true;
+#undef OC_BAD
+}
+
 static void test_zone_files(void) {
     printf("zone files (%s)\n", g_zones_dir);
     DIR *d = opendir(g_zones_dir);
@@ -220,9 +271,19 @@ static void test_zone_files(void) {
             bool ok = pdns_roundtrip(z, &info, why, sizeof(why));
             CHECK_MSG(ok, "%s: KDB1 round trip: %s", names[k], why);
             if (ok) {
-                CHECK(info.rr_count == fa.count + 1 + (z->has_ext ? (info.rr_count - fa.count - 1) : 0));      /* B8: the extension RRs are counted */
-                CHECK(info.max_body <= KDB_MAX_ZONE_DATA);
-                printf("  [ OK ] %-34s %6zu RRs, %zu ZONE_DATA, zone %s\n", names[k], fa.count, info.n_zone_data, rows.zone);
+                /* the oracle: the image that the zone file path makes of the same text against the image the loader makes of its rows (see image_oracle_same()) */
+                char oerr[300] = "", owhy[400] = "";
+                zone_image_t *li = pdns_zone_build_image(z, oerr, sizeof(oerr));
+                zone_arena_shrink_records(&fa);
+                zone_image_t *fi = build_zone_index(&fa, true) == 0 ? zone_image_freeze(&fa, apex) : NULL;
+                CHECK_MSG(li != NULL, "%s: the loader's image: %s", names[k], oerr);
+                CHECK_MSG(fi != NULL, "%s: the file's image cannot be made", names[k]);
+                if (li && fi) CHECK_MSG(image_oracle_same(li, fi, owhy, sizeof(owhy)), "%s: the loader's image is not the file's: %s", names[k], owhy);
+                zone_image_free(li);
+                zone_image_free(fi);
+                CHECK(info.rr_count == z->arena.count && info.rr_count >= 1);      /* the RRs of the image: the SOA once; the tag tables and the reset RRs of the extension are not RRs */
+                CHECK(info.max_body <= KDB_MAX_BODY && info.n_chunks >= 1);
+                printf("  [ OK ] %-34s %6zu RRs, image %llu bytes in %zu messages, zone %s\n", names[k], fa.count, (unsigned long long)info.image_size, info.n_chunks, rows.zone);
             }
         }
         pdns_zone_free(z);
@@ -772,11 +833,10 @@ static void test_zone_level(void) {
     z = build(two_ok, 1, NULL, 0, NULL);
     CHECK_MSG(!z->failed, "%s", z->error);
     CHECK(z->n_soa == 2 && z->serial == 2024010101u && z->arena.records[z->soa_index].type_code == 6);
-    {
+    {   /* two SOAs that every client sees: the reader takes them (one serial), the image is refused where it is built (the Backend refuses it as well: zone_image_validate_ex()) */
         rt_info_t info;
         char why[300];
-        CHECK_MSG(pdns_roundtrip(z, &info, why, sizeof(why)), "%s", why);
-        CHECK(info.flags == KDB_ZF_EXTENDED);
+        CHECK(!pdns_roundtrip(z, &info, why, sizeof(why)) && strstr(why, "same clients"));
     }
     pdns_zone_free(z);
     /* SOA not at the apex */
@@ -842,12 +902,15 @@ static void test_zone_level(void) {
     }
     /* limits */
     {
-        pdns_opts_t o = { 0, 4, 0, 0 };            /* SOA + 3 rows + the closing SOA = 5 RRs > 4 */
+        pdns_opts_t o = { 0, 4, 0, 0 };            /* SOA + 3 rows = 4 RRs: inside; the 5th row is the one that is refused */
         db_record_row_t rows[] = { R(2, "a.z.test", "A", "192.0.2.1", 300, 0), R(3, "b.z.test", "A", "192.0.2.2", 300, 0),
-                                   R(4, "c.z.test", "A", "192.0.2.3", 300, 0) };
+                                   R(4, "c.z.test", "A", "192.0.2.3", 300, 0), R(5, "d.z.test", "A", "192.0.2.4", 300, 0) };
         z = build(rows, 3, NULL, 0, &o);
+        CHECK_MSG(!z->failed, "%s", z->error);
+        pdns_zone_free(z);
+        z = build(rows, 4, NULL, 0, &o);
         CHECK(z->failed);
-        CHECK_HAS(z->error, "records.id 4");
+        CHECK_HAS(z->error, "records.id 5");
         CHECK_HAS(z->error, "max-zone-records");
         pdns_zone_free(z);
         pdns_opts_t o2 = { 0, 0, 200, 0 };
@@ -1151,7 +1214,7 @@ static int test_gate(void *ud, uint32_t serial, const uint8_t digest[KDB_DIGEST_
 
 static void test_kdb(void) {
     printf("KDB1 encoding\n");
-    /* many records: several ZONE_DATA messages, SOA first and last, every message <= 65535 */
+    /* many records: one image, ZONE_IMAGE messages of at most KDB_MAX_BODY, the SOA once */
     {
         size_t n = 2500;
         db_record_row_t *rows = calloc(n, sizeof(*rows));
@@ -1168,9 +1231,8 @@ static void test_kdb(void) {
         char why[300];
         bool ok = pdns_roundtrip(z, &info, why, sizeof(why));
         CHECK_MSG(ok, "%s", why);
-        CHECK(info.n_zone_data >= 3);
-        CHECK(info.max_body <= 65535 && info.max_body > 60000);
-        CHECK(info.rr_count == n + 2);                  /* SOA, n TXT, SOA */
+        CHECK(info.n_chunks >= 1 && info.max_body <= KDB_MAX_BODY && info.image_size > n * 60);
+        CHECK(info.rr_count == n + 1);                  /* SOA, n TXT */
         CHECK(info.serial == 2024010101u);
         CHECK(info.flags == 0);
 
@@ -1182,7 +1244,7 @@ static void test_kdb(void) {
         pdns_zone_t *z2 = build(rows, n, NULL, 0, NULL);
         CHECK(pdns_zone_encode_kdb(z2, &kp, rt_emit, &b2, err, sizeof(err)) == 0);
         CHECK(b1.len == b2.len && b1.len > 0 && memcmp(b1.buf, b2.buf, b1.len) == 0);
-        /* the first message is ZONE_BEGIN, the last ZONE_END */
+        /* the first message is ZONE_BEGIN (the image, ZONE_IMAGE messages, follows), the last ZONE_END */
         CHECK(memcmp(b1.buf, "KDB1", 4) == 0 && b1.buf[5] == KDB_T_ZONE_BEGIN);
         CHECK(memcmp(b1.buf + b1.len - 24, "KDB1", 4) == 0 && b1.buf[b1.len - 24 + 5] == KDB_T_ZONE_END);
         /* changing one row changes the digest */
@@ -1278,14 +1340,13 @@ static void test_kdb(void) {
             rt_info_t info;
             char why[300];
             CHECK_MSG(pdns_roundtrip(z, &info, why, sizeof(why)), "%s", why);
-            CHECK(info.n_zone_data == 3);              /* SOA | big RR | closing SOA: no two of them fit together */
-            CHECK(info.max_body <= 65535 && info.max_body > 65000);
+            CHECK(info.n_chunks >= 1 && info.image_size > 65000 && info.rr_count == 2);      /* SOA and the big RR: one image */
         }
         pdns_zone_free(z);
         snprintf(content, nofit * 2 + 32, "\\# %zu %.*s", nofit, (int)(nofit * 2), hex);
         db_record_row_t big = R(60, "big.z.test", "TYPE65534", content, 300, 0);
         z = build(&big, 1, NULL, 0, NULL);
-        /* 12 + owner + 10 + 65520 does not fit a ZONE_DATA message: the zone fails here, naming the row */
+        /* 12 + owner + 10 + 65520 does not fit the RDATA of a record (RDLENGTH 65535, RFC 1035 3.2.1): the zone fails here, naming the row */
         CHECK(z->failed);
         CHECK_HAS(z->error, "records.id 60");
         CHECK_HAS(z->error, "does not fit");
@@ -1328,7 +1389,7 @@ static void test_kdb(void) {
         z = build(NULL, 0, NULL, 0, &o);
         CHECK(!z->failed);
         CHECK(pdns_zone_encode_kdb(z, &(pdns_kdb_params_t){0, 1, KDB_ZK_PRIMARY, NULL, NULL, NULL, NULL, 0 }, rt_emit, &b, err, sizeof(err)) != 0);
-        CHECK_HAS(err, "limit");
+        CHECK_HAS(err, "max-zone-bytes");
         pdns_zone_free(z);
         free(b.buf);
     }
@@ -1338,7 +1399,7 @@ static void test_kdb(void) {
         pdns_zone_t *z = build(NULL, 0, m, 2, NULL);
         rt_buf_t b = {0};
         char err[200];
-        CHECK(pdns_zone_encode_kdb(z, &(pdns_kdb_params_t){5, 42, KDB_ZK_SECONDARY, NULL, NULL, NULL, NULL, 0 }, rt_emit, &b, err, sizeof(err)) == 0);
+        CHECK(pdns_zone_encode_kdb(z, &(pdns_kdb_params_t){5, 42, KDB_ZK_PRIMARY, NULL, NULL, NULL, NULL, 0 }, rt_emit, &b, err, sizeof(err)) == 0);
         static uint8_t fb[KDB_MAX_BODY];
         kdb_framer_t f;
         kdb_framer_init(&f, KDB_FROM_LOADER, fb, sizeof(fb));
@@ -1348,7 +1409,8 @@ static void test_kdb(void) {
         kdb_msg_t msg;
         char why[200];
         CHECK(kdb_decode(&fr, KDB_VIEWS_ANY, &msg, why, sizeof(why)) == KDB_OK);
-        CHECK(msg.u.zone_begin.view == 5 && msg.u.zone_begin.source_id == 42 && msg.u.zone_begin.zone_kind == KDB_ZK_SECONDARY);
+        CHECK(msg.u.zone_begin.view == 5 && msg.u.zone_begin.source_id == 42 && msg.u.zone_begin.zone_kind == KDB_ZK_PRIMARY &&
+              (msg.u.zone_begin.flags & KDB_ZF_IMAGE) && msg.u.zone_begin.image_size > sizeof(zone_image_t));
         CHECK(msg.u.zone_begin.settings.p && msg.u.zone_begin.settings.len == strlen(z->settings) &&
               memcmp(msg.u.zone_begin.settings.p, z->settings, msg.u.zone_begin.settings.len) == 0);
         CHECK(msg.u.zone_begin.profile.len == 2 && memcmp(msg.u.zone_begin.profile.p, "p1", 2) == 0);
@@ -1367,7 +1429,7 @@ static pdns_zone_t *build_sec(uint8_t kind, const char *master, const db_meta_ro
     return z;
 }
 
-static void sec_digest(const pdns_zone_t *z, uint8_t out[KDB_DIGEST_LEN], uint32_t *serial) {
+static void sec_digest(pdns_zone_t *z, uint8_t out[KDB_DIGEST_LEN], uint32_t *serial) {
     gate_seen_t g = { 0, 0, { 0 }, 1 };
     pdns_kdb_params_t p = { 0, 7, KDB_ZK_PRIMARY, NULL, test_gate, &g, NULL, 0 };
     char err[200];
@@ -1789,8 +1851,8 @@ static void test_ext(void) {
         char why[300];
         CHECK_MSG(pdns_roundtrip(z, &info, why, sizeof(why)), "%s", why);
         CHECK(info.flags == KDB_ZF_EXTENDED);
-        /* 2 SOA + 3 rows + 3 definitions + LOC lan, LOC wan, ECS east + 2 resets */
-        CHECK_MSG(info.rr_count == 13, "rr_count %llu", (unsigned long long)info.rr_count);
+        /* SOA + 3 rows: the tag and location definitions are tables of the zone (attributes of the image), not RRs */
+        CHECK_MSG(info.rr_count == 4 && info.rr_count == z->arena.count, "rr_count %llu", (unsigned long long)info.rr_count);
         pdns_zone_free(z);
     }
     {   /* B8t-1: attributes on the apex SOA (row 1) are read like any other (the B8 interim rejection is gone); B8t-2: the KDB1 stream
@@ -1870,7 +1932,7 @@ static void test_ext(void) {
         pdns_zone_free(z);
         z = build_ext(k_ext_rows, 3, NULL, 0, NULL, 0, td, 3, NULL, 0);       /* attributes without the metadata: still carried */
         CHECK_MSG(pdns_roundtrip(z, &info, why, sizeof(why)), "%s", why);
-        CHECK(info.flags == KDB_ZF_EXTENDED);
+        CHECK(info.flags == (KDB_ZF_EXTENDED | KDB_ZF_TINYDNS));      /* (the image says tinydns for a zone whose RRs carry the attributes, as the Backend found it out of the RRs) */
         pdns_zone_free(z);
     }
     /* rejections: the zone fails, the error names the zone and the row */
@@ -1942,7 +2004,7 @@ static bool has_warning(const pdns_zone_t *z, const char *needle) {
 static void test_limits(void) {
     printf("limits: max-zone-records, list lengths, metadata rows, tinydns definitions, SOA rules\n");
     char text[64];
-    {   /* max-zone-records counts the enabled rows (the SOA is one) and, separately, the RRs of the zone (the SOA counts twice) */
+    {   /* max-zone-records counts the enabled rows (the SOA is one) and, separately, the RRs of the zone (0.7 M3: the SOA counts once, as the image has it; the AXFR counted it twice) */
         pdns_opts_t o;
         memset(&o, 0, sizeof(o));
         o.max_records = 4;
@@ -1951,9 +2013,17 @@ static void test_limits(void) {
             snprintf(text, sizeof(text), "192.0.2.%d", i + 1);
             rows[i] = R(2 + i, "a.z.test", "A", strdup(text), 300, 0);
         }
-        pdns_zone_t *z = build(rows, 3, NULL, 0, &o);        /* 4 rows, 5 RRs */
+        pdns_zone_t *z = build(rows, 3, NULL, 0, &o);        /* 4 rows, 4 RRs: the limit itself is inside it (the image says n_rrs 4, the Backend accepts n_rrs <= 4) */
+        CHECK_MSG(!z->failed, "%s", z->error);
+        {
+            rt_info_t li;
+            char lw[300];
+            CHECK_MSG(pdns_roundtrip(z, &li, lw, sizeof(lw)) && li.rr_count == 4, "%s", lw);
+        }
+        pdns_zone_free(z);
+        z = build(rows, 4, NULL, 0, &o);                     /* 5 rows, 5 RRs: one more than the limit */
         CHECK(z->failed);
-        if (z->failed) CHECK_MSG(strstr(z->error, "more than 4 records") && strstr(z->error, "SOA counts twice"), "%s", z->error);
+        if (z->failed) CHECK_MSG(strstr(z->error, "more than 4 rows (max-zone-records)") != NULL, "%s", z->error);
         pdns_zone_free(z);
         {
             db_record_row_t ent[4];
@@ -1968,7 +2038,7 @@ static void test_limits(void) {
         if (z->failed) CHECK_MSG(strstr(z->error, "more than 4 rows (max-zone-records)") != NULL, "%s", z->error);
         pdns_zone_free(z);
         o.max_records = 6;
-        z = build(rows, 3, NULL, 0, &o);                     /* 4 rows, 5 RRs: inside the limit */
+        z = build(rows, 4, NULL, 0, &o);                     /* 5 rows, 5 RRs: inside the limit */
         CHECK_MSG(!z->failed, "%s", z->error);
         pdns_zone_free(z);
         for (int i = 0; i < 4; i++) free((char *)rows[i].content);
@@ -2249,6 +2319,130 @@ static void test_summary_apex(void) {
     }
 }
 
+/* ------------------------------------------------------------------ 0.7 M3: the loader's zone image against the Backend's, on generated zones
+ *
+ * Every pdns_roundtrip() of this file builds the zone as the image the loader sends, reads it through the stream, validates it as the Backend does and thaws it
+ * (tests/db/pdns_roundtrip.h): the zone files of tests/zones (DNSSEC with NSEC and NSEC3 chains, presigned layouts, wildcards, delegations with glue,
+ * DNAME), the corpus of one RR per type, ALIAS and LUA rules, tinydns and tag zones, SOA sets.  Here the zones are made at random, to reach the shapes that none of those
+ * has: the SOA anywhere among the rows, owners with several RRsets and TTLs in one RRset (harmonized), delegations with and without glue, wildcards below wildcards, empty
+ * non-terminals, long RRsets, names of the case a database may hold, every kind of record in one zone. */
+static uint64_t g_gen_state = 0x9E3779B97F4A7C15ull;
+static uint32_t gen_rand(void) {
+    g_gen_state ^= g_gen_state << 13;
+    g_gen_state ^= g_gen_state >> 7;
+    g_gen_state ^= g_gen_state << 17;
+    return (uint32_t)(g_gen_state >> 16);
+}
+
+#define GEN_MAX_ROWS 80
+typedef struct {
+    db_record_row_t rows[GEN_MAX_ROWS];
+    char names[GEN_MAX_ROWS][80];
+    char contents[GEN_MAX_ROWS][200];
+    size_t n;
+} gen_rows_t;
+
+static void gen_add(gen_rows_t *g, const char *name, const char *type, const char *content, int64_t ttl, int64_t prio) {
+    if (g->n >= GEN_MAX_ROWS) return;
+    size_t i = g->n++;
+    snprintf(g->names[i], sizeof(g->names[i]), "%s", name);
+    snprintf(g->contents[i], sizeof(g->contents[i]), "%s", content ? content : "");
+    g->rows[i] = R((int64_t)(i + 2), g->names[i], type, content ? g->contents[i] : NULL, ttl, prio);
+}
+
+static void gen_owner(char *out, size_t cap, unsigned flavour, unsigned k) {
+    switch (flavour % 6) {
+    case 0: snprintf(out, cap, "o%u.gen.test", k); break;
+    case 1: snprintf(out, cap, "www%u.sub%u.gen.test", k, k % 3); break;
+    case 2: snprintf(out, cap, "*.w%u.gen.test", k % 4); break;
+    case 3: snprintf(out, cap, "x%u.w%u.gen.test", k, k % 4); break;
+    case 4: snprintf(out, cap, "gen.test"); break;                                 /* the apex */
+    default: snprintf(out, cap, "d%u.gen.test", k % 5); break;
+    }
+}
+
+static void gen_zone_rows(gen_rows_t *g) {
+    g->n = 0;
+    unsigned n = 4 + gen_rand() % 40;
+    for (unsigned i = 0; i < n; i++) {
+        char owner[80], content[200];
+        unsigned k = gen_rand() % 9, fl = gen_rand();
+        gen_owner(owner, sizeof(owner), fl, k);
+        int64_t ttl = (int64_t[]){ 60, 300, 300, 300, 3600, 86400 }[gen_rand() % 6];
+        switch (gen_rand() % 22) {
+        case 0: case 1: snprintf(content, sizeof(content), "192.0.2.%u", 1 + gen_rand() % 250); gen_add(g, owner, "A", content, ttl, 0); break;
+        case 2: snprintf(content, sizeof(content), "2001:db8::%x", 1 + gen_rand() % 4000); gen_add(g, owner, "AAAA", content, ttl, 0); break;
+        case 3: snprintf(content, sizeof(content), "ns%u.gen.test", gen_rand() % 6); gen_add(g, owner, "NS", content, ttl, 0); break;
+        case 4: snprintf(content, sizeof(content), "mx%u.gen.test", gen_rand() % 4); gen_add(g, owner, "MX", content, ttl, (int64_t)(gen_rand() % 30)); break;
+        case 5: snprintf(content, sizeof(content), "%u %u srv%u.gen.test", gen_rand() % 5, gen_rand() % 100, gen_rand() % 4); gen_add(g, owner, "SRV", content, ttl, 0 + (int64_t)(gen_rand() % 3)); break;
+        case 6: snprintf(content, sizeof(content), "\"v=%u\"", gen_rand() % 1000); gen_add(g, owner, "TXT", content, ttl, 0); break;
+        case 7: snprintf(content, sizeof(content), "\"a%u\" \"b%u\" \"c\"", gen_rand() % 100, gen_rand() % 100); gen_add(g, owner, "TXT", content, ttl, 0); break;
+        case 8: snprintf(content, sizeof(content), "t%u.gen.test", gen_rand() % 6); { char co[80]; snprintf(co, sizeof(co), "c%u.gen.test", gen_rand() % 9); gen_add(g, co, "CNAME", content, ttl, 0); }; break;
+        case 9: snprintf(content, sizeof(content), "dn%u.other.test", gen_rand() % 3); { char co[80]; snprintf(co, sizeof(co), "dn%u.gen.test", gen_rand() % 4); gen_add(g, co, "DNAME", content, ttl, 0); }; break;
+        case 10: snprintf(content, sizeof(content), "p%u.gen.test", gen_rand() % 6); gen_add(g, owner, "PTR", content, ttl, 0); break;
+        case 11: gen_add(g, owner, "CAA", "0 issue \"ca.example.net\"", ttl, 0); break;
+        case 12: snprintf(content, sizeof(content), "1 1 %040x", gen_rand()); gen_add(g, owner, "SSHFP", content, ttl, 0); break;
+        case 13: snprintf(content, sizeof(content), "3 1 1 %064x", gen_rand()); gen_add(g, owner, "TLSA", content, ttl, 0); break;
+        case 14: snprintf(content, sizeof(content), "%u 8 2 %064x", 1 + gen_rand() % 60000, gen_rand()); gen_add(g, owner, "DS", content, ttl, 0); break;
+        case 15: gen_add(g, owner, "HINFO", "\"x86\" \"unix\"", ttl, 0); break;
+        case 16: gen_add(g, owner, "NAPTR", "100 10 \"u\" \"E2U+sip\" \"!^.*$!sip:info@example.net!\" .", ttl, 0); break;
+        case 17: gen_add(g, owner, NULL, NULL, 0, 0); break;                     /* an empty non-terminal row */
+        case 18: gen_add(g, owner, "TXT", "\"a\\\"b\\\\c\\032d\"", ttl, 0); break;   /* quote, backslash and a decimal escape inside a character-string */
+        case 19: snprintf(content, sizeof(content), "\\# 4 %08x", gen_rand()); gen_add(g, owner, "TYPE65280", content, ttl, 0); break;
+        case 20: gen_add(g, "gen.test", "NS", "ns1.gen.test", ttl, 0); gen_add(g, "ns1.gen.test", "A", "192.0.2.53", ttl, 0); break;
+        default: snprintf(content, sizeof(content), "192.0.2.%u", 1 + gen_rand() % 250); gen_add(g, "ns.d1.gen.test", "A", content, ttl, 0); gen_add(g, "d1.gen.test", "NS", "ns.d1.gen.test", ttl, 0); break;
+        }
+    }
+}
+
+static void test_image_generated(void) {
+    printf("zone images: the loader's image against the Backend's on generated zones\n");
+    unsigned made = 0, failed_zones = 0, with_soa_late = 0, big = 0;
+    gen_rows_t *g = malloc(sizeof(*g));
+    for (unsigned iter = 0; iter < 600 && g; iter++) {
+        gen_zone_rows(g);
+        pdns_zone_t *z = pdns_zone_new("gen.test", NULL);
+        if (!z) { CHECK(!"zone"); break; }
+        /* the SOA row among the others: first, last, or anywhere (the reader keeps the order of the rows; the Backend's stream opens with the SOA) */
+        size_t at = gen_rand() % (g->n + 1);
+        if (at) with_soa_late++;
+        db_record_row_t soa = R(at ? g->rows[at - 1].id : 1, "gen.test", "SOA", "ns1.gen.test hostmaster.gen.test 2024010101 7200 3600 1209600 300", 3600, 0);
+        for (size_t i = 0; i <= g->n; i++) {
+            if (i == at) pdns_zone_add_record(z, &soa);
+            if (i < g->n) pdns_zone_add_record(z, &g->rows[i]);
+        }
+        if (pdns_zone_finish(z) != 0) {                   /* (a CNAME beside other data, a bad row: the reader refuses it, as it should) */
+            failed_zones++;
+            pdns_zone_free(z);
+            continue;
+        }
+        made++;
+        if (z->arena.count > 40) big++;
+        rt_info_t info;
+        char why[400];
+        CHECK_MSG(pdns_roundtrip(z, &info, why, sizeof(why)), "generated zone %u (%zu RRs, SOA at %zu): %s", iter, z->arena.count, at, why);
+        pdns_zone_free(z);
+    }
+    free(g);
+    {   /* RDATA the Backend keeps as octets although the type is decoded to text fields: a NUL in a character-string, more character-strings than the fields hold */
+        char *many = malloc(8192), *p;
+        if (many) {
+            p = many;
+            for (int i = 0; i < 300; i++) p += sprintf(p, "\"s%d\" ", i);
+            db_record_row_t rows[] = { R(2, "many.z.test", "TXT", many, 300, 0), R(3, "nul.z.test", "TXT", "\"a\\000b\"", 300, 0), R(4, "nul.z.test", "TXT", "\"plain\"", 300, 0) };
+            pdns_zone_t *z = build(rows, 3, NULL, 0, NULL);
+            rt_info_t info;
+            char why[400];
+            printf("  TXT with 300 strings and with a NUL: %s\n", z->failed ? z->error : "accepted");
+            if (!z->failed) CHECK_MSG(pdns_roundtrip(z, &info, why, sizeof(why)), "%s", why);
+            pdns_zone_free(z);
+            free(many);
+        }
+    }
+    printf("  %u zones built and compared, %u refused by the reader, the SOA was not the first row in %u, %u of more than 40 RRs\n", made, failed_zones, with_soa_late, big);
+    CHECK(made > 200 && with_soa_late > 100);
+}
+
 int main(int argc, char **argv) {
     if (argc == 3 && strcmp(argv[1], "--gen-corpus") == 0) return gen_corpus(argv[2]);
     if (argc == 2) g_zones_dir = argv[1];
@@ -2264,6 +2458,7 @@ int main(int argc, char **argv) {
     test_isolation();
     test_metadata();
     test_ext();
+    test_image_generated();
     test_limits();
     test_kdb();
     test_secondary();

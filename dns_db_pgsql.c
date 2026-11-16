@@ -1227,6 +1227,14 @@ static int pg_scan_metadata_in(db_conn_t *c, const int64_t *ids, size_t n, db_me
                    pv, ml_row, &l);
 }
 
+static int pg_zones_with_keys_in(db_conn_t *c, const int64_t *ids, size_t n, db_key_cb cb, void *ud) {
+    char arr[IDS_BUF];
+    if (ids_literal(c, ids, n, arr, sizeof(arr)) != 0) return -1;
+    kl_t l = { cb, ud };
+    const char *pv[1] = { arr };
+    return pg_scan(c, "zones_with_keys", "SELECT DISTINCT domain_id FROM cryptokeys WHERE domain_id = ANY ($1::bigint[]) ORDER BY domain_id", 1, pv, kl_row, &l);
+}
+
 static int pg_scan_ext_in(db_conn_t *c, const int64_t *ids, size_t n, const db_ext_sink_t *sink) {
     if (!c->has_ext) {
         set_err(c, "the karidns_record_tags / karidns_record_tinydns / karidns_zone_tagdefs tables do not exist in this database");
@@ -2427,7 +2435,7 @@ const db_driver_t db_driver_postgresql = {
     .schema_findings = pg_schema_findings,      /* B12 */
     .find_zone = pg_find_zone,                  /* B13 */
     .find_zones_in = pg_find_zones_in,          /* 0.7: the lookup of a name */
-    .scan_records_in = pg_scan_records_in, .scan_metadata_in = pg_scan_metadata_in, .scan_ext_in = pg_scan_ext_in,      /* B13b */
+    .scan_records_in = pg_scan_records_in, .scan_metadata_in = pg_scan_metadata_in, .scan_ext_in = pg_scan_ext_in, .zones_with_keys_in = pg_zones_with_keys_in,      /* B13b */
     .scan_apex = pg_scan_apex,                  /* D1a step 6 */
     .count_domains = pg_count_domains, .manifest_page = pg_manifest_page, .current_cursor = pg_current_cursor, .changes_page = pg_changes_page,      /* 0.7 store, WP3 */
     /* M2, the ZoneImporter: write access (open_write connections only) */

@@ -4100,6 +4100,46 @@ int dbreg_commit(const char *view, const char *name, zone_db_entry_t *entry, boo
     return dbreg_commit_x(view, name, entry, created, source_id, serial, digest, shadowed);
 }
 
+/* 0.7 M3: the body of a zone that nobody waits for (the background fetch of the wanted bodies) goes to the store as it is, as an image: no entry, no element of the registry, no change for the
+ * index (the zone is attached from its record when the first query asks for it).  It is what dbreg_commit_store() does with a first fill that is over the limit (its `cold` branch), for every first
+ * fill.  Only a zone that has no version here: one that has a record with a version (the change of a zone: NOTIFY, the entry that is updated in place), is in memory, is hidden by a zone of
+ * karidns.conf or a catalog member, or is pinned (cache-mode 1: it is read into memory) takes the way of an entry.  DBREG_STORE_ONLY: the image is in the store (the record has the zone id *zid);
+ * DBREG_STORE_ENTRY: not changed, the caller makes an entry and commits it as before (also when the store cannot take the zone, and when an entry appeared while the image was written: the
+ * commit then finds this version in the store already); -1: out of memory. */
+bool dbreg_store_only_candidate(const char *view, const char *name, uint32_t serial, zone_ext_shared_t *shared) {
+    const dbdir_ops_t *ops = dbdir();
+    if (!ops || !ops->put_image) return false;
+    if (shared && shared->ext.cache_mode == 1) return false;
+    if (dbreg_config_shadows(view, name)) return false;
+    dbdir_rec_t prev;
+    /* a record that has an image is a version (the zone changes: NOTIFY, the entry that is updated); one that the reconcile made (state KNOWN: no image) is none, whatever serial the manifest said (a plain schema says it) unless the body is another one */
+    if (ops->rec_get(view, name, &prev) && (prev.state == 2 /* STORE_STATE_STORED */ || (prev.serial != 0 && prev.serial != serial))) return false;
+    pthread_mutex_lock(&g_zone_db_rebuild_lock);
+    dbreg_view_t *rv = dbreg_view_get(view, false);
+    dbreg_zone_t *z = rv ? dbreg_find(rv, name, zdir_name_hash(name)) : NULL;
+    const bool resident = z && (zdir_entry(z) != NULL || z->digest != NULL);
+    const bool member = !resident && dbreg_catalog_member_locked(view, name);
+    pthread_mutex_unlock(&g_zone_db_rebuild_lock);
+    return !resident && !member;
+}
+
+int dbreg_commit_store_only(const char *view, const char *name, const zone_image_t *img, int64_t source_id, uint32_t serial, const uint8_t digest[32], zone_ext_shared_t *shared) {
+    const dbdir_ops_t *ops = dbdir();
+    if (!dbreg_store_only_candidate(view, name, serial, shared)) return DBREG_STORE_ENTRY;
+    uint32_t zid = ZREF_NOZID;
+    if (ops->put_image(view, name, img, source_id, serial, digest, ops->settings_id(shared), &zid) != 0) return DBREG_STORE_ENTRY;
+    {
+        pthread_mutex_lock(&g_zone_db_rebuild_lock);
+        dbreg_view_t *rv = dbreg_view_get(view, false);
+        dbreg_zone_t *z = rv ? dbreg_find(rv, name, zdir_name_hash(name)) : NULL;
+        const bool resident = z && zdir_entry(z) != NULL;
+        pthread_mutex_unlock(&g_zone_db_rebuild_lock);
+        if (resident) return DBREG_STORE_ENTRY;       /* (an attach or a fetch made the zone resident from the older record while the image was written) */
+    }
+    if (dbreg_err_forget(view, name)) dbreg_err_sink_clear(zid);
+    return DBREG_STORE_ONLY;
+}
+
 /* A zone of a batch that is not kept in memory because the limit is reached (design 3.3, 8.3): the directory element with the serial, the digest and
  * the settings the loader sent and no data.  The element is queued for the index if it is not in it; the next query for the zone fetches the data.
  * A zone that has data in memory is left as it is (an element that is resident keeps serving: the caller decided on a stale view) and the result is
@@ -5590,7 +5630,8 @@ static void room_take_pass(const cache_cand_t *cand, size_t nc, bool relaxed, ui
 
 /* 0.7 fix 8, hot.list: the zones in the attach table (at most `cap`), each as score << 32 | zone id, where the score is what the cache manager's frequency of the zone is now (aged to the time of this call,
  * with the queries the zone has answered since the manager folded them in), so that a sort puts the most used first.  The registry lock is held for the walk (a zone is seen once, as the sampler sees it);
- * no counter or flag of an element is changed.  Returns how many were collected. */
+ * no counter or flag of an element is changed.  Only the zones that have answered a query since they came into memory are collected (0.7 fix D): a restart that attached every zone the fill had made resident
+ * (1.1 million random zones of 10 million at the first start) read them all again for a list that was meant to be the working set.  Returns how many were collected. */
 size_t dbreg_hot_collect(uint64_t *out, size_t cap) {
     const dbdir_ops_t *ops = dbdir();
     if (!ops || !out) return 0;
@@ -5601,6 +5642,7 @@ size_t dbreg_hot_collect(uint64_t *out, size_t cap) {
     for (zdir_elem_t *z; n < cap && (z = ops->attach_next(&pos)) != NULL;) {
         zone_db_entry_t *e = zdir_entry(z);
         if (!e || e->source != ZONE_SRC_DB || !(z->kind & ZDIR_K_STORED)) continue;
+        if (zone_queries32(e) == 0) continue;                  /* 0.7 fix D: a zone that no query has been answered from since it came into memory is there because the fill, the list or a sibling brought it, not because it is asked for */
         uint32_t f = atomic_load_explicit(&z->freq, memory_order_relaxed);
         const uint32_t steps = (now32 - z->t_age) / CACHE_AGE_MS;
         f = steps >= 32 ? 0 : f >> steps;

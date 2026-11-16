@@ -7688,19 +7688,17 @@ static void test_b8t2_receiver_soa_set(void) {
         zone_arena_destroy(&a);
     }
 
-    /* SETTINGS: ignored for a version 2 stream and for a stream that was not negotiated; a second one is ignored; the database
-     * loader may not send one */
-    for (int k = 0; k < 4; k++) {
+    /* SETTINGS: ignored for a version 2 stream and for a stream that was not negotiated; a second one is ignored (the settings of a
+     * database zone come with the ZONE_BEGIN of its image, not in a SETTINGS record) */
+    for (int k = 0; k < 3; k++) {
         zone_arena_init(&a);
         b8_session(&s, k == 0 ? 2 : k == 1 ? 0 : 3);
-        s.db_stream = k == 3;
         b8_init(&p);
         b8_soa(&p, z, 7, 3600);
         b8_rr(&p, z, 65408, 65302, (const uint8_t *)txt, strlen(txt));
         if (k == 2) b8_rr(&p, z, 65408, 65302, (const uint8_t *)"zone-udp-bufsize 512;", 21);
         int rc = b8_feed(&s, &a, &p, z);
-        if (k == 3) assert(rc != 0);
-        else if (k == 1) assert(rc != 0 && !s.has_settings);      /* L2: a record of class 65302 in a stream that was not negotiated refuses the transfer (it was ignored) */
+        if (k == 1) assert(rc != 0 && !s.has_settings);      /* L2: a record of class 65302 in a stream that was not negotiated refuses the transfer (it was ignored) */
         else assert(rc == 0 && s.has_settings == (k == 2) && (k != 2 || strcmp(s.settings_text, txt) == 0));
         zone_arena_destroy(&a);
     }
@@ -8254,14 +8252,13 @@ static size_t sr_tagdef(uint8_t *p, size_t cap, size_t off, bool ecs, int idx, i
 static void test_sr_i3_tagdef_limits(void) {
     printf("[TEST] AXFR/IXFR: I3 LOC_TAGDEF / ECS_TAGDEF: at most 4096 definitions and 65536 CIDRs, arrays grow geometrically...\n");
     static uint8_t pkt[70000];
-    for (int mode = 0; mode < 4; mode++) {     /* loc, ecs, loc on the loader's stream, ecs on the loader's stream */
+    for (int mode = 0; mode < 2; mode++) {     /* loc, ecs */
         bool ecs = mode & 1;
         zone_arena_t standby;
         zone_arena_init(&standby);
         axfr_session_t s;
         memset(&s, 0, sizeof(s));
-        s.db_stream = mode >= 2;
-        s.is_extended_mode = !s.db_stream;      /* (the network transfer negotiated the extension; L2) */
+        s.is_extended_mode = true;              /* (the network transfer negotiated the extension; L2) */
         int rc = 0, n = 0;
         while (rc == 0 && n < 4200) {
             size_t off = sr_hdr(pkt, 1, 0, 100);
@@ -8288,13 +8285,12 @@ static void test_sr_i3_tagdef_limits(void) {
         assert(standby.bind_location_tag_count == 9 && s.loc_tagdef_cap == 16);
         zone_arena_destroy(&standby);
     }
-    for (int mode = 0; mode < 2; mode++) {     /* the CIDRs of all the definitions together */
+    {                                          /* the CIDRs of all the definitions together */
         zone_arena_t standby;
         zone_arena_init(&standby);
         axfr_session_t s;
         memset(&s, 0, sizeof(s));
-        s.db_stream = mode == 1;
-        s.is_extended_mode = !s.db_stream;
+        s.is_extended_mode = true;
         int rc = 0, n = 0;
         while (rc == 0 && n < 30) {
             size_t off = sr_hdr(pkt, 1, 0, 1);
@@ -8727,13 +8723,6 @@ static void test_low_l2_trailing_rrs(void) {
     assert(s.is_finished && s.trailing_rrs);
     zone_arena_destroy(&standby);
 
-    /* the same for the database loader's stream (db_stream) */
-    zone_arena_init(&standby);
-    memset(&s, 0, sizeof(s));
-    s.db_stream = true;
-    assert(parse_xfr_packet(p, off, &standby, NULL, &s, "example.com.") == -1 && s.trailing_rrs);
-    zone_arena_destroy(&standby);
-
     /* an IXFR: new SOA, old SOA (our version), [deletions], new SOA, [additions], new SOA -- and one RR after the last */
     zone_arena_t active;
     zone_arena_init(&active);
@@ -8767,17 +8756,16 @@ static void test_low_l2_trailing_rrs(void) {
 }
 
 static void test_low_l2_ext_class_needs_negotiation(void) {
-    printf("[TEST] AXFR/IXFR: L2 class 65302 records are taken only in extended mode (or from the database loader)...\n");
+    printf("[TEST] AXFR/IXFR: L2 class 65302 records are taken only in extended mode...\n");
     uint8_t p[1500];
     size_t off;
     zone_arena_t standby;
     axfr_session_t s;
     static const uint8_t tag[3] = { 't', 'a', 'g' };
-    for (int mode = 0; mode < 3; mode++) {
+    for (int mode = 0; mode < 2; mode++) {
         zone_arena_init(&standby);
         memset(&s, 0, sizeof(s));
         s.is_extended_mode = mode == 1;
-        s.db_stream = mode == 2;
         off = l2_hdr(p, sizeof(p), "example.com.", 252, 3);
         off = l2_soa(p, sizeof(p), off, "example.com.", "example.com.", 200);
         off += (size_t)write_uncompressed_name(p, off, sizeof(p), "example.com.");

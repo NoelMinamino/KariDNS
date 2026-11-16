@@ -238,7 +238,7 @@ case $OS in
     *) HARDEN_LDFLAGS="-pie -Wl,-z,relro,-z,now -Wl,-z,noexecstack" ;;
 esac
 case $OS in
-    MINGW*|MSYS*|CYGWIN*) WIN_LDFLAGS="-static -lws2_32 -liphlpapi -lcrypt32" ;;
+    MINGW*|MSYS*|CYGWIN*) WIN_LDFLAGS="-static -lws2_32 -liphlpapi -lcrypt32 -lbcrypt" ;;
     *) WIN_LDFLAGS="" ;;
 esac
 VERSION_FILE=`{ tr -d ' \r\n' < VERSION; } 2>/dev/null || echo dev`
