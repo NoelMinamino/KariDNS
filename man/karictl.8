@@ -893,6 +893,24 @@ read) because the lookup found no room in the worker's park table, its
 dropped the lookup (its queue was full, or it waited there until its time was
 up); and queries answered SERVFAIL + EDE 14 because their lookup failed
 .TP 8
+\fBstore.lookup.remembered\fR, \fB.reask_suppressed\fR, \fB.remember_releases\fR
+0.7: names whose lookup the ingest thread shed (its queue was full, they waited
+there until \fBpark\-timeout\fR, or the loader said it was busy) and put in the
+table of the shed names; queries for such a name that their worker dropped at
+once, with no request, because the request would be shed again (also a drop,
+like \fB.drop.*\fR); times the names were forgotten before their time because
+the ingest thread had caught up (its queue was empty and a place free; at most
+eight times in a \fBpark\-timeout\fR). A name is remembered for
+\fBpark\-timeout\fR
+.TP 8
+\fBstore.lookup.drain.passes\fR, \fB.drain.cut\fR, \fB.drain.pass_max\fR, \fB.drain.pass_max_us\fR
+The passes of the ingest thread over the workers' rings and queues that handled
+a request (a pass runs about 1 ms and then serves the loader's answers); how
+many ended at that time slice with work left; the most requests one pass handled
+and the longest one ran (microseconds), since the start. A \fBpass_max\fR of a
+few thousand with \fBstore.lookup.take_fail\fR and \fBdrop.room\fR still rising
+means the thread does not keep up
+.TP 8
 \fBstore.park.drop.room\fR, \fB.drop.timeout\fR, \fB.drop.queue\fR
 The same for a query that waits for a zone that is out of memory: the park table
 was full (\fBpark\-max\fR), its \fBpark\-timeout\fR was up before the zone was

@@ -130,6 +130,10 @@ typedef struct store_lookup {
   /* the queries that were dropped (overload: not answered, counted, like a query that RRL drops) and the ones answered "not ready": per lookup by why (no room in the park table, its time was up, the ingest thread's queue was full or it waited
    * there until its time was up), the lookups that failed (SERVFAIL + EDE 14), and the same drops for a query that waits for a zone that is out of memory */
   uint64_t drop_lk_room, drop_lk_timeout, drop_lk_queue, servfail, drop_zone_room, drop_zone_timeout, drop_zone_queue;
+  /* remembered: names whose lookup was shed that were put in the table of the shed names (park_shed_remember()); reask_suppressed: queries for such a name that their worker dropped without a request (also a drop,
+   * PARK_CNT_LK_REMEMBERED); remember_releases: times the names were forgotten at once because the ingest thread had caught up.  drain_*: the passes of the ingest thread over the workers' rings and queues
+   * (fetch_issue()) that handled a request: how many, how many ended at the time slice with work left, the most requests one handled, the longest one ran (ns); since the start */
+  uint64_t remembered, reask_suppressed, remember_releases, drain_passes, drain_cut, drain_pass_max, drain_pass_max_ns;
   uint64_t hist[STORE_STATUS_HIST_BUCKETS];
   uint64_t max_ns;
 } store_lookup_t;

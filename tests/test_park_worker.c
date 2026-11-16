@@ -568,6 +568,28 @@ int main(void) {
         park_service(&w, -1);
         a = read_answer(sk[1]);
         CHECK(a.got && a.id == 0x7102 && a.rcode == 2 && a.ancount == 0 && a.ede == 14 && table.nwait == 0 && table.nlook == 0 && park_cnt_get(PARK_CNT_LK_SERVFAIL) == 1);        /* (a failed lookup: SERVFAIL + EDE 14, as for a zone whose fetch failed) */
+        /* the ingest thread shed the lookup of the name lately and remembers it (park_shed_remember()): a query for it is dropped at once with no request, counted; when the names are released (the ingest thread has caught
+         * up) the next query asks again.  A name that is not remembered is asked for as before. */
+        {
+            struct timespec tn;
+            clock_gettime(CLOCK_MONOTONIC, &tn);
+            const int64_t t_ms = (int64_t)tn.tv_sec * 1000 + tn.tv_nsec / 1000000;
+            const uint64_t rk0 = park_cnt_get(PARK_CNT_LK_REMEMBERED);
+            park_shed_set_ttl(60000);
+            park_shed_remember(park_lookup_claim_key("default", "www.late.test."), t_ms);
+            SEND_LK(0x7140);
+            CHECK(w.n_tx == 0 && table.nwait == 0 && table.nlook == 0 && !park_fetch_pop(park_fetch_ring(0), &q) && !read_answer(sk[1]).got && park_cnt_get(PARK_CNT_LK_REMEMBERED) == rk0 + 1);
+            clock_gettime(CLOCK_MONOTONIC, &tn);                                                  /* (released: the next query for the name parks and asks) */
+            park_shed_release((int64_t)tn.tv_sec * 1000 + tn.tv_nsec / 1000000);
+            SEND_LK(0x7141);
+            CHECK(w.n_tx == 0 && table.nwait == 1 && table.nlook == 1 && park_fetch_pop(park_fetch_ring(0), &q) && strcmp(q.zone, "www.late.test.") == 0 && q.mode == KDB_FETCH_LOOKUP &&
+                  park_cnt_get(PARK_CNT_LK_REMEMBERED) == rk0 + 1);
+            CHECK(park_wake_push(park_wake_ring(0), "default", "www.late.test.", false));
+            park_service(&w, -1);
+            a = read_answer(sk[1]);
+            CHECK(a.got && a.id == 0x7141 && a.rcode == 5 && table.nwait == 0 && table.nlook == 0);
+            park_shed_set_ttl(0);
+        }
         /* the time is up: the answer of a query that has waited the park-timeout; and a wake of every query after the deadline does not park it again */
         w.park_timeout_ms = 5;
         const uint64_t lt0 = park_cnt_get(PARK_CNT_LK_TIMEOUT);

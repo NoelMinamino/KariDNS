@@ -4873,30 +4873,51 @@ and a lookup that is answered "none" gives its place back at once), the queue of
 its queries as \fBstore.lookup.drop.queue\fR), and every wait by
 \fBpark\-timeout\fR (a query whose lookup was not answered in time is dropped,
 \fBstore.lookup.drop.timeout\fR; so is one whose lookup waited in the queue
-until its time was up, \fBexpired\fR).  What is answered: REFUSED for a name
-that the loader said no zone has (and for every unknown name once the pass has
-ended), and SERVFAIL + EDE 14 when the lookup failed (a database error, no
-answer of the loader, an answer that cannot be believed:
-\fBstore.lookup.servfail\fR), as for the fetch of a zone that fails.  Overload
-is never answered REFUSED or SERVFAIL for a name whose zone the database may
-have, for the queries that wait for a zone that is out of memory either
-(\fBstore.park.drop.*\fR).  With a loader that has \fBKDB_FEAT_LOOKUP_BODY\fR
-(karidns-dbloader(8), "THE STORE PROTOCOL") the answer of a lookup comes with
-the body of the zone it found, so that the query is answered after one round
-trip, not after a lookup and a second request for the zone
-(\fBbody_inline\fR).  The cost to the database is one indexed statement for each
-name (SQLite3: the name and its parents with the case ignored; PostgreSQL: the
-exact lower case spelling, which is what the PowerDNS schema stores; a zone
-stored with capitals is found by the pass, not by a lookup).  \fBkarictl
-dbstatus\fR has a line \fBlookup of names ...\fR with \fBasked\fR, \fBfound\fR,
-\fBnone\fR, \fBfailed\fR, \fBrefused\fR (by the ingest thread), \fBsame_name\fR,
-\fBin_flight\fR, \fBpending\fR (waiting for a place), \fBbody_inline\fR (zones
-that came with the answer), \fBtake_fail\fR, \fBcovered\fR (the zone was known
-by the time the name was to go), \fBshed\fR, \fBexpired\fR, \fBdrop_room\fR,
-\fBdrop_timeout\fR, \fBdrop_queue\fR, \fBservfail\fR, \fBzone_drop_room\fR,
-\fBzone_drop_timeout\fR, \fBzone_drop_queue\fR (the queries that were dropped,
-by why), \fBbad_body\fR and the time to the answer (\fBrtt_p50_us\fR,
-\fBrtt_p99_us\fR); \fBkarictl store\fR has the same as
+until its time was up, \fBexpired\fR). A name whose lookup was shed (the queue
+was full, it expired there, or the loader said it was busy) is \fBremembered\fR
+for \fBpark\-timeout\fR, in a table of 262,144 slots (2 MB of address space,
+touched as names are remembered) that the ingest thread writes and every worker
+reads without a lock: a query for a remembered name is dropped by its worker at
+once and asks nothing (\fBstore.lookup.reask_suppressed\fR; it is a drop, like
+the others), because the request would be shed again while the ingest thread is
+behind and the asks only fill the rings.  The names are forgotten early when the
+ingest thread has caught up (its queue is empty and a place is free; at most
+eight times in a \fBpark\-timeout\fR, \fBstore.lookup.remember_releases\fR), so
+that they are asked again as soon as there is room; a name that finds its window
+of eight slots full takes the place of the
+oldest.  \fBstore.lookup.remembered\fR counts the names put in the table.  The
+ingest thread takes the requests out of the workers' rings by a time slice of
+about 1 ms for each pass (it was 64 requests, which a loop that passes a few
+hundred times a second cannot keep up with at 400,000 queries a second);
+\fBstore.lookup.drain.passes\fR, \fB.drain.cut\fR (passes that ended at the
+slice with work left), \fB.drain.pass_max\fR and \fB.drain.pass_max_us\fR (the
+most requests, and the longest time, of one pass since the start) show it.  What
+is answered: REFUSED for a name that the loader said no zone has (and for every
+unknown name once the pass has ended), and SERVFAIL + EDE 14 when the lookup
+failed (a database error, no answer of the loader, an answer that cannot be
+believed: \fBstore.lookup.servfail\fR), as for the fetch of a zone that
+fails.  Overload is never answered REFUSED or SERVFAIL for a name whose zone the
+database may have, for the queries that wait for a zone that is out of memory
+either (\fBstore.park.drop.*\fR).  With a loader that has
+\fBKDB_FEAT_LOOKUP_BODY\fR (karidns-dbloader(8), "THE STORE PROTOCOL") the
+answer of a lookup comes with the body of the zone it found, so that the query
+is answered after one round trip, not after a lookup and a second request for
+the zone (\fBbody_inline\fR).  The cost to the database is one indexed statement
+for each name (SQLite3: the name and its parents with the case ignored;
+PostgreSQL: the exact lower case spelling, which is what the PowerDNS schema
+stores; a zone stored with capitals is found by the pass, not by a
+lookup).  \fBkarictl dbstatus\fR has a line \fBlookup of names ...\fR with
+\fBasked\fR, \fBfound\fR, \fBnone\fR, \fBfailed\fR, \fBrefused\fR (by the ingest
+thread), \fBsame_name\fR, \fBin_flight\fR, \fBpending\fR (waiting for a place),
+\fBbody_inline\fR (zones that came with the answer), \fBtake_fail\fR,
+\fBcovered\fR (the zone was known by the time the name was to go), \fBshed\fR,
+\fBexpired\fR, \fBdrop_room\fR, \fBdrop_timeout\fR, \fBdrop_queue\fR,
+\fBservfail\fR, \fBzone_drop_room\fR, \fBzone_drop_timeout\fR,
+\fBzone_drop_queue\fR (the queries that were dropped, by why), \fBremembered\fR,
+\fBreask_suppressed\fR, \fBremember_releases\fR, \fBdrain_passes\fR,
+\fBdrain_cut\fR, \fBdrain_pass_max\fR, \fBdrain_pass_max_us\fR (the shed names
+and the passes over the rings, above), \fBbad_body\fR and the time to the answer
+(\fBrtt_p50_us\fR, \fBrtt_p99_us\fR); \fBkarictl store\fR has the same as
 \fBstore.lookup.*\fR. \fBwarm\-before\-serve <s>\fR holds the queries (the
 sockets stay unread, the kernel queues what comes) until the first pass has
 ended, as well as until the hot list of the loader is read, for at most that

@@ -1547,7 +1547,8 @@ static void set_fetch_limits(const ing_cfg_t *c) {
   uint32_t rate = c->fetch_rate;                /* (0.7 P-A: 0 = unlimited) */
   atomic_store_explicit(&g_fetch_rate, rate, memory_order_relaxed);
   atomic_store_explicit(&g_park_timeout_ms, c->park_timeout_ms ? c->park_timeout_ms : PARK_DEFAULT_TIMEOUT_MS, memory_order_relaxed);
-  park_rate_set(rate);                       /* the bucket of this thread (dns_park.c; 0: no rate, no bucket) */
+  park_shed_set_ttl(c->park_timeout_ms ? c->park_timeout_ms : PARK_DEFAULT_TIMEOUT_MS);       /* (the names whose lookup was shed are remembered for as long as the queries wait: shed_remember()) */
+  park_rate_set(rate);                      /* the bucket of this thread (dns_park.c; 0: no rate, no bucket) */
 }
 /* the zones nobody asked for yet (the warm-up, the walk for apexes) use at most this many places of the limit or `cap`, half the limit at the most, so that the queries have the rest */
 static uint32_t fetch_sub_limit(uint32_t cap) {
@@ -1602,7 +1603,10 @@ static _Atomic bool g_lookup_on;
 static _Atomic bool g_lookup_hold;                         /* the last loader that said its HELLO looks names up, connected now or not: while its pass is pending a query for a name no zone covers waits for the loader's return (it is dropped at its time-out), it is not refused (0.7) */
 static _Atomic uint64_t g_lk_found, g_lk_none, g_lk_failed, g_lk_refused, g_lk_dup;
 static _Atomic uint64_t g_lk_asked, g_lk_body, g_lk_covered, g_lk_shed, g_lk_expired, g_lk_bad, g_lk_max_ns;     /* requests of the workers taken; bodies that came with the answer and were taken; names whose zone was known by the time they were to go; requests dropped because the queue was full; queue entries whose time was up; bodies that were thrown away; the longest time to an answer */
-static _Atomic uint32_t g_lk_pending, g_lk_inflight, g_lk_peak;      /* waiting for a place now, out now (the lookups and the fetches that came of them), the most that waited */
+static _Atomic uint32_t g_fp_max_n;                        /* the most requests one pass of fetch_issue() handled, since the start */
+static _Atomic uint64_t g_fp_max_ns;                       /* the longest one pass of fetch_issue() ran (and handled something), since the start */
+static _Atomic uint64_t g_fp_passes, g_fp_cut;             /* the passes that handled something, and those that ended at their bound (the time slice) with work left */
+static _Atomic uint32_t g_lk_pending, g_lk_inflight, g_lk_peak;     /* waiting for a place now, out now (the lookups and the fetches that came of them), the most that waited */
 static _Atomic uint64_t g_lk_hist[STORE_STATUS_HIST_BUCKETS];       /* the time from the request to the answer: <= 1 us, <= 2 us, ... (dns_store_status.h) */
 /* tests (always compiled: the coverage of the test programs and of karidns merges): a smaller bound of the lookup queue and of the wait queue than ING_LQ_MAX / ING_WQ_MAX (0: the constants), so that a full queue can be made with a few requests */
 _Atomic uint32_t db_ingest_test_lq_max, db_ingest_test_wq_max;
@@ -1649,6 +1653,13 @@ bool db_ingest_lookup_stats(store_lookup_t *out) {
   out->drop_zone_room = park_cnt_get(PARK_CNT_ZONE_ROOM);
   out->drop_zone_timeout = park_cnt_get(PARK_CNT_ZONE_TIMEOUT);
   out->drop_zone_queue = park_cnt_get(PARK_CNT_ZONE_QUEUE);
+  out->remembered = park_shed_remembered();
+  out->reask_suppressed = park_cnt_get(PARK_CNT_LK_REMEMBERED);
+  out->remember_releases = park_shed_releases();
+  out->drain_passes = atomic_load_explicit(&g_fp_passes, memory_order_relaxed);
+  out->drain_cut = atomic_load_explicit(&g_fp_cut, memory_order_relaxed);
+  out->drain_pass_max = atomic_load_explicit(&g_fp_max_n, memory_order_relaxed);
+  out->drain_pass_max_ns = atomic_load_explicit(&g_fp_max_ns, memory_order_relaxed);
   out->max_ns = atomic_load_explicit(&g_lk_max_ns, memory_order_relaxed);
   for (int i = 0; i < STORE_STATUS_HIST_BUCKETS; i++) out->hist[i] = atomic_load_explicit(&g_lk_hist[i], memory_order_relaxed);
   return true;
@@ -3632,11 +3643,33 @@ static void lookup_hist(int64_t ns) {
   if (ns > 0 && (uint64_t)ns > atomic_load_explicit(&g_lk_max_ns, memory_order_relaxed)) atomic_store_explicit(&g_lk_max_ns, (uint64_t)ns, memory_order_relaxed);
 }
 
+/* The names whose lookup was shed are remembered (park_shed_remember(), dns_park.h): a query for such a name is dropped by its worker with no request, for park-timeout or until this thread has caught up
+ * (shed_release_check()).  Only this thread calls these (the statics need no atomics); the counters are the park table's. */
+static int64_t s_shed_last_ms;                           /* when a name was remembered last (the loop looks for the catch-up while the entries could still be live) */
+static int64_t s_shed_rel_ms;                            /* ... and when the names were released last */
+static void shed_remember(uint64_t ckey) {
+  if (!ckey) return;
+  s_shed_last_ms = now_ms();
+  park_shed_remember(ckey, s_shed_last_ms);
+}
+
+/* The queue is empty and a lookup could be made: this thread has caught up, so the names that were remembered are asked again by the next query (at most once in an eighth of park-timeout: a thread that is
+ * on and off the edge of its queue would otherwise forget the names at every pass). */
+static void shed_release_check(const ing_t *g) {
+  if (s_shed_last_ms <= s_shed_rel_ms || g->nlq != 0 || !lookup_ready(g)) return;      /* (nothing was remembered since the last release, or not caught up) */
+  const int64_t now = now_ms();
+  const int64_t gap = (int64_t)atomic_load_explicit(&g_park_timeout_ms, memory_order_relaxed) / 8;
+  if (now - s_shed_rel_ms < (gap > 10 ? gap : 10)) return;
+  s_shed_rel_ms = now;
+  park_shed_release(now);
+}
+
 /* the lookup's own end (the answer is none, it failed, it was read through): the queries that wait for the name look it up again.  The place and the claim mark went back in fetch_complete(). */
 static void lookup_complete(const ing_freq_t *done, bool ok, const char *why) {
   const bool shed = !ok && done->busy;                   /* (the loader said it is busy: overload, the queries are dropped, not failed) */
   if (shed) {
     atomic_fetch_add_explicit(&g_lk_shed, 1, memory_order_relaxed);
+    shed_remember(done->ckey);                           /* (before the workers are told: a query that comes after their drop finds the name remembered) */
     logev_post(LOGC_DATABASE, 2, NULL, 0, "[DB] lookup of the name '%s' (view '%s') shed: the loader is busy; its queries are dropped", done->lk_q, done->view_name);
   } else if (!ok) {
     atomic_fetch_add_explicit(&g_lk_failed, 1, memory_order_relaxed);
@@ -3655,8 +3688,9 @@ static void lookup_drop(const park_fetch_req_t *q, uint64_t ckey) {
 
 /* a lookup that is dropped because the ingest thread is overloaded (its queue is full, or it waited until its time was up), or because the loader that would answer it is away: the queries that wait for the name are
  * dropped (counted at their workers), not answered REFUSED or SERVFAIL for a name whose zone the database may have.  Only the workers that asked are told (park_wake_queue_claim()): a flood of shed lookups
- * must not fill the wake ring of every worker. */
+ * must not fill the wake ring of every worker.  The name is remembered first (shed_remember()): the next query for it is dropped by its worker, it does not ask again for a request that would be shed again. */
 static void lookup_shed(const park_fetch_req_t *q, uint64_t ckey) {
+  shed_remember(ckey);
   park_wake_queue_claim(q->view, q->zone, ckey, false, PARK_ASK_DROP);
   if (ckey) park_claim_clear(ckey);
 }
@@ -4051,11 +4085,13 @@ static int warm_hot_gate(ing_t *g) {
   return park_rate_check(now_ms(), true) ? 1 : 0;        /* the bucket is at least half full (and has a token): the queries come first */
 }
 
-/* B2 W5: one pass of fetch_issue() handles at most this many requests, or runs about this long, and then the main loop serves the streams (the loader's answers, the
+/* B2 W5: one pass of fetch_issue() runs about ING_FETCH_SLICE_NS (a time slice, checked every eighth request) and then the main loop serves the streams (the loader's answers, the
  * installs, the delta) before it comes back: a flood of requests cannot keep the thread in here.  (At 200k queries a second for zones out of memory one pass ran 4 to
  * 130 ms, 97% of the thread, and the FETCH_REQs of the whole pass were written at its end: a fetch took 10 to 100 ms to start and the loader's answers waited for the
- * next pass.)  The FETCH_REQs made in a pass are written when it ends, so a request leaves at most about ING_FETCH_SLICE_NS after it was made. */
-#define ING_FETCH_SLICE_N 64
+ * next pass.)  The FETCH_REQs made in a pass are written when it ends, so a request leaves at most about ING_FETCH_SLICE_NS after it was made.
+ * 0.7: the pass was also cut at 64 requests, and a lookup of a name costs a few microseconds: a loop that passes 200 times a second (it waits for the store between two passes) drained 13000 requests a second from
+ * rings that fill at 400000 a second (the workers' rings of PARK_FETCH_RING requests were full: take_fail, drop.room).  The count is a limit only against a clock that does not advance. */
+#define ING_FETCH_SLICE_N 4096
 #define ING_FETCH_SLICE_NS 1000000LL
 
 /* A request that is being handled may hold a place of the pool of fetch-concurrency (park_place_take(): this thread takes it below, nobody else does) and a
@@ -4488,6 +4524,16 @@ static void fetch_issue(ing_t *g) {
     if (!fetch_send_req(g, r)) fetch_complete(g, r, false, "the loader's fetch stream is not connected");
   }
   fetch_release(&hold_place, &hold_tok, &hold_key);
+  {                                                      /* the pass, for store.lookup.drain_* (a pass that handled nothing is not counted) */
+    const uint32_t n = handled > 1 ? (uint32_t)(handled - 1) : 0;      /* (the count is one ahead at the end: it was raised to look at the next request) */
+    if (n > 0) {
+      const uint64_t ns = (uint64_t)(mono_ns() - t0);
+      atomic_fetch_add_explicit(&g_fp_passes, 1, memory_order_relaxed);
+      if (g->fmore) atomic_fetch_add_explicit(&g_fp_cut, 1, memory_order_relaxed);
+      if (n > atomic_load_explicit(&g_fp_max_n, memory_order_relaxed)) atomic_store_explicit(&g_fp_max_n, n, memory_order_relaxed);
+      if (ns > atomic_load_explicit(&g_fp_max_ns, memory_order_relaxed)) atomic_store_explicit(&g_fp_max_ns, ns, memory_order_relaxed);
+    }
+  }
   if (g->fetch_fd >= 0 && g->fout_off < g->fout_len) fetch_flush(g);      /* (the requests of the pass go out now) */
   wake_flush(g);
 }
@@ -5009,6 +5055,8 @@ static void *ingest_thread(void *arg) {
     if ((g->nwarm > 0 || (g->apex_walk && g->fetch_fd >= 0)) && (wait_ms < 0 || wait_ms > 50)) wait_ms = 50;      /* zones to read before a query asks, or the walk for apexes (while there is a fetch stream): try again soon */
     if (g->bg_on && g->fetch_fd >= 0 && (wait_ms < 0 || wait_ms > 50)) wait_ms = 50;           /* 0.7 WP7b: the bodies the reconcile wants are being asked for: look again soon (a pause after a failed round, a free place) */
     if ((g->nwq > 0 || g->nlq > 0) && (wait_ms < 0 || wait_ms > ING_WQ_TICK_MS)) wait_ms = ING_WQ_TICK_MS;     /* 0.7 P-B: requests wait (for the bucket, room, a place): look again, and at their deadlines */
+    if (s_shed_last_ms > s_shed_rel_ms && now_ms() < s_shed_last_ms + (int64_t)atomic_load_explicit(&g_park_timeout_ms, memory_order_relaxed) && (wait_ms < 0 || wait_ms > ING_WQ_TICK_MS))
+      wait_ms = ING_WQ_TICK_MS;                          /* 0.7: names are remembered as shed: look again soon, to forget them when this thread has caught up (shed_release_check()) */
     if (g->hold && (wait_ms < 0 || wait_ms > 50)) wait_ms = 50;           /* warm-before-serve: look at the warm-up and the time often */
     if (wait_ms < 0 || wait_ms > 10000) wait_ms = 10000;                  /* (the busy share of dbstatus is closed at the end of a window, so the thread wakes at least that often) */
     if (g->sresume || g->fresume) wait_ms = 0;                            /* 0.7 fix 8: frames are left in a framer, the requests of the queries were served first */
@@ -5070,6 +5118,7 @@ static void *ingest_thread(void *arg) {
     if (g->need_cleanup) cleanup_stream_state(g);
     maybe_apply_delta(g);
     if (g->nwarm > 0 || g->fmore || g->nwq > 0 || g->nlq > 0 || g->bg_on || park_fetch_pending()) fetch_issue(g);
+    shed_release_check(g);
     apex_walk_step(g);
     fetch_expire(g);
     wake_flush(g);
@@ -5636,11 +5685,13 @@ size_t db_ingest_status(const char *zone, const char *view, char *out, size_t ca
     {
       store_lookup_t lk;
       db_ingest_lookup_stats(&lk);
-      st_append(&c, "lookup of names while the first pass has not listed every zone: ready=%s in_flight=%u pending=%u asked=%llu found=%llu none=%llu failed=%llu refused=%llu same_name=%llu body_inline=%llu take_fail=%llu covered=%llu shed=%llu expired=%llu drop_room=%llu drop_timeout=%llu drop_queue=%llu servfail=%llu zone_drop_room=%llu zone_drop_timeout=%llu zone_drop_queue=%llu bad_body=%llu rtt_p50_us=%llu rtt_p99_us=%llu\n",
+      st_append(&c, "lookup of names while the first pass has not listed every zone: ready=%s in_flight=%u pending=%u asked=%llu found=%llu none=%llu failed=%llu refused=%llu same_name=%llu body_inline=%llu take_fail=%llu covered=%llu shed=%llu expired=%llu drop_room=%llu drop_timeout=%llu drop_queue=%llu servfail=%llu zone_drop_room=%llu zone_drop_timeout=%llu zone_drop_queue=%llu bad_body=%llu rtt_p50_us=%llu rtt_p99_us=%llu remembered=%llu reask_suppressed=%llu remember_releases=%llu drain_passes=%llu drain_cut=%llu drain_pass_max=%u drain_pass_max_us=%llu\n",
                 lk.ready ? "yes" : "no", (unsigned)lk.in_flight, (unsigned)lk.pending, (unsigned long long)lk.asked, (unsigned long long)lk.found, (unsigned long long)lk.none, (unsigned long long)lk.failed,
                 (unsigned long long)lk.refused, (unsigned long long)lk.same_name, (unsigned long long)lk.body_inline, (unsigned long long)lk.take_fail, (unsigned long long)lk.covered, (unsigned long long)lk.shed,
                 (unsigned long long)lk.expired, (unsigned long long)lk.drop_lk_room, (unsigned long long)lk.drop_lk_timeout, (unsigned long long)lk.drop_lk_queue, (unsigned long long)lk.servfail,
-                (unsigned long long)lk.drop_zone_room, (unsigned long long)lk.drop_zone_timeout, (unsigned long long)lk.drop_zone_queue, (unsigned long long)lk.bad_body, (unsigned long long)store_status_hist_pct(lk.hist, 50, lk.max_ns), (unsigned long long)store_status_hist_pct(lk.hist, 99, lk.max_ns));
+                (unsigned long long)lk.drop_zone_room, (unsigned long long)lk.drop_zone_timeout, (unsigned long long)lk.drop_zone_queue, (unsigned long long)lk.bad_body, (unsigned long long)store_status_hist_pct(lk.hist, 50, lk.max_ns), (unsigned long long)store_status_hist_pct(lk.hist, 99, lk.max_ns),
+                (unsigned long long)lk.remembered, (unsigned long long)lk.reask_suppressed, (unsigned long long)lk.remember_releases, (unsigned long long)lk.drain_passes, (unsigned long long)lk.drain_cut,
+                (unsigned)lk.drain_pass_max, (unsigned long long)((lk.drain_pass_max_ns + 999) / 1000));
     }
     dbreg_cache_stats_t cs;
     dbreg_cache_stats(&cs);

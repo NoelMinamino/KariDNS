@@ -1471,7 +1471,55 @@ static void test_end_and_counters(void) {
   park_unregister_worker(12);
 }
 
-/* 0.7, PARK_PEND_LOOKUP: the request of a lookup that a full ring refused stays with the entry that waits; when that entry goes first (time, release) the entry for the same name that waits too takes it over;
+/* 0.7: the names whose lookup was shed are remembered (park_shed_*): held for the ttl, renewed by a second shed, forgotten by a release, a full window gives its oldest entry up, a ttl of 0 remembers nothing,
+ * a stamp a little ahead of the reader's clock is not stale, a stamp that is far off is */
+static void test_shed_names(void) {
+  printf("[the shed names]\n");
+  const uint64_t n0 = park_shed_remembered(), r0 = park_shed_releases();
+  const int64_t T = 100000;
+  const uint64_t ka = park_lookup_claim_key("v1", "a.late.test."), kb = park_lookup_claim_key("v1", "b.late.test.");
+  CHECK(ka != kb);
+  park_shed_set_ttl(0);                                                           /* (no ttl: nothing is remembered, nothing held) */
+  park_shed_remember(ka, T);
+  CHECK(!park_shed_held(ka, T) && park_shed_remembered() == n0);
+  park_shed_set_ttl(1500);
+  CHECK(!park_shed_held(ka, T) && !park_shed_held(kb, T));
+  park_shed_remember(ka, T);
+  CHECK(park_shed_held(ka, T) && park_shed_held(ka, T + 1499) && !park_shed_held(ka, T + 1500) && !park_shed_held(kb, T) && park_shed_remembered() == n0 + 1);
+  CHECK(park_shed_held(ka, T - 500) && !park_shed_held(ka, T - 5000));            /* (a clock behind the writer's by a little: the entry is new, not stale; one that is far behind: another age) */
+  park_shed_remember(ka, T + 1000);                                               /* (shed again: the time is renewed, in the same slot) */
+  CHECK(park_shed_held(ka, T + 2499) && !park_shed_held(ka, T + 2500));
+  park_shed_remember(kb, T + 1000);
+  CHECK(park_shed_held(kb, T + 1200) && park_shed_held(ka, T + 1200));
+  park_shed_release(T + 1300);                                                    /* (released: every name remembered until then is free to be asked again) */
+  CHECK(!park_shed_held(ka, T + 1300) && !park_shed_held(kb, T + 1301) && park_shed_releases() == r0 + 1);
+  park_shed_remember(ka, T + 1302);                                               /* (and one that is shed after the release is held) */
+  CHECK(park_shed_held(ka, T + 1400) && !park_shed_held(kb, T + 1400));
+  park_shed_release(T + 1500);
+  park_shed_release(T + 1600);                                                    /* (a release that had nothing to forget is not counted) */
+  CHECK(!park_shed_held(ka, T + 1700) && park_shed_releases() == r0 + 2);
+  /* a window of PARK_SHED_WIN = 8 slots that are all live: the oldest gives its place up.  Keys that point at the same slot (key >> 8 equal) and differ in their high halves. */
+  uint64_t kw[10];
+  for (int i = 0; i < 10; i++) kw[i] = ((uint64_t)(0x1000 + i) << 32) | 0x5500u | 1u;
+  const int64_t W = T + 10000;
+  for (int i = 0; i < 9; i++) park_shed_remember(kw[i], W + i * 10);
+  CHECK(!park_shed_held(kw[0], W + 100) && park_shed_held(kw[1], W + 100) && park_shed_held(kw[8], W + 100));      /* (the first of nine is the oldest: out) */
+  park_shed_remember(kw[9], W + 200);
+  CHECK(park_shed_held(kw[9], W + 200) && !park_shed_held(kw[1], W + 200) && park_shed_held(kw[2], W + 200));
+  park_shed_remember(kw[0], W + 300);                                             /* (every slot is live still: the oldest, kw[2], makes room) */
+  CHECK(park_shed_held(kw[0], W + 300) && !park_shed_held(kw[2], W + 300) && park_shed_held(kw[3], W + 300));
+  park_shed_release(W + 1000);
+  CHECK(!park_shed_held(kw[0], W + 1000) && !park_shed_held(kw[9], W + 1000));
+  park_shed_set_ttl(100);
+  park_shed_remember(kw[3], W + 2000);
+  park_shed_remember(kw[4], W + 2050);
+  CHECK(park_shed_held(kw[3], W + 2099) && !park_shed_held(kw[3], W + 2100) && park_shed_held(kw[4], W + 2100));
+  park_shed_remember(kw[1], W + 2200);                                            /* (a name that is not in the window takes a slot of an entry that is over) */
+  CHECK(park_shed_held(kw[1], W + 2200) && !park_shed_held(kw[4], W + 2200));
+  park_shed_set_ttl(1500);
+}
+
+/* 0.7, PARK_PEND_LOOKUP: the request of a lookup that a full ring refused stays with the entry that waits; when that entry goes first (time, release) the entry for the same name that waits too takesit over;
  * a lone entry that goes takes it with it */
 static void test_lookup_pending(void) {
   printf("[a lookup that a full ring refused]\n");
@@ -1569,6 +1617,7 @@ int main(int argc, char **argv) {
   test_lookup_mark();
   test_lookup_room();
   test_end_and_counters();
+  test_shed_names();
   test_lookup_pending();
   test_lookup_claim_and_workers();
 #ifdef __FreeBSD__

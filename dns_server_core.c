@@ -2529,6 +2529,10 @@ static int udp_park_lookup(udp_pass_t *w, const view_snapshot_t *view, const cha
     park_cnt_note(PARK_CNT_LK_TIMEOUT);
     return -1;
   }
+  if (park_shed_held(park_lookup_claim_key(view->name, lname), now)) {      /* the ingest thread shed the lookup of this name lately: no request, it would be shed again */
+    park_cnt_note(PARK_CNT_LK_REMEMBERED);
+    return -1;
+  }
   if (!park_lookup_room(w->park)) {
     park_cnt_note(PARK_CNT_LK_ROOM);
     return -1;
@@ -3761,6 +3765,12 @@ process_tcp_client: ;
               const int64_t left = again ? ctx_tcp->park_deadline_ms - pnow : (int64_t)park_timeout_ms;
               uint32_t cidx = (uint32_t)(ctx_tcp - g_tcp_pool);
               ctx_tcp->lookup_respark = false;
+              if (left > 0 && route.view->name && park_timeout_ms != 0 && lookup_name(qname, qtype, lname, sizeof(lname)) && park_shed_held(park_lookup_claim_key(route.view->name, lname), pnow)) {
+                park_cnt_note(PARK_CNT_LK_REMEMBERED);          /* (the ingest thread shed the lookup of this name lately: as udp_park_lookup(), nothing is asked, the message is dropped) */
+                tcp_drop_message(ctx_tcp);
+                rcu_reader_exit(ctx);
+                continue;
+              }
               if (route.view->name && park_timeout_ms != 0 && lookup_name(qname, qtype, lname, sizeof(lname)) && (left <= 0 || !park_lookup_room(&park))) {
                 park_cnt_note(left <= 0 ? PARK_CNT_LK_TIMEOUT : PARK_CNT_LK_ROOM);       /* 0.7: overload: nothing is answered (a dropped query); the connection stays open */
                 tcp_drop_message(ctx_tcp);

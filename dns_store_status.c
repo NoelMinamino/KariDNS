@@ -495,6 +495,13 @@ static void add_lookup(list_t *l) {
   U("store.lookup.drop.timeout", k->drop_lk_timeout);
   U("store.lookup.drop.queue", k->drop_lk_queue);
   U("store.lookup.servfail", k->servfail);
+  U("store.lookup.remembered", k->remembered);
+  U("store.lookup.reask_suppressed", k->reask_suppressed);
+  U("store.lookup.remember_releases", k->remember_releases);
+  U("store.lookup.drain.passes", k->drain_passes);
+  U("store.lookup.drain.cut", k->drain_cut);
+  U("store.lookup.drain.pass_max", k->drain_pass_max);
+  U("store.lookup.drain.pass_max_us", (k->drain_pass_max_ns + 999) / 1000);
   U("store.park.drop.room", k->drop_zone_room);
   U("store.park.drop.timeout", k->drop_zone_timeout);
   U("store.park.drop.queue", k->drop_zone_queue);

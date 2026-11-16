@@ -400,6 +400,7 @@ enum {
   PARK_CNT_ZONE_ROOM,      /* a query for a zone out of memory: the park table was full: dropped */
   PARK_CNT_ZONE_TIMEOUT,   /* ... its park-timeout was up before the zone was there: dropped */
   PARK_CNT_ZONE_QUEUE,     /* ... the wait queue of the ingest thread was full: dropped */
+  PARK_CNT_LK_REMEMBERED,  /* a query for a name whose lookup was shed lately (park_shed_held()): dropped at the worker, no request made (store.lookup.reask_suppressed) */
   PARK_CNT_N
 };
 void park_cnt_note(int what);
@@ -407,5 +408,18 @@ uint64_t park_cnt_get(int what);
 bool park_lookup_room(const park_table_t *t);     /* may another entry be parked for a lookup? */
 void park_lookup_note_take_fail(void);            /* a worker could not make the request of a lookup now (its ring was full): the entry is pending */
 uint64_t park_lookup_take_fails(void);            /* ... how many times, all workers, since the start (a relaxed atomic) */
+
+/* The names whose lookup the ingest thread shed lately (0.7, "the shed names" in dns_park.c).  A lookup that is shed (the queue was full, it waited until its time was up, the loader said it was busy)
+ * drops the queries that wait for the name; the next query for the name would ask again, and the ask is shed again while the ingest thread is behind.  So the name is remembered, in a table of fixed size
+ * that the ingest thread writes and every worker reads (no lock, no allocation): a worker that finds the name there drops the query at once (PARK_CNT_LK_REMEMBERED) and asks nothing.  An entry lives for
+ * park_shed_set_ttl() milliseconds (the park-timeout), and all of them are released at once by park_shed_release() when the ingest thread has caught up (its queue is empty and a place is free), so that the
+ * names are asked again when there is room.  The key is park_lookup_claim_key().  A name that finds no free slot in its window takes the place of the oldest entry of the window (a name that is forgotten
+ * early is asked again early: nothing is lost but the saving).  Only the ingest thread writes. */
+void park_shed_set_ttl(uint32_t ms);                      /* 0: nothing is remembered */
+void park_shed_remember(uint64_t key, int64_t now_ms);
+bool park_shed_held(uint64_t key, int64_t now_ms);
+void park_shed_release(int64_t now_ms);                   /* every name remembered until now is forgotten */
+uint64_t park_shed_remembered(void);                      /* names put in the table, since the start */
+uint64_t park_shed_releases(void);                        /* releases that forgot at least one name */
 
 #endif /* DNS_PARK_H */
