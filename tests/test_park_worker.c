@@ -91,6 +91,15 @@ static size_t build_lk_query(uint8_t *b, uint16_t id) {
     return 12 + sizeof(qn);
 }
 
+/* the same with an OPT record (EDNS0, RFC 6891: UDP size 1232): an error answer then carries an Extended DNS Error (RFC 8914) */
+static size_t build_lk_query_edns(uint8_t *b, uint16_t id) {
+    size_t o = build_lk_query(b, id);
+    b[11] = 1;
+    static const uint8_t opt[] = { 0, 0, 41, 0x04, 0xD0, 0, 0, 0, 0, 0, 0 };
+    memcpy(b + o, opt, sizeof(opt));
+    return o + sizeof(opt);
+}
+
 /* a NOTIFY (opcode 4) or an UPDATE (opcode 5) for `name`: the zone / question section is "name SOA IN" (RFC 1996, RFC 2136 2.3) */
 static size_t build_op(uint8_t *b, uint16_t id, int opcode, const char *name) {
     memset(b, 0, 12);
@@ -549,13 +558,16 @@ int main(void) {
             w.park = &table;
             park_free(&small);
         }
-        /* the lookup failed (the database, the loader): SERVFAIL + EDE 14 at once, as the fetch of a zone that fails */
-        SEND_LK(0x7102);
+        /* the lookup failed (the database, the loader): SERVFAIL + EDE 14 at once, as the fetch of a zone that fails.  The query has an OPT record: the answer must carry the Extended DNS Error 14 (Not Ready, RFC 8914 4.15) */
+        {
+            size_t ql_ = build_lk_query_edns(rx + sizeof(udp_ipc_t), 0x7102);
+            mk_ipc((udp_ipc_t *)rx, 7, ql_); w.n_tx = 0; udp_one(&w, (udp_ipc_t *)rx, rx + sizeof(udp_ipc_t), (ssize_t)ql_);
+        }
         CHECK(table.nwait == 1 && park_fetch_pop(park_fetch_ring(0), &q));
         CHECK(park_wake_push(park_wake_ring(0), "default", "www.late.test.", true));
         park_service(&w, -1);
         a = read_answer(sk[1]);
-        CHECK(a.got && a.id == 0x7102 && a.rcode == 2 && a.ancount == 0 && table.nwait == 0 && table.nlook == 0 && park_cnt_get(PARK_CNT_LK_SERVFAIL) == 1);        /* (a failed lookup: SERVFAIL, as for a zone whose fetch failed; the query of this test has no EDNS, so no EDE 14 in it) */
+        CHECK(a.got && a.id == 0x7102 && a.rcode == 2 && a.ancount == 0 && a.ede == 14 && table.nwait == 0 && table.nlook == 0 && park_cnt_get(PARK_CNT_LK_SERVFAIL) == 1);        /* (a failed lookup: SERVFAIL + EDE 14, as for a zone whose fetch failed) */
         /* the time is up: the answer of a query that has waited the park-timeout; and a wake of every query after the deadline does not park it again */
         w.park_timeout_ms = 5;
         const uint64_t lt0 = park_cnt_get(PARK_CNT_LK_TIMEOUT);

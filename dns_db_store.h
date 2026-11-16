@@ -114,6 +114,8 @@ enum { DBR_UNSTORABLE = -2 /* a name the store cannot hold and the heap director
 int db_recon_apply(const char *view, const db_recon_entry_t *e, uint32_t *zid);
 /* a CHANGES upsert: db_recon_apply() and the count */
 int db_recon_change(const char *view, const db_recon_entry_t *e, uint32_t *zid);
+/* the answer of a by-name lookup (the ingest thread): as db_recon_change(), and the record is marked for the pass that is going on: it is newer than the page the loader read before, so an entry of the pass does not change it and the sweep does not delete it (dns_db_store.c, lk_mark()) */
+int db_recon_lookup(const char *view, const db_recon_entry_t *e, uint32_t *zid);
 /* 0.7 M2: n entries (any n) as n calls of db_recon_apply() / db_recon_change() / db_recon_entry(), in order: res[i] and zid[i] are what the call for entry i returns (res: DBR_*) and gives back.  The records that
  * are new are written in groups of up to 64, one journal record, one hold of the mutex of the writers of the records and one decision of the commit policy for a group (store_set_known_n()); an entry
  * of a record that exists, a rename or an entry that has the name or the source id of one that waits in the group writes the group first, so the effect is that of the calls one after the other.  The

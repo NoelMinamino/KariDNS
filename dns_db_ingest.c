@@ -168,6 +168,7 @@ typedef struct {
   bool bulk;                             /* asked for by the background fetch of the wanted bodies (the scan of the store), not by a query */
   bool nonstore;                         /* ... a secondary or catalog zone (it has a record that only remembers it) */
   bool loader_failed;                    /* the loader answered ZONE_FAILED (not "busy"): the zone is marked refused until its stamp changes */
+  bool busy;                             /* the loader answered "busy" (KDB_FETCH_BUSY_REASON): overload, not a failure of the zone: the queries that wait are dropped, not answered SERVFAIL (0.7) */
   bool reqfetch;                         /* the fetch of the zone a `karictl reload <zone>` asks for: the answer of the request waits for it */
   /* 0.7, a lookup of a name (FETCH_REQ mode KDB_FETCH_LOOKUP, or LOOKUP_FULL: the body of the zone that is found follows the answer, with the same request id).  `zone` is the name asked for until the answer; a request whose answer has a zone
    * that comes with its body (lkst LKS_BODY) is a fetch of that zone from then on (mode FULL, `zone` the zone), and lk_q is the name the queries wait for (they are woken by it too) */
@@ -1598,6 +1599,7 @@ static _Atomic uint64_t g_fq_hist[FQ_HIST_N];              /* fetches installed,
 static _Atomic uint32_t g_ing_busy_pct;                    /* share of the last window (~10 s) the ingest thread was not waiting for events */
 /* 0.7, the by-name lookups of the first start (FETCH_REQ mode KDB_FETCH_LOOKUP): the loader answers them (HELLO features, the store protocol on), and what became of them */
 static _Atomic bool g_lookup_on;
+static _Atomic bool g_lookup_hold;                         /* the last loader that said its HELLO looks names up, connected now or not: while its pass is pending a query for a name no zone covers waits for the loader's return (it is dropped at its time-out), it is not refused (0.7) */
 static _Atomic uint64_t g_lk_found, g_lk_none, g_lk_failed, g_lk_refused, g_lk_dup;
 static _Atomic uint64_t g_lk_asked, g_lk_body, g_lk_covered, g_lk_shed, g_lk_expired, g_lk_bad, g_lk_max_ns;     /* requests of the workers taken; bodies that came with the answer and were taken; names whose zone was known by the time they were to go; requests dropped because the queue was full; queue entries whose time was up; bodies that were thrown away; the longest time to an answer */
 static _Atomic uint32_t g_lk_pending, g_lk_inflight, g_lk_peak;      /* waiting for a place now, out now (the lookups and the fetches that came of them), the most that waited */
@@ -1620,6 +1622,7 @@ bool db_ingest_fill_stats(store_fill_t *out) {
   return true;
 }
 bool db_ingest_lookup_ready(void) { return atomic_load_explicit(&g_lookup_on, memory_order_acquire); }
+bool db_ingest_lookup_wanted(void) { return atomic_load_explicit(&g_lookup_on, memory_order_acquire) || atomic_load_explicit(&g_lookup_hold, memory_order_acquire); }
 /* the counters of the lookups for `karictl store` and dbstatus (dns_store_status.h): relaxed atomics that the ingest thread and the workers write, any thread reads */
 bool db_ingest_lookup_stats(store_lookup_t *out) {
   memset(out, 0, sizeof(*out));
@@ -1963,6 +1966,7 @@ static void on_hello(ing_t *g, const kdb_msg_t *m) {
   g->bg_on = false;
   send_config(g, "handshake");
   atomic_store_explicit(&g_lookup_on, g->stream_fd >= 0 && g->store_proto && (h->features & KDB_FEAT_LOOKUP) != 0, memory_order_release);      /* (send_config() may have dropped the stream) */
+  atomic_store_explicit(&g_lookup_hold, g->store_proto && (h->features & KDB_FEAT_LOOKUP) != 0, memory_order_release);       /* (a loader that does not look up ends the hold: the queries are refused as before) */
   g->debug_sent = -1;                                  /* 0.7 M2: a new loader learns the level in force after its CONFIG */
   send_debug(g);
   if (g->store_proto) {                                /* 0.7 WP7b: the records the store holds that have no body (an interrupted fill, a changed zone, a secondary zone: they are heap zones) are fetched once now */
@@ -2350,36 +2354,23 @@ static void on_zone_begin(ing_t *g, const kdb_msg_t *m) {
   g->cur = j;
 }
 
-/* ZONE_IMAGE of the zone j (either stream): the octets are appended to the image.  The announced size is a cap, checked by the state machine (the sum of the messages never passes it); the
- * buffer grows with what came (doubling, never above the cap), so a loader that announces a gigabyte and sends a kilobyte holds a kilobyte. */
-static void job_image(ing_t *g, ing_job_t *j, const kdb_msg_t *m) {
-  (void)g;
+/* ZONE_IMAGE of the zone j (either stream): the octets are appended to the image.  The announced size (ZONE_BEGIN image_size) is what the image must be (zone_image_validate_ex() refuses any other length) and is at most
+ * max-zone-bytes (the state machine: dns_db_stream.c), so the buffer is allocated once with that size, with the first piece: no doubling that copies the image again and holds up to three times its size meanwhile.  A
+ * loader that announces the most and sends a kilobyte holds the address space of one zone for as long as the stream's zone lasts (an allocation that nothing has touched is not memory), and a job is a zone of
+ * one stream at a time. */
+static void job_image(ing_job_t *j, const kdb_msg_t *m) {
   if (!j || j->skip || j->failed || j->cold) return;
-  const kdb_zone_image_t *zi = &m->u.zone_image;
-  if (j->img_size == 0 || zi->len > j->img_size - j->img_len) {      /* (the state machine refuses it: a job that is not an image zone, or more octets than announced) */
+  const int rc = zone_image_asm_add(&j->img, &j->img_len, &j->img_cap, j->img_size, m->u.zone_image.body, m->u.zone_image.len);      /* (the harness of tests/fuzz/fuzz_db_image_frames.c runs the same function) */
+  if (rc == -1) {                                        /* (the state machine refuses it: a job that is not an image zone, or more octets than announced) */
     j->failed = true;
     snprintf(j->reason, sizeof(j->reason), "zone image data that was not announced");
-    return;
+  } else if (rc != 0) {
+    j->failed = true;
+    snprintf(j->reason, sizeof(j->reason), "out of memory");
   }
-  const size_t need = j->img_len + zi->len;
-  if (need > j->img_cap) {
-    size_t nc = j->img_cap ? j->img_cap * 2 : need;
-    if (nc < need) nc = need;
-    if (nc > j->img_size) nc = (size_t)j->img_size;
-    uint8_t *nb = realloc(j->img, nc);
-    if (!nb) {
-      j->failed = true;
-      snprintf(j->reason, sizeof(j->reason), "out of memory");
-      return;
-    }
-    j->img = nb;
-    j->img_cap = nc;
-  }
-  memcpy(j->img + j->img_len, zi->body, zi->len);
-  j->img_len = need;
 }
 
-static void on_zone_image(ing_t *g, const kdb_msg_t *m) { job_image(g, g->cur, m); }
+static void on_zone_image(ing_t *g, const kdb_msg_t *m) { job_image(g->cur, m); }
 
 static void on_zone_end(ing_t *g) {
   ing_job_t *j = g->cur;
@@ -2739,12 +2730,6 @@ static void handle_msg(ing_t *g, const kdb_msg_t *m) {
   case KDB_T_BATCH_END:
     on_batch_end(g, m);
     break;
-  case KDB_T_MANIFEST_BEGIN:
-    on_manifest_begin(g, m);
-    break;
-  case KDB_T_MANIFEST_END:
-    on_manifest_end(g, m);
-    break;
   case KDB_T_CHANGES:
     on_changes(g, m);
     break;
@@ -2805,6 +2790,13 @@ static bool stream_frame(ing_t *g, const kdb_frame_t *fr) {
   kdb_msg_t msg;
   kdb_rc_t rc;
   const uint16_t t = fr->type;
+  {                                                      /* a protocol error that the reconcile thread found in a page: before any frame is handled (the thread may be idle again by now, and BATCH_END or CHANGES would commit what the stream said after the bad page) */
+    char why[KDB_REASON_LEN];
+    if (db_recon_error_take(why, sizeof(why))) {
+      protocol_error(g, why);
+      return false;
+    }
+  }
   if (t == KDB_T_MANIFEST || t == KDB_T_MANIFEST_BEGIN || t == KDB_T_MANIFEST_END) {
     if (!db_recon_room()) {
       stream_hold(g, fr, true);
@@ -2901,9 +2893,10 @@ static void on_stream_readable(ing_t *g) {
 }
 
 /* the reconcile thread has said something (EVFILT_USER ING_EVT_RECON): a protocol error it found in what the loader sent, bodies that are wanted, a free slot or an idle thread for the frame that waits */
+_Atomic bool db_ingest_test_recon_poll_off;              /* tests (always compiled, as db_ingest_test_lq_max): the event of the reconcile thread does not take its error, so that the stream thread's own look at it (stream_frame()) is the only one */
 static void recon_poll(ing_t *g) {
   char why[KDB_REASON_LEN];
-  if (db_recon_error_take(why, sizeof(why))) {
+  if (!atomic_load_explicit(&db_ingest_test_recon_poll_off, memory_order_relaxed) && db_recon_error_take(why, sizeof(why))) {
     protocol_error(g, why);
     return;
   }
@@ -3595,16 +3588,20 @@ static bool lookup_name_ok(const char *name) {
   return dns_name_normalize(name, out, sizeof(out)) == n && memcmp(name, out, n) == 0 && dns_name_len_no_root(name, n) != n;
 }
 
-/* the places that the lookups out (and the bodies that came with them) may take: three quarters of fetch-concurrency, at least one */
-static uint32_t lk_share(void) {
-  const uint32_t conc = atomic_load_explicit(&g_fetch_conc, memory_order_relaxed);
-  const uint32_t s = conc - conc / 4;
-  return s ? s : 1;
+/* the places that the lookups out (and the bodies that came with them) may take: three quarters of fetch-concurrency, but always at least one place is left to the fetches of zones (with two to four places, one), so that a flood
+ * of names that no zone has cannot hold every place.  A single place cannot be shared: the lookup takes it for one round trip (it is given back at once when the answer is none), and the places go to the lookups and the fetches by turns. */
+static uint32_t lk_share_for(uint32_t conc) {
+  if (conc <= 1) return 1;
+  return conc - (conc / 4 ? conc / 4 : 1);
 }
+static uint32_t lk_share(void) { return lk_share_for(atomic_load_explicit(&g_fetch_conc, memory_order_relaxed)); }
+#ifdef KARIDNS_UNIT_TEST
+uint32_t db_ingest_test_lk_share(uint32_t conc) { return lk_share_for(conc); }    /* tests: the places the lookups may take at a fetch-concurrency */
+#endif
 
 /* can a lookup be made now?  A stream, a free slot of the table, its share, and a place that is not the fill's share (as for the request of a query, qplace_ok()) */
 static bool lookup_ready(const ing_t *g) {
-  return g->fetch_fd >= 0 && g->nfreq < ING_FETCH_MAX && g->nlook < lk_share() && park_place_avail() && qplace_ok(g);
+  return g->fetch_fd >= 0 && atomic_load_explicit(&g_lookup_on, memory_order_acquire) && g->nfreq < ING_FETCH_MAX && g->nlook < lk_share() && park_place_avail() && qplace_ok(g);
 }
 
 /* the mode of the request: with the body of the zone when the loader sends it, there is no fetch-rate to keep (it counts the zones read for queries) and the zones in memory are below the hard line */
@@ -3637,24 +3634,31 @@ static void lookup_hist(int64_t ns) {
 
 /* the lookup's own end (the answer is none, it failed, it was read through): the queries that wait for the name look it up again.  The place and the claim mark went back in fetch_complete(). */
 static void lookup_complete(const ing_freq_t *done, bool ok, const char *why) {
-  if (!ok) {
+  const bool shed = !ok && done->busy;                   /* (the loader said it is busy: overload, the queries are dropped, not failed) */
+  if (shed) {
+    atomic_fetch_add_explicit(&g_lk_shed, 1, memory_order_relaxed);
+    logev_post(LOGC_DATABASE, 2, NULL, 0, "[DB] lookup of the name '%s' (view '%s') shed: the loader is busy; its queries are dropped", done->lk_q, done->view_name);
+  } else if (!ok) {
     atomic_fetch_add_explicit(&g_lk_failed, 1, memory_order_relaxed);
     logev_post(LOGC_DATABASE, 2, NULL, 0, "[DB] lookup of the name '%s' (view '%s') failed: %s", done->lk_q, done->view_name, why && why[0] ? why : "no reason given");
   }
-  park_wake_queue_all(done->view_name, done->lk_q, !ok);      /* (a failure is "not ready" for the queries, SERVFAIL + EDE 14 as for a zone whose fetch failed; "none" is the normal answer for a name that no zone has) */
+  /* (a failure is "not ready" for the queries, SERVFAIL + EDE 14 as for a zone whose fetch failed; "none" is the normal answer for a name that no zone has; the workers that asked are told, the claim is cleared by the caller after this) */
+  park_wake_queue_claim(done->view_name, done->lk_q, done->ckey, !ok && !shed, shed ? PARK_ASK_DROP : 0);
 }
 
-/* a request that ends before it was made (a loader that does not look up, a view that takes no database zones, a zone that is known already, a name that waited too long): its claim mark goes and the queries look the name up again */
+/* a request that ends before it was made (a loader that does not look up, a view that takes no database zones, a zone that is known already): its queries look the name up again (the normal answer).  The workers that asked are woken,
+ * then the claim mark goes. */
 static void lookup_drop(const park_fetch_req_t *q, uint64_t ckey) {
+  park_wake_queue_claim(q->view, q->zone, ckey, false, 0);
   if (ckey) park_claim_clear(ckey);
-  park_wake_queue_all(q->view, q->zone, false);
 }
 
-/* a lookup that is dropped because the ingest thread is overloaded (its queue is full, or it waited until its time was up): its claim mark goes and the queries that wait for the name are dropped (counted at their workers),
- * not answered REFUSED or SERVFAIL for a name whose zone the database may have */
+/* a lookup that is dropped because the ingest thread is overloaded (its queue is full, or it waited until its time was up), or because the loader that would answer it is away: the queries that wait for the name are
+ * dropped (counted at their workers), not answered REFUSED or SERVFAIL for a name whose zone the database may have.  Only the workers that asked are told (park_wake_queue_claim()): a flood of shed lookups
+ * must not fill the wake ring of every worker. */
 static void lookup_shed(const park_fetch_req_t *q, uint64_t ckey) {
+  park_wake_queue_claim(q->view, q->zone, ckey, false, PARK_ASK_DROP);
   if (ckey) park_claim_clear(ckey);
-  park_wake_queue_drop_all(q->view, q->zone);
 }
 
 static void lookup_note(const ing_t *g) {
@@ -3710,13 +3714,14 @@ static int view_db_index(const ing_t *g, const char *name) {
 /* the head of the queue goes, if it can: false when nothing waits or nothing can be made now.  The ones whose time is up are dropped before (lq_expire(): their queries have timed out). */
 static bool lq_pump_one(ing_t *g) {
   while (g->nlq > 0) {
-    if (!lookup_ready(g)) return false;
+    const bool hold = atomic_load_explicit(&g_lookup_hold, memory_order_acquire);
+    if (hold && !lookup_ready(g)) return false;           /* (a loader that looks names up is away or has no place: the entry waits for it until its time is up, lq_expire(): dropped, not refused) */
     struct ing_lq e = g->lq[g->lq_head];
     g->lq_head = (g->lq_head + 1) % ING_LQ_MAX;
     g->nlq--;
     lookup_note(g);
     const int vi = view_db_index(g, e.q.view);
-    if (vi < 0 || !atomic_load_explicit(&g_lookup_on, memory_order_acquire)) {
+    if (vi < 0 || !hold) {                                /* a view that takes no database zones, or a loader that does not look names up (a new one came): the normal answer */
       atomic_fetch_add_explicit(&g_lk_refused, 1, memory_order_relaxed);
       lookup_drop(&e.q, e.key);
       continue;
@@ -3741,17 +3746,21 @@ static void lq_expire(ing_t *g, int64_t now) {
 /* a request of a worker (mode KDB_FETCH_LOOKUP) taken from a ring: vi is the loader's index of its view (-1: none).  It is made now, or it waits for a place in the queue. */
 static void lookup_offer(ing_t *g, const park_fetch_req_t *q, int vi) {
   atomic_fetch_add_explicit(&g_lk_asked, 1, memory_order_relaxed);
-  if (vi < 0 || g->fetch_fd < 0 || !atomic_load_explicit(&g_lookup_on, memory_order_acquire) || !lookup_name_ok(q->zone)) {      /* (the worker did not know: it asked, and is woken as for the end of a lookup) */
+  if (vi < 0 || !atomic_load_explicit(&g_lookup_hold, memory_order_acquire) || !lookup_name_ok(q->zone)) {      /* (the worker did not know: it asked, and is woken as for the end of a lookup; a loader that is away for a while is not this case: the request waits for it) */
     atomic_fetch_add_explicit(&g_lk_refused, 1, memory_order_relaxed);
-    park_wake_queue_all(q->view, q->zone, false);
+    if (q->worker >= 0) park_wake_queue_one(q->worker, q->view, q->zone, false);
+    else park_wake_queue_all(q->view, q->zone, false);
     return;
   }
-  if (lookup_find(g, (uint16_t)vi, q->zone)) {           /* the same name is on its way: its answer wakes every worker */
+  const uint64_t key = park_lookup_claim_key(q->view, q->zone);       /* (a key of its own: not the zone's, whose fetch must not be taken for this request's duplicate) */
+  if (lookup_find(g, (uint16_t)vi, q->zone)) {           /* the same name is on its way: its answer wakes the workers that asked */
+    park_claim_note_worker(key, q->worker);
     atomic_fetch_add_explicit(&g_lk_dup, 1, memory_order_relaxed);
     return;
   }
-  const uint64_t key = park_claim_key(q->view, q->zone);
-  if (!park_claim_mark(key)) {                           /* the same name waits in the queue (the mark is the name's) */
+  const bool marked = park_claim_mark(key);
+  park_claim_note_worker(key, q->worker);
+  if (!marked) {                                         /* the same name waits in the queue (the mark is the name's) */
     atomic_fetch_add_explicit(&g_lk_dup, 1, memory_order_relaxed);
     return;
   }
@@ -3780,13 +3789,13 @@ static void fetch_complete(ing_t *g, ing_freq_t *r, bool ok, const char *why) {
   if (done.placed) park_place_give();                    /* (B2 W5: the one place of the fetch goes back, whichever way it ended: installed, failed, dropped, the loader gone) */
   g->nfreq--;
   atomic_store_explicit(&g_fq_inflight, g->nfreq, memory_order_relaxed);
-  if (done.lk) {                                         /* 0.7: a lookup (and the fetch that came of it) is over: its claim mark goes, the share of the places it took is free */
+  if (done.lk) {                                         /* 0.7: a lookup (and the fetch that came of it) is over: the share of the places it took is free; its claim mark goes after the workers that asked are told (below) */
     g->nlook--;
     lookup_note(g);
-    if (done.ckey) park_claim_clear(done.ckey);
   }
   if (done.mode == KDB_FETCH_LOOKUP || done.mode == KDB_FETCH_LOOKUP_FULL) {      /* 0.7: a lookup that has not become a fetch of a zone (no LOADING state, no stamp): the queries that wait for the name look it up again */
     lookup_complete(&done, ok, why);
+    if (done.ckey) park_claim_clear(done.ckey);
     return;
   }
   if (ok) fq_hist_add(now_ms() - done.sent_ms);
@@ -3841,12 +3850,18 @@ static void fetch_complete(ing_t *g, ing_freq_t *r, bool ok, const char *why) {
   if (ok && done.hot && !done.dropped && done.mode == KDB_FETCH_FULL) dbreg_warm_freq(done.view_name, done.zone, g->wl_count > done.hrank ? g->wl_count - done.hrank : 1);
   if (ok && !done.dropped && !done.quiet && !done.bulk && done.mode == KDB_FETCH_FULL && done.prio == KDB_FETCH_PRIO_BACKGROUND) dbreg_bg_loaded(done.view_name, done.zone);
   if ((!ok || done.dropped) && done.want_summary) warm_add(g, done.view_name, done.zone);     /* (the summary that was not asked for because this request was on its way) */
-  if (done.lk) {                                         /* 0.7: the fetch came of a lookup: the queries that wait for the name it was asked for are woken too, and are not failed (they look the name up again) */
+  /* a loader that said it is busy is overload, not a failure of the zone: the queries that wait are dropped and counted (store.park.drop.queue), not answered SERVFAIL (0.7) */
+  const bool shed = !ok && done.busy;
+  if (done.lk) {                                         /* 0.7: the fetch came of a lookup (its body, mode 3): the queries that wait for the zone, and those that wait for the name it was asked for, are woken; both are failed when the body failed
+                                                          * (SERVFAIL + EDE 14: the lookup found the zone and the database could not give it), dropped when the loader was busy.  The workers that asked for the name are told by the claim. */
     const bool same = domain_names_match_ci(done.lk_q, done.zone);
-    park_wake_queue_all(done.view_name, done.zone, !ok && !same);
-    if (!same) park_wake_queue_all(done.view_name, done.lk_q, false);
+    if (shed) park_wake_queue_drop_all(done.view_name, done.zone);
+    else park_wake_queue_all(done.view_name, done.zone, !ok);
+    if (!same) park_wake_queue_claim(done.view_name, done.lk_q, done.ckey, !ok && !shed, shed ? PARK_ASK_DROP : 0);
+    if (done.ckey) park_claim_clear(done.ckey);
   } else if (!done.quiet) {
-    park_wake_queue_all(done.view_name, done.zone, !ok);      /* (the triggers go out together, park_wake_flush())  */
+    if (shed) park_wake_queue_drop_all(done.view_name, done.zone);
+    else park_wake_queue_all(done.view_name, done.zone, !ok);      /* (the triggers go out together, park_wake_flush())  */
   }
   /* (the summary for the apex wakes nobody: no query waits for it, and the queries that wait for the data are not woken for nothing) */
 }
@@ -4058,7 +4073,7 @@ static void fetch_release(bool *place, bool *tok, uint64_t *key) {
 /* The request cannot be made (the wait queue is full, a view is gone, no free slot of the table): its queries get "not ready" now.  A request that holds a claim speaks for every
  * worker that parked for the zone without one (their requests are dropped while the mark is up, see below), so all of them are told; any other request concerns its worker only. */
 static void fetch_refuse(const park_fetch_req_t *q) {
-  if (q->claimed) park_wake_queue_all(q->view, q->zone, true);
+  if (q->claimed) park_wake_queue_claim(q->view, q->zone, park_claim_key(q->view, q->zone), true, 0);
   else park_wake_queue_one(q->worker, q->view, q->zone, true);
 }
 
@@ -4107,10 +4122,10 @@ static void wq_expire(ing_t *g, int64_t now) {
   while (g->nwq > 0 && g->wq[g->wq_head].deadline_ms <= now) {
     struct ing_wq e;
     wq_take_head(g, &e);
-    if (e.key) park_claim_clear(e.key);
     atomic_fetch_add_explicit(&g_wq_dropped, 1, memory_order_relaxed);
     if (e.room) atomic_fetch_add_explicit(&g_room_timeouts, 1, memory_order_relaxed);
-    park_wake_queue_all(e.q.view, e.q.zone, false);        /* (a transfer's request too: workers may have parked for its mark) */
+    park_wake_queue_claim(e.q.view, e.q.zone, e.key, false, 0);        /* (a transfer's request too: workers may have parked for its mark; the workers that asked are told, every worker when the mark knows none) */
+    if (e.key) park_claim_clear(e.key);
   }
 }
 
@@ -4146,7 +4161,9 @@ static bool wq_wait(ing_t *g, const park_fetch_req_t *q, bool *place, bool *tok,
   bool marked_here = false;
   if (k == 0) {
     k = park_claim_key(q->view, q->zone);
-    if (!park_claim_mark(k)) return true;                /* a request for this zone is on its way or waits already */
+    const bool marked = park_claim_mark(k);
+    park_claim_note_worker(k, q->worker);
+    if (!marked) return true;                            /* a request for this zone is on its way or waits already */
     marked_here = true;
   }
   if (!g->wq || g->nwq >= queue_cap(&db_ingest_test_wq_max, ING_WQ_MAX)) {
@@ -4179,7 +4196,7 @@ static void wq_overflow(const park_fetch_req_t *q) {
   atomic_fetch_add_explicit(&g_wq_full, 1, memory_order_relaxed);
   atomic_fetch_add_explicit(&g_fetch_shed, 1, memory_order_relaxed);
   logev_post(LOGC_DATABASE, 2, NULL, 0, "[DB] fetch of zone '%s' (view '%s') shed: the wait queue is full; its queries are dropped", q->zone, q->view);
-  if (q->claimed) park_wake_queue_drop_all(q->view, q->zone);
+  if (q->claimed) park_wake_queue_claim(q->view, q->zone, park_claim_key(q->view, q->zone), false, PARK_ASK_DROP);
   else park_wake_queue_drop_one(q->worker, q->view, q->zone);
 }
 
@@ -4230,7 +4247,10 @@ static void fetch_issue(ing_t *g) {
       continue;
     } else if (park_fetch_next(&q)) {
       warm = hot = false;                                /* (a query's request is not of the hot list, whatever the item before it in this pass was) */
-      if (q.claimed) hold_key = park_claim_key(q.view, q.zone);     /* (a worker marked the zone at its gate) */
+      if (q.claimed) {                                   /* (a worker marked the zone at its gate) */
+        hold_key = park_claim_key(q.view, q.zone);
+        park_claim_note_worker(hold_key, q.worker);
+      }
     } else if (g->nwarm > 0 && warm_left > 0 && g->nwq == 0 && g->nlq == 0) {      /* (the warm-up does not take what queries wait for) */
       size_t wi = 0;                                     /* the item to take: the head, or (hot items that cannot be read now) the first that is not hot */
       if (g->warm[0].hot) {                              /* (a hot item is not taken out of the list until it can be read, so that the order of the list holds) */
@@ -4297,7 +4317,10 @@ static void fetch_issue(ing_t *g) {
     if (r) continue;
     /* a worker that found the zone claimed asked without a claim (B2 M1): the claimed request is queued, and it takes the place and the token, starts the fetch and wakes every
      * worker (the completion), or fails them all (fetch_refuse()).  This request would be a second one for the same zone, so it is dropped. */
-    if (!q.claimed && !warm && q.mode == KDB_FETCH_FULL && q.worker >= 0 && park_claim_held(park_claim_key(q.view, q.zone))) continue;
+    if (!q.claimed && !warm && q.mode == KDB_FETCH_FULL && q.worker >= 0 && park_claim_held(park_claim_key(q.view, q.zone))) {
+      park_claim_note_worker(park_claim_key(q.view, q.zone), q.worker);       /* (this worker waits for the claimed request too: it is told when that one ends) */
+      continue;
+    }
     if (q.mode == KDB_FETCH_SUMMARY) {
       ing_freq_t *full = fetch_find_zone(g, (uint16_t)vi, q.zone, KDB_FETCH_FULL);
       if (full) {
@@ -4555,8 +4578,12 @@ static void on_fetch_failed(ing_t *g, const kdb_zone_failed_t *zf) {
   }
   char reason[KDB_REASON_LEN];
   sane_copy(reason, sizeof(reason), zf->reason.p, zf->reason.len);
-  if (strcmp(reason, KDB_FETCH_BUSY_REASON) == 0) atomic_fetch_add_explicit(&g_fq_loader_busy, 1, memory_order_relaxed);
-  else r->loader_failed = true;
+  if (strcmp(reason, KDB_FETCH_BUSY_REASON) == 0) {
+    atomic_fetch_add_explicit(&g_fq_loader_busy, 1, memory_order_relaxed);
+    r->busy = true;
+  } else {
+    r->loader_failed = true;
+  }
   fetch_complete(g, r, false, reason);
 }
 
@@ -4591,7 +4618,7 @@ static void on_lookup_result(ing_t *g, const kdb_lookup_result_t *l) {
   re.has_serial = l->has_serial;
   re.serial = l->serial;
   uint32_t zid;
-  const int rc = db_recon_change(r->view_name, &re, &zid);
+  const int rc = db_recon_lookup(r->view_name, &re, &zid);
   if (rc < 0) {
     fetch_complete(g, r, false, "the zone could not be recorded");
     return;
@@ -4616,7 +4643,7 @@ static void on_lookup_result(ing_t *g, const kdb_lookup_result_t *l) {
     atomic_fetch_add_explicit(&g_lk_body, 1, memory_order_relaxed);
   } else {
     r->lkst = LKS_SKIP;
-    park_wake_queue_all(r->view_name, r->lk_q, false);   /* (the zone is known: the queries need not wait for a body that is not read) */
+    park_wake_queue_claim(r->view_name, r->lk_q, r->ckey, false, 0);   /* (the zone is known: the queries need not wait for a body that is not read) */
   }
 }
 
@@ -4637,7 +4664,7 @@ static void handle_fetch_msg(ing_t *g, const kdb_msg_t *m) {
     on_fetch_begin(g, &m->u.zone_begin);
     break;
   case KDB_T_ZONE_IMAGE:
-    job_image(g, g->fcur, m);
+    job_image(g->fcur, m);
     break;
   case KDB_T_ZONE_END:
     on_fetch_end(g);

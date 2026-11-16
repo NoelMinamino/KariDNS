@@ -48,6 +48,7 @@ static struct {
   /* a protocol error of the loader found here (the reason is written before err is set) */
   _Atomic bool err;
   _Atomic uint64_t err_epoch;
+  _Atomic bool err_lock;             /* the error is written by this thread and taken by the stream thread: a spin lock held for the copy of the reason (the way of park_wake_push_ask()) */
   char err_why[KDB_REASON_LEN];
   /* what the entries became, since the ingest thread took them last */
   _Atomic uint32_t c_applied, c_unchanged, c_rejected, c_deleted;
@@ -198,13 +199,14 @@ void db_recon_abort_stream(void) {
 
 bool db_recon_error_take(char *why, size_t cap) {
   if (!atomic_load_explicit(&RT.err, memory_order_acquire)) return false;
-  if (atomic_load_explicit(&RT.err_epoch, memory_order_relaxed) != atomic_load_explicit(&RT.epoch, memory_order_relaxed)) {
-    atomic_store_explicit(&RT.err, false, memory_order_relaxed);                  /* (of a stream that is gone) */
-    return false;
-  }
-  snprintf(why, cap, "%s", RT.err_why);
+  while (atomic_exchange_explicit(&RT.err_lock, true, memory_order_acquire)) {}
+  /* (under the lock: rt_fail() of the stream that follows cannot be cleared by a stale clear made here, and the reason is not written while it is copied) */
+  bool take = atomic_load_explicit(&RT.err, memory_order_relaxed);
+  if (take && atomic_load_explicit(&RT.err_epoch, memory_order_relaxed) == atomic_load_explicit(&RT.epoch, memory_order_relaxed)) snprintf(why, cap, "%s", RT.err_why);
+  else take = false;                                                              /* (none, or of a stream that is gone) */
   atomic_store_explicit(&RT.err, false, memory_order_relaxed);
-  return true;
+  atomic_store_explicit(&RT.err_lock, false, memory_order_release);
+  return take;
 }
 
 void db_recon_note_full(void) { atomic_fetch_add_explicit(&RT.st_full, 1, memory_order_relaxed); }
@@ -238,10 +240,12 @@ void db_recon_note_stream(int64_t ns) {
 /* ---- the consumer ---- */
 
 /* a protocol error of the loader: the reason is for the stream thread, which closes the stream; this thread drops the rest of what the stream sent */
-static void rt_fail(const char *why) {
+static void rt_fail(const char *why, uint64_t epoch) {
+  while (atomic_exchange_explicit(&RT.err_lock, true, memory_order_acquire)) {}
   snprintf(RT.err_why, sizeof(RT.err_why), "%s", why);
-  atomic_store_explicit(&RT.err_epoch, atomic_load_explicit(&RT.epoch, memory_order_relaxed), memory_order_relaxed);
+  atomic_store_explicit(&RT.err_epoch, epoch, memory_order_relaxed);               /* (the stream of the item that was bad, not the one that is current now: if that has ended meanwhile the error is stale and dropped, not the next stream's) */
   atomic_store_explicit(&RT.err, true, memory_order_release);
+  atomic_store_explicit(&RT.err_lock, false, memory_order_release);
   RT.failed = true;
   rt_notify();
 }
@@ -270,7 +274,7 @@ static void rt_page(const rt_item_t *it, int64_t *apply_ns, uint64_t *entries) {
   char why[KDB_REASON_LEN];
   kdb_rc_t rc = kdb_man_page(&RT.man, &fr, &RT.msg, why, sizeof(why));
   if (rc != KDB_OK) {
-    rt_fail(why);
+    rt_fail(why, it->epoch);
     return;
   }
   dbrt_counts_t c;
@@ -320,7 +324,7 @@ static void rt_end(const rt_item_t *it) {
   char why[KDB_REASON_LEN];
   kdb_rc_t rc = kdb_man_end(&RT.man, me, why, sizeof(why));
   if (rc != KDB_OK) {
-    rt_fail(why);
+    rt_fail(why, it->epoch);
     return;
   }
   if (RT.skip) {

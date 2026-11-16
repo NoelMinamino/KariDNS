@@ -1499,6 +1499,49 @@ static void test_lookup_pending(void) {
   park_free(&t);
 }
 
+/* 0.7 review: the claim of a lookup is a key of its own, not the zone's (a lookup of the name "x.test." in flight must not make the fetch of the zone "x.test." a duplicate), and the end of a
+ * claimed request is told to the workers that asked for it, not pushed into the wake ring of every worker (a flood of shed requests overflowed the rings) */
+static void test_lookup_claim_and_workers(void) {
+  printf("[claims: the key of a lookup, the workers of a claim]\n");
+  const uint64_t zk = park_claim_key("v1", "x.test."), lk = park_lookup_claim_key("v1", "x.test.");
+  CHECK(zk != 0 && lk != 0 && zk != lk && lk == park_lookup_claim_key("v1", "x.test.") && lk != park_lookup_claim_key("v2", "x.test."));
+  CHECK(park_claim_mark(lk) && park_claim_held(lk) && !park_claim_held(zk));          /* (the lookup's mark is not the zone's) */
+  CHECK(park_claim_mark(zk) && park_claim_held(zk));                                  /* ... and the zone's fetch may still be claimed */
+  park_claim_clear(lk);
+  CHECK(!park_claim_held(lk) && park_claim_held(zk));
+  park_claim_clear(zk);
+  CHECK(!park_claim_held(zk));
+  /* the workers that asked: only they get the key; the wake rings of the others stay empty */
+  for (int w = 0; w < 5; w++) park_register_worker(w, -1);
+  park_key_t k;
+  for (int w = 0; w < 5; w++) while (park_wake_pop(park_wake_ring(w), &k)) {}
+  CHECK(park_claim_mark(lk));
+  park_claim_note_worker(lk, 1);
+  park_claim_note_worker(lk, 3);
+  park_claim_note_worker(lk, 3);
+  park_claim_note_worker(lk, -1);                                                     /* (not a worker: ignored) */
+  park_claim_note_worker(lk, 99999);
+  park_wake_queue_claim("v1", "x.test.", lk, false, PARK_ASK_DROP);
+  int got[5] = {0};
+  for (int w = 0; w < 5; w++) while (park_wake_pop(park_wake_ring(w), &k)) { got[w]++; CHECK(k.ask == PARK_ASK_DROP && k.key == park_name_key("v1", "x.test.") && !k.failed); }
+  CHECK(got[0] == 0 && got[1] == 1 && got[2] == 0 && got[3] == 1 && got[4] == 0);
+  park_wake_queue_claim("v1", "x.test.", lk, true, 0);                                /* (a failure: the same workers, with the failed flag) */
+  for (int w = 0; w < 5; w++) { int n = 0; while (park_wake_pop(park_wake_ring(w), &k)) { n++; CHECK(k.failed && k.ask == 0); } CHECK(n == ((w == 1 || w == 3) ? 1 : 0)); }
+  park_claim_clear(lk);                                                               /* the claim is over: the set goes with it */
+  park_wake_queue_claim("v1", "x.test.", lk, false, 0);                               /* a claim nobody knows is told to every worker that is registered */
+  for (int w = 0; w < 5; w++) { int n = 0; while (park_wake_pop(park_wake_ring(w), &k)) n++; CHECK(n == 1); }
+  CHECK(park_claim_mark(lk));                                                         /* a claim with no worker noted: every worker too (nothing is known) */
+  park_wake_queue_claim("v1", "x.test.", lk, false, PARK_ASK_DROP);
+  for (int w = 0; w < 5; w++) { int n = 0; while (park_wake_pop(park_wake_ring(w), &k)) n++; CHECK(n == 1); }
+  park_claim_note_worker(lk, 1);
+  park_claim_clear(lk);
+  CHECK(park_claim_mark(lk));                                                         /* a mark that was cleared and made again starts with no worker (a stale bit would limit the wake to worker 1) */
+  park_wake_queue_claim("v1", "x.test.", lk, false, PARK_ASK_DROP);
+  for (int w = 0; w < 5; w++) { int n = 0; while (park_wake_pop(park_wake_ring(w), &k)) n++; CHECK(n == 1); }
+  park_claim_clear(lk);
+  for (int w = 0; w < 5; w++) park_unregister_worker(w);
+}
+
 int main(int argc, char **argv) {
   g_self = argv[0];
   if (argc > 1 && strcmp(argv[1], "parkmem") == 0) return park_mem_child();
@@ -1527,6 +1570,7 @@ int main(int argc, char **argv) {
   test_lookup_room();
   test_end_and_counters();
   test_lookup_pending();
+  test_lookup_claim_and_workers();
 #ifdef __FreeBSD__
   test_wake_queue();
   test_sleep_protocol();

@@ -276,6 +276,14 @@ bool park_claim_mark(uint64_t key);
 void park_claim_clear(uint64_t key);
 /* The worker's side of a claim that was not used (the park table was full, the ring was full): the mark is cleared. */
 void park_claim_release(const char *view, const char *zone);
+/* The key of the claim of a by-name LOOKUP (0.7): a space of its own, not the zone's: a lookup of the name "example.test" and the fetch of the zone "example.test" are two requests that never stand in for each other
+ * (one claim mark for both made the ingest thread drop a zone fetch as the duplicate of a lookup).
+ * The workers that asked for a claim are remembered with it (park_claim_note_worker(), at most PARK_MAX_WORKERS), so that the end of a request that the ingest thread sheds, refuses or lets run out of time is told to
+ * those workers, not pushed into the wake ring of every worker (a flood of shed requests overflowed the rings, and an overflow makes every parked query look again).  The set is a superset (a worker that asked
+ * and is not in it asks again when its own request is handled); a claim that has no slot, or no worker noted, is told to every worker.  park_claim_clear() forgets the set, so the wake goes out before the clear. */
+uint64_t park_lookup_claim_key(const char *view, const char *name);
+void park_claim_note_worker(uint64_t key, int w);
+void park_wake_queue_claim(const char *view, const char *zone, uint64_t ckey, bool failed, uint8_t ask);   /* ask: 0 (woken, or failed), PARK_ASK_DROP (dropped) */
 
 /* ---- the workers' rings, and the notifications ---- */
 /* Worker w (0 .. PARK_MAX_WORKERS-1) has its rings in these arrays.  kq: the kqueue the ingest thread triggers (-1: no notification,

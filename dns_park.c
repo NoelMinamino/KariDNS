@@ -1168,6 +1168,11 @@ static _Atomic uint64_t g_claim[PARK_CLAIM_SLOTS];       /* 0: free */
 
 uint64_t park_claim_key(const char *view, const char *zone) { return name_key(view, zone); }
 
+/* a lookup's claim lives in a space of its own (the salt is the one park_bg_attach() uses for its table) */
+uint64_t park_lookup_claim_key(const char *view, const char *name) { return (name_key(view, name) ^ 0x9E3779B97F4A7C15ull) | 1; }
+
+static _Atomic uint64_t g_claim_w[PARK_CLAIM_SLOTS][PARK_MAX_WORKERS / 64];        /* the workers that asked for the claim in the slot (512 KB, untouched until a claim is marked) */
+
 static size_t claim_slot(uint64_t key, unsigned j) { return (size_t)(((key >> 8) + j) & (PARK_CLAIM_SLOTS - 1u)); }
 
 bool park_claim_held(uint64_t key) {
@@ -1189,13 +1194,51 @@ bool park_claim_mark(uint64_t key) {
 
 void park_claim_clear(uint64_t key) {
   for (unsigned j = 0; j < PARK_CLAIM_WIN; j++) {
-    _Atomic uint64_t *s = &g_claim[claim_slot(key, j)];
+    const size_t si = claim_slot(key, j);
+    _Atomic uint64_t *s = &g_claim[si];
+    if (atomic_load_explicit(s, memory_order_acquire) == key)           /* (only the owner of a slot clears it: the set of workers goes with the claim; a worker that notes itself later leaves a bit that costs one more wake) */
+      for (unsigned k = 0; k < PARK_MAX_WORKERS / 64; k++) atomic_store_explicit(&g_claim_w[si][k], 0, memory_order_relaxed);
     uint64_t v = key;
     (void)atomic_compare_exchange_strong_explicit(s, &v, 0, memory_order_acq_rel, memory_order_relaxed);
   }
 }
 
 void park_claim_release(const char *view, const char *zone) { park_claim_clear(name_key(view, zone)); }
+
+void park_claim_note_worker(uint64_t key, int w) {
+  if (key == 0 || w < 0 || w >= PARK_MAX_WORKERS) return;
+  for (unsigned j = 0; j < PARK_CLAIM_WIN; j++) {
+    const size_t si = claim_slot(key, j);
+    if (atomic_load_explicit(&g_claim[si], memory_order_acquire) == key) {
+      atomic_fetch_or_explicit(&g_claim_w[si][w / 64], 1ull << (w % 64), memory_order_relaxed);
+      return;
+    }
+  }
+}
+
+/* the end of the request a claim stands for is told to the workers that asked for it, to every worker when nothing is known (see park_lookup_claim_key() in dns_park.h).  The key of the entries is the name's: name_key(). */
+void park_wake_queue_claim(const char *view, const char *zone, uint64_t ckey, bool failed, uint8_t ask) {
+  size_t vl, zl;
+  if (!key_fits(view, zone, &vl, &zl)) return;
+  const uint64_t key = name_key(view, zone);
+  uint64_t m[PARK_MAX_WORKERS / 64] = {0};
+  bool known = false;
+  for (unsigned j = 0; ckey && j < PARK_CLAIM_WIN && !known; j++) {
+    const size_t si = claim_slot(ckey, j);
+    if (atomic_load_explicit(&g_claim[si], memory_order_acquire) != ckey) continue;
+    for (unsigned k = 0; k < PARK_MAX_WORKERS / 64; k++) {
+      m[k] = atomic_load_explicit(&g_claim_w[si][k], memory_order_relaxed);
+      if (m[k]) known = true;
+    }
+    break;
+  }
+  if (!known) {
+    for (int w = 0; w < PARK_MAX_WORKERS; w++) wake_key_one(w, key, failed, false, false, ask);
+    return;
+  }
+  for (unsigned k = 0; k < PARK_MAX_WORKERS / 64; k++)
+    for (uint64_t b = m[k]; b; b &= b - 1) wake_key_one((int)(k * 64 + (unsigned)__builtin_ctzll(b)), key, failed, false, false, ask);
+}
 
 void park_stats_get(park_stats_t *out) {
   out->full = atomic_load_explicit(&g_park_full, memory_order_relaxed);

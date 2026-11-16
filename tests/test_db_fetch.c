@@ -1373,7 +1373,7 @@ int main(void) {
         CHECK(park_fetch_request(0, "default", "r.test.", KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL));        /* (r.test. is out of memory after the failure above) */
         CHECK(ch_next(&fetchc, &m, 5000) && m.type == KDB_T_FETCH_REQ);
         send_failed_why(f[0], &e, 0, "r.test.", m.u.fetch_req.request_id, KDB_FETCH_BUSY_REASON);
-        CHECK(wake_next(&k, 5000) && park_key_is(&k, "default", "r.test.") && k.failed);
+        CHECK(wake_next(&k, 5000) && park_key_is(&k, "default", "r.test.") && !k.failed && k.ask == PARK_ASK_DROP);       /* (0.7: busy is overload: the queries that wait are dropped and counted, not answered SERVFAIL) */
         CHECK(fq_field("loader_busy", 0) == busy0 + 1);                                 /* (counted) */
         CHECK(fq_field("peak", 0) >= 1 && fq_field("in_flight", 0) == 0);
         CHECK(park_fetch_request(0, "default", "r.test.", KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL));
@@ -2051,13 +2051,13 @@ int main(void) {
             CHECK(ST("fetchq", "queue_dropped") == d0 + 2 && !park_claim_held(park_claim_key("default", cz[16])) && !park_claim_held(park_claim_key("default", cz[17])));
             CHECK(park_places_used() == 2 && ST("cache", "shed") == s0 && ST("cache", "room_timeouts") == to0 && ST("cache", "room_waits") == rw0);   /* (not held up by room) */
             CHECK(!ch_next(&fetch5, &m2, 100));                                      /* (nothing was fetched for them) */
-            for (int w = 0; w < GS_W; w++) {                                         /* every worker is woken (not failed): a query with time left asks again */
+            for (int w = 0; w < GS_W; w++) {                                         /* the workers that asked are woken (not failed): a query with time left asks again; the others are not troubled (the claim knows who asked: worker 0 for cz[16], worker 1 for cz[17]) */
                 int seen = 0;
                 while (wake_ring_next(w, &k1, 300)) {
-                    CHECK(!k1.failed && (park_key_is(&k1, "default", cz[16]) || park_key_is(&k1, "default", cz[17])));
+                    CHECK(!k1.failed && (park_key_is(&k1, "default", cz[w == 0 ? 16 : 17])));
                     seen++;
                 }
-                CHECK(seen == 2);
+                CHECK(seen == (w == 0 || w == 1 ? 1 : 0));
             }
             /* ... and does: a new entry; a place is freed, and the request goes out */
             CHECK(worker_ask(2, COLD_EL(16), "default", cz[16], KDB_FETCH_FULL) == 1);

@@ -1730,6 +1730,12 @@ static int attach_build(const char *view, const char *zone, uint32_t zid, const 
     const bool timed = (val_n++ % VAL_SAMPLE) == 0;
     const int64_t tv0 = timed ? mono_ns() : 0;
     int vr = zone_image_validate(img.data, img.len, vw, sizeof(vw));
+    /* the rules of the zone and of every source of a zone (RFC 9276 iterations are in the structure check; the owners under the apex, the RRs, the SOA, ALIAS and singleton rules): an image that an older build wrote,
+     * or that was stored before a rule was made, is looked at as an image that comes from the loader now.  The limits of the configuration follow below, when the settings of the zone are known. */
+    if (vr == 0) {
+      const zone_image_policy_t pol = { zone, sz->serial, UINT64_MAX, 0, 0, 0, true, (zi->flags & ZONE_IMAGE_F_TINYDNS) != 0 };
+      vr = zone_image_check_policy(img.data, img.len, &pol, vw, sizeof(vw));
+    }
     if (timed) atomic_fetch_add(&G.validate_ns, (uint64_t)(mono_ns() - tv0) * VAL_SAMPLE);
     atomic_fetch_add(&G.validated, 1);
     if (vr != 0) {
@@ -1765,6 +1771,15 @@ static int attach_build(const char *view, const char *zone, uint32_t zid, const 
       goto fail;
     }
     zone_ext_shared_ref(b->sh);
+  }
+  /* max-records, max-records-per-type, max-types-per-name and max-zone-ttl as they are now: the image was checked against the limits that were in force when its body came, and a limit that was tightened since (a
+   * reload) or an image from an older build must not attach unchecked.  A zone over a limit is read from the database again (the record becomes KNOWN), where the body is refused with the reason and the record is marked
+   * refused, as the zone would be at a first load. */
+  if (zone_limits_gate_settings(view, zone, b->sh, zi, "the attach of the stored zone") != 0) {
+    b->damaged = true;
+    b->cause = STORE_ATT_ERR_INVALID;
+    b->why = "the image is over a limit of the configuration";
+    goto fail;
   }
   entry = db_ingest_new_entry(view, zone, b->sh);
   if (!entry) {
@@ -2540,6 +2555,8 @@ static struct {
   int vid;
   char view[STORE_VIEW_NAME_MAX + 1];
   bits_t seen;
+  bits_t lk;                        /* the records that a lookup's answer made or changed during the pass (db_recon_lookup(), the ingest thread, under mu): newer than the page the loader read earlier, and not unlisted (the sweep) */
+  _Atomic bool lk_any;
   bool failed;                      /* an entry of this pass could not be recorded (or its bit could not be set): the pass sweeps nothing and keeps no cursor */
   int64_t t0_ns;
   /* the secondary and catalog records that the scan has asked for since the start (the zone loads once a run unless it changes) */
@@ -2856,6 +2873,23 @@ static void np_clear(uint32_t zid) {
   rc_unlock();
 }
 
+/* The reconcile thread applies the entries of a pass (db_recon_entry_n()) while the ingest thread applies the answers of the lookups (db_recon_lookup()): an entry of the pass was read by the loader some time before it
+ * is applied, an answer is read by the loader when it is asked for, so an answer that was applied during the pass is the newer.  The records the answers made are marked (RC.lk); the entry of the pass leaves such a record as it is,
+ * and the sweep does not take it for unlisted (the zone exists in the database: the loader found it). */
+static _Thread_local bool t_pass_apply;
+static bool lk_has(uint32_t zid) {
+  if (zid == STORE_NONE || !atomic_load_explicit(&RC.lk_any, memory_order_acquire)) return false;
+  rc_lock();
+  const bool b = bits_get(&RC.lk, zid);
+  rc_unlock();
+  return b;
+}
+static void lk_mark(const char *view, uint32_t zid) {
+  rc_lock();
+  if (RC.active && zid != STORE_NONE && strcmp(view, RC.view) == 0 && bits_set(&RC.lk, zid)) atomic_store_explicit(&RC.lk_any, true, memory_order_release);
+  rc_unlock();
+}
+
 static int recon_decide_locked(store_t *st, const char *view, const db_recon_entry_t *e, rc_look_t *lk, uint32_t *zid_out) {
   const char *name = lk->name;
   const size_t nlen = lk->nlen;
@@ -2896,7 +2930,9 @@ static int recon_decide_locked(store_t *st, const char *view, const db_recon_ent
     const bool known = rs.state == STORE_STATE_KNOWN, stale = (rs.flags & STORE_F_STALE) != 0, rej = (rs.flags & STORE_F_REJECTED_NEW) != 0;
     const bool kind_eq = ((rs.flags & STORE_F_NONSTORE) != 0) == np;
     const bool stamp_eq = e->stamped && rs.stamp_gen == e->gen && rs.stamp_time == e->time;
-    if (!kind_eq) {                                         /* a primary became a secondary or the other way: the zone is made again (its image is not the new kind's) */
+    if (t_pass_apply && lk_has(zid)) {                      /* the record is what a lookup's answer made during this pass: newer than this entry's page, which stays unapplied */
+      res = DBR_SAME;
+    } else if (!kind_eq) {                                         /* a primary became a secondary or the other way: the zone is made again (its image is not the new kind's) */
       r = store_set_known(st, (uint16_t)vid, name, nlen, &m, &zid);
       res = DBR_CHANGED;
     } else if (np) {                                        /* a secondary or catalog zone: the record is only the memory of it */
@@ -3102,6 +3138,19 @@ int db_recon_change(const char *view, const db_recon_entry_t *e, uint32_t *zid) 
   return r;
 }
 
+/* the answer of a lookup (the ingest thread): as a CHANGES upsert, and the record is marked for the pass that may be going on (see lk_mark()); the mark is made under the mutex of the writers, so the sweep, which
+ * deletes under it, sees the record or the mark */
+int db_recon_lookup(const char *view, const db_recon_entry_t *e, uint32_t *zid) {
+  uint32_t z = STORE_NONE;
+  rec_lock();
+  int r = recon_apply_locked(view, e, &z);
+  if (r >= 0) lk_mark(view, z);
+  rec_unlock();
+  rc_count(r, false);
+  if (zid) *zid = z;
+  return r;
+}
+
 void db_recon_change_n(const char *view, const db_recon_entry_t *e, size_t n, int *res, uint32_t *zid) {
   db_recon_apply_n(view, e, n, res, zid);
   rc_count_n(res, n, false);
@@ -3135,6 +3184,8 @@ bool db_recon_begin(const char *view, uint64_t estimate, bool force, char *why, 
   un_mark(view);
   rc_lock();
   bits_free(&RC.seen);
+  bits_free(&RC.lk);
+  atomic_store_explicit(&RC.lk_any, false, memory_order_relaxed);
   RC.active = true;
   RC.force = force;
   RC.failed = false;
@@ -3169,7 +3220,9 @@ void db_recon_entry_n(const db_recon_entry_t *e, size_t n, int *res, uint32_t *z
   void (*hook)(void) = atomic_load_explicit(&db_recon_test_entry_hook, memory_order_relaxed);
   if (hook)
     for (size_t i = 0; i < n; i++) hook();                           /* (tests: an entry of a pass that takes time) */
+  t_pass_apply = true;
   db_recon_apply_n(RC.view, e, n, res, zid);
+  t_pass_apply = false;
   for (size_t i = 0; i < n; i++) {
     bool seen_ok = bits_set(&RC.seen, zid[i]);
     if (atomic_load_explicit(&db_store_test_bits_fail, memory_order_relaxed) > 0 && atomic_fetch_sub_explicit(&db_store_test_bits_fail, 1, memory_order_relaxed) == 1) seen_ok = false;      /* (tests: the bit of the n-th entry of a pass could not be set: no memory) */
@@ -3193,6 +3246,8 @@ void db_recon_abort(void) {
     syslog(LOG_WARNING, "[Store] the pass of view '%s' was cut off (the loader's stream ended); nothing is swept, the next pass starts again", RC.view);
     RC.active = false;
     bits_free(&RC.seen);
+    bits_free(&RC.lk);
+    atomic_store_explicit(&RC.lk_any, false, memory_order_relaxed);
   }
   rc_unlock();
 }
@@ -3200,7 +3255,7 @@ void db_recon_abort(void) {
 /* the zones of the view in the store, a few thousand at a time (the read section does not last for a pass over ten million zones) */
 #define RC_CHUNK 4096u
 #define RC_VICTIMS 128u
-typedef struct { char zone[STORE_NAME_MAX + 2]; int64_t sid; } rc_victim_t;
+typedef struct { char zone[STORE_NAME_MAX + 2]; int64_t sid; uint32_t zid; } rc_victim_t;
 
 void db_recon_end(bool complete, uint64_t n_skipped, bool cursor_valid, uint64_t cursor, const uint8_t *ident, size_t ident_len, db_recon_end_t *out) {
   memset(out, 0, sizeof(*out));
@@ -3238,7 +3293,7 @@ void db_recon_end(bool complete, uint64_t n_skipped, bool cursor_valid, uint64_t
       }
       if (more < 0 || z.view != (uint16_t)vid) continue;
       total++;
-      if (!bits_get(&RC.seen, z.zid)) unlisted++;
+      if (!bits_get(&RC.seen, z.zid) && !lk_has(z.zid)) unlisted++;
     }
     store_read_unlock();
   }
@@ -3290,14 +3345,17 @@ void db_recon_end(bool complete, uint64_t n_skipped, bool cursor_valid, uint64_t
             end = true;
             break;
           }
-          if (more < 0 || z.view != (uint16_t)vid || bits_get(&RC.seen, z.zid)) continue;
+          if (more < 0 || z.view != (uint16_t)vid || bits_get(&RC.seen, z.zid) || lk_has(z.zid)) continue;
           snprintf(vic[nv].zone, sizeof(vic[nv].zone), "%s.", z.name);
           vic[nv].sid = z.source_id;
+          vic[nv].zid = z.zid;
           nv++;
         }
         store_read_unlock();
         for (unsigned i = 0; i < nv; i++) {
-          int dr = dbreg_delete(view, vic[i].zone, vic[i].sid);
+          rec_lock();                                     /* every writer of a record's existence holds the mutex for its step (the commit of a body, a lookup's answer, a CHANGES entry run on other threads now): the lookup's mark is looked at again under it */
+          int dr = lk_has(vic[i].zid) ? 0 : dbreg_delete(view, vic[i].zone, vic[i].sid);
+          rec_unlock();
           if (dr > 0) deleted++;
           else if (dr < 0) nfail++;                       /* (the store could not delete it: it stays, and is listed by no database: the next pass tries again) */
         }
@@ -3334,6 +3392,8 @@ done:
   RC.active = false;
   RC.s.duration_ms = out->duration_ms;
   bits_free(&RC.seen);
+  bits_free(&RC.lk);
+  atomic_store_explicit(&RC.lk_any, false, memory_order_relaxed);
   rc_unlock();
 }
 
@@ -3397,16 +3457,25 @@ int db_recon_scan(uint32_t *cursor, unsigned budget, db_scan_item_t *out) {
     if (more < 0) continue;
     const bool np = (z.flags & STORE_F_NONSTORE) != 0;
     bool want;
+    const char *vn = store_view_name(st, z.view);
     if (np) {
-      rc_lock();                                            /* (the reconcile thread clears bits of np_done when a record changes) */
-      want = !bits_get(&RC.np_done, z.zid);
+      /* (the reconcile thread clears the bit of np_done when a record changes, after it wrote the change: the bit is set first, then the record is read again, so a change that cleared the bit before is in what is read and one that comes after clears it again) */
+      rc_lock();
+      want = vn && !bits_get(&RC.np_done, z.zid) && bits_set(&RC.np_done, z.zid);
       rc_unlock();
+      if (want) {
+        store_zone_t z2;
+        if (store_zone_get(st, z.zid, &z2) == 0) {
+          z = z2;
+        } else {
+          np_clear(z.zid);                                  /* (the record is gone or cannot be read: asked for again if it comes back) */
+          want = false;
+        }
+      }
     }
     else if (z.flags & STORE_F_REJECTED_NEW) want = false;
     else want = z.state == STORE_STATE_KNOWN || (z.flags & STORE_F_STALE) != 0;
-    if (!want) continue;
-    const char *vn = store_view_name(st, z.view);
-    if (!vn) continue;
+    if (!want || !vn) continue;
     snprintf(out->view, sizeof(out->view), "%s", vn);
     snprintf(out->zone, sizeof(out->zone), "%s.", z.name);
     out->source_id = z.source_id;
@@ -3414,11 +3483,6 @@ int db_recon_scan(uint32_t *cursor, unsigned budget, db_scan_item_t *out) {
     out->nonstore = np;
     out->stamp_gen = z.stamp_gen;
     out->stamp_time = z.stamp_time;
-    if (np) {
-      rc_lock();
-      bits_set(&RC.np_done, z.zid);
-      rc_unlock();
-    }
     rc = 1;
     break;
   }
