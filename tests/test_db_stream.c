@@ -22,6 +22,7 @@
 
 #include "../dns_db_stream.h"
 #include "../dns_db_checkproto.h"
+#include "../dns_zone_image.h"
 
 static int g_checks = 0, g_failed = 0;
 #define CHECK(cond) do { g_checks++; if (!(cond)) { g_failed++; \
@@ -526,9 +527,9 @@ static void test_tlv_rejects(void) {
     /* unknown tags: beyond the table and 0 */
     kdb_enc_reset(&e); m_hello(&e, 1);
     kdb_enc_reset(&e); kdb_enc_begin(&e, KDB_T_HELLO);
-    kdb_enc_u16(&e, 1, 1); kdb_enc_str(&e, 2, "x"); kdb_enc_str(&e, 3, "y"); kdb_enc_u32(&e, 4, 1); kdb_enc_u8(&e, 6, 0);
+    kdb_enc_u16(&e, 1, 1); kdb_enc_str(&e, 2, "x"); kdb_enc_str(&e, 3, "y"); kdb_enc_u32(&e, 4, 1); kdb_enc_u8(&e, 7, 0);
     kdb_enc_end(&e);
-    CHECK_RC("unknown tag 6", send_enc(KDB_S_AWAIT_HELLO, &e), KDB_E_TLV_UNKNOWN);
+    CHECK_RC("unknown tag 7", send_enc(KDB_S_AWAIT_HELLO, &e), KDB_E_TLV_UNKNOWN);
     {   /* (the encoder refuses tag 0 itself; the body is made by hand) */
         const uint8_t tag0[] = { 0, 0, 0, 1, 1 };
         kdb_enc_reset(&e); kdb_enc_begin(&e, KDB_T_HELLO);
@@ -698,10 +699,10 @@ static void test_tlv_rejects(void) {
     {   /* reserved zone flag bit */
         uint8_t dig[KDB_DIGEST_LEN] = { 0 };
         kdb_enc_u16(&e, 1, 0); kdb_enc_name(&e, 2, ZN); kdb_enc_i64(&e, 3, 1); kdb_enc_u8(&e, 4, 0); kdb_enc_u32(&e, 5, 1);
-        kdb_enc_u32(&e, 6, 16); kdb_enc_u64(&e, 7, 4); kdb_enc_bytes(&e, 8, dig, sizeof(dig));
+        kdb_enc_u32(&e, 6, 32); kdb_enc_u64(&e, 7, 4); kdb_enc_bytes(&e, 8, dig, sizeof(dig));
     }
     kdb_enc_end(&e);
-    CHECK_RC("reserved zone flag (bit 4; bit 2 is the tinydns flag since B8, bit 3 the fetch summary of D1a)", send_enc(KDB_S_IN_BATCH, &e), KDB_E_RANGE);
+    CHECK_RC("reserved zone flag (bit 5; bit 2 is the tinydns flag since B8, bit 3 the fetch summary of D1a, bit 4 the zone image of M3)", send_enc(KDB_S_IN_BATCH, &e), KDB_E_RANGE);
     kdb_enc_free(&e);
 }
 
@@ -1357,6 +1358,7 @@ static void ms_changes(kdb_enc_t *e, uint64_t batch, uint16_t view, uint64_t cur
 }
 
 static int gen_corpus_fetch(const char *dir);
+static int gen_corpus_image(const char *dir);
 
 static int gen_corpus(const char *dir) {
     kdb_enc_t e;
@@ -1408,7 +1410,7 @@ static int gen_corpus(const char *dir) {
     m_batch_begin(&e, 7); ms_begin(&e, 7, 0, 0, 0, 0, 2, NULL); ms_page(&e, 7, 0, 0, 2, 1); ms_end(&e, 7, 0, 2, 0, 0, 0, 0, NULL); m_batch_end(&e, 7, 2, 0, 0);
     rc |= write_seed(dir, "seed_loader_store_plain.bin", 0xC1, &e);
     kdb_enc_free(&e);
-    return rc | gen_corpus_fetch(dir);
+    return rc | gen_corpus_fetch(dir) | gen_corpus_image(dir);
 }
 
 /* B6a: BATCH_BEGIN tag 4 request_id (optional u64): the batch answers that RELOAD_REQ */
@@ -3151,6 +3153,320 @@ static void test_split_pages(void) {
     }
     free(s);
 }
+/* ---------------------------------------------------------------- 0.7 M3 step 1: zone images (HELLO KDB_FEAT_IMAGE, ZONE_BEGIN flag KDB_ZF_IMAGE, ZONE_IMAGE) */
+static void im_hello(kdb_enc_t *e, uint32_t features, bool with_version, uint32_t version) {
+    kdb_enc_begin(e, KDB_T_HELLO);
+    kdb_enc_u16(e, 1, 1); kdb_enc_str(e, 2, "karidns-dbloader 0.7"); kdb_enc_str(e, 3, "sqlite3"); kdb_enc_u32(e, 4, 1234);
+    if (features) kdb_enc_u32(e, 5, features);
+    if (with_version) kdb_enc_u32(e, 6, version);
+    kdb_enc_end(e);
+}
+/* ZONE_BEGIN of an image zone; request_id != 0: the fetch stream */
+static void im_begin(kdb_enc_t *e, uint32_t flags, uint64_t rr, bool with_size, uint64_t size, uint8_t kind, uint64_t req) {
+    uint8_t dig[KDB_DIGEST_LEN];
+    memset(dig, 0x42, sizeof(dig));
+    kdb_enc_begin(e, KDB_T_ZONE_BEGIN);
+    kdb_enc_u16(e, 1, 1); kdb_enc_name(e, 2, ZN); kdb_enc_i64(e, 3, 5); kdb_enc_u8(e, 4, kind); kdb_enc_u32(e, 5, 7); kdb_enc_u32(e, 6, flags);
+    kdb_enc_u64(e, 7, rr); kdb_enc_bytes(e, 8, dig, sizeof(dig));
+    if (req) kdb_enc_u64(e, 11, req);
+    if (with_size) kdb_enc_u64(e, 23, size);
+    kdb_enc_end(e);
+}
+/* the octets of an image of `size` octets as far as the state machine looks: the header, then zeros */
+static uint8_t *im_bytes(uint32_t size, uint32_t n_rrs) {
+    uint8_t *b = calloc(1, size);
+    zone_image_t h;
+    memset(&h, 0, sizeof(h));
+    h.magic = ZONE_IMAGE_MAGIC;
+    h.version = ZONE_IMAGE_VERSION;
+    h.total_size = size;
+    h.n_rrs = n_rrs;
+    memcpy(b, &h, sizeof(h));
+    return b;
+}
+static void im_chunk(kdb_enc_t *e, const uint8_t *p, size_t n) { kdb_enc_raw_msg(e, KDB_T_ZONE_IMAGE, p, n); }
+
+/* a session on the first stream that has negotiated images (HELLO) and is in a batch; accept: the Backend takes images */
+static sess_t *im_session(bool accept, uint32_t features, bool with_version, uint32_t version, const kdb_limits_t *lim) {
+    sess_t *s = malloc(sizeof(*s));
+    sess_init(s, lim);
+    kdb_sm_set_image(&s->sm, accept);
+    kdb_enc_t e;
+    kdb_enc_init(&e);
+    im_hello(&e, features, with_version, version);
+    m_batch_begin(&e, 7);
+    CHECK_RC("image session prefix", sess_feed(s, e.buf, e.len, 0), KDB_OK);
+    kdb_enc_free(&e);
+    return s;
+}
+
+/* feed e into s and return the result (a copy of the reason in why) */
+static kdb_rc_t im_send(sess_t *s, const kdb_enc_t *e, char *why) {
+    CHECK(!e->err);
+    kdb_rc_t rc = sess_feed(s, e->buf, e->len, 0);
+    if (why) snprintf(why, KDB_REASON_LEN, "%s", s->reason);
+    return rc;
+}
+
+#define IM_MIN ((uint32_t)(sizeof(zone_image_t) + 8))
+
+static const kdb_limits_t BIGLIM = { 1000, 1ull << 30, NVIEWS };
+
+static void test_zone_image_frames(void) {
+    printf("[zone images: HELLO, ZONE_BEGIN flag and size, ZONE_IMAGE chunks]\n");
+    kdb_enc_t e;
+    kdb_enc_init(&e);
+    kdb_msg_t m;
+    char why[KDB_REASON_LEN];
+    CHECK_STR(kdb_type_name(KDB_T_ZONE_IMAGE), "ZONE_IMAGE");
+    CHECK(KDB_T_ZONE_IMAGE == 20 && KDB_FEAT_IMAGE == 8 && KDB_ZF_IMAGE == 16);
+
+    /* HELLO: the version is there exactly when the feature is; a wrong version is a version error, and the state machine remembers the feature */
+    {
+        sess_t *s = malloc(sizeof(*s));
+        sess_init(s, NULL);
+        im_hello(&e, KDB_FEAT_STORE | KDB_FEAT_IMAGE, true, ZONE_IMAGE_VERSION);
+        CHECK_RC("HELLO with the image feature", im_send(s, &e, why), KDB_OK);
+        CHECK(s->sm.image_hello && s->m.u.hello.image_version == ZONE_IMAGE_VERSION && (s->m.u.hello.features & KDB_FEAT_IMAGE));
+        free(s);
+        s = malloc(sizeof(*s));
+        sess_init(s, NULL);
+        kdb_enc_reset(&e); im_hello(&e, KDB_FEAT_STORE, false, 0);
+        CHECK_RC("HELLO without it", im_send(s, &e, why), KDB_OK);
+        CHECK(!s->sm.image_hello && s->m.u.hello.image_version == 0);
+        free(s);
+        kdb_enc_reset(&e); im_hello(&e, KDB_FEAT_IMAGE, true, ZONE_IMAGE_VERSION + 1);
+        CHECK_RC("HELLO with another image version", send_enc(KDB_S_AWAIT_HELLO, &e), KDB_E_VERSION);
+        kdb_enc_reset(&e); im_hello(&e, KDB_FEAT_IMAGE, true, 0);
+        CHECK_RC("HELLO with image version 0", send_enc(KDB_S_AWAIT_HELLO, &e), KDB_E_VERSION);
+        kdb_enc_reset(&e); im_hello(&e, KDB_FEAT_IMAGE, false, 0);
+        CHECK_RC("HELLO: the feature without a version", send_enc(KDB_S_AWAIT_HELLO, &e), KDB_E_TLV_MISSING);
+        kdb_enc_reset(&e); im_hello(&e, KDB_FEAT_STORE, true, ZONE_IMAGE_VERSION);
+        CHECK_RC("HELLO: a version without the feature", send_enc(KDB_S_AWAIT_HELLO, &e), KDB_E_TLV_MISSING);
+        kdb_enc_reset(&e); kdb_enc_begin(&e, KDB_T_HELLO);
+        kdb_enc_u16(&e, 1, 1); kdb_enc_str(&e, 2, "x"); kdb_enc_str(&e, 3, "y"); kdb_enc_u32(&e, 4, 1); kdb_enc_u32(&e, 5, 0); kdb_enc_u32(&e, 6, 1); kdb_enc_u8(&e, 7, 0);
+        kdb_enc_end(&e);
+        CHECK_RC("HELLO: tag 7 is unknown", send_enc(KDB_S_AWAIT_HELLO, &e), KDB_E_TLV_UNKNOWN);
+    }
+
+    /* ZONE_BEGIN decoding: the flag and tag 23 go together, a primary with data only */
+    {
+        kdb_frame_t fr;
+        kdb_framer_t f;
+        const struct { const char *what; uint32_t flags; bool size; uint64_t sz; uint8_t kind; kdb_rc_t want; } c[] = {
+            { "image flag and size", KDB_ZF_IMAGE, true, 4096, KDB_ZK_PRIMARY, KDB_OK },
+            { "image flag with extended / presigned / tinydns", KDB_ZF_IMAGE | KDB_ZF_EXTENDED | KDB_ZF_PRESIGNED | KDB_ZF_TINYDNS, true, 4096, KDB_ZK_PRIMARY, KDB_OK },
+            { "image flag, no size", KDB_ZF_IMAGE, false, 0, KDB_ZK_PRIMARY, KDB_E_TLV_MISSING },
+            { "size without the flag", 0, true, 4096, KDB_ZK_PRIMARY, KDB_E_RANGE },
+            { "image of no octets", KDB_ZF_IMAGE, true, 0, KDB_ZK_PRIMARY, KDB_E_RANGE },
+            { "image flag on a summary", KDB_ZF_IMAGE | KDB_ZF_SUMMARY, true, 4096, KDB_ZK_PRIMARY, KDB_E_RANGE },
+            { "image flag on a secondary", KDB_ZF_IMAGE, true, 4096, KDB_ZK_SECONDARY, KDB_E_RANGE },
+            { "image flag on a catalog consumer", KDB_ZF_IMAGE, true, 4096, KDB_ZK_CATALOG, KDB_E_RANGE },
+            { "flag bit 5 is reserved", 32, false, 0, KDB_ZK_PRIMARY, KDB_E_RANGE },
+        };
+        for (size_t i = 0; i < sizeof(c) / sizeof(c[0]); i++) {
+            kdb_enc_reset(&e);
+            im_begin(&e, c[i].flags, 4, c[i].size, c[i].sz, c[i].kind, 0);
+            kdb_framer_init(&f, KDB_FROM_LOADER, g_rbuf, sizeof(g_rbuf));
+            CHECK(kdb_framer_feed(&f, e.buf, e.len) == KDB_OK && kdb_framer_next(&f, &fr) == KDB_OK);
+            kdb_rc_t rc = kdb_decode(&fr, NVIEWS, &m, why, sizeof(why));
+            CHECK_RC(c[i].what, rc, c[i].want);
+            if (rc == KDB_OK) CHECK(m.u.zone_begin.image_size == ((c[i].flags & KDB_ZF_IMAGE) ? c[i].sz : 0) && m.u.zone_begin.flags == c[i].flags);
+        }
+    }
+
+    /* the state machine: accepted, with the chunks in any split that adds up */
+    {
+        const uint32_t sizes[] = { IM_MIN, 4096, 3 * 65536, 2 * KDB_MAX_BODY + 64, KDB_MAX_BODY, KDB_MAX_BODY + 8 };
+        for (size_t k = 0; k < sizeof(sizes) / sizeof(sizes[0]); k++) {
+            const uint32_t size = sizes[k];
+            uint8_t *img = im_bytes(size, 9);
+            sess_t *s = im_session(true, KDB_FEAT_STORE | KDB_FEAT_IMAGE, true, ZONE_IMAGE_VERSION, &BIGLIM);
+            kdb_enc_t *big = &e;
+            kdb_enc_reset(big);
+            im_begin(big, KDB_ZF_IMAGE, 9, true, size, KDB_ZK_PRIMARY, 0);
+            size_t off = 0, nmsg = 0;
+            const size_t piece = (k % 2) ? KDB_MAX_BODY : (size > 4000 ? 4000 : size);
+            while (off < size) {
+                size_t n = size - off < piece ? size - off : piece;
+                if (off == 0 && n < sizeof(zone_image_t)) n = sizeof(zone_image_t);
+                im_chunk(big, img + off, n);
+                off += n;
+                nmsg++;
+            }
+            m_zone_end(big, 9);
+            m_batch_end(big, 7, 1, 0, 0);
+            CHECK_RC("image zone", im_send(s, big, why), KDB_OK);
+            CHECK(s->sm.state == KDB_S_READY && s->sm.n_zones == 1 && s->sm.zone_image && s->sm.zone_image_have == size && s->sm.zone_image_msgs == nmsg &&
+                  s->sm.zone_bytes == size);
+            free(s);
+            free(img);
+        }
+        /* a one-chunk image of the header only is the smallest there is */
+        uint8_t *img = im_bytes(IM_MIN, 1);
+        sess_t *s = im_session(true, KDB_FEAT_IMAGE, true, ZONE_IMAGE_VERSION, NULL);
+        kdb_enc_reset(&e);
+        im_begin(&e, KDB_ZF_IMAGE, 1, true, IM_MIN, KDB_ZK_PRIMARY, 0);     /* (rr_count 1: an image has one SOA at least, an AXFR two) */
+        im_chunk(&e, img, IM_MIN);
+        m_zone_end(&e, 1);
+        CHECK_RC("one SOA", im_send(s, &e, why), KDB_OK);
+        free(s);
+        free(img);
+    }
+
+    /* what ZONE_BEGIN must hold */
+    {
+        const struct { const char *what; bool accept; uint32_t feat; bool ver; uint64_t rr; uint64_t size; kdb_rc_t want; } c[] = {
+            { "the Backend does not take images", false, KDB_FEAT_IMAGE, true, 4, 4096, KDB_E_STATE },
+            { "the loader did not say KDB_FEAT_IMAGE", true, KDB_FEAT_STORE, false, 4, 4096, KDB_E_STATE },
+            { "rr_count 0", true, KDB_FEAT_IMAGE, true, 0, 4096, KDB_E_COUNT },
+            { "rr_count above max-zone-records", true, KDB_FEAT_IMAGE, true, 1001, 4096, KDB_E_LIMIT_RECORDS },
+            { "image smaller than a header", true, KDB_FEAT_IMAGE, true, 4, IM_MIN - 8, KDB_E_RANGE },
+            { "image size not a multiple of 8", true, KDB_FEAT_IMAGE, true, 4, 4100, KDB_E_RANGE },
+            { "image size above 4 GiB", true, KDB_FEAT_IMAGE, true, 4, 0x100000000ull, KDB_E_RANGE },
+            { "image size above max-zone-bytes", true, KDB_FEAT_IMAGE, true, 4, 100008, KDB_E_LIMIT_BYTES },
+            { "image size at max-zone-bytes", true, KDB_FEAT_IMAGE, true, 4, 100000, KDB_OK },
+        };
+        for (size_t i = 0; i < sizeof(c) / sizeof(c[0]); i++) {
+            sess_t *s = im_session(c[i].accept, c[i].feat, c[i].ver, ZONE_IMAGE_VERSION, NULL);
+            kdb_enc_reset(&e);
+            im_begin(&e, KDB_ZF_IMAGE, c[i].rr, true, c[i].size, KDB_ZK_PRIMARY, 0);
+            CHECK_RC(c[i].what, im_send(s, &e, why), c[i].want);
+            if (c[i].want != KDB_OK) CHECK(s->sm.state == KDB_S_ERROR && why[0] != '\0');
+            free(s);
+        }
+    }
+
+    /* the ZONE_IMAGE messages: the sum, the first message, the order */
+    {
+        const uint32_t size = 4096;
+        uint8_t *img = im_bytes(size, 4);
+        uint8_t *bad = im_bytes(size, 4);
+        zone_image_t h;
+        struct { const char *what; int variant; kdb_rc_t want; } c[] = {
+            { "first message shorter than the header", 1, KDB_E_LENGTH },
+            { "bad magic", 2, KDB_E_RANGE },
+            { "another image version", 3, KDB_E_RANGE },
+            { "total_size differs from image_size", 4, KDB_E_COUNT },
+            { "n_rrs differs from rr_count", 5, KDB_E_COUNT },
+            { "more octets than announced", 6, KDB_E_LIMIT_BYTES },
+            { "ZONE_END before the image is complete", 7, KDB_E_COUNT },
+            { "ZONE_END without a ZONE_IMAGE", 8, KDB_E_COUNT },
+            { "ZONE_DATA in an image zone", 9, KDB_E_STATE },
+            { "an empty ZONE_IMAGE", 10, KDB_E_LENGTH },
+            { "ZONE_END with another count", 11, KDB_E_COUNT },
+            { "a second message with another header is only octets", 12, KDB_OK },
+        };
+        for (size_t i = 0; i < sizeof(c) / sizeof(c[0]); i++) {
+            sess_t *s = im_session(true, KDB_FEAT_IMAGE, true, ZONE_IMAGE_VERSION, NULL);
+            kdb_enc_reset(&e);
+            im_begin(&e, KDB_ZF_IMAGE, 4, true, size, KDB_ZK_PRIMARY, 0);
+            memcpy(bad, img, size);
+            memcpy(&h, bad, sizeof(h));
+            switch (c[i].variant) {
+            case 1: im_chunk(&e, img, sizeof(zone_image_t) - 8); break;
+            case 2: h.magic ^= 1; memcpy(bad, &h, sizeof(h)); im_chunk(&e, bad, size); m_zone_end(&e, 4); break;
+            case 3: h.version++; memcpy(bad, &h, sizeof(h)); im_chunk(&e, bad, size); m_zone_end(&e, 4); break;
+            case 4: h.total_size += 8; memcpy(bad, &h, sizeof(h)); im_chunk(&e, bad, size); m_zone_end(&e, 4); break;
+            case 5: h.n_rrs++; memcpy(bad, &h, sizeof(h)); im_chunk(&e, bad, size); m_zone_end(&e, 4); break;
+            case 6: im_chunk(&e, img, size); im_chunk(&e, img, 8); break;
+            case 7: im_chunk(&e, img, size - 8); m_zone_end(&e, 4); break;
+            case 8: m_zone_end(&e, 4); break;
+            case 9: im_chunk(&e, img, 1024); m_zone_data(&e, 1, 0, 8); break;
+            case 10: kdb_enc_raw_msg(&e, KDB_T_ZONE_IMAGE, "", 0); break;
+            case 11: im_chunk(&e, img, size); m_zone_end(&e, 5); break;
+            case 12: im_chunk(&e, img, 1024); memset(bad, 0xFF, 1024); im_chunk(&e, bad, size - 1024); m_zone_end(&e, 4); break;
+            }
+            CHECK_RC(c[i].what, im_send(s, &e, why), c[i].want);
+            if (c[i].want != KDB_OK) CHECK(s->sm.state == KDB_S_ERROR && why[0] != '\0');
+            free(s);
+        }
+        free(bad);
+        /* ZONE_IMAGE where no image zone is open: in a batch, ready, in a zone of ZONE_DATA, after ZONE_END */
+        sess_t *s = im_session(true, KDB_FEAT_IMAGE, true, ZONE_IMAGE_VERSION, NULL);
+        kdb_enc_reset(&e); im_chunk(&e, img, 64);
+        CHECK_RC("ZONE_IMAGE outside a zone", im_send(s, &e, why), KDB_E_STATE);
+        free(s);
+        s = im_session(true, KDB_FEAT_IMAGE, true, ZONE_IMAGE_VERSION, NULL);
+        kdb_enc_reset(&e); m_zone_begin(&e, 1, ZN, 4); im_chunk(&e, img, 64);
+        CHECK_RC("ZONE_IMAGE in a zone that did not announce an image", im_send(s, &e, why), KDB_E_STATE);
+        free(s);
+        s = im_session(true, KDB_FEAT_IMAGE, true, ZONE_IMAGE_VERSION, NULL);
+        kdb_enc_reset(&e); im_begin(&e, KDB_ZF_IMAGE, 4, true, size, KDB_ZK_PRIMARY, 0); im_chunk(&e, img, size); m_zone_end(&e, 4); im_chunk(&e, img, 64);
+        CHECK_RC("ZONE_IMAGE after ZONE_END", im_send(s, &e, why), KDB_E_STATE);
+        free(s);
+        /* a zone that is not an image goes on as it did, with a loader that negotiated images and without */
+        s = im_session(true, KDB_FEAT_IMAGE, true, ZONE_IMAGE_VERSION, NULL);
+        kdb_enc_reset(&e); m_zone_begin(&e, 1, ZN, 4); m_zone_data(&e, 4, 0, 8); m_zone_end(&e, 4);
+        CHECK_RC("ZONE_DATA zone beside images", im_send(s, &e, why), KDB_OK);
+        CHECK(!s->sm.zone_image);
+        free(s);
+        /* the abort of a zone with an image, and the next zone is a clean start */
+        s = im_session(true, KDB_FEAT_IMAGE, true, ZONE_IMAGE_VERSION, NULL);
+        kdb_enc_reset(&e); im_begin(&e, KDB_ZF_IMAGE, 4, true, size, KDB_ZK_PRIMARY, 0); im_chunk(&e, img, 1024); m_zone_abort(&e);
+        m_zone_begin(&e, 1, ZN, 4); m_zone_data(&e, 4, 0, 8); m_zone_end(&e, 4);
+        CHECK_RC("abort, then a plain zone", im_send(s, &e, why), KDB_OK);
+        free(s);
+        free(img);
+    }
+
+    /* a ZONE_IMAGE message above the limit of a frame is refused by the framer, and the Backend never sends one */
+    {
+        uint8_t hdr[KDB_HEADER_LEN] = { 'K', 'D', 'B', '1', 0, KDB_T_ZONE_IMAGE, 0, 0, 0, 0x10, 0, 1 };
+        kdb_framer_t f;
+        kdb_framer_init(&f, KDB_FROM_LOADER, g_rbuf, sizeof(g_rbuf));
+        CHECK_RC("ZONE_IMAGE of 1 MiB + 1", kdb_framer_feed(&f, hdr, sizeof(hdr)) == KDB_OK ? kdb_framer_next(&f, &(kdb_frame_t){ 0 }) : KDB_E_STATE, KDB_E_LENGTH);
+        hdr[9] = 0x0F; hdr[10] = 0xFF; hdr[11] = 0xFF;
+        kdb_framer_init(&f, KDB_FROM_BACKEND, g_rbuf, sizeof(g_rbuf));
+        CHECK_RC("ZONE_IMAGE from the Backend", kdb_framer_feed(&f, hdr, sizeof(hdr)) == KDB_OK ? kdb_framer_next(&f, &(kdb_frame_t){ 0 }) : KDB_E_STATE, KDB_E_TYPE);
+        kdb_enc_reset(&e);
+        uint8_t one[8] = { 0 };
+        CHECK(kdb_enc_raw_msg(&e, KDB_T_ZONE_IMAGE, one, sizeof(one)) == 0);
+        kdb_enc_reset(&e);
+        CHECK(kdb_enc_raw_msg(&e, KDB_T_ZONE_IMAGE, one, KDB_MAX_BODY + 1) != 0 && e.err);          /* the encoder keeps to the limit of the type */
+    }
+
+    /* the fetch stream: no HELLO, the caller says that images are taken */
+    {
+        uint8_t *img = im_bytes(4096, 4);
+        for (int accept = 0; accept < 2; accept++) {
+            sess_t *s = malloc(sizeof(*s));
+            sess_init_fetch(s, NULL);
+            kdb_sm_set_image(&s->sm, accept != 0);
+            kdb_enc_reset(&e);
+            im_begin(&e, KDB_ZF_IMAGE, 4, true, 4096, KDB_ZK_PRIMARY, 17);
+            if (accept) { im_chunk(&e, img, 4096); m_zone_end(&e, 4); }
+            CHECK_RC(accept ? "image on the fetch stream" : "image on the fetch stream that does not take it", im_send(s, &e, why), accept ? KDB_OK : KDB_E_STATE);
+            if (accept) CHECK(s->sm.state == KDB_S_READY && s->sm.n_zones == 1);
+            free(s);
+        }
+        free(img);
+    }
+    kdb_enc_free(&e);
+}
+
+
+/* seeds of tests/fuzz/fuzz_db_stream.c for the zone image frames: a first stream that negotiates images and carries two (one in two messages), and a fetch stream with one */
+static int gen_corpus_image(const char *dir) {
+    kdb_enc_t e;
+    kdb_enc_init(&e);
+    int rc = 0;
+    uint8_t *a = im_bytes(2048, 6), *b = im_bytes(4096, 2);
+    im_hello(&e, KDB_FEAT_STORE | KDB_FEAT_IMAGE, true, ZONE_IMAGE_VERSION); m_batch_begin(&e, 7);
+    im_begin(&e, KDB_ZF_IMAGE, 6, true, 2048, KDB_ZK_PRIMARY, 0); im_chunk(&e, a, 2048); m_zone_end(&e, 6);
+    im_begin(&e, KDB_ZF_IMAGE | KDB_ZF_EXTENDED | KDB_ZF_TINYDNS, 2, true, 4096, KDB_ZK_PRIMARY, 0); im_chunk(&e, b, 1500); im_chunk(&e, b + 1500, 4096 - 1500); m_zone_end(&e, 2);
+    m_zone_begin(&e, 1, ZN, 4); m_zone_data(&e, 4, 0, 8); m_zone_end(&e, 4);
+    m_batch_end(&e, 7, 3, 0, 0);
+    rc |= write_seed(dir, "seed_loader_images.bin", 0x80, &e);
+    kdb_enc_reset(&e);
+    im_begin(&e, KDB_ZF_IMAGE, 6, true, 2048, KDB_ZK_PRIMARY, 21); im_chunk(&e, a, 2048); m_zone_end(&e, 6);
+    rc |= write_seed(dir, "seed_fetch_image.bin", 0x88, &e);
+    kdb_enc_free(&e);
+    free(a);
+    free(b);
+    return rc;
+}
+
 int main(int argc, char **argv) {
     if (argc == 3 && strcmp(argv[1], "--gen-corpus") == 0) return gen_corpus(argv[2]) ? 1 : 0;
     test_roundtrip_loader();
@@ -3174,6 +3490,7 @@ int main(int argc, char **argv) {
     test_lookup_proto();
     test_split_pages();
     test_names();
+    test_zone_image_frames();
     printf("\n%d checks, %d failed\n", g_checks, g_failed);
     return g_failed ? 1 : 0;
 }

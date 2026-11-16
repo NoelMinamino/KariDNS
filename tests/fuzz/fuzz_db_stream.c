@@ -8,6 +8,9 @@
  *   bit 4      (install run only) start inside a batch, so a stream of ZONE_BEGIN .. ZONE_END is a valid input
  *   bit 3      D1a: the state machine of the fetch stream (kdb_sm_init_fetch(): request ids, summaries, no batches)
  *   bit 2      D1a step 7: the rest is not a stream but a hot list state file (kdb_hotl_parse(), the merge, the serializer, the parts encoder)
+ * 0.7 M3: the two state machines of the loader -> Backend runs take zone images (kdb_sm_set_image(): a HELLO with KDB_FEAT_IMAGE, or the fetch stream, then ZONE_BEGIN with
+ * the image flag and ZONE_IMAGE messages are reachable) and the harness checks what the machine promises about them; the install run does not take them (the Backend
+ * does not read an image yet).
  * The stream is run twice against the loader -> Backend side (whole buffer and the chosen chunking) and must
  * give the same result; once against the Backend -> loader side with the decoder and the entry iterators; and once
  * more through the install path of the Backend (beta design 8.5, milestone B4b): every ZONE_BEGIN / ZONE_DATA /
@@ -20,6 +23,7 @@
 #include <string.h>
 
 #include "../../dns_db_stream.h"
+#include "../../dns_zone_image.h"
 #include "../../dns_db_install.h"
 #include "../../dns_axfr_ixfr.h"
 #include "../../dns_snapshot_rcu.h"
@@ -51,6 +55,7 @@ static void run_loader(const uint8_t *p, size_t n, size_t chunk, uint8_t sel, ru
     kdb_framer_init(&f, KDB_FROM_LOADER, g_buf, sizeof(g_buf));
     if (sel & 0x08) kdb_sm_init_fetch(&sm, &lim);         /* D1a: the fetch stream (starts in READY) */
     else kdb_sm_init(&sm, &lim);
+    kdb_sm_set_image(&sm, true);
     if (sel & 0x40) sm.state = KDB_S_READY;
     memset(r, 0, sizeof(*r));
     r->sum = 1469598103934665603ull;
@@ -80,6 +85,27 @@ static void run_loader(const uint8_t *p, size_t n, size_t chunk, uint8_t sel, ru
                 if (sm.fetch != (m.u.zone_failed.request_id != 0)) abort();
             }
             if (fr.type == KDB_T_ZONE_DATA) mix(&r->sum, m.u.zone_data.ancount);
+            if (fr.type == KDB_T_ZONE_BEGIN) {              /* 0.7 M3: a zone image is announced as the machine promises: a primary with data, the size of an image within max-zone-bytes */
+                const kdb_zone_begin_t *zb = &m.u.zone_begin;
+                if (((zb->flags & KDB_ZF_IMAGE) != 0) != sm.zone_image || (!sm.zone_image && zb->image_size != 0)) abort();
+                if (sm.zone_image) {
+                    if (zb->image_size != sm.zone_image_size || (zb->image_size & 7) || zb->image_size < sizeof(zone_image_t) + 8 || zb->image_size > 0xFFFFF000u ||
+                        zb->image_size > sm.lim.max_zone_bytes || zb->rr_count == 0 || zb->zone_kind != KDB_ZK_PRIMARY || (zb->flags & KDB_ZF_SUMMARY)) abort();
+                    mix(&r->sum, zb->image_size);
+                }
+            }
+            if (fr.type == KDB_T_ZONE_IMAGE) {              /* the octets come to the size that was announced and never past it; the first message holds the header that says the same as ZONE_BEGIN */
+                if (!sm.zone_image || m.u.zone_image.len == 0 || m.u.zone_image.len > KDB_MAX_BODY || sm.zone_image_have > sm.zone_image_size || sm.zone_bytes != sm.zone_image_have) abort();
+                if (sm.zone_image_msgs == 1) {
+                    zone_image_t h;
+                    if (m.u.zone_image.len < sizeof(h)) abort();
+                    memcpy(&h, m.u.zone_image.body, sizeof(h));
+                    if (h.magic != ZONE_IMAGE_MAGIC || h.version != ZONE_IMAGE_VERSION || h.total_size != sm.zone_image_size || h.n_rrs != sm.zone_rr_declared) abort();
+                }
+                mix(&r->sum, m.u.zone_image.len + sm.zone_image_have);
+            }
+            if (fr.type == KDB_T_ZONE_END && sm.zone_image && sm.zone_image_have != sm.zone_image_size) abort();
+            if (fr.type == KDB_T_HELLO) mix(&r->sum, m.u.hello.features + m.u.hello.image_version);
             if (fr.type == KDB_T_LOOKUP_RESULT) {            /* 0.7: only the fetch stream carries it; a zone found has its entry, as a manifest entry */
                 const kdb_lookup_result_t *l = &m.u.lookup_result;
                 if (!sm.fetch || l->request_id == 0) abort();
@@ -176,6 +202,7 @@ static void run_split(const uint8_t *p, size_t n, uint8_t sel, run_t *r) {
     if (sel & 0x08) kdb_sm_init_fetch(&sm, &lim);
     else kdb_sm_init(&sm, &lim);
     kdb_sm_defer_manifest(&sm);
+    kdb_sm_set_image(&sm, true);
     if (sel & 0x40) sm.state = KDB_S_READY;
     memset(&man, 0, sizeof(man));
     memset(r, 0, sizeof(*r));

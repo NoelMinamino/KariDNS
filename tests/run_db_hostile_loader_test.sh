@@ -187,6 +187,7 @@ run_mode ext-bad-locdef reject "malformed zone data"
 run_mode ext-bad-wrap reject "malformed zone data"
 run_mode ext-long-tag reject "malformed zone data"
 run_mode ext-flag-bit error "value out of range|flags"
+run_mode ext-image-flag error "image"
 run_mode ext-ok ok "" "batch 1 complete: 3 zone(s) received (3 installed"
 # B8t-2: the version 3 SOA set (SOA_SET, the apex SOA RRs as wrapped body RRs)
 run_mode soaset-ok ok "" "batch 1 complete: 3 zone(s) received (3 installed"

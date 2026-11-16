@@ -15,6 +15,9 @@
 #include <sys/stat.h>
 #include "dns_db_stream.h"
 #include "dns_utils.h"
+#include "dns_zone_image.h"      /* the header of an image: magic, version, size, n_rrs (ZONE_IMAGE messages, 0.7 M3) */
+
+_Static_assert(sizeof(zone_image_t) % 8 == 0 && sizeof(zone_image_t) < KDB_MAX_BODY, "KDB_T_ZONE_IMAGE: the first message holds the whole header of the image");
 
 static inline uint16_t be16(const uint8_t *p) { return (uint16_t)((p[0] << 8) | p[1]); }
 static inline uint32_t be32(const uint8_t *p) {
@@ -49,15 +52,16 @@ struct kdb_tdef { const char *name; uint8_t n; const kdb_tspec_t *spec; };
     _Static_assert(sizeof(arr) / sizeof((arr)[0]) <= KDB_MAX_TAGS, "kdb_val_t arrays are KDB_MAX_TAGS long: " nm); \
     static const kdb_tdef_t var = { nm, (uint8_t)(sizeof(arr) / sizeof((arr)[0])), arr }
 
-static const kdb_tspec_t sp_hello[] = { S(KT_U16, KS_REQ, 0), S(KT_STR, KS_REQ, 64), S(KT_STR, KS_REQ, 32), S(KT_U32, KS_REQ, 0), S(KT_U32, 0, 0) };
+static const kdb_tspec_t sp_hello[] = { S(KT_U16, KS_REQ, 0), S(KT_STR, KS_REQ, 64), S(KT_STR, KS_REQ, 32), S(KT_U32, KS_REQ, 0), S(KT_U32, 0, 0), S(KT_U32, 0, 0) };
 static const kdb_tspec_t sp_batch_begin[] = { S(KT_U64, KS_REQ, 0), S(KT_U8, KS_REQ | KS_MAXV, 4), S(KT_U64, KS_REQ, 0), S(KT_U64, 0, 0), S(KT_U64, 0, 0) };
 static const kdb_tspec_t sp_zone_begin[] = {
     S(KT_U16, KS_REQ | KS_VIEW, 0), S(KT_NAME, KS_REQ, 0), S(KT_I64, KS_REQ, 0), S(KT_U8, KS_REQ | KS_MAXV, 2),
-    S(KT_U32, KS_REQ, 0), S(KT_U32, KS_REQ | KS_MAXV, KDB_ZF_PRESIGNED | KDB_ZF_EXTENDED | KDB_ZF_TINYDNS | KDB_ZF_SUMMARY), S(KT_U64, KS_REQ, 0),
+    S(KT_U32, KS_REQ, 0), S(KT_U32, KS_REQ | KS_MAXV, KDB_ZF_PRESIGNED | KDB_ZF_EXTENDED | KDB_ZF_TINYDNS | KDB_ZF_SUMMARY | KDB_ZF_IMAGE), S(KT_U64, KS_REQ, 0),
     S(KT_BYTES, KS_REQ | KS_EXACT, KDB_DIGEST_LEN), S(KT_TEXT, 0, 65535), S(KT_STR, KS_NE, 255), S(KT_U64, 0, 0),
     S(KT_U32, 0, 0), S(KT_U32, 0, 0), S(KT_U32, 0, 0),
     S(KT_NAME, 0, 0), S(KT_NAME, 0, 0), S(KT_U32, KS_MAXV, 2147483647u), S(KT_U32, KS_MAXV, 2147483647u), S(KT_U32, KS_MAXV, 2147483647u),
-    S(KT_BYTES, 0, KDB_APEX_NS_BYTES), S(KT_BYTES, 0, KDB_APEX_GLUE_BYTES), S(KT_BYTES, 0, KDB_NOTIFY_ADDR_BYTES) };
+    S(KT_BYTES, 0, KDB_APEX_NS_BYTES), S(KT_BYTES, 0, KDB_APEX_GLUE_BYTES), S(KT_BYTES, 0, KDB_NOTIFY_ADDR_BYTES),
+    S(KT_U64, 0, 0) };
 static const kdb_tspec_t sp_zone_end[] = { S(KT_U64, KS_REQ, 0) };
 static const kdb_tspec_t sp_zone_abort[] = { S(KT_STR, KS_REQ, 255) };
 static const kdb_tspec_t sp_zone_failed[] = { S(KT_U16, KS_REQ | KS_VIEW, 0), S(KT_NAME, KS_REQ, 0), S(KT_I64, KS_REQ, 0), S(KT_STR, KS_REQ, 255), S(KT_U64, 0, 0) };
@@ -185,6 +189,7 @@ static const kdb_mdef_t mdefs[] = {
     { KDB_T_MANIFEST_END, "MANIFEST_END", KDB_FROM_LOADER, false, KDB_MAX_BODY, &td_manifest_end },
     { KDB_T_CHANGES, "CHANGES", KDB_FROM_LOADER, false, KDB_MAX_BODY, &td_changes },
     { KDB_T_LOOKUP_RESULT, "LOOKUP_RESULT", KDB_FROM_LOADER, false, KDB_MAX_BODY, &td_lookup_result },
+    { KDB_T_ZONE_IMAGE, "ZONE_IMAGE", KDB_FROM_LOADER, true, KDB_MAX_BODY, NULL },
     { KDB_T_CONFIG, "CONFIG", KDB_FROM_BACKEND, false, KDB_MAX_BODY, &td_config },
     { KDB_T_RELOAD_REQ, "RELOAD_REQ", KDB_FROM_BACKEND, false, KDB_MAX_BODY, &td_reload_req },
     { KDB_T_INVENTORY, "INVENTORY", KDB_FROM_BACKEND, false, KDB_MAX_BODY, &td_inventory },
@@ -391,6 +396,12 @@ kdb_rc_t kdb_decode(const kdb_frame_t *fr, uint32_t vc, kdb_msg_t *m, char *why,
     m->type = fr->type;
     m->view_count = vc;
 
+    if (fr->type == KDB_T_ZONE_IMAGE) {   /* 0.7 M3: raw octets of a zone image; what is in them is the business of the state machine (the sum) and of zone_image_validate_ex() */
+        if (fr->len == 0) FAIL(why, wl, KDB_E_LENGTH, "ZONE_IMAGE: no octets");
+        m->u.zone_image.body = fr->body;
+        m->u.zone_image.len = fr->len;
+        return KDB_OK;
+    }
     if (md->raw) {   /* ZONE_DATA: DNS header checks without parsing RRs (RFC 1035 4.1.1, RFC 5936 2.2) */
         const uint8_t *b = fr->body;
         if (fr->len < DNS_HEADER_SIZE) FAIL(why, wl, KDB_E_DNSHDR, "ZONE_DATA: %u bytes, shorter than a DNS header", fr->len);
@@ -423,6 +434,9 @@ kdb_rc_t kdb_decode(const kdb_frame_t *fr, uint32_t vc, kdb_msg_t *m, char *why,
         m->u.hello.driver = gstr(&V(3));
         m->u.hello.pid = (uint32_t)V(4).u;
         m->u.hello.features = V(5).present ? (uint32_t)V(5).u : 0;
+        m->u.hello.image_version = V(6).present ? (uint32_t)V(6).u : 0;
+        if (V(6).present != ((m->u.hello.features & KDB_FEAT_IMAGE) != 0))
+            FAIL(why, wl, KDB_E_TLV_MISSING, "HELLO: the image version (tag 6) is there exactly when the features have KDB_FEAT_IMAGE");
         break;
     case KDB_T_INVENTORY_REQ:
         break;
@@ -458,6 +472,15 @@ kdb_rc_t kdb_decode(const kdb_frame_t *fr, uint32_t vc, kdb_msg_t *m, char *why,
             z->soa_refresh = (uint32_t)V(12).u;
             z->soa_retry = (uint32_t)V(13).u;
             z->soa_expire = (uint32_t)V(14).u;
+        }
+        z->image_size = 0;
+        if (z->flags & KDB_ZF_IMAGE) {          /* 0.7 M3: the data is a zone image: its size is announced, a summary and a secondary have no data at all */
+            if (!V(23).present) FAIL(why, wl, KDB_E_TLV_MISSING, "ZONE_BEGIN: the image flag needs the image size (tag 23)");
+            if ((z->flags & KDB_ZF_SUMMARY) || z->zone_kind != KDB_ZK_PRIMARY || V(23).u == 0)
+                FAIL(why, wl, KDB_E_RANGE, "ZONE_BEGIN: the image flag on a zone that is not a primary with data, or an image of no octets");
+            z->image_size = V(23).u;
+        } else if (V(23).present) {
+            FAIL(why, wl, KDB_E_RANGE, "ZONE_BEGIN: an image size without the image flag");
         }
         z->has_apex = false;
         z->naddrs = NULL;
@@ -1057,7 +1080,7 @@ static bool sm_legal(const kdb_sm_t *sm, uint16_t t) {
     if (sm->fetch) {
         switch (sm->state) {
         case KDB_S_READY: return t == KDB_T_ZONE_BEGIN || t == KDB_T_ZONE_FAILED || t == KDB_T_PROFILE || t == KDB_T_LOOKUP_RESULT;
-        case KDB_S_IN_ZONE: return t == KDB_T_ZONE_DATA || t == KDB_T_ZONE_END || t == KDB_T_ZONE_ABORT;
+        case KDB_S_IN_ZONE: return t == KDB_T_ZONE_DATA || t == KDB_T_ZONE_IMAGE || t == KDB_T_ZONE_END || t == KDB_T_ZONE_ABORT;
         default: return false;
         }
     }
@@ -1070,7 +1093,7 @@ static bool sm_legal(const kdb_sm_t *sm, uint16_t t) {
         if (sm->man_open) return t == KDB_T_MANIFEST || t == KDB_T_MANIFEST_END;       /* WP7a: inside a pass nothing but its pages and its end */
         return t == KDB_T_ZONE_BEGIN || t == KDB_T_ZONE_FAILED || t == KDB_T_ZONE_DELETE || t == KDB_T_PROFILE ||
                t == KDB_T_BATCH_END || t == KDB_T_MANIFEST_BEGIN || t == KDB_T_CHANGES;
-    case KDB_S_IN_ZONE: return t == KDB_T_ZONE_DATA || t == KDB_T_ZONE_END || t == KDB_T_ZONE_ABORT;
+    case KDB_S_IN_ZONE: return t == KDB_T_ZONE_DATA || t == KDB_T_ZONE_IMAGE || t == KDB_T_ZONE_END || t == KDB_T_ZONE_ABORT;
     case KDB_S_ERROR: break;
     }
     return false;
@@ -1102,6 +1125,7 @@ kdb_rc_t kdb_sm_legal_frame(kdb_sm_t *sm, uint16_t type) {
 }
 
 void kdb_sm_defer_manifest(kdb_sm_t *sm) { sm->man_deferred = true; }
+void kdb_sm_set_image(kdb_sm_t *sm, bool accept) { sm->image_accept = accept; }
 
 kdb_rc_t kdb_sm_accept(kdb_sm_t *sm, const kdb_frame_t *fr, kdb_msg_t *m) {
     kdb_rc_t rc = kdb_sm_legal_frame(sm, fr->type);
@@ -1112,6 +1136,9 @@ kdb_rc_t kdb_sm_accept(kdb_sm_t *sm, const kdb_frame_t *fr, kdb_msg_t *m) {
     switch (fr->type) {
     case KDB_T_HELLO:
         if (m->u.hello.proto != KDB_VERSION) SMFAIL(sm, KDB_E_VERSION, "HELLO: protocol version %u, want %u", m->u.hello.proto, KDB_VERSION);
+        if ((m->u.hello.features & KDB_FEAT_IMAGE) && m->u.hello.image_version != ZONE_IMAGE_VERSION)
+            SMFAIL(sm, KDB_E_VERSION, "HELLO: zone image version %u, want %u", m->u.hello.image_version, (unsigned)ZONE_IMAGE_VERSION);
+        sm->image_hello = (m->u.hello.features & KDB_FEAT_IMAGE) != 0;
         sm->state = KDB_S_READY;
         break;
     case KDB_T_INVENTORY_REQ:
@@ -1187,21 +1214,55 @@ kdb_rc_t kdb_sm_accept(kdb_sm_t *sm, const kdb_frame_t *fr, kdb_msg_t *m) {
         if (zk == KDB_ZK_PRIMARY && summary) {
             if (n != 0) SMFAIL(sm, KDB_E_COUNT, "ZONE_BEGIN: a summary has rr_count 0, not %llu", (unsigned long long)n);
         } else if (zk == KDB_ZK_PRIMARY) {
-            if (n < 2) SMFAIL(sm, KDB_E_COUNT, "ZONE_BEGIN: rr_count %llu, an AXFR has at least two SOAs (RFC 5936 2.2)", (unsigned long long)n);
+            if (n < 2 && !(m->u.zone_begin.flags & KDB_ZF_IMAGE)) SMFAIL(sm, KDB_E_COUNT, "ZONE_BEGIN: rr_count %llu, an AXFR has at least two SOAs (RFC 5936 2.2)", (unsigned long long)n);
         } else if (n != 0) {
             /* B7b: a secondary / catalog consumer zone carries no data (the Backend transfers it from the masters in the settings) */
             SMFAIL(sm, KDB_E_COUNT, "ZONE_BEGIN: a secondary zone has rr_count 0, not %llu", (unsigned long long)n);
         }
         if (n > sm->lim.max_zone_records) SMFAIL(sm, KDB_E_LIMIT_RECORDS, "ZONE_BEGIN: rr_count above max-zone-records");
+        sm->zone_image = false;
+        sm->zone_image_size = sm->zone_image_have = 0;
+        sm->zone_image_msgs = 0;
+        if (m->u.zone_begin.flags & KDB_ZF_IMAGE) {
+            /* 0.7 M3: the data is an image.  rr_count is its n_rrs (at least the SOA); the size is a cap that is checked here, before one octet of the image is read:
+             * what a zone image can hold at most (zone_image_validate() works in 32 bits), whole 8-octet units, a header and a strings area, and max-zone-bytes */
+            const uint64_t isz = m->u.zone_begin.image_size;
+            if (!sm->image_accept || (!sm->fetch && !sm->image_hello)) SMFAIL(sm, KDB_E_STATE, "ZONE_BEGIN: a zone image, which was not negotiated (HELLO KDB_FEAT_IMAGE)");
+            if (n < 1) SMFAIL(sm, KDB_E_COUNT, "ZONE_BEGIN: rr_count 0 for a zone image");
+            if (isz < sizeof(zone_image_t) + 8 || isz > 0xFFFFF000u || (isz & 7) != 0) SMFAIL(sm, KDB_E_RANGE, "ZONE_BEGIN: image_size is not the size of an image");
+            if (isz > sm->lim.max_zone_bytes) SMFAIL(sm, KDB_E_LIMIT_BYTES, "ZONE_BEGIN: image_size above max-zone-bytes");
+            sm->zone_image = true;
+            sm->zone_image_size = isz;
+        }
         sm->zone_rr_declared = n;
-        sm->zone_rr_sum = 0;
+        sm->zone_rr_sum = sm->zone_image ? n : 0;       /* (an image has no ANCOUNT to sum: the count is in its header, checked with the first ZONE_IMAGE) */
         sm->zone_bytes = 0;
         sm->zone_data_msgs = 0;
         sm->state = KDB_S_IN_ZONE;
         break;
     }
+    case KDB_T_ZONE_IMAGE: {
+        const uint32_t len = m->u.zone_image.len;
+        if (!sm->zone_image) SMFAIL(sm, KDB_E_STATE, "ZONE_IMAGE: the zone did not announce an image");
+        /* zone_image_have <= zone_image_size <= max_zone_bytes hold here: subtract, never add */
+        if ((uint64_t)len > sm->zone_image_size - sm->zone_image_have) SMFAIL(sm, KDB_E_LIMIT_BYTES, "ZONE_IMAGE: more octets than ZONE_BEGIN announced");
+        if (sm->zone_image_have == 0) {
+            /* the first message: the header of the image says the same as ZONE_BEGIN, so a loader that lies about the size or the count is found before the rest comes */
+            zone_image_t h;
+            if (len < sizeof(h)) SMFAIL(sm, KDB_E_LENGTH, "ZONE_IMAGE: the first message is shorter than the header of an image");
+            memcpy(&h, m->u.zone_image.body, sizeof(h));
+            if (h.magic != ZONE_IMAGE_MAGIC || h.version != ZONE_IMAGE_VERSION) SMFAIL(sm, KDB_E_RANGE, "ZONE_IMAGE: not the header of an image of this version");
+            if ((uint64_t)h.total_size != sm->zone_image_size) SMFAIL(sm, KDB_E_COUNT, "ZONE_IMAGE: the size in the header differs from ZONE_BEGIN");
+            if ((uint64_t)h.n_rrs != sm->zone_rr_declared) SMFAIL(sm, KDB_E_COUNT, "ZONE_IMAGE: the RR count in the header differs from ZONE_BEGIN");
+        }
+        sm->zone_image_have += len;
+        sm->zone_bytes += len;
+        if (sm->zone_image_msgs < UINT32_MAX) sm->zone_image_msgs++;
+        break;
+    }
     case KDB_T_ZONE_DATA: {
         uint32_t len = m->u.zone_data.len;
+        if (sm->zone_image) SMFAIL(sm, KDB_E_STATE, "ZONE_DATA: the zone announced an image");
         /* zone_bytes <= max_zone_bytes and zone_rr_sum <= zone_rr_declared hold here: subtract, never add */
         if ((uint64_t)len > sm->lim.max_zone_bytes - sm->zone_bytes) SMFAIL(sm, KDB_E_LIMIT_BYTES, "ZONE_DATA: zone above max-zone-bytes");
         if (m->u.zone_data.arcount != 0 && sm->zone_data_msgs != 0)
@@ -1215,6 +1276,7 @@ kdb_rc_t kdb_sm_accept(kdb_sm_t *sm, const kdb_frame_t *fr, kdb_msg_t *m) {
     }
     case KDB_T_ZONE_END:
         if (m->u.zone_end.rr_count != sm->zone_rr_declared) SMFAIL(sm, KDB_E_COUNT, "ZONE_END: count differs from ZONE_BEGIN");
+        if (sm->zone_image && sm->zone_image_have != sm->zone_image_size) SMFAIL(sm, KDB_E_COUNT, "ZONE_END: the image is not complete");
         if (sm->zone_rr_sum != sm->zone_rr_declared) SMFAIL(sm, KDB_E_COUNT, "ZONE_END: ANCOUNT sum differs from the declared count");
         sm->n_zones++;
         if (sm->fetch) sm->n_profiles = 0;
