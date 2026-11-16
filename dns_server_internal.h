@@ -916,6 +916,8 @@ typedef struct dbdir_rec {
   uint32_t serial, settings;
   int64_t source_id;
   uint64_t stamp_gen, stamp_time;   /* 0.7 WP7b: the version stamp of the record (the loader's manifest or change entry that asked for this version of the zone) */
+  uint32_t seq;                  /* 0.7 M4: the sequence word of the store's cells at the read (store_zone_unchanged()): the commit of an attach asks "has the record stayed as it was read" with one word, inside the registry lock, instead of searching the name index and reading the cells again */
+  bool seq_set;                  /* seq was filled in (a record that is read by the store; a test that makes a record by hand has none: the commit then reads the record again, as before) */
   uint8_t digest[32];
 } dbdir_rec_t;
 typedef struct dbdir_ops {
@@ -927,6 +929,7 @@ typedef struct dbdir_ops {
   uint32_t (*settings_id)(zone_ext_shared_t *sh);                            /* the id of settings (assigned and made durable when it has none); 0 = none */
   bool (*rec_get)(const char *view, const char *zone, dbdir_rec_t *out);     /* the store's record of a zone (the name with its trailing dot) */
   int (*rec_get_nb)(const char *view, const char *zone, dbdir_rec_t *out);   /* the same without ever sleeping (for a caller that holds the registry lock): 1 found, 0 none, -1 a cell was being written (not known now) */
+  bool (*rec_unchanged)(const dbdir_rec_t *rec);                               /* 0.7 M4: is the record still the one that was read (rec->seq_set, rec->zid, rec->seq)?  One word, no lock, no sleep; NULL: not available */
   int (*put)(const char *view, const char *zone, zone_db_entry_t *entry, int64_t source_id, uint32_t serial, const uint8_t digest[32], uint32_t settings, uint32_t *zid);
   int (*del)(const char *view, const char *zone, int64_t source_id, bool *had);   /* delete by name (when source_id is 0 or the record's) */
   void (*set_known)(uint32_t zid);                                           /* the record loses its image (damaged, or the version is not trusted) */
@@ -1535,6 +1538,17 @@ typedef struct {                 /* what the commit checks against the element (
   uint8_t digest[32];
 } dbreg_attach_info_t;
 int dbreg_attach_store(const char *view, const char *name, const dbdir_rec_t *rec, zone_db_entry_t *entry, bool bg, void (*under_lock)(void *), void *under_arg);
+/* 0.7 M4: up to DBREG_ATT_BATCH attaches in one section of the registry's lock (the hot list).  Each item is judged as dbreg_attach_store() judges it; item->result is DBREG_ATT_*, and an entry is
+ * the registry's only when its result is DBREG_ATT_STARTED (otherwise the caller frees it). */
+#define DBREG_ATT_BATCH 32
+typedef struct dbreg_att_item {
+  const char *view, *name;
+  const dbdir_rec_t *rec;
+  zone_db_entry_t *entry;
+  bool bg;
+  int result;
+} dbreg_att_item_t;
+void dbreg_attach_store_n(dbreg_att_item_t *it, size_t n);
 /* 0.7 fix 7, the worker's attach (dns_db_store.c): the worker makes the entry of a zone whose image is in the page cache and publishes a STAGED element for it (a zdir_elem_t that is not in the
  * registry: only the staging table of dns_db_store.c reaches it), takes no lock of the registry and answers from the entry; a store thread registers the entry (dbreg_attach_store() with the record
  * the staged element holds: dbreg_staged_rec()) and takes the staged element away (dbreg_staged_retire(): freed after the grace period; entry_dead: the registry did not take the entry, it goes too).
