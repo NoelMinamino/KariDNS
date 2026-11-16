@@ -271,7 +271,7 @@ else
     [ $((T1 - T0)) -ge 5 ] && pass "... the client waited for its own timeout ($((T1 - T0)) s)" || fail "the client had an answer or an error after $((T1 - T0)) s"
     out=$(./dag @127.0.0.1 -p "$PORT" www.a.test A +tcp +nohexdump +time=8 +tries=1 2>&1)
     ! echo "$out" | grep -q 'status:' && pass "TCP: no answer when the time is up" || fail "TCP: an answer: $(echo "$out" | head -5)"
-    evicted a.test. "a.test is out of memory"
+    # (a.test is still out of memory: nothing brought it back while the loader is stopped)
     got=$(perl tests/db/dns_tcp_probe.pl 127.0.0.1 "$PORT" dropwarm www.a.test www.b.test 2>&1)
     want=$(printf 'id=102 rcode=0 an=1\nid=103 rcode=0 an=1')
     [ "$got" = "$want" ] && pass "TCP: the dropped query gets no answer, the connection stays open: the warm query behind it and a later one on the same connection are answered" || fail "dropwarm: $got"

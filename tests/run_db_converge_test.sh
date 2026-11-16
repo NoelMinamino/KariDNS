@@ -258,9 +258,9 @@ sleep 1
 LIM=$(stat limit); RES=$(stat resident)
 [ "$RES" -gt $((LIM / 10 * 11)) ] && pass "the zones in memory are above 110% of the limit and stay there ($RES > $LIM)" || fail "resident $RES is not over 110% of $LIM"
 DT0=$($KCTL store -k 2>/dev/null | sed -n 's/^store.park.drop.timeout=//p' | head -1)
-EANS=$(q www.e.test)
+EANS=$(q www.e.test)               # (a dropped query: dag prints its timeout, not an address)
 DT1=$($KCTL store -k 2>/dev/null | sed -n 's/^store.park.drop.timeout=//p' | head -1)
-[ -z "$EANS" ] && oom e.test && [ "${DT1:-0}" -gt "${DT0:-0}" ] 2>/dev/null && pass "a query for a zone out of memory is dropped when park-timeout is over (no address answered, store.park.drop.timeout $DT0 -> $DT1): its request waited for room that could not be made" || fail "www.e.test: answer '$EANS', store.park.drop.timeout $DT0 -> $DT1"
+! echo "$EANS" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' && oom e.test && [ "${DT1:-0}" -gt "${DT0:-0}" ] 2>/dev/null && pass "a query for a zone out of memory is dropped when park-timeout is over (no address answered, store.park.drop.timeout $DT0 -> $DT1): its request waited for room that could not be made" || fail "www.e.test: answer '$EANS', store.park.drop.timeout $DT0 -> $DT1"
 W0=$(walks_now)
 conf "" "memory-limit 1m;"
 $KCTL reconfig > /dev/null 2>&1
