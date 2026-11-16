@@ -355,4 +355,47 @@ int zone_image_rr_to_record(const zone_image_t *img, uint32_t rr, zone_arena_t *
  * The checksum of the stored record is the caller's (the store's) business. */
 int zone_image_validate(const void *buf, size_t len, char *why, size_t whylen);
 
+/* ---- an image that comes from the database loader (0.7 M3) ----
+ *
+ * zone_image_validate() knows the image, not the zone it is for or the stream it came in.  zone_image_validate_ex() adds what the receiver
+ * of a ZONE_BEGIN / ZONE_IMAGE .. ZONE_END sequence knows, and what the ZONE_DATA path used to enforce while it built the zone from wire RRs
+ * (dns_axfr_ixfr.c parse_xfr_packet(), dns_db_install.c).  The image is the loader's claim: everything below is checked, and nothing the
+ * loader says is taken as given.
+ *
+ *   size       len == announced_size (ZONE_BEGIN image_size), <= max_bytes (max-zone-bytes: for a database zone it is the size of the image);
+ *              both are tested before the image is read
+ *   count      n_rrs == rr_count (ZONE_BEGIN) and <= max_records (max-zone-records)
+ *   zone       apex_name names `apex`; every owner is the apex or below it (RFC 1034 §4.2: a zone is its apex and what is below it); every RR is
+ *              of class IN (RFC 1035 §5.2) and not of a meta type (RFC 6895 §3.1: OPT TKEY TSIG IXFR AXFR MAILB MAILA ANY, RFC 9824 NXNAME)
+ *   SOA        SOA RRs are at the apex only, there is at least one with a complete RDATA, at most KARIDNS_SOA_SET_MAX of them, and every one carries
+ *              `serial` (RFC 2181 §6.1: a zone has one serial).  More than one, or one restricted to some clients, needs `extended`, and is not
+ *              allowed in a zone with DNSSEC RRs (the signature of the SOA RRset would not hold for every client); no two apex SOA RRs are seen by
+ *              the same clients (the checks of zone_arena_check_soa_set() and of db_zone_build_install())
+ *   extensions tinydns locations and time stamps, tags and the zone level tables (zattr) only with `extended` (ZONE_BEGIN flag EXTENDED); the
+ *              TINYDNS image flag is `tinydns` (ZONE_BEGIN flag TINYDNS); no ECS trusted resolvers (they come from the zone's settings: a list in the
+ *              image would pass the acl-ceiling); at most XFR_TAGDEF_MAX location and as many ECS tag definitions, XFR_TAGDEF_CIDR_MAX CIDRs in
+ *              them, and XFR_TAGDEF_MAX tinydns locations (the limits of the Extended AXFR reader)
+ * Not checked, as the zone file does not either: the NSEC next-name chain, that an NSEC3 owner is the hash of the name it covers, CNAME / DNAME
+ * shapes, the apex NS RRset, RDATA beyond the names (see zone_image_validate()).  The lookups never follow a stored chain: a false one can only
+ * misanswer inside that zone.
+ *
+ * pol NULL = zone_image_validate().  Returns what zone_image_validate() returns (0 valid, -1 not valid, -2 out of memory); why gets the reason. */
+typedef struct {
+    const char *apex;            /* the zone: canonical absolute name (ZONE_BEGIN) */
+    uint32_t serial;             /* ZONE_BEGIN serial */
+    uint64_t rr_count;           /* ZONE_BEGIN rr_count (= the image's n_rrs) */
+    uint64_t announced_size;     /* ZONE_BEGIN image_size, 0 = not checked */
+    uint64_t max_bytes;          /* max-zone-bytes, 0 = no limit */
+    uint64_t max_records;        /* max-zone-records, 0 = no limit */
+    bool extended;               /* KDB_ZF_EXTENDED */
+    bool tinydns;                /* KDB_ZF_TINYDNS */
+} zone_image_policy_t;
+int zone_image_validate_ex(const void *buf, size_t len, const zone_image_policy_t *pol, char *why, size_t whylen);
+
+/* The limits of a zone on its image: what zone_arena_check_limits() checks on the builder (BIND 9.20 max-records, max-records-per-type,
+ * max-types-per-name, max-zone-ttl; 0 = no limit), with the same verdicts.  Not the same order of findings: the builder is scanned in record
+ * order, the image in owner order, so a zone that breaks two limits may be refused for either.  0 = within the limits, -1 = refused (err says which),
+ * -2 = out of memory.  Allocates a little for an owner that has more RRs than the smallest per-name limit: load path only. */
+int zone_image_check_limits(const zone_image_t *img, const zone_limits_t *lim, char *err, size_t errlen);
+
 #endif
