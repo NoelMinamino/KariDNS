@@ -639,6 +639,13 @@ static int nt_take(int *last, int max) {
 
 /* a store thread that is held before it registers a staged zone (W5b) */
 static _Atomic bool g_adopt_hold;
+static _Atomic int g_bh_arm;
+static void batch_stale_hook(dbdir_rec_t *r) {
+    if (atomic_exchange(&g_bh_arm, 0)) {
+        r->seq += 2;                                                             /* (as if a version came after the record was read) */
+        r->serial += 1;
+    }
+}
 static void adopt_hold_hook(void) {
     for (int t = 0; t < 5000 && atomic_load(&g_adopt_hold); t++) usleep(1000);
 }
@@ -1181,7 +1188,7 @@ static int run_mode(const char *mode) {
             CHECK(en[i] != NULL);
         }
         CHECK(dbdir()->rec_unchanged(&rcs[0]));                                       /* (as it was read) */
-        rcs[0].seq += 2;                                                              /* a2: a version came after the record was read */
+        rcs[0].seq += 2; rcs[0].serial += 1;   /* a2: a version came after the record was read (the word moves, and the record is not the same version: the word alone is no reason, see W5d) */
         CHECK(!dbdir()->rec_unchanged(&rcs[0]));
         CHECK(dbreg_fetch_begin("default", "a4.test.") == DBREG_FETCH_STARTED);       /* a4: a fetch is on its way */
         rcs[3].seq_set = false;                                                       /* a5: a record that carries no sequence word is looked at again by name: another version */
@@ -1202,10 +1209,45 @@ static int run_mode(const char *mode) {
         for (int i = 0; i < 4; i++) free_zone_db_entry(en[i]);                       /* (none of them was taken) */
         CHECK(!in_memory("a2.test.") && !in_memory("a4.test.") && !in_memory("a5.test."));
         dbreg_attach_store_n(it, 0);                                                 /* (nothing to do) */
+        {
+            /* more items than a batch: the registry takes DBREG_ATT_BATCH of them, and says NOT for the rest (the caller keeps their entries) */
+            enum { BIG = DBREG_ATT_BATCH + 8 };
+            static dbdir_rec_t rb;
+            static zone_db_entry_t *eb[BIG];
+            static dbreg_att_item_t ib[BIG];
+            CHECK(in_memory("a1.test.") && dbdir()->rec_get("default", "a1.test.", &rb));
+            for (int i = 0; i < BIG; i++) {
+                eb[i] = db_ingest_new_entry("default", "a1.test.", NULL);
+                ib[i].view = "default";
+                ib[i].name = "a1.test.";
+                ib[i].rec = &rb;
+                ib[i].entry = eb[i];
+                ib[i].bg = false;
+                ib[i].result = -99;
+            }
+            dbreg_attach_store_n(ib, BIG);
+            bool ok = true;
+            for (int i = 0; i < BIG; i++) ok = ok && ib[i].result == (i < DBREG_ATT_BATCH ? DBREG_ATT_RESIDENT : DBREG_ATT_NOT);
+            CHECK(ok);
+            for (int i = 0; i < BIG; i++) free_zone_db_entry(eb[i]);
+        }
         CHECK(dbdir()->attach_count() > 0);
         if (a2_was) CHECK(attach_by_worker("a2.test.", &k) == 1);                          /* (as it was) */
         if (a4_was) CHECK(attach_by_worker("a4.test.", &k) == 1);
         if (a5_was) CHECK(attach_by_worker("a5.test.", &k) == 1);
+        {
+            /* a batched job whose record changed (a version) between the read and the registration: the registry says STALE for it, and the store thread reads the record again and attaches the zone */
+            CHECK(evict_zone("a2.test.") && !in_memory("a2.test."));
+            db_store_counters_t cs0, cs1;
+            db_store_counters(&cs0);
+            atomic_store(&g_bh_arm, 1);
+            db_store_test_batch_hook = batch_stale_hook;
+            CHECK(attach_by_worker("a2.test.", &k) == 1);
+            db_store_test_batch_hook = NULL;
+            db_store_counters(&cs1);
+            CHECK(atomic_load(&g_bh_arm) == 0);                                      /* (the hook changed the record of the job) */
+            CHECK(in_memory("a2.test.") && cs1.attach_ok == cs0.attach_ok + 1);     /* (attached by the second try, counted once) */
+        }
     }
 
     /* -- the commit of an attach is conditional: a delete that comes after the record was read wins, nothing is made */
@@ -2164,6 +2206,42 @@ static int run_mode(const char *mode) {
                 CHECK(in_memory("wn.test.") && dbdir()->attach_get(zn.zid) != NULL);        /* (and registered this time) */
             }
 
+            /* W5d (0.7 M4): a write to the record that is no new version (a stamp, a flag: the store's sequence word moves) between the staging and the registration does not take the zone away: the record is compared
+             *      as it always was when the word is not the same, and it is the same version */
+            {
+                batch_begin(a[0], &e, 95, KDB_BATCH_DIFF);
+                send_zone(a[0], &e, "wf.test.", 3, 0, 5300);
+                batch_end(a[0], &e, &mainc, 95, 1, 0);
+                warm_zone("wf.test.");
+                CHECK(evict_zone("wf.test."));
+                zref_t zf;
+                CHECK(zref_of("wf.test.", &zf) && zf.zid != ZREF_NOZID);
+                dbdir_rec_t rf0, rf1;
+                CHECK(ops->rec_get("default", "wf.test.", &rf0) && rf0.seq_set);
+                db_store_counters(&w0);
+                atomic_store(&g_adopt_hold, true);
+                db_store_test_adopt_hook = adopt_hold_hook;
+                rcu_aux_read_lock();
+                snw = acquire_zone_snapshot();
+                vsw = snapshot_find_view(snw, "default");
+                const bool staged = vsw && ops->worker_attach(vsw, &zf, 0);
+                rcu_aux_read_unlock();
+                CHECK(staged);
+                ops->note_flags(zf.zid, 0x0100, 0);                                    /* (a write to the record: the word moves, the version does not) */
+                CHECK(ops->rec_get("default", "wf.test.", &rf1) && rf1.seq != rf0.seq && rf1.serial == rf0.serial && memcmp(rf1.digest, rf0.digest, 32) == 0);
+                CHECK(!ops->rec_unchanged(&rf0));
+                atomic_store(&g_adopt_hold, false);
+                for (int t = 0; t < 2500; t++) {
+                    db_store_counters(&w1);
+                    if (w1.wa_adopted + w1.wa_lost > w0.wa_adopted + w0.wa_lost) break;
+                    usleep(2000);
+                }
+                db_store_test_adopt_hook = NULL;
+                CHECK(w1.wa_adopted == w0.wa_adopted + 1 && w1.wa_lost == w0.wa_lost);        /* (registered, not dropped) */
+                CHECK(in_memory("wf.test.") && ops->attach_get(zf.zid) != NULL);
+                ops->note_flags(zf.zid, 0, 0x0100);
+            }
+
             /* W6: a zone whose record is damaged: the worker does not attach it (the checksum), says nothing, and the zone is left to the store threads that read it from the database */
             {
                 const char *wz = "w1.test.";
@@ -2400,6 +2478,244 @@ static void *at_reader(void *arg) {
     }
     return NULL;
 }
+/* The prepared growth in the cases that a writer that goes on makes hard.  The thread that prepares the table is held (db_store_test_prep_hook) after it has copied the table and before it takes the lock, and the
+ * test does what the registry does meanwhile; then it is let go and the table is looked at: an element that was re-keyed and hidden is nowhere (it was put under the old id in the new table by the log, with
+ * the id it has now: a stale element that a lock-free reader would find, and use after it was freed), an element that was taken out is not there, the one that was re-keyed and put back is there under its new id. */
+#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
+#define AT_SLOW 1
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer)
+#define AT_SLOW 1
+#endif
+#endif
+#ifndef AT_SLOW
+#define AT_SLOW 0
+#endif
+static _Atomic bool g_pp_hold;
+static _Atomic int g_pp_calls;
+static void prep_hold_hook(int where) {
+    (void)where;
+    atomic_fetch_add(&g_pp_calls, 1);
+    for (int t = 0; t < 20000 && atomic_load(&g_pp_hold); t++) usleep(1000);
+}
+static zdir_elem_t *at_new(uint32_t zid) {
+    zdir_elem_t *el = calloc(1, sizeof(*el));
+    el->zid = zid;
+    return el;
+}
+static bool at_put(const dbdir_ops_t *ops, zdir_elem_t *el) { return ops->attach_reserve() && ops->attach_put(el); }
+static void at_rekey(zdir_elem_t *el, uint32_t zid) { __atomic_store_n(&el->zid, zid, __ATOMIC_RELAXED); }
+static bool at_wait_prep(const dbdir_ops_t *ops, bool on, int ms) {
+    for (int t = 0; t < ms; t++) {
+        if ((ops->counters(9) != 0) == on) return true;
+        usleep(1000);
+    }
+    return false;
+}
+/* the number of elements of the table that are the pointer `p` */
+static int at_count_ptr(const dbdir_ops_t *ops, const zdir_elem_t *p) {
+    int n = 0;
+    size_t pos = 0;
+    rcu_aux_read_lock();
+    for (zdir_elem_t *e; (e = ops->attach_next(&pos)) != NULL;) n += e == p;
+    rcu_aux_read_unlock();
+    return n;
+}
+/* every element of the table has the id that it is put under (a stale element has another) */
+static size_t at_scan_ok(const dbdir_ops_t *ops) {
+    size_t n = 0, pos = 0;
+    rcu_aux_read_lock();
+    for (zdir_elem_t *e; (e = ops->attach_next(&pos)) != NULL;) {
+        if (ops->attach_get(e->zid) == e) n++;
+        else n += 1000000000ull;                                                /* (a stale one: the sum is then far off) */
+    }
+    rcu_aux_read_unlock();
+    return n;
+}
+/* fills the table with elements of ids base.. until a growth is being prepared (the hook holds the thread when it has copied the table); false: it did not start */
+static bool at_fill_to_prep(const dbdir_ops_t *ops, uint32_t base, zdir_elem_t ***arr, uint32_t *n) {
+    const uint32_t max = 200000;
+    *arr = calloc(max, sizeof(**arr));
+    *n = 0;
+    while (*n < max && ops->counters(9) == 0) {
+        zdir_elem_t *el = at_new(base + *n);
+        (*arr)[(*n)++] = el;
+        if (!at_put(ops, el)) return false;
+    }
+    return ops->counters(9) != 0;
+}
+static void at_drop_all(const dbdir_ops_t *ops, zdir_elem_t **arr, uint32_t n) {
+    CHECK(at_wait_prep(ops, false, 20000));                                       /* (a thread that makes a table reads the elements: they are not freed meanwhile) */
+    for (uint32_t i = 0; i < n; i++) ops->attach_remove(arr[i]);
+    (void)rcu_writer_wait_until_safe(rcu_writer_advance_epoch(), 5000);
+    for (uint32_t i = 0; i < n; i++) free(arr[i]);
+    free(arr);
+}
+
+static void at_scenarios(const dbdir_ops_t *ops) {
+    zdir_elem_t **a;
+    uint32_t n;
+    /* A: re-keyed and hidden, re-keyed and put back, put and hidden, taken out, all while the table is made */
+    atomic_store(&g_pp_hold, true);
+    atomic_store(&g_pp_calls, 0);
+    db_store_test_prep_hook = prep_hold_hook;
+    CHECK(at_fill_to_prep(ops, 3000000, &a, &n));
+    for (int t = 0; t < 20000 && atomic_load(&g_pp_calls) == 0; t++) usleep(1000);
+    CHECK(atomic_load(&g_pp_calls) == 1 && ops->counters(9) == 1);               /* (the table is copied; the thread waits) */
+    const uint64_t bg0 = ops->counters(8);
+    zdir_elem_t *x = a[100], *r = a[200], *w = a[300];
+    ops->attach_remove(x);                                                       /* x: the zone is re-keyed and then hidden (shadowed): taken out, given the id of its new record, never put back */
+    at_rekey(x, 7000000);
+    ops->attach_remove(r);                                                       /* r: taken out (evicted), and freed later */
+    ops->attach_remove(w);                                                       /* w: re-keyed and put back */
+    at_rekey(w, 7000300);
+    CHECK(at_put(ops, w));
+    zdir_elem_t *y = at_new(5000001), *z = at_new(5000011);
+    CHECK(at_put(ops, y) && at_put(ops, z));                                     /* put while the table is made, with the id they had then ... */
+    ops->attach_remove(y);                                                       /* y: re-keyed and put back under another id */
+    at_rekey(y, 5000002);
+    CHECK(at_put(ops, y));
+    ops->attach_remove(z);                                                       /* z: re-keyed and hidden: the logged put has the id it had then, not the one it has now */
+    at_rekey(z, 5000012);
+    atomic_store(&g_pp_hold, false);
+    CHECK(at_wait_prep(ops, false, 20000));
+    CHECK(ops->counters(8) == bg0 + 1);                                          /* (the prepared table was put in) */
+    rcu_aux_read_lock();
+    CHECK(ops->attach_get(3000100) == NULL && ops->attach_get(7000000) == NULL);   /* x: nowhere */
+    CHECK(ops->attach_get(3000200) == NULL);                                       /* r: out */
+    CHECK(ops->attach_get(3000300) == NULL && ops->attach_get(7000300) == w);      /* w: under the new id only */
+    CHECK(ops->attach_get(5000001) == NULL && ops->attach_get(5000002) == y);      /* y: under the new id only */
+    CHECK(ops->attach_get(5000011) == NULL && ops->attach_get(5000012) == NULL);   /* z: nowhere */
+    rcu_aux_read_unlock();
+    CHECK(at_count_ptr(ops, x) == 0 && at_count_ptr(ops, r) == 0 && at_count_ptr(ops, z) == 0 && at_count_ptr(ops, y) == 1 && at_count_ptr(ops, w) == 1);
+    CHECK(at_scan_ok(ops) == (size_t)n - 1);                                           /* (n put; x and r are out, z is nowhere, y is new: n - 2 + 1) */
+    free(x);                                                                     /* (freed after the table was put in, as the registry does after the grace period: nothing of the table has them) */
+    free(r);
+    free(z);
+    CHECK(at_scan_ok(ops) == (size_t)n - 1);                                           /* (a stale pointer to a freed element would be read here) */
+    a[100] = a[200] = a[300] = NULL;
+    ops->attach_remove(y);
+    free(y);
+    for (uint32_t i = 0; i < n; i++)
+        if (a[i]) {
+            ops->attach_remove(a[i]);
+            free(a[i]);
+        }
+    ops->attach_remove(w);
+    free(w);
+    free(a);
+    db_store_test_prep_hook = NULL;
+    CHECK(at_wait_prep(ops, false, 2000));
+
+    /* B: the log of the writers cannot grow: the prepared table is dropped and the growth is made inside the lock, as it was */
+    atomic_store(&g_pp_hold, true);
+    atomic_store(&g_pp_calls, 0);
+    db_store_test_prep_hook = prep_hold_hook;
+    CHECK(at_fill_to_prep(ops, 4000000, &a, &n));
+    for (int t = 0; t < 20000 && atomic_load(&g_pp_calls) == 0; t++) usleep(1000);
+    const uint64_t bg1 = ops->counters(8), gr1 = ops->counters(6);
+    atomic_store(&db_store_test_plog_fail, 1);                                    /* (from here: the table is copied, the thread waits; the next put cannot be logged) */
+    zdir_elem_t *e1 = at_new(4900001), *e2 = at_new(4900002);
+    CHECK(at_put(ops, e1) && at_put(ops, e2));                                   /* (the first of them cannot be logged) */
+    atomic_store(&g_pp_hold, false);
+    CHECK(at_wait_prep(ops, false, 20000));
+    CHECK(ops->counters(8) == bg1 && ops->counters(6) == gr1);                    /* (nothing was put in) */
+    CHECK(atomic_load(&db_store_test_plog_fail) == 0);
+    db_store_test_prep_hook = NULL;
+    zdir_elem_t **more = calloc(40000, sizeof(*more));
+    for (int i = 0; i < 40000; i++) {                                            /* (the table goes on to fill and grows inside the lock when it is half full, or by a new preparation) */
+        more[i] = at_new(4950000 + (uint32_t)i);
+        CHECK(at_put(ops, more[i]));
+        if (i == 0) CHECK(at_wait_prep(ops, false, 20000));
+    }
+    CHECK(at_wait_prep(ops, false, 20000));
+    CHECK(ops->attach_get(4900001) == e1 && ops->attach_get(4900002) == e2 && ops->attach_get(4000500) == a[500] && ops->attach_get(4950000 + 39999) == more[39999]);
+    CHECK(at_scan_ok(ops) == (size_t)n + 2 + 40000);
+    ops->attach_remove(e1);
+    ops->attach_remove(e2);
+    free(e1);
+    free(e2);
+    at_drop_all(ops, more, 40000);
+    at_drop_all(ops, a, n);
+
+    /* C: the table that is full of tombstones (a steady attach and eviction of the same number of zones) is made again outside the lock, at the same size */
+    atomic_store(&g_pp_calls, 0);
+    atomic_store(&g_pp_hold, false);
+    db_store_test_prep_hook = prep_hold_hook;
+    const uint32_t live = 40000;
+    zdir_elem_t **ring = calloc(live, sizeof(*ring));
+    for (uint32_t i = 0; i < live; i++) {
+        ring[i] = at_new(6000000 + i);
+        CHECK(at_put(ops, ring[i]));
+    }
+    CHECK(at_wait_prep(ops, false, 20000));
+    const uint64_t slots2 = ops->counters(5), gr2 = ops->counters(6), bg2 = ops->counters(8);
+    uint32_t next = 6000000 + live;
+    zdir_elem_t *gone[4096];
+    int ngone = 0;
+    for (uint32_t k = 0; k < 600000; k++) {                                      /* (one out, one in: the live ones stay 40,000, the used slots grow with the tombstones) */
+        const uint32_t slot = k % live;
+        ops->attach_remove(ring[slot]);
+        gone[ngone++] = ring[slot];                                              /* (freed after a grace period, as the registry frees an element: the thread that makes a table may be reading it) */
+        ring[slot] = at_new(next++);
+        CHECK(at_put(ops, ring[slot]));
+        if (ngone == 4096) {
+            (void)rcu_writer_wait_until_safe(rcu_writer_advance_epoch(), 5000);
+            for (int g = 0; g < ngone; g++) free(gone[g]);
+            ngone = 0;
+        }
+        if ((k & 1023) == 0) usleep(100);
+    }
+    (void)rcu_writer_wait_until_safe(rcu_writer_advance_epoch(), 5000);
+    for (int g = 0; g < ngone; g++) free(gone[g]);
+    CHECK(at_wait_prep(ops, false, 20000));
+    const uint64_t gr3 = ops->counters(6) - gr2, bg3 = ops->counters(8) - bg2;
+    printf("  tombstones: %llu table(s) made at %llu slots, %llu of them outside the lock; prepared growths started: %d\n", (unsigned long long)gr3, (unsigned long long)slots2, (unsigned long long)bg3, atomic_load(&g_pp_calls));
+    CHECK(ops->counters(5) >= slots2);                                           /* (the size that 40,000 live elements get: four slots each; compaction itself keeps it) */
+    CHECK(gr3 >= 1 && atomic_load(&g_pp_calls) >= 1 && bg3 >= (AT_SLOW ? 0 : 1));
+    CHECK(at_scan_ok(ops) == live);
+    at_drop_all(ops, ring, live);
+    db_store_test_prep_hook = NULL;
+}
+
+static _Atomic bool g_at_stopped;
+static void *at_stop_thread(void *arg) {
+    (void)arg;
+    db_store_stop();
+    atomic_store(&g_at_stopped, true);
+    return NULL;
+}
+/* D: the store stops while a table is being made: the stop waits for the thread, the table is not put in, and no growth is started after it */
+static void at_stop_scenario(const dbdir_ops_t *ops) {
+    zdir_elem_t **a;
+    uint32_t n;
+    atomic_store(&g_pp_hold, true);
+    atomic_store(&g_pp_calls, 0);
+    atomic_store(&g_at_stopped, false);
+    db_store_test_prep_hook = prep_hold_hook;
+    CHECK(at_fill_to_prep(ops, 8000000, &a, &n));
+    for (int t = 0; t < 20000 && atomic_load(&g_pp_calls) == 0; t++) usleep(1000);
+    CHECK(atomic_load(&g_pp_calls) == 1);
+    const uint64_t bg = ops->counters(8);
+    pthread_t th;
+    CHECK(pthread_create(&th, NULL, at_stop_thread, NULL) == 0);
+    usleep(300000);
+    CHECK(!atomic_load(&g_at_stopped) && ops->counters(9) == 1);                 /* (the stop is waiting for the thread that makes the table) */
+    atomic_store(&g_pp_hold, false);
+    pthread_join(th, NULL);
+    CHECK(atomic_load(&g_at_stopped) && ops->counters(9) == 0);
+    CHECK(ops->counters(8) == bg);                                               /* (the table was dropped: the store is stopping) */
+    db_store_test_prep_hook = NULL;
+    for (uint32_t i = 0; i < 60000; i++) {                                       /* (more elements than a growth is started for: none is) */
+        zdir_elem_t *el = at_new(8500000 + i);
+        CHECK(at_put(ops, el));
+        ops->attach_remove(el);
+        free(el);
+    }
+    CHECK(ops->counters(9) == 0 && ops->counters(8) == bg);
+    at_drop_all(ops, a, n);
+}
+
 static int run_attab(const char *dir) {
     printf("[the attach table grows outside the registry's lock]\n");
     char sdir[600];
@@ -2451,17 +2767,19 @@ static int run_attab(const char *dir) {
     const uint64_t grows = ops->counters(6) - g0, prepared = ops->counters(8) - b0;
     printf("  %d elements, %llu table(s) made (%llu of them outside the lock), slots %llu -> %llu, longest put %.2f ms, %llu lookups\n", AT_N, (unsigned long long)grows, (unsigned long long)prepared,
            (unsigned long long)slots0, (unsigned long long)ops->counters(5), (double)worst / 1e6, (unsigned long long)atomic_load(&g_at_looks));
+    /* (what a descheduled thread can change is the time, and how many of the growths were ready in time: neither is asserted here; the cases that matter are held by the hook below) */
+    CHECK(at_wait_prep(ops, false, 20000));
     CHECK(wrong == 0);
     CHECK(atomic_load(&g_at_bad) == 0 && atomic_load(&g_at_looks) > 1000);
-    CHECK(grows >= 5 && prepared >= (UNDER_TSAN_TEST ? 0 : 3));      /* (under ThreadSanitizer the copy is slow and the writer outruns it: only the answers are checked) */
-    CHECK(grows - prepared <= 8);                                               /* (the small tables, up to 65,536 slots, are made inside the lock as they were: 7 of them) */
-    CHECK(worst < (UNDER_TSAN_TEST ? 2000000000ll : 30000000ll));          /* (no put stood still for 30 ms: a doubling inside the lock took 50 to 100 ms at 500,000 zones) */
-    for (uint32_t i = 1; i <= AT_N && g_at_el; i++) {                            /* (the table goes with the store: nothing is freed that a reader could have) */
+    CHECK(grows >= 5);
+    for (uint32_t i = 1; i <= AT_N && g_at_el; i++) {                            /* (the table is emptied: nothing is freed that a reader could have) */
         if (!(i % 7 == 0 && i + 50 <= AT_N)) ops->attach_remove(g_at_el[i]);
     }
-    db_store_stop();
+    (void)rcu_writer_wait_until_safe(rcu_writer_advance_epoch(), 5000);
     for (uint32_t i = 1; i <= AT_N && g_at_el; i++) free(g_at_el[i]);
     free(g_at_el);
+    at_scenarios(ops);
+    at_stop_scenario(ops);                                                       /* (this stops the store) */
     printf("%d checks, %d failed\n", g_checks, g_failed);
     return g_failed ? 1 : 0;
 }
@@ -2598,7 +2916,7 @@ static int run_hot(const char *dir, int phase) {
         } else {
             dbreg_cache_set_limit(0);
             CHECK(c.hot_state == 3);                                                             /* (3: stopped at the high mark) */
-            CHECK(nseen >= (int)(nwant / 4) && nseen <= (int)(nwant / 4) + 6 * 32 + 6);            /* (a thread looks at the limit between batches: the batches that were taken meanwhile are finished) */
+            CHECK(nseen >= (int)(nwant / 4) && nseen <= (int)(nwant / 4) + 6 + 2);                   /* (the limit is looked at for every zone: each thread goes one zone past it at the most, and what was made is registered) */
             CHECK(c.hot_attached < nwant && dbdir()->attach_count() < nwant);
         }
         atomic_store(&db_store_test_hot_pending, false);

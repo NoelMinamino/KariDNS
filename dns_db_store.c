@@ -257,6 +257,7 @@ static struct {
   bool hthr_started;
   _Atomic bool hstop;
   _Atomic bool hot_limit;               /* a thread of the list met the high mark of memory-limit: they all stop */
+  _Atomic bool hot_failed;              /* a thread of the list had no memory for its batch */
   _Atomic size_t hot_next;              /* the next place of hot_ids that a thread takes (a batch of HOT_BATCH) */
   _Atomic uint32_t hot_live, hot_nthr;  /* the threads that have not ended, and the threads that were started */
   _Atomic int64_t hot_t0_ns, hot_end_ns; /* the start of the attach of the list, and its end (0: still running) */
@@ -559,6 +560,7 @@ typedef struct att_plog {
 } att_plog_t;
 #define ATT_TOMB ((zdir_elem_t *)(uintptr_t)1)
 #define ATT_MIN_CAP 1024u
+#define ATT_PLOG_MAX (1u << 20)           /* the most a prepared growth logs (16 MB): a thread that cannot get its read section for so long gives the growth up */
 #define ATT_PREP_MIN_CAP 65536u          /* a table of fewer slots is made again inside the lock (16,000 elements: well under a millisecond) */
 #ifdef KARIDNS_UNIT_TEST
 int db_store_test_attach_reserve_fail = 0;                   /* the n-th dir_attach_reserve() fails (0: off): the table cannot grow */
@@ -570,6 +572,7 @@ static struct {
   size_t floor_cap;                  /* 0.7 M4: the smallest the table is made (att_presize()) */
   uint64_t tabgen;                   /* counts the tables that were put in */
   bool prep, prep_bad;               /* a bigger table is being made outside the lock (att_prep_thread()); the log of the writers could not be kept */
+  bool stopping;                     /* the store is stopping: no growth is started */
   uint64_t pgen;                     /* tabgen when it was started */
   att_plog_t *plog;                  /* what the writers did meanwhile */
   size_t plog_n, plog_cap;
@@ -577,10 +580,18 @@ static struct {
   _Atomic uint64_t puts, removes, grows, shrinks, grows_bg;      /* grows_bg: of grows, the ones that were prepared outside the lock */
 } AT = { .lock = PTHREAD_MUTEX_INITIALIZER };
 
+/* tests: the log of a prepared growth cannot grow (the number of times), and the thread that makes the table calls this when it has copied the old one, before it takes the lock (where 0) */
+_Atomic int db_store_test_plog_fail;
+void (*_Atomic db_store_test_prep_hook)(int where);
+
 static inline size_t att_hash(uint32_t zid) {
   uint64_t x = (uint64_t)zid * 0x9E3779B97F4A7C15ull;
   return (size_t)(x >> 32);
 }
+
+/* The zone id of an element, for the code that looks at elements that the registry may be re-keying (dbreg_commit_store() takes an element out of the table, gives it the id of its new record, and puts it back, or
+ * does not when the zone is hidden; the thread that makes a bigger table reads it with no lock): a relaxed atomic read, and the registry's write is one too. */
+static inline uint32_t att_zid(const zdir_elem_t *e) { return __atomic_load_n(&e->zid, __ATOMIC_RELAXED); }
 
 static zdir_elem_t *dir_attach_get(uint32_t zid) {
   const att_tab_t *t = atomic_load_explicit(&AT.tab, memory_order_acquire);
@@ -589,7 +600,7 @@ static zdir_elem_t *dir_attach_get(uint32_t zid) {
   for (;;) {
     zdir_elem_t *e = atomic_load_explicit(&t->slot[i], memory_order_acquire);
     if (!e) return NULL;
-    if (e != ATT_TOMB && e->zid == zid) return e;
+    if (e != ATT_TOMB && att_zid(e) == zid) return e;
     i = (i + 1) & t->mask;
   }
 }
@@ -608,16 +619,27 @@ static void att_retired_run_locked(bool force) {
   }
 }
 
-/* the table `nt` (made by the caller, no reader has it yet or the lock is held) takes the element `el`: false when a slot of the same zone id was replaced (no new element), true when it is new.  live / used: the counts of
- * `nt`, kept by the caller. */
-static bool att_put_into(att_tab_t *t, zdir_elem_t *el, size_t *live, size_t *used) {
-  size_t i = att_hash(el->zid) & t->mask, tomb = (size_t)-1;
+/* the element of the zone id `zid` in the table `t`, or NULL */
+static zdir_elem_t *att_find(const att_tab_t *t, uint32_t zid) {
+  size_t i = att_hash(zid) & t->mask;
+  for (;;) {
+    zdir_elem_t *e = atomic_load_explicit(&t->slot[i], memory_order_acquire);
+    if (!e) return NULL;
+    if (e != ATT_TOMB && att_zid(e) == zid) return e;
+    i = (i + 1) & t->mask;
+  }
+}
+
+/* the table `t` (the lock is held, or no reader has it yet) takes the element `el` under the zone id `zid`: false when a slot of the same zone id was replaced (no new element), true when it is new.  live / used:
+ * the counts of `t`, kept by the caller. */
+static bool att_put_into(att_tab_t *t, zdir_elem_t *el, uint32_t zid, size_t *live, size_t *used) {
+  size_t i = att_hash(zid) & t->mask, tomb = (size_t)-1;
   for (;;) {
     zdir_elem_t *e = atomic_load_explicit(&t->slot[i], memory_order_relaxed);
     if (!e) break;
     if (e == ATT_TOMB) {
       if (tomb == (size_t)-1) tomb = i;
-    } else if (e->zid == el->zid) {                              /* the same zone id: the element is replaced (or it is the same one) */
+    } else if (att_zid(e) == zid) {                              /* the same zone id: the element is replaced (or it is the same one) */
       atomic_store_explicit(&t->slot[i], el, memory_order_release);
       return false;
     }
@@ -630,7 +652,7 @@ static bool att_put_into(att_tab_t *t, zdir_elem_t *el, size_t *live, size_t *us
   return true;
 }
 
-/* the element `el` (the same pointer) leaves the table `t`: true when it was there */
+/* the element `el` (the same pointer), put under `zid`, leaves the table `t`: true when it was there */
 static bool att_del_from(att_tab_t *t, const zdir_elem_t *el, uint32_t zid, size_t *live) {
   size_t i = att_hash(zid) & t->mask;
   for (;;) {
@@ -645,7 +667,19 @@ static bool att_del_from(att_tab_t *t, const zdir_elem_t *el, uint32_t zid, size
   }
 }
 
-/* the table `nt` becomes the table (the lock is held): the old one is freed after the grace period of the readers that may have it */
+/* a table of `cap` empty slots (a null pointer is all bits zero: the memory is not touched until it is used) */
+static att_tab_t *att_tab_new(size_t cap) {
+  att_tab_t *nt = calloc(1, sizeof(*nt) + cap * sizeof(_Atomic(zdir_elem_t *)));
+  if (!nt) return NULL;
+  nt->cap = cap;
+  nt->mask = cap - 1;
+  return nt;
+}
+
+/* The table `nt` becomes the table (the lock is held); `spare` is the node that the old table is retired with, made by the caller before it took the lock: nothing in here allocates, and nothing waits for a
+ * grace period (a thread that makes a bigger table is in a read section and waits for this lock: a wait here for the grace period of its section would be the end of both).  The old table is freed after the
+ * grace period of the readers that may have it.  The table is not counted in memory-limit (32 bytes a zone at the most, with the elements of the registry, which are not either: `karictl dbstatus` shows the
+ * zone directory's own bytes). */
 static void att_install_locked(att_tab_t *nt, size_t live, size_t used, att_retired_t *spare) {
   att_tab_t *old = atomic_load_explicit(&AT.tab, memory_order_relaxed);
   atomic_store_explicit(&AT.tab, nt, memory_order_release);
@@ -655,34 +689,32 @@ static void att_install_locked(att_tab_t *nt, size_t live, size_t used, att_reti
   AT.tabgen++;
   atomic_fetch_add_explicit(&AT.grows, 1, memory_order_relaxed);
   if (old) {
-    att_retired_t *r = spare ? spare : malloc(sizeof(*r));
-    if (r) {
-      r->t = old;
-      r->epoch = ep;
-      r->next = AT.retired;
-      AT.retired = r;
-    } else {
-      (void)rcu_writer_wait_until_safe(ep, 60000);            /* (no memory for the node: the grace period is waited for here) */
-      free(old);
-    }
+    spare->t = old;
+    spare->epoch = ep;
+    spare->next = AT.retired;
+    AT.retired = spare;
+  } else {
+    free(spare);
   }
 }
 
-/* the table is made again with `want_cap` slots, inside the lock: the growth that nothing prepared (the first table, a shrink, a table that filled up while a prepared one was being made) */
+/* the table is made again with `want_cap` slots, inside the lock: the growth that nothing prepared (the first table, a shrink, a table that filled up while a prepared one was being made).  No memory for the
+ * table or for the node that retires the old one: false, and the old table stays. */
 static bool att_rehash_locked(size_t want_cap) {
-  att_tab_t *nt = malloc(sizeof(*nt) + want_cap * sizeof(_Atomic(zdir_elem_t *)));
-  if (!nt) return false;
-  nt->cap = want_cap;
-  nt->mask = want_cap - 1;
-  for (size_t i = 0; i < want_cap; i++) atomic_init(&nt->slot[i], NULL);
+  att_retired_t *spare = malloc(sizeof(*spare));
+  att_tab_t *nt = spare ? att_tab_new(want_cap) : NULL;
+  if (!nt) {
+    free(spare);
+    return false;
+  }
   att_tab_t *old = atomic_load_explicit(&AT.tab, memory_order_relaxed);
   size_t n = 0, u = 0;
   for (size_t i = 0; old && i < old->cap; i++) {
     zdir_elem_t *e = atomic_load_explicit(&old->slot[i], memory_order_relaxed);
     if (!e || e == ATT_TOMB) continue;
-    (void)att_put_into(nt, e, &n, &u);
+    (void)att_put_into(nt, e, att_zid(e), &n, &u);
   }
-  att_install_locked(nt, n, u, NULL);
+  att_install_locked(nt, n, u, spare);
   return true;
 }
 
@@ -693,66 +725,74 @@ static size_t att_cap_for(size_t live) {
   return cap;
 }
 
-/* what the writers do to the table while a bigger one is being made (att_prep_thread()), in the order they did it: the new table is brought up to date with this before it is put in */
-static void att_plog_locked(zdir_elem_t *el, bool put) {
-  if (!AT.prep) return;
-  if (AT.plog_n == AT.plog_cap) {
+/* what the writers do to the table while a bigger one is being made (att_prep_thread()), in the order they did it: the new table is brought up to date with this before it is put in.  A log of more than
+ * ATT_PLOG_MAX (the thread has not got its read section: all 126 are taken), or one that cannot grow, drops the prepared table: the growth is made inside the lock, as it was. */
+static void att_plog_locked(zdir_elem_t *el, uint32_t zid, bool put) {
+  if (!AT.prep || AT.prep_bad) return;
+  const bool inject = atomic_load_explicit(&db_store_test_plog_fail, memory_order_relaxed) > 0;            /* (tests: the log cannot grow) */
+  if (inject) atomic_fetch_sub_explicit(&db_store_test_plog_fail, 1, memory_order_relaxed);
+  if (inject || AT.plog_n == AT.plog_cap) {
     const size_t nc = AT.plog_cap ? AT.plog_cap * 2 : 1024;
-    att_plog_t *nl = realloc(AT.plog, nc * sizeof(*nl));
+    att_plog_t *nl = nc > ATT_PLOG_MAX || inject ? NULL : realloc(AT.plog, nc * sizeof(*nl));
     if (!nl) {
-      AT.prep_bad = true;                                     /* (the table made meanwhile is dropped: the growth is made inside the lock, as it was) */
+      AT.prep_bad = true;
+      AT.plog_n = 0;
       return;
     }
     AT.plog = nl;
     AT.plog_cap = nc;
   }
   AT.plog[AT.plog_n].el = el;
-  AT.plog[AT.plog_n].zid = el->zid;
+  AT.plog[AT.plog_n].zid = zid;
   AT.plog[AT.plog_n].put = put;
   AT.plog_n++;
 }
 
 /* 0.7 M4: a table that grows with the zones was rehashed at every doubling inside the registry's lock: 500,000 zones took 50 to 100 ms in which every attach, and every query that waited for one, stood still.
- * The growth is now prepared outside the lock.  When the table is three eighths full (it is made again at one half) a thread is started; it makes the table of the next size from the one that readers and
- * writers use (it is in a read section: the elements and the table it reads are not freed meanwhile), and the writers go on and write what they do to the old table in a log.  At the end the thread takes the
- * lock, does the logged puts and removals on the new table (a few thousand), and puts it in: a swap of a pointer inside the lock, as the readers' side was and stays (they take no lock, and a reader that has
- * the old table finishes on it).  A table that was made again meanwhile (a growth inside the lock, a shrink) makes the prepared one useless: it is dropped. */
+ * The growth is now prepared outside the lock.  When the table is three eighths full (it is made again at one half) a thread is started; it makes the table of the next size (or of the same size, without the
+ * tombstones that a steady attach and eviction leave) from the one that readers and writers use, in a read section (the elements and the table it reads are not freed meanwhile), and the writers go on and write what
+ * they do to the old table in a log.  The elements are read with no lock while the registry may be re-keying one: an element is taken over only when the old table finds it under the id that was read (an element that
+ * is taken out and put back under another id is in the log, and a hidden one only taken out).  At the end the thread takes the lock, does the logged puts and removals on the new table (a few thousand), under the ids
+ * they were logged with, and puts it in: a swap of a pointer inside the lock, as the readers' side was and stays (they take no lock, and a reader that has the old table finishes on it).  A table that was made again
+ * meanwhile (a growth inside the lock, a shrink), a log that could not be kept, or a store that is stopping makes the prepared one useless: it is dropped. */
 static void *att_prep_thread(void *arg) {
   (void)arg;
   rcu_aux_read_lock();
   pthread_mutex_lock(&AT.lock);
   att_tab_t *old = atomic_load_explicit(&AT.tab, memory_order_relaxed);
   const uint64_t gen = AT.pgen;
-  const size_t want = old && AT.tabgen == gen ? att_cap_for(AT.live) : 0;
+  size_t want = 0;
+  if (old && AT.tabgen == gen && !AT.prep_bad && !AT.stopping) {
+    want = att_cap_for(AT.live);
+    if (want < old->cap) want = old->cap;
+  }
   pthread_mutex_unlock(&AT.lock);
-  att_tab_t *nt = old && want > old->cap ? malloc(sizeof(*nt) + want * sizeof(_Atomic(zdir_elem_t *))) : NULL;
+  att_tab_t *nt = want ? att_tab_new(want) : NULL;
+  att_retired_t *spare = nt ? malloc(sizeof(*spare)) : NULL;      /* (the node that the old table is retired with: made here, so that nothing is allocated or waited for inside the lock) */
   size_t live = 0, used = 0;
-  if (nt) {
-    nt->cap = want;
-    nt->mask = want - 1;
-    memset((void *)nt->slot, 0, want * sizeof(_Atomic(zdir_elem_t *)));       /* (a null pointer is all bits zero) */
+  if (nt && spare) {
     for (size_t i = 0; i < old->cap; i++) {
       zdir_elem_t *e = atomic_load_explicit(&old->slot[i], memory_order_acquire);
-      if (e && e != ATT_TOMB) (void)att_put_into(nt, e, &live, &used);
+      if (!e || e == ATT_TOMB) continue;
+      const uint32_t k = att_zid(e);
+      if (att_find(old, k) == e) (void)att_put_into(nt, e, k, &live, &used);
     }
+    void (*hook)(int) = atomic_load_explicit(&db_store_test_prep_hook, memory_order_acquire);
+    if (hook) hook(0);
   }
-  att_retired_t *spare = nt ? malloc(sizeof(*spare)) : NULL;      /* (the node that the old table is retired with: no wait for a grace period inside this read section) */
   pthread_mutex_lock(&AT.lock);
-  if (nt && spare && AT.tabgen == gen && !AT.prep_bad) {
+  if (nt && spare && AT.tabgen == gen && !AT.prep_bad && !AT.stopping) {
     for (size_t k = 0; k < AT.plog_n; k++) {
       const att_plog_t *l = &AT.plog[k];
-      if (l->put) {
-        (void)att_put_into(nt, l->el, &live, &used);
-      } else {
-        (void)att_del_from(nt, l->el, l->zid, &live);
-      }
+      if (l->put) (void)att_put_into(nt, l->el, l->zid, &live, &used);
+      else (void)att_del_from(nt, l->el, l->zid, &live);
     }
     att_install_locked(nt, live, used, spare);
-    spare = NULL;
     atomic_fetch_add_explicit(&AT.grows_bg, 1, memory_order_relaxed);
-  } else {
-    free(nt);
+    nt = NULL;
+    spare = NULL;
   }
+  free(nt);
   free(spare);
   AT.prep = false;
   AT.plog_n = 0;
@@ -765,7 +805,7 @@ static void *att_prep_thread(void *arg) {
 static void att_prep_start_locked(void) {
   pthread_attr_t at;
   pthread_t th;
-  if (pthread_attr_init(&at) != 0) return;
+  if (AT.stopping || pthread_attr_init(&at) != 0) return;
   pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
   AT.prep = true;
   AT.prep_bad = false;
@@ -773,6 +813,13 @@ static void att_prep_start_locked(void) {
   AT.plog_n = 0;
   if (pthread_create(&th, &at, att_prep_thread, NULL) != 0) AT.prep = false;       /* (no thread: the growth is made inside the lock when the table is half full) */
   pthread_attr_destroy(&at);
+}
+
+/* the store is stopping: no growth is started from here on (att_prep_wait() then waits for the one in progress) */
+static void att_prep_stop(bool stopping) {
+  pthread_mutex_lock(&AT.lock);
+  AT.stopping = stopping;
+  pthread_mutex_unlock(&AT.lock);
 }
 
 /* the end of a prepared growth is waited for (the stop of the store: nothing of the table is used after it) */
@@ -792,20 +839,41 @@ static bool att_room_locked(void) {
   att_tab_t *t = atomic_load_explicit(&AT.tab, memory_order_relaxed);
   if (!t || (AT.used + 1) * 2 > t->cap) {                       /* load above 1/2 (tombstones count): a bigger table, or the same size without the tombstones */
     if (!att_rehash_locked(att_cap_for(AT.live))) return false;
-  } else if (!AT.prep && t->cap >= ATT_PREP_MIN_CAP && AT.used * 8 > t->cap * 3 && att_cap_for(AT.live) > t->cap) {
-    att_prep_start_locked();                                    /* (three eighths full: the next size is made outside the lock) */
+  } else if (!AT.prep && t->cap >= ATT_PREP_MIN_CAP && AT.used * 8 > t->cap * 3) {
+    att_prep_start_locked();                                    /* (three eighths full, with the elements or the tombstones: the next table is made outside the lock) */
   }
   return true;
 }
 
-/* 0.7 M4: the table is made for `n` zones before they come.  The list of the last run says how many zones are coming; the floor keeps the table from being made smaller by the first detach. */
+/* 0.7 M4: the table is made for `n` zones before they come.  The list of the last run says how many zones are coming; the floor keeps the table from being made smaller by the first detach.  The table is made
+ * and its node allocated before the lock is taken (the memory is not touched: it is zero), and what the table holds by then (nothing, at the start of the server) is moved inside it. */
 static void att_presize(size_t n) {
   pthread_mutex_lock(&AT.lock);
   const size_t want = att_cap_for(n > AT.live ? n : AT.live);
   AT.floor_cap = want;
   att_tab_t *t = atomic_load_explicit(&AT.tab, memory_order_relaxed);
-  if (!t || t->cap < want) (void)att_rehash_locked(want);
+  const bool need = !t || t->cap < want;
   pthread_mutex_unlock(&AT.lock);
+  if (!need) return;
+  att_tab_t *nt = att_tab_new(want);
+  att_retired_t *spare = malloc(sizeof(*spare));
+  if (nt && spare) {
+    pthread_mutex_lock(&AT.lock);
+    t = atomic_load_explicit(&AT.tab, memory_order_relaxed);
+    if (!t || t->cap < want) {
+      size_t live = 0, used = 0;
+      for (size_t i = 0; t && i < t->cap; i++) {
+        zdir_elem_t *e = atomic_load_explicit(&t->slot[i], memory_order_relaxed);
+        if (e && e != ATT_TOMB) (void)att_put_into(nt, e, att_zid(e), &live, &used);
+      }
+      att_install_locked(nt, live, used, spare);
+      nt = NULL;
+      spare = NULL;
+    }
+    pthread_mutex_unlock(&AT.lock);
+  }
+  free(nt);
+  free(spare);
 }
 
 /* The registry makes the room before it changes anything (dbreg_commit_store()): an element that is registered with its entry and then cannot be put in the table is a zone that the caller frees the entry of,
@@ -827,8 +895,9 @@ static bool dir_attach_put(zdir_elem_t *el) {
     return false;
   }
   att_tab_t *t = atomic_load_explicit(&AT.tab, memory_order_relaxed);
-  if (att_put_into(t, el, &AT.live, &AT.used)) atomic_fetch_add_explicit(&AT.puts, 1, memory_order_relaxed);
-  att_plog_locked(el, true);
+  const uint32_t zid = att_zid(el);
+  if (att_put_into(t, el, zid, &AT.live, &AT.used)) atomic_fetch_add_explicit(&AT.puts, 1, memory_order_relaxed);
+  att_plog_locked(el, zid, true);
   pthread_mutex_unlock(&AT.lock);
   return true;
 }
@@ -837,9 +906,10 @@ static void dir_attach_remove(const zdir_elem_t *el) {
   pthread_mutex_lock(&AT.lock);
   att_tab_t *t = atomic_load_explicit(&AT.tab, memory_order_relaxed);
   if (t) {
-    if (att_del_from(t, el, el->zid, &AT.live)) {
+    const uint32_t zid = att_zid(el);
+    if (att_del_from(t, el, zid, &AT.live)) {
       atomic_fetch_add_explicit(&AT.removes, 1, memory_order_relaxed);
-      att_plog_locked((zdir_elem_t *)(uintptr_t)el, false);
+      att_plog_locked((zdir_elem_t *)(uintptr_t)el, zid, false);
     }
     /* 0.7 store S5: after a mass detach the table is smaller again (1/8 full or less: a table of four times the live elements, the tombstones gone); the old one is freed after the grace period */
     if (t->cap > ATT_MIN_CAP && AT.live * 8 <= t->cap) {
@@ -896,6 +966,7 @@ _Atomic bool db_store_test_not_resident;                   /* the worker's attac
 _Atomic bool db_store_test_resident;                       /* the worker's attach finds the image in the page cache whatever mincore() says (tests: on ZFS, and any file system that does not report the pages that were written, mincore() says no) */
 void (*_Atomic db_store_test_adopt_hook)(void);           /* called by a store thread before it registers a staged zone (tests: hold it, and change the zone meanwhile) */
 _Atomic bool db_store_test_adopt_noview;                  /* the registration of a staged zone finds no view for the store's id (tests: the store is closing) */
+void (*_Atomic db_store_test_batch_hook)(dbdir_rec_t *rec);   /* called for the record of every job of a batch of attaches just before the batch is registered (tests: change the record, as a writer of the store would) */
 _Atomic bool db_store_test_hot_pending;                    /* the threads of hot.list see attach requests of queries that wait (tests: they are never starved by them) */
 void (*_Atomic db_store_test_hot_hook)(uint32_t zid);     /* called by the threads of hot.list before each zone (tests: the order, and time) */
 #define STG_CAP 16384u
@@ -1283,6 +1354,7 @@ static uint64_t dir_counters(int what) {
   case 6: return atomic_load_explicit(&AT.grows, memory_order_relaxed);
   case 7: return atomic_load_explicit(&AT.shrinks, memory_order_relaxed);
   case 8: return atomic_load_explicit(&AT.grows_bg, memory_order_relaxed);
+  case 9: { pthread_mutex_lock(&AT.lock); const uint64_t p = AT.prep ? 1 : 0; pthread_mutex_unlock(&AT.lock); return p; }         /* a bigger table is being made */
   default: return 0;
   }
 }
@@ -2015,6 +2087,7 @@ static void attach_zone_x(const char *view, const char *zone, uint32_t zid, unsi
  * requests it finds waiting (up to ATT_BATCH), then registers them in one section of the lock (dbreg_attach_store_n()), then tells the queries.  The first request of a batch waits for the entries of the
  * others to be made (tens of microseconds each); a thread that finds one request registers it at once, as before. */
 #define ATT_BATCH 16
+#define ATT_BATCH_US 300                 /* the oldest job of a batch is registered when it is this old */
 typedef struct {
   store_zone_t sz;               /* the record the entry was made from */
   att_built_t b;                 /* the entry (attach_build()) */
@@ -2025,11 +2098,13 @@ typedef struct {
   unsigned fl;                   /* ATTF_* */
 } att_job_t;
 
-/* the entries of jobs[0..n) are registered together; each job's zone is then told as an attach of one zone tells it (attach_finish()) */
-static void attach_batch_run(att_job_t *jobs, size_t n, dbreg_att_item_t *ri) {
+/* the entries of jobs[0..n) are registered together; each job's zone is then told as an attach of one zone tells it (attach_finish()).  The number of zones that the registry took. */
+static size_t attach_batch_run(att_job_t *jobs, size_t n, dbreg_att_item_t *ri) {
+  void (*hook)(dbdir_rec_t *) = atomic_load_explicit(&db_store_test_batch_hook, memory_order_acquire);
   for (size_t i = 0; i < n; i++) {
     att_job_t *j = &jobs[i];
     rec_from_zone(&j->sz, &j->rec);
+    if (hook) hook(&j->rec);
     ri[i].view = j->view;
     ri[i].name = j->zone;
     ri[i].rec = &j->rec;
@@ -2037,10 +2112,13 @@ static void attach_batch_run(att_job_t *jobs, size_t n, dbreg_att_item_t *ri) {
     ri[i].bg = (j->fl & ATTF_BG) != 0;
   }
   dbreg_attach_store_n(ri, n);
+  size_t ok = 0;
   for (size_t i = 0; i < n; i++) {
     att_job_t *j = &jobs[i];
+    ok += ri[i].result == DBREG_ATT_STARTED;
     attach_finish(j->view, j->zone, j->sz.view, j->sz.zid, &j->sz, j->t0, j->fl, 0, ri[i].result, &j->b);
   }
+  return ok;
 }
 
 /* A request of a worker for the zone with the id `zid` of the view `sview` (the worker's lookup named it, and nothing else: 8 bytes): the record gives the names.  The first half of the attach: the
@@ -2095,16 +2173,24 @@ static bool attach_drain(att_job_t *jobs, dbreg_att_item_t *ri) {
   size_t n = 0;
   while (park_attach_next(&q)) {
     any = true;
-    if (q.adopt) {
-      adopt_job(q.sview, q.zid);
-    } else if (q.by_name) {
-      attach_job(&q, 0);
-    } else if (attach_job_prep(&q, &jobs[n]) && ++n == ATT_BATCH) {
-      attach_batch_run(jobs, n, ri);
-      n = 0;
+    if (q.adopt || q.by_name) {                                /* (another kind of job, and a slow one: what is made waits for it no longer) */
+      if (n) {
+        (void)attach_batch_run(jobs, n, ri);
+        n = 0;
+      }
+      if (q.adopt) adopt_job(q.sview, q.zid);
+      else attach_job(&q, 0);
+    } else if (attach_job_prep(&q, &jobs[n])) {
+      n++;
+      /* The queries of the first jobs wait while the others are made (a read of an image that is not in the cache takes milliseconds, and the attach deadline of a query is 200 ms): a batch is only what is
+       * there already and can be made in a moment: it goes when it is full, when nothing else waits, and when the first job is ATT_BATCH_US old. */
+      if (n == ATT_BATCH || !park_attach_pending() || mono_ns() - jobs[0].t0 > ATT_BATCH_US * 1000ll) {
+        (void)attach_batch_run(jobs, n, ri);
+        n = 0;
+      }
     }
   }
-  if (n) attach_batch_run(jobs, n, ri);
+  if (n) (void)attach_batch_run(jobs, n, ri);
   return any;
 }
 
@@ -2191,6 +2277,10 @@ static void hot_attach_batch(store_t *st, const uint32_t *ids, size_t n, att_job
   for (size_t i = 0; i < n; i++) {
     const uint32_t zid = ids[i];
     if (hook) hook(zid);
+    if (dbreg_cache_limit() && dbreg_cache_over_high(0)) {      /* (the high mark of memory-limit counts the entries that are made and not registered yet: it is looked at for every zone, so that the threads go no further than one zone each past it) */
+      atomic_store(&G.hot_limit, true);
+      break;
+    }
     att_job_t *h = &it[m];
     const char *vn = NULL;
     store_read_lock();
@@ -2209,26 +2299,31 @@ static void hot_attach_batch(store_t *st, const uint32_t *ids, size_t n, att_job
       atomic_fetch_add(&G.hot_skipped, 1);
       continue;
     }
-    atomic_fetch_add(&G.hot_attached, 1);
     snprintf(h->zone, sizeof(h->zone), "%s.", h->sz.name);
     h->t0 = t0;
     h->fl = ATTF_SIB | ATTF_QUIET;
     if (attach_build(h->view, h->zone, zid, &h->sz, ATTF_SIB, NULL, &h->b) != ATB_OK) {
       attach_fail(h->view, h->zone, h->sz.view, zid, &h->sz, ATTF_QUIET, &h->b);
+      atomic_fetch_add(&G.hot_skipped, 1);                     /* (it could not be attached: logged, counted as an attach that failed) */
       continue;
     }
     m++;
   }
-  if (m) attach_batch_run(it, m, ri);
+  if (m) {
+    const size_t ok = attach_batch_run(it, m, ri);              /* (what was made is registered, also when the limit stopped the batch) */
+    atomic_fetch_add(&G.hot_attached, ok);
+    atomic_fetch_add(&G.hot_skipped, m - ok);                   /* (in memory when it came to the registry: another attach or a fetch was first) */
+  }
   park_wake_flush();
 }
 
 /* the thread of the list that leaves last says how it ended */
 static void hot_finish(void) {
   atomic_store(&G.hot_end_ns, mono_ns());
-  const bool lim = atomic_load(&G.hot_limit);
-  atomic_store(&G.hot_state, lim ? DBS_HOT_LIMIT : DBS_HOT_DONE);
-  if (!atomic_load_explicit(&G.hstop, memory_order_acquire))
+  const bool lim = atomic_load(&G.hot_limit), failed = atomic_load(&G.hot_failed);
+  atomic_store(&G.hot_state, failed ? DBS_HOT_NONE : lim ? DBS_HOT_LIMIT : DBS_HOT_DONE);
+  if (failed) syslog(LOG_WARNING, "[Store] hot.list: a thread of the list had no memory for its batch and ended; %llu zone(s) were attached", (unsigned long long)atomic_load(&G.hot_attached));
+  else if (!atomic_load_explicit(&G.hstop, memory_order_acquire))
     syslog(LOG_NOTICE, "[Store] hot.list: %llu zone(s) attached in the background by %u thread(s), %llu skipped (in memory already, or not stored)%s", (unsigned long long)atomic_load(&G.hot_attached),
            (unsigned)atomic_load(&G.hot_nthr), (unsigned long long)atomic_load(&G.hot_skipped), lim ? "; stopped at the high mark of memory-limit" : "");
 }
@@ -2250,6 +2345,7 @@ static void *hot_thread(void *arg) {
   store_t *st = atomic_load_explicit(&G.st, memory_order_acquire);
   att_job_t *it = malloc(HOT_BATCH * sizeof(*it));
   dbreg_att_item_t *ri = malloc(HOT_BATCH * sizeof(*ri));
+  if (!it || !ri) atomic_store(&G.hot_failed, true);
   while (st && it && ri && !atomic_load_explicit(&G.hstop, memory_order_acquire) && !atomic_load_explicit(&G.hot_limit, memory_order_relaxed)) {
     if (dbreg_cache_limit() && dbreg_cache_over_high(0)) {
       atomic_store(&G.hot_limit, true);
@@ -2280,7 +2376,7 @@ void db_store_hot_start(void) {
   }
   atomic_store(&G.hstop, false);
   atomic_store(&G.hot_limit, false);
-
+  atomic_store(&G.hot_failed, false);
   atomic_store(&G.hot_next, 0);
   atomic_store(&G.hot_end_ns, 0);
   atomic_store(&G.hot_t0_ns, mono_ns());
@@ -3299,6 +3395,7 @@ bool db_store_start(const server_config_t *cfg) {
   int n = db->store_threads ? (int)db->store_threads : KARIDNS_DB_STORE_THREADS_DEFAULT;
   if (n > DBS_MAX_ATTACH_THREADS) n = DBS_MAX_ATTACH_THREADS;
   atomic_store(&G.astop, false);
+  att_prep_stop(false);
   for (int i = 0; i < n; i++) {
     if (pthread_create(&G.athr[G.nathr], NULL, attach_thread, NULL) != 0) break;
     G.nathr++;
@@ -3351,7 +3448,7 @@ void db_store_stop(void) {
   if (!st) return;
   atomic_store(&G.hstop, true);                               /* 0.7 fix 8: the background attach of hot.list ends first */
   for (int i = 0; G.hthr_started && i < G.hot_nstarted; i++) pthread_join(G.hthr[i], NULL);
-  att_prep_wait();                                            /* 0.7 M4: a table that is being made for the attached zones is done before the store goes */
+  att_prep_stop(true);                                        /* 0.7 M4: no growth of the attach table is started from here on */
   G.hthr_started = false;
   G.hot_nstarted = 0;
   free(G.hot_ids);
@@ -3368,6 +3465,7 @@ void db_store_stop(void) {
 #endif
   for (int i = 0; i < G.nathr; i++) pthread_join(G.athr[i], NULL);
   G.nathr = 0;
+  att_prep_wait();                                            /* (the threads that register zones are gone: the growth that was in progress is done before the store goes) */
   (void)rcu_writer_wait_until_safe(rcu_writer_advance_epoch(), 5000);          /* (the staged elements that were registered are freed when the readers that may have found them have left) */
   stgr_run(false);
   pthread_mutex_lock(&G.wlock);

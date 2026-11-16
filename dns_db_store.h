@@ -183,6 +183,10 @@ extern _Atomic bool db_store_test_not_resident;
 extern _Atomic bool db_store_test_resident;
 extern void (*_Atomic db_store_test_adopt_hook)(void);
 extern _Atomic bool db_store_test_adopt_noview;
+extern _Atomic int db_store_test_plog_fail;                       /* the log of a growth of the attach table that is being prepared cannot grow (the number of times) */
+extern void (*_Atomic db_store_test_prep_hook)(int where);       /* the thread that prepares the growth of the attach table calls this (where 0) after it has copied the table and before it takes the lock */
+struct dbdir_rec;
+extern void (*_Atomic db_store_test_batch_hook)(struct dbdir_rec *rec);   /* called for the record of every job of a batch of attaches just before the batch is registered */
 extern _Atomic bool db_store_test_hot_pending;                    /* the threads of hot.list see attach requests of queries that wait (tests: they are never starved by them) */
 extern void (*_Atomic db_store_test_hot_hook)(uint32_t zid);   /* called by the threads of hot.list before each zone (tests: the order, and time) */
 #ifdef KARIDNS_UNIT_TEST

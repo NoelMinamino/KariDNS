@@ -3906,7 +3906,7 @@ static int dbreg_commit_store(const char *view, const char *name, zone_db_entry_
     }
     if ((z->kind & ZDIR_K_STORED) && z->zid != zid && cur) ops->attach_remove(z);       /* (the record has another id now) */
     z->kind |= ZDIR_K_STORED;
-    z->zid = zid;
+    __atomic_store_n(&z->zid, zid, __ATOMIC_RELAXED);        /* (the thread that makes a bigger attach table reads the zone ids with no lock) */
     {
         int sid = ops->view_sid(view);
         z->sview = sid >= 0 ? (uint16_t)sid : 0;
@@ -4318,9 +4318,11 @@ static int attach_store_locked(const dbdir_ops_t *ops, const char *view, const c
     dbreg_zone_t *z = rv ? dbreg_find(rv, name, zdir_name_hash(name)) : NULL;
     if (!rv) return DBREG_ATT_NOT;
     if (z) return zdir_entry(z) ? DBREG_ATT_RESIDENT : atomic_load_explicit(&z->state, memory_order_relaxed) == ZDIR_ST_LOADING ? DBREG_ATT_BUSY : DBREG_ATT_NOT;       /* (an element of the name that is not resident and not LOADING is not the store's to attach over) */
-    if (rec->seq_set && ops->rec_unchanged) {                           /* 0.7 M4: the record was read by the store with its sequence word; one word says whether a version, a delete or a rename has come since (no search in the name index, no cell read: a page that is not in memory is a wait for the disk, or on ZFS a copy out of the cache, with every other attach waiting for this lock) */
-        if (!ops->rec_unchanged(rec)) return DBREG_ATT_STALE;           /* (changed, or a cell is being written now: the caller reads the record again) */
-    } else {
+    /* 0.7 M4: the record was read by the store with its sequence word; when the word is the same, nothing has been written to the record since (no search in the name index, no cell read: a page that is not in memory
+     * is a wait for the disk, or on ZFS a copy out of the cache, with every other attach waiting for this lock).  The word is more than the version: a stamp that the manifest of a pass writes again, a flag,
+     * moves it too, and that is no reason to throw the entry away; so when it is not the same the record is read again, by name, and compared as it always was (and a cell that is being written is waited for
+     * outside the lock, a few times). */
+    if (!(rec->seq_set && ops->rec_unchanged && ops->rec_unchanged(rec))) {
         dbdir_rec_t cur;
         const int gr = rec_get_locked(ops, view, name, &cur);
         if (gr < 0) {                                                   /* (a cell of the store is being written: not now) */
@@ -4388,6 +4390,7 @@ void dbreg_attach_store_n(dbreg_att_item_t *it, size_t n) {
     commit_post_t post[DBREG_ATT_BATCH];
     bool sh_cfg[DBREG_ATT_BATCH];
     bool live[DBREG_ATT_BATCH];
+    bool done[DBREG_ATT_BATCH] = { false };
     bool any = false;
     for (size_t i = 0; i < n; i++) {
         it[i].result = DBREG_ATT_NOT;
@@ -4399,14 +4402,31 @@ void dbreg_attach_store_n(dbreg_att_item_t *it, size_t n) {
         any = true;
     }
     if (!any) return;
-    pthread_mutex_lock(&g_zone_db_rebuild_lock);
-    for (size_t i = 0; i < n; i++) {
-        bool busy;
-        if (live[i]) it[i].result = attach_store_locked(ops, it[i].view, it[i].name, it[i].rec, it[i].entry, &offered[i], sh_cfg[i], &post[i], &busy);
+    /* an item whose record has a cell that is being written is looked at again after a pause, outside the lock, as the single attach does (a few times; then it is STALE) */
+    for (int attempt = 0;; attempt++) {
+        bool again = false;
+        pthread_mutex_lock(&g_zone_db_rebuild_lock);
+        for (size_t i = 0; i < n; i++) {
+            if (!live[i]) continue;
+            bool busy;
+            it[i].result = attach_store_locked(ops, it[i].view, it[i].name, it[i].rec, it[i].entry, &offered[i], sh_cfg[i], &post[i], &busy);
+            if (busy && attempt < REC_BUSY_TRIES) {
+                again = true;                                           /* (this item stays: the others are done) */
+            } else {
+                live[i] = false;
+                done[i] = true;
+            }
+        }
+        pthread_mutex_unlock(&g_zone_db_rebuild_lock);
+        for (size_t i = 0; i < n; i++) {
+            if (done[i]) {
+                commit_post_run(&post[i]);
+                done[i] = false;
+            }
+        }
+        if (!again) return;
+        rec_busy_pause();
     }
-    pthread_mutex_unlock(&g_zone_db_rebuild_lock);
-    for (size_t i = 0; i < n; i++)
-        if (live[i]) commit_post_run(&post[i]);
 }
 
 bool dbreg_err_get_locked(const char *view, const char *zone, uint32_t zid, char *out, size_t cap) {
