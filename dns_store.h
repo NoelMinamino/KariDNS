@@ -163,6 +163,7 @@ typedef struct store_meta {
 /* zt + zc of one zone (store_zone_get / store_iter) */
 typedef struct store_zone {
   uint32_t zid;
+  uint32_t seq;                   /* the sequence word of the cell pair at the read (store_zone_unchanged()); 0 when the zone was not read by store_zone_get() */
   uint8_t  state;                 /* STORE_STATE_* */
   uint8_t  klen;
   uint16_t view;
@@ -338,6 +339,10 @@ uint32_t store_find_source(const store_t *s, uint16_t source, int64_t domain_id,
 /* zt + zc fields of a zone.  0, -ENOENT (free / out of range), -EBADMSG (CRC of the record wrong: a damaged zone; a
  * record that is being replaced is read again until it is consistent). */
 int      store_zone_get(const store_t *s, uint32_t zid, store_zone_t *out);
+/* Has the zone's cell pair stayed as store_zone_get() read it (z->seq)?  Every write of the cells (a put, a delete, a state change, a rename) advances the sequence word, so true means that
+ * the zone id still holds the record that was read, with the name, the version, the digest and the location.  It reads one word of the cell that the read touched a moment ago (no search in the
+ * name index, no CRC): a caller that holds a lock can ask this where it would have read the record again.  false: changed, being written, or not a zone. */
+bool     store_zone_unchanged(const store_t *s, uint32_t zid, uint32_t seq);
 /* Read the image of a STORED zone and verify its checksum64 (and the header against zt).  -ENOENT: not stored; -EBADMSG: damaged
  * (the caller sets the zone back to KNOWN and fetches it again).  Release with store_img_release(). */
 int      store_image_read(const store_t *s, uint32_t zid, store_img_t *img);

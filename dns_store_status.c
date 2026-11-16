@@ -545,6 +545,8 @@ static void add_extra(list_t *l) {
   U("store.hot.attached", x.hot_attached);
   U("store.hot.skipped", x.hot_skipped);
   U("store.hot.written_at_stop", x.hot_written);
+  U("store.hot.threads", x.hot_threads);
+  U("store.hot.attached_per_s", x.hot_per_s);
 }
 
 static void add_store(list_t *l, const store_t *s, const store_attach_stats_t *a) {

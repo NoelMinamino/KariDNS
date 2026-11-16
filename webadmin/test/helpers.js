@@ -14,6 +14,7 @@ import { Router, listen, closeServer } from '../lib/http.js';
 import { ROUTES } from '../lib/routes.js';
 import { hashPassword } from '../lib/crypto.js';
 import * as S from '../lib/store.js';
+import { fetchBadPort } from './fakeidp.js';
 
 export const ROOT = new URL('../../', import.meta.url);
 const sqlOf = (rel) => fs.readFileSync(new URL(rel, ROOT), 'utf8');
@@ -96,7 +97,11 @@ export async function deploy({ settings, now, run = runChild, key = Buffer.alloc
   backend.open();
   const log = memLog();
   const app = new App({ config, backend, log, run, key, now, ui });
-  const server = await listen(app, new Router(ROUTES));
+  let server = await listen(app, new Router(ROUTES));
+  while (fetchBadPort(server.address().port)) {                 // fetch refuses some ports ("bad port"): listen again for another
+    await closeServer(server, 0);
+    server = await listen(app, new Router(ROUTES));
+  }
   const origin = `http://127.0.0.1:${server.address().port}`;
   const base = `${origin}/api/v1`;
   const d = { app, backend, server, base, origin, dir, log, config };

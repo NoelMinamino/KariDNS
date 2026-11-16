@@ -6,6 +6,12 @@
 import crypto from 'node:crypto';
 import http from 'node:http';
 
+// The ports that fetch (undici) refuses to connect to ("bad port", WHATWG Fetch "bad port" list; the part above 1023).  An ephemeral port can be one of them
+// (FreeBSD hands out 10000 and up, so 10080 is possible): a test server on port 0 takes another port then.
+const BAD_PORTS = new Set([1719, 1720, 1723, 2049, 3659, 4045, 4190, 5060, 5061, 6000, 6566, 6665, 6666, 6667, 6668, 6669, 6679, 6697, 10080]);
+export const fetchBadPort = (port) => BAD_PORTS.has(port);
+
+
 export const b64 = (buf) => Buffer.from(buf).toString('base64url');
 
 // a compact JWS made by hand (also for the hostile tokens of the tests: alg none, HS256, a wrong key ...)
@@ -70,9 +76,13 @@ export class FakeIdp {
   get redirectUris() { return this.redirects ??= new Set(); }
 
   async start(port = 0, host = '127.0.0.1') {
-    this.server = http.createServer((req, res) => { this.handle(req, res).catch((e) => { res.statusCode = 500; res.end(String(e)); }); });
-    await new Promise((resolve) => { this.server.listen(port, host, resolve); });
-    this.port = this.server.address().port;
+    for (;;) {
+      this.server = http.createServer((req, res) => { this.handle(req, res).catch((e) => { res.statusCode = 500; res.end(String(e)); }); });
+      await new Promise((resolve) => { this.server.listen(port, host, resolve); });
+      this.port = this.server.address().port;
+      if (port !== 0 || !fetchBadPort(this.port)) break;
+      await new Promise((resolve) => { this.server.close(resolve); });
+    }
     return this;
   }
 

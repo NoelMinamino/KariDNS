@@ -114,6 +114,7 @@ typedef struct store_extra {
    * and hot.list (state 0 none, 1 attaching, 2 done, 3 stopped at the high mark, 4 off) */
   uint64_t wa_ok, wa_cold, wa_over, wa_claim, wa_fail, wa_decline, wa_full, wa_adopted, wa_lost, wa_ns;
   uint64_t hot_state, hot_listed, hot_attached, hot_skipped, hot_written;
+  uint64_t hot_threads, hot_per_s;
 } store_extra_t;
 void store_status_set_extra_fn(bool (*fn)(store_extra_t *out));
 

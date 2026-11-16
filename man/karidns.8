@@ -1,4 +1,4 @@
-.TH KARIDNS 8 "2026-11-14" "KariDNS" "KariDNS Manual"
+.TH KARIDNS 8 "2026-11-16" "KariDNS" "KariDNS Manual"
 .\" Generated from docs/karidns.md by man/md2man.pl (make man): edit the Markdown manual, not this page.
 .SH NAME
 karidns \- Authoritative DNS Server Daemon for FreeBSD
@@ -1164,6 +1164,15 @@ unchanged. Only the value \fB1\fR counts. The integration tests export it
 host's \fB/var/log/messages\fR and still show their messages on the standard
 error the tests read. Do not set it for a daemonized server: its standard error
 is \fB/dev/null\fR, so those lines would be lost.
+.TP 8
+\fBKARIDNS_NO_DEFAULT_STORE=1\fR
+A test hook (0.7): a \fBdatabase { }\fR block without \fBstore\fR runs without a
+zone store, as if \fB/var/db/karidns\fR did not exist (logged as \fBthe zone
+store is off: KARIDNS_NO_DEFAULT_STORE=1 ...\fR); a store the block names is
+used as before. Only the value \fB1\fR counts. The integration tests export it
+(\fBtests/lib_proc.sh\fR, \fBtests/run_all_suite.sh\fR), so that their result
+does not depend on whether the build host has \fB/var/db/karidns\fR; the tests
+of the store name their directory.
 .TP 8
 \fBKARIDNS_XFER_MINUTE_SECS=n\fR
 A test hook: a "minute" of the transfer time limits is n seconds (1..60); see

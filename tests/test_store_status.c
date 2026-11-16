@@ -163,7 +163,7 @@ static bool extra_fn(store_extra_t *x) {
   x->attach_slots = 2048; x->attach_grows = 3; x->attach_shrinks = 1;
   x->folded = 11; x->fold_rows = 5; x->fold_replaced = 2; x->err_texts = 4; x->err_noted = 9; x->err_dropped = 1; x->sampled_detaches = 6;
   x->wa_ok = 100; x->wa_cold = 7; x->wa_over = 2; x->wa_claim = 3; x->wa_fail = 4; x->wa_decline = 5; x->wa_full = 6; x->wa_adopted = 98; x->wa_lost = 2; x->wa_ns = 1500000;
-  x->hot_state = 2; x->hot_listed = 1000; x->hot_attached = 990; x->hot_skipped = 10; x->hot_written = 1234;
+  x->hot_state = 2; x->hot_listed = 1000; x->hot_attached = 990; x->hot_skipped = 10; x->hot_written = 1234; x->hot_threads = 6; x->hot_per_s = 123456;
   return true;
 }
 static bool g_mem_ok = true;
@@ -523,6 +523,8 @@ static void test_store(int mode, const char *base) {
   CHECK_EQ(kv_num("store.hot.attached"), 990);
   CHECK_EQ(kv_num("store.hot.skipped"), 10);
   CHECK_EQ(kv_num("store.hot.written_at_stop"), 1234);
+  CHECK_EQ(kv_num("store.hot.threads"), 6);
+  CHECK_EQ(kv_num("store.hot.attached_per_s"), 123456);
   store_status_set_extra_fn(NULL);
   store_status_format(js, STORE_STATUS_OUT_MAX, STORE_FMT_JSON, NULL);
   CHECK(parse_json(js));

@@ -307,11 +307,15 @@ if ! wait_up $P6; then fail "server 6 did not start"; tail -20 "$W/s6.log"; else
 options { port $P7; pid-file "none"; bind-address { 127.0.0.1; }; $USER_OPT };
 zone "ex.test" { type secondary; primaries { 127.0.0.1 port $P6; }; $lim };
 EOF
+        # the log of the case before holds its "not installed" line, and the shell that starts the server truncates the log only when it
+        # runs: without this the wait below sees the old line at once and the checks run before the transfer
+        rm -f "$W/s7.log"
         "$KARIDNS" -f -c "$W/s7.conf" > "$W/s7.log" 2>&1 &
         S7=$!
         PIDS="$PIDS $S7"
         _i=0
-        while [ $_i -lt 40 ] && ! grep -q "not installed after XFR\|Transfer.*complete\|AXFR.*success" "$W/s7.log" && [ -z "$(d $P7 www.ex.test A +nocookie +short 2>/dev/null | grep 192)" ]; do sleep 0.5; _i=$((_i + 1)); done
+        # wait for the exact answer or the refusal line (not for a "192" anywhere in the output: an error text can hold it)
+        while [ $_i -lt 40 ] && ! grep -q "not installed after XFR" "$W/s7.log" && [ "$(d $P7 www.ex.test A +nocookie +short 2>/dev/null)" != "192.0.2.80" ]; do sleep 0.5; _i=$((_i + 1)); done
         case "$lim" in
         "max-records 6;"*)
             [ "$(d $P7 www.ex.test A +nocookie +short)" = "192.0.2.80" ] && pass "a limit that the zone fits ('$lim'): the transfer is installed" || fail "secondary with room: www not served: $(tail -5 "$W/s7.log")" ;;
