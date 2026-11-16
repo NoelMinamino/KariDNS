@@ -27,19 +27,44 @@
  * in the kernel), so a group never holds two entries that touch one name or one source id, and the slots an entry has claimed in the index are skipped by the entries after it (see kn_chunk_t).
  *
  * Durability / group commit.  fdatasync is not issued per call: store_commit() (a batch end), the policy
- * (sync_interval_ms, default 100 ms, evaluated at each writer call and in store_tick()), a checkpoint and close do
+ * (sync_interval_ms, default 100 ms), a checkpoint and close do
  *     fdatasync(segments written since the last commit)   -- an image is durable before ...
  *     fdatasync(journal)                                  -- ... the record that points at it
  * so after power loss the journal prefix that was synced is complete and only points at durable images.
  *
+ * No I/O wait inside the writer mutex (0.7 fix A).  At 10M zones a checkpoint's msync of the tables took 1.5 to 25 s and a growth of the index
+ * 6 s, all of it inside the writer mutex, and the threads that wait for the mutex hold the record mutex of the Backend meanwhile.  Now:
+ *   - A commit takes, under the mutex, the LSN it covers, the segments marked dirty (the marks are cleared) and the journal's fd; it syncs them
+ *     with the mutex released, then publishes committed_lsn.  Commits are serialised by the "I/O baton" (io_busy, a flag under bg_mu that is
+ *     taken without the writer mutex, or tried with it: never waited for while it is held), so a later commit never publishes past an earlier
+ *     one's segments.  A failed sync marks the segments dirty again.  The periodic commit is the flusher thread's; STORE_SYNC_EVERY syncs after
+ *     the mutex is released, before the call returns; store_commit() waits for a commit that covers its LSN.
+ *   - A checkpoint is fuzzy: under the mutex only its position P (= the last LSN), a copy of the superblock as of P, and the switch to the next
+ *     journal file (pre-created, so the switch is a 64-byte pwrite of its header) are taken.  Then, with the mutex released, the journal up to P
+ *     and the segments are synced (the baton is given back after this), the tables are msynced and the superblock (checkpoint LSN P, the
+ *     journal after the switch) is written.  Writers go on meanwhile, so the flushed tables hold every effect of the records <= P and maybe some
+ *     of the records > P.  That is what a replay from P is made for: every op is an absolute value ("cell X = V", "slot = value", "counter =
+ *     value", the bytes of a name), so a location that a record > P wrote ends with the value of the last such record whatever it held before,
+ *     and a location that no record > P wrote holds its value of P (a checkpoint's flush only adds pages that records > P changed); the
+ *     counters of the superblock are those of P, and every record after P carries the absolute value of every counter it changes.  Same boot
+ *     (kill -9): the page cache holds every page, the replay is exact as before.  Power loss: pages of records > P that are not in the durable
+ *     journal may be on disk, as the kernel's own flush could always put them there; the open rebuilds the derived tables then, as before (a
+ *     cell that was in the middle of a write when its page was flushed fails its CRC and is dropped by the rebuild: the zone is fetched again).
+ *     One checkpoint at a time (ck_busy); the tables, ix / sx and segments it flushes are kept from being freed by io_hold.
+ *   - A checkpoint with the clean flag (store_checkpoint_clean(), close), the first one of an open and the one of a repair keep the writers out
+ *     for the whole time: the clean flag must name a state that no record follows.  A writer that finds the clean flag on disk writes a
+ *     superblock without it first (nothing changed since: no flush), outside any hold of the writer mutex that it cannot give up.
+ *   - A growth of ix / sx is built outside the mutex (see rg_* below), and its OP_GEN record is written under the mutex once the bigger index
+ *     is up to date.
+ *
  * Checkpoint (store_checkpoint(), by the journal size limit, by checkpoint_interval_ms, at close, after recovery).
- *     commit; msync + fdatasync every mapped file; create the next journal file; write the *other* superblock copy (seq+1,
- *     checkpoint LSN = last LSN, names the journal gen and the ix / sx generations, counters, views, cursors, CRC-32C);
- *     fdatasync it; delete journals / generations that neither superblock copy names any more.  The older copy plus the
- *     journals it names stays valid, so a damaged newer copy costs nothing: the open uses the older one and replays the
- *     longer journal chain.  Growth of ix / sx (a new generation file, built from a sequential pass over zt) is a checkpoint
- *     barrier: the new file is complete and flushed, an OP_GEN record bridges the journal chain, and no later record refers to
- *     the old generation.
+ *     switch to the next journal file; commit up to P; msync + fdatasync every mapped file; fdatasync the new journal and the directory;
+ *     write the *other* superblock copy (seq+1, checkpoint LSN = P, names the new journal gen and the ix / sx generations of P, counters,
+ *     views, cursors, CRC-32C); fdatasync it; delete journals / generations that neither superblock copy names any more.  The older copy plus
+ *     the journals it names stays valid, so a damaged newer copy costs nothing: the open uses the older one and replays the longer journal
+ *     chain.  Growth of ix / sx (a new generation file) is bridged by an OP_GEN record in the journal chain: a replay from a checkpoint before
+ *     it applies the records before it to the old generation and switches to the new one, whose file then holds every change up to the record
+ *     (and maybe later ones: the ops are absolute).
  *
  * Recovery at open.  Take the newer valid superblock copy whose files check out against fstat sizes; read the journal files
  * from the gen it names (and the ones after, while their base LSN continues); apply every record with LSN > checkpoint LSN
@@ -54,7 +79,8 @@
  * it cannot apply.
  *
  * Bounded size: a checkpoint is forced when the journal reaches journal_max_bytes (default 100 MiB: a replay of that is about a second
- * warm), so the journal never grows without limit and the replay after a crash is bounded.
+ * warm), so the journal never grows without limit and the replay after a crash is bounded (by that and what is written while one
+ * checkpoint flushes: the writer that finds the journal full switches it at once when no other checkpoint runs).
  *
  * ======================================================================================================================
  * 0.7 WP9 (S6): the cleaner, disk full, the scrub, nx
@@ -98,9 +124,9 @@
  * Start (design 7).  The open reads ix once from the beginning (the first lookup does not wait for the disk), then a thread reads zt in the
  * background; both times are in the statistics.  On ZFS the open reads st_blksize of a table file (the dataset's recordsize) and warns above 32 KiB.
  *
- * Deliberate limits: store-copy-max (a big zone mapped instead of copied in COPY mode) is not done; ix / sx growth runs under the
- * writer mutex (readers continue on the old generation; a 10M-zone rebuild blocks the writer for seconds, once per 1.5x growth, or never
- * after store_reserve()); the nx pass blocks the writer as long (rarely: only when more than half of nx is dead).
+ * Deliberate limits: store-copy-max (a big zone mapped instead of copied in COPY mode) is not done; an index that fills up to one half before
+ * its build outside the mutex ended is grown inside it (as before 0.7 fix A); store_repair() and the nx pass block the writer (rarely: only
+ * when more than half of nx is dead).
  *
  * Journal ops (typed, each a TLV {u16 type, u16 0, u32 payload length}):
  *   ZREC zid + zt[64] + zc[64] | NX offset + bytes | IX / SX count x {slot, value} | V count x {field id, value}
@@ -269,6 +295,8 @@ typedef struct {                       /* a table that grows in place inside a r
   uint8_t *base;
   size_t   reserve;                    /* bytes of address space */
   _Atomic uint64_t mapped;             /* data bytes mapped (multiple of the page size) */
+  _Atomic uint64_t extended;           /* data bytes the file is known to hold (allocated): a growth up to it is a mapping only (0.7 fix A: the flusher extends ahead, outside the writer mutex) */
+  _Atomic bool no_alloc;               /* posix_fallocate() is not there (ZFS): nothing is allocated ahead */
 } mtab_t;
 
 typedef struct ixgen {                 /* one generation of ix or sx */
@@ -295,12 +323,18 @@ typedef struct retire {
 } retire_t;
 
 #define JB_MAXV 96
+/* An index change of a record, kept for a growth that is being built outside the mutex (rg_*): which index (0 ix, 1 sx), put or take out, the
+ * hash and the zone id.  The bigger index is brought up to date with these, in their order, before it is put in. */
+typedef struct { uint64_t h; uint32_t z; uint8_t which, ins; uint16_t pad; } rgent_t;
+#define JB_MAXPL 208                      /* index ops of one record: three for each entry of a group of KN_MAX (64), with room */
 typedef struct {
   uint8_t *p;
   size_t   len, cap;
   uint32_t nops;
   unsigned nv;
   struct { uint32_t fid; uint64_t val; } vs[JB_MAXV];
+  unsigned npl;                           /* the index changes of the record (rgent_t), always noted: a growth may start while a group is being planned */
+  rgent_t  pl[JB_MAXPL];
 } jb_t;
 
 struct store {
@@ -336,16 +370,50 @@ struct store {
   _Atomic(ixgen_t *) ix;
   _Atomic(ixgen_t *) sx;
   _Atomic(seg_t *) segs[ST_MAXSEG + 1];
-  uint8_t seg_dirty[ST_MAXSEG + 1];
+  _Atomic uint8_t seg_dirty[ST_MAXSEG + 1];           /* set by the writer after an append, cleared by the commit that takes the segment (and set again when its sync fails) */
 
   int jfd;
   _Atomic uint64_t jbytes;
   _Atomic uint64_t lsn, committed_lsn;
-  uint64_t uncommitted;
-  bool dir_dirty;
-  uint64_t last_sync_ms, last_ckpt_ms;
+  _Atomic bool dir_dirty;
+  _Atomic uint64_t last_sync_ms, last_ckpt_ms;
   jb_t jb;
   retire_t *rq_head, *rq_tail;
+
+  /* ---- 0.7 fix A: the I/O outside the writer mutex (see the top of the file) ----
+   * Lock order: wlock, then bg_mu (innermost; nothing is waited for while it is held, except on bg_cv).  io_busy (the I/O baton: one commit at a
+   * time) and ck_busy (one checkpoint at a time) are flags under bg_mu: a thread that holds the writer mutex only tries them (ck_try_locked()). */
+  pthread_mutex_t bg_mu;
+  pthread_cond_t bg_cv;
+  bool io_busy, ck_busy, ck_handoff, bg_stop, bg_kick, fl_on;
+  pthread_t fl_thr, fl_thr2;
+  _Atomic bool ck_want;                               /* a checkpoint is wanted soon (after a growth: the old generation can go when the superblocks name the new one) */
+  _Atomic int io_hold;                                /* commits and checkpoints whose I/O uses segment descriptors and index generations: retire_run() frees none meanwhile */
+  int jold;                                           /* (baton) the journal before a switch whose sync failed: synced by the next commit, then closed */
+  int jnext_fd;                                       /* (ck_busy) the next journal file, created ahead of the switch; jnext_gen its generation */
+  uint32_t jnext_gen;
+  struct {                                            /* (ck_busy) the checkpoint being made */
+    uint64_t lsn, t0;
+    bool clean, dir;
+    int oldfd, newfd;
+    ixgen_t *ix, *sx;
+    uint32_t nseg;
+    seg_t *seg[ST_MAXSEG];
+  } ck;
+  struct { uint32_t nseg; seg_t *seg[ST_MAXSEG]; } cm;   /* (baton) the segments of the commit being made */
+  /* growth of ix / sx outside the mutex (rg_*; wlock, except the flags the build thread reads) */
+  bool rg_active, rg_bad;
+  _Atomic bool rg_cancel, rg_stop, rg_live;
+  uint64_t tabgen, rg_tabgen;                         /* tabgen: +1 at every change of a generation; a build made against another one is dropped */
+  uint32_t ix_gen_next, sx_gen_next;                  /* the number of the next generation file (a dropped build does not reuse its number) */
+  uint64_t rg_hwm, rg_nix, rg_nsx;
+  uint32_t rg_ixgen, rg_sxgen;
+  rgent_t *rg_log;
+  size_t rg_n, rg_cap;
+  _Atomic uint64_t n_growths_bg;
+  /* holds of the writer mutex */
+  uint64_t wl_t0;
+  _Atomic uint64_t wl_n, wl_slow, wl_max_us;
 
   _Atomic uint64_t n_puts, n_replaces, n_deletes, n_growths, n_checkpoints, n_commits, n_write_errors;
   _Atomic uint64_t n_group_records, n_group_entries;      /* 0.7 M2: journal records of a group commit (store_set_known_n()) and the entries they carried */
@@ -414,10 +482,18 @@ struct store {
 /* test hooks                                                                                                           */
 /* ------------------------------------------------------------------------------------------------------------------ */
 
+void (*_Atomic store_test_ckpt_hook)(int step);
+void (*_Atomic store_test_regrow_hook)(int step);
+_Atomic bool store_test_no_flusher;
+static void st_hook(void (*_Atomic *h)(int), int step) {
+  void (*f)(int) = atomic_load_explicit(h, memory_order_acquire);
+  if (f) f(step);
+}
+
 #ifdef KARIDNS_UNIT_TEST
-long store_test_crash_countdown = 0;
+_Atomic long store_test_crash_countdown = 0;
 void (*store_test_before_counters)(store_t *s) = NULL;
-long store_test_fail_commit = 0;
+_Atomic long store_test_fail_commit = 0;
 /* a writer function of the store (its name: "put", "set_known", "delete", "set_flags", "set_stamp", "set_cursor") fails before it changes anything with the errno this returns (0: no failure) */
 int (*store_test_write_fault)(const char *op, uint32_t zid) = NULL;
 void (*store_test_in_stats)(void) = NULL;
@@ -428,13 +504,21 @@ void (*store_test_cleaner_step)(store_t *s, uint32_t victim) = NULL;
 /* ... the same for an entry of a group (store_set_known_n()): the entry fails with the errno, the others go on */
 #define ST_FAULT_RES(op, zid, res) do { int fe_ = store_test_write_fault ? store_test_write_fault((op), (zid)) : 0; if (fe_) (res) = fe_; } while (0)
 static void st_crash_point(void) {
-  long c = store_test_crash_countdown;
-  if (c > 0 && --c == 0) kill(getpid(), SIGKILL);
-  store_test_crash_countdown = c;
+  long c = atomic_load_explicit(&store_test_crash_countdown, memory_order_relaxed);
+  while (c > 0 && !atomic_compare_exchange_weak_explicit(&store_test_crash_countdown, &c, c - 1, memory_order_relaxed, memory_order_relaxed)) {}
+  if (c == 1) kill(getpid(), SIGKILL);
+}
+/* the n-th commit fails (store_test_fail_commit) */
+static bool st_fail_commit(void) {
+  long c = atomic_load_explicit(&store_test_fail_commit, memory_order_relaxed);
+  while (c > 0 && !atomic_compare_exchange_weak_explicit(&store_test_fail_commit, &c, c - 1, memory_order_relaxed, memory_order_relaxed)) {}
+  return c == 1;
 }
 #define CRASH_POINT() st_crash_point()
+#define FAIL_COMMIT() st_fail_commit()
 #else
 #define CRASH_POINT() ((void)0)
+#define FAIL_COMMIT() false
 #define ST_FAULT(op, zid) ((void)0)
 #define ST_FAULT_RES(op, zid, res) ((void)0)
 #endif
@@ -1034,6 +1118,7 @@ static int mtab_open(store_t *s, mtab_t *t, const char *name, uint32_t kind, uin
     int r = mtab_map_tail(t, 0, data);
     if (r < 0) return r;
   }
+  atomic_store_explicit(&t->extended, data, memory_order_relaxed);
   atomic_store_explicit(&t->mapped, data, memory_order_release);
   return 0;
 }
@@ -1043,22 +1128,53 @@ static void mtab_close(mtab_t *t) {
   memset(t, 0, sizeof(*t));
   t->fd = -1;
 }
-/* grow the data area to at least `need` bytes (never shrinks); the address of existing data does not change */
-static int mtab_grow(store_t *s, mtab_t *t, uint64_t need) {
-  uint64_t cur = atomic_load_explicit(&t->mapped, memory_order_relaxed);
-  if (need <= cur) return 0;
-  if (need > t->reserve) return -EFBIG;
+/* the size a growth from cur to at least need makes (a quarter more, at least a chunk, in whole chunks) */
+static uint64_t mtab_want(const store_t *s, const mtab_t *t, uint64_t cur, uint64_t need) {
   uint64_t want = need;
   if (cur + cur / 4 > want) want = cur + cur / 4;
   if (cur + ST_CHUNK > want) want = cur + ST_CHUNK;
   want = (want + ST_CHUNK - 1) & ~(uint64_t)(ST_CHUNK - 1);
   if (want > t->reserve) want = t->reserve & ~(uint64_t)(s->pagesz - 1);
-  int r = st_extend(t->fd, (off_t)(ST_HDR_PAGE + cur), (off_t)(ST_HDR_PAGE + want));
-  if (r < 0) return r;
-  r = mtab_map_tail(t, cur, want);
+  return want;
+}
+static void mtab_note_extended(mtab_t *t, uint64_t to) {
+  uint64_t c = atomic_load_explicit(&t->extended, memory_order_relaxed);
+  while (to > c && !atomic_compare_exchange_weak_explicit(&t->extended, &c, to, memory_order_release, memory_order_relaxed)) {}
+}
+/* grow the data area to at least `need` bytes (never shrinks); the address of existing data does not change.  The blocks are allocated here unless the flusher did it already (mtab_ahead()). */
+static int mtab_grow(store_t *s, mtab_t *t, uint64_t need) {
+  uint64_t cur = atomic_load_explicit(&t->mapped, memory_order_relaxed);
+  if (need <= cur) return 0;
+  if (need > t->reserve) return -EFBIG;
+  const uint64_t want = mtab_want(s, t, cur, need);
+  if (atomic_load_explicit(&t->extended, memory_order_acquire) < want) {
+    int r = st_extend(t->fd, (off_t)(ST_HDR_PAGE + cur), (off_t)(ST_HDR_PAGE + want));
+    if (r < 0) return r;
+    mtab_note_extended(t, want);
+  }
+  int r = mtab_map_tail(t, cur, want);
   if (r < 0) return r;
   atomic_store_explicit(&t->mapped, want, memory_order_release);
   return 0;
+}
+/* Outside the writer mutex (the flusher, store_reserve()): allocate the blocks of the next growth of the table when what is in use (`used` bytes) is near the end of what is mapped, or
+ * those of a growth to `need` (store_reserve()), so that the growth inside the mutex is a mapping (posix_fallocate() of a quarter of zt at millions of zones is seconds on UFS).  A growth
+ * inside the mutex at the same time allocates the same range: both are the same allocation. */
+static void mtab_ahead(store_t *s, mtab_t *t, uint64_t used, uint64_t need) {
+  const uint64_t cur = atomic_load_explicit(&t->mapped, memory_order_acquire);
+  if (need <= cur) {
+    if (used + used / 8 + ST_CHUNK / 2 < cur) return;         /* (not near the end yet) */
+    need = cur + 1;
+  }
+  if (need > t->reserve || atomic_load_explicit(&t->no_alloc, memory_order_relaxed)) return;
+  const uint64_t want = mtab_want(s, t, cur, need), have = atomic_load_explicit(&t->extended, memory_order_acquire);
+  if (have >= want) return;
+  const uint64_t from = have > cur ? have : cur;
+  /* posix_fallocate() only: it never makes a file shorter (an ftruncate() here could undo a growth that the writer made meanwhile).  A file system without it (ZFS) extends a file
+   * with ftruncate(), which is no wait: nothing to do ahead there. */
+  const int r = posix_fallocate(t->fd, (off_t)(ST_HDR_PAGE + from), (off_t)(want - from));
+  if (r == 0) mtab_note_extended(t, want);
+  else if (r == EINVAL || r == EOPNOTSUPP || r == ENODEV) atomic_store_explicit(&t->no_alloc, true, memory_order_relaxed);
 }
 static int mtab_sync(mtab_t *t) {
   uint64_t m = atomic_load_explicit(&t->mapped, memory_order_relaxed);
@@ -1159,6 +1275,7 @@ static void retire_add_seg(store_t *s, seg_t *g) {
   s->rq_tail = r;
 }
 static void retire_run(store_t *s, bool force) {
+  if (!force && atomic_load_explicit(&s->io_hold, memory_order_acquire) > 0) return;      /* (a commit or a checkpoint syncs a segment or a generation outside the mutex) */
   while (s->rq_head && (force || rcu_writer_is_safe(s->rq_head->epoch))) {
     retire_t *r = s->rq_head;
     s->rq_head = r->next;
@@ -1314,7 +1431,7 @@ static int seg_create(store_t *s, uint32_t n, uint64_t cap) {
   if (r < 0) { close(fd); return r; }
   s->dir_dirty = true;
   seg_t *old = atomic_load_explicit(&s->segs[n], memory_order_relaxed);
-  if (old) { atomic_store_explicit(&s->segs[n], NULL, memory_order_release); seg_free(old); }
+  if (old) { atomic_store_explicit(&s->segs[n], NULL, memory_order_release); retire_add_seg(s, old); }       /* (a reader or a commit may still hold it) */
   close(fd);
   return 0;
 }
@@ -1327,6 +1444,18 @@ static void jb_reset(jb_t *j) {
   j->len = ST_JREC_HDR;
   j->nops = 0;
   j->nv = 0;
+  j->npl = 0;
+}
+/* note an index change of the record (rgent_t); -ENOMEM when the record has too many (it is cut: a group is written first) */
+static int jb_pl(jb_t *j, uint8_t which, bool ins, uint64_t h, uint32_t z) {
+  if (j->npl >= JB_MAXPL) return -ENOMEM;
+  rgent_t *e = &j->pl[j->npl++];
+  e->h = h;
+  e->z = z;
+  e->which = which;
+  e->ins = ins ? 1 : 0;
+  e->pad = 0;
+  return 0;
 }
 static uint8_t *jb_op(jb_t *j, uint16_t type, size_t paylen) {
   paylen = (paylen + 7) & ~(size_t)7;
@@ -1417,6 +1546,7 @@ static int switch_gen(store_t *s, uint32_t which, uint32_t gen, uint64_t nslots)
   _Atomic(ixgen_t *) *slot = which == 0 ? &s->ix : &s->sx;
   ixgen_t *old = atomic_exchange_explicit(slot, g, memory_order_acq_rel);
   if (which == 0) s->ix_gen = gen; else s->sx_gen = gen;
+  s->tabgen++;
   if (old) retire_add(s, old);
   return 0;
 }
@@ -1561,29 +1691,45 @@ static int apply_ops(store_t *s, const uint8_t *ops, size_t len) {
 /* journal file: append, commit                                                                                         */
 /* ------------------------------------------------------------------------------------------------------------------ */
 
-static int journal_open_new(store_t *s, uint32_t gen, uint64_t base_lsn) {
+/* create (or empty) journal file `gen`: the next checkpoint switches to it (journal_switch_locked() writes its header).  A file with no header ends the chain that a replay reads. */
+static int journal_create(store_t *s, uint32_t gen) {
   char name[32];
   st_name_ix(name, sizeof(name), "jrn", gen);
   int fd = st_openat(s, name, O_RDWR | O_CREAT | O_TRUNC);
   if (fd < 0) return fd;
+  s->dir_dirty = true;
+  return fd;
+}
+
+/* The journal goes on in file jrn_gen + 1, whose records start at base_lsn: its header is written (into the page cache: the checkpoint syncs the file before a superblock names it), and
+ * the file before stays open in *oldfd for the sync of its last records.  Writer mutex and ck_busy held.  The file was made ahead (jnext_fd) when it could be: the switch is a pwrite. */
+static int journal_switch_locked(store_t *s, uint64_t base_lsn, int *oldfd) {
+  const uint32_t gen = s->jrn_gen + 1;
+  int fd = -1;
+  if (s->jnext_fd >= 0 && s->jnext_gen == gen) {
+    fd = s->jnext_fd;
+    s->jnext_fd = -1;
+  } else {
+    if (s->jnext_fd >= 0) { close(s->jnext_fd); s->jnext_fd = -1; }
+    if ((fd = journal_create(s, gen)) < 0) return fd;
+  }
   fhdr_t h;
   fhdr_make(s, &h, FK_JRN, gen, 8, base_lsn);
   uint8_t page[ST_JHDR];
   memset(page, 0, sizeof(page));
   memcpy(page, &h, sizeof(h));
   int r = st_pwrite_all(fd, page, ST_JHDR, 0);
-  if (r == 0 && fdatasync(fd) != 0) r = -errno;
-  if (r < 0) { close(fd); return r; }
-  s->dir_dirty = true;
-  if (s->jfd >= 0) close(s->jfd);
+  if (r < 0) { close(fd); return r; }        /* (the file holds no valid header: a replay stops before it) */
+  *oldfd = s->jfd;
   s->jfd = fd;
   s->jbytes = ST_JHDR;
   s->jrn_gen = gen;
   return 0;
 }
 
-static int checkpoint_locked(store_t *s, bool clean);
 static void space_checkpoint(store_t *s);
+static int unclean_try_locked(store_t *s);
+static void rg_note_locked(store_t *s, const jb_t *j);
 
 /* finish the builder's record (counters last), give it its LSN and CRC, write it.  The cells are not touched. */
 static int journal_append(store_t *s) {
@@ -1591,8 +1737,9 @@ static int journal_append(store_t *s) {
   int r = jb_flush_v(j);
   if (r < 0) return r;
   /* the last checkpoint on disk says "clean stop" (store_checkpoint_clean()) and this is a change after it: the flag is cleared durably first, as the open does
-   * (a record after a clean flag would not make the next open after a power loss rebuild the tables) */
-  if (s->clean_on_disk && (r = checkpoint_locked(s, false)) < 0) return r;
+   * (a record after a clean flag would not make the next open after a power loss rebuild the tables).  Every writer clears it before it plans a record (wr_lock()):
+   * this is the guard for a path that did not. */
+  if (s->clean_on_disk && (r = unclean_try_locked(s)) < 0) return r;
   jrec_t h;
   h.magic = ST_MAGIC_JREC;
   h.len = (uint32_t)j->len;
@@ -1607,45 +1754,134 @@ static int journal_append(store_t *s) {
   if (r < 0) return r;
   s->jbytes += j->len;
   s->lsn = h.lsn;
-  s->uncommitted++;
   CRASH_POINT();
   return 0;
 }
 
-/* log the built record, then apply its ops */
+/* log the built record, then apply its ops (and keep its index changes for a growth being built outside the mutex) */
 static int journal_commit_apply(store_t *s) {
   int r = journal_append(s);
   if (r < 0) return r;
+  rg_note_locked(s, &s->jb);
   r = apply_ops(s, s->jb.p + ST_JREC_HDR, s->jb.len - ST_JREC_HDR);
   CRASH_POINT();
   return r;
 }
 
-static int commit_locked(store_t *s) {
-#ifdef KARIDNS_UNIT_TEST
-  if (store_test_fail_commit > 0 && --store_test_fail_commit == 0) return -EIO;
-#endif
-  uint32_t nsegs = (uint32_t)VG(s, V_NSEGS);
+/* ---- the writer mutex: every hold is timed (store.lock.*) ---- */
+
+static void wr_lock_raw(store_t *s) {
+  pthread_mutex_lock(&s->wlock);
+  s->wl_t0 = st_now_us();
+}
+static void wr_unlock_raw(store_t *s) {
+  const uint64_t h = st_now_us() - s->wl_t0;
+  atomic_fetch_add_explicit(&s->wl_n, 1, memory_order_relaxed);
+  if (h >= 1000) atomic_fetch_add_explicit(&s->wl_slow, 1, memory_order_relaxed);
+  uint64_t m = atomic_load_explicit(&s->wl_max_us, memory_order_relaxed);
+  while (h > m && !atomic_compare_exchange_weak_explicit(&s->wl_max_us, &m, h, memory_order_relaxed, memory_order_relaxed)) {}
+  pthread_mutex_unlock(&s->wlock);
+}
+
+/* ---- the I/O baton (io_busy: one commit at a time) and the checkpoint flag (ck_busy), under bg_mu ----
+ * A thread that does not hold the writer mutex waits for them; one that holds it only tries (ck_try_locked()): the holder of a flag may be waiting for the writer mutex. */
+
+static void bg_signal(store_t *s) {
+  pthread_mutex_lock(&s->bg_mu);
+  s->bg_kick = true;
+  pthread_cond_broadcast(&s->bg_cv);
+  pthread_mutex_unlock(&s->bg_mu);
+}
+static void baton_take(store_t *s) {
+  pthread_mutex_lock(&s->bg_mu);
+  while (s->io_busy) pthread_cond_wait(&s->bg_cv, &s->bg_mu);
+  s->io_busy = true;
+  pthread_mutex_unlock(&s->bg_mu);
+}
+/* both: a checkpoint (it takes the baton for its first part) */
+static void ck_acquire(store_t *s) {
+  pthread_mutex_lock(&s->bg_mu);
+  while (s->io_busy || s->ck_busy) pthread_cond_wait(&s->bg_cv, &s->bg_mu);
+  s->io_busy = s->ck_busy = true;
+  pthread_mutex_unlock(&s->bg_mu);
+}
+static bool ck_try_locked(store_t *s) {
+  pthread_mutex_lock(&s->bg_mu);
+  const bool ok = !s->io_busy && !s->ck_busy;
+  if (ok) s->io_busy = s->ck_busy = true;
+  pthread_mutex_unlock(&s->bg_mu);
+  return ok;
+}
+static void bg_release(store_t *s, bool io, bool ck) {
+  pthread_mutex_lock(&s->bg_mu);
+  if (io) s->io_busy = false;
+  if (ck) s->ck_busy = false;
+  pthread_cond_broadcast(&s->bg_cv);
+  pthread_mutex_unlock(&s->bg_mu);
+}
+
+/* ---- commit ---- */
+
+/* What a commit covers (writer mutex held): the LSN, the segments written since the last commit (their marks are cleared; io_hold keeps the descriptors), whether the directory has new entries.
+ * The journal's fd does not change while the baton is held (a switch needs it). */
+static uint32_t commit_capture_locked(store_t *s, seg_t **seg, bool *dir) {
+  uint32_t nsegs = (uint32_t)VG(s, V_NSEGS), k = 0;
   if (nsegs > ST_MAXSEG) nsegs = ST_MAXSEG;
   for (uint32_t n = 1; n <= nsegs; n++) {
-    if (!s->seg_dirty[n]) continue;
+    if (!atomic_exchange_explicit(&s->seg_dirty[n], 0, memory_order_relaxed)) continue;
     seg_t *g = atomic_load_explicit(&s->segs[n], memory_order_relaxed);
-    if (g && fdatasync(g->fd) != 0) return -errno;
-    s->seg_dirty[n] = 0;
+    if (g) seg[k++] = g;
   }
+  *dir = atomic_exchange_explicit(&s->dir_dirty, false, memory_order_relaxed);
+  atomic_fetch_add_explicit(&s->io_hold, 1, memory_order_acq_rel);
+  return k;
+}
+
+/* The sync of a commit (the baton held; no lock): the segments (an image is durable before the record that points at it), the directory (new files are in it before a record that refers
+ * to them is durable), a journal file before a switch whose sync had failed, the journal file fd.  Then committed_lsn = target.  A failure marks the segments and the directory dirty again. */
+static int commit_sync(store_t *s, uint64_t target, seg_t *const *seg, uint32_t nseg, bool dir, int fd) {
+  int r = FAIL_COMMIT() ? -EIO : 0;
+  for (uint32_t k = 0; k < nseg && r == 0; k++)
+    if (fdatasync(seg[k]->fd) != 0) r = -errno;
   CRASH_POINT();
-  /* new files (segments, journals) are in the directory before a journal record that refers to them is durable */
-  if (s->dir_dirty) {
-    if (fsync(s->dirfd) != 0 && errno != EINVAL && errno != ENOTSUP) return -errno;
-    s->dir_dirty = false;
+  if (r == 0 && dir && fsync(s->dirfd) != 0 && errno != EINVAL && errno != ENOTSUP) r = -errno;
+  if (r == 0 && s->jold >= 0) {
+    if (fdatasync(s->jold) != 0) r = -errno;
+    else { close(s->jold); s->jold = -1; }
   }
-  if (s->jfd >= 0 && fdatasync(s->jfd) != 0) return -errno;
-  s->committed_lsn = s->lsn;
-  s->uncommitted = 0;
-  s->last_sync_ms = st_now_ms();
-  s->n_commits++;
+  if (r == 0 && fd >= 0 && fdatasync(fd) != 0) r = -errno;
+  if (r < 0) {
+    for (uint32_t k = 0; k < nseg; k++) atomic_store_explicit(&s->seg_dirty[seg[k]->num], 1, memory_order_relaxed);
+    if (dir) atomic_store_explicit(&s->dir_dirty, true, memory_order_relaxed);
+    return r;
+  }
+  if (target > atomic_load_explicit(&s->committed_lsn, memory_order_relaxed)) atomic_store_explicit(&s->committed_lsn, target, memory_order_release);
+  atomic_store_explicit(&s->last_sync_ms, st_now_ms(), memory_order_relaxed);
+  atomic_fetch_add_explicit(&s->n_commits, 1, memory_order_relaxed);
   CRASH_POINT();
   return 0;
+}
+
+static void note_error(store_t *s, int r);
+
+/* Make every record up to `target` durable (no lock held).  Callers that come together share one sync: the second finds its LSN covered. */
+static int st_commit(store_t *s, uint64_t target) {
+  if (atomic_load_explicit(&s->committed_lsn, memory_order_acquire) >= target) return 0;
+  baton_take(s);
+  int r = 0;
+  if (atomic_load_explicit(&s->committed_lsn, memory_order_acquire) < target) {
+    wr_lock_raw(s);
+    const uint64_t t = s->lsn;
+    bool dir;
+    const uint32_t n = commit_capture_locked(s, s->cm.seg, &dir);
+    const int fd = s->jfd;
+    wr_unlock_raw(s);
+    r = commit_sync(s, t, s->cm.seg, n, dir, fd);
+    atomic_fetch_sub_explicit(&s->io_hold, 1, memory_order_acq_rel);
+  }
+  bg_release(s, true, false);
+  if (r < 0) note_error(s, r);
+  return r;
 }
 
 /* ------------------------------------------------------------------------------------------------------------------ */
@@ -1716,18 +1952,22 @@ static int sb_read(store_t *s, int slot, sb_t *b) {
   if (!sb_fields_ok(b)) return -EBADMSG;
   return 0;
 }
-static int sb_write(store_t *s, bool clean, uint32_t jrn_gen) {
-  int slot = s->sb_next;
-  sb_fill(s, s->sbbuf, clean, s->sb_seq + 1, jrn_gen);
+/* write the superblock copy in s->sbbuf (sb_fill()) to the slot that is next, and sync it (ck_busy: the superblock is the checkpoint's) */
+static int sb_store(store_t *s) {
+  const int slot = s->sb_next;
   int r = st_pwrite_all(s->sb_fd[slot], s->sbbuf, ST_SB_SIZE, 0);
   if (r == 0 && fdatasync(s->sb_fd[slot]) != 0) r = -errno;
   if (r < 0) return r;
-  s->sb_seq++;
-  s->slot_jrn[slot] = jrn_gen;
-  s->slot_ix[slot] = s->ix_gen;
-  s->slot_sx[slot] = s->sx_gen;
+  s->sb_seq = s->sbbuf->f.seq;
+  s->slot_jrn[slot] = s->sbbuf->f.jrn_gen;
+  s->slot_ix[slot] = s->sbbuf->f.ix_gen;            /* (the generations of the copy: a fuzzy checkpoint names those of its position) */
+  s->slot_sx[slot] = s->sbbuf->f.sx_gen;
   s->sb_next = slot ^ 1;
   return 0;
+}
+static int sb_write(store_t *s, bool clean, uint32_t jrn_gen) {
+  sb_fill(s, s->sbbuf, clean, s->sb_seq + 1, jrn_gen);
+  return sb_store(s);
 }
 
 /* ------------------------------------------------------------------------------------------------------------------ */
@@ -1748,41 +1988,196 @@ static void unlink_old_gens(store_t *s) {
   }
 }
 
-static int checkpoint_locked(store_t *s, bool clean) {
-  uint64_t t0 = st_now_us();
-  int r = commit_locked(s);
-  if (r < 0) return r;
-  mtab_t *tabs[3] = { &s->zt, &s->zc, &s->nx };
-  for (int i = 0; i < 3 && r == 0; i++) r = mtab_sync(tabs[i]);
-  ixgen_t *ix = atomic_load_explicit(&s->ix, memory_order_relaxed), *sx = atomic_load_explicit(&s->sx, memory_order_relaxed);
-  if (r == 0 && ix && msync((void *)ix->slots, ix->maplen, MS_SYNC) != 0) r = -errno;
-  if (r == 0 && ix && fdatasync(ix->fd) != 0) r = -errno;
-  if (r == 0 && sx && msync((void *)sx->slots, sx->maplen, MS_SYNC) != 0) r = -errno;
-  if (r == 0 && sx && fdatasync(sx->fd) != 0) r = -errno;
+/* The begin of a checkpoint (writer mutex, ck_busy and the baton held): its position P is the last LSN; the journal goes on in the next file (records > P); the superblock as of P is made
+ * in s->sbbuf (counters, views, cursors, the index generations of P); what the commit of P has to sync is taken (the dirty segments, the old journal's fd), and the index generations that
+ * the flush syncs.  io_hold keeps all of it from being freed until ck_run() / ck_full_locked() is done with it.  No wait for the disk here. */
+static int ck_begin_locked(store_t *s, bool clean) {
+  const uint64_t P = s->lsn;
+  int oldfd = -1;
+  int r = journal_switch_locked(s, P + 1, &oldfd);
   if (r < 0) return r;
   CRASH_POINT();
-  /* the next journal first (its base LSN continues the chain), then the superblock that names it */
-  uint32_t ngen = s->jrn_gen + 1;
-  r = journal_open_new(s, ngen, s->lsn + 1);
-  if (r < 0) return r;
-  CRASH_POINT();
-  if (s->dir_dirty) {
-    if (fsync(s->dirfd) != 0 && errno != EINVAL && errno != ENOTSUP) return -errno;
-    s->dir_dirty = false;
+  atomic_store_explicit(&s->ck_want, false, memory_order_relaxed);
+  sb_fill(s, s->sbbuf, clean, s->sb_seq + 1, s->jrn_gen);
+  s->ck.nseg = commit_capture_locked(s, s->ck.seg, &s->ck.dir);           /* (io_hold + 1) */
+  s->ck.lsn = P;
+  s->ck.t0 = st_now_us();
+  s->ck.clean = clean;
+  s->ck.oldfd = oldfd;
+  s->ck.newfd = s->jfd;
+  s->ck.ix = atomic_load_explicit(&s->ix, memory_order_relaxed);
+  s->ck.sx = atomic_load_explicit(&s->sx, memory_order_relaxed);
+  return 0;
+}
+
+/* the records up to P are durable: the segments, the journal before the switch (the baton held).  If that fails the old journal stays open (jold) and the next commit syncs it. */
+static int ck_io_commit(store_t *s) {
+  int r = commit_sync(s, s->ck.lsn, s->ck.seg, s->ck.nseg, s->ck.dir, s->ck.oldfd);
+  if (s->ck.oldfd >= 0) {
+    if (r == 0) close(s->ck.oldfd);
+    else s->jold = s->ck.oldfd;                     /* (jold was free: a checkpoint does not begin while one is kept) */
+    s->ck.oldfd = -1;
   }
-  s->ckpt_us = st_now_us() - t0;
-  r = sb_write(s, clean, ngen);
+  return r;
+}
+
+/* the flush: every mapped table and the index generations of P (no lock: writers go on; what they change after P is replayed from the new journal) */
+static int ck_io_tables(store_t *s) {
+  mtab_t *tabs[3] = { &s->zt, &s->zc, &s->nx };
+  int r = 0;
+  for (int i = 0; i < 3 && r == 0; i++) r = mtab_sync(tabs[i]);
+  const ixgen_t *gens[2] = { s->ck.ix, s->ck.sx };
+  for (int i = 0; i < 2 && r == 0; i++)
+    if (gens[i] && (msync((void *)gens[i]->slots, gens[i]->maplen, MS_SYNC) != 0 || fdatasync(gens[i]->fd) != 0)) r = -errno;
+  return r;
+}
+
+/* the new journal's header and its directory entry are durable before the superblock that names them; then the superblock (ck_busy) */
+static int ck_io_super(store_t *s) {
+  if (fdatasync(s->ck.newfd) != 0) return -errno;
+  if (fsync(s->dirfd) != 0 && errno != EINVAL && errno != ENOTSUP) return -errno;
+  CRASH_POINT();
+  return sb_store(s);
+}
+
+/* the superblock is on disk: the checkpoint is P (ck_busy) */
+static void ck_finish(store_t *s) {
+  atomic_store_explicit(&s->ckpt_us, st_now_us() - s->ck.t0, memory_order_relaxed);
+  atomic_store_explicit(&s->ckpt_time, (uint64_t)time(NULL), memory_order_relaxed);
+  atomic_store_explicit(&s->last_ckpt_ms, st_now_ms(), memory_order_relaxed);
+  atomic_store_explicit(&s->clean_on_disk, s->ck.clean, memory_order_relaxed);
+  atomic_store_explicit(&s->ckpt_lsn, s->ck.lsn, memory_order_release);
+  atomic_fetch_add_explicit(&s->n_checkpoints, 1, memory_order_relaxed);
+  unlink_old_gens(s);
+}
+
+/* the next journal file is made now (ck_busy), so that the next switch is a pwrite inside the mutex */
+static void ck_precreate(store_t *s) {
+  if (s->jnext_fd >= 0) return;
+  const uint32_t g = s->jrn_gen + 1;
+  const int fd = journal_create(s, g);
+  if (fd >= 0) { s->jnext_fd = fd; s->jnext_gen = g; }
+}
+
+/* The rest of a checkpoint that ck_begin_locked() began (ck_busy and the baton held, no lock): the commit of P, the baton back (commits go on), the flush, the superblock.  A failure
+ * leaves the superblocks as they were: the journal chain from the older checkpoint goes on through the file that was switched to, and the next checkpoint tries again. */
+static int ck_run(store_t *s) {
+  st_hook(&store_test_ckpt_hook, 1);
+  int r = ck_io_commit(s);
+  bg_release(s, true, false);
+  if (r == 0) {
+    CRASH_POINT();
+    st_hook(&store_test_ckpt_hook, 2);
+    r = ck_io_tables(s);
+  }
+  if (r == 0) {
+    CRASH_POINT();
+    st_hook(&store_test_ckpt_hook, 3);
+    r = ck_io_super(s);
+  }
+  atomic_fetch_sub_explicit(&s->io_hold, 1, memory_order_acq_rel);
+  if (r == 0) {
+    CRASH_POINT();
+    ck_finish(s);
+    ck_precreate(s);
+    st_hook(&store_test_ckpt_hook, 4);
+  } else {
+    note_error(s, r);
+  }
+  bg_release(s, false, true);
+  return r;
+}
+
+/* The superblock on disk says "clean" and nothing was written since (the clean checkpoint is the state): a superblock without the flag, before the first record (writer mutex and
+ * ck_busy + the baton held).  No flush: the tables are as the clean checkpoint left them. */
+static int unclean_now_locked(store_t *s) {
+  if (!s->clean_on_disk) return 0;
+  int r = sb_write(s, false, s->jrn_gen);
+  if (r == 0) atomic_store_explicit(&s->clean_on_disk, false, memory_order_relaxed);
+  return r;
+}
+static int unclean_try_locked(store_t *s) {
+  if (!ck_try_locked(s)) return -EAGAIN;
+  int r = unclean_now_locked(s);
+  bg_release(s, true, true);
+  return r;
+}
+
+/* A checkpoint with the writers kept out for all of it (writer mutex, ck_busy and the baton held): the clean one (the flag must name a state that no record follows), the first one of an
+ * open, the one of a repair, and the rare one a writer needs at once (the emergency cleaning, the nx pass).  The steps of the fuzzy one, in the same order. */
+static int ck_full_locked(store_t *s, bool clean) {
+  int r = 0;
+  if (s->jold >= 0) {
+    if (fdatasync(s->jold) != 0) r = -errno;
+    else { close(s->jold); s->jold = -1; }
+  }
+  if (r == 0) r = ck_begin_locked(s, clean);
+  if (r < 0) return r;
+  r = ck_io_commit(s);
+  if (r == 0) { CRASH_POINT(); r = ck_io_tables(s); }
+  if (r == 0) { CRASH_POINT(); r = ck_io_super(s); }
+  atomic_fetch_sub_explicit(&s->io_hold, 1, memory_order_acq_rel);
   if (r < 0) return r;
   CRASH_POINT();
-  s->ckpt_lsn = s->lsn;
-  s->ckpt_time = (uint64_t)time(NULL);
-  s->last_ckpt_ms = st_now_ms();
-  s->clean_on_disk = clean;
-  s->n_checkpoints++;
-  unlink_old_gens(s);
+  ck_finish(s);
   retire_run(s, false);
   space_checkpoint(s);
   return 0;
+}
+/* the writer mutex with the checkpoint's flags (for a ck_full_locked()); the clean flag on disk is cleared first when the caller writes records */
+static void wr_lock_ck(store_t *s) {
+  ck_acquire(s);
+  wr_lock_raw(s);
+}
+static void wr_unlock_ck(store_t *s) {
+  wr_unlock_raw(s);
+  bg_release(s, true, true);
+}
+/* A writer that holds the mutex and needs a checkpoint now: the flags are tried, and when another thread has them the mutex is given up while they are waited for.  1: the checkpoint was
+ * made with the mutex given up for a moment (the caller's view of the store may have changed), 0: made, < 0: failed. */
+static int ck_now_locked(store_t *s) {
+  int given = 0;
+  if (!ck_try_locked(s)) {
+    wr_unlock_raw(s);
+    ck_acquire(s);
+    wr_lock_raw(s);
+    given = 1;
+  }
+  int r = ck_full_locked(s, false);
+  bg_release(s, true, true);
+  if (r < 0) note_error(s, r);
+  return r < 0 ? r : given;
+}
+
+/* A checkpoint from a thread that holds no lock (the flusher, store_checkpoint()): the flags, the begin under the writer mutex, the rest without it.  force: also when nothing was
+ * written since the last one.  0, or -errno. */
+static int st_ckpt(store_t *s, bool force) {
+  ck_acquire(s);
+  int r = 0;
+  if (s->jold >= 0) {                                 /* (a journal whose sync failed: synced first, with no lock held) */
+    if (fdatasync(s->jold) != 0) r = -errno;
+    else { close(s->jold); s->jold = -1; }
+  }
+  if (r == 0) {
+    wr_lock_raw(s);
+    const bool need = force || s->lsn > s->ckpt_lsn;
+    r = need ? unclean_now_locked(s) : 1;           /* (writers go on while this checkpoint flushes: a clean flag on disk goes first) */
+    if (r == 0) r = ck_begin_locked(s, false);
+    wr_unlock_raw(s);
+  }
+  if (r != 0) {
+    bg_release(s, true, true);
+    if (r < 0) note_error(s, r);
+    return r < 0 ? r : 0;
+  }
+  return ck_run(s);
+}
+/* what a checkpoint leaves to the writer mutex: the retired generations and segments, the free space and the warnings */
+static void ck_after(store_t *s) {
+  wr_lock_raw(s);
+  retire_run(s, false);
+  space_checkpoint(s);
+  wr_unlock_raw(s);
 }
 
 /* ------------------------------------------------------------------------------------------------------------------ */
@@ -1809,93 +2204,244 @@ static int index_publish(store_t *s, uint32_t which, ixgen_t *g) {
   _Atomic(ixgen_t *) *slot = which == 0 ? &s->ix : &s->sx;
   ixgen_t *old = atomic_exchange_explicit(slot, g, memory_order_acq_rel);
   if (which == 0) s->ix_gen = g->gen; else s->sx_gen = g->gen;
+  s->tabgen++;
   if (old) retire_add(s, old);
   return 0;
 }
+static void ixgen_drop(store_t *s, ixgen_t *g, uint32_t kind) {         /* a generation that was made and not put in: its file goes */
+  if (!g) return;
+  char name[32];
+  st_name_ix(name, sizeof(name), kind == FK_IX ? "ix" : "sx", g->gen);
+  ixgen_free(g);
+  if (unlinkat(s->dirfd, name, 0) == 0) s->dir_dirty = true;
+}
 
-/* Replace ix and / or sx (a non-zero slot count) by new generations built from a pass over zt; a checkpoint barrier.
- * Under the writer mutex; readers continue on the old generation. */
-static int index_regrow(store_t *s, uint64_t ix_slots, uint64_t sx_slots) {
-  uint64_t hwm = VG(s, V_HWM);
-  ixgen_t *nix = NULL, *nsx = NULL;
-  uint64_t live_ix = 0, live_sx = 0;
-  int r = 0;
-  if (ix_slots && (r = ixgen_create(s, FK_IX, s->ix_gen + 1, ix_slots, &nix)) < 0) return r;
-  if (sx_slots && (r = ixgen_create(s, FK_SX, s->sx_gen + 1, sx_slots, &nsx)) < 0) { ixgen_free(nix); return r; }
-  for (uint64_t z = 0; z < hwm && r == 0; z++) {
-    r64_t rt, rc;
+/* Insert every live zone of zt[0, hwm) into the new generations nix / nsx (either may be NULL).  lockfree: the writers go on meanwhile (a cell is read under its sequence counter, a long
+ * name checked against it as store_zone_get() does; what the writers change is in the build's log); otherwise the writer mutex is held.  A damaged cell stays invisible.  *live_ix /
+ * *live_sx: the entries made (into empty slots: as many used).  -ENOSPC: a generation is too small; -ECANCELED: the build was dropped meanwhile. */
+static int rg_fill(store_t *s, ixgen_t *nix, ixgen_t *nsx, uint64_t hwm, bool lockfree, uint64_t *live_ix, uint64_t *live_sx) {
+  uint64_t li = 0, ls = 0;
+  for (uint64_t z = 0; z < hwm; z++) {
+    if (lockfree && (z & 0x3fffu) == 0 &&
+        (atomic_load_explicit(&s->rg_cancel, memory_order_relaxed) || atomic_load_explicit(&s->rg_stop, memory_order_relaxed))) return -ECANCELED;
     if (zt_state_fast(s, (uint32_t)z) == STORE_STATE_FREE) continue;
-    if (zrec_read_locked(s, (uint32_t)z, &rt, &rc) < 0) continue;     /* damaged: stays invisible */
+    r64_t rt, rc;
     zt_t t;
     zc_t c;
-    zt_unpack(&rt, &t);
-    zc_unpack(&rc, &c);
+    uint8_t fn[256];
+    bool ok = false;
+    for (int tries = 0; tries < 64 && !ok; tries++) {
+      uint32_t seq = 0;
+      if ((lockfree ? zrec_read_seq(s, (uint32_t)z, &rt, &rc, &seq) : zrec_read_locked(s, (uint32_t)z, &rt, &rc)) < 0) break;
+      zt_unpack(&rt, &t);
+      zc_unpack(&rc, &c);
+      if (t.state == STORE_STATE_FREE || !zt_fullname(s, &t, fn)) break;
+      ok = true;
+      if (lockfree && t.klen > ST_NAME_INL) {          /* (the nx pass may have moved the name while it was copied) */
+        atomic_thread_fence(memory_order_acquire);
+        ok = store_zone_unchanged(s, (uint32_t)z, seq);
+      }
+    }
+    if (!ok) continue;
     if (nix) {
-      uint8_t fn[256];
-      if (!zt_fullname(s, &t, fn)) continue;
-      if (ix_raw_insert(nix, st_hash_name(s, t.view, fn, t.klen), (uint32_t)z) < 0) { r = -ENOSPC; break; }
-      live_ix++;
+      if (ix_raw_insert(nix, st_hash_name(s, t.view, fn, t.klen), (uint32_t)z) < 0) return -ENOSPC;
+      li++;
     }
     if (nsx && c.source_id != 0) {
-      if (ix_raw_insert(nsx, st_hash_src(s, c.source, t.view, c.source_id), (uint32_t)z) < 0) { r = -ENOSPC; break; }
-      live_sx++;
+      if (ix_raw_insert(nsx, st_hash_src(s, c.source, t.view, c.source_id), (uint32_t)z) < 0) return -ENOSPC;
+      ls++;
     }
   }
-  if (r == 0 && nix) r = (msync((void *)nix->slots, nix->maplen, MS_SYNC) != 0 || fdatasync(nix->fd) != 0) ? -errno : 0;
-  if (r == 0 && nsx) r = (msync((void *)nsx->slots, nsx->maplen, MS_SYNC) != 0 || fdatasync(nsx->fd) != 0) ? -errno : 0;
-  if (r < 0) { ixgen_free(nix); ixgen_free(nsx); return r; }
-  CRASH_POINT();
-  /* the bridge in the journal chain: GEN ops and the counters of the new tables */
+  *live_ix = li;
+  *live_sx = ls;
+  return 0;
+}
+
+/* The new generations are put in (writer mutex): the bridge in the journal chain (GEN ops and the counters of the new tables), then the pointers.  The record is in the journal before the
+ * memory follows it; it needs no sync of its own (a replay after kill -9 has the page cache; after a power loss the open rebuilds the derived tables, and so the old generation, which the
+ * superblocks still name, is kept until two checkpoints name the new one).  On failure nothing changes. */
+static int rg_publish_locked(store_t *s, ixgen_t *nix, ixgen_t *nsx, uint64_t ix_used, uint64_t ix_live, uint64_t sx_used, uint64_t sx_live) {
   jb_reset(&s->jb);
+  int r = 0;
   if (nix) {
     uint8_t *p = jb_op(&s->jb, OP_GEN, 16);
     uint32_t w = 0, g = nix->gen;
     if (!p) r = -ENOMEM; else { memcpy(p, &w, 4); memcpy(p + 4, &g, 4); memcpy(p + 8, &nix->nslots, 8); }
-    jb_vset(&s->jb, V_IX_USED, live_ix);
-    jb_vset(&s->jb, V_IX_LIVE, live_ix);
+    if (r == 0 && ((r = jb_vset(&s->jb, V_IX_USED, ix_used)) < 0 || (r = jb_vset(&s->jb, V_IX_LIVE, ix_live)) < 0)) {}
   }
   if (r == 0 && nsx) {
     uint8_t *p = jb_op(&s->jb, OP_GEN, 16);
     uint32_t w = 1, g = nsx->gen;
     if (!p) r = -ENOMEM; else { memcpy(p, &w, 4); memcpy(p + 4, &g, 4); memcpy(p + 8, &nsx->nslots, 8); }
-    jb_vset(&s->jb, V_SX_USED, live_sx);
-    jb_vset(&s->jb, V_SX_LIVE, live_sx);
+    if (r == 0 && ((r = jb_vset(&s->jb, V_SX_USED, sx_used)) < 0 || (r = jb_vset(&s->jb, V_SX_LIVE, sx_live)) < 0)) {}
   }
   if (r == 0) r = journal_append(s);
-  if (r < 0) { ixgen_free(nix); ixgen_free(nsx); return r; }       /* (nothing is logged: the old generations stay, the new files are garbage that the next growth overwrites) */
-  /* The record is in the journal now, so the memory follows it whatever the sync says: a replay switches to the new generations, and so does this process.  A failed
-   * sync is reported (the growth, and the write that wanted room, fail) but does not leave the index on the old generation while the journal names the new one. */
-  const int rc_sync = commit_locked(s);
-  /* the journal now names the new generations; publish them (the files stay open: apply_ops would only reopen them) */
+  if (r < 0) return r;
+  CRASH_POINT();
   if (nix) {
     index_publish(s, 0, nix);
-    VS(s, V_IX_USED, live_ix);
-    VS(s, V_IX_LIVE, live_ix);
+    VS(s, V_IX_USED, ix_used);
+    VS(s, V_IX_LIVE, ix_live);
   }
   if (nsx) {
     index_publish(s, 1, nsx);
-    VS(s, V_SX_USED, live_sx);
-    VS(s, V_SX_LIVE, live_sx);
+    VS(s, V_SX_USED, sx_used);
+    VS(s, V_SX_LIVE, sx_live);
   }
   s->n_growths++;
+  atomic_store_explicit(&s->ck_want, true, memory_order_relaxed);
   CRASH_POINT();
-  if (rc_sync < 0) return rc_sync;
-  return checkpoint_locked(s, false);
+  return 0;
 }
 
-/* would ix_make_room() grow a table if pix (psx) more index slots were in use? (the entries of a group commit have claimed slots that the counters do not show yet) */
+/* Replace ix and / or sx (a non-zero slot count) by new generations built from a pass over zt, inside the writer mutex: the index filled up to one half before a build outside the mutex
+ * ended (or none could be started).  A build in progress is dropped (its generation numbers are not used again).  Readers continue on the old generation. */
+static int regrow_locked(store_t *s, uint64_t ix_slots, uint64_t sx_slots) {
+  if (s->rg_active) atomic_store_explicit(&s->rg_cancel, true, memory_order_relaxed);
+  uint64_t hwm = VG(s, V_HWM), live_ix = 0, live_sx = 0;
+  if (hwm > st_zt_cap(s)) hwm = st_zt_cap(s);
+  ixgen_t *nix = NULL, *nsx = NULL;
+  int r = 0;
+  if (ix_slots && (r = ixgen_create(s, FK_IX, s->ix_gen_next++, ix_slots, &nix)) < 0) return r;
+  if (sx_slots && (r = ixgen_create(s, FK_SX, s->sx_gen_next++, sx_slots, &nsx)) < 0) { ixgen_drop(s, nix, FK_IX); return r; }
+  r = rg_fill(s, nix, nsx, hwm, false, &live_ix, &live_sx);
+  CRASH_POINT();
+  if (r == 0) r = rg_publish_locked(s, nix, nsx, live_ix, live_ix, live_sx, live_sx);
+  if (r < 0) { ixgen_drop(s, nix, FK_IX); ixgen_drop(s, nsx, FK_SX); }
+  return r;
+}
+
+/* ---- growth outside the writer mutex (0.7 fix A; the pattern of the attach table's growth, M4) ----
+ * At 3/8 of a generation in use (tombstones count) a build is started on a thread of its own: new generations of the next size are made from one pass over zt while the writers go on
+ * (and keep using the old ones); every index change of a record written meanwhile is kept in rg_log (jb_t.pl, moved there by journal_commit_apply()).  At the end the build takes the
+ * writer mutex, makes the logged changes on the new generations, in their order ("this hash leads to this zone" / "... no longer": each one sets the presence of one entry, so whatever
+ * state of a zone the pass read, the last change of the entry decides), and puts them in with their OP_GEN record.  A build is dropped when a generation was changed meanwhile (a growth
+ * inside the mutex, a repair: tabgen), when its log could not grow, or when the store closes; its files go.  If the index reaches one half before the build ends, the growth is made inside
+ * the mutex as before. */
+#define RG_LOG_MAX (8u << 20)                 /* index changes kept for one build (128 MiB): more drops it */
+
+static void rg_note_locked(store_t *s, const jb_t *j) {
+  if (!s->rg_active || s->rg_bad || j->npl == 0) return;
+  if (s->rg_n + j->npl > s->rg_cap) {
+    size_t nc = s->rg_cap ? s->rg_cap * 2 : 4096;
+    while (nc < s->rg_n + j->npl) nc *= 2;
+    rgent_t *nl = nc > RG_LOG_MAX ? NULL : realloc(s->rg_log, nc * sizeof(*nl));
+    if (!nl) { s->rg_bad = true; return; }
+    s->rg_log = nl;
+    s->rg_cap = nc;
+  }
+  memcpy(s->rg_log + s->rg_n, j->pl, (size_t)j->npl * sizeof(rgent_t));
+  s->rg_n += j->npl;
+}
+
+/* one logged change on a new generation: the entry (hash, zone) is there (ins) or not; *used / *live follow */
+static int rg_apply(ixgen_t *g, const rgent_t *e, uint64_t *used, uint64_t *live) {
+  const uint64_t pos = slot_find_zid(g, e->h, e->z);
+  if (e->ins) {
+    if (pos != UINT64_MAX) return 0;
+    bool was_empty;
+    const uint64_t at = slot_find_insert(g, e->h, &was_empty, NULL, 0);
+    if (at == UINT64_MAX) return -ENOSPC;
+    atomic_store_explicit(&g->slots[at], st_slotval(st_tag(e->h), e->z), memory_order_relaxed);
+    (*live)++;
+    if (was_empty) (*used)++;
+  } else if (pos != UINT64_MAX) {
+    atomic_store_explicit(&g->slots[pos], st_slotval(st_tag(e->h), STORE_NONE), memory_order_relaxed);
+    if (*live) (*live)--;
+  }
+  return 0;
+}
+
+/* The build (the thread of rg_start_locked(), or the caller of store_reserve()): 0 put in, -ECANCELED dropped, or -errno. */
+static int rg_build(store_t *s) {
+  ixgen_t *nix = NULL, *nsx = NULL;
+  uint64_t li = 0, ls = 0;
+  int r = 0;
+  if (s->rg_nix) r = ixgen_create(s, FK_IX, s->rg_ixgen, s->rg_nix, &nix);
+  if (r == 0 && s->rg_nsx) r = ixgen_create(s, FK_SX, s->rg_sxgen, s->rg_nsx, &nsx);
+  if (r == 0) r = rg_fill(s, nix, nsx, s->rg_hwm, true, &li, &ls);
+  /* (no flush here: the build has to end before the writers fill the old index to one half, and the checkpoint that follows the growth flushes the new files) */
+  CRASH_POINT();
+  st_hook(&store_test_regrow_hook, 1);
+  wr_lock_raw(s);
+  uint64_t iu = li, il = li, su = ls, sl = ls;
+  if (r == 0 && (atomic_load_explicit(&s->rg_cancel, memory_order_relaxed) || atomic_load_explicit(&s->rg_stop, memory_order_relaxed) || s->tabgen != s->rg_tabgen || s->rg_bad))
+    r = -ECANCELED;
+  for (size_t k = 0; k < s->rg_n && r == 0; k++) {
+    const rgent_t *e = &s->rg_log[k];
+    if (e->which == 0 && nix) r = rg_apply(nix, e, &iu, &il);
+    else if (e->which == 1 && nsx) r = rg_apply(nsx, e, &su, &sl);
+  }
+  if (r == 0) r = rg_publish_locked(s, nix, nsx, iu, il, su, sl);
+  if (r == 0) {
+    atomic_fetch_add_explicit(&s->n_growths_bg, 1, memory_order_relaxed);
+    nix = nsx = NULL;
+  }
+  s->rg_active = false;
+  s->rg_n = 0;
+  if (s->rg_cap > 65536) { free(s->rg_log); s->rg_log = NULL; s->rg_cap = 0; }
+  wr_unlock_raw(s);
+  if (r == 0) st_hook(&store_test_regrow_hook, 2);
+  ixgen_drop(s, nix, FK_IX);
+  ixgen_drop(s, nsx, FK_SX);
+  if (r == 0) bg_signal(s);                           /* (a checkpoint names the new generation soon: the old one's file can go) */
+  else if (r != -ECANCELED) note_error(s, r);
+  return r;
+}
+static void *rg_main(void *arg) {
+  store_t *s = arg;
+  (void)rg_build(s);
+  atomic_store_explicit(&s->rg_live, false, memory_order_release);     /* (the last touch of the store: store_close() waits for it) */
+  return NULL;
+}
+/* a build of generations with nix / nsx slots (0: that one does not grow) begins (writer mutex held); spawn: on its own thread (otherwise the caller runs rg_build() after the mutex).
+ * false: none was started (one runs, the store closes, no thread). */
+static bool rg_start_locked(store_t *s, uint64_t nix, uint64_t nsx, bool spawn) {
+  if (s->rg_active || atomic_load_explicit(&s->rg_stop, memory_order_relaxed) || (!nix && !nsx)) return false;
+  uint64_t hwm = VG(s, V_HWM);
+  if (hwm > st_zt_cap(s)) hwm = st_zt_cap(s);
+  s->rg_nix = nix;
+  s->rg_nsx = nsx;
+  s->rg_ixgen = nix ? s->ix_gen_next++ : 0;
+  s->rg_sxgen = nsx ? s->sx_gen_next++ : 0;
+  s->rg_hwm = hwm;
+  s->rg_tabgen = s->tabgen;
+  s->rg_n = 0;
+  s->rg_bad = false;
+  atomic_store_explicit(&s->rg_cancel, false, memory_order_relaxed);
+  s->rg_active = true;
+  if (!spawn) return true;
+  pthread_attr_t at;
+  pthread_t th;
+  bool ok = pthread_attr_init(&at) == 0;
+  if (ok) {
+    pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+    atomic_store_explicit(&s->rg_live, true, memory_order_release);
+    ok = pthread_create(&th, &at, rg_main, s) == 0;
+    if (!ok) atomic_store_explicit(&s->rg_live, false, memory_order_release);
+    pthread_attr_destroy(&at);
+  }
+  if (!ok) s->rg_active = false;                      /* (no thread: the growth is made inside the mutex at one half) */
+  return ok;
+}
+
+/* would ix_make_room() grow a table inside the mutex if pix (psx) more index slots were in use? (the entries of a group commit have claimed slots that the counters do not show yet) */
 static bool ix_room_short(const store_t *s, bool need_sx, uint64_t pix, uint64_t psx) {
   const ixgen_t *ix = atomic_load_explicit(&s->ix, memory_order_relaxed), *sx = atomic_load_explicit(&s->sx, memory_order_relaxed);
   return (VG(s, V_IX_USED) + pix + 1) * 2 > ix->nslots || (need_sx && (VG(s, V_SX_USED) + psx + 1) * 2 > sx->nslots);
 }
 
+/* room for one more entry (writer mutex held): at 3/8 in use a build outside the mutex begins (the new size is four times the live entries: 1/4 in use, so that the writers have 1/8 of the old size to fill before the build has to be done, and the next build comes after 1.5 times the entries); at 1/2 the growth is made here */
 static int ix_make_room(store_t *s, bool need_sx) {
   ixgen_t *ix = atomic_load_explicit(&s->ix, memory_order_relaxed), *sx = atomic_load_explicit(&s->sx, memory_order_relaxed);
+  const uint64_t iu = VG(s, V_IX_USED), su = VG(s, V_SX_USED), il = VG(s, V_IX_LIVE), sl = VG(s, V_SX_LIVE);
   uint64_t nix = 0, nsx = 0;
-  if ((VG(s, V_IX_USED) + 1) * 2 > ix->nslots) nix = ix_slots_for(VG(s, V_IX_LIVE) + 1);
-  if (need_sx && (VG(s, V_SX_USED) + 1) * 2 > sx->nslots) nsx = ix_slots_for(VG(s, V_SX_LIVE) + 1);
-  if (!nix && !nsx) return 0;
-  return index_regrow(s, nix, nsx);
+  if ((iu + 1) * 2 > ix->nslots) nix = ix_slots_for(il + il / 3 + 1);
+  if (need_sx && (su + 1) * 2 > sx->nslots) nsx = ix_slots_for(sl + sl / 3 + 1);
+  if (nix || nsx) return regrow_locked(s, nix, nsx);
+  if (!s->rg_active && ((iu + 1) * 8 > ix->nslots * 3 || (su + 1) * 8 > sx->nslots * 3))
+    (void)rg_start_locked(s, (iu + 1) * 8 > ix->nslots * 3 ? ix_slots_for(il + il / 3 + 1) : 0, (su + 1) * 8 > sx->nslots * 3 ? ix_slots_for(sl + sl / 3 + 1) : 0, true);
+  return 0;
 }
 
 /* ------------------------------------------------------------------------------------------------------------------ */
@@ -1978,19 +2524,83 @@ static void space_used(store_t *s, uint64_t n) {
   if (s->avail_est >= 0) s->avail_est = (uint64_t)s->avail_est > n ? s->avail_est - (int64_t)n : 0;
 }
 
-/* time- and size-driven commit / checkpoint after a writer call */
+/* is a commit due? (no lock: atomics) */
+static bool commit_due(const store_t *s, uint64_t now) {
+  const uint64_t lsn = atomic_load_explicit(&s->lsn, memory_order_relaxed), done = atomic_load_explicit(&s->committed_lsn, memory_order_relaxed);
+  if (lsn <= done) return false;
+  if (s->o.sync_policy == STORE_SYNC_EVERY) return true;               /* (what the writers' calls left: the cleaner, the scrub, a call that failed) */
+  return s->o.sync_policy == STORE_SYNC_BATCH && now - atomic_load_explicit(&s->last_sync_ms, memory_order_relaxed) >= s->o.sync_interval_ms;
+}
+/* is a checkpoint due? */
+static bool ckpt_due(const store_t *s, uint64_t now) {
+  const uint64_t lsn = atomic_load_explicit(&s->lsn, memory_order_relaxed);
+  if (atomic_load_explicit(&s->jbytes, memory_order_relaxed) >= s->o.journal_max_bytes) return true;
+  if (lsn <= atomic_load_explicit(&s->ckpt_lsn, memory_order_relaxed)) return false;
+  if (atomic_load_explicit(&s->ck_want, memory_order_relaxed)) return true;
+  return s->o.checkpoint_interval_ms != UINT32_MAX && now - atomic_load_explicit(&s->last_ckpt_ms, memory_order_relaxed) >= s->o.checkpoint_interval_ms;
+}
+
+/* After a writer call (writer mutex held): no I/O wait here.  The due commit and checkpoint are the flusher's (it is woken); a journal that is full is switched at once when no other
+ * checkpoint runs (the flush of that checkpoint is handed to the flusher), so that the journal stays near its bound. */
 static int post_write(store_t *s) {
-  int r = 0;
-  uint64_t now = st_now_ms();
-  if (s->o.sync_policy == STORE_SYNC_EVERY) r = commit_locked(s);
-  else if (s->o.sync_policy == STORE_SYNC_BATCH && s->uncommitted && now - s->last_sync_ms >= s->o.sync_interval_ms) r = commit_locked(s);
-  if (r == 0) {
-    if (s->jbytes >= s->o.journal_max_bytes) r = checkpoint_locked(s, false);
-    else if (s->o.checkpoint_interval_ms != UINT32_MAX && s->lsn > s->ckpt_lsn && now - s->last_ckpt_ms >= s->o.checkpoint_interval_ms)
-      r = checkpoint_locked(s, false);
+  const uint64_t now = st_now_ms();
+  bool kick = commit_due(s, now);
+  if (s->fl_on && s->jbytes >= s->o.journal_max_bytes && ck_try_locked(s)) {
+    int r = s->jold < 0 ? ck_begin_locked(s, false) : 1;          /* (the writers cleared the clean flag in wr_lock(); a journal whose sync failed is the flusher's first) */
+    if (r == 0) {
+      pthread_mutex_lock(&s->bg_mu);
+      s->ck_handoff = true;
+      pthread_cond_broadcast(&s->bg_cv);
+      pthread_mutex_unlock(&s->bg_mu);
+    } else {
+      bg_release(s, true, true);
+      if (r < 0) note_error(s, r);
+      kick = true;
+    }
+  } else if (ckpt_due(s, now)) {
+    kick = true;
   }
   retire_run(s, false);
-  if (r < 0) note_error(s, r);
+  if (kick && s->fl_on) bg_signal(s);
+  return 0;
+}
+
+/* The writer mutex for a call that writes records: a clean flag on disk is cleared first (the mutex is given up while the checkpoint's flags are waited for).  0, or the error of that
+ * superblock write (the mutex is not held then). */
+static int wr_lock(store_t *s) {
+  wr_lock_raw(s);
+  while (atomic_load_explicit(&s->clean_on_disk, memory_order_relaxed)) {
+    wr_unlock_raw(s);
+    ck_acquire(s);
+    wr_lock_raw(s);
+    const int r = unclean_now_locked(s);
+    bg_release(s, true, true);
+    if (r < 0) {
+      wr_unlock_raw(s);
+      note_error(s, r);
+      return r;
+    }
+  }
+  return 0;
+}
+
+/* the due work without a flusher thread (no lock held) */
+static void bg_due(store_t *s) {
+  const uint64_t now = st_now_ms();
+  if (commit_due(s, now)) (void)st_commit(s, atomic_load_explicit(&s->lsn, memory_order_relaxed));
+  if (ckpt_due(s, now) && st_ckpt(s, false) == 0) ck_after(s);
+}
+
+/* The end of a writer call: the mutex is given up; STORE_SYNC_EVERY makes the call durable now (with the mutex released: other writers go on), and without a flusher the due work is done
+ * here.  Returns r, or the error of that commit. */
+static int wr_done(store_t *s, int r) {
+  const uint64_t my = s->lsn;
+  wr_unlock_raw(s);
+  if (r >= 0 && s->o.sync_policy == STORE_SYNC_EVERY) {
+    const int c = st_commit(s, my);
+    if (c < 0) r = c;
+  }
+  if (!s->fl_on) bg_due(s);
   return r;
 }
 
@@ -2290,12 +2900,14 @@ static int put_locked(store_t *s, uint16_t view, const char *name, size_t nlen, 
         if ((r = jb_slot(j, OP_SX, pos, st_slotval(st_tag(oh), STORE_NONE))) < 0) return r;
         if ((r = jb_vadd(s, j, V_SX_LIVE, -1)) < 0) return r;
       }
+      if ((r = jb_pl(j, 1, false, oh, z)) < 0) return r;
     }
     if (sx_new) {
       bool was_empty;
       uint64_t pos = slot_find_insert(sx, sxh, &was_empty, ck ? ck->sxpos : NULL, ck ? ck->nsx : 0);
       if (pos == UINT64_MAX) return -ENOSPC;
       if (ck) ck->sxpos[ck->nsx] = pos;                   /* (claimed when the entry is kept: below) */
+      if ((r = jb_pl(j, 1, true, sxh, nz)) < 0) return r;
       if ((r = jb_slot(j, OP_SX, pos, st_slotval(st_tag(sxh), nz))) < 0) return r;
       if ((r = jb_vadd(s, j, V_SX_LIVE, 1)) < 0) return r;
       if (was_empty && (r = jb_vadd(s, j, V_SX_USED, 1)) < 0) return r;
@@ -2307,6 +2919,7 @@ static int put_locked(store_t *s, uint16_t view, const char *name, size_t nlen, 
     uint64_t pos = slot_find_insert(ix, h, &was_empty, ck ? ck->ixpos : NULL, ck ? ck->nix : 0);
     if (pos == UINT64_MAX) return -ENOSPC;
     if (ck) ck->ixpos[ck->nix] = pos;
+    if ((r = jb_pl(j, 0, true, h, nz)) < 0) return r;
     if ((r = jb_slot(j, OP_IX, pos, st_slotval(st_tag(h), nz))) < 0) return r;
     if ((r = jb_vadd(s, j, V_IX_LIVE, 1)) < 0) return r;
     if (was_empty && (r = jb_vadd(s, j, V_IX_USED, 1)) < 0) return r;
@@ -2741,7 +3354,10 @@ static int nx_reclaim_locked(store_t *s, bool force, uint64_t *reclaimed) {
     if (batch >= 256 || (batch && i + 1 == n)) {
       r = journal_commit_apply(s);
       batch = 0;
-      if (r == 0 && s->jbytes >= s->o.journal_max_bytes) r = checkpoint_locked(s, false);
+      if (r == 0 && s->jbytes >= s->o.journal_max_bytes && ck_try_locked(s)) {    /* (the pass keeps the mutex: a checkpoint that runs elsewhere is not waited for, the journal grows meanwhile) */
+        r = ck_full_locked(s, false);
+        bg_release(s, true, true);
+      }
     }
   }
   free(e);
@@ -2782,10 +3398,10 @@ static uint64_t emergency_free_locked(store_t *s) {
     else if (r < 0) { cl_finish_victim(s, true, &rep); break; }
   }
   (void)nx_reclaim_locked(s, false, NULL);
-  (void)checkpoint_locked(s, false);
+  s->in_cleaner = was;
+  (void)ck_now_locked(s);                             /* (the mutex may be given up while another checkpoint ends: in_cleaner is the caller's again before that) */
   seg_retire_locked(s, true);
   retire_run(s, false);
-  s->in_cleaner = was;
   fs_probe(s);
   return atomic_load_explicit(&s->c_segs_freed, memory_order_relaxed) - freed0;
 }
@@ -2821,22 +3437,20 @@ int store_put(store_t *s, uint16_t view, const char *name, size_t len, const sto
   ST_FAULT("put", STORE_NONE);
   int r = check_name_args(s, view, len, meta);
   if (r < 0) return r;
-  pthread_mutex_lock(&s->wlock);
+  if ((r = wr_lock(s)) < 0) return r;
   r = put_stored_locked(s, view, name, len, meta, image, image_len, zid);
   if (r < 0) { if (!is_nospc(r)) note_error(s, r); } else { note_ok(s); r = post_write(s); }       /* (a full disk was counted where it was found) */
-  pthread_mutex_unlock(&s->wlock);
-  return r;
+  return wr_done(s, r);
 }
 int store_set_known(store_t *s, uint16_t view, const char *name, size_t len, const store_meta_t *meta, uint32_t *zid) {
   if (!s || !name || !meta) return -EINVAL;
   ST_FAULT("set_known", STORE_NONE);
   int r = check_name_args(s, view, len, meta);
   if (r < 0) return r;
-  pthread_mutex_lock(&s->wlock);
+  if ((r = wr_lock(s)) < 0) return r;
   r = put_locked(s, view, name, len, meta, NULL, 0, STORE_STATE_KNOWN, zid, NULL);
   if (r < 0) note_error(s, r); else { note_ok(s); r = post_write(s); }
-  pthread_mutex_unlock(&s->wlock);
-  return r;
+  return wr_done(s, r);
 }
 
 /* ---- group commit: store_set_known_n() ---- */
@@ -2844,19 +3458,21 @@ int store_set_known(store_t *s, uint16_t view, const char *name, size_t len, con
 typedef struct {
   size_t len;
   uint32_t nops;
-  unsigned nv;
+  unsigned nv, npl;
   struct { uint32_t fid; uint64_t val; } vs[JB_MAXV];
 } jb_mark_t;
 static void jb_mark(const jb_t *j, jb_mark_t *k) {
   k->len = j->len;
   k->nops = j->nops;
   k->nv = j->nv;
+  k->npl = j->npl;
   memcpy(k->vs, j->vs, (size_t)j->nv * sizeof(k->vs[0]));
 }
 static void jb_rollback(jb_t *j, const jb_mark_t *k) {          /* (the entry that failed leaves nothing in the record) */
   j->len = k->len;
   j->nops = k->nops;
   j->nv = k->nv;
+  j->npl = k->npl;
   memcpy(j->vs, k->vs, (size_t)k->nv * sizeof(k->vs[0]));
 }
 
@@ -2888,7 +3504,11 @@ int store_set_known_n(store_t *s, uint16_t view, const store_known_t *in, size_t
   size_t pidx[KN_MAX];
   uint32_t pz[KN_MAX];
   memset(&ck, 0, sizeof(ck));
-  pthread_mutex_lock(&s->wlock);
+  const int lr = wr_lock(s);
+  if (lr < 0) {
+    for (size_t i = 0; i < n; i++) { res[i] = lr; if (zid) zid[i] = STORE_NONE; }
+    return 0;
+  }
   for (size_t i = 0; i < n; i++) {
     res[i] = 0;
     if (zid) zid[i] = STORE_NONE;
@@ -2927,7 +3547,9 @@ int store_set_known_n(store_t *s, uint16_t view, const store_known_t *in, size_t
     }
   }
   kn_flush(s, &ck, pidx, pz, res, zid);
-  pthread_mutex_unlock(&s->wlock);
+  const int c = wr_done(s, 0);
+  if (c < 0)                                                        /* (STORE_SYNC_EVERY: the commit of the entries failed) */
+    for (size_t i = 0; i < n; i++) if (res[i] == 0) res[i] = c;
   return 0;
 }
 
@@ -2955,6 +3577,7 @@ static int delete_locked(store_t *s, uint32_t z) {
       if ((r = jb_slot(j, OP_IX, pos, st_slotval(st_tag(h), STORE_NONE))) < 0) return r;
       if ((r = jb_vadd(s, j, V_IX_LIVE, -1)) < 0) return r;
     }
+    if ((r = jb_pl(j, 0, false, h, z)) < 0) return r;
   }
   if (c.source_id != 0) {
     ixgen_t *sx = atomic_load_explicit(&s->sx, memory_order_relaxed);
@@ -2964,6 +3587,7 @@ static int delete_locked(store_t *s, uint32_t z) {
       if ((r = jb_slot(j, OP_SX, pos, st_slotval(st_tag(oh), STORE_NONE))) < 0) return r;
       if ((r = jb_vadd(s, j, V_SX_LIVE, -1)) < 0) return r;
     }
+    if ((r = jb_pl(j, 1, false, oh, z)) < 0) return r;
   }
   /* the cell becomes FREE and the head of the free list */
   zt_t ft;
@@ -2994,30 +3618,30 @@ static int delete_locked(store_t *s, uint32_t z) {
 int store_delete(store_t *s, uint32_t zid) {
   if (!s) return -EINVAL;
   ST_FAULT("delete", zid);
-  pthread_mutex_lock(&s->wlock);
-  int r = delete_locked(s, zid);
+  int r = wr_lock(s);
+  if (r < 0) return r;
+  r = delete_locked(s, zid);
   if (r < 0 && r != -ENOENT) note_error(s, r); else if (r == 0) { note_ok(s); r = post_write(s); }
-  pthread_mutex_unlock(&s->wlock);
-  return r;
+  return wr_done(s, r);
 }
 int store_delete_name(store_t *s, uint16_t view, const char *name, size_t len) {
   if (!s || !name || len > STORE_NAME_MAX) return -EINVAL;
   uint8_t fn[256];
   for (size_t i = 0; i < len; i++) fn[i] = st_lc((uint8_t)name[i]);
-  pthread_mutex_lock(&s->wlock);
+  int r = wr_lock(s);
+  if (r < 0) return r;
   ixgen_t *ix = atomic_load_explicit(&s->ix, memory_order_relaxed);
   uint32_t z = ix_lookup(s, ix, view, fn, len, st_hash_name(s, view, fn, len));
-  int r = z == STORE_NONE ? -ENOENT : delete_locked(s, z);
+  r = z == STORE_NONE ? -ENOENT : delete_locked(s, z);
   if (r < 0 && r != -ENOENT) note_error(s, r); else if (r == 0) { note_ok(s); r = post_write(s); }
-  pthread_mutex_unlock(&s->wlock);
-  return r;
+  return wr_done(s, r);
 }
 
 int store_set_flags(store_t *s, uint32_t zid, uint16_t set, uint16_t clear) {
   if (!s) return -EINVAL;
   ST_FAULT("set_flags", zid);
-  pthread_mutex_lock(&s->wlock);
-  int r;
+  int r = wr_lock(s);
+  if (r < 0) return r;
   r64_t rt, rc;
   if ((uint64_t)zid >= st_zt_cap(s) || zt_state_fast(s, zid) == STORE_STATE_FREE) r = -ENOENT;
   else if ((r = zrec_read_locked(s, zid, &rt, &rc)) == 0) {
@@ -3041,16 +3665,15 @@ int store_set_flags(store_t *s, uint32_t zid, uint16_t set, uint16_t clear) {
     }
   }
   if (r < 0 && r != -ENOENT) note_error(s, r); else if (r == 0) { note_ok(s); r = post_write(s); }
-  pthread_mutex_unlock(&s->wlock);
-  return r;
+  return wr_done(s, r);
 }
 
 /* 0.7 WP7b: the version stamp (zc) and the flags (zt) of a zone, in one journal record: the database has another version than the one the record holds, or the same one again */
 int store_set_stamp(store_t *s, uint32_t zid, uint64_t gen, uint64_t time, uint16_t set, uint16_t clear) {
   if (!s) return -EINVAL;
   ST_FAULT("set_stamp", zid);
-  pthread_mutex_lock(&s->wlock);
-  int r;
+  int r = wr_lock(s);
+  if (r < 0) return r;
   r64_t rt, rc;
   if ((uint64_t)zid >= st_zt_cap(s) || zt_state_fast(s, zid) == STORE_STATE_FREE) r = -ENOENT;
   else if ((r = zrec_read_locked(s, zid, &rt, &rc)) == 0) {
@@ -3079,27 +3702,25 @@ int store_set_stamp(store_t *s, uint32_t zid, uint64_t gen, uint64_t time, uint1
     }
   }
   if (r < 0 && r != -ENOENT) note_error(s, r); else if (r == 0) { note_ok(s); r = post_write(s); }
-  pthread_mutex_unlock(&s->wlock);
-  return r;
+  return wr_done(s, r);
 }
 
 int store_view_add(store_t *s, const char *name) {
   if (!s || !name || !*name || strlen(name) > STORE_VIEW_NAME_MAX) return -EINVAL;
-  pthread_mutex_lock(&s->wlock);
-  int r;
+  int r = wr_lock(s);
+  if (r < 0) return r;
   uint32_t n = atomic_load_explicit(&s->nviews, memory_order_relaxed);
   for (uint32_t i = 0; i < n; i++)
-    if (strcmp(s->views[i], name) == 0) { pthread_mutex_unlock(&s->wlock); return (int)i; }
-  if (n >= ST_MAXV) { pthread_mutex_unlock(&s->wlock); return -ENOSPC; }
+    if (strcmp(s->views[i], name) == 0) { wr_unlock_raw(s); return (int)i; }
+  if (n >= ST_MAXV) { wr_unlock_raw(s); return -ENOSPC; }
   jb_reset(&s->jb);
   uint8_t *p = jb_op(&s->jb, OP_VIEW, 8 + STORE_VIEW_NAME_MAX + 1);
-  if (!p) { pthread_mutex_unlock(&s->wlock); return -ENOMEM; }
+  if (!p) { wr_unlock_raw(s); return -ENOMEM; }
   memcpy(p, &n, 4);
   memcpy(p + 8, name, strlen(name));
   r = journal_commit_apply(s);
   if (r < 0) note_error(s, r); else { note_ok(s); r = post_write(s); if (r == 0) r = (int)n; }
-  pthread_mutex_unlock(&s->wlock);
-  return r;
+  return wr_done(s, r);
 }
 int store_view_id(const store_t *s, const char *name) {
   if (!s || !name) return -ENOENT;
@@ -3116,10 +3737,10 @@ const char *store_view_name(const store_t *s, int view) {
 int store_set_cursor(store_t *s, uint16_t source, uint64_t cursor, const void *ident, size_t ident_len) {
   if (!s || source >= ST_MAXSRC || ident_len > STORE_IDENT_MAX || (ident_len && !ident)) return -EINVAL;
   ST_FAULT("set_cursor", STORE_NONE);
-  pthread_mutex_lock(&s->wlock);
+  int r = wr_lock(s);
+  if (r < 0) return r;
   jb_reset(&s->jb);
   uint8_t *p = jb_op(&s->jb, OP_SRC, 24 + STORE_IDENT_MAX);
-  int r = 0;
   if (!p) r = -ENOMEM;
   else {
     uint32_t src = source, valid = 1, il = (uint32_t)ident_len;
@@ -3131,33 +3752,46 @@ int store_set_cursor(store_t *s, uint16_t source, uint64_t cursor, const void *i
     r = journal_commit_apply(s);
   }
   if (r < 0) note_error(s, r); else { note_ok(s); r = post_write(s); }
-  pthread_mutex_unlock(&s->wlock);
-  return r;
+  return wr_done(s, r);
 }
 int store_get_cursor(store_t *s, uint16_t source, bool *valid, uint64_t *cursor, void *ident, size_t *ident_len) {
   if (!s || source >= ST_MAXSRC) return -EINVAL;
-  pthread_mutex_lock(&s->wlock);
+  wr_lock_raw(s);
   const srcent_t *e = &s->src[source];
   if (valid) *valid = e->valid != 0;
   if (cursor) *cursor = e->cursor;
   if (ident) memcpy(ident, e->ident, e->identlen);
   if (ident_len) *ident_len = e->identlen;
-  pthread_mutex_unlock(&s->wlock);
+  wr_unlock_raw(s);
   return 0;
 }
 
+/* The first fill announces its size: the tables and the indexes are made big enough once.  The bigger indexes are built outside the writer mutex, on this thread (a build that runs is
+ * waited for first); a build that is dropped meanwhile leaves the growth to the writers (at one half). */
+static void tables_ahead(store_t *s, uint64_t zones);
 int store_reserve(store_t *s, uint64_t zones) {
   if (!s) return -EINVAL;
-  pthread_mutex_lock(&s->wlock);
-  int r = ensure_zt_cap(s, zones + 1);
+  for (int wait = 0; wait < 100000 && atomic_load_explicit(&s->rg_live, memory_order_acquire); wait++) usleep(1000);
+  tables_ahead(s, zones + 1);                          /* (the blocks of zt and zc outside the mutex: inside it the growth is a mapping) */
+  int r = wr_lock(s);
+  if (r < 0) return r;
+  r = ensure_zt_cap(s, zones + 1);
+  bool built = false;
   if (r == 0) {
     ixgen_t *ix = atomic_load_explicit(&s->ix, memory_order_relaxed), *sx = atomic_load_explicit(&s->sx, memory_order_relaxed);
-    uint64_t want = zones * 22 / 10 + 16;
+    uint64_t want = zones * 8 / 3 + 16;               /* (the announced zones stay below the 3/8 at which a growth begins) */
     uint64_t nix = want > ix->nslots ? want : 0, nsx = want > sx->nslots ? want : 0;
-    if (nix || nsx) r = index_regrow(s, nix, nsx);
+    if (nix || nsx) {
+      if (rg_start_locked(s, nix, nsx, false)) built = true;
+      else r = regrow_locked(s, nix, nsx);
+    }
   }
   if (r < 0) note_error(s, r);
-  pthread_mutex_unlock(&s->wlock);
+  wr_unlock_raw(s);
+  if (built) {
+    r = rg_build(s);
+    if (r == -ECANCELED) r = 0;
+  }
   return r;
 }
 
@@ -3236,10 +3870,11 @@ static void space_checkpoint(store_t *s) {
 /* ---- the scrub ---- */
 
 static void scrub_note_bad_image(store_t *s, uint32_t z, const store_zone_t *zz, const char *why) {
-  pthread_mutex_lock(&s->wlock);
-  int r = zone_make_known_locked(s, z, zz->loc);
+  int r = wr_lock(s);
+  if (r < 0) return;
+  r = zone_make_known_locked(s, z, zz->loc);
   if (r == 0) post_write(s);
-  pthread_mutex_unlock(&s->wlock);
+  wr_unlock_raw(s);
   if (r == 0) {
     bad_note(s, z);
     s->sc_p_bad_img++;
@@ -3386,11 +4021,11 @@ int store_scrub_run(store_t *s, store_scrub_report_t *rep) {
 static int cleaner_work(store_t *s, uint64_t budget, uint64_t until_ms, store_compact_report_t *rep) {
   int ret = 0;
   while (budget > 0 && st_now_ms() < until_ms) {
-    pthread_mutex_lock(&s->wlock);
+    if ((ret = wr_lock(s)) < 0) break;
     if (!s->cl_seg) {
       uint32_t v = cl_pick(s, NULL, NULL, NULL, NULL, true);
       if (!v && cl_rotate_open_locked(s)) v = cl_pick(s, NULL, NULL, NULL, NULL, true);
-      if (!v) { pthread_mutex_unlock(&s->wlock); break; }
+      if (!v) { wr_unlock_raw(s); break; }
       s->cl_seg = v;
       s->cl_off = ST_SEGHDR;
       s->cl_buf_len = 0;
@@ -3401,10 +4036,19 @@ static int cleaner_work(store_t *s, uint64_t budget, uint64_t until_ms, store_co
     else if (r < 0) { cl_finish_victim(s, true, rep); ret = r; }
     atomic_store_explicit(&s->c_last_unix, (uint64_t)time(NULL), memory_order_relaxed);
     int pr = post_write(s);
-    pthread_mutex_unlock(&s->wlock);
+    wr_unlock_raw(s);
     if (r < 0 || pr < 0) { if (ret == 0) ret = pr; break; }
   }
   return ret;
+}
+
+/* the writer mutex with the checkpoint's flags, for a caller that writes records and then a checkpoint with the writers kept out (store_compact(finish), the operator's clean-now,
+ * store_repair()): the clean flag on disk goes first.  wr_unlock_ck() gives all of it up. */
+static int wr_lock_ck_w(store_t *s) {
+  wr_lock_ck(s);
+  const int r = unclean_now_locked(s);
+  if (r < 0) { wr_unlock_ck(s); note_error(s, r); }
+  return r;
 }
 
 int store_compact(store_t *s, uint64_t max_bytes, bool finish, store_compact_report_t *rep) {
@@ -3412,18 +4056,22 @@ int store_compact(store_t *s, uint64_t max_bytes, bool finish, store_compact_rep
   if (rep) memset(rep, 0, sizeof(*rep));
   const uint64_t freed0 = atomic_load_explicit(&s->c_segs_freed, memory_order_relaxed);
   int r = cleaner_work(s, max_bytes ? max_bytes : UINT64_MAX, st_now_ms() + 3600000u, rep);
-  pthread_mutex_lock(&s->wlock);
+  int lr = finish ? wr_lock_ck_w(s) : wr_lock(s);
+  if (lr < 0) return r < 0 ? r : lr;
   uint64_t got = 0;
   int nr = nx_reclaim_locked(s, false, &got);
   if (rep) rep->nx_reclaimed = got;
   if (r == 0 && nr < 0) r = nr;
   if (finish) {
-    int cr = checkpoint_locked(s, false);
+    int cr = ck_full_locked(s, false);
+    if (cr < 0) note_error(s, cr);
     if (r == 0 && cr < 0) r = cr;
     seg_retire_locked(s, true);
     retire_run(s, false);
+    wr_unlock_ck(s);
+  } else {
+    wr_unlock_raw(s);
   }
-  pthread_mutex_unlock(&s->wlock);
   if (rep) rep->segs_freed = (uint32_t)(atomic_load_explicit(&s->c_segs_freed, memory_order_relaxed) - freed0);
   bad_drain(s);
   return r;
@@ -3449,20 +4097,21 @@ static void maintenance(store_t *s) {
     uint64_t moved = atomic_load_explicit(&s->c_moved_bytes, memory_order_relaxed) - before;
     if (rate != UINT64_MAX && !forced) s->cl_tokens = s->cl_tokens > (double)moved ? s->cl_tokens - (double)moved : 0.0;
   }
-  if (forced) {                       /* nothing left to clean: the operator's request is over (a checkpoint, and the empty segments go) */
-    pthread_mutex_lock(&s->wlock);
+  if (forced && wr_lock_ck_w(s) == 0) {        /* nothing left to clean: the operator's request is over (a checkpoint, and the empty segments go) */
     if (!s->cl_seg && cl_pick(s, NULL, NULL, NULL, NULL, true) == 0 && !cl_rotate_open_locked(s)) {
       atomic_store_explicit(&s->c_forced, false, memory_order_relaxed);
-      (void)checkpoint_locked(s, false);
+      const int cr = ck_full_locked(s, false);
+      if (cr < 0) note_error(s, cr);
       seg_retire_locked(s, true);
     }
-    pthread_mutex_unlock(&s->wlock);
+    wr_unlock_ck(s);
   }
-  pthread_mutex_lock(&s->wlock);
-  seg_retire_locked(s, false);
-  (void)nx_reclaim_locked(s, false, NULL);
-  if (s->avail_est < 0 || st_now_ms() - s->last_probe_ms >= 10000) fs_probe(s);
-  pthread_mutex_unlock(&s->wlock);
+  if (wr_lock(s) == 0) {
+    seg_retire_locked(s, false);
+    (void)nx_reclaim_locked(s, false, NULL);
+    if (s->avail_est < 0 || st_now_ms() - s->last_probe_ms >= 10000) fs_probe(s);
+    wr_unlock_raw(s);
+  }
   /* the scrub: a pass is due when the interval since the last one has passed; it runs in slices at scrub_rate */
   if (pthread_mutex_trylock(&s->sc_mu) == 0) {
     const uint32_t iv = s->o.scrub_interval_s ? s->o.scrub_interval_s : 604800u;
@@ -3489,34 +4138,32 @@ static void maintenance(store_t *s) {
 
 int store_commit(store_t *s) {
   if (!s) return -EINVAL;
-  pthread_mutex_lock(&s->wlock);
-  int r = commit_locked(s);
-  if (r < 0) note_error(s, r);
-  pthread_mutex_unlock(&s->wlock);
-  return r;
+  return st_commit(s, atomic_load_explicit(&s->lsn, memory_order_acquire));
 }
+/* the tick: the commit that is due is made here (a short sync, no lock held while it waits), the checkpoint is the flusher's (without one the tick makes it), then the background work */
 int store_tick(store_t *s) {
   if (!s) return -EINVAL;
-  pthread_mutex_lock(&s->wlock);
-  int r = post_write(s);
-  pthread_mutex_unlock(&s->wlock);
+  int r = 0;
+  wr_lock_raw(s);
+  (void)post_write(s);
+  wr_unlock_raw(s);
+  if (commit_due(s, st_now_ms())) r = st_commit(s, atomic_load_explicit(&s->lsn, memory_order_acquire));
+  if (!s->fl_on) bg_due(s);
   maintenance(s);
   return r;
 }
 int store_checkpoint(store_t *s) {
   if (!s) return -EINVAL;
-  pthread_mutex_lock(&s->wlock);
-  int r = checkpoint_locked(s, false);
-  if (r < 0) note_error(s, r);
-  pthread_mutex_unlock(&s->wlock);
+  int r = st_ckpt(s, true);
+  ck_after(s);
   return r;
 }
 int store_checkpoint_clean(store_t *s) {
   if (!s) return -EINVAL;
-  pthread_mutex_lock(&s->wlock);
-  int r = checkpoint_locked(s, true);
+  wr_lock_ck(s);
+  int r = ck_full_locked(s, true);
   if (r < 0) note_error(s, r);
-  pthread_mutex_unlock(&s->wlock);
+  wr_unlock_ck(s);
   return r;
 }
 
@@ -4030,6 +4677,11 @@ void store_stats(const store_t *s, store_stats_t *o) {
   o->zt_readahead_us = atomic_load_explicit(&s->ra_zt_us, memory_order_relaxed);
   o->zt_readahead_done = atomic_load_explicit(&s->ra_done, memory_order_acquire);
   o->err_total = store_err_total(s);
+  o->lock_holds = atomic_load_explicit(&s->wl_n, memory_order_relaxed);
+  o->lock_holds_slow = atomic_load_explicit(&s->wl_slow, memory_order_relaxed);
+  o->lock_hold_max_us = atomic_load_explicit(&s->wl_max_us, memory_order_relaxed);
+  o->growths_background = atomic_load_explicit(&s->n_growths_bg, memory_order_relaxed);
+  o->flusher = s->fl_on;
   rcu_aux_read_unlock();
 }
 
@@ -4174,7 +4826,7 @@ int store_hot_read(const store_t *cs, uint32_t **zids, size_t *n) {
 
 int store_check(store_t *s, store_check_report_t *rep) {
   memset(rep, 0, sizeof(*rep));
-  pthread_mutex_lock(&s->wlock);
+  wr_lock_raw(s);
   uint64_t hwm = VG(s, V_HWM), known = 0, stored = 0, rej = 0, nons = 0, bytes = 0, nfree = 0, live_ix = 0, live_sx = 0, nxlive = 0;
   uint64_t vk[ST_MAXV][4];
   memset(vk, 0, sizeof(vk));
@@ -4252,7 +4904,7 @@ int store_check(store_t *s, store_check_report_t *rep) {
   const ixgen_t *ix = atomic_load_explicit(&s->ix, memory_order_relaxed), *sx = atomic_load_explicit(&s->sx, memory_order_relaxed);
   if ((VG(s, V_IX_USED)) * 2 > ix->nslots + 1 || VG(s, V_IX_USED) < VG(s, V_IX_LIVE)) CHK_FAIL("ix used %" PRIu64 " slots %" PRIu64, VG(s, V_IX_USED), ix->nslots);
   if (VG(s, V_SX_USED) < VG(s, V_SX_LIVE) || VG(s, V_SX_USED) * 2 > sx->nslots + 1) CHK_FAIL("sx used %" PRIu64 " slots %" PRIu64, VG(s, V_SX_USED), sx->nslots);
-  pthread_mutex_unlock(&s->wlock);
+  wr_unlock_raw(s);
   return rep->errors ? -EBADMSG : 0;
 }
 
@@ -4272,8 +4924,9 @@ static int rebuild_locked(store_t *s) {
   uint32_t nviews = atomic_load_explicit(&s->nviews, memory_order_relaxed);
   ixgen_t *nix = NULL, *nsx = NULL;
   uint64_t slots = ix_slots_for(hwm);
-  int r = ixgen_create(s, FK_IX, s->ix_gen + 1, slots, &nix);
-  if (r == 0) r = ixgen_create(s, FK_SX, s->sx_gen + 1, slots, &nsx);
+  if (s->rg_active) atomic_store_explicit(&s->rg_cancel, true, memory_order_relaxed);       /* (a build in progress is dropped: the generations change here) */
+  int r = ixgen_create(s, FK_IX, s->ix_gen_next++, slots, &nix);
+  if (r == 0) r = ixgen_create(s, FK_SX, s->sx_gen_next++, slots, &nsx);
   if (r < 0) { ixgen_free(nix); free(nv); return r; }
   /* counters are recomputed: clear everything except the segment tables, which are recomputed below too */
   uint64_t nsegs = NG(V_NSEGS), cur_seg = NG(V_CUR_SEG), nx_used = NG(V_NX_USED);
@@ -4395,15 +5048,16 @@ static int rebuild_locked(store_t *s) {
 
 int store_repair(store_t *s) {
   if (!s) return -EINVAL;
-  pthread_mutex_lock(&s->wlock);
+  int r = wr_lock_ck_w(s);                            /* (the writers are kept out until the checkpoint of the rebuild is on disk) */
+  if (r < 0) return r;
   /* the rebuild changes cells, tables and counters that no journal record describes, and is only complete with its checkpoint: a marker in the journal first, so
    * that a crash (or a failed checkpoint and a later crash) in between makes the open rebuild again instead of trusting half of it */
   jb_reset(&s->jb);
-  int r = jb_op(&s->jb, OP_REBUILD, 8) ? journal_append(s) : -ENOMEM;
+  r = jb_op(&s->jb, OP_REBUILD, 8) ? journal_append(s) : -ENOMEM;
   if (r == 0) r = rebuild_locked(s);
-  if (r == 0) r = checkpoint_locked(s, false);
+  if (r == 0) r = ck_full_locked(s, false);
   if (r < 0) note_error(s, r);
-  pthread_mutex_unlock(&s->wlock);
+  wr_unlock_ck(s);
   return r;
 }
 
@@ -4431,6 +5085,8 @@ static void files_close(store_t *s) {
     seg_free(g);
   }
   if (s->jfd >= 0) { close(s->jfd); s->jfd = -1; }
+  if (s->jold >= 0) { close(s->jold); s->jold = -1; }
+  if (s->jnext_fd >= 0) { close(s->jnext_fd); s->jnext_fd = -1; }
 }
 
 /* Adopt the state of superblock copy b: open and check the table files.  On failure the files are closed again. */
@@ -4546,7 +5202,7 @@ static int create_store(store_t *s) {
   if (r == 0) r = ensure_zt_cap(s, zones + 1);
   if (r == 0) r = ensure_nx_cap(s, 1);
   ixgen_t *ix = NULL, *sx = NULL;
-  uint64_t slots = zones ? zones * 22 / 10 + 16 : ST_IX_MIN;
+  uint64_t slots = zones ? zones * 8 / 3 + 16 : ST_IX_MIN;
   if (slots < ST_IX_MIN) slots = ST_IX_MIN;
   if (r == 0) r = ixgen_create(s, FK_IX, 1, slots, &ix);
   if (r == 0) r = ixgen_create(s, FK_SX, 1, slots, &sx);
@@ -4560,9 +5216,12 @@ static int create_store(store_t *s) {
   s->ckpt_lsn = 0;
   s->jrn_gen = 0;
   atomic_store_explicit(&s->sc_last_done, (uint64_t)time(NULL), memory_order_relaxed);
+  s->ix_gen_next = s->sx_gen_next = 2;
   /* two superblock copies so that either one can be the "older" one from the start */
   s->sb_next = 0;
-  r = journal_open_new(s, 1, 1);
+  int oldfd = -1;
+  r = journal_switch_locked(s, 1, &oldfd);            /* (jrn_gen 0: the journal file 1, records from LSN 1) */
+  if (r == 0 && fdatasync(s->jfd) != 0) r = -errno;
   if (r == 0) r = sb_write(s, false, 1);
   if (r == 0) r = sb_write(s, false, 1);
   return r;
@@ -4634,6 +5293,106 @@ static void fs_open_checks(store_t *s) {
   }
 }
 
+/* ---- the flusher (0.7 fix A): two threads, so that a long flush of the tables does not stop the commits ----
+ * fl_commit_main(): the periodic commit (STORE_SYNC_BATCH: when a record waited sync_interval_ms; STORE_SYNC_EVERY: what the cleaner and the scrub left).  fl_ckpt_main(): the
+ * checkpoints (journal size, checkpoint_interval_ms, after a growth) and the ones a writer began when it found the journal full (ck_handoff), then the housekeeping of the writer
+ * mutex (ck_after()).  Neither holds a lock while it waits for the disk. */
+static void bg_wait_ms(store_t *s, uint64_t ms) {           /* (bg_mu held) */
+  if (s->bg_kick || s->bg_stop || s->ck_handoff) return;
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  ts.tv_sec += (time_t)(ms / 1000u);
+  ts.tv_nsec += (long)(ms % 1000u) * 1000000L;
+  if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+  (void)pthread_cond_timedwait(&s->bg_cv, &s->bg_mu, &ts);
+}
+static void bg_backoff(store_t *s, uint64_t ms) {           /* (bg_mu held) after a failed sync: the next try after `ms`, whatever wakes the thread meanwhile */
+  const uint64_t until = st_now_ms() + ms;
+  for (uint64_t now = st_now_ms(); now < until && !s->bg_stop && !s->ck_handoff; now = st_now_ms()) {
+    s->bg_kick = false;
+    bg_wait_ms(s, until - now);
+  }
+}
+/* the blocks of the next growth of zt, zc and nx, allocated outside the writer mutex (zones: also room for that many records, store_reserve()) */
+static void tables_ahead(store_t *s, uint64_t zones) {
+  const uint64_t hwm = VG(s, V_HWM), need = zones * ST_REC;
+  mtab_ahead(s, &s->zt, hwm * ST_REC, need);
+  mtab_ahead(s, &s->zc, hwm * ST_REC, need);
+  mtab_ahead(s, &s->nx, VG(s, V_NX_USED), 0);
+}
+static void *fl_commit_main(void *arg) {
+  store_t *s = arg;
+  pthread_mutex_lock(&s->bg_mu);
+  while (!s->bg_stop) {
+    uint64_t wait = s->o.sync_policy == STORE_SYNC_BATCH ? s->o.sync_interval_ms : 1000u;
+    const uint64_t now = st_now_ms(), last = atomic_load_explicit(&s->last_sync_ms, memory_order_relaxed);
+    if (s->o.sync_policy == STORE_SYNC_BATCH && atomic_load_explicit(&s->lsn, memory_order_relaxed) > atomic_load_explicit(&s->committed_lsn, memory_order_relaxed))
+      wait = now - last >= s->o.sync_interval_ms ? 0 : s->o.sync_interval_ms - (now - last);     /* (a record waits: commit when it is due, not a whole interval later) */
+    if (wait) bg_wait_ms(s, wait);
+    s->bg_kick = false;
+    if (s->bg_stop) break;
+    pthread_mutex_unlock(&s->bg_mu);
+    int r = 0;
+    if (commit_due(s, st_now_ms())) r = st_commit(s, atomic_load_explicit(&s->lsn, memory_order_acquire));
+    tables_ahead(s, 0);
+    pthread_mutex_lock(&s->bg_mu);
+    if (r < 0) bg_backoff(s, s->o.sync_interval_ms > 1000u ? s->o.sync_interval_ms : 1000u);
+  }
+  pthread_mutex_unlock(&s->bg_mu);
+  return NULL;
+}
+static void *fl_ckpt_main(void *arg) {
+  store_t *s = arg;
+  pthread_mutex_lock(&s->bg_mu);
+  for (;;) {
+    if (s->ck_handoff) {                               /* (a writer began it and holds its flags for it: finished even when the store stops) */
+      s->ck_handoff = false;
+      pthread_mutex_unlock(&s->bg_mu);
+      if (ck_run(s) == 0) ck_after(s);
+      pthread_mutex_lock(&s->bg_mu);
+      continue;
+    }
+    if (s->bg_stop) break;
+    bg_wait_ms(s, 1000);
+    s->bg_kick = false;
+    if (s->bg_stop || s->ck_handoff) continue;
+    pthread_mutex_unlock(&s->bg_mu);
+    int r = 0;
+    if (ckpt_due(s, st_now_ms()) && (r = st_ckpt(s, false)) == 0) ck_after(s);
+    pthread_mutex_lock(&s->bg_mu);
+    if (r < 0) bg_backoff(s, 1000);
+  }
+  pthread_mutex_unlock(&s->bg_mu);
+  return NULL;
+}
+static void bg_start(store_t *s) {
+  if (atomic_load_explicit(&store_test_no_flusher, memory_order_relaxed)) return;
+  if (pthread_create(&s->fl_thr, NULL, fl_ckpt_main, s) != 0) return;
+  if (pthread_create(&s->fl_thr2, NULL, fl_commit_main, s) != 0) {
+    pthread_mutex_lock(&s->bg_mu);
+    s->bg_stop = true;
+    pthread_cond_broadcast(&s->bg_cv);
+    pthread_mutex_unlock(&s->bg_mu);
+    pthread_join(s->fl_thr, NULL);
+    s->bg_stop = false;
+    return;
+  }
+  s->fl_on = true;
+}
+/* the store closes: the flusher ends (a checkpoint it runs is finished), a build of the index is dropped and waited for */
+static void bg_stop_join(store_t *s) {
+  atomic_store_explicit(&s->rg_stop, true, memory_order_relaxed);
+  while (atomic_load_explicit(&s->rg_live, memory_order_acquire)) usleep(1000);
+  if (!s->fl_on) return;
+  pthread_mutex_lock(&s->bg_mu);
+  s->bg_stop = true;
+  pthread_cond_broadcast(&s->bg_cv);
+  pthread_mutex_unlock(&s->bg_mu);
+  pthread_join(s->fl_thr, NULL);
+  pthread_join(s->fl_thr2, NULL);
+  s->fl_on = false;
+}
+
 int store_open(int dirfd, const store_opts_t *opts, store_t **out) {
   uint64_t t0 = st_now_us();
   if (!out) return -EINVAL;
@@ -4654,6 +5413,15 @@ int store_open(int dirfd, const store_opts_t *opts, store_t **out) {
   pthread_mutex_init(&s->seg_mu, NULL);
   pthread_mutex_init(&s->sc_mu, NULL);
   pthread_mutex_init(&s->bad_mu, NULL);
+  pthread_mutex_init(&s->bg_mu, NULL);
+  {
+    pthread_condattr_t ca;
+    pthread_condattr_init(&ca);
+    pthread_condattr_setclock(&ca, CLOCK_MONOTONIC);         /* (bg_wait_ms()) */
+    pthread_cond_init(&s->bg_cv, &ca);
+    pthread_condattr_destroy(&ca);
+  }
+  s->jold = s->jnext_fd = -1;
   s->avail_est = -1;
   s->reserve_bytes = s->o.reserve_bytes ? s->o.reserve_bytes : s->seg_size / 2;
   if (!s->o.reserve_bytes) {
@@ -4733,13 +5501,20 @@ int store_open(int dirfd, const store_opts_t *opts, store_t **out) {
     bool anomaly = false;
     r = journal_replay(s, cand[used]->f.jrn_gen, &anomaly);
     if (r < 0) goto fail;
+    /* the numbers of new generation files start above every one that a superblock or the journal named */
+    s->ix_gen_next = s->ix_gen > s->slot_ix[0] ? s->ix_gen : s->slot_ix[0];
+    if (s->slot_ix[1] > s->ix_gen_next) s->ix_gen_next = s->slot_ix[1];
+    s->ix_gen_next++;
+    s->sx_gen_next = s->sx_gen > s->slot_sx[0] ? s->sx_gen : s->slot_sx[0];
+    if (s->slot_sx[1] > s->sx_gen_next) s->sx_gen_next = s->slot_sx[1];
+    s->sx_gen_next++;
     /* same boot after an unclean stop: the page cache kept every cell and the replay is exact; another or an unknown boot (power
      * loss, OS crash): cells may be ahead of the journal, so the derived tables are rebuilt */
     bool rebuild = s->o.force_rebuild || anomaly || (unclean && (s->boot_id == 0 || was_boot == 0 || was_boot != s->boot_id));
     if (rebuild) {
-      pthread_mutex_lock(&s->wlock);
+      wr_lock_raw(s);
       r = rebuild_locked(s);
-      pthread_mutex_unlock(&s->wlock);
+      wr_unlock_raw(s);
       if (r < 0) goto fail;
     }
   }
@@ -4748,12 +5523,13 @@ int store_open(int dirfd, const store_opts_t *opts, store_t **out) {
   cand[0] = cand[1] = NULL;
   /* start the session: a new journal and a superblock with the clean flag cleared and this boot id, durable before the first
    * modification */
-  pthread_mutex_lock(&s->wlock);
-  r = checkpoint_locked(s, false);
-  pthread_mutex_unlock(&s->wlock);
+  wr_lock_ck(s);
+  r = ck_full_locked(s, false);
+  wr_unlock_ck(s);
   if (r < 0) goto fail;
   s->clean_on_disk = false;
-  s->last_sync_ms = s->last_ckpt_ms = st_now_ms();
+  s->last_sync_ms = st_now_ms();
+  s->last_ckpt_ms = st_now_ms();
   if (!atomic_load_explicit(&s->sc_last_done, memory_order_relaxed)) atomic_store_explicit(&s->sc_last_done, (uint64_t)time(NULL), memory_order_relaxed);      /* (a store from before the scrub: its first pass is one interval from now) */
   fs_open_checks(s);
   err_ring_open(s);
@@ -4765,6 +5541,7 @@ int store_open(int dirfd, const store_opts_t *opts, store_t **out) {
   } else {
     atomic_store_explicit(&s->ra_done, true, memory_order_release);
   }
+  bg_start(s);                                        /* the flusher (0.7 fix A); without it the writers make the due commits and checkpoints after the mutex */
   s->rec.open_us = st_now_us() - t0;
   if (s->rec.records_replayed || s->rec.rebuilt || s->rec.used_older_super)
     st_log(s, 4, "store: recovered: %" PRIu64 " journal records, rebuilt=%d, older superblock=%d", s->rec.records_replayed,
@@ -4782,6 +5559,8 @@ fail:
   bad_free_all(s);
   pthread_mutex_destroy(&s->bad_mu);
   pthread_mutex_destroy(&s->err_mu);
+  pthread_mutex_destroy(&s->bg_mu);
+  pthread_cond_destroy(&s->bg_cv);
   free(s->sbbuf);
   free(s->jb.p);
   free(s->cl_buf);
@@ -4792,8 +5571,9 @@ fail:
 int store_close(store_t *s) {
   if (!s) return -EINVAL;
   ra_stop_join(s);
-  pthread_mutex_lock(&s->wlock);
-  int r = checkpoint_locked(s, true);
+  bg_stop_join(s);
+  wr_lock_ck(s);
+  int r = ck_full_locked(s, true);
   if (r < 0) st_log(s, 3, "store: clean checkpoint at close failed: %d", r);
   /* wait (bounded) for readers of retired generations; the caller has stopped them */
   uint64_t e = rcu_writer_advance_epoch();
@@ -4801,14 +5581,17 @@ int store_close(store_t *s) {
   retire_run(s, true);
   files_close(s);
   for (int i = 0; i < 2; i++) if (s->sb_fd[i] >= 0) close(s->sb_fd[i]);
-  pthread_mutex_unlock(&s->wlock);
+  wr_unlock_ck(s);
   pthread_mutex_destroy(&s->wlock);
   pthread_mutex_destroy(&s->seg_mu);
   pthread_mutex_destroy(&s->sc_mu);
   bad_free_all(s);
   pthread_mutex_destroy(&s->bad_mu);
   pthread_mutex_destroy(&s->err_mu);
+  pthread_mutex_destroy(&s->bg_mu);
+  pthread_cond_destroy(&s->bg_cv);
   err_ring_close(s);
+  free(s->rg_log);
   free(s->sbbuf);
   free(s->jb.p);
   free(s->cl_buf);
