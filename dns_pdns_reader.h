@@ -32,10 +32,10 @@
  *                                        (ambiguous); any other type with prio != 0: warning, ignored
  *   7. content                           must not be empty; line-safety rules below
  *   8. after parsing                     a PRESIGNED zone gets the NSEC3PARAM / NSEC3 / NSEC RRs PowerDNS does not store
- *                                        (dns_presigned.h, design 3.6); every record is written as ZONE_DATA writes it and read back with the decoder the
- *                                        Backend uses (parse_resource_record); one it refuses (the zone parser itself refuses
+ *                                        (dns_presigned.h, design 3.6); every record is written in uncompressed wire form and read back with the decoder
+ *                                        the Backend uses for a transferred zone (parse_resource_record); one it refuses (the zone parser itself refuses
  *                                        such generic RDATA since D15-2; this is defence in depth) fails the zone with its records.id, as
- *                                        does a record that cannot fit a ZONE_DATA message on its own
+ *                                        does a record whose RDATA does not fit the 65,535 octets of a record
  *
  * Line-safety rules (pdns_text_check(); RFC 1035 5.1 master file format, and the tokenizer of dns_zone_parser.c
  * which is what decides): a stored value must not be able to end its own line, hide the rest of the line, start a
@@ -112,9 +112,9 @@ typedef struct { uint64_t seq; int64_t domain_id; uint64_t pos; } db_change_row_
 
 typedef struct {
     uint32_t default_ttl;       /* for a NULL records.ttl; 0 = PDNS_DEFAULT_TTL (an explicit TTL 0 cannot be a default) */
-    uint64_t max_records;       /* max-zone-records: RRs of the zone with both SOAs counted (= ZONE_BEGIN rr_count), and,\n                                   separately, enabled rows incl. ENT rows; 0 = KDB_DEFAULT_MAX_ZONE_RECORDS */
+    uint64_t max_records;       /* max-zone-records: RRs of the zone (the SOA once: the n_rrs of the zone image = ZONE_BEGIN rr_count), and,\n                                   separately, enabled rows incl. ENT rows; 0 = KDB_DEFAULT_MAX_ZONE_RECORDS */
     uint64_t max_text_bytes;    /* generated zone text; 0 = 4 GiB */
-    uint64_t max_zone_bytes;    /* sum of the ZONE_DATA bodies; 0 = KDB_DEFAULT_MAX_ZONE_BYTES */
+    uint64_t max_zone_bytes;    /* the size of the zone image; 0 = KDB_DEFAULT_MAX_ZONE_BYTES */
 } pdns_opts_t;
 
 typedef struct { int64_t row_id; char *name; char *ordername; } pdns_ent_t;   /* name canonical absolute; ordername NULL if NULL */
@@ -221,7 +221,7 @@ int pdns_zone_set_secondary(pdns_zone_t *z, uint8_t kind, const char *master);
 /* D1a milestone 4 (design 3.3, 6.3): make a primary zone a summary before pdns_zone_finish(): the part of it the Backend keeps in its zone
  * directory when the data is not in memory.  No rows are needed (pdns_zone_add_record() is not called); pdns_zone_finish() converts the
  * metadata into the settings text and the flags, and pdns_zone_encode_kdb() writes ZONE_BEGIN (KDB_ZF_SUMMARY, rr_count 0, a zero digest,
- * the serial and the SOA timers given here) and ZONE_END, no ZONE_DATA, and never calls the digest gate.  serial and timers are those of the
+ * the serial and the SOA timers given here) and ZONE_END, no image, and never calls the digest gate.  serial and timers are those of the
  * zone's SOA as the loader read them from the zone list. */
 void pdns_zone_set_summary(pdns_zone_t *z, uint32_t serial, bool has_timers, uint32_t refresh, uint32_t retry, uint32_t expire);
 
@@ -296,31 +296,25 @@ typedef struct {
  * Return 0, or -1 to stop (pdns_zone_encode_kdb() then returns -1). */
 typedef int (*pdns_emit_fn)(void *ud, const uint8_t *msg, size_t len);
 
-/* ZONE_BEGIN, ZONE_DATA..., ZONE_END of a converted zone, in this order and nothing else.
- *   ZONE_DATA   uncompressed RRs (serialize_dns_record without a compression context, RFC 3597 4), SOA first and
- *               last (RFC 5936 2.2), the other rows in records.id order (design 3.4: deterministic), each message
- *               <= 65,535 bytes with the header QR=1, AA=1, ID 0, QDCOUNT/NSCOUNT/ARCOUNT 0 (B1 rules).
- *   rr_count    number of RRs including both SOAs
- *   digest      SHA-256 over the ZONE_DATA bodies in stream order (the 12-byte DNS header and the RRs of each
- *               message, no framing, no ZONE_DATA headers), then, when the zone has a settings text or names a profile,
- *               a marker and the length-prefixed settings text, profile name and profile text (B7a: a metadata-only
- *               edit changes the digest); two loaders on the same rows send the same digest
- *   flags       bit0 presigned.  Extended AXFR attributes (tags, tinydns) are B8.
+/* A zone with rows is ZONE_BEGIN (flag KDB_ZF_IMAGE), the zone image in ZONE_IMAGE messages and ZONE_END (pdns_zone_encode_image(): 0.7 M3, in this order and nothing else).
+ *   rr_count    the n_rrs of the image: the RRs of the zone, the SOA once
+ *   digest      SHA-256 of the image bytes, then the markers of a presigned zone, the settings text, the profile name and the profile text (B7a: a metadata-only
+ *               edit changes the digest); the same rows give the same image and so the same digest, whoever sends them
+ *   flags       bit0 presigned, bit1 extended (Extended AXFR attributes: tags, tinydns, SOA sets), bit2 tinydns, bit4 image
  *   B7b         a zone made secondary by pdns_zone_set_secondary() is encoded as ZONE_BEGIN (zone_kind secondary / catalog, serial 0,
- *               flags 0, rr_count 0, the settings text with the masters) and ZONE_END (0): no ZONE_DATA.  Its digest covers the
+ *               flags 0, rr_count 0, the settings text with the masters) and ZONE_END (0): no image.  Its digest covers the
  *               settings text, the profile name and the profile text only, so a loader that restarts finds the zone up to date.
- * Returns 1 (nothing emitted) when p->gate asked to skip the zone.
+ * Returns 1 (nothing emitted) when p->gate asked to skip the zone.  z->arena is changed for a zone with rows (see pdns_zone_build_image()).
  *
- * Fails (-1, *err filled) for a tinydns zone, for an RR that does not fit a message, and above max_zone_bytes. */
-int pdns_zone_encode_kdb(const pdns_zone_t *z, const pdns_kdb_params_t *p, pdns_emit_fn emit, void *ud,
+ * Fails (-1, *err filled) for a zone that does not make an image (what the Backend would refuse: pdns_zone_build_image() checks it) and above max_zone_bytes. */
+int pdns_zone_encode_kdb(pdns_zone_t *z, const pdns_kdb_params_t *p, pdns_emit_fn emit, void *ud,
                          char *err, size_t errlen);
 
 /* ------------------------------------------------------------------ zone images (0.7 M3: planning_0.7.x_store_m3_image_design.md) */
 /* The zone as the image the Backend serves from, built here instead of there.  pdns_zone_build_image() takes the arena of a finished primary zone with rows
- * (not a summary, not a secondary) and does what the Backend does with the ZONE_DATA stream of that zone: the reference SOA first (a SOA set has none: every
- * SOA is a row), the tinydns flag as the stream sets it, build_zone_index(true), zone_image_freeze() with the zone name as the apex, and then zone_image_validate_ex()
- * with what ZONE_BEGIN will say (a zone that the Backend would refuse is a failure of the loader, with the zone named).  The same rows give the same image, byte
- * for byte, and it is the image that the ZONE_DATA path gives (tests/db/pdns_imagediff.h compares the two).
+ * (not a summary, not a secondary): the reference SOA first (a SOA set has none: every SOA is a row), the tinydns flag, build_zone_index(true), zone_image_freeze()
+ * with the zone name as the apex, and then zone_image_validate_ex() with what ZONE_BEGIN will say (a zone that the Backend would refuse is a failure of the loader, with
+ * the zone named).  The same rows give the same image, byte for byte (zone_image_freeze() is deterministic).
  * z->arena is changed: the record order, the RRset TTLs and the indexes are those of the image, and z->soa_index and z->line_id follow; the zone can still be
  * encoded with pdns_zone_encode_kdb() afterwards (a stream with the harmonized TTLs).  NULL: failed, err says why.  Free with zone_image_free(). */
 zone_image_t *pdns_zone_build_image(pdns_zone_t *z, char *err, size_t errlen);

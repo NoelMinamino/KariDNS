@@ -49,7 +49,10 @@ bool db_ingest_hold_queries(void);
 bool db_ingest_lookup_ready(void);
 /* the lookups' counters (dns_store_status.h, `store.lookup.*`): fills *out, true.  Any thread; no lock. */
 struct store_lookup;
+struct store_fill;
 bool db_ingest_lookup_stats(struct store_lookup *out);
+/* 0.7 M3: the zone images (store.fill.*) */
+bool db_ingest_fill_stats(struct store_fill *out);
 /* tests: a smaller bound of the lookup queue and of the wait queue (0: the constants of dns_db_ingest.c) */
 extern _Atomic uint32_t db_ingest_test_lq_max, db_ingest_test_wq_max;
 

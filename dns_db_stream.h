@@ -14,11 +14,14 @@
  *   decoder  kdb_decode      one frame -> typed kdb_msg_t (required tags present, each tag once, unknown tag =
  *                            error, exact integer lengths, ASCII strings, canonical absolute DNS names, view
  *                            index < view count).  No allocation.
- *   machine  kdb_sm_accept   Backend side: AWAIT_HELLO -> READY <-> IN_BATCH <-> IN_ZONE, ZONE_DATA header and
- *                            count / byte / record limit checks.  It does not parse RRs (parse_xfr_packet(), B4b).
+ *   machine  kdb_sm_accept   Backend side: AWAIT_HELLO -> READY <-> IN_BATCH <-> IN_ZONE, the zone image rules
+ *                            (the announced size, the sum of the ZONE_IMAGE messages, the header of the image) and
+ *                            the byte / record limit checks.  It does not read the image (zone_image_validate_ex()).
  *
  * Wire format: 12-byte header {"KDB1", u16 type, u16 flags (=0), u32 body length}, big-endian.  Body of every
- * message except ZONE_DATA: TLV list {u16 tag, u16 len, value}.  ZONE_DATA body: one DNS message.
+ * message except ZONE_IMAGE: TLV list {u16 tag, u16 len, value}.  ZONE_IMAGE body: octets of a zone image.
+ * (0.7 M3: type 5, ZONE_DATA, the zone as the RRs of an AXFR in DNS messages, is gone: the data of a database zone is a zone image, and a
+ * loader that does not send images is not taken.  Type 5 is unknown now.)
  * A TLV length is a u16, so no single value (settings text, nested entry) exceeds 65,535 bytes.
  *
  * Lifetime: kdb_str_t, kdb_frame_t.body and the iterators point into the framer's buffer.  They are valid until
@@ -43,19 +46,20 @@
  * loader -> Backend
  *   HELLO (1)         1 proto_version u16 R (=1) | 2 loader_version str<=64 R | 3 driver str<=32 R | 4 pid u32 R |
  *                     5 features u32 O (0.7 WP7a: bit0 KDB_FEAT_STORE: the loader speaks the store protocol below; bit1 KDB_FEAT_LOOKUP: it answers FETCH_REQ mode 2; bit2 KDB_FEAT_LOOKUP_BODY: it answers mode 3; absent = 0;
- *                     0.7 M3, bit3 KDB_FEAT_IMAGE: it sends a zone as a zone image, ZONE_BEGIN with the image flag and ZONE_IMAGE messages, instead of ZONE_DATA; needs tag 6) |
+ *                     0.7 M3, bit3 KDB_FEAT_IMAGE: it sends the data of a zone as a zone image (ZONE_BEGIN with the image flag and ZONE_IMAGE messages); needs tag 6) |
  *                     6 image_version u32 O (0.7 M3: the version of the zone image format the loader builds, ZONE_IMAGE_VERSION of dns_zone_image.h; present exactly when
- *                     features has bit3, and the Backend takes the loader only when it is its own version: loader and Backend are one package)
+ *                     features has bit3).  The Backend takes only a loader that has bit 3 and its own image version (KDB_E_VERSION, a protocol error with a reason that says so):
+ *                     the loader and the Backend are one package, and there is no other way to send a zone.
  *   INVENTORY_REQ (2) no tags (empty body)
  *   BATCH_BEGIN (3)   1 batch_id u64 R | 2 kind u8 R (0 startup,1 full,2 diff,3 zone,4 auto) | 3 change_seq u64 R |
  *                     4 request_id u64 O (B6a: the batch answers that RELOAD_REQ; absent or 0 = not an answer)
  *   ZONE_BEGIN (4)    1 view view R | 2 zone name R | 3 source_id i64 R | 4 zone_kind u8 R (0 primary,1 secondary,
  *                     2 catalog) | 5 serial u32 R | 6 flags u32 R (bit0 presigned, bit1 extended, bit2 tinydns, bit3 summary, bit4 image; others 0) |
- *                     7 rr_count u64 R (primary: both SOAs and, with bit1, the Extended AXFR marker and definition RRs counted, >= 2; secondary and catalog: 0, no ZONE_DATA, B7b) | 8 digest bytes R (exactly 32) |
+ *                     7 rr_count u64 R (primary: the RRs of the zone image, >= 1; secondary and catalog: 0, no data, B7b) | 8 digest bytes R (exactly 32) |
  *                     9 settings text<=65535 O | 10 profile str ne <=255 O |
  *                     D1a (fetch stream only): 11 request_id u64 O (the FETCH_REQ this zone answers; required on the fetch stream, forbidden
  *                     on the batch stream).  flags bit3 = summary: the zone's serial, kind and settings without its data (primary: rr_count 0, no
- *                     ZONE_DATA, digest all zero); on the fetch stream, and (milestone 4) in a batch when CONFIG said dir_only.  12 soa_refresh u32 | 13 soa_retry u32 | 14 soa_expire u32 (all
+ *                     no zone image, digest all zero); on the fetch stream, and (milestone 4) in a batch when CONFIG said dir_only.  12 soa_refresh u32 | 13 soa_retry u32 | 14 soa_expire u32 (all
  *                     three or none: the timers of the zone's SOA, which the zone directory keeps without the zone).
  *                     D1a step 6, a summary only, tags 12..14 required, all of 15..20 or none: the apex of the zone, for the answer to an SOA question when the
  *                     zone is not in memory.  15 soa_mname name | 16 soa_rname name | 17 soa_minimum u32 | 18 soa_ttl u32 | 19 ns_ttl u32 (the three
@@ -68,15 +72,14 @@
  *                     the zone changes while its data is out of memory.  Records of  index u8 (the position of the name in tag 20) | type u8 (1 A, 28 AAAA) |
  *                     address (4 or 16 octets); the indexes do not decrease, at most 8 records for one index.  The Backend keeps them with the apex block.
  *                     0.7 M3 (a zone image): flags bit4 = image (KDB_ZF_IMAGE): the zone's data is the zone image of dns_zone_image.h, built by the loader, sent as ZONE_IMAGE
- *                     messages instead of ZONE_DATA.  23 image_size u64: the size of the image in octets (tag 23 is there exactly when the flag is; a primary, not a summary; a
+ *                     messages.  A primary zone has no other way to carry its data, so the flag is required (a summary and a secondary have no data).  23 image_size u64: the size of the image in octets (tag 23 is there exactly when the flag is; a primary, not a summary; a
  *                     multiple of 8, the size of the header of the image at least, at most 0xFFFFF000, and at most max-zone-bytes, which for a zone image is the
  *                     size of the image).  rr_count is then the number of RRs of the image (n_rrs, >= 1, not the RRs of an AXFR: no second SOA, no Extended AXFR marker or
  *                     definition RRs; the tag and location definitions are in the image) and at most max-zone-records.  The digest is SHA-256 of the image bytes
  *                     followed by the markers of the settings text, the profile and a PRESIGNED zone (dns_pdns_reader.c); the image of one zone is always the same
  *                     bytes (zone_image_freeze() is deterministic), so the same rows give the same digest.
- *   ZONE_DATA (5)     raw DNS message (<= 65,535 bytes), no TLV; only for a zone without the image flag
  *   ZONE_IMAGE (20)   0.7 M3: raw, no TLV: the next octets of the image (1 to KDB_MAX_BODY, 1 MiB), in the order of the image.  Only between a ZONE_BEGIN with the image flag
- *                     and its ZONE_END, and the Backend takes it only from a loader whose HELLO said KDB_FEAT_IMAGE with its own image version.  The sum of the messages is image_size
+ *                     and its ZONE_END.  The sum of the messages is image_size
  *                     exactly: one more octet than announced is a protocol error as is a ZONE_END before the image is complete.  The first message holds at least the header of the image
  *                     (the zone_image_t struct, in the byte order of the machine: the loader and the Backend run on one host) and its magic, version, total_size (= image_size) and n_rrs
  *                     (= rr_count) are checked at once, before the rest is buffered.  The size is only a cap: a Backend allocates for the octets that came, never for the announced
@@ -141,7 +144,7 @@
  *                     10 serial u32 O (a plain schema).  With found = 0 none of 4..10.  The Backend records the zone as a MANIFEST entry would (a KNOWN record, its body is read when a
  *                     query asks for it); the entry is a claim of an untrusted loader: its name must enclose the name that was asked for.
  *                     Mode 3 (KDB_FETCH_LOOKUP_FULL): with found = 1 the LOOKUP_RESULT is followed, on the same stream and with the same request id, by that zone's body, ZONE_BEGIN ..
- *                     ZONE_DATA .. ZONE_END (or ZONE_FAILED, or ZONE_ABORT), as the answer to a FETCH_REQ mode 0 for the zone would be; with found = 0 nothing follows.  From the Backend's
+ *                     ZONE_IMAGE .. ZONE_END (or ZONE_FAILED, or ZONE_ABORT), as the answer to a FETCH_REQ mode 0 for the zone would be; with found = 0 nothing follows.  From the Backend's
  *                     side the request becomes a fetch of the zone with the same id: the body must be the zone the result named (the name and the source id), at most one body comes
  *                     for a request, and a body that comes without a result, for another zone, or for a mode 2 request is discarded.
  * Backend -> loader (type | 0x8000)
@@ -155,7 +158,7 @@
  *                         13 db_ident bytes<=64 O (the identity of the database the cursor belongs to, as the loader reported it; a different identity makes the loader list the source again)
  *                     5 default_ttl u32 O (<= 2147483647; B4a) | 6 bulk_threshold u8 O (<= 100) | 7 loader_threads u32 O (<= 16) |
  *                     8 dir_only u8 O (0/1; D1a milestone 4: memory-limit is set, so a zone the Backend does not have in memory is sent as a
- *                         summary (ZONE_BEGIN with the summary flag, settings and SOA timers, no ZONE_DATA) also in a batch) |
+ *                         summary (ZONE_BEGIN with the summary flag, settings and SOA timers, no zone image) also in a batch) |
  *                     9 signer_wait u8 O (0/1; 0.6.0 item C: database { signer-wait }; absent = 1) |
  *                     10 store_proto u8 O (0/1; 0.7 WP7a: use the store protocol: no INVENTORY is sent or wanted, the loader answers with MANIFEST / CHANGES; the Backend
  *                         sets it only when HELLO features has KDB_FEAT_STORE; absent = 0)
@@ -196,7 +199,7 @@
  *                     every handshake and at every change; the loader logs its messages up to that level (karidns-dbloader --debug at its start)
  *
  * The fetch stream (D1a, design 6.1) is a second KDB1 stream, made by the supervisor with the first.  It carries only what a
- * parked query waits for: FETCH_REQ from the Backend; from the loader, ZONE_BEGIN .. ZONE_DATA .. ZONE_END / ZONE_ABORT (PROFILE
+ * parked query waits for: FETCH_REQ from the Backend; from the loader, ZONE_BEGIN .. ZONE_IMAGE .. ZONE_END / ZONE_ABORT (PROFILE
  * before ZONE_BEGIN) or ZONE_FAILED for each request, every one with the request id.  No HELLO, no batches, no results: the
  * state machine starts in READY (kdb_sm_init_fetch()) and the Backend discards a zone it did not ask for.
  */
@@ -209,8 +212,7 @@
 #define KDB_MAGIC "KDB1"
 #define KDB_VERSION 1
 #define KDB_HEADER_LEN 12
-#define KDB_MAX_BODY (1u << 20)      /* every message but ZONE_DATA */
-#define KDB_MAX_ZONE_DATA 65535u     /* ZONE_DATA body */
+#define KDB_MAX_BODY (1u << 20)      /* every message */
 #define KDB_REASON_LEN 128
 #define KDB_FEAT_STORE 0x1u          /* HELLO features: the store protocol (MANIFEST / CHANGES) */
 #define KDB_FEAT_LOOKUP 0x2u         /* HELLO features: the loader answers FETCH_REQ mode KDB_FETCH_LOOKUP with LOOKUP_RESULT (the zone that encloses a name, 0.7 first start) */
@@ -239,7 +241,7 @@ enum { KDB_HA_WRITTEN = 0, KDB_HA_UNCHANGED, KDB_HA_FAILED, KDB_HA_NOFILE, KDB_H
 
 enum {
     /* loader -> Backend */
-    KDB_T_HELLO = 1, KDB_T_INVENTORY_REQ = 2, KDB_T_BATCH_BEGIN = 3, KDB_T_ZONE_BEGIN = 4, KDB_T_ZONE_DATA = 5,
+    KDB_T_HELLO = 1, KDB_T_INVENTORY_REQ = 2, KDB_T_BATCH_BEGIN = 3, KDB_T_ZONE_BEGIN = 4,
     KDB_T_ZONE_END = 6, KDB_T_ZONE_ABORT = 7, KDB_T_ZONE_FAILED = 8, KDB_T_ZONE_DELETE = 9, KDB_T_PROFILE = 10,
     KDB_T_BATCH_END = 11, KDB_T_AUTO_STATUS = 12, KDB_T_WARM_LIST = 13, KDB_T_HOT_ACK = 14,
     KDB_T_MANIFEST_BEGIN = 15, KDB_T_MANIFEST = 16, KDB_T_MANIFEST_END = 17, KDB_T_CHANGES = 18,      /* 0.7 WP7a: the store protocol */
@@ -259,7 +261,7 @@ enum { KDB_FETCH_FULL = 0, KDB_FETCH_SUMMARY, KDB_FETCH_LOOKUP, KDB_FETCH_LOOKUP
 enum { KDB_BATCH_STARTUP = 0, KDB_BATCH_FULL, KDB_BATCH_DIFF, KDB_BATCH_ZONE, KDB_BATCH_AUTO };
 enum { KDB_ZK_PRIMARY = 0, KDB_ZK_SECONDARY, KDB_ZK_CATALOG };
 #define KDB_ZF_PRESIGNED 0x1u
-#define KDB_ZF_EXTENDED 0x2u    /* ZONE_DATA carries Extended AXFR records (dns_wire.h, xext_*): location / ECS tags, tinydns time stamps and locations */
+#define KDB_ZF_EXTENDED 0x2u    /* the image may carry location / ECS tags, tinydns time stamps and locations, several or restricted SOA RRs (zone_image_validate_ex(): without the flag it has none) */
 #define KDB_ZF_TINYDNS 0x4u     /* B8: the zone is a tinydns zone (ZONE_IMAGE_F_TINYDNS: time-dependent TTLs, never cached), also without any time stamp or location */
 #define KDB_APEX_NS_MAX 8        /* D1a step 6: NS names of a summary's apex */
 #define KDB_APEX_NS_BYTES 2047   /* ... and the bytes of their list (8 names of 253 characters and the separators) */
@@ -267,8 +269,8 @@ enum { KDB_ZK_PRIMARY = 0, KDB_ZK_SECONDARY, KDB_ZK_CATALOG };
 #define KDB_APEX_GLUE_BYTES 2048 /* ... and the bytes of the list (8 names, 8 AAAA records of 22 octets each: 1408) */
 #define KDB_NOTIFY_ADDR_PER_NS 8 /* D1a step 7: addresses of one NS target in the NOTIFY address list (tag 22) */
 #define KDB_NOTIFY_ADDR_BYTES 1152 /* ... and the bytes of the list (8 targets, 8 AAAA records of 18 octets each) */
-#define KDB_ZF_IMAGE 0x10u      /* 0.7 M3: the zone is a zone image (ZONE_BEGIN tag 23 = its size, ZONE_IMAGE messages instead of ZONE_DATA); rr_count is the n_rrs of the image */
-#define KDB_ZF_SUMMARY 0x8u     /* D1a, fetch stream: the zone's summary (serial, kind, settings), no ZONE_DATA, rr_count 0, zero digest */
+#define KDB_ZF_IMAGE 0x10u      /* 0.7 M3: the data of the zone is a zone image (ZONE_BEGIN tag 23 = its size, ZONE_IMAGE messages): required for every primary zone with data; rr_count is the n_rrs of the image */
+#define KDB_ZF_SUMMARY 0x8u     /* D1a, fetch stream: the zone's summary (serial, kind, settings), no data, rr_count 0, zero digest */
 enum { KDB_ST_APPLIED = 0, KDB_ST_UNCHANGED, KDB_ST_REJECTED, KDB_ST_SHADOWED, KDB_ST_DELETED,
        KDB_ST_SEND_BODY,       /* D1a: SEND_BODY, to a summary (or to a zone body that was left out): the zone is in the Backend's memory in another version than the loader says, send it whole */
        KDB_ST_NOT_RESIDENT };  /* D1a: NOT_RESIDENT, to a zone body: the Backend took the version into its directory and left the data out (memory-limit), so it has no data of the zone */
@@ -280,7 +282,7 @@ typedef enum {
     KDB_E_MAGIC, KDB_E_TYPE, KDB_E_FLAGS, KDB_E_LENGTH,
     KDB_E_TLV_TRUNC, KDB_E_TLV_DUP, KDB_E_TLV_UNKNOWN, KDB_E_TLV_MISSING, KDB_E_TLV_LEN, KDB_E_TLV_STR,
     KDB_E_TLV_NAME, KDB_E_RANGE,
-    KDB_E_STATE, KDB_E_VERSION, KDB_E_DNSHDR, KDB_E_OPT, KDB_E_COUNT, KDB_E_SEQ,
+    KDB_E_STATE, KDB_E_VERSION, KDB_E_COUNT, KDB_E_SEQ,
     KDB_E_LIMIT_BYTES, KDB_E_LIMIT_RECORDS, KDB_E_LIMIT_PROFILES
 } kdb_rc_t;
 
@@ -312,7 +314,7 @@ int kdb_enc_name(kdb_enc_t *e, uint16_t tag, const char *name);           /* the
 int kdb_enc_nest_begin(kdb_enc_t *e, uint16_t tag);                       /* one level */
 int kdb_enc_nest_end(kdb_enc_t *e);
 int kdb_enc_end(kdb_enc_t *e);                    /* patches the length; fails if above the type's limit */
-int kdb_enc_raw_msg(kdb_enc_t *e, uint16_t type, const void *body, size_t n);   /* ZONE_DATA, or crafted bodies */
+int kdb_enc_raw_msg(kdb_enc_t *e, uint16_t type, const void *body, size_t n);   /* ZONE_IMAGE, or crafted bodies */
 
 /* ---------------------------------------------------------------- framer */
 typedef enum { KDB_FROM_LOADER = 0, KDB_FROM_BACKEND = 1 } kdb_dir_t;   /* which side wrote the stream */
@@ -367,10 +369,6 @@ typedef struct {
     uint16_t naddrs_len;
     uint64_t image_size;        /* 0.7 M3: tag 23, the size of the zone image; 0 = the flag KDB_ZF_IMAGE is not set (the decoder: the tag is there exactly when the flag is) */
 } kdb_zone_begin_t;
-typedef struct {
-    const uint8_t *body; uint32_t len;   /* the DNS message */
-    uint32_t ancount, arcount;
-} kdb_zone_data_t;
 typedef struct { const uint8_t *body; uint32_t len; } kdb_zone_image_t;     /* 0.7 M3: the octets of one ZONE_IMAGE message (points into the frame) */
 typedef struct { uint64_t rr_count; } kdb_zone_end_t;
 typedef struct { kdb_str_t reason; } kdb_zone_abort_t;
@@ -385,7 +383,7 @@ typedef struct {
     uint32_t default_ttl;       /* 0 = tag absent */
     int bulk_threshold;         /* percent; -1 = tag absent */
     uint32_t loader_threads;    /* 0 = tag absent */
-    bool dir_only;              /* tag 8 (D1a milestone 4): memory-limit is set; the loader sends the summary only (no ZONE_DATA) for a zone the Backend does not have in memory */
+    bool dir_only;              /* tag 8 (D1a milestone 4): memory-limit is set; the loader sends the summary only (no data) for a zone the Backend does not have in memory */
     bool signer_wait;           /* tag 9 (0.6.0 item C): the loader does not reload a zone with the metadata X-KARIDNS-SIGNER=1 because of the change log; absent = true */
     bool store_proto;           /* tag 10 (0.7 WP7a): the store protocol (MANIFEST / CHANGES instead of INVENTORY); absent = false */
     uint32_t n_views;
@@ -442,7 +440,7 @@ typedef struct {
     uint16_t type;
     uint32_t view_count;       /* as given to kdb_decode() */
     union {
-        kdb_hello_t hello; kdb_batch_begin_t batch_begin; kdb_zone_begin_t zone_begin; kdb_zone_data_t zone_data;
+        kdb_hello_t hello; kdb_batch_begin_t batch_begin; kdb_zone_begin_t zone_begin;
         kdb_zone_end_t zone_end; kdb_zone_abort_t zone_abort; kdb_zone_failed_t zone_failed;
         kdb_zone_delete_t zone_delete; kdb_profile_t profile; kdb_batch_end_t batch_end; kdb_auto_status_t auto_status;
         kdb_config_t config; kdb_reload_req_t reload_req; kdb_inventory_t inventory;
@@ -537,7 +535,7 @@ int kdb_hotl_file_write(const char *path, const kdb_hotl_t *l, char *err, size_t
 /* ---------------------------------------------------------------- Backend state machine */
 typedef struct {
     uint64_t max_zone_records;   /* default KDB_DEFAULT_MAX_ZONE_RECORDS */
-    uint64_t max_zone_bytes;     /* sum of the ZONE_DATA bodies of one zone, or the size of its image (0.7 M3); default KDB_DEFAULT_MAX_ZONE_BYTES */
+    uint64_t max_zone_bytes;     /* the size of the image of one zone (0.7 M3: what the ZONE_DATA bodies added up to before); default KDB_DEFAULT_MAX_ZONE_BYTES */
     uint32_t view_count;         /* configured views, or KDB_VIEWS_ANY */
 } kdb_limits_t;
 
@@ -557,11 +555,7 @@ typedef struct {
     uint64_t man_entries;                      /* entries seen in this pass */
     /* current zone, valid in IN_ZONE */
     uint64_t zone_rr_declared;                 /* ZONE_BEGIN rr_count */
-    uint64_t zone_rr_sum;                      /* sum of ANCOUNT so far; at ZONE_END equal to the declared count */
-    uint64_t zone_bytes;                       /* sum of ZONE_DATA bodies so far */
-    uint32_t zone_data_msgs;
-    bool image_accept;                         /* 0.7 M3: the caller takes zone images on this stream (kdb_sm_set_image(); M3 step 1: nobody does yet) */
-    bool image_hello;                          /* ... and the HELLO of the loader said KDB_FEAT_IMAGE with the image version of this build (the fetch stream has no HELLO: the first stream negotiated it) */
+    uint64_t zone_bytes;                       /* octets of the image so far */
     bool zone_image;                           /* the zone being received is an image (ZONE_BEGIN flag KDB_ZF_IMAGE) */
     uint64_t zone_image_size;                  /* ... its announced size (ZONE_BEGIN tag 23) */
     uint64_t zone_image_have;                  /* ... the octets of ZONE_IMAGE messages so far; at most zone_image_size, equal to it at ZONE_END */
@@ -573,13 +567,10 @@ typedef struct {
 } kdb_sm_t;
 
 void kdb_sm_init(kdb_sm_t *sm, const kdb_limits_t *lim);   /* lim == NULL: defaults, KDB_VIEWS_ANY */
-/* The state machine of the fetch stream (D1a): starts in READY, accepts PROFILE / ZONE_BEGIN / ZONE_FAILED there and ZONE_DATA /
+/* The state machine of the fetch stream (D1a): starts in READY, accepts PROFILE / ZONE_BEGIN / ZONE_FAILED there and ZONE_IMAGE /
  * ZONE_END / ZONE_ABORT in a zone; every ZONE_BEGIN and ZONE_FAILED carries a request id; summaries are allowed.  After ZONE_END,
  * ZONE_ABORT and ZONE_FAILED the machine is READY again and the profile count starts again. */
 void kdb_sm_init_fetch(kdb_sm_t *sm, const kdb_limits_t *lim);
-/* 0.7 M3: the caller takes zone images on this stream.  A ZONE_BEGIN with the image flag is a protocol error unless it does and, on the first stream, the HELLO of the loader
- * said KDB_FEAT_IMAGE with the image version of this build (kdb_sm_accept() records that; the fetch stream has no HELLO, the first stream negotiated it for both). */
-void kdb_sm_set_image(kdb_sm_t *sm, bool accept);
 /* Validate one frame from the loader against the current state, decode it, apply the semantic checks.  KDB_OK:
  * *msg is valid and the state advanced.  KDB_E_*: protocol error; the state is KDB_S_ERROR (sticky) and
  * sm->reason says why.  An error leaves any partial zone to be discarded by the caller. */

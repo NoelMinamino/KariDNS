@@ -261,7 +261,7 @@ typedef struct {
   size_t settings_len;
   bool ext_probe;         /* B8t-2: version 3 was asked for and a standard answer means "try version 2" (xfr_ext_probe()) */
   bool no_ext_answer;     /* set when handle_axfr_event() stopped for that reason */
-  bool db_stream;         /* B8: the messages come from the database loader (ZONE_DATA): the Extended AXFR records are checked strictly (a malformed definition, state or wrapper record rejects the zone) and ECS_TRUSTED (65407) is refused: the trusted resolvers come from the settings text only, inside acl-ceiling */
+  bool db_stream;         /* B8: the messages come from the database loader's zone data (since 0.7 M3 a zone image; the flag stays for the transfer parser's tests): the Extended AXFR records are checked strictly (a malformed definition, state or wrapper record rejects the zone) and ECS_TRUSTED (65407) is refused: the trusted resolvers come from the settings text only, inside acl-ceiling */
   /* batch 4 (BIND 9.20 zone.c refresh_callback(), zone_xfrdone()) */
   bool serial_behind;     /* the primary's serial is older than ours: "serial number received from primary < ours" -- not a failure, the next primary is asked */
   const xfr_eff_t *eff;   /* the transfer / timer options of the zone (NULL: the SOA timers are stored as received, no time limit) */
@@ -933,6 +933,7 @@ typedef struct dbdir_ops {
   bool (*rec_get)(const char *view, const char *zone, dbdir_rec_t *out);     /* the store's record of a zone (the name with its trailing dot) */
   int (*rec_get_nb)(const char *view, const char *zone, dbdir_rec_t *out);   /* the same without ever sleeping (for a caller that holds the registry lock): 1 found, 0 none, -1 a cell was being written (not known now) */
   int (*put)(const char *view, const char *zone, zone_db_entry_t *entry, int64_t source_id, uint32_t serial, const uint8_t digest[32], uint32_t settings, uint32_t *zid);
+  int (*put_image)(const char *view, const char *zone, const struct zone_image_s *img, int64_t source_id, uint32_t serial, const uint8_t digest[32], uint32_t settings, uint32_t *zid);   /* 0.7 M3: the same for an image without an entry (a bulk body: store only) */
   int (*del)(const char *view, const char *zone, int64_t source_id, bool *had);   /* delete by name (when source_id is 0 or the record's) */
   void (*set_known)(uint32_t zid);                                           /* the record loses its image (damaged, or the version is not trusted) */
   void (*note_flags)(uint32_t zid, uint16_t set, uint16_t clear);
@@ -1194,6 +1195,10 @@ int zone_install_builder(zone_db_entry_t *entry, zone_arena_t *builder, const ch
 void zone_install_version(zone_db_entry_t *entry, zone_version_t *standby, const zone_version_t *cur_active, bool keep_prev);
 /* the size limits of the zone (max-records, ...) checked on a built zone before it is installed; 0 = ok (see dns_axfr_ixfr.c) */
 int zone_limits_gate(zone_db_entry_t *entry, zone_arena_t *builder, const char *what);
+/* the same on a zone image (0.7 M3, dns_db_install.c, dns_db_ingest.c): 0 = within the limits, -1 = refused (logged) */
+int zone_limits_gate_image(zone_db_entry_t *entry, const struct zone_image_s *img, const char *what);
+/* ... for a zone that has no entry: the interned settings `shared` (NULL: none) are the zone's options; a primary of the database */
+int zone_limits_gate_settings(const char *view_name, const char *domain, zone_ext_shared_t *shared, const struct zone_image_s *img, const char *what);
 /* 公開直前に呼ぶ: 応答キャッシュに入れてよいか (rcache_ok) を決める。ゾーンの設定は zone_entry_config(cfg, entry)
  * (DB のゾーンは dbcfg)。entry は view_name、domain、source (と DB のゾーンなら dbcfg) だけを読む */
 void build_zone_response_cache(zone_version_t *ver, server_config_t *cfg, const zone_db_entry_t *entry);
@@ -1331,6 +1336,12 @@ void view_clear_dir(view_snapshot_t *view);
  * memory: the caller keeps ownership of a new entry). */
 int dbreg_commit(const char *view, const char *name, zone_db_entry_t *entry, bool created, int64_t source_id,
                  uint32_t serial, const uint8_t digest[32], bool *shadowed);
+/* 0.7 M3: the image of a body that nobody waits for goes to the store alone (dns_snapshot_rcu.c): DBREG_STORE_ONLY, or DBREG_STORE_ENTRY (the caller installs an entry as before) */
+#define DBREG_STORE_ONLY 0
+#define DBREG_STORE_ENTRY 1
+/* the cheap test before the stamp guard is taken: a zone that has no version here (no record with an image, no element, no entry), is not hidden by karidns.conf, and takes no cache mode that skips its data */
+bool dbreg_store_only_candidate(const char *view, const char *name, uint32_t serial, zone_ext_shared_t *shared);
+int dbreg_commit_store_only(const char *view, const char *name, const struct zone_image_s *img, int64_t source_id, uint32_t serial, const uint8_t digest[32], zone_ext_shared_t *shared);
 /* The entry registered for (view, name) or NULL.  Valid while the caller is the only ingest thread working on that
  * name (the ingest thread serializes zones of the same name). */
 zone_db_entry_t *dbreg_lookup_entry(const char *view, const char *name);

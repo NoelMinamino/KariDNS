@@ -121,6 +121,7 @@ static uint64_t (*_Atomic g_att_count_fn)(void);
 static bool (*_Atomic g_recon_fn)(store_recon_t *);
 static bool (*_Atomic g_extra_fn)(store_extra_t *);
 static bool (*_Atomic g_lookup_fn)(store_lookup_t *);
+static bool (*_Atomic g_fill_fn)(store_fill_t *);
 
 void store_status_bind(store_t *s) { atomic_store_explicit(&g_store, s, memory_order_release); }
 void store_status_set_memory_fn(bool (*fn)(ma_est_t *out)) { atomic_store_explicit(&g_mem_fn, fn, memory_order_release); }
@@ -129,6 +130,7 @@ void store_status_set_attached_count_fn(uint64_t (*fn)(void)) { atomic_store_exp
 void store_status_set_extra_fn(bool (*fn)(store_extra_t *out)) { atomic_store_explicit(&g_extra_fn, fn, memory_order_release); }
 void store_status_set_recon_fn(bool (*fn)(store_recon_t *out)) { atomic_store_explicit(&g_recon_fn, fn, memory_order_release); }
 void store_status_set_lookup_fn(bool (*fn)(store_lookup_t *out)) { atomic_store_explicit(&g_lookup_fn, fn, memory_order_release); }
+void store_status_set_fill_fn(bool (*fn)(store_fill_t *out)) { atomic_store_explicit(&g_fill_fn, fn, memory_order_release); }
 
 /* ------------------------------------------------------------------------------------------------------------------------------ */
 /* the entry list                                                                                                                 */
@@ -447,6 +449,20 @@ static void add_recon(list_t *l) {
     add_s(l, "store.recon.guard.release", "karictl reload -force");
   }
   free(r);
+}
+
+/* 0.7 M3: the zone images (the figures are the ingest thread's or a builder's, dns_db_ingest.c) */
+static void add_fill(list_t *l) {
+  bool (*fn)(store_fill_t *) = atomic_load_explicit(&g_fill_fn, memory_order_acquire);
+  store_fill_t f;
+  if (!fn || !fn(&f)) return;
+  U("store.fill.images", f.images);
+  U("store.fill.image_bytes", f.image_bytes);
+  U("store.fill.validate_ns", f.validate_ns);
+  U("store.fill.validate_ns_per_image", f.images ? f.validate_ns / f.images : 0);
+  U("store.fill.invalid", f.invalid);
+  U("store.fill.store_only", f.store_only);
+  U("store.fill.resident", f.resident);
 }
 
 /* 0.7: the by-name lookups of the first start (the figures are the ingest thread's, dns_db_ingest.c) */
@@ -773,6 +789,7 @@ size_t store_status_format(char *out, size_t cap, int fmt, const char *zone) {
     add_extra(&l);
     add_recon(&l);
     add_lookup(&l);
+    add_fill(&l);
   }
   sb_t b = { out, cap, 0, false };
   if (fmt == STORE_FMT_JSON) write_json(&b, &l);

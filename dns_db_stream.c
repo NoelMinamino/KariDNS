@@ -174,7 +174,6 @@ static const kdb_mdef_t mdefs[] = {
     { KDB_T_INVENTORY_REQ, "INVENTORY_REQ", KDB_FROM_LOADER, false, KDB_MAX_BODY, &td_empty },
     { KDB_T_BATCH_BEGIN, "BATCH_BEGIN", KDB_FROM_LOADER, false, KDB_MAX_BODY, &td_batch_begin },
     { KDB_T_ZONE_BEGIN, "ZONE_BEGIN", KDB_FROM_LOADER, false, KDB_MAX_BODY, &td_zone_begin },
-    { KDB_T_ZONE_DATA, "ZONE_DATA", KDB_FROM_LOADER, true, KDB_MAX_ZONE_DATA, NULL },
     { KDB_T_ZONE_END, "ZONE_END", KDB_FROM_LOADER, false, KDB_MAX_BODY, &td_zone_end },
     { KDB_T_ZONE_ABORT, "ZONE_ABORT", KDB_FROM_LOADER, false, KDB_MAX_BODY, &td_zone_abort },
     { KDB_T_ZONE_FAILED, "ZONE_FAILED", KDB_FROM_LOADER, false, KDB_MAX_BODY, &td_zone_failed },
@@ -231,8 +230,6 @@ const char *kdb_rc_name(kdb_rc_t rc) {
     case KDB_E_RANGE: return "value out of range";
     case KDB_E_STATE: return "message not allowed in this state";
     case KDB_E_VERSION: return "protocol version mismatch";
-    case KDB_E_DNSHDR: return "bad ZONE_DATA DNS header";
-    case KDB_E_OPT: return "OPT outside the first ZONE_DATA";
     case KDB_E_COUNT: return "RR count mismatch";
     case KDB_E_SEQ: return "batch mismatch";
     case KDB_E_LIMIT_BYTES: return "zone byte limit exceeded";
@@ -402,26 +399,6 @@ kdb_rc_t kdb_decode(const kdb_frame_t *fr, uint32_t vc, kdb_msg_t *m, char *why,
         m->u.zone_image.len = fr->len;
         return KDB_OK;
     }
-    if (md->raw) {   /* ZONE_DATA: DNS header checks without parsing RRs (RFC 1035 4.1.1, RFC 5936 2.2) */
-        const uint8_t *b = fr->body;
-        if (fr->len < DNS_HEADER_SIZE) FAIL(why, wl, KDB_E_DNSHDR, "ZONE_DATA: %u bytes, shorter than a DNS header", fr->len);
-        uint16_t fl = be16(b + 2), qd = be16(b + 4), an = be16(b + 6), ns = be16(b + 8), ar = be16(b + 10);
-        if (!(fl & 0x8000)) FAIL(why, wl, KDB_E_DNSHDR, "ZONE_DATA: QR is not set");
-        if ((fl >> 11) & 0xF) FAIL(why, wl, KDB_E_DNSHDR, "ZONE_DATA: opcode is not QUERY");
-        if (!(fl & 0x0400)) FAIL(why, wl, KDB_E_DNSHDR, "ZONE_DATA: AA is not set (RFC 5936 2.2.1)");
-        if (fl & 0x0200) FAIL(why, wl, KDB_E_DNSHDR, "ZONE_DATA: TC is set (RFC 5936 2.2.1)");
-        if (fl & 0x000F) FAIL(why, wl, KDB_E_DNSHDR, "ZONE_DATA: RCODE is not 0");
-        if (qd != 0) FAIL(why, wl, KDB_E_DNSHDR, "ZONE_DATA: QDCOUNT is not 0");
-        if (ns != 0) FAIL(why, wl, KDB_E_DNSHDR, "ZONE_DATA: NSCOUNT is not 0 (RFC 5936 2.2.4)");
-        if (ar > 1) FAIL(why, wl, KDB_E_DNSHDR, "ZONE_DATA: ARCOUNT above 1");
-        if (an == 0) FAIL(why, wl, KDB_E_DNSHDR, "ZONE_DATA: no answer RR");
-        m->u.zone_data.body = b;
-        m->u.zone_data.len = fr->len;
-        m->u.zone_data.ancount = an;
-        m->u.zone_data.arcount = ar;
-        return KDB_OK;
-    }
-
     kdb_val_t vals[KDB_MAX_TAGS];
     uint32_t nrep = 0;
     kdb_rc_t rc = tlv_parse(md->td, fr->body, fr->len, vc, vals, &nrep, why, wl);
@@ -1080,7 +1057,7 @@ static bool sm_legal(const kdb_sm_t *sm, uint16_t t) {
     if (sm->fetch) {
         switch (sm->state) {
         case KDB_S_READY: return t == KDB_T_ZONE_BEGIN || t == KDB_T_ZONE_FAILED || t == KDB_T_PROFILE || t == KDB_T_LOOKUP_RESULT;
-        case KDB_S_IN_ZONE: return t == KDB_T_ZONE_DATA || t == KDB_T_ZONE_IMAGE || t == KDB_T_ZONE_END || t == KDB_T_ZONE_ABORT;
+        case KDB_S_IN_ZONE: return t == KDB_T_ZONE_IMAGE || t == KDB_T_ZONE_END || t == KDB_T_ZONE_ABORT;
         default: return false;
         }
     }
@@ -1093,7 +1070,7 @@ static bool sm_legal(const kdb_sm_t *sm, uint16_t t) {
         if (sm->man_open) return t == KDB_T_MANIFEST || t == KDB_T_MANIFEST_END;       /* WP7a: inside a pass nothing but its pages and its end */
         return t == KDB_T_ZONE_BEGIN || t == KDB_T_ZONE_FAILED || t == KDB_T_ZONE_DELETE || t == KDB_T_PROFILE ||
                t == KDB_T_BATCH_END || t == KDB_T_MANIFEST_BEGIN || t == KDB_T_CHANGES;
-    case KDB_S_IN_ZONE: return t == KDB_T_ZONE_DATA || t == KDB_T_ZONE_IMAGE || t == KDB_T_ZONE_END || t == KDB_T_ZONE_ABORT;
+    case KDB_S_IN_ZONE: return t == KDB_T_ZONE_IMAGE || t == KDB_T_ZONE_END || t == KDB_T_ZONE_ABORT;
     case KDB_S_ERROR: break;
     }
     return false;
@@ -1125,7 +1102,6 @@ kdb_rc_t kdb_sm_legal_frame(kdb_sm_t *sm, uint16_t type) {
 }
 
 void kdb_sm_defer_manifest(kdb_sm_t *sm) { sm->man_deferred = true; }
-void kdb_sm_set_image(kdb_sm_t *sm, bool accept) { sm->image_accept = accept; }
 
 kdb_rc_t kdb_sm_accept(kdb_sm_t *sm, const kdb_frame_t *fr, kdb_msg_t *m) {
     kdb_rc_t rc = kdb_sm_legal_frame(sm, fr->type);
@@ -1136,9 +1112,11 @@ kdb_rc_t kdb_sm_accept(kdb_sm_t *sm, const kdb_frame_t *fr, kdb_msg_t *m) {
     switch (fr->type) {
     case KDB_T_HELLO:
         if (m->u.hello.proto != KDB_VERSION) SMFAIL(sm, KDB_E_VERSION, "HELLO: protocol version %u, want %u", m->u.hello.proto, KDB_VERSION);
-        if ((m->u.hello.features & KDB_FEAT_IMAGE) && m->u.hello.image_version != ZONE_IMAGE_VERSION)
-            SMFAIL(sm, KDB_E_VERSION, "HELLO: zone image version %u, want %u", m->u.hello.image_version, (unsigned)ZONE_IMAGE_VERSION);
-        sm->image_hello = (m->u.hello.features & KDB_FEAT_IMAGE) != 0;
+        /* 0.7 M3: a zone of the database travels as a zone image, in the format of this build, or not at all (no ZONE_DATA fallback: the loader and the Backend are one package) */
+        if (!(m->u.hello.features & KDB_FEAT_IMAGE))
+            SMFAIL(sm, KDB_E_VERSION, "HELLO: the loader does not send zone images (KDB_FEAT_IMAGE is missing): it is of another version than this Backend");
+        if (m->u.hello.image_version != ZONE_IMAGE_VERSION)
+            SMFAIL(sm, KDB_E_VERSION, "HELLO: the loader builds zone images of version %u, this Backend takes version %u", m->u.hello.image_version, (unsigned)ZONE_IMAGE_VERSION);
         sm->state = KDB_S_READY;
         break;
     case KDB_T_INVENTORY_REQ:
@@ -1214,7 +1192,8 @@ kdb_rc_t kdb_sm_accept(kdb_sm_t *sm, const kdb_frame_t *fr, kdb_msg_t *m) {
         if (zk == KDB_ZK_PRIMARY && summary) {
             if (n != 0) SMFAIL(sm, KDB_E_COUNT, "ZONE_BEGIN: a summary has rr_count 0, not %llu", (unsigned long long)n);
         } else if (zk == KDB_ZK_PRIMARY) {
-            if (n < 2 && !(m->u.zone_begin.flags & KDB_ZF_IMAGE)) SMFAIL(sm, KDB_E_COUNT, "ZONE_BEGIN: rr_count %llu, an AXFR has at least two SOAs (RFC 5936 2.2)", (unsigned long long)n);
+            /* 0.7 M3: the data of a primary zone is a zone image, always (rr_count is its n_rrs, at least the SOA) */
+            if (!(m->u.zone_begin.flags & KDB_ZF_IMAGE)) SMFAIL(sm, KDB_E_STATE, "ZONE_BEGIN: the data of a primary zone is a zone image (flag KDB_ZF_IMAGE)");
         } else if (n != 0) {
             /* B7b: a secondary / catalog consumer zone carries no data (the Backend transfers it from the masters in the settings) */
             SMFAIL(sm, KDB_E_COUNT, "ZONE_BEGIN: a secondary zone has rr_count 0, not %llu", (unsigned long long)n);
@@ -1227,7 +1206,6 @@ kdb_rc_t kdb_sm_accept(kdb_sm_t *sm, const kdb_frame_t *fr, kdb_msg_t *m) {
             /* 0.7 M3: the data is an image.  rr_count is its n_rrs (at least the SOA); the size is a cap that is checked here, before one octet of the image is read:
              * what a zone image can hold at most (zone_image_validate() works in 32 bits), whole 8-octet units, a header and a strings area, and max-zone-bytes */
             const uint64_t isz = m->u.zone_begin.image_size;
-            if (!sm->image_accept || (!sm->fetch && !sm->image_hello)) SMFAIL(sm, KDB_E_STATE, "ZONE_BEGIN: a zone image, which was not negotiated (HELLO KDB_FEAT_IMAGE)");
             if (n < 1) SMFAIL(sm, KDB_E_COUNT, "ZONE_BEGIN: rr_count 0 for a zone image");
             if (isz < sizeof(zone_image_t) + 8 || isz > 0xFFFFF000u || (isz & 7) != 0) SMFAIL(sm, KDB_E_RANGE, "ZONE_BEGIN: image_size is not the size of an image");
             if (isz > sm->lim.max_zone_bytes) SMFAIL(sm, KDB_E_LIMIT_BYTES, "ZONE_BEGIN: image_size above max-zone-bytes");
@@ -1235,9 +1213,7 @@ kdb_rc_t kdb_sm_accept(kdb_sm_t *sm, const kdb_frame_t *fr, kdb_msg_t *m) {
             sm->zone_image_size = isz;
         }
         sm->zone_rr_declared = n;
-        sm->zone_rr_sum = sm->zone_image ? n : 0;       /* (an image has no ANCOUNT to sum: the count is in its header, checked with the first ZONE_IMAGE) */
         sm->zone_bytes = 0;
-        sm->zone_data_msgs = 0;
         sm->state = KDB_S_IN_ZONE;
         break;
     }
@@ -1260,24 +1236,9 @@ kdb_rc_t kdb_sm_accept(kdb_sm_t *sm, const kdb_frame_t *fr, kdb_msg_t *m) {
         if (sm->zone_image_msgs < UINT32_MAX) sm->zone_image_msgs++;
         break;
     }
-    case KDB_T_ZONE_DATA: {
-        uint32_t len = m->u.zone_data.len;
-        if (sm->zone_image) SMFAIL(sm, KDB_E_STATE, "ZONE_DATA: the zone announced an image");
-        /* zone_bytes <= max_zone_bytes and zone_rr_sum <= zone_rr_declared hold here: subtract, never add */
-        if ((uint64_t)len > sm->lim.max_zone_bytes - sm->zone_bytes) SMFAIL(sm, KDB_E_LIMIT_BYTES, "ZONE_DATA: zone above max-zone-bytes");
-        if (m->u.zone_data.arcount != 0 && sm->zone_data_msgs != 0)
-            SMFAIL(sm, KDB_E_OPT, "ZONE_DATA: ARCOUNT in a message after the first of the zone");
-        if ((uint64_t)m->u.zone_data.ancount > sm->zone_rr_declared - sm->zone_rr_sum)
-            SMFAIL(sm, KDB_E_COUNT, "ZONE_DATA: more RRs than ZONE_BEGIN declared");
-        sm->zone_bytes += len;
-        sm->zone_rr_sum += m->u.zone_data.ancount;
-        if (sm->zone_data_msgs < UINT32_MAX) sm->zone_data_msgs++;
-        break;
-    }
     case KDB_T_ZONE_END:
         if (m->u.zone_end.rr_count != sm->zone_rr_declared) SMFAIL(sm, KDB_E_COUNT, "ZONE_END: count differs from ZONE_BEGIN");
         if (sm->zone_image && sm->zone_image_have != sm->zone_image_size) SMFAIL(sm, KDB_E_COUNT, "ZONE_END: the image is not complete");
-        if (sm->zone_rr_sum != sm->zone_rr_declared) SMFAIL(sm, KDB_E_COUNT, "ZONE_END: ANCOUNT sum differs from the declared count");
         sm->n_zones++;
         if (sm->fetch) sm->n_profiles = 0;
         sm->state = sm->fetch ? KDB_S_READY : KDB_S_IN_BATCH;

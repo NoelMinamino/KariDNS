@@ -3,7 +3,7 @@
  *
  * Reads the PowerDNS 5.1 tables of one database through a driver (dns_db_driver.h), converts every zone with the
  * shared reader (dns_pdns_reader.h) and writes the KDB1 stream (dns_db_stream.h) the loader sends to the Backend:
- * HELLO, BATCH_BEGIN (startup), per zone ZONE_BEGIN / ZONE_DATA... / ZONE_END or ZONE_FAILED, BATCH_END.
+ * HELLO, BATCH_BEGIN (startup), per zone ZONE_BEGIN / ZONE_IMAGE... / ZONE_END or ZONE_FAILED, BATCH_END.
  *
  *   karidns-dbloader --dump OUT --driver sqlite3 --database-file PATH [options]     (B3, this file)
  *   karidns-dbloader --dump OUT --driver postgresql --conninfo-file FILE [--schema NAME] [options]     (B10)
@@ -1348,7 +1348,7 @@ static const char *zone_type_reason(const char *type) {
 /* B6b: a zone is converted by a worker (the main thread when loader-threads is 1) into a zres_t, and committed to the
  * stream by the main thread, in zones[] order.  The worker never touches the inventory, the socket or the counters: it
  * reads the zone's own entry of zones[] (the Backend's version of it, copied by plan_diff()) and builds the ZONE_BEGIN /
- * ZONE_DATA / ZONE_END messages in memory, so a conversion that fails half way leaves nothing on the stream. */
+ * ZONE_IMAGE / ZONE_END messages in memory, so a conversion that fails half way leaves nothing on the stream. */
 static void io_pump(struct lio *io);
 
 enum { ZR_UNCHANGED = 1, ZR_SENT, ZR_FAILED, ZR_FATAL };
@@ -2257,7 +2257,10 @@ static int run_zones(ctx_t *x, const db_source_t *src, bool bulk, size_t n_want)
 static int send_hello(ctx_t *x, const char *driver_list, uint32_t pid) {
     if (kdb_enc_begin(&x->enc, KDB_T_HELLO) != 0 || kdb_enc_u16(&x->enc, 1, KDB_VERSION) != 0 ||
         kdb_enc_str(&x->enc, 2, KARIDNS_VERSION) != 0 || kdb_enc_str(&x->enc, 3, driver_list) != 0 ||
-        kdb_enc_u32(&x->enc, 4, pid) != 0 || (x->io && kdb_enc_u32(&x->enc, 5, KDB_FEAT_STORE | KDB_FEAT_LOOKUP | KDB_FEAT_LOOKUP_BODY) != 0) || kdb_enc_end(&x->enc) != 0 || send_enc(x) != 0)
+        kdb_enc_u32(&x->enc, 4, pid) != 0 ||
+        /* 0.7 M3: every zone of the database travels as a zone image, in the image version of this build: the Backend takes no other loader (KDB_FEAT_IMAGE, tag 6) */
+        kdb_enc_u32(&x->enc, 5, (x->io ? KDB_FEAT_STORE | KDB_FEAT_LOOKUP | KDB_FEAT_LOOKUP_BODY : 0u) | KDB_FEAT_IMAGE) != 0 || kdb_enc_u32(&x->enc, 6, ZONE_IMAGE_VERSION) != 0 ||
+        kdb_enc_end(&x->enc) != 0 || send_enc(x) != 0)
         return -1;
     return 0;
 }
@@ -5285,7 +5288,7 @@ static int do_load(ctx_t *x, struct lio *io, uint8_t kind, int only_view, const 
  * fetch stream: it reads the requests into a queue of FQ_MAX (a request beyond that is answered ZONE_FAILED "busy", so the Backend does not
  * wait for it), takes the most urgent one (priority 0 before 1 before 2, the oldest first) and runs it through the same reader as a one-zone
  * reload (run_view() in fetch mode): its own database connection and snapshot, no batch, no inventory, no results.  The answer is ZONE_BEGIN ..
- * ZONE_DATA .. ZONE_END, a summary (mode 1: ZONE_BEGIN and ZONE_END with the summary flag) or ZONE_FAILED with the reason, each with the request
+ * ZONE_IMAGE .. ZONE_END, a summary (mode 1: ZONE_BEGIN and ZONE_END with the summary flag) or ZONE_FAILED with the reason, each with the request
  * id.  The thread reads the configuration from a copy the main thread publishes whenever it takes a CONFIG into use. */
 static int g_fetch_fd = -1;
 static pthread_mutex_t g_fcfg_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -6666,7 +6669,7 @@ static void usage(FILE *fp) {
         "  karidns-dbloader --check --driver postgresql --conninfo-file FILE [--schema NAME] [options]\n"
         "\n"
         "Dump mode writes the stream exactly as the loader sends it to the Backend: HELLO, BATCH_BEGIN (startup), per\n"
-        "zone ZONE_BEGIN / ZONE_DATA... / ZONE_END (or ZONE_FAILED with the reason), BATCH_END.  Zones come in\n"
+        "zone ZONE_BEGIN / ZONE_IMAGE... / ZONE_END (or ZONE_FAILED with the reason), BATCH_END.  Zones come in\n"
         "domains.id order, so two runs on the same database write the same bytes (the HELLO carries pid 0).\n"
         "Stream mode (-s FD) is what karidns runs: FD is a socket to the Backend.  The loader sends HELLO, waits for the\n"
         "CONFIG of the Backend (databases, limits) and its inventory (the zones it has), then sends the startup batch: it\n"

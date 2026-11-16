@@ -370,7 +370,7 @@ int zone_image_validate(const void *buf, size_t len, char *why, size_t whylen);
  *   SOA        SOA RRs are at the apex only, there is at least one with a complete RDATA, at most KARIDNS_SOA_SET_MAX of them, and every one carries
  *              `serial` (RFC 2181 §6.1: a zone has one serial).  More than one, or one restricted to some clients, needs `extended`, and is not
  *              allowed in a zone with DNSSEC RRs (the signature of the SOA RRset would not hold for every client); no two apex SOA RRs are seen by
- *              the same clients (the checks of zone_arena_check_soa_set() and of db_zone_build_install())
+ *              the same clients (the checks of zone_arena_check_soa_set(), which the Backend made on a zone built from RRs)
  *   extensions tinydns locations and time stamps, tags and the zone level tables (zattr) only with `extended` (ZONE_BEGIN flag EXTENDED); the
  *              TINYDNS image flag is `tinydns` (ZONE_BEGIN flag TINYDNS); no ECS trusted resolvers (they come from the zone's settings: a list in the
  *              image would pass the acl-ceiling); at most XFR_TAGDEF_MAX location and as many ECS tag definitions, XFR_TAGDEF_CIDR_MAX CIDRs in

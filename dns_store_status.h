@@ -134,6 +134,14 @@ typedef struct store_lookup {
 } store_lookup_t;
 void store_status_set_lookup_fn(bool (*fn)(store_lookup_t *out));
 
+/* 0.7 M3: the zone images the loader sent (dns_db_ingest.c): images / image_bytes: checked by zone_image_validate_ex(), validate_ns: the time of that check, invalid: refused;
+ * store_only: put in the store alone (a body that nobody waited for, of a zone with no version here: no entry, attached when a query asks); resident: installed as an entry (a query's fetch,
+ * a changed zone, a zone that is in memory, heap mode) */
+typedef struct store_fill {
+  uint64_t images, image_bytes, validate_ns, invalid, store_only, resident;
+} store_fill_t;
+void store_status_set_fill_fn(bool (*fn)(store_fill_t *out));
+
 /* ---- what the server tells this module ---- */
 /* the open store (NULL: "store not configured", state=none) */
 void store_status_bind(store_t *s);

@@ -1072,6 +1072,44 @@ int zone_limits_gate(zone_db_entry_t *entry, zone_arena_t *builder, const char *
   return 0;
 }
 
+/* The same limits on a zone image (0.7 M3: a zone of the database arrives as an image, not as a builder): zone_image_check_limits() with what zone_limits_effective() says for the zone (server,
+ * view and zone options).  0 = within the limits, -1 = refused (logged) or out of memory. */
+static int limits_gate_image(const server_config_t *cfg, const zone_config_t *zcfg, const char *view_name, const char *domain, const zone_image_t *img, const char *what) {
+  zone_limits_t lim;
+  zone_limits_effective(cfg, zcfg, view_name, &lim);
+  if (!lim.max_records && !lim.max_per_type && !lim.max_types_per_name && !lim.max_zone_ttl) return 0;
+  char lim_err[320];
+  if (zone_image_check_limits(img, &lim, lim_err, sizeof(lim_err)) != 0) {
+    syslog(LOG_ERR, "[Zone] zone '%s' not installed after %s: %s", domain, what, lim_err);
+    return -1;
+  }
+  return 0;
+}
+
+int zone_limits_gate_image(zone_db_entry_t *entry, const zone_image_t *img, const char *what) {
+  rcu_aux_read_lock();
+  server_config_t *cfg = acquire_config_snapshot();
+  int rc = limits_gate_image(cfg, zone_entry_config(cfg, entry), zone_vname(entry), entry->domain, img, what);
+  release_config_snapshot(cfg);
+  rcu_aux_read_unlock();
+  return rc;
+}
+
+/* the same for a zone that has no entry (a body that goes to the store alone): the settings of the zone are the interned block `shared` (NULL: none), the zone a primary of the database */
+int zone_limits_gate_settings(const char *view_name, const char *domain, zone_ext_shared_t *shared, const zone_image_t *img, const char *what) {
+  zone_config_t zc;
+  memset(&zc, 0, sizeof(zc));
+  zc.domain = (char *)domain;
+  zc.type = (char *)"master";
+  zc.ext = shared ? &shared->ext : NULL;
+  rcu_aux_read_lock();
+  server_config_t *cfg = acquire_config_snapshot();
+  int rc = limits_gate_image(cfg, &zc, view_name, domain, img, what);
+  release_config_snapshot(cfg);
+  rcu_aux_read_unlock();
+  return rc;
+}
+
 int zone_install_builder(zone_db_entry_t *entry, zone_arena_t *builder, const char *what, bool keep_prev) {
   zone_version_t *cur_active = atomic_load_explicit(&entry->rcu.active, memory_order_acquire);
 

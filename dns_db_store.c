@@ -942,32 +942,28 @@ static int view_ensure(store_t *st, const char *view) {
   return vid;
 }
 
-/* The version of the entry goes to the store (the install of the loader's zone has made the entry and published its version; the registry commit follows).  *zid: the zone's id.
- * 0, or a negative errno; -ENOTSUP: not a zone the store can hold (the root zone, a name too long, no records, another serial by now). */
-static int dir_put_locked(const char *view, const char *zone, zone_db_entry_t *entry, int64_t source_id, uint32_t serial, const uint8_t digest[32], uint32_t settings, uint32_t *zid_out) {
+/* The flags of the store's record that the image says (the engine and the scan read them without the image). */
+static uint16_t image_store_flags(const zone_image_t *img) {
+  uint16_t flags = 0;
+  if (img->flags & ZONE_IMAGE_F_ALIAS) flags |= STORE_F_ALIAS;
+  if (img->flags & ZONE_IMAGE_F_WILDCARD) flags |= STORE_F_WILDCARD;
+  if (img->n_nsec > 0 || img->n_n3chains > 0) flags |= STORE_F_PRESIGNED;
+  return flags;
+}
+
+/* An image goes to the store (0.7 M3: the loader built it, the stream thread validated it; there is no entry for a zone that a bulk fetch brings).  *zid: the zone's id.
+ * 0, or a negative errno; -ENOTSUP: not a zone the store can hold (the root zone, a name too long, no records). */
+static int dir_put_img_locked(const char *view, const char *zone, const zone_image_t *img, int64_t source_id, uint32_t serial, const uint8_t digest[32], uint32_t settings, uint32_t *zid_out) {
   store_t *st = atomic_load_explicit(&G.st, memory_order_acquire);
   char name[DBS_NAME_MAX];
   size_t nlen;
   if (!st) return -ENODEV;
   if (t_put_refuse) return -ECANCELED;                     /* (the commit was refused: the body is not for the record's stamp any more, db_store_commit_begin()) */
   if (!store_name(zone, name, sizeof(name), &nlen)) return -ENOTSUP;
+  if (img->n_rrs == 0) return -ENOTSUP;
   int vid = view_ensure(st, view);
   if (vid < 0) return vid;
-  /* the version is pinned while it is copied (a dynamic UPDATE or a newer install may replace it meanwhile) */
-  zone_version_t *v = NULL;
-  uint16_t flags = 0;
-  int rc = -ENOTSUP;
-  rcu_aux_read_lock();
-  v = atomic_load_explicit(&entry->rcu.active, memory_order_acquire);
-  if (v && v->image && v->image->n_rrs > 0 && atomic_load_explicit(&entry->serial, memory_order_relaxed) == serial) {
-    atomic_fetch_add_explicit(&v->xfr_refs, 1, memory_order_acq_rel);
-    if (v->image->flags & ZONE_IMAGE_F_ALIAS) flags |= STORE_F_ALIAS;
-    if (v->image->flags & ZONE_IMAGE_F_WILDCARD) flags |= STORE_F_WILDCARD;
-    if (v->image->n_nsec > 0 || v->image->n_n3chains > 0) flags |= STORE_F_PRESIGNED;
-    rc = 0;
-  }
-  rcu_aux_read_unlock();
-  if (rc != 0) return rc;
+  const uint16_t flags = image_store_flags(img);
   store_meta_t m;
   memset(&m, 0, sizeof(m));
   m.source_id = source_id;
@@ -998,12 +994,10 @@ static int dir_put_locked(const char *view, const char *zone, zone_db_entry_t *e
     atomic_fetch_add(&G.wt_skipped, 1);
     if (cflags & (STORE_F_STALE | STORE_F_REJECTED_NEW)) (void)store_set_flags(st, zid, 0, STORE_F_STALE | STORE_F_REJECTED_NEW);       /* (the body that was asked for is this version) */
     *zid_out = zid;
-    atomic_fetch_sub_explicit(&v->xfr_refs, 1, memory_order_acq_rel);
     return 0;
   }
   const unsigned labels = store_name_labels(name, nlen);
   dmax_raise(vid, labels);                                  /* (before the zone is in the index: the lookup must ask for it the moment it can be found; again below, after a delete's refresh) */
-  const zone_image_t *img = v->image;
   int r = store_put(st, (uint16_t)vid, name, nlen, &m, img, img->total_size, &zid);
   if (r == -EEXIST && source_id != 0) {                    /* the domain id is another zone of the store (a renamed domain): that one goes, the new name is put */
     /* The old name goes through the registry (dbreg_delete()), not the store alone: the zone may be attached under the old name, and its element and entry would stay (counted resident, reachable by the
@@ -1018,7 +1012,6 @@ static int dir_put_locked(const char *view, const char *zone, zone_db_entry_t *e
     if (oldname[0] && dbreg_delete(view, oldname, source_id) > 0) r = store_put(st, (uint16_t)vid, name, nlen, &m, img, img->total_size, &zid);
     else if (old != STORE_NONE && !oldname[0] && store_delete(st, old) == 0) r = store_put(st, (uint16_t)vid, name, nlen, &m, img, img->total_size, &zid);       /* (a record whose name cannot be read) */
   }
-  atomic_fetch_sub_explicit(&v->xfr_refs, 1, memory_order_acq_rel);
   if (r == 0) {
     dmax_raise(vid, labels);
     atomic_fetch_add(&G.wt_put, 1);
@@ -1026,6 +1019,36 @@ static int dir_put_locked(const char *view, const char *zone, zone_db_entry_t *e
     return 0;
   }
   note_error("the write", zone, r);
+  return r;
+}
+
+
+/* The version of the entry goes to the store (the install of the loader's zone has made the entry and published its version; the registry commit follows).  *zid: the zone's id.
+ * 0, or a negative errno; -ENOTSUP: not a zone the store can hold (the root zone, a name too long, no records, another serial by now). */
+static int dir_put_locked(const char *view, const char *zone, zone_db_entry_t *entry, int64_t source_id, uint32_t serial, const uint8_t digest[32], uint32_t settings, uint32_t *zid_out) {
+  if (!atomic_load_explicit(&G.st, memory_order_acquire)) return -ENODEV;
+  if (t_put_refuse) return -ECANCELED;
+  /* the version is pinned while it is copied (a dynamic UPDATE or a newer install may replace it meanwhile) */
+  zone_version_t *v = NULL;
+  int rc = -ENOTSUP;
+  rcu_aux_read_lock();
+  v = atomic_load_explicit(&entry->rcu.active, memory_order_acquire);
+  if (v && v->image && v->image->n_rrs > 0 && atomic_load_explicit(&entry->serial, memory_order_relaxed) == serial) {
+    atomic_fetch_add_explicit(&v->xfr_refs, 1, memory_order_acq_rel);
+    rc = 0;
+  }
+  rcu_aux_read_unlock();
+  if (rc != 0) return rc;
+  rc = dir_put_img_locked(view, zone, v->image, source_id, serial, digest, settings, zid_out);
+  atomic_fetch_sub_explicit(&v->xfr_refs, 1, memory_order_acq_rel);
+  return rc;
+}
+
+/* the image-only form: for the registry's store-only commit of a body nobody waits for (dbdir_ops_t.put_image) */
+static int dir_put_img(const char *view, const char *zone, const zone_image_t *img, int64_t source_id, uint32_t serial, const uint8_t digest[32], uint32_t settings, uint32_t *zid_out) {
+  rec_lock();
+  int r = dir_put_img_locked(view, zone, img, source_id, serial, digest, settings, zid_out);
+  rec_unlock();
   return r;
 }
 
@@ -1188,6 +1211,7 @@ static const dbdir_ops_t g_ops = {
   .rec_get = dir_rec_get,
   .rec_get_nb = dir_rec_get_nb,
   .put = dir_put,
+  .put_image = dir_put_img,
   .del = dir_del,
   .note_flags = dir_note_flags,
   .attach_reserve = dir_attach_reserve,

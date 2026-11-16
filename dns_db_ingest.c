@@ -112,13 +112,15 @@ typedef struct ing_job {
   uint32_t serial;
   uint64_t rr_count;
   uint8_t digest[KDB_DIGEST_LEN];
-  db_zone_build_t *build;
+  uint8_t *img;                          /* 0.7 M3: the zone image, reassembled from the ZONE_IMAGE messages (malloc, grows with the octets that came: the announced size is only a cap) */
+  size_t img_len, img_cap;
+  uint64_t img_size;                     /* ZONE_BEGIN image_size */
+  uint32_t zflags;                       /* ZONE_BEGIN flags (KDB_ZF_*) */
+  uint64_t lim_bytes, lim_records;       /* max-zone-bytes and max-zone-records of the stream this zone came on (CONFIG) */
   bool skip;                             /* decided at ZONE_BEGIN: the data is discarded, the zone is rejected */
-  bool failed;                           /* a ZONE_DATA message was refused */
+  bool failed;                           /* a ZONE_IMAGE message could not be kept (out of memory) */
   uint8_t zkind;                          /* B7b: KDB_ZK_*; secondary (SLAVE) and catalog (CONSUMER) zones have no data: the masters are in the settings */
   zone_ext_shared_t *shared;             /* B7a: the interned settings of the zone (this job holds a reference), NULL = none */
-  uint8_t *buf;                        /* ingest-threads > 1: the ZONE_DATA messages, [u32 length][bytes] each */
-  size_t buf_len, buf_cap;
   uint8_t status;                        /* KDB_ST_* */
   int builder;                           /* index of the builder it was handed to */
   bool fill;                             /* 0.7 fix 8: the body of a background fetch of the reconcile (the first fill): the thread's time for it is counted apart (g_ing_fill_pct) */
@@ -242,6 +244,7 @@ typedef struct {
   uint32_t inflight;
   uint32_t since_retire;
   int64_t last_delta_ms;
+  bool delta_wake;             /* 0.7 M3: a fetch completed that left a change for the index: it is published once, before the workers that wait for the zone are triggered (wake_flush()), not once per zone */
   /* INVENTORY in progress */
   bool inv_active;
   dbreg_cursor_t inv_cur;
@@ -860,11 +863,16 @@ static void send_enc(ing_t *g) {
 
 static void job_free(ing_job_t *j) {
   if (!j) return;
-  db_zone_build_free(j->build);
+  free(j->img);
   zone_ext_shared_unref(j->shared);
   free(j->apex);
-  free(j->buf);
   free(j);
+}
+
+static void job_drop_image(ing_job_t *j) {
+  free(j->img);
+  j->img = NULL;
+  j->img_len = j->img_cap = 0;
 }
 
 static void job_reject(ing_job_t *j, const char *why) {
@@ -1072,7 +1080,7 @@ static void apply_ixfr_depth(zone_db_entry_t *e, const zone_config_t *dc) {
 }
 
 /* A new entry for a DB zone (design 4.2): source DB, its settings block (interned settings or none).  zkind: a primary (its data
- * comes in ZONE_DATA), or (B7b) a secondary / catalog consumer, which the existing secondary machinery of the control thread
+ * comes in ZONE_IMAGE), or (B7b) a secondary / catalog consumer, which the existing secondary machinery of the control thread
  * transfers from the masters in its settings (refresh timer, SOA retry and expire, NOTIFY, IXFR), like a configured one. */
 static zone_db_entry_t *new_db_entry(const char *view, const char *zone, zone_ext_shared_t *shared, uint8_t zkind) {
   zone_db_entry_t *e = (zkind == KDB_ZK_PRIMARY && dbdir()) ? create_light_zone_entry(zone, view) : create_new_zone_entry(zone, view);      /* 0.7 store S5: a primary zone of the store is a light entry (the core in a slot of the entry pool) */
@@ -1146,8 +1154,13 @@ rejected:
   (void)dbreg_reject(j->view_name, j->zone, j->source_id, j->reason);
 }
 
-/* ZONE_END work, on the stream thread (ingest-threads 1) or a builder: feed what was buffered, check, publish the
- * image into the entry, enter the zone in the registry.  Sets j->status / j->reason; the reply is the caller's. */
+/* 0.7 M3: the zone images that came (store.fill.*, karictl store): validated, their octets and the time of the validation, the ones that were refused, and what became of the others: put in the
+ * store alone (a bulk body of a zone without a version here) or installed as an entry (a query's fetch, a changed zone, heap mode).  Relaxed atomics: the stream thread or a builder writes. */
+static _Atomic uint64_t g_fill_images, g_fill_image_bytes, g_fill_validate_ns, g_fill_invalid, g_fill_store_only, g_fill_resident;
+static int64_t mono_ns(void);
+
+/* ZONE_END work, on the stream thread (ingest-threads 1) or a builder: check the image, put it in the store alone or publish it
+ * into the entry, enter the zone in the registry.  Sets j->status / j->reason; the reply is the caller's. */
 static void job_execute(ing_job_t *j) {
   if (j->skip) {                                         /* status and reason were set at ZONE_BEGIN */
     /* (a zone nobody asked for, or a fetch that was refused, is not a rejection of the zone: its last good version, if any, keeps serving) */
@@ -1197,19 +1210,20 @@ static void job_execute(ing_job_t *j) {
     job_execute_secondary(j);
     return;
   }
-  /* ingest-threads > 1: the messages were buffered by the stream thread */
-  for (size_t off = 0; j->buf && !j->failed && off + 4 <= j->buf_len;) {
-    uint32_t n;
-    memcpy(&n, j->buf + off, 4);
-    off += 4;
-    if (db_zone_build_feed(j->build, j->buf + off, n, j->reason, sizeof(j->reason)) != 0) j->failed = true;
-    off += n;
-  }
-  free(j->buf);
-  j->buf = NULL;
   if (j->failed) {                                       /* j->reason says why */
     j->status = KDB_ST_REJECTED;
     goto rejected;
+  }
+  if (!j->img || j->img_len != j->img_size) {            /* (the state machine keeps this: ZONE_END comes when the image is complete) */
+    job_reject(j, "the zone image is incomplete");
+    goto rejected;
+  }
+  if (j->img_cap > j->img_len) {                         /* (the buffer grew by doubling: the image lives as long as the entry does, without the slack) */
+    uint8_t *tr = realloc(j->img, j->img_len);
+    if (tr) {
+      j->img = tr;
+      j->img_cap = j->img_len;
+    }
   }
   /* A fetch brings the version the loader read when the request was made.  If the directory has another version by now (a summary or a body of a newer one came
    * meanwhile), what the fetch brings may be the older one and must not replace it: it is dropped (not a rejection: the zone is still asked for by the requests that
@@ -1223,8 +1237,7 @@ static void job_execute(ing_job_t *j) {
     db_stamp_t now;
     if (!db_store_zone_stamp(j->view_name, j->zone, &now, NULL) || now.gen != j->iv_st_gen || now.time != j->iv_st_time) {
       j->status = KDB_ST_UNCHANGED;
-      db_zone_build_free(j->build);
-      j->build = NULL;
+      job_drop_image(j);
       return;
     }
   }
@@ -1233,8 +1246,49 @@ static void job_execute(ing_job_t *j) {
     uint32_t sr;
     if (!dbreg_zone_version(j->view_name, j->zone, &sid, &sr) || ((sid != j->iv_sid || sr != j->iv_serial) && (sid != j->source_id || sr != j->serial))) {
       j->status = KDB_ST_UNCHANGED;
-      db_zone_build_free(j->build);
-      j->build = NULL;
+      job_drop_image(j);
+      return;
+    }
+  }
+  /* 0.7 M3: the image is the loader's claim: what the building of the zone from RRs used to check (ZONE_DATA) is checked on the image now (the zone, the size, the counts, the limits of the stream,
+   * what the extended encoding allows; dns_zone_image.h).  The time is counted (store.fill.validate_us). */
+  {
+    const zone_image_policy_t pol = { j->zone, j->serial, j->rr_count, j->img_size, j->lim_bytes, j->lim_records, (j->zflags & KDB_ZF_EXTENDED) != 0, (j->zflags & KDB_ZF_TINYDNS) != 0 };
+    char vw[160];
+    const int64_t tv0 = mono_ns();
+    const int vr = zone_image_validate_ex(j->img, j->img_len, &pol, vw, sizeof(vw));
+    atomic_fetch_add_explicit(&g_fill_validate_ns, (uint64_t)(mono_ns() - tv0), memory_order_relaxed);
+    atomic_fetch_add_explicit(&g_fill_images, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&g_fill_image_bytes, j->img_len, memory_order_relaxed);
+    if (vr != 0) {
+      atomic_fetch_add_explicit(&g_fill_invalid, 1, memory_order_relaxed);
+      char msg[KDB_REASON_LEN];
+      snprintf(msg, sizeof(msg), "the zone image is refused: %s", vw);
+      job_reject(j, msg);
+      goto rejected;
+    }
+  }
+  /* A body that nobody waits for (the background fetch of the wanted bodies) of a zone that has no version here goes to the store as it is: no entry is made, nothing is attached; the first query
+   * attaches the zone from its record (dbreg_commit_store_only()).  Every other body is installed as the entry's next version and committed as before. */
+  if (j->fill && j->fetch_id && dbdir() && dbreg_store_only_candidate(j->view_name, j->zone, j->serial, j->shared)) {
+    if (zone_limits_gate_settings(j->view_name, j->zone, j->shared, (const zone_image_t *)(const void *)j->img, "database load") != 0) {
+      job_reject(j, "the zone is over a limit of the configuration (see the log)");
+      goto rejected;
+    }
+    db_stamp_t swant = { j->iv_st_gen, j->iv_st_time };
+    const int sgd = db_store_commit_begin(j->view_name, j->zone, j->iv_st_valid ? &swant : NULL);
+    int so = DBREG_STORE_ENTRY;
+    if (sgd == DBC_OK) so = dbreg_commit_store_only(j->view_name, j->zone, (const zone_image_t *)(const void *)j->img, j->source_id, j->serial, j->digest, j->shared);
+    db_store_commit_end();
+    if (sgd != DBC_OK) {                                 /* the body is for another stamp than the record has now, or the zone is gone: nothing is taken from it */
+      j->status = KDB_ST_UNCHANGED;
+      job_drop_image(j);
+      return;
+    }
+    if (so == DBREG_STORE_ONLY) {
+      atomic_fetch_add_explicit(&g_fill_store_only, 1, memory_order_relaxed);
+      j->status = KDB_ST_APPLIED;
+      job_drop_image(j);
       return;
     }
   }
@@ -1264,7 +1318,7 @@ static void job_execute(ing_job_t *j) {
     old_cfg = db_entry_swap_config(entry, nc, &cfg_epoch);
     apply_ixfr_depth(entry, nc);
   }
-  if (db_zone_build_install(j->build, entry, NULL, j->reason, sizeof(j->reason)) != 0) {
+  if (db_zone_install_image(entry, (zone_image_t *)(void *)j->img, NULL, j->reason, sizeof(j->reason)) != 0) {
     if (created) {
       free_zone_db_entry(entry);                         /* never registered or published into a snapshot */
     } else if (new_cfg) {
@@ -1277,6 +1331,9 @@ static void job_execute(ing_job_t *j) {
     goto rejected;
   }
   if (new_cfg) db_entry_retire_config(entry, old_cfg, cfg_epoch);
+  j->img = NULL;                                         /* (the entry's version owns the image now) */
+  j->img_len = j->img_cap = 0;
+  atomic_fetch_add_explicit(&g_fill_resident, 1, memory_order_relaxed);
   bool shadowed = false;
   const uint32_t serial_now = atomic_load(&entry->serial);      /* (before the commit: a zone of the store that is over the limit is not kept, the entry is gone) */
   /* 0.7 WP7b: the check above was made before the install, which takes a long time: the database may have changed the zone again (a CHANGES or manifest entry of the ingest thread, which does not wait for
@@ -1290,8 +1347,7 @@ static void job_execute(ing_job_t *j) {
     if (created) free_zone_db_entry(entry);                    /* never registered or published into a snapshot */
     else dbreg_busy_clear(j->view_name, j->zone);              /* (the zone is in memory and was marked busy; no commit follows: its record is gone, or cannot be read now (a damaged cell), and the mark must not stay) */
     j->status = KDB_ST_UNCHANGED;
-    db_zone_build_free(j->build);
-    j->build = NULL;
+    job_drop_image(j);
     return;
   }
   const int cr = dbreg_commit(j->view_name, j->zone, entry, created, j->source_id, serial_now, j->digest, &shadowed);
@@ -1303,14 +1359,11 @@ static void job_execute(ing_job_t *j) {
   }
   if (gd == DBC_STALE) {                                       /* (registered, but not stored: the version the record asks for is another one) */
     j->status = KDB_ST_UNCHANGED;
-    db_zone_build_free(j->build);
-    j->build = NULL;
+    job_drop_image(j);
     return;
   }
   j->serial = serial_now;
   j->status = shadowed ? KDB_ST_SHADOWED : KDB_ST_APPLIED;
-  db_zone_build_free(j->build);
-  j->build = NULL;
   return;
 rejected:
   {
@@ -1321,8 +1374,7 @@ rejected:
     (void)dbreg_reject_ex(j->view_name, j->zone, j->source_id, j->reason, gd == DBC_OK);
     db_store_commit_end();
   }
-  db_zone_build_free(j->build);
-  j->build = NULL;
+  job_drop_image(j);
 }
 
 static void *builder_thread(void *arg) {
@@ -1370,6 +1422,15 @@ static void send_zone_result(ing_t *g, uint16_t view, const char *zone, uint8_t 
     g->enc.err = true;
   }
   send_enc(g);
+}
+
+static void apply_delta(ing_t *g);
+static void wake_flush(ing_t *g) {
+  if (g->delta_wake) {
+    g->delta_wake = false;
+    if (dbreg_pending_count() > 0) apply_delta(g);
+  }
+  park_wake_flush();
 }
 
 static void fetch_job_finish(ing_t *g, ing_job_t *j);
@@ -1546,6 +1607,17 @@ _Atomic uint32_t db_ingest_test_lq_max, db_ingest_test_wq_max;
 static uint32_t queue_cap(const _Atomic uint32_t *hook, uint32_t max) {
   const uint32_t v = atomic_load_explicit(hook, memory_order_relaxed);
   return v && v < max ? v : max;
+}
+/* 0.7 M3: the zone images (store.fill.*, dns_store_status.h) */
+bool db_ingest_fill_stats(store_fill_t *out) {
+  memset(out, 0, sizeof(*out));
+  out->images = atomic_load_explicit(&g_fill_images, memory_order_relaxed);
+  out->image_bytes = atomic_load_explicit(&g_fill_image_bytes, memory_order_relaxed);
+  out->validate_ns = atomic_load_explicit(&g_fill_validate_ns, memory_order_relaxed);
+  out->invalid = atomic_load_explicit(&g_fill_invalid, memory_order_relaxed);
+  out->store_only = atomic_load_explicit(&g_fill_store_only, memory_order_relaxed);
+  out->resident = atomic_load_explicit(&g_fill_resident, memory_order_relaxed);
+  return true;
 }
 bool db_ingest_lookup_ready(void) { return atomic_load_explicit(&g_lookup_on, memory_order_acquire); }
 /* the counters of the lookups for `karictl store` and dbstatus (dns_store_status.h): relaxed atomics that the ingest thread and the workers write, any thread reads */
@@ -2254,16 +2326,16 @@ static ing_job_t *job_from_begin(ing_t *g, const kdb_zone_begin_t *zb, bool of_b
     j->skip = true;
     job_reject(j, "the settings of a primary zone name masters (masters / primaries belong to SLAVE and CONSUMER zones)");
   } else if (zb->zone_kind != KDB_ZK_PRIMARY) {
-    j->zkind = zb->zone_kind;                            /* no ZONE_DATA follows (the stream rules, dns_db_stream.c): ZONE_END runs it */
+    j->zkind = zb->zone_kind;                            /* no image follows (the stream rules, dns_db_stream.c): ZONE_END runs it */
   } else if (cache_wants_cold(j)) {
     j->cold = true;                                      /* nothing is built; the data that follows is discarded (job_feed()) */
   } else {
-    j->build = db_zone_build_new(j->zone, j->rr_count, zb->flags);
-    if (j->build) db_zone_build_set_serial(j->build, zb->serial);
-    if (!j->build) {
-      j->skip = true;
-      job_reject(j, "out of memory");
-    }
+    /* 0.7 M3: the data is a zone image (the state machine requires it): job_image() collects it, job_execute() checks it */
+    j->zflags = zb->flags;
+    j->img_size = zb->image_size;
+    const kdb_limits_t *lim = of_batch ? &g->sm.lim : &g->fsm.lim;
+    j->lim_bytes = lim->max_zone_bytes;
+    j->lim_records = lim->max_zone_records;
   }
   return j;
 }
@@ -2278,41 +2350,36 @@ static void on_zone_begin(ing_t *g, const kdb_msg_t *m) {
   g->cur = j;
 }
 
-/* ZONE_DATA of the zone j (either stream) */
-static void job_feed(ing_t *g, ing_job_t *j, const kdb_msg_t *m) {
+/* ZONE_IMAGE of the zone j (either stream): the octets are appended to the image.  The announced size is a cap, checked by the state machine (the sum of the messages never passes it); the
+ * buffer grows with what came (doubling, never above the cap), so a loader that announces a gigabyte and sends a kilobyte holds a kilobyte. */
+static void job_image(ing_t *g, ing_job_t *j, const kdb_msg_t *m) {
+  (void)g;
   if (!j || j->skip || j->failed || j->cold) return;
-  if (!j->build) {
-    /* I6: ZONE_DATA for a job without a builder (a secondary zone, whose ZONE_BEGIN starts none, or an earlier failure):
-     * the stream rules (dns_db_stream.c) refuse it before this point; fail the job rather than feed a NULL builder */
+  const kdb_zone_image_t *zi = &m->u.zone_image;
+  if (j->img_size == 0 || zi->len > j->img_size - j->img_len) {      /* (the state machine refuses it: a job that is not an image zone, or more octets than announced) */
     j->failed = true;
-    snprintf(j->reason, sizeof(j->reason), "zone data for a zone that takes none");
+    snprintf(j->reason, sizeof(j->reason), "zone image data that was not announced");
     return;
   }
-  const kdb_zone_data_t *zd = &m->u.zone_data;
-  if (g->nbuilders == 0) {
-    if (db_zone_build_feed(j->build, zd->body, zd->len, j->reason, sizeof(j->reason)) != 0) j->failed = true;
-    return;
-  }
-  size_t need = j->buf_len + 4 + zd->len;
-  if (need > j->buf_cap) {
-    size_t nc = j->buf_cap ? j->buf_cap : 65536;
-    while (nc < need) nc *= 2;
-    uint8_t *nb = realloc(j->buf, nc);
+  const size_t need = j->img_len + zi->len;
+  if (need > j->img_cap) {
+    size_t nc = j->img_cap ? j->img_cap * 2 : need;
+    if (nc < need) nc = need;
+    if (nc > j->img_size) nc = (size_t)j->img_size;
+    uint8_t *nb = realloc(j->img, nc);
     if (!nb) {
       j->failed = true;
       snprintf(j->reason, sizeof(j->reason), "out of memory");
       return;
     }
-    j->buf = nb;
-    j->buf_cap = nc;
+    j->img = nb;
+    j->img_cap = nc;
   }
-  uint32_t n = zd->len;
-  memcpy(j->buf + j->buf_len, &n, 4);
-  memcpy(j->buf + j->buf_len + 4, zd->body, zd->len);
-  j->buf_len = need;
+  memcpy(j->img + j->img_len, zi->body, zi->len);
+  j->img_len = need;
 }
 
-static void on_zone_data(ing_t *g, const kdb_msg_t *m) { job_feed(g, g->cur, m); }
+static void on_zone_image(ing_t *g, const kdb_msg_t *m) { job_image(g, g->cur, m); }
 
 static void on_zone_end(ing_t *g) {
   ing_job_t *j = g->cur;
@@ -2653,8 +2720,8 @@ static void handle_msg(ing_t *g, const kdb_msg_t *m) {
   case KDB_T_ZONE_BEGIN:
     on_zone_begin(g, m);
     break;
-  case KDB_T_ZONE_DATA:
-    on_zone_data(g, m);
+  case KDB_T_ZONE_IMAGE:
+    on_zone_image(g, m);
     break;
   case KDB_T_ZONE_END:
     on_zone_end(g);
@@ -3762,7 +3829,7 @@ static void fetch_complete(ing_t *g, ing_freq_t *r, bool ok, const char *why) {
     if (dbdir()->rec_get(done.view_name, done.zone, &rec)) dbdir()->note_flags(rec.zid, STORE_F_REJECTED_NEW, 0);
   }
   req_fetch_done(g, &done, ok, why);
-  if (dbreg_pending_count() > 0) apply_delta(g);         /* a zone that was new to the index becomes visible before its queries are woken */
+  g->delta_wake = true;                                  /* a zone that was new to the index becomes visible before its queries are woken: the delta is published once, by wake_flush(), before the triggers go out (0.7 M3: at 10k zones a second a publish per zone was most of the work) */
   if (ok && !done.quiet && done.mode == KDB_FETCH_FULL) dbreg_touch_loaded(done.view_name, done.zone);
   /* a zone that only a background fetch (a CNAME or glue that leads into it, step 8) brought is the first to go when memory-limit needs room (BGLOAD): N cold name
    * servers behind the glue of one zone must not push the zones the queries use out of memory.  Unlike a zone a transfer brought (design 7) it stays while there
@@ -4399,7 +4466,7 @@ static void fetch_issue(ing_t *g) {
   }
   fetch_release(&hold_place, &hold_tok, &hold_key);
   if (g->fetch_fd >= 0 && g->fout_off < g->fout_len) fetch_flush(g);      /* (the requests of the pass go out now) */
-  park_wake_flush();
+  wake_flush(g);
 }
 
 static void fetch_protocol_error(ing_t *g, const char *reason) {
@@ -4569,8 +4636,8 @@ static void handle_fetch_msg(ing_t *g, const kdb_msg_t *m) {
   case KDB_T_ZONE_BEGIN:
     on_fetch_begin(g, &m->u.zone_begin);
     break;
-  case KDB_T_ZONE_DATA:
-    job_feed(g, g->fcur, m);
+  case KDB_T_ZONE_IMAGE:
+    job_image(g, g->fcur, m);
     break;
   case KDB_T_ZONE_END:
     on_fetch_end(g);
@@ -4635,7 +4702,7 @@ static void on_fetch_readable(ing_t *g) {
         fetch_protocol_error(g, g->fsm.reason);            /* (the reason names the rule, never bytes of the stream) */
         return;
       }
-      const bool fillmsg = g->fcur && g->fcur->fill && (msg.type == KDB_T_ZONE_DATA || msg.type == KDB_T_ZONE_END);
+      const bool fillmsg = g->fcur && g->fcur->fill && (msg.type == KDB_T_ZONE_IMAGE || msg.type == KDB_T_ZONE_END);
       const int64_t tm0 = fillmsg ? mono_ns() : 0;
       handle_fetch_msg(g, &msg);
       if (fillmsg) g->fill_ns += mono_ns() - tm0;
@@ -4968,7 +5035,7 @@ static void *ingest_thread(void *arg) {
         }
       }
       if (g->need_cleanup) cleanup_stream_state(g);
-      park_wake_flush();                                 /* B2 W5: the workers that a completion woke are triggered once per event, not once per zone */
+      wake_flush(g);                                     /* B2 W5: the workers that a completion woke are triggered once per event, not once per zone (and the index delta is published once, M3) */
     }
     if (g->sresume && !ran_s && g->stream_fd >= 0) on_stream_readable(g);        /* (what the last pass left, when no event of the stream came) */
     if (g->fresume && !ran_f && g->fetch_fd >= 0) on_fetch_readable(g);
@@ -4978,7 +5045,7 @@ static void *ingest_thread(void *arg) {
     if (g->nwarm > 0 || g->fmore || g->nwq > 0 || g->nlq > 0 || g->bg_on || park_fetch_pending()) fetch_issue(g);
     apex_walk_step(g);
     fetch_expire(g);
-    park_wake_flush();
+    wake_flush(g);
     hold_check(g);
     if (g->stream_fd >= 0 && g->out_off < g->out_len) out_flush(g);
     if (g->fetch_fd >= 0 && g->fout_off < g->fout_len) fetch_flush(g);
@@ -5039,13 +5106,19 @@ bool db_ingest_start(int stream_fd, int ctrl_fd, int fetch_fd) {
   EV_SET(&ev[0], 1, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0, NULL);
   if (kevent(g->wait_kq, ev, 1, NULL, 0, NULL) != 0) return false;
   atomic_store_explicit(&g_ing_kick_kq, g->kq, memory_order_relaxed);
-  store_status_set_lookup_fn(db_ingest_lookup_stats);        /* 0.7: `karictl store` shows the lookups of the first start (store.lookup.*) */
+  store_status_set_lookup_fn(db_ingest_lookup_stats);
+  store_status_set_fill_fn(db_ingest_fill_stats);          /* 0.7 M3: `karictl store` shows the zone images (store.fill.*) */        /* 0.7: `karictl store` shows the lookups of the first start (store.lookup.*) */
   dbreg_set_pending_notify(ing_kick);                /* D1a step 5: an eviction leaves a delta to publish; the thread may be asleep without a timeout */
   /* builder threads (design 1.5, D10): ingest-threads 1 = the stream thread builds */
   ing_cfg_t snap;
   snapshot_cfg(&snap);
   uint32_t nthr = snap.ingest_threads;
   if (nthr > ING_MAX_BUILDERS) nthr = ING_MAX_BUILDERS;
+  if (nthr > 1 && db_store_enabled()) {
+    /* 0.7 M3: with the store a zone costs a check of its image and one write that the store serializes (the loader builds the image): builders gain nothing, so ingest-threads has no effect here */
+    syslog(LOG_INFO, "[DB] ingest-threads %u has no effect with the zone store (the loader builds the zone images); it applies to `store none` only", nthr);
+    nthr = 1;
+  }
   if (nthr > 1) {
     for (uint32_t i = 0; i < nthr; i++) {
       ing_builder_t *b = &g->builders[i];
