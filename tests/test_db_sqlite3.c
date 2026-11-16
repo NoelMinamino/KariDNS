@@ -2109,6 +2109,7 @@ static int ff_scan_records(db_conn_t *c, const int64_t *d, db_record_cb cb, void
 static int ff_scan_range(db_conn_t *c, int64_t lo, int64_t hi, db_record_cb cb, void *ud) { return ff_hit("scan_records_range") ? g_ff_rc : db_driver_sqlite3.scan_records_range(c, lo, hi, cb, ud); }
 static int ff_scan_metadata(db_conn_t *c, const int64_t *d, db_meta_cb cb, void *ud) { return ff_hit("scan_metadata") ? g_ff_rc : db_driver_sqlite3.scan_metadata(c, d, cb, ud); }
 static int ff_keys(db_conn_t *c, db_key_cb cb, void *ud) { return ff_hit("zones_with_keys") ? g_ff_rc : db_driver_sqlite3.zones_with_keys(c, cb, ud); }
+static int ff_keys_in(db_conn_t *c, const int64_t *ids, size_t n, db_key_cb cb, void *ud) { return ff_hit("zones_with_keys") ? g_ff_rc : db_driver_sqlite3.zones_with_keys_in(c, ids, n, cb, ud); }
 static int ff_views(db_conn_t *c, const int64_t *d, db_domain_view_cb cb, void *ud) { return ff_hit("scan_domain_views") ? g_ff_rc : db_driver_sqlite3.scan_domain_views(c, d, cb, ud); }
 static int ff_profiles(db_conn_t *c, db_profile_cb cb, void *ud) { return ff_hit("scan_profiles") ? g_ff_rc : db_driver_sqlite3.scan_profiles(c, cb, ud); }
 static int ff_ext(db_conn_t *c, const int64_t *d, const db_ext_sink_t *s) { return ff_hit("scan_ext") ? g_ff_rc : db_driver_sqlite3.scan_ext(c, d, s); }
@@ -2126,6 +2127,7 @@ static void ff_init(void) {
     g_fdrv.scan_records_range = ff_scan_range;
     g_fdrv.scan_metadata = ff_scan_metadata;
     g_fdrv.zones_with_keys = ff_keys;
+    g_fdrv.zones_with_keys_in = ff_keys_in;
     g_fdrv.scan_domain_views = ff_views;
     g_fdrv.scan_profiles = ff_profiles;
     g_fdrv.scan_ext = ff_ext;
@@ -4363,6 +4365,27 @@ static bool in_same(db_conn_t *c, const int64_t *ids, size_t n) {
     return ok;
 }
 
+/* zones_with_keys_in (0.7): the keys of ids[0..n) are the keys of the whole table, those ids only, in ascending order, whatever the order or the
+ * repeats of ids; an id without keys, or not in the database, gives nothing */
+typedef struct { int64_t v[DB_IN_MAX + 8]; size_t n; } keyset_t;
+static int keyset_add(void *ud, int64_t id) { keyset_t *k = ud; if (k->n < sizeof(k->v) / sizeof(k->v[0])) k->v[k->n++] = id; return 0; }
+static int stop_key(void *ud, int64_t id) { (void)id; ++*(size_t *)ud; return 1; }
+static bool keys_in_same(db_conn_t *c, const int64_t *ids, size_t n) {
+    const db_driver_t *D = &db_driver_sqlite3;
+    keyset_t all = { .n = 0 }, in = { .n = 0 }, want = { .n = 0 };
+    int rc = D->zones_with_keys(c, keyset_add, &all);
+    rc |= D->zones_with_keys_in(c, ids, n, keyset_add, &in);
+    for (size_t i = 0; i < all.n; i++)
+        for (size_t j = 0; j < n; j++)
+            if (all.v[i] == ids[j]) {
+                want.v[want.n++] = all.v[i];
+                break;
+            }
+    bool ok = rc == 0 && in.n == want.n && memcmp(in.v, want.v, want.n * sizeof(int64_t)) == 0;
+    if (!ok) printf("    n=%zu rc=%d: %zu keys at once, %zu expected\n", n, rc, in.n, want.n);
+    return ok;
+}
+
 static void test_scan_in(void) {
     printf("scan_records_in / scan_metadata_in / scan_ext_in (0.7): the rows of several zones are the rows of the zone-by-zone calls; the kept statements are not parsed again\n");
     char path[600], err[DB_ERRLEN];
@@ -4383,6 +4406,7 @@ static void test_scan_in(void) {
             sqlf(db, "INSERT INTO karidns_zone_tagdefs (domain_id, kind, tag, cidr) VALUES (%d, 'location', 'a', '192.0.2.0/24'), (%d, 'location', 'a', '198.51.100.0/24')", i, i);
     }
     add_zone(db, 141, "empty.test", "NATIVE");                              /* a zone without a row anywhere */
+    for (int i = 3; i <= 140; i += 3) sqlf(db, "INSERT INTO cryptokeys (domain_id, flags, active, content) VALUES (%d, 257, 1, 'x'), (%d, 256, 1, 'y')", i, i);   /* every third zone is signed */
     raw_exec(db, "ANALYZE");                                                /* (the planner has statistics, as in a database that has been used) */
     sqlite3_close(db);
     int rc = 0;
@@ -4431,6 +4455,30 @@ static void test_scan_in(void) {
         for (size_t i = 0; i < DB_IN_MAX; i++) ids[i] = (int64_t)i + 1;
         unsigned long p0 = g_sq_prepares;
         for (size_t k = 0; k < sizeof(sizes) / sizeof(sizes[0]); k++) CHECK(in_same(c, ids, sizes[k]));
+        CHECK(g_sq_prepares == p0);
+    }
+    {   /* zones_with_keys_in: the same keys as the full scan for these zones, every size class, scattered ids, ids without keys, ids that are not there */
+        CHECK(D->zones_with_keys_in != NULL);
+        int64_t ids[DB_IN_MAX];
+        for (size_t k = 0; k < sizeof(sizes) / sizeof(sizes[0]); k++) {
+            for (size_t i = 0; i < sizes[k]; i++) ids[i] = (int64_t)i + 1;
+            CHECK_MSG(keys_in_same(c, ids, sizes[k]), "keys of the first %zu zones", sizes[k]);
+        }
+        int64_t a[] = { 3 }, b[] = { 1, 2 }, d[] = { 142 }, e[] = { 141, 142, 9999, 6 }, f[] = { 140, 3, 99, 3, 4 }, g[] = { 9223372036854775807LL, -5, 0, 12 };
+        CHECK(keys_in_same(c, a, 1) && keys_in_same(c, b, 2) && keys_in_same(c, d, 1) && keys_in_same(c, e, 4) && keys_in_same(c, f, 5) && keys_in_same(c, g, 4));
+        keyset_t ks = { .n = 0 };
+        CHECK(D->zones_with_keys_in(c, d, 1, keyset_add, &ks) == 0 && ks.n == 0);          /* not in the database: no key */
+        CHECK(D->zones_with_keys_in(c, b, 2, keyset_add, &ks) == 0 && ks.n == 0);          /* in the database, no key */
+        CHECK(D->zones_with_keys_in(c, e, 4, keyset_add, &ks) == 0 && ks.n == 1 && ks.v[0] == 6);
+        CHECK(D->zones_with_keys_in(c, f, 5, keyset_add, &ks) == 0 && ks.n == 3 && ks.v[1] == 3 && ks.v[2] == 99);          /* (the repeated 3 is one key; 4 has none) */
+        for (size_t i = 0; i < DB_IN_MAX; i++) ids[i] = (int64_t)i + 1;
+        size_t cnt = 0;
+        CHECK(D->zones_with_keys_in(c, ids, 10, stop_key, &cnt) == DB_STOPPED && cnt == 1);          /* a stopped read leaves the statement usable */
+        CHECK(keys_in_same(c, ids, 10));
+        CHECK(D->zones_with_keys_in(c, ids, 0, keyset_add, &ks) == -1 && strstr(D->errmsg(c), "scan_*_in") != NULL);
+        CHECK(D->zones_with_keys_in(c, ids, DB_IN_MAX + 1, keyset_add, &ks) == -1);
+        unsigned long p0 = g_sq_prepares;          /* the kept statements: nothing is parsed again */
+        for (size_t k = 0; k < sizeof(sizes) / sizeof(sizes[0]); k++) CHECK(keys_in_same(c, ids, sizes[k]));
         CHECK(g_sq_prepares == p0);
     }
     CHECK(D->end_snapshot(c) == 0);

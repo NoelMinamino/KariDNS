@@ -120,6 +120,15 @@ run badmain
 has "a FETCH_REQ on the first stream ends the loader" '^LOADER ended$'
 has "... with an error status" '^DONE answers=0 loader=3$'
 
+echo "== keys: a fetch reads the keys of the zones it asks for (zones_with_keys_in), as the full scan did"
+mkzone keyed.test 5
+sqlite3 "$DB" "INSERT INTO cryptokeys (domain_id, flags, active, content) SELECT id, 257, 1, 'x' FROM domains WHERE name IN ('signed.test', 'keyed.test')"
+sqlite3 "$DB" "INSERT INTO cryptokeys (domain_id, flags, active, content) SELECT id, 256, 1, 'y' FROM domains WHERE name IN ('signed.test', 'keyed.test')"
+run req:1:signed.test.:0:0 req:2:keyed.test.:0:0 req:3:small.test.:0:0 wait:3
+has "a signed zone (PRESIGNED, keys) is served with its records" '^ANS id=1 zone=signed.test. kind=primary summary=0 presigned=1 serial=77 rr=3 data=[1-9]'
+has "a zone with keys and no PRESIGNED fails (the keys were read for the zone that was asked for)" '^FAILED id=2 zone=keyed.test. reason=.*cryptokeys but no PRESIGNED'
+has "a zone without keys is served next to them" '^ANS id=3 zone=small.test. kind=primary summary=0 presigned=0 serial=2024010101 rr=3 data=[1-9]'
+
 echo
 echo "$PASS passed, $FAILS failed"
 [ "$FAILS" -eq 0 ]

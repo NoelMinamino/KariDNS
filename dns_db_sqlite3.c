@@ -68,7 +68,7 @@ struct db_conn {
     sqlite3_stmt *st_apex_all, *st_apex_one, *st_zones, *st_zone_one, *st_rec_all, *st_rec_one, *st_rec_rng, *st_meta_all, *st_meta_one, *st_keys, *st_changes, *st_cmax;
     sqlite3_stmt *st_dv_all, *st_dv_one;
     sqlite3_stmt *st_zlk[6];    /* 0.7: find_zones_in(), one statement per size class (SQ_ZLK_MIN << i names), kept: the lookup of a name must not parse SQL */
-    sqlite3_stmt *st_in[5][7];  /* 0.7: scan_records_in, scan_metadata_in, scan_ext_in (records, metadata, tags, tinydns, tagdefs) x size class (2 << i ids), kept */
+    sqlite3_stmt *st_in[6][7];  /* 0.7: scan_records_in, scan_metadata_in, scan_ext_in (records, metadata, tags, tinydns, tagdefs), zones_with_keys_in (cryptokeys) x size class (2 << i ids), kept */
     sqlite3_stmt *st_mpage, *st_cpage, *st_cnt, *st_cntv;      /* 0.7 WP3: manifest_page, changes_page, count_domains (all, one view) */
     db_mgroup_t mg;             /* the manifest row being assembled */
     bool has_domain_views;
@@ -317,7 +317,7 @@ static void sq_close(db_conn_t *c) {
     sqlite3_finalize(c->st_dv_all);
     sqlite3_finalize(c->st_dv_one);
     for (size_t i = 0; i < sizeof(c->st_zlk) / sizeof(c->st_zlk[0]); i++) sqlite3_finalize(c->st_zlk[i]);
-    for (size_t k = 0; k < 5; k++)
+    for (size_t k = 0; k < sizeof(c->st_in) / sizeof(c->st_in[0]); k++)
         for (size_t i = 0; i < 7; i++) sqlite3_finalize(c->st_in[k][i]);
     sqlite3_finalize(c->st_prof);
     for (int i = 0; i < 2; i++) {
@@ -999,11 +999,8 @@ static int sq_scan_metadata(db_conn_t *c, const int64_t *domain_id, db_meta_cb c
     return meta_loop(c, st, cb, ud);
 }
 
-static int sq_zones_with_keys(db_conn_t *c, db_key_cb cb, void *ud) {
-    int ret = prep(c, &c->st_keys, "SELECT DISTINCT domain_id FROM cryptokeys ORDER BY domain_id");
-    if (ret != 0) return ret;
-    sqlite3_stmt *st = c->st_keys;
-    rearm(st);
+static int keys_loop(db_conn_t *c, sqlite3_stmt *st, db_key_cb cb, void *ud) {
+    int ret = 0;
     for (;;) {
         int rc = sqlite3_step(st);
         if (rc == SQLITE_DONE) break;
@@ -1019,6 +1016,13 @@ static int sq_zones_with_keys(db_conn_t *c, db_key_cb cb, void *ud) {
     }
     rearm(st);
     return ret;
+}
+
+static int sq_zones_with_keys(db_conn_t *c, db_key_cb cb, void *ud) {
+    int ret = prep(c, &c->st_keys, "SELECT DISTINCT domain_id FROM cryptokeys ORDER BY domain_id");
+    if (ret != 0) return ret;
+    rearm(c->st_keys);
+    return keys_loop(c, c->st_keys, cb, ud);
 }
 
 static int sq_changes_since(db_conn_t *c, uint64_t after, db_change_cb cb, void *ud, uint64_t *last_seq, bool *gap) {
@@ -1403,7 +1407,7 @@ static int sq_scan_ext(db_conn_t *c, const int64_t *domain_id, const db_ext_sink
  * has an IN list; its text depends on how many ids there are, so there is one kept statement for each table and size class (2, 4, ... 128 = DB_IN_MAX ids; parsed at
  * the first use of the class); the placeholders a call does not need are bound NULL, which is equal to no id.  Where a one-zone statement is a few microseconds,
  * a fetch of 64 zones asks the database seven times instead of about 450. */
-enum { IN_REC, IN_META, IN_XT, IN_XD, IN_XG, IN_KINDS };
+enum { IN_REC, IN_META, IN_XT, IN_XD, IN_XG, IN_KEY, IN_KINDS };
 
 static sqlite3_stmt *in_stmt(db_conn_t *c, int kind, const int64_t *ids, size_t n, int *err) {
     *err = 0;
@@ -1427,6 +1431,7 @@ static sqlite3_stmt *in_stmt(db_conn_t *c, int kind, const int64_t *ids, size_t 
             [IN_XD] = { "SELECT r.domain_id, t.record_id, t.ttd, t.loc, t.countdown FROM karidns_record_tinydns t JOIN records r ON r.id = t.record_id "
                         "WHERE r.domain_id IN (", "", ") ORDER BY r.domain_id, t.record_id" },
             [IN_XG] = { "SELECT domain_id, kind, tag, cidr FROM karidns_zone_tagdefs WHERE domain_id IN (", "", ") ORDER BY domain_id, rowid" },
+            [IN_KEY] = { "SELECT DISTINCT domain_id FROM cryptokeys WHERE domain_id IN (", "", ") ORDER BY domain_id" },
         };
         char sql[1600];
         size_t o = (size_t)snprintf(sql, sizeof(sql), "%s", k_in[kind].head);
@@ -1453,6 +1458,12 @@ static int sq_scan_metadata_in(db_conn_t *c, const int64_t *ids, size_t n, db_me
     int err;
     sqlite3_stmt *st = in_stmt(c, IN_META, ids, n, &err);
     return st ? meta_loop(c, st, cb, ud) : err;
+}
+
+static int sq_zones_with_keys_in(db_conn_t *c, const int64_t *ids, size_t n, db_key_cb cb, void *ud) {
+    int err;
+    sqlite3_stmt *st = in_stmt(c, IN_KEY, ids, n, &err);
+    return st ? keys_loop(c, st, cb, ud) : err;
 }
 
 static int sq_scan_ext_in(db_conn_t *c, const int64_t *ids, size_t n, const db_ext_sink_t *sink) {
@@ -2032,7 +2043,7 @@ const db_driver_t db_driver_sqlite3 = {
     .schema_findings = sq_schema_findings,      /* B12 */
     .find_zone = sq_find_zone,                  /* B13 */
     .find_zones_in = sq_find_zones_in,          /* 0.7: the lookup of a name */
-    .scan_records_in = sq_scan_records_in, .scan_metadata_in = sq_scan_metadata_in, .scan_ext_in = sq_scan_ext_in,      /* B13b; SQLite3 since 0.7: the statements of a fetch of many zones */
+    .scan_records_in = sq_scan_records_in, .scan_metadata_in = sq_scan_metadata_in, .scan_ext_in = sq_scan_ext_in, .zones_with_keys_in = sq_zones_with_keys_in,      /* B13b; SQLite3 since 0.7: the statements of a fetch of many zones */
     .scan_apex = sq_scan_apex,                  /* D1a step 6 */
     .count_domains = sq_count_domains, .manifest_page = sq_manifest_page, .current_cursor = sq_current_cursor, .changes_page = sq_changes_page,      /* 0.7 store, WP3 */
     /* M2, the ZoneImporter: write access (open_write connections only) */

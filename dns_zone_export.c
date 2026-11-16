@@ -381,7 +381,8 @@ static int zx_read_zone_x(const db_driver_t *d, db_conn_t *c, bool has_ext, cons
         rc = d->scan_ext(c, &id, &sk);
     }
     keyq_t kq = { id, false };
-    if (has_keys && rc == 0 && !z->failed) rc = d->zones_with_keys(c, zx_cb_key, &kq);
+    if (has_keys && rc == 0 && !z->failed)       /* this one zone only: cryptokeys is not scanned whole for every zone read */
+        rc = d->zones_with_keys_in ? d->zones_with_keys_in(c, &id, 1, zx_cb_key, &kq) : d->zones_with_keys(c, zx_cb_key, &kq);
     if (has_keys) *has_keys = kq.has;
     zx_set_free(&feed.names);
     zx_set_free(&feed.orders);

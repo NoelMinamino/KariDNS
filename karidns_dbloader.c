@@ -1303,6 +1303,25 @@ static int cmp_i64(const void *a, const void *b) {
     return x < y ? -1 : x > y;
 }
 
+/* The keys of the zones this pass reads: the whole table when the pass is a bulk one (most zones are read anyway), else only those of the
+ * zones in wl (a fetch, a batch, a lookup, a one-zone reload: cryptokeys has two rows for each signed zone, and a fetch must not scan them all). */
+static int load_keys(ctx_t *x, bool bulk) {
+    const db_driver_t *drv = x->drv;
+    int rc = 0;
+    if (bulk || !drv->zones_with_keys_in) {
+        rc = drv->zones_with_keys(x->conn, key_cb, x);
+    } else {
+        int64_t ids[DB_IN_MAX];
+        for (size_t pos = 0; pos < x->nwl && rc == 0;) {
+            size_t n = 0;
+            while (n < DB_IN_MAX && pos < x->nwl) ids[n++] = x->zones[x->wl[pos++]].id;
+            rc = drv->zones_with_keys_in(x->conn, ids, n, key_cb, x);
+        }
+    }
+    qsort(x->keys, x->nk, sizeof(int64_t), cmp_i64);
+    return rc;
+}
+
 static bool zone_has_keys(const ctx_t *x, int64_t id) {
     return x->nk && bsearch(&id, x->keys, x->nk, sizeof(int64_t), cmp_i64) != NULL;
 }
@@ -4297,12 +4316,11 @@ have_zones:
         if (x->io && only_zone == NULL)
             bulk = n_want > 0 && (uint64_t)n_want * 100 >= (uint64_t)x->nz * (uint64_t)(x->bulk_threshold >= 0 ? x->bulk_threshold : 25);
         if (x->fb) bulk = false;                          /* (a batch reads the zones it asked for, never the table) */
-        if ((rc = x->drv->zones_with_keys(x->conn, key_cb, x)) != 0) {
+        if ((rc = load_keys(x, bulk)) != 0) {
             status = x->oom ? EXIT_ERROR : db_err(x, rc, "reading metadata");
             if (x->oom) lg(LOG_ERR, "out of memory");
             goto out_snap;
         }
-        qsort(x->keys, x->nk, sizeof(int64_t), cmp_i64);
         if (n_want > 0 && si.has_profiles && x->drv->scan_profiles) {                  /* B7a: the profiles, in this snapshot, before any zone is converted */
             rc = x->drv->scan_profiles(x->conn, prof_cb, x);
             if (rc != 0) {

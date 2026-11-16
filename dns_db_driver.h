@@ -362,6 +362,9 @@ typedef struct db_driver {
     int (*scan_records_in)(db_conn_t *c, const int64_t *ids, size_t n, db_record_cb cb, void *ud);
     int (*scan_metadata_in)(db_conn_t *c, const int64_t *ids, size_t n, db_meta_cb cb, void *ud);
     int (*scan_ext_in)(db_conn_t *c, const int64_t *ids, size_t n, const db_ext_sink_t *sink);
+    /* Optional: zones_with_keys for the n zones in ids (1..DB_IN_MAX, any order) only, ORDER BY domain_id: a fetch or a lookup reads a known set of zones
+     * and must not scan the whole of cryptokeys (20 million rows at 10 million signed zones).  Same callback and return values as zones_with_keys.  NULL = use zones_with_keys. */
+    int (*zones_with_keys_in)(db_conn_t *c, const int64_t *ids, size_t n, db_key_cb cb, void *ud);
     /* D1a step 6: the apex SOA and NS rows (db_apex_row_t) of one zone (domain_id) or of all, ORDER BY domain_id, id; as scan_records in a snapshot.
      * NULL = the driver cannot tell: no apex goes with the summaries. */
     int (*scan_apex)(db_conn_t *c, const int64_t *domain_id, db_apex_cb cb, void *ud);
