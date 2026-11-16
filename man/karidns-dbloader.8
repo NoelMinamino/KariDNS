@@ -453,16 +453,50 @@ closest zone the view serves being a secondary or catalog zone is no answer
 id.  The Backend treats the entry as a claim of an untrusted loader: the zone
 must enclose the name that was asked for, and it is recorded as a \fBMANIFEST\fR
 entry (a known zone: its body is fetched as for any zone), so the pass that is
-still going finds it.
+still going finds it.  \fBWith the body (mode 3).\fR A loader whose \fBHELLO\fR
+features have bit 2 (\fBKDB_FEAT_LOOKUP_BODY\fR, 0x4; this loader sends features
+7) is asked with mode 3 (\fBKDB_FETCH_LOOKUP_FULL\fR): when a zone is found, the
+answer is followed on the same stream, with the same request id, by the body of
+that zone (\fBZONE_BEGIN\fR .. \fBZONE_DATA\fR .. \fBZONE_END\fR, read as for a
+request of the zone: the same worker, the same snapshot connection kept for the
+next request, the domain id of the answer as the id the zone must still have;
+\fBZONE_FAILED\fR with the name of the zone when it cannot be read), so that a
+zone the Backend did not know is answerable after one round trip, not two (a
+lookup, then a request for the zone).  With nothing found nothing follows.  The
+Backend sends mode 3 only to a loader that announced the bit, and only with no
+\fBfetch\-rate\fR (the rate counts the zones read for queries) and with the
+zones in memory below the hard line of \fBmemory\-limit\fR (the fetches wait for
+room); otherwise it asks mode 2, and a loader of an earlier version gets mode 2
+only.  From the answer on the request is a fetch of that zone in the Backend,
+with the same id and the same place of \fBfetch\-concurrency\fR.  The body is a
+claim of an untrusted loader as the answer is: it must be the zone the answer
+named (the name and the \fBsource_id\fR), it must come after the answer and
+once, and the stamp check at the commit is the one of a fetch (the record the
+answer made holds the stamp the body is installed under); any other body (before
+the answer, for another zone or another id, a second one, one after a mode 2
+answer) is read through and thrown away and counted (\fBbad_body\fR), and the
+stream goes on.  A zone that another request has on its way, or that is in
+memory already, has its body read through and thrown away as well (the loader
+cannot be told not to send it).  The request of a lookup is of the priority 0 of
+a query, so the loader serves it before the bodies of the background fill
+(priority 2), and a request that has waited \fBFQ_AGING_MS\fR goes first, as for
+any priority.  The Backend gives a lookup a place of \fBfetch\-concurrency\fR as
+it gives one to the fetch of a zone (it holds it until the answer, with mode 3
+until the body is installed), at most three quarters of the places for lookups
+at one time, and keeps a lookup that finds none in a queue of its own for
+\fBpark\-timeout\fR; the answer "none" gives its place back at once.  \fBkarictl
+dbstatus\fR and \fBkarictl store\fR count them (\fBstore.lookup.*\fR,
+docs/karictl.md).
 .IP \(bu 2
-\fBBodies.\fR The loader sends no zone body in this protocol. The Backend asks
-for the bodies it lacks (a stamp it does not have) with \fBFETCH_REQ\fR on the
-fetch stream, by name and, with tag 8, by \fBsource_id\fR; a pool of workers
-reads and converts the zone as for any fetch. A name that has another id in the
-database now answers \fBZONE_FAILED\fR ("renamed or created again";
-\fBCHANGES\fR says so). The summary of a fetch (mode 1) looks up the addresses
-of out-of-zone name servers for the NOTIFY of that one zone by query at that
-time; the loader has no list of them.
+\fBBodies.\fR The loader sends no zone body in this protocol (the answer of a
+lookup in mode 3 is followed by the body of the zone it found: see above). The
+Backend asks for the bodies it lacks (a stamp it does not have) with
+\fBFETCH_REQ\fR on the fetch stream, by name and, with tag 8, by
+\fBsource_id\fR; a pool of workers reads and converts the zone as for any
+fetch. A name that has another id in the database now answers \fBZONE_FAILED\fR
+("renamed or created again"; \fBCHANGES\fR says so). The summary of a fetch
+(mode 1) looks up the addresses of out-of-zone name servers for the NOTIFY of
+that one zone by query at that time; the loader has no list of them.
 .IP \(bu 2
 \fBReload requests.\fR \fBreload\fR (scope all) drains the change log; \fBreload
 \-force\fR makes a pass. A reload of one zone is a \fBCHANGES\fR entry with the

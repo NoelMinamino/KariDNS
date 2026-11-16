@@ -847,6 +847,42 @@ Zones that a worker attached and a store thread then registered / found in
 memory already, changed or gone (dropped: the answer the worker gave was the
 version the record had)
 .TP 8
+\fBstore.lookup.available\fR, \fB.ready\fR
+0.7, the lookups of the first start (a query for a name that no stored zone
+covers while a view's first pass has not listed every zone): 1 when the figures
+below are there; 1 when the loader answers lookups
+.TP 8
+\fBstore.lookup.asked\fR, \fB.found\fR, \fB.none\fR, \fB.failed\fR
+Requests of the workers that the ingest thread took; how they ended: a zone was
+found and recorded, no zone, a failure (the loader's error, no answer within the
+time, a zone that does not enclose the name)
+.TP 8
+\fBstore.lookup.pending\fR, \fB.pending_peak\fR, \fB.in_flight\fR
+Lookups that wait for a place of \fBfetch\-concurrency\fR now, the most that
+waited, lookups out now (with the bodies that came with them: at most three
+quarters of the places)
+.TP 8
+\fBstore.lookup.take_fail\fR
+How often a worker could not make the request of a lookup because its ring to
+the ingest thread was full: the query stays parked as pending and the worker
+asks again, it is not refused
+.TP 8
+\fBstore.lookup.body_inline\fR
+Zones whose body came with the answer of the lookup (FETCH_REQ mode 3: one round
+trip) and was taken
+.TP 8
+\fBstore.lookup.bad_body\fR, \fB.refused\fR, \fB.same_name\fR, \fB.covered\fR, \fB.shed\fR, \fB.expired\fR
+Bodies thrown away because the answer did not announce them (before the answer,
+another zone or id, a second one); requests not made (no loader that looks up, a
+view without database zones); the same name already on its way; the zone of the
+name was known when it was to go; dropped because the queue was full; dropped
+because they waited \fBpark\-timeout\fR
+.TP 8
+\fBstore.lookup.rtt.p50_us\fR, \fB.p99_us\fR, \fB.max_us\fR, \fB.rtt.hist.*\fR
+The time from the request to the answer (without the body), as the attach times:
+the upper bound of the bucket that holds the percentile, the longest, the
+buckets (<= 1 us, <= 2 us, ... in the JSON and \fB\-k\fR forms)
+.TP 8
 \fBstore.hot.state\fR, \fB.listed\fR, \fB.attached\fR, \fB.skipped\fR, \fB.written_at_stop\fR
 0.7: the hot list of the store: \fBnone\fR, \fBattaching\fR, \fBdone\fR,
 \fBhigh\-mark\fR (stopped at the high mark of \fBmemory\-limit\fR) or \fBoff\fR
