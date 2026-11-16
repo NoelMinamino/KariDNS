@@ -384,6 +384,25 @@ static void timg_free(void *p) {
 }
 
 /* take the zone out of memory and wait until the registry's reference of its entry is gone (the garbage of the next delta is freed) */
+/* versions_live once nothing more is retired: a version freed by an earlier step can leave after dbreg_evict_inflight() is 0 (its image is released at a later pass of the retire stack), so a
+ * number read right after it may still fall; read it when three passes in a row leave it unchanged */
+static uint64_t settled_versions(void) {
+    db_store_counters_t c;
+    uint64_t prev = UINT64_MAX;
+    for (int i = 0, same = 0; i < 1000; i++) {
+        zone_retire_process(true);
+        db_store_counters(&c);
+        if (c.versions_live == prev) {
+            if (++same >= 3) break;
+        } else {
+            same = 0;
+            prev = c.versions_live;
+        }
+        usleep(2000);
+    }
+    return c.versions_live;
+}
+
 static bool evict_zone(const char *zone) {
     if (!dbreg_test_evict("default", zone)) return false;
     wait_retired();
@@ -2080,6 +2099,7 @@ static int run_mode(const char *mode) {
                 CHECK(evict_zone("wd.test."));
                 zref_t zd;
                 CHECK(zref_of("wd.test.", &zd) && zd.zid != ZREF_NOZID);
+                const uint64_t vl0 = settled_versions();
                 db_store_counters(&w0);
                 atomic_store(&g_adopt_hold, true);
                 db_store_test_adopt_hook = adopt_hold_hook;
@@ -2102,7 +2122,7 @@ static int run_mode(const char *mode) {
                 CHECK(!zref_of("wd.test.", &zd));                                       /* (not in the store, not staged, not in memory) */
                 wait_retired();
                 db_store_counters(&w1);
-                CHECK(w1.versions_live == w0.versions_live);                             /* (the entry was given back) */
+                CHECK(settled_versions() == vl0);                             /* (the entry was given back) */
             }
 
             /* W5c: the registration of a staged zone finds no view for the store's id (the store is closing, or the id is not one): the staged element leaves the table all the same (it held the zone's slot and its entry for ever) */
@@ -2115,6 +2135,7 @@ static int run_mode(const char *mode) {
                 zref_t zn;
                 CHECK(zref_of("wn.test.", &zn) && zn.zid != ZREF_NOZID);
                 drain_wakes();
+                const uint64_t vl0 = settled_versions();
                 db_store_counters(&w0);
                 atomic_store(&db_store_test_adopt_noview, true);
                 rcu_aux_read_lock();
@@ -2132,7 +2153,7 @@ static int run_mode(const char *mode) {
                 CHECK(w1.wa_lost == w0.wa_lost + 1 && w1.wa_adopted == w0.wa_adopted);
                 wait_retired();
                 db_store_counters(&w1);
-                CHECK(w1.versions_live == w0.versions_live);                             /* (the entry was given back) */
+                CHECK(settled_versions() == vl0);                             /* (the entry was given back) */
                 CHECK(stored_only("wn.test."));                                         /* (not in memory, not staged) */
                 rcu_aux_read_lock();
                 snw = acquire_zone_snapshot();
@@ -4825,6 +4846,22 @@ static int lock_tests(void) {
         CHECK(l1.st_uid == (root ? run_uid : geteuid()));
         if (kase == 3) CHECK(same_file(&l0, &l1));                           /* a lock file that is fine is kept, not made again */
         db_store_frontend_close();
+    }
+    /* KARIDNS_NO_DEFAULT_STORE=1 (the test hook of tests/lib_proc.sh): no store in the default directory, whether or not /var/db/karidns exists; a named store is opened */
+    {
+        printf("  KARIDNS_NO_DEFAULT_STORE=1\n");
+        const char *old = getenv("KARIDNS_NO_DEFAULT_STORE");
+        char *keep = old ? strdup(old) : NULL;
+        setenv("KARIDNS_NO_DEFAULT_STORE", "1", 1);
+        database_config_t d0;
+        memset(&d0, 0, sizeof(d0));
+        d0.enabled = true;
+        bool dflt = false;
+        CHECK(db_store_dir_of(&d0, &dflt) != NULL && dflt);
+        CHECK(db_store_frontend_open(&d0, false, (uid_t)-1, (gid_t)-1, msg, sizeof(msg)) && db_store_dir_fd() < 0 && strstr(msg, "KARIDNS_NO_DEFAULT_STORE=1") != NULL);
+        CHECK(db_store_frontend_open(&db, root, run_uid, run_gid, msg, sizeof(msg)) && db_store_dir_fd() >= 0);   /* (as the loop above: as root the directory is the run user's) */
+        db_store_frontend_close();
+        if (keep) { setenv("KARIDNS_NO_DEFAULT_STORE", keep, 1); free(keep); } else unsetenv("KARIDNS_NO_DEFAULT_STORE");
     }
     char cmd[800];
     snprintf(cmd, sizeof(cmd), "rm -rf %s", base);

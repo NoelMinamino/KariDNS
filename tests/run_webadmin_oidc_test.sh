@@ -79,7 +79,7 @@ stop_server() {
 checks_after() {
     grep -q "(a bug)" "$1" && bad "row level security refused what the API had allowed" "$(grep '(a bug)' "$1" | head -3)" || ok "the service never logged a disagreement with the database"
     grep -Eq '^[^ ]+ error ' "$1" && bad "the service logged an error" "$(grep ' error ' "$1" | head -3)" || ok "the service logged no error"
-    if grep -Fq "$CLIENT_SECRET" "$1" || grep -Eq 'karidns_session=|karidns_oidc=|\$scrypt\$|kdt_' "$1" || { [ -n "${ADMIN_PW:-}" ] && grep -Fq "$ADMIN_PW" "$1"; }; then bad "the log holds a secret, cookie, hash or password"; else ok "the log holds no client secret, cookie, hash or password"; fi
+    if grep -Fq -e "$CLIENT_SECRET" "$1" || grep -Eq 'karidns_session=|karidns_oidc=|\$scrypt\$|kdt_' "$1" || { [ -n "${ADMIN_PW:-}" ] && grep -Fq -e "$ADMIN_PW" "$1"; }; then bad "the log holds a secret, cookie, hash or password"; else ok "the log holds no client secret, cookie, hash or password"; fi
     grep -q "auth: oidc idp: sign-in refused" "$1" && ok "the refusals are in the log with their reasons" || bad "no refusal in the log"
 }
 
@@ -299,7 +299,7 @@ EOF
     gui_run_driver "sign-in with a provider, SQLite3" "$G/browser" webadmin/test/e2e/gui_oidc.mjs GUI_BASE="http://127.0.0.1:$PORT" GUI_IDP="$IDP_URL" GUI_ADMIN_PASSWORD="$ADMIN_PW"
     stop_server
     grep -Eq '^[^ ]+ error ' "$G/server.log" && bad "the service logged an error" "$(grep ' error ' "$G/server.log" | head -3)" || ok "the service logged no error"
-    if grep -Fq "$CLIENT_SECRET" "$G/server.log" || grep -Eq 'karidns_session=|karidns_oidc=|\$scrypt\$' "$G/server.log" || grep -Fq "$ADMIN_PW" "$G/server.log"; then bad "the log holds a secret, cookie, hash or password"; else ok "the log holds no client secret, cookie, hash or password"; fi
+    if grep -Fq -e "$CLIENT_SECRET" "$G/server.log" || grep -Eq 'karidns_session=|karidns_oidc=|\$scrypt\$' "$G/server.log" || grep -Fq -e "$ADMIN_PW" "$G/server.log"; then bad "the log holds a secret, cookie, hash or password"; else ok "the log holds no client secret, cookie, hash or password"; fi
     stop_idp
     _w=0; while [ $_w -lt 50 ] && pgrep -f "$T" > /dev/null 2>&1; do sleep 0.1; _w=$((_w + 1)); done   # a process that was just killed may take a moment to go
     if pgrep -f "$T" > /dev/null 2>&1; then bad "a process of the test is still running" "$(pgrep -fl "$T")"; else ok "no process of the test is left"; fi

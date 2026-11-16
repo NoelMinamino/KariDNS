@@ -1789,6 +1789,9 @@ For complete configuration syntax, query evaluation flows, and Extended AXFR det
 `KARIDNS_NOSYSLOG=1`
 : A test hook (0.7, in the spirit of BIND's `named -T nosyslog`): every line the server would give `syslog(3)` -- the built-in `default_syslog`, `syslog` channels, and the messages written before the logging statement is in force -- goes to standard error only, as `KariDNS <pid> - - <text>`, the same copy that `openlog(3)`'s `LOG_PERROR` prints on standard error anyway. The system log gets nothing; file and `stderr` channels are unchanged. Only the value `1` counts. The integration tests export it (`tests/lib_proc.sh`), so that the servers they start do not fill the build host's `/var/log/messages` and still show their messages on the standard error the tests read. Do not set it for a daemonized server: its standard error is `/dev/null`, so those lines would be lost.
 
+`KARIDNS_NO_DEFAULT_STORE=1`
+: A test hook (0.7): a `database { }` block without `store` runs without a zone store, as if `/var/db/karidns` did not exist (logged as `the zone store is off: KARIDNS_NO_DEFAULT_STORE=1 ...`); a store the block names is used as before. Only the value `1` counts. The integration tests export it (`tests/lib_proc.sh`, `tests/run_all_suite.sh`), so that their result does not depend on whether the build host has `/var/db/karidns`; the tests of the store name their directory.
+
 `KARIDNS_XFER_MINUTE_SECS=n`
 : A test hook: a "minute" of the transfer time limits is n seconds (1..60); see `max-transfer-time-in` and the related options.
 

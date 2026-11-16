@@ -124,7 +124,7 @@ i=0; while [ $i -lt 100 ] && kill -0 "$SRV" 2>/dev/null; do sleep 0.1; i=$((i + 
 if kill -0 "$SRV" 2>/dev/null; then bad "the server did not stop after SIGTERM"; kill -KILL "$SRV" 2>/dev/null; else wait "$SRV" 2>/dev/null; same "the server stops on SIGTERM with status 0" "$?" 0; fi
 SRV=""
 grep -q "stopped" "$T/server.log" && ok "...and says so" || bad "no 'stopped' in the log"
-if grep -Fq "$ADMIN_PW" "$T/server.log" || grep -Eq 'Sunrise-Harbor|Maple-Anchor|Violet-Lantern|Cobalt-Ranger|a new password|karidns_session=|\$scrypt\$' "$T/server.log"; then bad "the log holds a password, cookie or hash"; else ok "the log holds no password, cookie or hash"; fi
+if grep -Fq -e "$ADMIN_PW" "$T/server.log" || grep -Eq 'Sunrise-Harbor|Maple-Anchor|Violet-Lantern|Cobalt-Ranger|a new password|karidns_session=|\$scrypt\$' "$T/server.log"; then bad "the log holds a password, cookie or hash"; else ok "the log holds no password, cookie or hash"; fi
 grep -q "kdt_" "$T/server.log" && bad "the log holds a token" || ok "...and no token"
 grep -q "auth: admin logged in" "$T/server.log" && ok "logins are logged (user and address)" || bad "no login line in the log"
 grep -Eq '^.* error ' "$T/server.log" && bad "the server logged an error" "$(grep ' error ' "$T/server.log" | head -3)" || ok "the server logged no error"
