@@ -1277,7 +1277,8 @@ static int store_do_op(store_t *s, uint64_t K) {
   default: return 0;
   }
 }
-static void model_do_op(model_t *m, uint64_t K) {
+/* parts: how many entries of a group (OP_KNOWN_N) are applied (UINT32_MAX: all; the other operations are whole) */
+static void model_do_op_part(model_t *m, uint64_t K, unsigned parts) {
   uint32_t i;
   int k = op_kind(K, &i);
   mz_t *z = &m->z[i];
@@ -1288,13 +1289,19 @@ static void model_do_op(model_t *m, uint64_t K) {
   case OP_KNOWN_N: {
     uint32_t idx[16];
     unsigned g = kn_group(K, i, idx);
-    for (unsigned j = 0; j < g; j++) { mz_t *y = &m->z[idx[j]]; y->exists = 1; y->known = 1; y->ver = K; y->flags = op_flags(K); }
+    for (unsigned j = 0; j < g && j < parts; j++) { mz_t *y = &m->z[idx[j]]; y->exists = 1; y->known = 1; y->ver = K; y->flags = op_flags(K); }
     break;
   }
   case OP_FLAGS: if (z->exists) z->flags = op_flags(K); break;
   case OP_CURSOR: m->cursor_valid = true; m->cursor = K; break;
   default: break;
   }
+}
+static void model_do_op(model_t *m, uint64_t K) { model_do_op_part(m, K, UINT32_MAX); }
+/* the entries of operation K (a group: its size; otherwise 1) */
+static unsigned model_op_parts(uint64_t K) {
+  uint32_t i, idx[16];
+  return op_kind(K, &i) == OP_KNOWN_N ? kn_group(K, i, idx) : 1;
 }
 /* compare the store with the model; verbose = print the first difference */
 static bool model_matches(store_t *s, const model_t *m, bool verbose) {
@@ -1433,9 +1440,9 @@ static void test_kill_loop(int iters, int mode) {
   shm_t *shm = mmap(NULL, sizeof(*shm), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0);
   CHECK(shm != MAP_FAILED);
   if (shm == MAP_FAILED) { tdir_free(&d); return; }
-  model_t *model = calloc(1, sizeof(*model)), *tmp = calloc(1, sizeof(*tmp));
+  model_t *model = calloc(1, sizeof(*model)), *tmp = calloc(1, sizeof(*tmp)), *tmp2 = calloc(1, sizeof(*tmp2)), *tmp3 = calloc(1, sizeof(*tmp3));
   uint64_t K0 = 0, boot = 42, rng = 20261114;
-  int fresh = 0, crashed = 0, countdown_hits = 0, tampered = 0, older = 0, torn = 0, exact = 0, replayed_total = 0, lost_ops = 0, with_free = 0;
+  int fresh = 0, crashed = 0, countdown_hits = 0, tampered = 0, older = 0, torn = 0, exact = 0, replayed_total = 0, lost_ops = 0, with_free = 0, part_groups = 0;
   uint32_t max_segs = 0;
   for (int it = 0; it < iters; it++) {
     if (it % (mode == 4 ? 2 : 25) == 0) {                             /* (mode 4: a new store often, so that the index grows from its smallest size again) */
@@ -1527,14 +1534,27 @@ static void test_kill_loop(int iters, int mode) {
       K0 = begun;                                                       /* absolute ops: the generator needs no state */
     } else {
       CHECK(!st.recovery.rebuilt);
-      /* the state must be the model after n ops, acked <= n <= begun */
+      /* the state must be the model after n ops, acked <= n <= begun, or (mode 2) after n ops and the first entries of op n: store_set_known_n() writes a group as more than one record
+       * when an entry needs the index (or a table) to grow first, or names a zone pending in the group, and a kill between those records keeps the first ones (each record is whole or
+       * not there; the call is not one unit, see dns_store.h) */
       memcpy(tmp, model, sizeof(*tmp));
       for (uint64_t K = K0; K < acked; K++) model_do_op(tmp, K);
       uint64_t found = UINT64_MAX;
+      unsigned found_part = 0;
       for (uint64_t n = acked; n <= begun && found == UINT64_MAX; n++) {
-        if (model_matches(s, tmp, false)) found = n;
-        else if (n < begun) model_do_op(tmp, n);
+        if (model_matches(s, tmp, false)) { found = n; break; }
+        if (n == begun) break;
+        const unsigned np = model_op_parts(n);
+        if (np > 1) memcpy(tmp3, tmp, sizeof(*tmp3));
+        model_do_op(tmp, n);
+        for (unsigned j = 1; j < np && found == UINT64_MAX; j++) {
+          memcpy(tmp2, tmp3, sizeof(*tmp2));
+          model_do_op_part(tmp2, n, j);
+          if (memcmp(tmp2, tmp, sizeof(*tmp2)) == 0) continue;          /* (the rest of the group changes nothing: a zone of the group twice) */
+          if (model_matches(s, tmp2, false)) { found = n; found_part = j; }
+        }
       }
+      if (found_part) part_groups++;
       if (found == UINT64_MAX) {
         printf("  iteration %d: no prefix matches (K0=%" PRIu64 " acked=%" PRIu64 " done=%" PRIu64 " begun=%" PRIu64 ", killed=%d, countdown=%ld)\n", it, K0, acked, done, begun, killed, cd);
         /* print the difference against the model at 'begun' and at 'acked' */
@@ -1551,6 +1571,7 @@ static void test_kill_loop(int iters, int mode) {
       /* rebuild the model at `found` */
       memcpy(tmp, model, sizeof(*tmp));
       for (uint64_t K = K0; K < found; K++) model_do_op(tmp, K);
+      if (found_part) model_do_op_part(tmp, found, found_part);        /* (the next child runs op `found` again, whole: its entries are absolute values) */
       memcpy(model, tmp, sizeof(*model));
       K0 = found;
     }
@@ -1564,9 +1585,12 @@ static void test_kill_loop(int iters, int mode) {
          "  %d replayed records in total, %d exact-end matches, %d begun-but-lost operations; %d opens found removed segments (%u segment numbers at the most)\n",
          fresh, crashed, countdown_hits, tampered, older, torn, replayed_total, exact, lost_ops, with_free, max_segs);
   if (mode >= 3) printf("  %d kills planned at a step of a %s\n", hk_kills, mode == 3 ? "checkpoint" : "growth");
+  if (mode == 2) printf("  %d recoveries found a group of entries applied in part (a kill between the records of one call)\n", part_groups);
   atomic_store(&g_hk_step, 0);
   free(model);
   free(tmp);
+  free(tmp2);
+  free(tmp3);
   munmap(shm, sizeof(*shm));
   tdir_free(&d);
   g_kill_mode = 0;
@@ -2194,6 +2218,9 @@ static void test_growth_sync_fails(void) {
       if (rc != 0) break;
       n++;
     }
+    /* a growth of the index that a put started is built on a thread of its own (no flusher does not stop that) and may put its generation in after the last put: wait for it, or the
+     * generation read here is older than the one its journal record names (store_reserve() waits for a build that runs, and with 0 zones does nothing else) */
+    if (store_reserve(c, 0) != 0) _exit(4);
     store_stats_t st;
     store_stats(c, &st);
     uint64_t out[6] = { (uint64_t)(int64_t)rc, st.ix_gen, st.zones_stored, n, st.write_errors, st.growths };
@@ -4536,6 +4563,7 @@ static bool file_tail_equal(const char *p, const char *q, off_t from) {
   return ok;
 }
 
+static void gj_hold_build(int step) { if (step == 1) usleep(5000000); }       /* (a build of the index outside the mutex does not end while the group is written) */
 static void test_group_journal(void) {
   printf("[group commit: the journal record, a torn record, kill -9]\n");
   /* 1. a group of one is the record of store_set_known() */
@@ -4634,6 +4662,78 @@ static void test_group_journal(void) {
       CHECK_EQ(store_close(s), 0);
     }
     tdir_free(&d);
+  }
+  /* 3. a group that the index growth splits: the entries past one half of the index wait for the growth (the build outside the mutex is held back here), so the call writes the first
+   * entries as one record, the growth as the next, the rest as a third.  kill -9 at every crash point of the call: after the replay the group's zones are a prefix of the entries in the
+   * order of the call (each record whole or not there), and some kills keep only the first record (the call is not one unit: what the kill -9 loop's model allows) */
+  {
+    int parts = 0, whole = 0, none = 0, bad = 0, runs = 0;
+    for (long c = 1; c < 400 && !bad; c++) {
+      tdir_t d;
+      tdir_new(&d, "gjs");
+      store_opts_t o;
+      small_opts(&o);
+      o.sync_policy = STORE_SYNC_NONE;
+      o.checkpoint_interval_ms = UINT32_MAX;
+      fflush(stdout);
+      pid_t pid = fork();
+      if (pid == 0) {
+        atomic_store(&store_test_no_flusher, true);
+        atomic_store(&store_test_regrow_hook, gj_hold_build);
+        store_t *s = NULL;
+        if (store_open(d.fd, &o, &s) != 0) _exit(3);
+        store_view_add(s, "v0");
+        for (uint32_t i = 0; i < 500; i++) { store_meta_t m = meta_of(i, 1); char nm[160]; name_of(i, nm, sizeof(nm)); if (store_set_known(s, 0, nm, strlen(nm), &m, NULL) != 0) _exit(4); }
+        gk_t g[64];
+        store_known_t in[64];
+        int r[64];
+        for (unsigned j = 0; j < 64; j++) {
+          name_of(1000 + j, g[j].nm, sizeof(g[j].nm));
+          g[j].m = meta_of(1000 + j, 1);
+          in[j].name = g[j].nm; in[j].len = strlen(g[j].nm); in[j].meta = &g[j].m;
+        }
+        store_test_crash_countdown = c;
+        if (store_set_known_n(s, 0, in, 64, r, NULL) != 0) _exit(5);
+        store_test_crash_countdown = 0;
+        for (unsigned j = 0; j < 64; j++) if (r[j] != 0) _exit(6);
+        _exit(0);
+      }
+      int stt = 0;
+      waitpid(pid, &stt, 0);
+      const bool killed = WIFSIGNALED(stt);
+      if (!killed) CHECK(WIFEXITED(stt) && WEXITSTATUS(stt) == 0);
+      o.create = false;
+      store_t *s = NULL;
+      CHECK_EQ(store_open(d.fd, &o, &s), 0);
+      if (s) {
+        unsigned found = 0;
+        bool prefix = true;
+        store_read_lock();
+        for (unsigned j = 0; j < 64; j++) {
+          char nm[160];
+          name_of(1000 + j, nm, sizeof(nm));
+          const bool there = store_find(s, 0, nm, strlen(nm)) != STORE_NONE;
+          if (there && found != j) prefix = false;
+          if (there) found++;
+        }
+        store_read_unlock();
+        store_stats_t st;
+        store_stats(s, &st);
+        if (!prefix || st.zones_known != 500 + found || st.recovery.rebuilt) bad++;
+        if (found == 64) whole++;
+        else if (found == 0) none++;
+        else parts++;
+        check_consistent(s, "split group");
+        CHECK_EQ(store_close(s), 0);
+      }
+      tdir_free(&d);
+      runs++;
+      if (!killed) break;                                                     /* (the countdown is past the call's crash points) */
+    }
+    printf("  a group split by the index growth, killed at each of %d crash points: %d whole, %d none, %d in part (a prefix)\n", runs, whole, none, parts);
+    CHECK_EQ(bad, 0);
+    CHECK(parts > 0);
+    CHECK(whole > 0 && none > 0);
   }
 }
 
