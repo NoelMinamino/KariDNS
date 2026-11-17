@@ -6362,6 +6362,7 @@ static int run_heap(int nz, const char *mode) {
 }
 
 int main(int argc, char **argv) {
+    signal(SIGPIPE, SIG_IGN);                               /* (as the server does, dns_server_core.c: a write to a stream whose other end the test closed is EPIPE, not the end of the process; the parts inherit it) */
     zi_www_varies = 1;                                      /* (the www address of a zone follows its serial) */
     setvbuf(stdout, NULL, _IOLBF, 0);                       /* (a log that shows where the time goes, also through a pipe) */
     g_self = argv[0];
