@@ -32,7 +32,7 @@
 #define STORE_STATUS_SAMPLE_PAGES  4096     /* the most pages mincore() looks at per sample */
 #define STORE_STATUS_SAMPLE_TTL_MS 10000    /* a sample is reused this long */
 #define STORE_STATUS_HIST_BUCKETS  25       /* <= 1 us, <= 2 us, ... <= 2^23 us (8.4 s), more */
-#define STORE_STATUS_FINE_BUCKETS  177      /* 0.7: the percentiles' histogram: 0 .. 7 us one each, then eight per power of two (an eighth of an octave) up to 2^24 - 1 us, more */
+#define STORE_STATUS_FINE_BUCKETS  STORE_FINE_BUCKETS    /* 0.7: the percentiles' histogram: 0 .. 7 us one each, then eight per power of two (an eighth of an octave) up to 2^24 - 1 us, more */
 #define STORE_STATUS_OUT_MAX       32768    /* the reply is always shorter than this (the callers' buffers are this big or larger) */
 
 enum { STORE_FMT_TEXT = 0, STORE_FMT_JSON = 1, STORE_FMT_KV = 2 };
@@ -108,6 +108,10 @@ typedef struct store_recon {
   uint64_t rt_busy_pct, rt_entries_per_s, rt_queued, rt_apply_ns_per_entry, rt_entries, rt_pages, rt_full_stops, rt_group_records, rt_group_entries, rt_loop_max_us, rt_stream_max_us;
   /* 0.7 fix A: the mutex of the writers of the records (dns_db_store.c g_rec_mu): holds since the start, those of 1 ms or more, the longest hold, the longest wait for it (microseconds) */
   uint64_t rec_holds, rec_holds_slow, rec_hold_max_us, rec_wait_max_us;
+  uint64_t rec_hold_fine[STORE_FINE_BUCKETS];   /* 0.7: every hold of the records lock (store.lock.records_hold_p999_us) */
+  uint64_t settle_errors;        /* 0.7: settles after the records lock that found the journal full or failed (the calls had returned 0) */
+  uint64_t batch_store_errors;   /* batch ends whose commit failed (the cursor stays where it was durable) */
+  int      batch_store_last;     /* the result of the last batch end's commit (0, -errno) */
 } store_recon_t;
 /* fills *out and returns true, or returns false when the server has none (no loader) */
 void store_status_set_recon_fn(bool (*fn)(store_recon_t *out));

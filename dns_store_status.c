@@ -48,13 +48,7 @@ static unsigned bucket_of(uint64_t ns) {
   return b >= STORE_STATUS_HIST_BUCKETS - 1 ? STORE_STATUS_HIST_BUCKETS - 1 : b;
 }
 /* the fine buckets: 0 .. 7 us one each; from 8 us on, the power of two e (2^e <= us) and the three bits below its top bit: bucket (e - 2) x 8 + those bits, up to e = 23 */
-unsigned store_status_fine_bucket(uint64_t ns) {
-  const uint64_t us = (ns + 999) / 1000;
-  if (us < 8) return (unsigned)us;
-  const unsigned e = 63u - (unsigned)__builtin_clzll(us);
-  if (e > 23) return STORE_STATUS_FINE_BUCKETS - 1;
-  return (e - 2) * 8u + (unsigned)((us >> (e - 3)) & 7u);
-}
+unsigned store_status_fine_bucket(uint64_t ns) { return store_fine_bucket_us((ns + 999) / 1000); }    /* (the scheme is the store's: store_fine_bucket_us()) */
 uint64_t store_status_fine_upper_us(unsigned i) {
   if (i >= STORE_STATUS_FINE_BUCKETS - 1) return UINT64_MAX;
   if (i < 8) return i;
@@ -482,6 +476,10 @@ static void add_recon(list_t *l) {
   U("store.lock.records_holds", r->rec_holds);
   U("store.lock.records_holds_slow", r->rec_holds_slow);
   U("store.lock.records_hold_max_us", r->rec_hold_max_us);
+  U("store.lock.records_hold_p999_us", store_status_fine_pct(r->rec_hold_fine, 999, r->rec_hold_max_us * 1000));
+  U("store.recon.settle_errors", r->settle_errors);
+  U("store.recon.batch_store_errors", r->batch_store_errors);
+  U("store.recon.batch_store_last_error", r->batch_store_last < 0 ? -r->batch_store_last : 0);
   U("store.lock.records_wait_max_us", r->rec_wait_max_us);
   U("store.recon.guard.held_views", r->guard_views);
   if (r->guard_views) {
@@ -669,6 +667,23 @@ static void add_store(list_t *l, const store_t *s, const store_attach_stats_t *a
   U("store.journal.limit_wait_us", st->journal_limit_wait_us);
   U("store.journal.limit_wait_max_us", st->journal_limit_wait_max_us);
   U("store.journal.commit_switches", st->journal_commit_switches);
+  {                                                                              /* 0.7: the journal ring (the record is written after the writer mutex) */
+    static const char *const jst[] = { "ok", "nospace", "failed" };
+    add_s(l, "store.journal.state", jst[st->journal_state < 0 || st->journal_state > 2 ? 2 : st->journal_state]);
+  }
+  U("store.journal.error", st->journal_error);
+  U("store.journal.failed_at_unix", st->journal_failed_unix);
+  U("store.journal.ring_bytes", st->ring_bytes);
+  U("store.journal.ring_unwritten_bytes", st->ring_unwritten_bytes);
+  U("store.journal.ring_peak_bytes", st->ring_peak_bytes);
+  U("store.journal.ring_waits", st->ring_waits);
+  U("store.journal.ring_wait_max_us", st->ring_wait_max_us);
+  U("store.journal.ring_full_in_lock", st->ring_full_in_lock);
+  U("store.journal.leader_writes", st->leader_writes);
+  U("store.journal.bytes_per_write", st->leader_writes ? st->leader_bytes / st->leader_writes : 0);
+  U("store.journal.write_max_us", st->leader_write_max_us);
+  U("store.journal.retries", st->leader_retries);
+  U("store.journal.ck_waits", st->checkpoint_journal_waits);
   U("store.writes.prewrites", st->image_prewrites);
   U("store.writes.prewrite_misses", st->image_prewrite_misses);
   U("store.checkpoint.count", st->checkpoints);
@@ -690,6 +705,9 @@ static void add_store(list_t *l, const store_t *s, const store_attach_stats_t *a
   U("store.lock.writer_holds", st->lock_holds);
   U("store.lock.writer_holds_slow", st->lock_holds_slow);
   U("store.lock.writer_hold_max_us", st->lock_hold_max_us);
+  U("store.lock.writer_hold_p50_us", store_status_fine_pct(st->lock_hold_fine, 500, st->lock_hold_max_us * 1000));
+  U("store.lock.writer_hold_p99_us", store_status_fine_pct(st->lock_hold_fine, 990, st->lock_hold_max_us * 1000));
+  U("store.lock.writer_hold_p999_us", store_status_fine_pct(st->lock_hold_fine, 999, st->lock_hold_max_us * 1000));
   add_s(l, "store.lock.writer_hold_max_site", st->lock_hold_max_site ? st->lock_hold_max_site : "-");
   for (uint32_t i = 0; i < st->lock_nsites && i < STORE_LOCK_SITES; i++) {          /* 0.7: the holds of 1 ms or more by function */
     const store_lock_site_t *w = &st->lock_sites[i];

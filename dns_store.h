@@ -47,7 +47,8 @@
  *  So the rights to limit the fd to: CAP_LOOKUP, CAP_CREATE, CAP_READ, CAP_WRITE, CAP_SEEK, CAP_MMAP_RW, CAP_FSYNC, CAP_FTRUNCATE,
  *  CAP_FALLOCATE, CAP_FSTAT, CAP_FSTATFS, CAP_UNLINKAT.  The boot id (opts.boot_id) must be passed in: sysctl is not available there.
  *
- *  Durability.  A writer call is applied and visible to readers when it returns.  It is recoverable after kill -9 at once; it
+ *  Durability.  A writer call is applied and visible to readers when it returns (0.7: and to readers before its journal record is in the kernel: the record is written after
+ *  the writer mutex, see "The journal ring" in dns_store.c; a kill -9 in that window loses the change, which the call had not returned yet).  It is recoverable after kill -9 at once; it
  *  is durable against power loss after the next commit: store_commit() (a "batch end"), the periodic commit of the policy in
  *  store_opts_t (every sync_interval_ms, made by the flusher thread), or a checkpoint.  A commit that fails in the background is
  *  counted (write_errors, STORE_ST_DEGRADED_NOSPC for a full disk) and tried again; store_commit() and STORE_SYNC_EVERY return its error.
@@ -93,6 +94,13 @@ enum {
 /* store_stats_t.state bits */
 #define STORE_ST_DEGRADED_NOSPC 0x1u  /* no room: the last write failed with ENOSPC / EFBIG / EDQUOT, or the store is degraded (new and changed zones are kept as records without an image, see store_put()); cleared by the next write that works, in the degraded state by the next image that is stored */
 #define STORE_ST_REPAIRED       0x2u  /* the last open had to rebuild the derived tables */
+/* 0.7, the journal ring: the state of the write of the journal (store_stats_t.journal_state) */
+#define STORE_JOURNAL_OK        0     /* records are written as they come */
+#define STORE_JOURNAL_NOSPACE   1     /* a write met ENOSPC: new records and every wait fail with -ENOSPC until the flusher's retry passes (the file system has room again) */
+#define STORE_JOURNAL_FAILED    2     /* a write failed (EIO): the store takes no more records, writes no table page and no clean checkpoint; a restart replays the written prefix */
+/* the eighth-of-an-octave histogram of times (0.7; store.lock.*_p*_us, store.attach / store.cold): 0 .. 7 us one each, then eight buckets per power of two up to 2^24 - 1 us, more */
+#define STORE_FINE_BUCKETS 177
+unsigned store_fine_bucket_us(uint64_t us);
 
 typedef struct store store_t;
 
@@ -302,6 +310,19 @@ typedef struct store_stats {
   uint64_t checkpoint_table_bytes;  /* bytes of the tables that checkpoints wrote since the open */
   uint64_t checkpoint_table_last_bytes; /* ... the last one */
   uint64_t checkpoint_paced_us;     /* the time fuzzy checkpoints waited to stay under their write rate (ck_pace()) */
+  /* ---- 0.7: the journal ring (the record is written after the writer mutex) ---- */
+  int      journal_state;           /* STORE_JOURNAL_* */
+  int      journal_error;           /* the errno of the last write that failed (0: none since the state was ok) */
+  uint64_t journal_failed_unix;     /* when the state became STORE_JOURNAL_FAILED (0: never) */
+  uint64_t ring_bytes;              /* the ring's memory in use: the pages it has touched (at most 64 MiB; counted in memory-limit) */
+  uint64_t ring_unwritten_bytes;    /* reserved and not yet in the kernel, now */
+  uint64_t ring_peak_bytes;         /* ... the most since the open */
+  uint64_t ring_waits, ring_wait_max_us;   /* writer calls that waited before the writer mutex for room in the ring, and the longest wait */
+  uint64_t ring_full_in_lock;       /* reservations that found the ring full inside the mutex and wrote it there */
+  uint64_t leader_writes, leader_bytes, leader_write_max_us;   /* the pwrite() calls of the leaders, their bytes, the longest one */
+  uint64_t leader_retries;          /* writes tried again after an error */
+  uint64_t checkpoint_journal_waits;  /* runs of table pages a checkpoint held until the journal was written up to them (rule T) */
+  uint64_t lock_hold_fine[STORE_FINE_BUCKETS];   /* every hold of the writer mutex (store.lock.writer_hold_p50_us, _p99_us, _p999_us) */
 } store_stats_t;
 
 /* What one store_compact() did. */
@@ -415,6 +436,11 @@ int  store_set_known(store_t *s, uint16_t view, const char *name, size_t len, co
 #define STORE_GROUP_MAX 32              /* entries of one group record (64 before 0.7's writer-hold fixes) */
 typedef struct { const char *name; size_t len; const store_meta_t *meta; } store_known_t;
 int  store_set_known_n(store_t *s, uint16_t view, const store_known_t *in, size_t n, int *res, uint32_t *zid);
+/* 0.7, deferral: on (true) the calls of this thread on this store return after the apply without waiting for their journal record to be in the kernel (the flusher writes it,
+ * store_settle() or a commit waits for it); off clears the thread's slot (before the thread ends: thread ids are reused).  -EAGAIN without a flusher or after the store began to
+ * stop (the calls wait then), -EBUSY when the slots are taken.  store_settle(): the records of this thread's deferred calls are in the kernel (0), or the journal's error. */
+int  store_defer(store_t *s, bool on);
+int  store_settle(store_t *s);
 int  store_delete(store_t *s, uint32_t zid);
 int  store_delete_name(store_t *s, uint16_t view, const char *name, size_t len);
 /* change zt.flags (set, then clear bits) without touching the image (NOTIFY_DUE, REJECTED_NEW, ...) */
@@ -546,9 +572,15 @@ extern _Atomic long store_test_fail_ckwrite;
 bool store_test_files_match(store_t *s);
 /* a hold of the writer mutex by the function `site` that lasted `us` microseconds (its start is set back): the counters of the holds as for a real one */
 void store_test_hold(store_t *s, const char *site, uint64_t us);
-/* is the writer mutex free now (no thread holds it)?  and: called before each retired index generation or segment is released (its memory unmapped, its descriptor closed) */
+/* is the writer mutex not held by the calling thread?  and: called before each retired index generation or segment is released (its memory unmapped, its descriptor closed) */
 bool store_test_writer_free(store_t *s);
 extern void (*store_test_retire_free)(store_t *s);
+/* the journal ring: the leader's write of [pos, pos + len) fails with the errno this returns (0: it is written); a hook at the leader's steps (1: a round begins, 2: a span was
+ * written); the rule-T wait of the checkpoint is left out (the negative control of the tests); the ring's size for the stores opened while it is set (0: 64 MiB) */
+extern int (*_Atomic store_test_jw_fault)(uint64_t pos, uint64_t len);
+extern void (*_Atomic store_test_jw_hook)(store_t *s, int step);
+extern _Atomic bool store_test_no_rule_t;
+extern _Atomic uint64_t store_test_jr_cap;
 /* a word (byte offset off, a multiple of 8) of the memory of a table: 0 zt, 1 zc, 2 nx, 3 the current ix, 4 the current sx (the tables are private memory since 0.7: a test that damages a cell
  * does it here, not in the file); poke marks it for the next checkpoint */
 uint64_t store_test_peek(store_t *s, int which, uint64_t off);
@@ -559,6 +591,9 @@ extern int (*store_test_write_fault)(const char *op, uint32_t zid);
 extern void (*store_test_in_stats)(void);
 /* the free bytes of the store's file system, as the test wants them (a negative value = ask the file system) */
 extern int64_t (*store_test_fs_free)(void);
+/* ... and its size (NULL: 1 GiB at least); the floor the journal keeps free (-1: jr_floor(), the default; >= 0: that many bytes) */
+extern int64_t (*_Atomic store_test_fs_total)(void);
+extern _Atomic int64_t store_test_jr_floor;
 /* an append of an image record fails with the errno this returns (not 0) before it writes anything: the disk fills up between the free-space check and the write */
 extern int (*store_test_append_fault)(uint64_t reclen);
 /* called at the start of every slice of the cleaner (writer mutex held) with the segment it is emptying: a test takes a reference of an image there (store_image_read does not need the mutex) */
