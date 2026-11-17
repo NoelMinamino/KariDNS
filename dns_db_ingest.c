@@ -1666,6 +1666,7 @@ bool db_ingest_lookup_stats(store_lookup_t *out) {
 }
 #define ING_BUSY_WINDOW_NS 10000000000LL
 static _Atomic bool g_ma_event;                            /* 0.7 P-F: a start or a full load ended: the cache thread says what the database needs in memory (ma_tick()) */
+static _Atomic bool g_ma_loaded;                           /* 0.7 P-F: the first full load has ended: before it the registry holds only part of the zones, and an estimate from them would name a wrong count */
 static void fq_hist_add(int64_t ms) {
   int b = ms <= 1 ? 0 : ms <= 10 ? 1 : ms <= 100 ? 2 : ms <= 1000 ? 3 : 4;
   atomic_fetch_add_explicit(&g_fq_hist[b], 1, memory_order_relaxed);
@@ -2479,8 +2480,10 @@ static void on_batch_end(ing_t *g, const kdb_msg_t *m) {
       syslog(LOG_INFO, "[DB] initial load complete: %zu zone(s) served from the database", total);
     }
   }
-  if (g->batch_kind == KDB_BATCH_STARTUP || g->batch_kind == KDB_BATCH_FULL)
+  if (g->batch_kind == KDB_BATCH_STARTUP || g->batch_kind == KDB_BATCH_FULL) {
+    atomic_store_explicit(&g_ma_loaded, true, memory_order_relaxed);
     atomic_store_explicit(&g_ma_event, true, memory_order_relaxed);        /* 0.7 P-F: the cache thread says what the database needs */
+  }
   if (g->req_wait) {                                     /* 0.7 WP7b: a reload of one zone: the body is being fetched, and the answer says what became of it: the loader (it waits for BATCH_RESULT) and the request wait for it */
     g->defer_end = true;
     g->defer_batch = b->batch_id;
@@ -4973,7 +4976,7 @@ static void ma_check(uint64_t limit, bool event) {
 static void ma_tick(uint64_t limit, int64_t now) {
   static int64_t next_check, next_rt;
   bool ev = atomic_exchange_explicit(&g_ma_event, false, memory_order_relaxed);
-  if (ev || limit != g_ma_est.limit || now >= next_check) {
+  if (ev || (atomic_load_explicit(&g_ma_loaded, memory_order_relaxed) && (limit != g_ma_est.limit || now >= next_check))) {
     ma_check(limit, ev);
     next_check = now + 10000 + (int64_t)g_ma_est.zones / 20;       /* (10 s and 50 us a zone: the count walks the registry, 60 s at a million zones) */
   }
