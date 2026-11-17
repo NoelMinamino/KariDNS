@@ -544,6 +544,9 @@ extern _Atomic long store_test_fail_ckwrite;
 bool store_test_files_match(store_t *s);
 /* a hold of the writer mutex by the function `site` that lasted `us` microseconds (its start is set back): the counters of the holds as for a real one */
 void store_test_hold(store_t *s, const char *site, uint64_t us);
+/* is the writer mutex free now (no thread holds it)?  and: called before each retired index generation or segment is released (its memory unmapped, its descriptor closed) */
+bool store_test_writer_free(store_t *s);
+extern void (*store_test_retire_free)(store_t *s);
 /* a word (byte offset off, a multiple of 8) of the memory of a table: 0 zt, 1 zc, 2 nx, 3 the current ix, 4 the current sx (the tables are private memory since 0.7: a test that damages a cell
  * does it here, not in the file); poke marks it for the next checkpoint */
 uint64_t store_test_peek(store_t *s, int which, uint64_t off);

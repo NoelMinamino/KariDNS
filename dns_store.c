@@ -425,6 +425,7 @@ struct store {
   _Atomic uint64_t last_sync_ms, last_ckpt_ms;
   jb_t jb;
   retire_t *rq_head, *rq_tail;
+  retire_t *rq_free;                                  /* (the mutex) what retire_run() took off the queue: freed by wr_unlock_raw() after the unlock (an munmap of a generation is 20 to 60 ms at 10M zones) */
 
   /* ---- 0.7 fix A: the I/O outside the writer mutex (see the top of the file) ----
    * Lock order: wlock, then bg_mu (innermost; nothing is waited for while it is held, except on bg_cv).  io_busy (the I/O baton: one commit at a
@@ -1416,15 +1417,32 @@ static void retire_add_seg(store_t *s, seg_t *g) {
   if (s->rq_tail) s->rq_tail->next = r; else s->rq_head = r;
   s->rq_tail = r;
 }
+/* (writer mutex held) the generations and segments whose grace period has passed leave the queue; their memory and descriptors are released by wr_unlock_raw() after the unlock: no
+ * reader can reach them (grace period) and no commit or checkpoint uses them (io_hold was 0 under the mutex; the ones that start later take the current generations and segments) */
 static void retire_run(store_t *s, bool force) {
   if (!force && atomic_load_explicit(&s->io_hold, memory_order_acquire) > 0) return;      /* (a commit or a checkpoint syncs a segment or a generation outside the mutex) */
   while (s->rq_head && (force || rcu_writer_is_safe(s->rq_head->epoch))) {
     retire_t *r = s->rq_head;
     s->rq_head = r->next;
     if (!s->rq_head) s->rq_tail = NULL;
+    r->next = s->rq_free;
+    s->rq_free = r;
+  }
+}
+#ifdef KARIDNS_UNIT_TEST
+void (*store_test_retire_free)(store_t *s) = NULL;
+#endif
+static void retire_free(store_t *s, retire_t *r) {
+  (void)s;
+  while (r) {
+    retire_t *n = r->next;
+#ifdef KARIDNS_UNIT_TEST
+    if (store_test_retire_free) store_test_retire_free(s);
+#endif
     ixgen_free(r->g);
     if (r->sg) seg_free(r->sg);
     free(r);
+    r = n;
   }
 }
 
@@ -1972,7 +1990,10 @@ static void wr_unlock_raw(store_t *s) {
     say = s->wl_log_ms == 0 || now - s->wl_log_ms >= 60000u;
     if (say) s->wl_log_ms = now ? now : 1;
   }
+  retire_t *const rf = s->rq_free;                    /* (retire_run(): released with the mutex given up) */
+  s->rq_free = NULL;
   pthread_mutex_unlock(&s->wlock);
+  retire_free(s, rf);
   if (say) st_log(s, 4, "store: the writer mutex was held for %" PRIu64 " ms by %s (store.lock.writer_hold_max_us)", h / 1000u, site);
 }
 
@@ -4826,6 +4847,11 @@ void store_test_hold(store_t *s, const char *site, uint64_t us) {
   wr_lock_raw_at(s, site);
   s->wl_t0 -= us;
   wr_unlock_raw(s);
+}
+bool store_test_writer_free(store_t *s) {
+  if (pthread_mutex_trylock(&s->wlock) != 0) return false;
+  pthread_mutex_unlock(&s->wlock);
+  return true;
 }
 bool store_test_files_match(store_t *s) {
   wr_lock_raw(s);

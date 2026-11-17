@@ -859,14 +859,15 @@ could be started)
 Holds of the store's writer mutex since the open, those of 1 ms or more, the
 longest one in microseconds, and the function that held it (\fB\-\fR before the
 first hold). No sync of the disk is waited for inside it (0.7); a long hold is
-CPU work of one call (an nx pass, a repair, a growth inside the mutex), or a
-wait of the disk that another thread causes: a store into a page of the tables
-waits while a checkpoint writes that page out, and the append of a journal
-record meets the file system's back-pressure (up to 2.7 s were measured in a
-first fill of ten million zones under load; 0.7 no longer appends to a file that
-a sync holds: see \fB.journal.commit_switches\fR and
-\fBstore.writes.prewrites\fR). A hold of a second or more is also logged (at
-most once a minute) with its function
+CPU work of one call (an nx pass, a repair, a growth inside the mutex; the
+memory of a replaced index generation is released after it, 0.7), or a wait of
+the disk that another thread causes: a store into a page of the tables waits
+while a checkpoint writes that page out, and the append of a journal record
+meets the file system's back-pressure (up to 2.7 s were measured in a first fill
+of ten million zones under load; 0.7 no longer appends to a file that a sync
+holds: see \fB.journal.commit_switches\fR and \fBstore.writes.prewrites\fR). A
+hold of a second or more is also logged (at most once a minute) with its
+function
 .TP 8
 \fBstore.lock.site.<function>.slow\fR, \fB.over_10ms\fR, \fB.over_100ms\fR, \fB.slow_us\fR, \fB.max_us\fR
 The holds of the writer mutex of 1 ms or more by the function that took it

@@ -2796,6 +2796,44 @@ static void test_growth_catchup(void) {
   }
 }
 
+/* 0.7: a retired index generation is released (munmap, close) after the writer mutex is given up, not inside it (20 to 60 ms holds at 10M zones) */
+static _Atomic int g_rf_n, g_rf_locked;
+static void rf_hook(store_t *s) {
+  atomic_fetch_add(&g_rf_n, 1);
+  if (!store_test_writer_free(s)) atomic_fetch_add(&g_rf_locked, 1);
+}
+static void test_retire_after_unlock(void) {
+  printf("[a retired index generation is released after the writer mutex]\n");
+  tdir_t d;
+  tdir_new(&d, "rfree");
+  store_opts_t o;
+  small_opts(&o);
+  o.checkpoint_interval_ms = UINT32_MAX;
+  o.scrub_interval_s = UINT32_MAX;
+  atomic_store(&store_test_no_flusher, true);                            /* (no other thread takes the mutex while the hook looks at it) */
+  store_t *s = NULL;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (s) {
+    CHECK_EQ(store_view_add(s, "default"), 0);
+    atomic_store(&g_rf_n, 0);
+    atomic_store(&g_rf_locked, 0);
+    store_test_retire_free = rf_hook;
+    store_stats_t st;
+    uint32_t i = 0;
+    for (store_stats(s, &st); st.growths == 0 && i < 5000; i++) { CHECK_EQ(put_i(s, 0, i, 1, NULL), 0); store_stats(s, &st); }
+    for (int w = 0; w < 5000 && st.growths_background != st.growths; w++) { usleep(1000); store_stats(s, &st); }    /* (a build on its thread: it has ended) */
+    for (uint32_t k = 0; k < 50 && atomic_load(&g_rf_n) == 0; k++) { CHECK_EQ(put_i(s, 0, i++, 1, NULL), 0); usleep(1000); }
+    store_test_retire_free = NULL;
+    CHECK(st.growths >= 1);
+    CHECK(atomic_load(&g_rf_n) >= 1);
+    CHECK_EQ(atomic_load(&g_rf_locked), 0);
+    check_consistent(s, "after the release");
+    CHECK_EQ(store_close(s), 0);
+  }
+  atomic_store(&store_test_no_flusher, false);
+  tdir_free(&d);
+}
+
 static void test_journal_bound(int mode) {
   printf("[the journal stays below 2 x journal_max_bytes while a checkpoint is slow; a close leaves a fuzzy checkpoint (%s)]\n", mode == STORE_MODE_MAP ? "MAP" : "COPY");
   tdir_t d;
@@ -5172,7 +5210,7 @@ int main(void) {
   if (WANT("group")) { test_group_commit(STORE_MODE_MAP); test_group_commit(STORE_MODE_COPY); test_group_journal(); }
   if (WANT("kill")) test_kill_loop(iters, 0);
   if (WANT("kgrp")) test_kill_loop(UNDER_TSAN ? 25 : 50, 2);
-  if (WANT("nowait")) { test_no_wait_in_lock(STORE_MODE_MAP); test_no_wait_in_lock(STORE_MODE_COPY); test_growth_catchup(); }
+  if (WANT("nowait")) { test_no_wait_in_lock(STORE_MODE_MAP); test_no_wait_in_lock(STORE_MODE_COPY); test_growth_catchup(); test_retire_after_unlock(); }
   if (WANT("jbound")) { test_journal_bound(STORE_MODE_MAP); test_journal_bound(STORE_MODE_COPY); }
   if (WANT("kfz")) test_kill_loop(UNDER_TSAN ? 25 : 50, 3);
   if (WANT("kgrow")) test_kill_loop(UNDER_TSAN ? 20 : 50, 4);
