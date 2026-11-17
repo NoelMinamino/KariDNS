@@ -14,7 +14,7 @@ import { canonicalZone, absolute } from '../names.js';
 import { templateComment } from '../templates.js';
 import { dnskeyView } from '../dnssec.js';
 import { KINDS, metaKind, metaProblem, MAX_ROWS } from '../meta.js';
-import { dataset, zoneParam, zoneGrants, requireGlobal } from './common.js';
+import { dataset, zoneParam, zoneGrants, requireGlobal, withWarnings } from './common.js';
 
 const EDIT_MS = 120000;            // the tools may take this long for one change set (a large zone is read twice)
 const IMPORT_RUN_MS = 300000;      // ... and this long for an import
@@ -60,10 +60,10 @@ export async function rrsetsPatch(ctx) {
   const facts = await loadFacts(ctx, ds, zone);
   editable(facts);
   const want = wantReload(app, ch.reload);
-  return runChange(ctx, {
+  return withWarnings(await runChange(ctx, {
     ds, zone, facts, kind: 'edit', rrsets: ch.rrsets, label: rrsetLabel, maps: renderChangeFile(ch.rrsets), expectations: renderExpectations(ch.rrsets),
     comment: ch.comment, dryRun: ch.dryRun, want, timeoutMs: EDIT_MS,
-  });
+  }), ch.warnings);
 }
 
 // A zone text goes to the zone-file parser of the server.  $INCLUDE is refused there (standard input has no directory).  $GENERATE is refused here: a line of 30
@@ -105,8 +105,9 @@ export async function zoneCreate(ctx) {
   requireGlobal(ctx);
   const ds = dataset(ctx);
   const c = parseCreate(ctx.body, { types: app.types });
+  const warnings = [];
   let zone;
-  try { zone = canonicalZone(c.name); } catch (e) { throw badRequest(e.message, '/name'); }
+  try { zone = canonicalZone(c.name, warnings); } catch (e) { throw badRequest(e.message, '/name'); }
   if (await ctx.db((tx) => S.zoneId(tx, ds.schema, zone)) !== undefined) throw new ApiError(409, 'exists', 'a zone of this name exists already');
   const want = wantReload(app, c.reload);
   const base = { ds, zone, facts: null, create: true, zoneType: c.kind, kind: 'create', comment: c.comment, dryRun: c.dryRun, want, timeoutMs: EDIT_MS };
@@ -120,10 +121,10 @@ export async function zoneCreate(ctx) {
       tpl = await ctx.db((tx) => (c.templateId !== undefined ? S.getTemplate(tx, c.templateId) : S.getTemplateByName(tx, c.template)));
       if (!tpl) throw notFound('no such template');
     }
-    const made = createRRsets(c, zone, tpl);
+    const made = createRRsets(c, zone, tpl, warnings);
     spec = { ...base, rrsets: made.rrsets, label: made.label, maps: renderChangeFile(made.rrsets, made.label), ...(tpl ? { comment: templateComment(tpl, c.comment) } : {}) };
   }
-  const r = await runChange(ctx, spec);
+  const r = withWarnings(await runChange(ctx, spec), warnings);
   if (!r.committed) return r;
   return reply(201, { zone: absolute(zone), ...r }, { headers: { Location: `/api/v1/datasets/${ds.name}/zones/${absolute(zone)}` } });
 }

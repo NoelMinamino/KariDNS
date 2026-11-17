@@ -37,12 +37,12 @@ const FIELDS = (required) => ({
 });
 
 // One record of a template: the owner relative (no final dot), the type upper case and not SOA or a DNSSEC type, the RDATA safe in a zone file.
-function recordOf(r, i, types) {
+function recordOf(r, i, types, warnings) {
   const at = `/records/${i}`;
   let owner = r.owner;
   if (owner !== '@') {
     if (owner.endsWith('.')) throw badRequest("the owner is relative to the zone: no final dot ('@' is the apex)", `${at}/owner`);
-    try { owner = canonicalOwner(owner); } catch (e) { throw badRequest(e.message, `${at}/owner`); }
+    try { owner = canonicalOwner(owner, warnings); } catch (e) { throw badRequest(e.message, `${at}/owner`); }
   }
   const type = recordType(r.type, types, `${at}/type`);
   if (type === 'SOA') throw badRequest('the SOA of a zone made from a template comes from the soa fields', `${at}/type`);
@@ -64,7 +64,7 @@ function ttlProblem(records) {
   }
 }
 
-// -> { name?, description?, soa?, records?, dryRun }; only what the body has (a PATCH changes only that).  create: name is required.  soa: null clears the defaults.
+// -> { name?, description?, soa?, records?, warnings? (IDN, of the owners), dryRun }; only what the body has (a PATCH changes only that).  create: name is required.  soa: null clears the defaults.
 export function parseTemplate(body, { types, create = false } = {}) {
   const b = shape(body, FIELDS(create));
   const out = { dryRun: b.dry_run === true };
@@ -78,7 +78,9 @@ export function parseTemplate(body, { types, create = false } = {}) {
     };
   }
   if (b.records !== undefined) {
-    out.records = b.records.map((r, i) => recordOf(r, i, types));
+    const warnings = [];
+    out.records = b.records.map((r, i) => recordOf(r, i, types, warnings));
+    if (warnings.length) out.warnings = warnings;
     ttlProblem(out.records);
   } else if (create) {
     out.records = [];

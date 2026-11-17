@@ -57,7 +57,7 @@ test('the examples use only names and addresses reserved for documentation', () 
     const text = md.replace(/\]\([^)]*\)/g, ']').replace(/`[a-z0-9.-]+\.(md|js|mjs|sh|c|conf|sample)`/g, '');
     // host names: a name ending in a real top-level domain
     const real = [...text.matchAll(/\b[a-z0-9][a-z0-9-]*(?:\.[a-z0-9][a-z0-9-]*)*\.(?:com|net|org|jp|io|dev|info|biz|co|uk|de|fr|ru|cn|us|eu|app|cloud|tokyo|xyz|local)\b/gi)].map((m) => m[0]);
-    assert.deepEqual(real, [], `${name}: a name that may be real`);
+    assert.deepEqual(real.filter((n) => n !== 'ldns.jp'), [], `${name}: a name that may be real`);   // (ldns.jp: the page the interface links to, 0.7)
     for (const m of text.matchAll(/\b(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})\b/g)) {
       assert.ok(m[0].startsWith('192.0.2.') || m[0].startsWith('198.51.100.') || m[0].startsWith('203.0.113.') || m[0] === '127.0.0.1', `${name}: the address ${m[0]}`);
     }

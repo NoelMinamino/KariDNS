@@ -5,6 +5,7 @@ import { h, link, fill, fileLink } from '../dom.js';
 import { render, timeNode } from '../format.js';
 import { problemNodes } from '../widgets.js';
 import { zonePath } from '../zonelib.js';
+import { nameNodes, ldnsLink } from '../idnui.js';
 
 const SECTIONS = [
   ['zone', 'zone.sec-records', () => true],
@@ -62,7 +63,8 @@ export function zoneFrame(ctx, { ds, zone, active }, build) {
       info.last_reload_request ? [t('zone.last-reload'), [`#${info.last_reload_request.generation} `, timeNode(info.last_reload_request.at, i18n.lang)]] : null,
     ].filter(Boolean);
     fill(head, h('section', { class: 'card', 'aria-labelledby': 'zone-title' },
-      h('h1', { id: 'zone-title' }, render(info.name), ' ', badges),
+      h('h1', { id: 'zone-title' }, nameNodes(info.name, info.unicode), ' ', badges),
+      ldnsLink(ctx, info.name, 'SOA'),
       h('dl', null, rows.map(([k, v]) => [h('dt', null, k), h('dd', null, v)])),
       nav));
   }

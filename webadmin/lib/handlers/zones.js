@@ -6,7 +6,8 @@ import { query, LIMIT, CURSOR, decodeCursor, encodeCursor } from '../validate.js
 import * as S from '../store.js';
 import { reply } from '../http.js';
 import { isGlobal, zoneGrant, rrVisible, auditVisible } from '../perm.js';
-import { canonicalOwner, inZone, absolute } from '../names.js';
+import { canonicalOwner, inZone, absolute, unicodeOf } from '../names.js';
+import { asciiName, toAscii } from '../idn.js';
 import { exportArgv, renderArgv } from '../tools.js';
 import { contentProblem, MAX_RRSETS, MAX_RECORDS, ZONE_TEXT_LIMIT } from '../changes.js';
 import { VERSION } from '../app.js';
@@ -25,14 +26,26 @@ export function datasets(ctx) {
   };
 }
 
+// A part of a name to search for (0.7): Unicode is taken; each label with non-ASCII code points becomes its A-label, so it matches as a whole label (punycode
+// keeps no part of a label: '例え' finds 例え.test and www.例え.test, '例' alone does not).  The ASCII parts stay a part of a name as before.  -> the text the
+// store searches for, or a 400 when it is not of `re` then.
+const ZONE_TEXT = { type: 'string', min: 1, max: 255, re: /^[^\0-\x20\x7f]+$/u, reText: 'a part of a name (no spaces or control characters)' };
+function searchText(text, pointer, re) {
+  let ascii;
+  try { ascii = asciiName(text); } catch (e) { throw badRequest(e.message, pointer); }
+  if (!re.test(ascii)) throw badRequest('a part of a name is expected (letters, digits, - _ . and Unicode labels)', pointer);
+  return ascii;
+}
+
 const NAME_CURSOR = (o) => typeof o?.n === 'string' && o.n.length <= 255;
 
 export async function zonesList(ctx) {
   const ds = dataset(ctx);
   const q = query(ctx.query, {
-    limit: LIMIT, cursor: CURSOR, prefix: { type: 'string', min: 1, max: 255, re: /^[A-Za-z0-9_.-]+$/ }, contains: { type: 'string', min: 1, max: 255, re: /^[A-Za-z0-9_.-]+$/ },
+    limit: LIMIT, cursor: CURSOR, prefix: ZONE_TEXT, contains: ZONE_TEXT,
     kind: { type: 'string', values: ['NATIVE', 'MASTER', 'SLAVE', 'PRODUCER', 'CONSUMER'] }, signed: { type: 'bool' },
   });
+  for (const k of ['prefix', 'contains']) if (q[k] !== undefined) q[k] = searchText(q[k], `?${k}`, /^[A-Za-z0-9_.-]+$/);
   const limit = q.limit ?? 100;
   const gs = ctx.auth.grants.filter((g) => g.role === 'global_master' || g.data_schema === ds.schema);
   if (gs.length === 0) return { zones: [], next_cursor: null };
@@ -43,7 +56,7 @@ export async function zonesList(ctx) {
   const zones = [];
   for (const z of p.items) {
     const role = zoneGrant(gs, ds.schema, z.name);
-    if (role) zones.push({ name: absolute(z.name), kind: z.kind, serial: z.serial, presigned: z.presigned, signer: z.signer, catalog: z.catalog, role });
+    if (role) zones.push({ name: absolute(z.name), unicode: unicodeOf(absolute(z.name)), kind: z.kind, serial: z.serial, presigned: z.presigned, signer: z.signer, catalog: z.catalog, role });
   }
   return { zones, next_cursor: p.next_cursor };
 }
@@ -56,7 +69,7 @@ export async function zoneGet(ctx) {
   if (!z) throw notFound('no such zone');
   return {
     zone: {
-      name: absolute(z.name), id: z.id, kind: z.kind, serial: z.serial, catalog: z.catalog, master: z.master, account: z.account, notified_serial: z.notified_serial,
+      name: absolute(z.name), unicode: unicodeOf(absolute(z.name)), id: z.id, kind: z.kind, serial: z.serial, catalog: z.catalog, master: z.master, account: z.account, notified_serial: z.notified_serial,
       presigned: z.presigned, signer: z.signer, nsec3param: z.nsec3param, generation: z.generation, changed_at: z.changed_at, views: z.views,
       signer_state: z.signer_state, waiting_for_signer: z.signer && (z.signer_state?.signed_serial ?? null) !== z.serial, last_reload_request: z.last_reload_request,
       role: gs[0].role, grants: gs.map((g) => grantView(ctx.app, g)),
@@ -72,7 +85,8 @@ function recordText(type, content, prio) {
 }
 
 const RR_CURSOR = (o) => typeof o?.n === 'string' && typeof o?.t === 'string' && o.n.length <= 255 && o.t.length <= 32;
-const OWNER_TEXT = { type: 'string', min: 1, max: 255, re: /^[A-Za-z0-9_.*/-]+$/, reText: 'letters, digits and . _ * / - (a part of a name; a final dot is not needed)' };
+const OWNER_TEXT = { ...ZONE_TEXT, reText: 'letters, digits, . _ * / - and Unicode labels (a part of a name; a final dot is not needed)' };
+const OWNER_ASCII = /^[A-Za-z0-9_.*/-]+$/;
 
 // G2: the records of these RRsets as the text a change set takes (karidns-zone render: the loader's reader and the zone-file writer, one run for the page).  A record
 // that cannot be rendered (the reader refuses it, a type that has no other form, a text a change set would refuse) gets rdata null: the client shows the stored content
@@ -113,8 +127,8 @@ export async function rrsetsList(ctx) {
     if (!inZone(name, zone)) throw badRequest('the name is not in the zone', '?name');
   }
   // G3: the first owner to list, as stored (lower case, no final dot), and a part of an owner (any case)
-  const from = q.from === undefined ? undefined : q.from.toLowerCase().replace(/\.$/, '');
-  const contains = q.contains === undefined ? undefined : q.contains.toLowerCase();
+  const from = q.from === undefined ? undefined : searchText(q.from, '?from', OWNER_ASCII).toLowerCase().replace(/\.$/, '');
+  const contains = q.contains === undefined ? undefined : searchText(q.contains, '?contains', OWNER_ASCII).toLowerCase();
   const cur = q.cursor === undefined ? undefined : decodeCursor(q.cursor, RR_CURSOR);
   const after = cur && { name: cur.n, type: cur.t };
   // a global or domain master reads the whole zone; a subdomain master the names under its suffixes (and the apex SOA and NS)
@@ -143,7 +157,7 @@ export async function rrsetsList(ctx) {
   const rrsets = visible.map((s) => {
     const ttls = s.rows.map((r) => r.ttl).filter((t) => t !== null);
     s.records = s.rows.map((r) => ({ content: recordText(s.type, r.content, r.prio), disabled: r.disabled, ttl: r.ttl }));
-    return { name: absolute(s.name), type: s.type, ttl: ttls.length ? Math.min(...ttls) : null, tagged: found.tagged.has(`${s.name} ${s.type}`), records: s.records };
+    return { name: absolute(s.name), unicode: unicodeOf(absolute(s.name)), type: s.type, ttl: ttls.length ? Math.min(...ttls) : null, tagged: found.tagged.has(`${s.name} ${s.type}`), records: s.records };
   });
   if (q.rdata === true) await addRdata(ctx, zone, visible);
   const lastShown = shown[shown.length - 1];
@@ -268,6 +282,18 @@ export async function health(ctx) {
   return reply(ok ? 200 : 503, { status: ok ? 'ok' : 'unavailable', database: ok ? 'ok' : 'error' });
 }
 
+// GET /idn?name= (0.7): what the API makes of a name it is given, the way dig +idnin converts it -> { ascii, unicode (null: no U-label to show), warnings, dig:
+// whether dig sends the same name }.  Nothing is read or written: a form shows it under a field of a name.
+export function idn(ctx) {
+  const q = query(ctx.query, { name: { type: 'string', required: true, min: 1, max: 1024 } });
+  let r;
+  try { r = toAscii(q.name); } catch (e) { throw badRequest(e.message, '?name'); }
+  return { ascii: r.name, unicode: unicodeOf(r.name) ?? null, warnings: r.warnings, dig: r.dig };
+}
+
+// the page the GUI links a name to (0.7, ldns-link): ldns.jp asks public resolvers over DoH from the browser; this service sends nothing to it
+export const LDNS_URL = 'https://ldns.jp/';
+
 // G5: what a client (the GUI) needs to follow the service: the record types a change set takes (karidns-zone's own list; null when the service could not ask) and the
 // settings and limits that change what a form should offer
 export function version(ctx) {
@@ -275,6 +301,7 @@ export function version(ctx) {
   const s = app.settings;
   return {
     version: VERSION, tools: app.versions, datasets: app.datasets.map((d) => d.name), types: app.types ? [...app.types].sort() : null,
-    ui: { reload_after_change: s['reload-after-change'], reload_available: reloadAvailable(s), reload_all: s.database === 'pg', require_totp: s['require-totp'], max_rrsets: MAX_RRSETS, max_records: MAX_RECORDS, zone_text_limit: ZONE_TEXT_LIMIT },
+    ui: { reload_after_change: s['reload-after-change'], reload_available: reloadAvailable(s), reload_all: s.database === 'pg', require_totp: s['require-totp'],
+      ldns: s['ldns-link'] ? { url: LDNS_URL, resolver: s['ldns-resolver'] } : null, max_rrsets: MAX_RRSETS, max_records: MAX_RECORDS, zone_text_limit: ZONE_TEXT_LIMIT },
   };
 }

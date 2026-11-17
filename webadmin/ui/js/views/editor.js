@@ -4,9 +4,10 @@
 
 import { h, openDialog } from '../dom.js';
 import { render } from '../format.js';
-import { field, select, message } from '../widgets.js';
+import { field, select, message, problemText } from '../widgets.js';
 import { absName, relName, recordLines, recordsText, rdataOf, expectOf, ttlRange } from '../zonelib.js';
 import { replaceEntry, addEntry, deleteEntry, soaEntry } from '../draft.js';
+import { idnHint, asciiOf } from '../idnui.js';
 
 const TTL_MAX = 2147483647;
 const sameRecords = (a, b) => a.length === b.length && a.every((x, i) => x === b[i]);
@@ -33,7 +34,9 @@ export function openEditor(ctx, { kind, zone, info, draft, types, rr, entry }) {
   const dlg = h('dialog', { class: 'modal wide', 'aria-labelledby': 'edit-title' },
     h('h2', { id: 'edit-title' }, t(adding ? 'edit.title-add' : kind === 'soa' ? 'edit.title-soa' : 'edit.title'), ...(adding ? [] : [' ', h('code', null, render(relName((rr ?? entry).name, zone))), ' ', render((rr ?? entry).type)])), form);
 
-  form.addEventListener('submit', (ev) => {
+  if (name) idnHint(ctx, name, (s) => absName(s, zone));
+
+  form.addEventListener('submit', async (ev) => {
     ev.preventDefault();
     for (const f of [name, typeText, ttl, records]) f?.setError(null);
     err.set(null);
@@ -41,6 +44,8 @@ export function openEditor(ctx, { kind, zone, info, draft, types, rr, entry }) {
     if (adding) {
       owner = absName(name.input.value, zone);
       if (owner === null) { name.setError(t('edit.bad-name')); name.focus(); return; }
+      // (a U-label: the draft holds the A-labels the service stores, so that it meets the RRset of that name)
+      if (/[^\x00-\x7f]/.test(owner)) try { owner = await asciiOf(ctx, owner); } catch (e) { name.setError(problemText(ctx.i18n, e)); name.focus(); return; }
     }
     const type = adding ? (typeSel ? typeSel.input.value : typeText.input.value.trim().toUpperCase()) : (rr ?? entry).type;
     if (adding && !/^[A-Z][A-Z0-9-]{0,31}$/.test(type)) { typeText.setError(t('edit.bad-type')); typeText.focus(); return; }

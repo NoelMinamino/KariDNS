@@ -1,4 +1,4 @@
-.TH KARIDNS\-WEBADMIN 8 "2026-11-16" "KariDNS" "KariDNS Manual"
+.TH KARIDNS\-WEBADMIN 8 "2026-11-17" "KariDNS" "KariDNS Manual"
 .\" Generated from docs/karidns-webadmin.md by man/md2man.pl (make man): edit the Markdown manual, not this page.
 .SH NAME
 karidns\-webadmin \- the service that gives people and programs an HTTP API for
@@ -729,6 +729,27 @@ shows the identity the user is linked to (read only: a global master links and
 unlinks, in the user's page under \fIAdministration\fR). A group has no
 identity.
 .IP \(bu 2
+\fBInternationalized names\fR (0.7). A zone name or a record name may be typed
+in Unicode; the service stores its A-labels, converted the way \fBdig +idnin\fR
+converts the name (UTS #46 non-transitional, and the transitional mapping for
+the whole name when a label has a code point IDNA2008 does not allow, as dig
+does). Under the field the page shows the name that will be stored
+(\fB\[u4F8B]\[u3048].test\fR \[u2192] \fBxn\-\-r8jz45g.test\fR) and the
+warnings: a name that breaks a rule of IDNA2008 (a disallowed symbol, hyphens,
+the bidi rule, a katakana middle dot without kana, mixed scripts) is stored all
+the same, with a warning; only a name with no A-label form is refused. Lists and
+the zone page show the U-labels with the A-labels under them; the search takes
+either form (a label typed in Unicode matches a whole label). The API reference
+has the rules ("INTERNATIONALIZED NAMES AND LDNS.JP").
+.IP \(bu 2
+\fBldns.jp\fR (0.7). Each zone (its SOA) and each record set has a link
+"ldns.jp" that opens ldns.jp <https://ldns.jp/> in a new tab, which asks a
+public resolver (\fBldns\-resolver\fR: Google by default, Cloudflare, IIJ or
+Alibaba) over DNS over HTTPS: the zone as the world sees it. The service sends
+nothing; a click sends the name to ldns.jp and to that resolver. It is on by
+default; \fBldns\-link = no\fR in the configuration removes the links, for
+internal views and zones whose names should not leave the house.
+.IP \(bu 2
 \fBStorage.\fR The page keeps the chosen language in \fBlocalStorage\fR and
 nothing else: no token, no zone data, no secret.
 .IP \(bu 2
@@ -1184,6 +1205,10 @@ A subdomain master or domain master can ask for a reload (\fBPOST .../reload\fR)
 of a zone it has a grant on, up to 2 requests a second.
 .IP \(bu 2
 There is no per-request audit of reads; the audit log records changes.
+.IP \(bu 2
+The links to \fBldns.jp\fR (on by default) send a zone or record name to ldns.jp
+and to a public resolver when a person clicks one; the service itself sends
+nothing. Turn them off with \fBldns\-link = no\fR where names are private.
 .SH MEASUREMENTS
 Measured on 2026-11-08 on the FreeBSD 15.1 build host (a jail with 4 vCPU on a
 shared host; PostgreSQL 18.6 with \fBshared_buffers\fR 128 MB in a private

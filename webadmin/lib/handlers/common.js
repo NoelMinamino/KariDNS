@@ -54,6 +54,9 @@ export function page(rows, limit, key) {
   return { items, next_cursor: more ? encodeCursor(key(items[items.length - 1])) : null };
 }
 
+// a reply with the IDN warnings of its names (idn.js), when there are any
+export const withWarnings = (r, warnings) => (warnings?.length ? { ...r, warnings } : r);
+
 export const clean = (s) => String(s).replace(/[\0-\x1f\x7f]+/g, ' ').slice(0, 80);
 
 export { ApiError };

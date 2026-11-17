@@ -15,6 +15,7 @@ import { ZONE_TEXT_LIMIT as ZIP } from './changes.js';           // a zone text 
 export const ROUTES = [
   { method: 'GET', path: '/health', auth: 'none', handler: zones.health },
   { method: 'GET', path: '/version', handler: zones.version },
+  { method: 'GET', path: '/idn', handler: zones.idn },
 
   { method: 'POST', path: '/auth/login', auth: 'none', bodyLimit: 16384, handler: auth.login },
   { method: 'POST', path: '/auth/logout', preTotp: true, sessionOnly: true, handler: auth.logout },

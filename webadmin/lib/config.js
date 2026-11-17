@@ -89,6 +89,8 @@ const GLOBAL_KEYS = {
   'scrypt-ln': parseScryptLn,
   'audit-retention': parseRetention,
   ui: parseBool,
+  'ldns-link': parseBool,
+  'ldns-resolver': parseEnum('google', 'cloudflare', 'iij', 'alidns'),
   'ui-dir': parseAbsPath,
   log: parseLog,
 };
@@ -150,6 +152,8 @@ export function defaults() {
     'scrypt-ln': 17,
     'audit-retention': 0,
     ui: true,
+    'ldns-link': true,
+    'ldns-resolver': 'google',
     'ui-dir': undefined,
     log: 'stderr',
   };

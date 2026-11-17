@@ -40,9 +40,10 @@ test('absName: @, relative, absolute, the zone written out, a U-label, nonsense'
   assert.equal(absName('www.example.test.', z), 'www.example.test.');
   assert.equal(absName('www.other.test.', z), 'www.other.test.');
   assert.equal(absName('*.wild', z), '*.wild.example.test.');
-  assert.equal(absName('bücher', z), 'xn--bcher-kva.example.test.');
+  assert.equal(absName('Bücher', z), 'bücher.example.test.', 'U-labels stay: the service converts them (GET /idn)');
   assert.equal(absName('a bé', z), null, 'a space makes no host name');
-  assert.equal(absName('é', z), 'xn--9ca.example.test.');
+  assert.equal(absName('é。例え', z), 'é.例え.example.test.');
+  assert.equal(absName('www.例え.test', '例え.test.'), 'www.例え.test.');
 });
 
 test('the lines of a records box and of the "more records" box', () => {

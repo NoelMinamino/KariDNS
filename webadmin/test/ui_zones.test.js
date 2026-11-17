@@ -75,7 +75,7 @@ test('S3: the zone list shows the role, kind, serial and badges; the search form
   // a text the service would refuse is told here
   ui.type(ui.input('q'), 'a b');
   await ui.submit(ui.q('form'));
-  assert.match(ui.text(), /Use letters, digits, dots, hyphens and underscores only\./);
+  assert.match(ui.text(), /Use letters, digits, dots, hyphens, underscores and Unicode labels; no spaces./);
   assert.equal(ui.env.window.location.hash, '#/zones?ds=main&q=exa&mode=prefix&kind=MASTER&signed=true');
 });
 
@@ -328,6 +328,39 @@ test('S5: edit a record set: the editor, the draft, the preview (a dry run with 
   assert.match(ui.q('section.draft').textContent, /Nothing is changed yet/);
   assert.equal(ui.count('GET', '/rrsets'), 2, 'the page of record sets was read again');
   assert.match(ui.polite(), /The change was saved\./);
+});
+
+test('0.7 IDN: both forms of a name in the table and the header, the ldns.jp links, a name typed in Unicode goes into the draft as its A-labels', async () => {
+  const idn = (b, url) => {
+    const name = new URL(url, 'http://x.test').searchParams.get('name');
+    if (name === 'ウェブ.example.test.') return reply(200, { api: 1, ascii: 'xn--gckc5l.example.test.', unicode: 'ウェブ.example.test.', warnings: [{ code: 'idn-mixed-script', label: 'ウェブ' }], dig: true });
+    return problem(400, 'bad-request', { detail: 'no A-label form' });
+  };
+  const rrsets = [...RRSETS, { name: 'xn--gckc5l.example.test.', unicode: 'ウェブ.example.test.', type: 'A', ttl: 300, tagged: false, records: [rec('192.0.2.5')] }];
+  const version = { ...VERSION, ui: { ...VERSION.ui, ldns: { url: 'https://ldns.jp/', resolver: 'iij' } } };
+  const ui = await bootApp({ routes: zoneRoutes({ rrsets }, { 'GET /idn': idn }), hash: ZONE, version });
+  const row = rows(ui).find((r) => r.querySelector('th').textContent.startsWith('ウェブ'));
+  assert.deepEqual([row.querySelector('span.ulabel').textContent, row.querySelector('span.alabel').textContent], ['ウェブ', 'xn--gckc5l']);
+  assert.equal(row.querySelector('a.outside').getAttribute('href'), 'https://ldns.jp/?q=xn--gckc5l.example.test&t=A&c=dig&r=iij&auto=1');
+  assert.equal(ui.q('a.outside').getAttribute('href'), 'https://ldns.jp/?q=example.test&t=SOA&c=dig&r=iij&auto=1', 'the zone: its SOA');
+  await ui.click(ui.button(/^Add a record set$/));
+  let dlg = editorOf(ui);
+  ui.type(ui.input('name', dlg), 'ウェブ');
+  ui.input('name', dlg).dispatchEvent(new FakeEvent('blur'));
+  await flush();
+  assert.match(dlg.textContent, /Stored as xn--gckc5l\.example\.test\..*mixes scripts/);
+  ui.type(ui.input('ttl', dlg), '300');
+  ui.type(ui.input('records', dlg), '192.0.2.6');
+  await ui.submit(dlg.querySelector('form'));
+  assert.match(ui.q('ul.draft-list').textContent, /^Add xn--gckc5l A/);
+  // a name the service has no A-label form for: said at the field, nothing in the draft
+  await ui.click(ui.button(/^Add a record set$/));
+  dlg = editorOf(ui);
+  ui.type(ui.input('name', dlg), 'a‍b');
+  ui.type(ui.input('ttl', dlg), '300');
+  ui.type(ui.input('records', dlg), '192.0.2.7');
+  await ui.submit(dlg.querySelector('form'));
+  assert.ok(ui.dialogs().length === 1 && /no A-label form|request/i.test(dlg.textContent), dlg.textContent);
 });
 
 test('S5: add a record set (name relative or absolute, a type from the list), delete one, undo, discard; the SOA has its own form with a warning and no precondition', async () => {

@@ -1,0 +1,387 @@
+{
+ "dig": "DiG 9.20.30",
+ "vectors": [
+  {
+   "name": "例え.test",
+   "dig": "xn--r8jz45g.test"
+  },
+  {
+   "name": "日本語.example",
+   "dig": "xn--wgv71a119e.example"
+  },
+  {
+   "name": "ＷＷＷ.例え.ＴＥＳＴ",
+   "dig": "www.xn--r8jz45g.test"
+  },
+  {
+   "name": "例え。test",
+   "dig": "xn--r8jz45g.test"
+  },
+  {
+   "name": "www．例え．test",
+   "dig": "www.xn--r8jz45g.test"
+  },
+  {
+   "name": "www｡例え.test",
+   "dig": "www.xn--r8jz45g.test"
+  },
+  {
+   "name": "Ab.例え.test",
+   "dig": "ab.xn--r8jz45g.test"
+  },
+  {
+   "name": "例え.test.",
+   "dig": "xn--r8jz45g.test."
+  },
+  {
+   "name": "straße.example",
+   "dig": "xn--strae-oqa.example"
+  },
+  {
+   "name": "faß.example",
+   "dig": "xn--fa-hia.example"
+  },
+  {
+   "name": "ẞ.example",
+   "dig": "xn--zca.example"
+  },
+  {
+   "name": "ΣΑΣ.example",
+   "dig": "xn--mxa9ab.example"
+  },
+  {
+   "name": "ς.example",
+   "dig": "xn--3xa.example"
+  },
+  {
+   "name": "İstanbul.example",
+   "dig": "xn--istanbul-o0e.example"
+  },
+  {
+   "name": "ﬁ.example",
+   "dig": "fi.example"
+  },
+  {
+   "name": "ⅷ.example",
+   "dig": "viii.example"
+  },
+  {
+   "name": "①.example",
+   "dig": "1.example"
+  },
+  {
+   "name": "ǅ.example",
+   "dig": "xn--d-toa.example"
+  },
+  {
+   "name": "ͅ.example",
+   "dig": "xn--uxa.example"
+  },
+  {
+   "name": "café.example",
+   "dig": "xn--caf-dma.example"
+  },
+  {
+   "name": "café.example",
+   "dig": "xn--caf-dma.example"
+  },
+  {
+   "name": "⁠a.example",
+   "dig": "a.example"
+  },
+  {
+   "name": "a­.example",
+   "dig": "a.example"
+  },
+  {
+   "name": "〆.test",
+   "dig": "xn--v6j.test"
+  },
+  {
+   "name": "ー.test",
+   "dig": "xn--wek.test"
+  },
+  {
+   "name": "々.test",
+   "dig": "xn--u6j.test"
+  },
+  {
+   "name": "ヴ.test",
+   "dig": "xn--oek.test"
+  },
+  {
+   "name": "ｶﾞ.test",
+   "dig": "xn--mck.test"
+  },
+  {
+   "name": "㍿.test",
+   "dig": "xn--6oqv20b1zgzxr.test"
+  },
+  {
+   "name": "_dmarc.例え.test",
+   "dig": "_dmarc.xn--r8jz45g.test"
+  },
+  {
+   "name": "*.例え.test",
+   "dig": "*.xn--r8jz45g.test"
+  },
+  {
+   "name": "例.123",
+   "dig": "xn--fsq.123"
+  },
+  {
+   "name": "1.例",
+   "dig": "1.xn--fsq"
+  },
+  {
+   "name": "a_b.例え.test",
+   "dig": "a_b.xn--r8jz45g.test"
+  },
+  {
+   "name": "xn--r8jz45g.test",
+   "dig": "xn--r8jz45g.test"
+  },
+  {
+   "name": "XN--R8JZ45G.TEST",
+   "dig": "XN--R8JZ45G.TEST"
+  },
+  {
+   "name": "xn--zz.test",
+   "dig": "xn--zz.test"
+  },
+  {
+   "name": "xn--a.test",
+   "dig": "xn--a.test"
+  },
+  {
+   "name": "xn--zz.例え.test",
+   "dig": null
+  },
+  {
+   "name": "xn--n3h.例え.test",
+   "dig": "xn--n3h.xn--r8jz45g.test"
+  },
+  {
+   "name": "a-.例え.test",
+   "dig": null
+  },
+  {
+   "name": "-a.例え.test",
+   "dig": null
+  },
+  {
+   "name": "ab--c.例え.test",
+   "dig": null
+  },
+  {
+   "name": "☃.example",
+   "dig": "xn--n3h.example"
+  },
+  {
+   "name": "😀.example",
+   "dig": "xn--e28h.example"
+  },
+  {
+   "name": "♥.example",
+   "dig": "xn--g6h.example"
+  },
+  {
+   "name": "ᄀ.example",
+   "dig": "xn--ypd.example"
+  },
+  {
+   "name": "ᆨ.example",
+   "dig": "xn--rud.example"
+  },
+  {
+   "name": "܀.example",
+   "dig": "xn--tmb.example"
+  },
+  {
+   "name": "straße.☃.example",
+   "dig": "strasse.xn--n3h.example"
+  },
+  {
+   "name": "ß☃.example",
+   "dig": "xn--ss-gsx.example"
+  },
+  {
+   "name": "ς.♥.example",
+   "dig": "xn--4xa.xn--g6h.example"
+  },
+  {
+   "name": "ᄀß.example",
+   "dig": "xn--ss-cmk.example"
+  },
+  {
+   "name": "☃.a١.example",
+   "dig": "xn--n3h.xn--a-bqc.example"
+  },
+  {
+   "name": "-例.test",
+   "dig": null
+  },
+  {
+   "name": "例-.test",
+   "dig": null
+  },
+  {
+   "name": "ab--例.test",
+   "dig": null
+  },
+  {
+   "name": "aשלום.example",
+   "dig": null
+  },
+  {
+   "name": "١٢٣.example",
+   "dig": null
+  },
+  {
+   "name": "a١.example",
+   "dig": null
+  },
+  {
+   "name": "a١.☃.example",
+   "dig": null
+  },
+  {
+   "name": "a‍b.example",
+   "dig": null
+  },
+  {
+   "name": "a‍b.☃.example",
+   "dig": null
+  },
+  {
+   "name": "́a.example",
+   "dig": null
+  },
+  {
+   "name": "例llllllllllllllllllllllllllllllllllllllllllllllllllllllllllll.test",
+   "dig": null
+  },
+  {
+   "name": "⒈.example",
+   "dig": null
+  },
+  {
+   "name": "㈱.test",
+   "dig": null
+  },
+  {
+   "name": "a b.test",
+   "dig": null
+  },
+  {
+   "name": "שלום.example",
+   "dig": "xn--9dbne9b.example"
+  },
+  {
+   "name": "مثال.example",
+   "dig": "xn--mgbh0fb.example"
+  },
+  {
+   "name": "مثال١.example",
+   "dig": "xn--mgbh0fb7l.example"
+  },
+  {
+   "name": "क्‍ष.example",
+   "dig": "xn--11b2ezcw70k.example"
+  },
+  {
+   "name": "ソフト・バンク.test",
+   "dig": "xn--pck1a7a6ax6p2b.test"
+  },
+  {
+   "name": "a・b.test",
+   "dig": "xn--ab-3n4a.test"
+  },
+  {
+   "name": "l·l.example",
+   "dig": "xn--ll-0ea.example"
+  },
+  {
+   "name": "a·b.example",
+   "dig": "xn--ab-0ea.example"
+  },
+  {
+   "name": "١۱.example",
+   "dig": null
+  },
+  {
+   "name": "аpple.example",
+   "dig": "xn--pple-43d.example"
+  },
+  {
+   "name": "abcテスト.test",
+   "dig": "xn--abc-7k4bocn.test"
+  },
+  {
+   "name": "テスト한국.test",
+   "dig": "xn--zckzah0578joztb.test"
+  }
+ ],
+ "display": [
+  {
+   "name": "xn--r8jz45g.test",
+   "dig": "例え.test"
+  },
+  {
+   "name": "XN--R8JZ45G.test",
+   "dig": "例え.test"
+  },
+  {
+   "name": "www.xn--r8jz45g.test",
+   "dig": "www.例え.test"
+  },
+  {
+   "name": "xn--zz.test",
+   "dig": "xn--zz.test"
+  },
+  {
+   "name": "xn--a.test",
+   "dig": ".test"
+  },
+  {
+   "name": "xn--ab---3u6f.test",
+   "dig": "ab--例.test"
+  },
+  {
+   "name": "xn----lb7a.test",
+   "dig": "-例.test"
+  },
+  {
+   "name": "xn--n3h.example",
+   "dig": "☃.example"
+  },
+  {
+   "name": "xn--strae-oqa.example",
+   "dig": "straße.example"
+  },
+  {
+   "name": "xn--fa-hia.example",
+   "dig": "faß.example"
+  },
+  {
+   "name": "xn--9hbcd.example",
+   "dig": "١٢٣.example"
+  },
+  {
+   "name": "xn--a-bqc.example",
+   "dig": "a١.example"
+  },
+  {
+   "name": "xn--ab-3n4a.test",
+   "dig": "a・b.test"
+  },
+  {
+   "name": "xn--pple-43d.example",
+   "dig": "аpple.example"
+  },
+  {
+   "name": "_dmarc.xn--r8jz45g.test",
+   "dig": "_dmarc.例え.test"
+  }
+ ]
+}
