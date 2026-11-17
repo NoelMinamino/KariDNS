@@ -369,7 +369,7 @@ typedef struct retire {
 #define JR_ADMIT (1u << 20)                      /* a writer waits before the mutex while less than this is free in the ring */
 #define JR_SLACK (8ull << 20)                    /* jr_floor(): spans in flight, a header, a probe interval of small records */
 #define JR_ZFS_SLACK (16ull << 20)               /* jr_floor() on a copy-on-write file system: statfs lags behind the open transaction group */
-#define ST_DEFER_SLOTS 8
+#define ST_DEFER_SLOTS 32                        /* threads that defer at one time (the ingest and reconcile threads for good, one more inside the records lock at a time) */
 enum { JW_OK = 0, JW_NOSPACE = 1, JW_FAILED = 2 };
 typedef struct { uint64_t pos, foff; int fd; } jr_ext_t;    /* the ring's bytes from pos (to the next extent's pos) go to fd at foff.. */
 
@@ -443,6 +443,7 @@ struct store {
   uint64_t jr_head;                                   /* (wlock) bytes reserved */
   _Atomic uint64_t jr_pub, jr_tail;
   jr_ext_t jx[JX_CAP];
+  uint32_t jx_cap;                                    /* the extents that may be in use: JX_CAP (fewer in a test, store_test_jx_cap) */
   uint64_t jx_head;                                   /* (wlock) extents begun */
   _Atomic uint64_t jx_pub, jx_done;                   /* extents published; the index of the extent jr_tail is in (the ones before it are all written: their slots may be reused) */
   pthread_mutex_t jw_mu;                              /* the leader flag and its waiters; order: wlock -> jw_mu, never jw_mu -> wlock */
@@ -457,6 +458,7 @@ struct store {
   _Atomic uint64_t df_pos[ST_DEFER_SLOTS];            /* ... and the highest position their calls left (store_settle()) */
   _Atomic bool df_off;                                /* deferral ends with the flusher (bg_stop_join()): no background leader is left */
   _Atomic bool jw_kick;                               /* a deferred call asked the flusher to write the ring (one wake-up per round, wr_ack()) */
+  _Atomic uint64_t n_df_busy;                         /* store_defer() found no free slot */
   _Atomic bool bg_stop_a;                             /* bg_stop for the waits outside bg_mu (the flusher's lead of the ring) */
   _Atomic bool cow;                                   /* the file system allocates on every write (ZFS): a checkpoint's overwrites take space too */
   _Atomic uint64_t ck_left;                           /* the bytes the running checkpoint may still allocate (jr_floor()) */
@@ -536,6 +538,7 @@ struct store {
   uint8_t  seg_draining[ST_MAXSEG + 1];            /* writer: the segment has no live record; drain_lsn / drain_epoch say when */
   uint64_t seg_drain_lsn[ST_MAXSEG + 1], seg_drain_epoch[ST_MAXSEG + 1];
   uint64_t seg_skip_until[ST_MAXSEG + 1];          /* writer: the cleaner could not empty this segment (a damaged record): not again before this time (ms) */
+  uint64_t seg_dead_seen[ST_MAXSEG + 1], seg_dead_ms[ST_MAXSEG + 1];   /* writer: the dead bytes of a segment when the background cleaner last looked, and when they last changed (cl_settle_scan_locked()) */
   uint32_t cl_seg;                                 /* writer: the segment the cleaner is emptying, and the offset it has scanned to */
   uint64_t cl_off;
   uint8_t *cl_buf;                                 /* COPY mode: a piece of the segment being scanned */
@@ -551,6 +554,7 @@ struct store {
   /* space */
   _Atomic int64_t avail_est;                       /* free bytes of the file system as of the last probe less every byte reserved since (records, images, a checkpoint's allocating writes); < 0 = unknown */
   _Atomic uint64_t probe_bytes, last_probe_ms;    /* (atomics: the probe is made outside the writer mutex, st_probe_stale()) */
+  _Atomic uint64_t n_reprobe_lock;                 /* probes made inside the writer mutex to confirm a refusal (store.space.reprobe_in_lock) */
   _Atomic uint64_t fs_total, fs_avail, fs_checked_unix;
   _Atomic uint32_t fs_blksize, fs_rec_warn;
   _Atomic uint32_t space_level;
@@ -1620,6 +1624,7 @@ static seg_t *seg_get(store_t *s, uint32_t n) {
 /* writer: create segment n with room for at least `cap` bytes */
 static int seg_create(store_t *s, uint32_t n, uint64_t cap) {
   char name[32];
+  s->seg_draining[n] = 0;                              /* (a removal that waited for the journal (3) does not unlink the new file: N8) */
   snprintf(name, sizeof(name), "seg.%u", n);
   int fd = st_openat(s, name, O_RDWR | O_CREAT | O_TRUNC);
   if (fd < 0) return fd;
@@ -1941,6 +1946,13 @@ int (*_Atomic store_test_jw_fault)(uint64_t pos, uint64_t len) = NULL;
 void (*_Atomic store_test_jw_hook)(store_t *s, int step) = NULL;
 _Atomic bool store_test_no_rule_t = false;
 _Atomic uint64_t store_test_jr_cap = 0;
+_Atomic uint32_t store_test_jx_cap = 0;
+_Atomic uint64_t store_test_fl_loops = 0;
+_Atomic uint32_t store_test_jw_run = 0;
+void store_test_probe(store_t *s) { fs_probe(s); }
+static void bg_stop_join(store_t *s);
+void store_test_stop_flusher(store_t *s) { bg_stop_join(s); }
+int store_test_dirfd_of(store_t *s) { return s->dirfd; }
 _Atomic int64_t store_test_jr_floor = -1;
 int64_t (*_Atomic store_test_fs_total)(void) = NULL;
 static int jw_fault_now(uint64_t p, uint64_t n) { int (*f)(uint64_t, uint64_t) = atomic_load(&store_test_jw_fault); return f ? f(p, n) : 0; }
@@ -1957,15 +1969,18 @@ static void jw_hook_now(store_t *s, int k) { void (*f)(store_t *, int) = atomic_
 static int st_pwritev_all(int fd, const struct iovec *iov, int niov, uint64_t rlen, off_t off);
 static void fs_probe(store_t *s);
 static void space_used(store_t *s, uint64_t n);
+static void space_unused(store_t *s, uint64_t n);
 static inline bool is_nospc_err(int r) { return r == -ENOSPC || r == -EFBIG || r == -EDQUOT; }
 
 /* the bytes [p, p + n) of the ring to fd at foff (two pieces at the wrap); the whole span or an error (a short write is continued by st_pwritev_all()) */
 static int jr_write_span(store_t *s, int fd, uint64_t foff, uint64_t p, uint64_t n) {
   const int f = JW_FAULT(p, n);
-  if (f) return -f;
-  const uint64_t o = p % s->jr_cap, a = s->jr_cap - o < n ? s->jr_cap - o : n;
-  struct iovec v[2] = { { s->jr_buf + o, (size_t)a }, { s->jr_buf, (size_t)(n - a) } };
-  return st_pwritev_all(fd, v, a < n ? 2 : 1, n, (off_t)foff);
+  if (f > 0) return -f;
+  uint64_t len = f < 0 ? n / 2 : n;                    /* (f < 0, the tests: half of the span reaches the file, then the write fails) */
+  const uint64_t o = p % s->jr_cap, a = s->jr_cap - o < len ? s->jr_cap - o : len;
+  struct iovec v[2] = { { s->jr_buf + o, (size_t)a }, { s->jr_buf, (size_t)(len - a) } };
+  const int r = len ? st_pwritev_all(fd, v, a < len ? 2 : 1, len, (off_t)foff) : 0;
+  return f < 0 ? -EIO : r;
 }
 
 /* One round of the leader (jw_leader held, no lock): every byte published when it starts.  jr_tail moves to the end of each span written whole; an error stops the round with
@@ -1980,7 +1995,11 @@ static int jw_round(store_t *s) {
     const jr_ext_t *e = &s->jx[k % JX_CAP];
     uint64_t stop = end;
     if (k + 1 < xn && s->jx[(k + 1) % JX_CAP].pos < stop) stop = s->jx[(k + 1) % JX_CAP].pos;
-    const uint64_t n = stop - p > JW_RUN ? JW_RUN : stop - p;
+    uint64_t run = JW_RUN;
+#ifdef KARIDNS_UNIT_TEST
+    if (atomic_load_explicit(&store_test_jw_run, memory_order_relaxed)) run = atomic_load_explicit(&store_test_jw_run, memory_order_relaxed);
+#endif
+    const uint64_t n = stop - p > run ? run : stop - p;
     const uint64_t t0 = st_now_us();
     r = jr_write_span(s, e->fd, e->foff + (p - e->pos), p, n);
     if (r < 0) break;
@@ -2061,14 +2080,12 @@ static void jw_retry(store_t *s) {
   pthread_mutex_unlock(&s->jw_mu);
   atomic_fetch_add_explicit(&s->n_jw_retries, 1, memory_order_relaxed);
   int r = jw_round(s);
-  if (r < 0 && !is_nospc_err(r)) {
-    atomic_store_explicit(&s->jw_state, JW_OK, memory_order_relaxed);   /* (another error: the three tries of jw_after_error(), then JW_FAILED) */
-    r = jw_after_error(s, r);
-  }
+  if (r < 0 && !is_nospc_err(r)) r = jw_after_error(s, r);   /* (another error: the three tries of jw_after_error(), in JW_NOSPACE, then JW_FAILED) */
   pthread_mutex_lock(&s->jw_mu);
   if (r == 0) {
     atomic_store_explicit(&s->jw_state, JW_OK, memory_order_release);
     atomic_store_explicit(&s->jw_last_err, 0, memory_order_relaxed);
+    s->jr_warn_ms = 0;                                  /* (the next trouble is said at once) */
   }
   s->jw_leader = false;
   pthread_cond_broadcast(&s->jw_cv);
@@ -2123,6 +2140,7 @@ int store_defer(store_t *s, bool on) {
       return 0;
     }
   }
+  atomic_fetch_add_explicit(&s->n_df_busy, 1, memory_order_relaxed);   /* (the calls wait then: counted, store.journal.defer_busy) */
   return -EBUSY;
 }
 int store_settle(store_t *s) {
@@ -2220,7 +2238,7 @@ static int jr_room_locked(store_t *s, uint64_t n, unsigned exts) {
     if (st == JW_NOSPACE) return -ENOSPC;
     if (s->jx_head == 0 && exts == 0) return -EIO;     /* (no journal file yet: the open switches to one before any record) */
     const uint64_t tail = atomic_load_explicit(&s->jr_tail, memory_order_acquire), xd = atomic_load_explicit(&s->jx_done, memory_order_acquire);
-    if (s->jr_head + n - tail <= s->jr_cap && s->jx_head - xd + exts < JX_CAP) return 0;
+    if (s->jr_head + n - tail <= s->jr_cap && s->jx_head - xd + exts < s->jx_cap) return 0;
     atomic_fetch_add_explicit(&s->n_jr_inlock, 1, memory_order_relaxed);
     const int r = jw_drain_locked(s);
     if (r < 0) return r;
@@ -2229,11 +2247,19 @@ static int jr_room_locked(store_t *s, uint64_t n, unsigned exts) {
 
 /* The journal's room on the file system (writer mutex held, before anything is applied): the estimate less jr_floor().  Refused: the file system is probed again here (only
  * when it is nearly full) before -ENOSPC. */
+/* The probe again inside the mutex (the deviation from the plan's "unlock, probe, retry", planning 10.4): only when the estimate says that the call does not fit, i.e. the
+ * file system is within the call's size of the threshold or below it (nearly full), and at most once every 100 ms; counted (store.space.reprobe_in_lock).  Elsewhere the probe is
+ * made before the mutex (st_probe_stale()).  The emergency cleaning keeps its own probe. */
+static void st_reprobe_locked(store_t *s) {
+  if (st_now_ms() - atomic_load_explicit(&s->last_probe_ms, memory_order_relaxed) < 100) return;
+  atomic_fetch_add_explicit(&s->n_reprobe_lock, 1, memory_order_relaxed);
+  fs_probe(s);
+}
 static int jr_space_locked(store_t *s, uint64_t n) {
-  if (s->in_cleaner) { space_used(s, n); return 0; }   /* (the cleaner's records make room: not refused, as its appends are not) */
+  if (s->in_cleaner) { space_used(s, n); return 0; }   /* (the cleaner's records make room: not refused, as its appends are not; planning 10.4) */
   int64_t est = atomic_load_explicit(&s->avail_est, memory_order_relaxed);
   if (est >= 0 && (uint64_t)est < n + jr_floor(s)) {
-    fs_probe(s);
+    st_reprobe_locked(s);
     est = atomic_load_explicit(&s->avail_est, memory_order_relaxed);
     if (est >= 0 && (uint64_t)est < n + jr_floor(s)) return -ENOSPC;
   }
@@ -2260,7 +2286,7 @@ static int journal_reserve_locked(store_t *s) {
     if (r < 0) return r;
   }
   if ((r = jr_space_locked(s, j->len)) < 0) return r;
-  if ((r = jr_room_locked(s, j->len, 0)) < 0) return r;
+  if ((r = jr_room_locked(s, j->len, 0)) < 0) { space_unused(s, j->len); return r; }   /* (nothing was taken: the estimate gets the bytes back) */
   jrec_t h;
   h.magic = ST_MAGIC_JREC;
   h.len = (uint32_t)j->len;
@@ -2487,7 +2513,7 @@ static int st_commit_ex(store_t *s, uint64_t target, uint32_t need_gen) {
     const int fd = oldfd >= 0 ? oldfd : s->jfd;
     const uint64_t E = s->jr_head;                    /* (rule F, N5: the records <= t, the old file's last bytes and the new file's header are below it) */
     wr_unlock_raw(s);
-    r = jw_wait(s, E, NULL);                          /* (-ENOSPC / -EIO at once in the states that write nothing: no sync of bytes that are not written) */
+    r = jw_wait(s, E, need_gen ? &s->ck_cancel : &s->bg_stop_a);   /* (-ENOSPC / -EIO at once in the states that write nothing; -ECANCELED at a stop: no sync of bytes that are not written) */
     if (r < 0) commit_unmark(s, s->cm.seg, n, dir);
     else r = commit_sync(s, t, s->cm.seg, n, dir, fd);
     if (r == 0 && gen > s->jrn_synced) s->jrn_synced = gen;     /* (a kept jold, an older file, was synced first by commit_sync()) */
@@ -2972,11 +2998,11 @@ static void wr_lock_ck_at(store_t *s, const char *site) {
   wr_lock_raw_at(s, site);
 }
 #define wr_lock_ck(s) wr_lock_ck_at((s), __func__)
-static void wr_unlock_ck(store_t *s) {
+static int wr_unlock_ck(store_t *s) {
   const uint64_t t = s->jr_head;
   wr_unlock_raw(s);
   bg_release(s, true, true);
-  (void)jw_wait(s, t, NULL);                          /* (a repair, a compaction, a close: their records are written before they return; a failed state returns at once) */
+  return jw_wait(s, t, NULL);                         /* (a repair, a compaction, a close: their records are written before they return; a failed state returns at once) */
 }
 /* A writer that holds the mutex and needs a checkpoint now: the flags are tried, and when another thread has them the mutex is given up while they are waited for.  1: the checkpoint was
  * made with the mutex given up for a moment (the caller's view of the store may have changed), 0: made, < 0: failed. */
@@ -3430,7 +3456,7 @@ static int space_allow(store_t *s, uint64_t rlen) {
   int64_t est = atomic_load_explicit(&s->avail_est, memory_order_relaxed);
   if (est < 0) { fs_probe(s); est = atomic_load_explicit(&s->avail_est, memory_order_relaxed); }
   if (est >= 0 && (uint64_t)est < keep + rlen) {
-    fs_probe(s);
+    st_reprobe_locked(s);
     est = atomic_load_explicit(&s->avail_est, memory_order_relaxed);
     if (est >= 0 && (uint64_t)est < keep + rlen) return -ENOSPC;
   }
@@ -3440,6 +3466,11 @@ static void space_used(store_t *s, uint64_t n) {
   atomic_fetch_add_explicit(&s->probe_bytes, n, memory_order_relaxed);
   int64_t c = atomic_load_explicit(&s->avail_est, memory_order_relaxed);
   while (c >= 0 && !atomic_compare_exchange_weak_explicit(&s->avail_est, &c, (uint64_t)c > n ? c - (int64_t)n : 0, memory_order_relaxed, memory_order_relaxed)) {}
+}
+
+static void space_unused(store_t *s, uint64_t n) {
+  int64_t c = atomic_load_explicit(&s->avail_est, memory_order_relaxed);
+  while (c >= 0 && !atomic_compare_exchange_weak_explicit(&s->avail_est, &c, c + (int64_t)n, memory_order_relaxed, memory_order_relaxed)) {}
 }
 
 /* is a commit due? (no lock: atomics) */
@@ -3494,10 +3525,11 @@ static int wr_admit(store_t *s) {
   if (st == JW_FAILED) return -EIO;
   if (st == JW_NOSPACE) return -ENOSPC;
   const uint64_t pub = atomic_load_explicit(&s->jr_pub, memory_order_acquire), tail = atomic_load_explicit(&s->jr_tail, memory_order_acquire);
-  if (pub - tail + JR_ADMIT <= s->jr_cap && atomic_load_explicit(&s->jx_pub, memory_order_acquire) - atomic_load_explicit(&s->jx_done, memory_order_acquire) + 2 < JX_CAP) return 0;
+  const uint64_t admit = JR_ADMIT < s->jr_cap / 8 ? JR_ADMIT : s->jr_cap / 8;         /* (a small ring, in the tests: an eighth of it) */
+  if (pub - tail + admit <= s->jr_cap && atomic_load_explicit(&s->jx_pub, memory_order_acquire) - atomic_load_explicit(&s->jx_done, memory_order_acquire) + 2 < s->jx_cap) return 0;
   const uint64_t t0 = st_now_us();
   atomic_fetch_add_explicit(&s->n_jr_waits, 1, memory_order_relaxed);
-  const int r = jw_wait(s, pub, NULL);
+  const int r = jw_wait(s, pub, &s->bg_stop_a);       /* (a stop ends the wait: R2) */
   const uint64_t us = st_now_us() - t0;
   uint64_t m = atomic_load_explicit(&s->jr_wait_max_us, memory_order_relaxed);
   while (us > m && !atomic_compare_exchange_weak_explicit(&s->jr_wait_max_us, &m, us, memory_order_relaxed, memory_order_relaxed)) {}
@@ -4162,7 +4194,26 @@ static void bad_free_all(store_t *s) {
 
 /* The segment to clean: the one with the least live share among those that are dead enough, are not open, are not pinned and were not given up on.  *ncand / *dead_total (optional): the
  * number of segments that are dead enough and the dead bytes of all but the open one; *pinned: of the candidates, those an image points into; *draining: segments with nothing live. */
+/* The background cleaner does not copy a segment that is still dying (0.7).  A segment whose dead bytes changed in the last CL_SETTLE_MS is being emptied by the writers right now
+ * (a pass of the loader rewrites zone after zone, in the order the segment holds them): its live records are most likely replaced within seconds, and copying them is work that
+ * is thrown away (run_db_store_test: when the store's lock no longer waited for the journal the cleaner took such segments at 50 % dead and moved 2.7 times the bytes).  It waits
+ * until the dead bytes stand still, unless the segment is mostly dead already (live <= a quarter: cheap to copy), the space is low or the cleaner was asked for (store_compact(),
+ * the operator's full speed, the emergency cleaning: they do not use the rule).  A store with steady random churn reaches the quarter on its own. */
+#define CL_SETTLE_MS 1000u
+static void cl_settle_scan_locked(store_t *s, uint64_t now) {
+  uint32_t nsegs = (uint32_t)VG(s, V_NSEGS);
+  if (nsegs > ST_MAXSEG) nsegs = ST_MAXSEG;
+  for (uint32_t n = 1; n <= nsegs; n++) {
+    const uint64_t used = VG(s, V_SEG(n, 0)), live = VG(s, V_SEG(n, 1));
+    const uint64_t body = used > ST_SEGHDR ? used - ST_SEGHDR : 0, dead = live < body ? body - live : 0;
+    if (dead != s->seg_dead_seen[n] || s->seg_dead_ms[n] == 0) { s->seg_dead_seen[n] = dead; s->seg_dead_ms[n] = now; }
+  }
+}
+static uint32_t cl_pick_ex(const store_t *s, uint32_t *ncand, uint64_t *dead_total, uint32_t *pinned, uint32_t *draining, bool respect_skip, bool settle);
 static uint32_t cl_pick(const store_t *s, uint32_t *ncand, uint64_t *dead_total, uint32_t *pinned, uint32_t *draining, bool respect_skip) {
+  return cl_pick_ex(s, ncand, dead_total, pinned, draining, respect_skip, false);
+}
+static uint32_t cl_pick_ex(const store_t *s, uint32_t *ncand, uint64_t *dead_total, uint32_t *pinned, uint32_t *draining, bool respect_skip, bool settle) {
   uint32_t nsegs = (uint32_t)VG(s, V_NSEGS), cur = (uint32_t)VG(s, V_CUR_SEG), best = 0;
   uint64_t now = st_now_ms(), mind = s->seg_size / 4 < (1ull << 20) ? s->seg_size / 4 : (1ull << 20);
   uint64_t best_pct = 101;
@@ -4180,6 +4231,7 @@ static uint32_t cl_pick(const store_t *s, uint32_t *ncand, uint64_t *dead_total,
     nc++;
     if (seg_refs(s, n) > 0) { np++; continue; }
     if (respect_skip && s->seg_skip_until[n] > now) continue;
+    if (settle && live * 4 > body && now - s->seg_dead_ms[n] < CL_SETTLE_MS && atomic_load_explicit(&s->space_level, memory_order_relaxed) == 0) continue;     /* (still dying: see above) */
     uint64_t pct = live * 100 / body;
     if (pct < best_pct) { best_pct = pct; best = n; }
   }
@@ -4339,11 +4391,29 @@ static void cl_finish_victim(store_t *s, bool failed, store_compact_report_t *re
 
 /* Remove the segments that have no live record: the file goes when (a) a checkpoint after the last journal record that touched the segment is on disk, (b) the readers that
  * could still hold an old location are gone, (c) no image of it is held.  wait: give the grace period a moment (the emergency path and store_compact(finish)). */
+/* the file of a removed segment goes (its record is in the kernel: N8) */
+static void seg_unlink_locked(store_t *s, uint32_t n) {
+  seg_t *g = atomic_exchange_explicit(&s->segs[n], NULL, memory_order_acq_rel);
+  if (g) retire_add_seg(s, g);
+  char name[32];
+  snprintf(name, sizeof(name), "seg.%u", n);
+  (void)unlinkat(s->dirfd, name, 0);
+  s->dir_dirty = true;
+  CRASH_POINT();
+  s->seg_draining[n] = 0;
+  s->seg_skip_until[n] = 0;
+  atomic_fetch_add_explicit(&s->c_segs_freed, 1, memory_order_relaxed);
+}
 static void seg_retire_locked(store_t *s, bool wait) {
   uint32_t nsegs = (uint32_t)VG(s, V_NSEGS), cur = (uint32_t)VG(s, V_CUR_SEG), draining = 0, pinned = 0;
   if (nsegs > ST_MAXSEG) nsegs = ST_MAXSEG;
   for (uint32_t n = 1; n <= nsegs; n++) {
     uint64_t used = VG(s, V_SEG(n, 0)), live = VG(s, V_SEG(n, 1));
+    if (used == 0 && s->seg_draining[n] == 3) {           /* (its record is applied, its file waits for the journal: N8) */
+      if (jw_drain_locked(s) == 0) { seg_unlink_locked(s, n); draining--; }
+      draining++;
+      continue;
+    }
     if (used == 0 || n == cur || live != 0 || n == s->cl_seg) { s->seg_draining[n] = 0; continue; }
     if (!s->seg_draining[n]) {
       s->seg_draining[n] = 1;
@@ -4368,18 +4438,10 @@ static void seg_retire_locked(store_t *s, bool wait) {
     if (jr < 0) continue;
     CRASH_POINT();
     /* N8: the record that frees the number is in the kernel before the file goes (the number is free in memory at once: a new seg.N could be made before a later unlink).
-     * Inside the mutex, once per removed segment; when the journal cannot be written the file stays (zero counters: the next tick tries again). */
-    if (jw_drain_locked(s) < 0) continue;
-    seg_t *g = atomic_exchange_explicit(&s->segs[n], NULL, memory_order_acq_rel);
-    if (g) retire_add_seg(s, g);
-    char name[32];
-    snprintf(name, sizeof(name), "seg.%u", n);
-    (void)unlinkat(s->dirfd, name, 0);
-    s->dir_dirty = true;
-    CRASH_POINT();
-    s->seg_draining[n] = 0;
-    s->seg_skip_until[n] = 0;
-    atomic_fetch_add_explicit(&s->c_segs_freed, 1, memory_order_relaxed);
+     * Inside the mutex, once per removed segment; when the journal cannot be written the file stays, marked (3): a later pass unlinks it once the record is written, and a
+     * segment made again with that number (seg_create()) clears the mark first. */
+    if (jw_drain_locked(s) < 0) { s->seg_draining[n] = 3; continue; }
+    seg_unlink_locked(s, n);
     draining--;
   }
   atomic_store_explicit(&s->c_draining, draining, memory_order_relaxed);
@@ -5145,15 +5207,17 @@ int store_scrub_run(store_t *s, store_scrub_report_t *rep) {
 /* ---- the cleaner by itself ---- */
 
 /* Work of the cleaner for one tick or one store_compact(): victims, a bounded number of bytes moved.  Takes the writer mutex per slice of records. */
-static int cleaner_work(store_t *s, uint64_t budget, uint64_t until_ms, store_compact_report_t *rep) {
+/* settle: the background cleaner of the tick (CL_SETTLE_MS); store_compact() and the operator's full speed take every segment that is dead enough */
+static int cleaner_work(store_t *s, uint64_t budget, uint64_t until_ms, store_compact_report_t *rep, bool settle) {
   int ret = 0;
   while (budget > 0 && st_now_ms() < until_ms) {
     const bool ap = !t_ap_held;                       /* (the cleaner appends to the open segment: not while a store_put() has a record written ahead there) */
     if (ap) pthread_mutex_lock(&s->ap_mu);
     if ((ret = wr_lock(s)) < 0) { if (ap) pthread_mutex_unlock(&s->ap_mu); break; }
     if (!s->cl_seg) {
-      uint32_t v = cl_pick(s, NULL, NULL, NULL, NULL, true);
-      if (!v && cl_rotate_open_locked(s)) v = cl_pick(s, NULL, NULL, NULL, NULL, true);
+      if (settle) cl_settle_scan_locked(s, st_now_ms());
+      uint32_t v = cl_pick_ex(s, NULL, NULL, NULL, NULL, true, settle);
+      if (!v && cl_rotate_open_locked(s)) v = cl_pick_ex(s, NULL, NULL, NULL, NULL, true, settle);
       if (!v) { wr_unlock_raw(s); if (ap) pthread_mutex_unlock(&s->ap_mu); break; }
       s->cl_seg = v;
       s->cl_off = ST_SEGHDR;
@@ -5189,7 +5253,7 @@ int store_compact(store_t *s, uint64_t max_bytes, bool finish, store_compact_rep
   if (!s) return -EINVAL;
   if (rep) memset(rep, 0, sizeof(*rep));
   const uint64_t freed0 = atomic_load_explicit(&s->c_segs_freed, memory_order_relaxed);
-  int r = cleaner_work(s, max_bytes ? max_bytes : UINT64_MAX, st_now_ms() + 3600000u, rep);
+  int r = cleaner_work(s, max_bytes ? max_bytes : UINT64_MAX, st_now_ms() + 3600000u, rep, false);
   int lr = finish ? wr_lock_ck_w(s) : wr_lock(s);
   if (lr < 0) return r < 0 ? r : lr;
   uint64_t got = 0;
@@ -5202,7 +5266,8 @@ int store_compact(store_t *s, uint64_t max_bytes, bool finish, store_compact_rep
     if (r == 0 && cr < 0) r = cr;
     seg_retire_locked(s, true);
     retire_run(s, false);
-    wr_unlock_ck(s);
+    const int w = wr_unlock_ck(s);
+    if (r == 0) r = w;                                  /* (the records of the removals are written before the call returns 0) */
   } else {
     const int w = wr_unlock_w(s);
     if (r == 0) r = w;
@@ -5228,7 +5293,7 @@ static void maintenance(store_t *s) {
   }
   if (budget) {
     uint64_t before = atomic_load_explicit(&s->c_moved_bytes, memory_order_relaxed);
-    (void)cleaner_work(s, budget, now + (forced ? 1000u : ST_CL_SLICE_MS), NULL);
+    (void)cleaner_work(s, budget, now + (forced ? 1000u : ST_CL_SLICE_MS), NULL, !forced);
     uint64_t moved = atomic_load_explicit(&s->c_moved_bytes, memory_order_relaxed) - before;
     if (rate != UINT64_MAX && !forced) s->cl_tokens = s->cl_tokens > (double)moved ? s->cl_tokens - (double)moved : 0.0;
   }
@@ -5909,6 +5974,9 @@ void store_stats(const store_t *s, store_stats_t *o) {
   o->leader_write_max_us = atomic_load_explicit(&s->jw_write_max_us, memory_order_relaxed);
   o->leader_retries = atomic_load_explicit(&s->n_jw_retries, memory_order_relaxed);
   o->checkpoint_journal_waits = atomic_load_explicit(&s->n_ck_twaits, memory_order_relaxed);
+  o->space_estimate_bytes = atomic_load_explicit(&s->avail_est, memory_order_relaxed);
+  o->space_reprobe_in_lock = atomic_load_explicit(&s->n_reprobe_lock, memory_order_relaxed);
+  o->defer_busy = atomic_load_explicit(&s->n_df_busy, memory_order_relaxed);
   for (unsigned k = 0; k < STORE_FINE_BUCKETS; k++) o->lock_hold_fine[k] = atomic_load_explicit(&s->wl_fine[k], memory_order_relaxed);
   o->flusher = s->fl_on;
   o->checkpoint_max_us = atomic_load_explicit(&s->ckpt_max_us, memory_order_relaxed);
@@ -6586,18 +6654,25 @@ static void *fl_commit_main(void *arg) {
   uint64_t retry_ms = 100, next_retry = 0;
   pthread_mutex_lock(&s->bg_mu);
   while (!s->bg_stop) {
-    uint64_t wait = s->o.sync_policy == STORE_SYNC_BATCH ? s->o.sync_interval_ms : 1000u;
+#ifdef KARIDNS_UNIT_TEST
+    atomic_fetch_add_explicit(&store_test_fl_loops, 1, memory_order_relaxed);
+#endif
+    /* (the wait of each state: no commit is made in JW_NOSPACE and JW_FAILED, so the "a record waits for its commit" rule of JW_OK must not make the loop spin there) */
     const int jst = atomic_load_explicit(&s->jw_state, memory_order_acquire);
+    const uint64_t now = st_now_ms();
+    uint64_t wait;
     if (jst == JW_NOSPACE) {
-      const uint64_t now = st_now_ms();
       wait = next_retry > now ? next_retry - now : 0;
       if (wait > 20) wait = 20;
-    } else if (jst == JW_OK && atomic_load_explicit(&s->jr_pub, memory_order_acquire) > atomic_load_explicit(&s->jr_tail, memory_order_acquire)) {
-      wait = 1;
+    } else if (jst == JW_FAILED) {
+      wait = 1000;                                       /* (only the log line once a minute is left to do) */
+    } else {
+      wait = s->o.sync_policy == STORE_SYNC_BATCH ? s->o.sync_interval_ms : 1000u;
+      const uint64_t last = atomic_load_explicit(&s->last_sync_ms, memory_order_relaxed);
+      if (s->o.sync_policy == STORE_SYNC_BATCH && atomic_load_explicit(&s->lsn, memory_order_relaxed) > atomic_load_explicit(&s->committed_lsn, memory_order_relaxed))
+        wait = now - last >= s->o.sync_interval_ms ? 0 : s->o.sync_interval_ms - (now - last);     /* (a record waits: commit when it is due, not a whole interval later) */
+      if (wait > 1 && atomic_load_explicit(&s->jr_pub, memory_order_acquire) > atomic_load_explicit(&s->jr_tail, memory_order_acquire)) wait = 1;   /* (the background leader) */
     }
-    const uint64_t now = st_now_ms(), last = atomic_load_explicit(&s->last_sync_ms, memory_order_relaxed);
-    if (s->o.sync_policy == STORE_SYNC_BATCH && atomic_load_explicit(&s->lsn, memory_order_relaxed) > atomic_load_explicit(&s->committed_lsn, memory_order_relaxed))
-      wait = now - last >= s->o.sync_interval_ms ? 0 : s->o.sync_interval_ms - (now - last);     /* (a record waits: commit when it is due, not a whole interval later) */
     if (wait) bg_wait_ms(s, wait);
     s->bg_kick = false;
     if (s->bg_stop) break;
@@ -6731,9 +6806,11 @@ int store_open(int dirfd, const store_opts_t *opts, store_t **out) {
   s->ck_buf = malloc(ST_CK_RUN);
   s->jb.p = malloc(4096);
   s->jb.cap = s->jb.p ? 4096 : 0;
+  s->jx_cap = JX_CAP;
   s->jr_cap = JR_CAP_DEF;
 #ifdef KARIDNS_UNIT_TEST
   if (atomic_load(&store_test_jr_cap)) s->jr_cap = atomic_load(&store_test_jr_cap);
+  if (atomic_load(&store_test_jx_cap) >= 3 && atomic_load(&store_test_jx_cap) <= JX_CAP) s->jx_cap = atomic_load(&store_test_jx_cap);
 #endif
   s->jr_buf = mmap(NULL, (size_t)s->jr_cap, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE | ST_NOCORE, -1, 0);    /* (pages are touched as the ring is used) */
   if (s->jr_buf == MAP_FAILED) s->jr_buf = NULL;

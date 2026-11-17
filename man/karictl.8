@@ -868,6 +868,10 @@ writes tried again after an error, and the runs of table pages a checkpoint held
 until the journal was written up to them (a checkpoint never writes a table page
 whose change the kernel's journal does not hold yet)
 .TP 8
+\fBstore.journal.defer_busy\fR
+0.7: calls of a thread that wanted to defer (not wait for its journal records)
+and found no free slot: they waited instead. Should stay 0
+.TP 8
 \fBstore.writes.prewrites\fR, \fB.prewrite_misses\fR
 0.7: image records that \fBstore_put()\fR wrote before the writer mutex (the
 change inside it only records where they are), and those it wrote again inside
@@ -1093,6 +1097,13 @@ every second while images are written)
 \fBstore.space.reserve_bytes\fR, \fB.store_bytes\fR
 Free bytes that only the cleaner may use (images are refused below that: half a
 segment, 256 KiB to 128 MiB); what the store occupies
+.TP 8
+\fBstore.space.estimate_bytes\fR, \fB.reprobe_in_lock\fR
+0.7: the free space the store reckons with between two readings (the last
+reading less every byte written or reserved since, the journal ring's unwritten
+bytes included), and the readings made inside the store's writer lock to confirm
+a refusal (only when the estimate says the call does not fit, i.e. the file
+system is nearly full, and at most every 100 ms)
 .TP 8
 \fBstore.space.growth_bytes_per_hour\fR, \fB.full_in_hours\fR
 The growth over the last hour (0 until five minutes of history exist, or when

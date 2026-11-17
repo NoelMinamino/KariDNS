@@ -322,6 +322,9 @@ typedef struct store_stats {
   uint64_t leader_writes, leader_bytes, leader_write_max_us;   /* the pwrite() calls of the leaders, their bytes, the longest one */
   uint64_t leader_retries;          /* writes tried again after an error */
   uint64_t checkpoint_journal_waits;  /* runs of table pages a checkpoint held until the journal was written up to them (rule T) */
+  int64_t  space_estimate_bytes;    /* the free space the store reckons with: the last probe less every byte reserved since (-1: unknown) */
+  uint64_t space_reprobe_in_lock;   /* probes made inside the writer mutex to confirm a refusal (nearly full: at most every 100 ms) */
+  uint64_t defer_busy;              /* store_defer() found no free slot (the calls of that thread waited then) */
   uint64_t lock_hold_fine[STORE_FINE_BUCKETS];   /* every hold of the writer mutex (store.lock.writer_hold_p50_us, _p99_us, _p999_us) */
 } store_stats_t;
 
@@ -581,6 +584,15 @@ extern int (*_Atomic store_test_jw_fault)(uint64_t pos, uint64_t len);
 extern void (*_Atomic store_test_jw_hook)(store_t *s, int step);
 extern _Atomic bool store_test_no_rule_t;
 extern _Atomic uint64_t store_test_jr_cap;
+/* the extents of the ring that may be in use for the stores opened while it is set (3 .. 256; 0: 256); a probe of the free space now */
+extern _Atomic uint32_t store_test_jx_cap;
+void store_test_probe(store_t *s);
+/* the rounds of the flusher's commit loop (a loop that spins shows here); the flusher stopped as the first step of a close does (the store stays usable: the writers make the due work) */
+extern _Atomic uint64_t store_test_fl_loops;
+/* the longest span the leader writes at once (0: 4 MiB): a small one cuts records in the middle (the torn tails of the tests) */
+extern _Atomic uint32_t store_test_jw_run;
+void store_test_stop_flusher(store_t *s);
+int store_test_dirfd_of(store_t *s);
 /* a word (byte offset off, a multiple of 8) of the memory of a table: 0 zt, 1 zc, 2 nx, 3 the current ix, 4 the current sx (the tables are private memory since 0.7: a test that damages a cell
  * does it here, not in the file); poke marks it for the next checkpoint */
 uint64_t store_test_peek(store_t *s, int which, uint64_t off);

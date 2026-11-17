@@ -684,6 +684,7 @@ static void add_store(list_t *l, const store_t *s, const store_attach_stats_t *a
   U("store.journal.write_max_us", st->leader_write_max_us);
   U("store.journal.retries", st->leader_retries);
   U("store.journal.ck_waits", st->checkpoint_journal_waits);
+  U("store.journal.defer_busy", st->defer_busy);
   U("store.writes.prewrites", st->image_prewrites);
   U("store.writes.prewrite_misses", st->image_prewrite_misses);
   U("store.checkpoint.count", st->checkpoints);
@@ -745,6 +746,8 @@ static void add_store(list_t *l, const store_t *s, const store_attach_stats_t *a
   U("store.space.fs_free_bytes", st->fs_free_bytes);
   U("store.space.checked_unix", st->fs_checked_unix);
   U("store.space.reserve_bytes", st->reserve_bytes);
+  add_u(l, false, "store.space.estimate_bytes", st->space_estimate_bytes < 0 ? 0 : (uint64_t)st->space_estimate_bytes);
+  U("store.space.reprobe_in_lock", st->space_reprobe_in_lock);
   U("store.space.store_bytes", st->store_bytes);
   U("store.space.growth_bytes_per_hour", st->growth_bytes_per_hour);
   U("store.space.full_in_hours", st->full_in_hours);
