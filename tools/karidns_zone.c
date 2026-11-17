@@ -38,6 +38,7 @@
 #include <unistd.h>
 #ifdef HAVE_LIBIDN2
 #include <idn2.h>
+#include "tools/dag_idn.h"
 #endif
 
 #include "dns_config_parser.h"
@@ -1043,27 +1044,6 @@ static int kz_cmd_render(const kz_args_t *a) {
 #define KZ_IDN_MAX_LINES 100000
 #define KZ_IDN_MAX_NAME 1024
 
-#ifdef HAVE_LIBIDN2
-/* The name dig 9.20 sends for +idnin (BIND dighost.c with libidn2; measured on the build host with dig 9.20.30 / libidn2 2.3.8): a name of ASCII
- * alone is sent as it is; otherwise IDNA2008 with the UTS #46 non-transitional mapping, and when the first problem libidn2 finds is a code point
- * IDNA2008 does not allow (IDN2_DISALLOWED, RFC 5892), the whole name again with the transitional mapping (UTS #46 section 4.1).  Any other problem:
- * dig sends the octets.  -> IDN2_OK and *out (idn2_free) or the error of the non-transitional attempt; *trans: the transitional mapping made it. */
-static int kz_idn_like_dig(const char *name, char **out, bool *trans) {
-    *trans = false;
-    *out = NULL;
-    int rc = idn2_lookup_u8((const uint8_t *)name, (uint8_t **)out, IDN2_NONTRANSITIONAL);
-    if (rc == IDN2_DISALLOWED) {
-        char *t = NULL;
-        if (idn2_lookup_u8((const uint8_t *)name, (uint8_t **)&t, IDN2_TRANSITIONAL) == IDN2_OK) {
-            *out = t;
-            *trans = true;
-            return IDN2_OK;
-        }
-    }
-    return rc;
-}
-#endif
-
 /* idn --json: names on standard input, one a line, "a TAB name" (the name dig +idnin sends) or "u TAB name" (the name dig +idnout shows).  The document
  * has the key "idn": one entry for each line, in order:
  *   a: { "ascii": "<name>" | null, "transitional": bool, "error": "<IDN2_...>" | null, "reason": "<text>" | null }: an ASCII name comes back as it is,
@@ -1110,7 +1090,10 @@ static int kz_cmd_idn(void) {
             for (const unsigned char *c = (const unsigned char *)name; *c; c++) if (*c >= 0x80) ascii = false;
             char *out = NULL;
             bool trans = false;
-            int rc = kz_idn_like_dig(name, &out, &trans);
+            /* the name dig 9.20 sends for +idnin (tools/dag_idn.c); any problem: dig sends the octets, so the error is the one of the first attempt */
+            int first_rc = IDN2_OK;
+            int rc = dag_idn_lookup(name, false, &out, &first_rc, &trans);
+            if (rc != IDN2_OK) rc = first_rc;
             kz_jb_add(&b, "\"ascii\": ");
             if (ascii) kz_jb_str(&b, name, strlen(name));
             else if (rc == IDN2_OK) kz_jb_str(&b, out, strlen(out));

@@ -54,7 +54,7 @@ SRCS = dns_server_core.c dns_log.c dns_log_state.c dns_db_stream.c dns_db_ingest
 OBJS = $(SRCS:.c=.o)
 
 # dag を構成するモジュール (dag.c 以外)。fuzz / unit test / asan ビルドでも共有する
-DAG_MOD_SRCS = tools/dag_output_yaml.c tools/dag_batch.c tools/dag_axfr_client.c tools/dag_trace.c tools/dag_trace_common.c tools/dag_iter.c tools/dag_roothints.c tools/dag_tsig_client.c tools/dag_edns_client.c tools/dag_transport.c tools/dag_http.c tools/dag_replay.c tools/dnstap_decode.c tools/dag_pcap_l4.c tools/dag_tcp_reassembly.c
+DAG_MOD_SRCS = tools/dag_output_yaml.c tools/dag_batch.c tools/dag_axfr_client.c tools/dag_trace.c tools/dag_trace_common.c tools/dag_iter.c tools/dag_roothints.c tools/dag_idn.c tools/dag_tsig_client.c tools/dag_edns_client.c tools/dag_transport.c tools/dag_http.c tools/dag_replay.c tools/dnstap_decode.c tools/dag_pcap_l4.c tools/dag_tcp_reassembly.c
 DAG_TARGET = dag
 DAG_SRCS = tools/dag.c $(DAG_MOD_SRCS) dns_wire.c dns_utils.c dns_zone_parser.c dns_cidr.c
 
@@ -305,6 +305,9 @@ tools/dag_iter.o: tools/dag_iter.c tools/dag_iter.h tools/dag_roothints.h tools/
 
 tools/dag_roothints.o: tools/dag_roothints.c tools/dag_roothints.h tools/dag_internal.h
 	$(CC) $(CFLAGS) -c tools/dag_roothints.c -o tools/dag_roothints.o
+
+tools/dag_idn.o: tools/dag_idn.c tools/dag_idn.h
+	$(CC) $(CFLAGS) -c tools/dag_idn.c -o tools/dag_idn.o
 
 tools/dag_tsig_client.o: tools/dag_tsig_client.c tools/dag_tsig_client.h tools/dag_internal.h
 	$(CC) $(CFLAGS) -c tools/dag_tsig_client.c -o tools/dag_tsig_client.o
@@ -623,8 +626,8 @@ karidns-dbloader-asan: dbloader-check-drivers $(DBLOADER_SRCS)
 # 0.6.0 karidns-zone (docs/karidns-zone.md): the command line of the ZoneImporter / ZoneExporter.  It links the DB drivers of DB_DRIVERS like
 # karidns-dbloader and runs as an ordinary user.  make karidns-zone DB_DRIVERS="sqlite3 postgresql"
 KARIDNS_ZONE_TARGET = karidns-zone
-KARIDNS_ZONE_SRCS = tools/karidns_zone.c dns_zone_import.c dns_zone_changes.c dns_zone_render.c dns_zone_export.c dns_zone_msg.c dns_zone_text.c dns_zone_rows.c dns_pdns_reader.c dns_presigned.c dns_db_stream.c dns_zone_lint.c dns_config_parser.c dns_tsig_acl.c dns_diag.c dns_wire.c dns_zone_parser.c dns_tinydns_parser.c dns_utils.c dns_cidr.c dns_zone_image.c $(DBLOADER_DRV_SRCS)
-KARIDNS_ZONE_HDRS = dns_db_driver.h dns_zone_import.h dns_zone_changes.h dns_zone_render.h dns_zone_export.h dns_zone_msg.h dns_zone_text.h dns_zone_rows.h dns_zone_lint.h dns_diag.h dns_diag_codes.h
+KARIDNS_ZONE_SRCS = tools/karidns_zone.c tools/dag_idn.c dns_zone_import.c dns_zone_changes.c dns_zone_render.c dns_zone_export.c dns_zone_msg.c dns_zone_text.c dns_zone_rows.c dns_pdns_reader.c dns_presigned.c dns_db_stream.c dns_zone_lint.c dns_config_parser.c dns_tsig_acl.c dns_diag.c dns_wire.c dns_zone_parser.c dns_tinydns_parser.c dns_utils.c dns_cidr.c dns_zone_image.c $(DBLOADER_DRV_SRCS)
+KARIDNS_ZONE_HDRS = tools/dag_idn.h dns_db_driver.h dns_zone_import.h dns_zone_changes.h dns_zone_render.h dns_zone_export.h dns_zone_msg.h dns_zone_text.h dns_zone_rows.h dns_zone_lint.h dns_diag.h dns_diag_codes.h
 
 karidns-zone: dbloader-check-drivers $(KARIDNS_ZONE_SRCS) $(KARIDNS_ZONE_HDRS)
 	$(CC) $(CFLAGS) $(DBLOADER_DRV_CFLAGS) -I. $(KARIDNS_ZONE_SRCS) -o $(KARIDNS_ZONE_TARGET) $(LDFLAGS) -pthread -lcrypto $(DBLOADER_DRV_LIBS) $(IDN_LDFLAGS)
