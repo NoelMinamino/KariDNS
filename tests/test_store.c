@@ -2590,6 +2590,7 @@ static void test_private_tables(void) {
   store_stats_t st;
   store_stats(s, &st);
   CHECK(st.table_private_bytes > 0);
+  CHECK_EQ(store_reserve(s, 0), 0);                                     /* (a growth of the index built outside the mutex may still be on its way: its generation would come after the checkpoint) */
   CHECK_EQ(store_checkpoint_clean(s), 0);
   CHECK(store_test_files_match(s));                                      /* (the writers were out: the files are the memory) */
   store_stats(s, &st);
@@ -2605,6 +2606,7 @@ static void test_private_tables(void) {
   atomic_store(&store_test_ckpt_hook, NULL);
   const uint32_t K = atomic_load(&g_pt_k);
   CHECK(K > 0);
+  CHECK_EQ(store_reserve(s, 0), 0);
   CHECK_EQ(store_checkpoint_clean(s), 0);
   CHECK(store_test_files_match(s));
   /* a write of the tables fails: the checkpoint gives its pages back and the next one writes them */

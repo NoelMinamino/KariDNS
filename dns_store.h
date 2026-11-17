@@ -291,6 +291,7 @@ typedef struct store_stats {
   uint64_t table_private_bytes;     /* pages of zt, zc, nx, ix, sx that the writers changed since the open: private memory of the process (counted in memory-limit) */
   uint64_t checkpoint_table_bytes;  /* bytes of the tables that checkpoints wrote since the open */
   uint64_t checkpoint_table_last_bytes; /* ... the last one */
+  uint64_t checkpoint_paced_us;     /* the time fuzzy checkpoints waited to stay under their write rate (ck_pace()) */
 } store_stats_t;
 
 /* What one store_compact() did. */

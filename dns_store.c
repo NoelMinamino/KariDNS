@@ -443,7 +443,7 @@ struct store {
   _Atomic uint64_t n_prew, n_prew_miss;               /* records written before the mutex that the change took; those it wrote again (store.writes.prewrites, .prewrite_misses) */
   uint32_t jnext_gen;
   struct {                                            /* (ck_busy) the checkpoint being made */
-    uint64_t lsn, t0;
+    uint64_t lsn, t0, tw0;                            /* tw0: when the write of the tables began (ck_pace()) */
     bool clean, dir;
     int oldfd, newfd;
     uint32_t gen;                                     /* the journal file the superblock names (newfd until a commit switches the journal on) */
@@ -455,6 +455,7 @@ struct store {
   uint8_t *ck_buf;                                    /* (ck_busy) the copy of a run of pages that the checkpoint writes */
   _Atomic uint64_t priv_bytes;                        /* the private pages of the tables (store.tables.private_bytes) */
   _Atomic uint64_t n_ck_bytes, ck_last_bytes;         /* bytes of the tables written by checkpoints: all, the last one */
+  _Atomic uint64_t n_ck_paced_us;                     /* the time fuzzy checkpoints gave way to the writers (ck_pace()) */
   struct { uint32_t nseg; seg_t *seg[ST_MAXSEG]; } cm;   /* (baton) the segments of the commit being made */
   /* growth of ix / sx outside the mutex (rg_*; wlock, except the flags the build thread reads) */
   bool rg_active, rg_bad;
@@ -1268,19 +1269,22 @@ static void mtab_note_extended(mtab_t *t, uint64_t to) {
   while (to > c && !atomic_compare_exchange_weak_explicit(&t->extended, &c, to, memory_order_release, memory_order_relaxed)) {}
 }
 static bool st_no_fallocate(int r) { return r == EINVAL || r == EOPNOTSUPP || r == ENODEV; }
-/* grow the data area to at least `need` bytes (never shrinks); the address of existing data does not change.  The new pages are anonymous memory.  Where the file system allocates
- * (posix_fallocate(): UFS) the file's blocks are allocated here unless the flusher did it already (mtab_ahead()), so that a full disk is -ENOSPC now and not a checkpoint that cannot
- * write; elsewhere (ZFS) the checkpoint extends the file (ck_write_tab()). */
+static void fs_probe(store_t *s);
+static void space_used(store_t *s, uint64_t n);
+/* grow the data area to at least `need` bytes (never shrinks); the address of existing data does not change.  The new pages are anonymous memory, and no operation on the file is made
+ * here (inside the writer mutex): UFS's posix_fallocate() syncs the file's vnode and waits for the lock that a checkpoint's fdatasync() of the table holds (holds of seconds).  The
+ * room is checked against the free space (fs_probe(): a full disk is -ENOSPC now, not a checkpoint that cannot write); the flusher allocates the blocks ahead
+ * (mtab_ahead()) and the checkpoint extends the file to the size of its position (ck_write_tab()). */
 static int mtab_grow(store_t *s, mtab_t *t, uint64_t need) {
   uint64_t cur = atomic_load_explicit(&t->mapped, memory_order_relaxed);
   if (need <= cur) return 0;
   if (need > t->reserve) return -EFBIG;
-  const uint64_t want = mtab_want(s, t, cur, need);
-  if (!atomic_load_explicit(&t->no_alloc, memory_order_relaxed) && atomic_load_explicit(&t->extended, memory_order_acquire) < want) {
-    const int e = posix_fallocate(t->fd, (off_t)(ST_HDR_PAGE + cur), (off_t)(want - cur));
-    if (e == 0) mtab_note_extended(t, want);
-    else if (st_no_fallocate(e)) atomic_store_explicit(&t->no_alloc, true, memory_order_relaxed);
-    else return -e;
+  const uint64_t want = mtab_want(s, t, cur, need), ext = atomic_load_explicit(&t->extended, memory_order_acquire);
+  if (ext < want) {                                   /* (the blocks are the flusher's and the checkpoint's to allocate: here only the room is checked; the reserve of the cleaner may be used, as an allocation could) */
+    const uint64_t n = want - (ext > cur ? ext : cur);
+    fs_probe(s);
+    if (s->avail_est >= 0 && (uint64_t)s->avail_est < n) return -ENOSPC;
+    space_used(s, n);
   }
   if (dm_resize(&t->d, want >> s->pgshift) < 0) return -ENOMEM;
   int r = mtab_map_tail(t, cur, want, false);
@@ -2305,6 +2309,23 @@ static void ck_drop_taken(store_t *s) {
     s->ck.t[i].dirty = NULL;
   }
 }
+/* A fuzzy checkpoint writes at most ST_CK_RATE bytes a second (0.7): written at full speed, a burst of table pages (a first fill changes every page, a growth's generation is written
+ * whole) filled the file system's write queue that the writers' journal appends inside the mutex then waited for (ZFS: the transaction group, txg_wait_synced(), 1.0 to 5.0 s in a 10M
+ * first fill; UFS: runningbufspace).  A checkpoint with the writers kept out does not wait (cancel NULL).  (Also tried, not kept: a sleep as long as a slow write, which made the
+ * checkpoints of a 10M first start on UFS 60 to 98 s long and left the longest hold where it was.) */
+#define ST_CK_RATE (256ull << 20)
+#define ST_CK_SYNC (64u << 20)
+static void ck_pace(store_t *s, uint64_t done, const _Atomic bool *cancel) {
+  const uint64_t el = st_now_us() - s->ck.tw0, due = done / (ST_CK_RATE / 1000000);
+  if (due <= el) return;
+  uint64_t nap = due - el > 200000 ? 200000 : due - el;
+  atomic_fetch_add_explicit(&s->n_ck_paced_us, nap, memory_order_relaxed);
+  while (nap && !atomic_load_explicit(cancel, memory_order_relaxed)) {
+    const uint64_t p = nap > 20000 ? 20000 : nap;
+    usleep((useconds_t)p);
+    nap -= p;
+  }
+}
 /* Write the pages of table i that the checkpoint took (no lock: the writers go on).  A run of pages is copied into ck_buf with word loads (the writers store words into those pages
  * meanwhile: a copy may hold the effect of records after P, which the replay from P makes right again, see "The tables in private memory") and written with pwrite(); the page that
  * a writer stores into is never the page the kernel writes out.  Then the file is extended to the size of P and synced.  *done: the bytes written. */
@@ -2315,6 +2336,7 @@ static int ck_write_tab(store_t *s, int i, int fd, const uint8_t *base, const _A
   if (!all && np > s->ck.t[i].npages) np = s->ck.t[i].npages;
   const uint64_t run_max = ST_CK_RUN >> s->pgshift;
   bool wrote = false;
+  uint64_t pend = 0;                                  /* (bytes written since the last sync of a fuzzy checkpoint) */
   for (uint64_t p = 0; p < np; ) {
     if (!all && dirty[p >> 6] == 0) { p = (p | 63) + 1; continue; }
     if (!all && !((dirty[p >> 6] >> (p & 63)) & 1)) { p++; continue; }
@@ -2330,6 +2352,13 @@ static int ck_write_tab(store_t *s, int i, int fd, const uint8_t *base, const _A
     wrote = true;
     CRASH_POINT();
     st_hook(&store_test_ckpt_hook, 5);
+    /* a fuzzy checkpoint syncs every ST_CK_SYNC bytes: the file system then has at most that much of it on its way (UFS: runningbufspace, about 16 MB, is what the writers' journal appends wait
+     * for; a sync of the whole table at the end had hundreds of megabytes in flight) */
+    if (cancel && (pend += len) >= ST_CK_SYNC) {
+      if (fdatasync(fd) != 0) return -errno;
+      pend = 0;
+    }
+    if (cancel) ck_pace(s, *done, cancel);
     if (cancel && atomic_load_explicit(cancel, memory_order_relaxed)) return -ECANCELED;
   }
   struct stat st;
@@ -2346,6 +2375,7 @@ static int ck_write_tab(store_t *s, int i, int fd, const uint8_t *base, const _A
 static int ck_io_tables(store_t *s, const _Atomic bool *cancel) {
   mtab_t *tabs[3] = { &s->zt, &s->zc, &s->nx };
   uint64_t done = 0;
+  s->ck.tw0 = st_now_us();
   int r = 0;
   for (int i = 0; i < 5 && r == 0; i++) {
     if (i < 3) {
@@ -5282,6 +5312,7 @@ void store_stats(const store_t *s, store_stats_t *o) {
   o->table_private_bytes = atomic_load_explicit(&s->priv_bytes, memory_order_relaxed);
   o->checkpoint_table_bytes = atomic_load_explicit(&s->n_ck_bytes, memory_order_relaxed);
   o->checkpoint_table_last_bytes = atomic_load_explicit(&s->ck_last_bytes, memory_order_relaxed);
+  o->checkpoint_paced_us = atomic_load_explicit(&s->n_ck_paced_us, memory_order_relaxed);
   rcu_aux_read_unlock();
 }
 
