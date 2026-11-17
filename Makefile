@@ -627,11 +627,11 @@ KARIDNS_ZONE_SRCS = tools/karidns_zone.c dns_zone_import.c dns_zone_changes.c dn
 KARIDNS_ZONE_HDRS = dns_db_driver.h dns_zone_import.h dns_zone_changes.h dns_zone_render.h dns_zone_export.h dns_zone_msg.h dns_zone_text.h dns_zone_rows.h dns_zone_lint.h dns_diag.h dns_diag_codes.h
 
 karidns-zone: dbloader-check-drivers $(KARIDNS_ZONE_SRCS) $(KARIDNS_ZONE_HDRS)
-	$(CC) $(CFLAGS) $(DBLOADER_DRV_CFLAGS) -I. $(KARIDNS_ZONE_SRCS) -o $(KARIDNS_ZONE_TARGET) $(LDFLAGS) -pthread -lcrypto $(DBLOADER_DRV_LIBS)
+	$(CC) $(CFLAGS) $(DBLOADER_DRV_CFLAGS) -I. $(KARIDNS_ZONE_SRCS) -o $(KARIDNS_ZONE_TARGET) $(LDFLAGS) -pthread -lcrypto $(DBLOADER_DRV_LIBS) $(IDN_LDFLAGS)
 
 # the tool under AddressSanitizer / UBSan (tests/run_karidns_zone_test.sh with ZONE=./karidns-zone-asan)
 karidns-zone-asan: dbloader-check-drivers $(KARIDNS_ZONE_SRCS) $(KARIDNS_ZONE_HDRS)
-	$(CC) $(ASAN_CFLAGS) $(DBLOADER_DRV_CFLAGS) -I. $(KARIDNS_ZONE_SRCS) -o karidns-zone-asan $(LDFLAGS) -pthread -lcrypto $(DBLOADER_DRV_LIBS)
+	$(CC) $(ASAN_CFLAGS) $(IDN_CFLAGS) $(DBLOADER_DRV_CFLAGS) -I. $(KARIDNS_ZONE_SRCS) -o karidns-zone-asan $(LDFLAGS) -pthread -lcrypto $(DBLOADER_DRV_LIBS) $(IDN_LDFLAGS)
 
 TEST_DB_SQLITE3_SRCS = tests/test_db_sqlite3.c dns_db_sqlite3.c dns_pdns_reader.c dns_presigned.c dns_db_stream.c dns_db_checkproto.c dns_zone_lint.c dns_diag.c dns_wire.c dns_zone_parser.c dns_tinydns_parser.c dns_utils.c dns_cidr.c dns_zone_image.c $(TEST_SYSLOG_QUIET)
 

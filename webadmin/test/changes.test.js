@@ -29,7 +29,6 @@ test('a change set: names are canonical, types upper case, the shape is checked'
       { name: 'www.example.test', type: 'A', op: 'replace', ttl: 300, records: ['192.0.2.10', '192.0.2.11'], expect: null },
       { name: 'old.example.test', type: 'TXT', op: 'delete', ttl: null, records: [], expect: null },
     ],
-    warnings: [],
   });
   assert.equal(parseChangeSet({ rrsets: [rr('example.test.', 'NS', 1, 'ns1.example.test.')] }, 'example.test').reload, undefined);
   // the types karidns-zone names, TYPEnnn, and nothing else
@@ -52,7 +51,7 @@ test('a change set: names are canonical, types upper case, the shape is checked'
   bad(() => parseChangeSet({ rrsets: [rr('a..example.test', 'A', 1, 'x')] }, 'example.test'), '/rrsets/0/name');
   bad(() => parseChangeSet({ rrsets: [rr('a\\.example.test', 'A', 1, 'x')] }, 'example.test'), '/rrsets/0/name');
   bad(() => parseChangeSet({ rrsets: [rr('a b.example.test', 'A', 1, 'x')] }, 'example.test'), '/rrsets/0/name');
-  bad(() => parseChangeSet({ rrsets: [rr('a‍b.example.test', 'A', 1, 'x')] }, 'example.test'), '/rrsets/0/name');   // (0.7: é is converted; a misplaced ZWJ has no A-label form)
+  bad(() => parseChangeSet({ rrsets: [rr('é.example.test', 'A', 1, 'x')] }, 'example.test'), '/rrsets/0/name');
   bad(() => parseChangeSet({ rrsets: [rr(`${'a'.repeat(64)}.example.test`, 'A', 1, 'x')] }, 'example.test'), '/rrsets/0/name');
   // REPLACE and DELETE
   bad(() => parseChangeSet({ rrsets: [{ name: 'a.example.test', type: 'A', changetype: 'REPLACE', records: [{ content: 'x' }] }] }, 'example.test'), '/rrsets/0/ttl', /needs a ttl/);

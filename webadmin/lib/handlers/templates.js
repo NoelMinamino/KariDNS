@@ -9,7 +9,7 @@ import { renderChangeFile, templateRRsets, templateLabel } from '../changes.js';
 import { runChange } from '../pipeline.js';
 import { parseTemplate, templateZoneText, templateMessages, templateComment } from '../templates.js';
 import { clip } from '../../../node/lib/run.js';
-import { dataset, zoneParam, zoneGrants, requireGlobal, idParam, idCursor, page, withWarnings } from './common.js';
+import { dataset, zoneParam, zoneGrants, requireGlobal, idParam, idCursor, page } from './common.js';
 import { loadFacts, editable, wantReload, noChangeSet } from './write.js';
 
 const EDIT_MS = 120000;
@@ -56,12 +56,12 @@ export async function get(ctx) {
 // warnings come back in `messages`.  dry_run: only the checks.
 export async function create(ctx) {
   requireGlobal(ctx);
-  const { warnings, ...t } = parseTemplate(ctx.body, { types: ctx.app.types, create: true });
+  const t = parseTemplate(ctx.body, { types: ctx.app.types, create: true });
   const messages = await checkRecords(ctx, t.records);
   if (hasErrors(messages)) throw refused(messages);
-  if (t.dryRun) return withWarnings({ dry_run: true, valid: true, messages }, warnings);
+  if (t.dryRun) return { dry_run: true, valid: true, messages };
   const id = await ctx.db((tx) => S.createTemplate(tx, t, ctx.auth.principal.id), { write: true, changeSet: noChangeSet(ctx) });
-  return reply(201, withWarnings({ template: view(await ctx.db((tx) => S.getTemplate(tx, id))), messages }, warnings), { headers: { Location: `/api/v1/templates/${id}` } });
+  return reply(201, { template: view(await ctx.db((tx) => S.getTemplate(tx, id))), messages }, { headers: { Location: `/api/v1/templates/${id}` } });
 }
 
 // PATCH /templates/{id}: any of name, description, soa (null clears), records (the whole list).  The revision grows.
@@ -69,16 +69,16 @@ export async function update(ctx) {
   requireGlobal(ctx);
   const id = idParam(ctx);
   const t = parseTemplate(ctx.body, { types: ctx.app.types });
-  const { dryRun, warnings, ...patch } = t;
+  const { dryRun, ...patch } = t;
   if (Object.keys(patch).length === 0) throw badRequest('nothing to change: give name, description, soa or records', '/');
   const old = await ctx.db((tx) => S.getTemplate(tx, id));
   if (!old) throw notFound('no such template');
   const messages = await checkRecords(ctx, patch.records ?? old.records);
   if (hasErrors(messages)) throw refused(messages);
-  if (dryRun) return withWarnings({ dry_run: true, valid: true, messages }, warnings);
+  if (dryRun) return { dry_run: true, valid: true, messages };
   const n = await ctx.db((tx) => S.updateTemplate(tx, id, patch), { write: true, changeSet: noChangeSet(ctx) });
   if (!n) throw notFound('no such template');
-  return withWarnings({ template: view(await ctx.db((tx) => S.getTemplate(tx, id))), messages }, warnings);
+  return { template: view(await ctx.db((tx) => S.getTemplate(tx, id))), messages };
 }
 
 export async function remove(ctx) {

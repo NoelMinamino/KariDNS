@@ -262,8 +262,7 @@ test('names: owners, zones, containment', () => {
   assert.equal(canonicalOwner('_dmarc._tcp.example.test'), '_dmarc._tcp.example.test');
   assert.equal(canonicalOwner('1/24.2.0.192.in-addr.arpa'), '1/24.2.0.192.in-addr.arpa');
   assert.equal(canonicalOwner('a'), 'a');
-  assert.equal(canonicalOwner('Exämple.test'), 'xn--exmple-cua.test', '0.7: a U-label becomes its A-label');
-  for (const bad of ['', '.', 'a..b', '-a.test', 'a-.test', 'b*.test', 'a b.test', 'a\nb', '㈱.test', 'a\\.b', `${'x'.repeat(64)}.test`, `${'a.'.repeat(130)}test`, '*']) {
+  for (const bad of ['', '.', 'a..b', '-a.test', 'a-.test', 'b*.test', 'a b.test', 'a\nb', 'exämple.test', 'a\\.b', `${'x'.repeat(64)}.test`, `${'a.'.repeat(130)}test`, '*']) {
     if (bad === '*') { assert.equal(canonicalOwner(bad), '*'); continue; }
     assert.throws(() => canonicalOwner(bad), Error, JSON.stringify(bad));
   }

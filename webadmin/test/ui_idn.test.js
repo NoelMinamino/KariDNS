@@ -43,14 +43,14 @@ test('nameNodes: the U-labels over the A-labels, or the name alone', () => {
 
 test('warningList: each code in the language of the page, an unknown code in the words of the service, nothing for no warnings', () => {
   const ctx = makeCtx({ lang: 'ja' });
-  const list = warningList(ctx.i18n.t, [{ code: 'idn-hyphen', label: '-例' }, { code: 'idn-new', label: 'x', message: 'the label "x" is new' }, null]);
+  const list = warningList(ctx.i18n.t, [{ code: 'idn-contexto', label: 'a・b' }, { code: 'idn-new', label: 'x', message: 'the label "x" is new' }, null]);
   assert.equal(list.childNodes.length, 3);
-  assert.match(list.childNodes[0].textContent, /^ラベル -例 がハイフンで/);
+  assert.match(list.childNodes[0].textContent, /^ラベル a・b に、IDNA2008 が/);
   assert.equal(list.childNodes[1].textContent, 'the label "x" is new');
   assert.equal(list.childNodes[2].textContent, '');
   assert.equal(warningList(ctx.i18n.t, []), null);
   assert.equal(warningList(ctx.i18n.t, undefined), null);
-  for (const code of ['idn-disallowed', 'idn-unassigned', 'idn-bidi', 'idn-bad-alabel', 'idn-contexto', 'idn-mixed-script', 'idn-transitional', 'idn-not-dig']) {
+  for (const code of ['idn-disallowed', 'idn-bad-alabel', 'idn-contexto', 'idn-mixed-script', 'idn-transitional']) {
     assert.ok(!warningList(ctx.i18n.t, [{ code, label: 'L' }]).textContent.includes('idn.'), code);
   }
 });

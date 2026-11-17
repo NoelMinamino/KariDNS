@@ -1,104 +1,111 @@
-// idn.js (0.7): names typed in Unicode -> the A-labels dig +idnin sends, compared with what dig 9.20 sent on the build host (idn_dig_vectors.json, made by
-// idn_dig_vectors_gen.mjs), the U-label form compared with what dig +idnout shows, the derived property of RFC 5892 and the warnings.
+// idn.js (0.7): names in Unicode through `karidns-zone idn` (a scripted tool here; tests/run_karidns_zone_idn_test.sh compares the real one with dig 9.20):
+// which names are asked about, one run for all, the warnings, the 400s, a tool without libidn2, a broken tool, and the pre-pass over the fields of a route.
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import fs from 'node:fs';
-import { toAscii, asciiName, toUnicode, idnaProperty } from '../lib/idn.js';
-import { canonicalOwner, canonicalZone, unicodeOf } from '../lib/names.js';
+import { needsIdn, asciiNames, unicodeNames, idnPrepass } from '../lib/idn.js';
+import { idnRun, isIdnCall } from './idn_fake.js';
 
-const V = JSON.parse(fs.readFileSync(new URL('./idn_dig_vectors.json', import.meta.url), 'utf8'));
-const codes = (name) => toAscii(name).warnings.map((w) => w.code);
+function ctxOf({ unavailable = false, broken = null } = {}) {
+  const calls = [];
+  const errors = [];
+  const app = {
+    settings: { 'karidns-zone': '/opt/karidns-zone' },
+    log: { error: (l) => errors.push(l) },
+    runTool: async (file, argv, opts) => {
+      calls.push({ file, argv, input: opts.input });
+      assert.ok(isIdnCall({ argv }));
+      return broken ?? idnRun(opts.input, { unavailable });
+    },
+  };
+  return { app, id: 'r1', calls, errors, params: {}, query: new URLSearchParams(), body: undefined };
+}
+const codes = (m, n) => m.get(n).warnings.map((w) => w.code);
 
-test('every name dig converts gets the same octets (up to the case of ASCII letters); every name dig does not is refused or said to be one dig does not convert', () => {
-  assert.ok(V.vectors.length >= 80, 'the vectors are there');
-  for (const { name, dig } of V.vectors) {
-    if (dig !== null) {
-      const r = toAscii(name);
-      assert.equal(r.dig, true, name);
-      assert.equal(r.name.toLowerCase(), dig.toLowerCase(), name);
-      continue;
-    }
-    let r = null;
-    try { r = toAscii(name); canonicalOwner(r.name); } catch { continue; }      // no A-label form, or one the database cannot hold: refused
-    assert.equal(r.dig, false, name);
-    assert.ok(r.warnings.some((w) => w.code === 'idn-not-dig'), name);
+test('needsIdn: non-ASCII or an xn-- label, on one line of the input of the tool', () => {
+  assert.equal(needsIdn('例え.test'), true);
+  assert.equal(needsIdn('www.XN--r8jz45g.test'), true);
+  assert.equal(needsIdn('www.example.test'), false);
+  assert.equal(needsIdn('axn--b.test'), false);
+  assert.equal(needsIdn('例\tえ'), false);
+  assert.equal(needsIdn(''), false);
+  assert.equal(needsIdn(7), false);
+});
+
+test('asciiNames: one run of the tool for every name, the A-labels, the warnings, a name dig does not convert is a 400 at its pointer', async () => {
+  const ctx = ctxOf();
+  const m = await asciiNames(ctx, ['例え.test', 'www.example.test', '例え.test', '☃.EXAMPLE.test.', 'a・b.test', 'аpple.example.test', 'xn--zz.test', 'xn--r8jz45g.test']);
+  assert.equal(ctx.calls.length, 1);
+  assert.deepEqual(ctx.calls[0].argv, ['idn', '--json']);
+  assert.equal(ctx.calls[0].input, 'a\t例え.test\na\t☃.EXAMPLE.test.\na\ta・b.test\na\tаpple.example.test\na\txn--zz.test\na\txn--r8jz45g.test\n', 'each once, ASCII names only with xn--');
+  assert.equal(m.get('例え.test').ascii, 'xn--r8jz45g.test');
+  assert.deepEqual(codes(m, '例え.test'), []);
+  assert.deepEqual(codes(m, '☃.EXAMPLE.test.'), ['idn-disallowed', 'idn-transitional']);
+  assert.deepEqual(codes(m, 'a・b.test'), ['idn-contexto']);
+  assert.deepEqual(codes(m, 'аpple.example.test'), ['idn-mixed-script']);
+  assert.deepEqual(codes(m, 'xn--zz.test'), ['idn-bad-alabel']);
+  assert.deepEqual(codes(m, 'xn--r8jz45g.test'), []);
+  assert.equal(m.has('www.example.test'), false);
+  assert.match(m.get('☃.EXAMPLE.test.').warnings[0].message, /^"☃\.EXAMPLE\.test\." has a code point that IDNA2008 does not allow/);
+  assert.equal((await asciiNames(ctx, ['www.example.test'])).size, 0);
+  assert.equal(ctx.calls.length, 1, 'no run for plain names');
+  await assert.rejects(asciiNames(ctx, ['-例.test'], () => '/name'), (e) => e.status === 400 && e.errors[0].pointer === '/name' && /dig \+idnin would send \(libidn2: string has forbidden bi-directional/.test(e.errors[0].text ?? e.message));
+});
+
+test('the CONTEXTO rules and the scripts: warnings only (dig converts such names)', async () => {
+  const cases = [['l·l', []], ['a·b', ['idn-contexto']], ['͵α', []], ['͵a', ['idn-contexto', 'idn-mixed-script']], ['א׳', []], ['a׳', ['idn-contexto', 'idn-mixed-script']],
+    ['١۱', ['idn-contexto']], ['۱١', ['idn-contexto']], ['テスト・ガイド', []], ['abcテスト漢字', []], ['ᚠᚡ', []], ['aᚠ', ['idn-mixed-script']]];
+  const names = cases.map(([l]) => `${l}.test`);
+  const ctx = ctxOf();
+  ctx.app.runTool = async (f, argv, opts) => {
+    const lines = opts.input.split('\n').filter(Boolean);
+    return { code: 0, stdout: JSON.stringify({ idn: lines.map(() => ({ ascii: 'xn--x.test', transitional: false, error: null, reason: null })) }), stderr: '' };
+  };
+  const m = await asciiNames(ctx, names);
+  cases.forEach(([l, want], i) => assert.deepEqual(codes(m, names[i]), want, l));
+});
+
+test('unicodeNames: the U-label form of the names with an xn-- label, nothing for the others', async () => {
+  const ctx = ctxOf();
+  const m = await unicodeNames(ctx, ['xn--r8jz45g.test.', 'www.example.test.', 'xn--zz.example.test.', '例え.test.']);
+  assert.deepEqual([...m], [['xn--r8jz45g.test.', '例え.test.']]);
+  assert.equal(ctx.calls[0].input, 'u\txn--r8jz45g.test.\nu\txn--zz.example.test.\n');
+  assert.equal((await unicodeNames(ctx, ['www.example.test.'])).size, 0);
+  assert.equal(ctx.calls.length, 1);
+});
+
+test('a karidns-zone without libidn2: Unicode is refused with the reason, A-labels are shown as they are; a broken tool is a 500, logged', async () => {
+  const ctx = ctxOf({ unavailable: true });
+  await assert.rejects(asciiNames(ctx, ['例え.test'], () => '?name'), (e) => e.status === 400 && /built without libidn2/.test(e.errors[0].text ?? e.message));
+  assert.equal((await asciiNames(ctx, ['xn--zz.test'])).size, 0, 'an ASCII name needs no conversion');
+  assert.equal((await unicodeNames(ctx, ['xn--r8jz45g.test.'])).size, 0);
+  for (const broken of [{ code: 1, stdout: '', stderr: 'boom' }, { code: 0, stdout: '{"idn": []}', stderr: '' }, { spawnError: 'ENOENT' }, { timedOut: true }, { truncated: true, code: 0, stdout: '' }]) {
+    const b = ctxOf({ broken });
+    await assert.rejects(asciiNames(b, ['例え.test']), (e) => e.status === 500);
+    assert.match(b.errors[0], /^r1: karidns-zone idn /);
   }
 });
 
-test('the U-label form is what dig +idnout shows; a label that does not decode back to itself stays an A-label', () => {
-  for (const { name, dig } of V.display) {
-    // (dig shows xn--a as an empty label: it is no A-label, the page shows it as it is)
-    const want = name === 'xn--a.test' ? name : dig;
-    assert.equal(toUnicode(name) ?? name, want, name);
-  }
-  assert.equal(toUnicode('www.example.test.'), undefined);
-  assert.equal(toUnicode('xn--zz.test'), undefined);
-  assert.equal(toUnicode(42), undefined);
-  assert.equal(unicodeOf('www.xn--r8jz45g.test.'), 'www.例え.test.');
-});
-
-test('the warnings: each rule, said once a label, and none for a plain name', () => {
-  assert.deepEqual(codes('www.example.test'), []);
-  assert.deepEqual(codes('例え.test'), []);
-  assert.deepEqual(codes('xn--zz.test'), ['idn-bad-alabel']);
-  assert.deepEqual(codes('☃.☃.example'), ['idn-disallowed']);
-  assert.deepEqual(codes('straße.☃.example'), ['idn-disallowed', 'idn-transitional']);
-  assert.deepEqual(codes('ab--例.test'), ['idn-hyphen', 'idn-not-dig']);
-  assert.deepEqual(codes('a-.例.test'), ['idn-hyphen', 'idn-not-dig']);
-  assert.deepEqual(codes('١٢٣.example'), ['idn-bidi', 'idn-not-dig']);
-  assert.deepEqual(codes('a・b.test'), ['idn-contexto']);
-  assert.deepEqual(codes('a·b.example'), ['idn-contexto']);
-  assert.deepEqual(codes('l·l.example'), []);
-  assert.deepEqual(codes('͵α.example'), []);
-  assert.deepEqual(codes('͵a.example'), ['idn-contexto', 'idn-mixed-script']);
-  assert.deepEqual(codes('א׳.example'), []);
-  assert.deepEqual(codes('аpple.example'), ['idn-mixed-script']);
-  assert.deepEqual(codes('aᚠ.example'), ['idn-mixed-script']);
-  assert.deepEqual(codes('ᚠᚡ.example'), [], 'a script that is not asked about is one script');
-  assert.deepEqual(codes('abcテスト漢字.test'), []);
-  assert.deepEqual(codes('مثال١.example'), []);
-  assert.deepEqual(codes('مثال۱.example'), [], 'the extended Arabic-Indic digits alone');
-  assert.deepEqual(codes('a b.例.test').includes('idn-not-dig'), true);
-  const w = toAscii('☃.example').warnings[0];
-  assert.match(w.message, /^the label "☃" has a code point that IDNA2008 does not allow/);
-  assert.throws(() => toAscii(7), /not a string/);
-  assert.throws(() => toAscii('a‍b.test'), /no A-label form/);
-  assert.throws(() => toAscii('⒈.example'), /no A-label form/);
-});
-
-test('asciiName adds the warnings of a name to a list once; canonicalOwner and canonicalZone take Unicode', () => {
-  const into = [];
-  assert.equal(asciiName('☃.example', into), 'xn--n3h.example');
-  asciiName('☃.example', into);
-  assert.equal(into.length, 1);
-  assert.equal(asciiName('www.example.test'), 'www.example.test');
-  const w = [];
-  assert.equal(canonicalOwner('ＷＷＷ.例え.ＴＥＳＴ.', w), 'www.xn--r8jz45g.test');
-  assert.equal(canonicalZone('例え.test.', w), 'xn--r8jz45g.test');
-  assert.deepEqual(w, []);
-  assert.throws(() => canonicalZone(5), /not a string/);
-  assert.throws(() => canonicalOwner(`例${'l'.repeat(60)}.test`), /not allowed/);
-  assert.throws(() => canonicalOwner('㈱.test'), /not allowed/);
-});
-
-test('the derived property of RFC 5892 (section 3), rule by rule', () => {
-  const p = (c) => idnaProperty(c);
-  assert.equal(p(0xdf), 'PVALID', 'F: an exception');
-  assert.equal(p(0xb7), 'CONTEXTO');
-  assert.equal(p(0x663), 'CONTEXTO');
-  assert.equal(p(0x6f3), 'CONTEXTO');
-  assert.equal(p(0x640), 'DISALLOWED');
-  assert.equal(p(0x378), 'UNASSIGNED', 'J');
-  assert.equal(p(0xfdd0), 'DISALLOWED', 'a noncharacter is not unassigned (C)');
-  assert.equal(p(0x61), 'PVALID', 'K: LDH');
-  assert.equal(p(0x2d), 'PVALID');
-  assert.equal(p(0x200d), 'CONTEXTJ', 'H');
-  assert.equal(p(0x41), 'DISALLOWED', 'B: unstable');
-  assert.equal(p(0x13f8), 'DISALLOWED', 'B: a small Cherokee letter folds to the capital');
-  assert.equal(p(0x20), 'DISALLOWED', 'C');
-  assert.equal(p(0x20d0), 'DISALLOWED', 'D');
-  assert.equal(p(0x1100), 'DISALLOWED', 'I');
-  assert.equal(p(0x3042), 'PVALID', 'A');
-  assert.equal(p(0x2603), 'DISALLOWED', 'a symbol');
+test('idnPrepass: the path, the query and the body fields of a route become A-labels; the warnings once each', async () => {
+  const ctx = ctxOf();
+  ctx.params = { ds: 'main', zone: '例え.test.' };
+  ctx.query = new URLSearchParams({ name: 'ＷＷＷ.例え.test', contains: 'ウェブ', from: 'www' });
+  ctx.body = { name: 'ß☃.test', rrsets: [{ name: '☃.EXAMPLE.test.' }, { name: 'www.example.test' }, { name: 7 }, { name: '☃.EXAMPLE.test.' }], records: 'not an array', other: '例え.test' };
+  await idnPrepass(ctx, { params: ['zone', 'ds'], query: ['name', 'contains', 'from', 'missing'], body: ['name', 'rrsets.*.name', 'records.*.owner', 'nothing.*.x'] });
+  assert.equal(ctx.calls.length, 1);
+  assert.deepEqual(ctx.params, { ds: 'main', zone: 'xn--r8jz45g.test.' });
+  assert.deepEqual([...ctx.query], [['name', 'www.xn--r8jz45g.test'], ['contains', 'xn--gckc5l'], ['from', 'www']]);
+  assert.deepEqual(ctx.body.rrsets.map((r) => r.name), ['xn--n3h.example.test.', 'www.example.test', 7, 'xn--n3h.example.test.']);
+  assert.equal(ctx.body.name, 'xn--ss-gsx.test');
+  assert.equal(ctx.body.other, '例え.test', 'a field the route does not name is left alone');
+  assert.deepEqual(ctx.idnWarnings.map((w) => `${w.code} ${w.label}`), ['idn-disallowed ß☃.test', 'idn-transitional ß☃.test', 'idn-disallowed ☃.EXAMPLE.test.', 'idn-transitional ☃.EXAMPLE.test.']);
+  // a name the tool cannot convert: the pointer of its field
+  const bad = ctxOf();
+  bad.body = { rrsets: [{ name: 'www.example.test' }, { name: '-例.test' }] };
+  await assert.rejects(idnPrepass(bad, { body: ['rrsets.*.name'] }), (e) => e.status === 400 && e.errors[0].pointer === '/rrsets/1/name');
+  const plain = ctxOf();
+  plain.params = { zone: 'xn--r8jz45g.test' };
+  await idnPrepass(plain, { params: ['zone'] });
+  assert.equal(plain.calls.length, 0, 'an ASCII zone in the path runs no tool');
+  assert.deepEqual(plain.idnWarnings, []);
 });

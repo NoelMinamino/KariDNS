@@ -206,7 +206,7 @@ All paths are relative to `/api/v1`. "Global" means a global master.
 |---|---|
 | `GET /health` | no login. `{"status":"ok","database":"ok"}`, or 503 when the database does not answer within 3 seconds |
 | `GET /version` | login. `{version, tools, datasets, types, ui}`: the version, the versions of `karidns-zone` and `karicheck`, the datasets, `types` (the record types a change set takes, sorted, as `karidns-zone --types-list` names them; `null` when the service did not ask) and `ui`, what a client (the web interface) follows: `{reload_after_change, reload_available, reload_all, require_totp (global\|all\|none), max_rrsets (1000), max_records (1000, an RRset), zone_text_limit (16777216 octets: a zone text in an import or a zone creation)}`. `reload_all` (0.7) is `true` on PostgreSQL only, where `POST /datasets/{ds}/reload` (every zone) can be asked for (SQLite3 answers it with 409 `unsupported`). `reload_available` is `false` exactly where a request with `"reload": true` (and `POST .../reload`) is refused with 400: SQLite3 without `karictl-config`; the web interface then offers no reload. `ldns` (0.7): `{url, resolver}` for the links to ldns.jp, `null` with `ldns-link = no` |
-| `GET /idn?name=` | login (0.7). What the service makes of a name, without reading or writing anything: `{ascii, unicode, warnings, dig}`. `ascii`: the name with A-labels (a final dot is kept); `unicode`: its U-label form, `null` when it has none; `warnings`: as in a change set ("INTERNATIONALIZED NAMES AND LDNS.JP"); `dig`: whether `dig +idnin` sends the same name. 400 `bad-request` (pointer `?name`) when the name has no A-label form. The web interface shows it under a field of a name |
+| `GET /idn?name=` | login (0.7). What the service makes of a name, without reading or writing anything: `{ascii, unicode, warnings}` (one run of `karidns-zone idn`). `ascii`: the name with A-labels, as `dig +idnin` sends it (a final dot is kept); `unicode`: its U-label form, `null` when it has none; `warnings`: as in a change set ("INTERNATIONALIZED NAMES AND LDNS.JP"). 400 `bad-request` (pointer `?name`) when dig would not convert the name, with the reason of libidn2. The web interface shows it under a field of a name |
 
 ### Login and self
 
@@ -303,20 +303,40 @@ Paths are `/datasets/{ds}/zones/{zone}/...`. Any principal with a grant on the z
 
 ## INTERNATIONALIZED NAMES AND LDNS.JP
 
-**Names in Unicode** (0.7). Every field and parameter that takes a zone name or an owner name also takes it in Unicode: the name of a new zone, `{zone}` in a path (percent-encoded), the `name` of an RRset in a change set, the owner of a template record, the suffix of a grant, `?name=` and `?zone=`. The database holds A-labels only (lower case, no final dot), so everything that reads it (the server, `karidns-zone`, the signer) is unchanged. The conversion is the one `dig +idnin` makes (BIND 9.20 with libidn2):
+**Names in Unicode (0.7).** Every field and parameter that takes a zone name or an owner name also takes it in Unicode:
 
-1. A name that is all ASCII is taken as it is (an `xn--` label is not decoded first).
-2. Otherwise the whole name is mapped with UTS #46 non-transitional processing (case folded, full-width forms and compatibility characters mapped, `。` `．` `｡` are dots) and each label with non-ASCII code points becomes its A-label (RFC 3492, IDNA2008: RFC 5890 to 5893).
-3. When the first problem the IDNA2008 checks find is a code point IDNA2008 does not allow (RFC 5892: symbols such as `☃`, old Hangul jamo, ...), dig converts the whole name again with the **transitional** mapping, and so does the service: `ß` becomes `ss`, `ς` becomes `σ`, ZWJ and ZWNJ are dropped. `straße.☃.example` is stored as `strasse.xn--n3h.example`, `straße.example` as `xn--strae-oqa.example`.
-4. A name UTS #46 refuses (a misplaced ZWJ, a bidi label Node's mapping refuses, `⒈`), or one whose A-labels are no name the database may hold (a label over 63 octets, `㈱` mapped to `(株)`), is refused: 400 `bad-request` with the pointer of the field.
+- the name of a new zone;
+- `{zone}` in a path (percent-encoded);
+- the `name` of an RRset in a change set;
+- the owner of a template record;
+- the zone and suffix of a grant;
+- `?name=`, `?zone=`, `?from=`, `?prefix=` and `?contains=`.
 
-**Warnings, not refusals.** A rule of IDNA2008 that a name breaks does not stop it (it is the operator's name); the reply of the write says so in `warnings: [{code, label, message}]` (absent when there are none): `idn-disallowed` (a code point IDNA2008 does not allow; most registries refuse it), `idn-transitional` (converted with the transitional mapping, step 3), `idn-hyphen` (a U-label that starts or ends with `-` or has `--` in its third and fourth place, RFC 5891 4.2.3.1), `idn-bidi` (the bidi rule of RFC 5893), `idn-contexto` (a CONTEXTO rule of RFC 5892 appendix A, such as the katakana middle dot `・` without kana or kanji in the label: dig converts it, registration refuses it), `idn-mixed-script` (a label of several scripts beyond the combinations of UTS #39 5.2 "Highly Restrictive", such as Latin with Cyrillic), `idn-bad-alabel` (an `xn--` label that does not decode back to itself), `idn-unassigned`, and `idn-not-dig` (dig does not convert this name at all, it sends the UTF-8 octets: hyphens, bidi; the service stores the A-labels of the UTS #46 mapping). The replies that carry them: `PATCH .../rrsets`, `POST .../zones`, `POST /templates`, `PATCH /templates/{id}` (and their dry runs).
+The service turns such a name into its A-labels before anything else looks at the request. The database holds A-labels only (lower case, no final dot), so everything that reads it (the server, `karidns-zone`, the signer) is unchanged.
 
-**The U-label form.** The zone list, a zone and the RRsets carry `unicode` beside `name` when an A-label of the name decodes back to itself (as `dig +idnout` shows it; a label that does not stays an A-label). It is for showing; the name is `name`.
+**The conversion is dig's.** It is made by libidn2 through `karidns-zone idn` (docs/karidns-zone.md, "idn"), called the way `dig +idnin` calls it in BIND 9.20. The service runs it once per request, and only for names that are not ASCII.
 
-**Search.** `?prefix=` and `?contains=` of the zone list and `?from=` and `?contains=` of the RRsets take Unicode too. A label written in Unicode becomes its A-label and so matches **as a whole label** (punycode keeps no part of a label): `?contains=例え` finds `例え.test` and `www.例え.test`, `?contains=例` does not find `例え.test`. The ASCII parts of the text stay a part of a name as before; `?contains=xn--r8jz45g` finds the same zones.
+1. A name that is all ASCII is taken as it is.
+2. Otherwise the name goes through IDNA2008 with the UTS #46 non-transitional mapping: case folded, full-width forms and compatibility characters mapped, `。` `．` `｡` read as dots.
+3. When that fails because of a code point IDNA2008 does not allow (RFC 5892: a symbol such as `☃`), the whole name is converted again with the transitional mapping, as dig does: `ß` becomes `ss`, `ς` becomes `σ`, ZWJ and ZWNJ are dropped. `straße.☃.example` is stored as `strasse.xn--n3h.example`; `straße.example` as `xn--strae-oqa.example`.
+4. A name dig would not convert is refused: 400 `bad-request` with the pointer of the field and libidn2's reason. Examples are a hyphen in the wrong place (RFC 5891 4.2.3.1), the bidi rule of RFC 5893, a zero width joiner out of place, a label over 63 octets, or a code point UTS #46 does not allow. dig would send such a name as raw octets, so it has no A-label form.
 
-**How close to dig.** `webadmin/test/idn_dig_vectors.json` holds what dig 9.20.30 (libidn2 2.3.8) sent and showed for about 90 names on the build host, and the unit tests compare the service with it; `webadmin/test/idn_dig_vectors_gen.mjs` makes it again. The mapping is Node's (`url.domainToASCII`, ICU); the checks of RFC 5892 are made from the Unicode properties of JavaScript's regular expressions, and the bidi rule of RFC 5893 judges by scripts and digit ranges (JavaScript has no Bidi_Class), so for a code point new in a later version of Unicode, or a rare bidi case, a warning (and whether dig would convert the name) can differ from libidn2; the A-labels of a name dig converts are the mapping's either way. One difference is on purpose: dig shows the label `xn--a` (no A-label) as an empty label; the service shows it as it is.
+The service does not use Node's own IDNA code (`url.domainToASCII`): it gives different answers on different builds of Node. With libidn2, the stored name is the same on every host and the same as dig's. A karidns-zone built without libidn2 cannot convert: a name in Unicode is then refused with a message that says so, and names are shown with their A-labels only.
+
+**Warnings.** A rule that a name dig converts still breaks does not stop it (it is the operator's name). The reply of the write lists them in `warnings: [{code, label, message}]`; the field is absent when there are none. The codes:
+
+- `idn-disallowed` and `idn-transitional`: step 3 above. Most registries refuse such a name.
+- `idn-contexto`: a CONTEXTO rule of RFC 5892 appendix A is broken, such as the katakana middle dot `・` in a label without kana or kanji. dig converts the name, but registration refuses it (RFC 5891 4.2.3.3).
+- `idn-mixed-script`: a label of several scripts beyond the combinations of UTS #39 5.2 "Highly Restrictive", such as Latin with Cyrillic.
+- `idn-bad-alabel`: an ASCII name with an `xn--` label that libidn2 does not accept. The name is stored as it is, as dig sends it.
+
+The replies that carry them are `PATCH .../rrsets`, `POST .../zones`, `POST /templates`, `PATCH /templates/{id}`, `POST /grants`, and their dry runs. `idn-contexto` and `idn-mixed-script` are judged by the Unicode data of the JavaScript engine; they are warnings only.
+
+**The U-label form.** The zone list, a zone and the RRsets carry `unicode` beside `name` when the name has an A-label that libidn2 decodes, as `dig +idnout` shows it. It is for display; the name itself is `name`.
+
+**Search.** A part of a name written in Unicode is converted as a name, so a Unicode label matches **as a whole label** (punycode keeps no part of a label). `?contains=例え` finds `例え.test` and `www.例え.test`; `?contains=例` does not find `例え.test`. The ASCII parts stay a part of a name as before, and `?contains=xn--r8jz45g` finds the same zones.
+
+**How close to dig.** `tests/run_karidns_zone_idn_test.sh` compares `karidns-zone idn` with what dig 9.20.30 (libidn2 2.3.8) sent and showed for about 90 names on the build host. The vectors are in `webadmin/test/idn_dig_vectors.json`, made by `webadmin/test/idn_dig_vectors_gen.mjs`. Every one is the same, byte for byte.
 
 **ldns.jp.** With `ldns-link = yes` (the default) the web interface puts a link to `https://ldns.jp/?q=<name>&t=<type>&c=dig&r=<ldns-resolver>&auto=1` beside each zone (type SOA) and each RRset (its type). The page opens in a new tab without a Referer or an opener, and from the browser asks the public resolver (Google, Cloudflare, IIJ or Alibaba) over DNS over HTTPS: what the name looks like from outside, through that resolver's cache. The service sends nothing, so it is no relay of queries (no SSRF). A click sends the name to ldns.jp and to the resolver; set `ldns-link = no` where zone names are private.
 

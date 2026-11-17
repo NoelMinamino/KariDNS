@@ -340,6 +340,8 @@ X (DB_IMPORT_CHANGED, "db.import.changed", 'E', "the zone changed under the tool
 X (DB_APPLY_CHANGES, "db.apply.changes", 'E', "apply: the change file is not valid: a line, an owner, a type, a TTL or an RDATA a change file does not take")
 X (DB_APPLY_ZONE, "db.apply.zone", 'E', "apply: the zone is not there (or is there, with --create), is not a primary zone, or the change would take its SOA away")
 X (DB_RENDER_INPUT, "db.render.input", 'E', "render: the records on standard input are not lines of the form owner TAB type TAB prio TAB content, or there are too many")
+X (DB_IDN_INPUT, "db.idn.input", 'E', "idn: the names on standard input are not lines of the form a TAB name or u TAB name, or there are too many")
+X (DB_IDN_UNAVAILABLE, "db.idn.unavailable", 'E', "idn: this karidns-zone was built without libidn2 and cannot convert internationalized names")
 X (DB_IMPORT_SIGNER, "db.import.signer", 'E', "import --signer cannot take this file or zone: the file is not a signed zone, or the zone is not a primary zone of the database; nothing was written")
 X (DB_IMPORT_SIGNER_ZONE, "db.import.signer-zone", 'I', "the zone is signed by karidns-signer: the import kept its DNSSEC records and signer metadata, and the zone is served again after the next signing")
 X (DB_IMPORT_ANALYZE, "db.import.analyze", 'I', "imports that wrote or removed 1000 records or more refreshed the stale planner statistics of the records table (ANALYZE, PostgreSQL)")

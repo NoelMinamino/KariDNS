@@ -67,10 +67,10 @@ function recordText(text, pointer) {
 }
 
 // One RRset of a request; ops 'replace' (ttl, records) or 'delete'.  zone: canonical.
-function rrsetOf(r, i, zone, types, warnings) {
+function rrsetOf(r, i, zone, types) {
   const at = `/rrsets/${i}`;
   let name;
-  try { name = canonicalOwner(r.name, warnings); } catch (e) { throw badRequest(e.message, `${at}/name`); }
+  try { name = canonicalOwner(r.name); } catch (e) { throw badRequest(e.message, `${at}/name`); }
   if (!inZone(name, zone)) throw badRequest('the name is not in the zone', `${at}/name`);
   const out = { name, type: recordType(r.type, types, `${at}/type`), op: r.changetype === 'DELETE' ? 'delete' : 'replace', ttl: null, records: [], expect: null };
   if (out.op === 'delete') {
@@ -86,20 +86,18 @@ function rrsetOf(r, i, zone, types, warnings) {
   return out;
 }
 
-// -> { comment, dryRun, reload, rrsets: [{ name, type, op, ttl, records: [text], expect: null | [{ ttl, content }] }], warnings: the IDN warnings of the names };
-// reload: true / false / undefined (not said)
+// -> { comment, dryRun, reload, rrsets: [{ name, type, op, ttl, records: [text], expect: null | [{ ttl, content }] }] }; reload: true / false / undefined (not said)
 export function parseChangeSet(body, zone, { types } = {}) {
   const b = shape(body, CHANGE_SPEC);
-  const warnings = [];
   const seen = new Set();
   const rrsets = b.rrsets.map((r, i) => {
-    const x = rrsetOf(r, i, zone, types, warnings);
+    const x = rrsetOf(r, i, zone, types);
     const key = `${x.name} ${x.type}`;
     if (seen.has(key)) throw badRequest('this RRset is named twice in the change set', `/rrsets/${i}`);
     seen.add(key);
     return x;
   });
-  return { comment: b.comment, dryRun: b.dry_run === true, reload: b.reload, rrsets, warnings };
+  return { comment: b.comment, dryRun: b.dry_run === true, reload: b.reload, rrsets };
 }
 
 // The change file of the RRsets (docs/karidns-zone.md "The change file"), one line per operation, and the maps from the lines of what karidns-zone reports back to
@@ -295,7 +293,7 @@ export const templateLabel = (rrsets) => (i) => ({ path: `/template/records/${rr
 
 // the RRsets of the new zone `zone` (canonical) -> { rrsets (as parseChangeSet makes them), serial, label }.  tpl: the template (S.getTemplate), when the request names one: its
 // SOA values are the defaults of the request's, its records are in the zone unless the request has an RRset of the same name and type (or name servers: the apex NS)
-export function createRRsets(c, zone, tpl, warnings) {
+export function createRRsets(c, zone, tpl) {
   const s = c.soa ?? {};
   const t = tpl?.soa ?? {};
   const mname = s.mname ?? t.mname;
@@ -320,7 +318,7 @@ export function createRRsets(c, zone, tpl, warnings) {
   }
   const more = (c.rrsets ?? []).map((r, i) => {
     if (r.changetype !== 'REPLACE') throw badRequest('a new zone has nothing to delete', `/rrsets/${i}/changetype`);
-    return rrsetOf(r, i, zone, c.types, warnings);
+    return rrsetOf(r, i, zone, c.types);
   });
   const seen = new Set(rrsets.map((x) => `${x.name} ${x.type}`));
   more.forEach((x, i) => {

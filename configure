@@ -33,7 +33,7 @@ Options:
   --with-db-drivers=LIST  the drivers of karidns-dbloader and karidns-zone: auto, none, or sqlite3, postgresql or both, separated by a
                           space or a comma (default: auto, the drivers whose library is found).  A driver that is named and not
                           found is an error
-  --with-idn2=auto|yes|no libidn2 for dag (internationalized names; default: auto).  yes: an error when it is not found
+  --with-idn2=auto|yes|no libidn2 for dag and karidns-zone idn (internationalized names; default: auto).  yes: an error when it is not found
                           (--with-idn2 is yes, --without-idn2 is no)
   --with-openssl=DIR      OpenSSL is in DIR/include and DIR/lib (default: the system's, or the Homebrew one on macOS).  The Makefile
                           searches /usr/local and the Homebrew directories first: with two copies of OpenSSL there, set CFLAGS and LDFLAGS

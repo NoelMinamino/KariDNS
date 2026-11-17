@@ -9,6 +9,7 @@
  *   karidns-zone apply [options] --changes <file|-> <zone>
  *   karidns-zone --types-list
  *   karidns-zone render --json <zone>
+ *   karidns-zone idn --json
  *
  * A thin shell over dns_zone_import.c (zone file -> PowerDNS rows, one transaction per zone, the checks of karicheck, the read-back through the
  * loader's reader) and dns_zone_export.c (rows -> zone file text, canonical order, verified).  This file reads the database settings the way
@@ -35,6 +36,9 @@
 #include <strings.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#ifdef HAVE_LIBIDN2
+#include <idn2.h>
+#endif
 
 #include "dns_config_parser.h"
 #include "dns_db_driver.h"
@@ -108,6 +112,7 @@ static void kz_usage(FILE *fp) {
         "  karidns-zone apply [options] --zone-file <file|-> [--delete-others] <zone>\n"
         "  karidns-zone --types-list [--json]\n"
         "  karidns-zone render --json <zone>\n"
+        "  karidns-zone idn --json\n"
         "  karidns-zone --version | -h | --help\n"
         "\n"
         "import reads a zone file (BIND format, or a tinydns data file) and writes the zone to the PowerDNS database in one transaction; export\n"
@@ -181,6 +186,10 @@ static void kz_usage(FILE *fp) {
         "`owner TAB type TAB prio TAB content` (records.name, type, prio or -, content), for the zone named; the document has \"render\": { \"rdata\": [...], \"errors\": [...] }:\n"
         "for each line the record's text as a change file takes it (every name absolute, MX and SRV with the priority in front), or null and an error.\n"
         "\n"
+        "idn (the WebAdmin; docs/karidns-zone.md, \"idn\"): reads no database and no configuration.  Standard input holds names, one a line, `a TAB name`\n"
+        "(the name dig +idnin sends, converted by libidn2 the way dig 9.20 does it) or `u TAB name` (the U-labels dig +idnout shows); the document has\n"
+        "\"idn\": [...], one entry a line.  Needs libidn2.\n"
+        "\n"
         "Output:\n"
         "      --json              one JSON document on standard output (docs/karicheck.md, JSON OUTPUT; first key \"karidns-zone\");\n"
         "                          export of a single zone then needs a <file>\n"
@@ -199,7 +208,8 @@ static void kz_usage(FILE *fp) {
         "  karidns-zone apply -c " KARIDNS_CONFDIR "/karidns.conf --expect-generation 17 --changes changes.txt example.test\n"
         "  karidns-zone apply --dry-run --sqlite3 /var/db/karidns/pdns.sqlite3 --zone-file example.test.zone --delete-others example.test\n"
         "  karidns-zone --types-list\n"
-        "  printf 'mail.example.test\\tMX\\t10\\tmail2.example.test\\n' | karidns-zone render --json example.test\n");
+        "  printf 'mail.example.test\\tMX\\t10\\tmail2.example.test\\n' | karidns-zone render --json example.test\n"
+        "  printf 'u\\txn--r8jz45g.test\\n' | karidns-zone idn --json\n");
 }
 
 /* A usage error: one message and the usage text on stderr; with --json only the message goes into the document.  Exit status 2. */
@@ -1027,6 +1037,111 @@ static int kz_cmd_render(const kz_args_t *a) {
 }
 
 /* ------------------------------------------------------------------------------------------------------------- */
+/* idn (0.7: the WebAdmin)                                                                                        */
+/* ------------------------------------------------------------------------------------------------------------- */
+
+#define KZ_IDN_MAX_LINES 100000
+#define KZ_IDN_MAX_NAME 1024
+
+#ifdef HAVE_LIBIDN2
+/* The name dig 9.20 sends for +idnin (BIND dighost.c with libidn2; measured on the build host with dig 9.20.30 / libidn2 2.3.8): a name of ASCII
+ * alone is sent as it is; otherwise IDNA2008 with the UTS #46 non-transitional mapping, and when the first problem libidn2 finds is a code point
+ * IDNA2008 does not allow (IDN2_DISALLOWED, RFC 5892), the whole name again with the transitional mapping (UTS #46 section 4.1).  Any other problem:
+ * dig sends the octets.  -> IDN2_OK and *out (idn2_free) or the error of the non-transitional attempt; *trans: the transitional mapping made it. */
+static int kz_idn_like_dig(const char *name, char **out, bool *trans) {
+    *trans = false;
+    *out = NULL;
+    int rc = idn2_lookup_u8((const uint8_t *)name, (uint8_t **)out, IDN2_NONTRANSITIONAL);
+    if (rc == IDN2_DISALLOWED) {
+        char *t = NULL;
+        if (idn2_lookup_u8((const uint8_t *)name, (uint8_t **)&t, IDN2_TRANSITIONAL) == IDN2_OK) {
+            *out = t;
+            *trans = true;
+            return IDN2_OK;
+        }
+    }
+    return rc;
+}
+#endif
+
+/* idn --json: names on standard input, one a line, "a TAB name" (the name dig +idnin sends) or "u TAB name" (the name dig +idnout shows).  The document
+ * has the key "idn": one entry for each line, in order:
+ *   a: { "ascii": "<name>" | null, "transitional": bool, "error": "<IDN2_...>" | null, "reason": "<text>" | null }: an ASCII name comes back as it is,
+ *      with the error libidn2 finds in it (an xn-- label that is no A-label, ...) for a warning; a name dig does not convert has "ascii": null;
+ *   u: { "unicode": "<name>" | null }: null when the name has no A-label that libidn2 decodes (it is shown as it is).
+ * Reads no database and no configuration.  Without libidn2 the tool cannot do it: exit status 1, db.idn.unavailable. */
+static int kz_cmd_idn(void) {
+    size_t len = 0;
+    char *text = kz_read_all("-", &len);
+    if (!text) return 1;
+#ifndef HAVE_LIBIDN2
+    free(text);
+    dns_diag(DIAG_ERROR, DC_DB_IDN_UNAVAILABLE, NULL, 0, "this karidns-zone was built without libidn2: it cannot convert internationalized names\n");
+    return 1;
+#else
+    kz_jb_t b = { NULL, 0, 0, false };
+    kz_jb_add(&b, "[");
+    size_t lines = 0;
+    int ret = 0;
+    char *save = NULL;
+    for (char *line = strtok_r(text, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
+        size_t n = strlen(line);
+        if (n && line[n - 1] == '\r') line[--n] = '\0';
+        if (n == 0) continue;
+        if (++lines > KZ_IDN_MAX_LINES || n < 3 || (line[0] != 'a' && line[0] != 'u') || line[1] != '\t' || n - 2 > KZ_IDN_MAX_NAME || strchr(line + 2, '\t')) {
+            dns_diag(DIAG_ERROR, DC_DB_IDN_INPUT, "standard input", (int)lines, "the line is not 'a' or 'u', a TAB and a name of 1 to %d octets (at most %d lines)\n",
+                     KZ_IDN_MAX_NAME, KZ_IDN_MAX_LINES);
+            ret = 1;
+            break;
+        }
+        const char *name = line + 2;
+        kz_jb_add(&b, "%s{ ", lines > 1 ? ", " : "");
+        if (line[0] == 'u') {
+            char *u = NULL;
+            if (strstr(name, "xn--") || strstr(name, "XN--") || strstr(name, "Xn--") || strstr(name, "xN--")) {
+                if (idn2_to_unicode_8z8z(name, &u, 0) != IDN2_OK) u = NULL;
+            }
+            kz_jb_add(&b, "\"unicode\": ");
+            if (u && strcmp(u, name) != 0) kz_jb_str(&b, u, strlen(u));
+            else kz_jb_add(&b, "null");
+            idn2_free(u);
+        } else {
+            bool ascii = true;
+            for (const unsigned char *c = (const unsigned char *)name; *c; c++) if (*c >= 0x80) ascii = false;
+            char *out = NULL;
+            bool trans = false;
+            int rc = kz_idn_like_dig(name, &out, &trans);
+            kz_jb_add(&b, "\"ascii\": ");
+            if (ascii) kz_jb_str(&b, name, strlen(name));
+            else if (rc == IDN2_OK) kz_jb_str(&b, out, strlen(out));
+            else kz_jb_add(&b, "null");
+            kz_jb_add(&b, ", \"transitional\": %s, \"error\": ", trans ? "true" : "false");
+            if (rc == IDN2_OK) kz_jb_add(&b, "null, \"reason\": null");
+            else {
+                const char *e = idn2_strerror_name(rc);
+                const char *r = idn2_strerror(rc);
+                kz_jb_str(&b, e ? e : "IDN2_UNKNOWN", strlen(e ? e : "IDN2_UNKNOWN"));
+                kz_jb_add(&b, ", \"reason\": ");
+                kz_jb_str(&b, r ? r : "", strlen(r ? r : ""));
+            }
+            idn2_free(out);
+        }
+        kz_jb_add(&b, " }");
+    }
+    kz_jb_add(&b, "]");
+    free(text);
+    if (ret == 0 && b.oom) {
+        dns_diag(DIAG_ERROR, DC_INTERNAL_OOM, NULL, 0, "out of memory\n");
+        ret = 1;
+    }
+    if (ret == 0) dns_diag_json_extra("idn", b.p);
+    dns_diag_counts(1, 0);
+    free(b.p);
+    return ret;
+#endif
+}
+
+/* ------------------------------------------------------------------------------------------------------------- */
 /* export                                                                                                         */
 /* ------------------------------------------------------------------------------------------------------------- */
 
@@ -1350,6 +1465,16 @@ static int kz_check_render_args(const kz_args_t *a) {
     return 0;
 }
 
+static int kz_check_idn_args(const kz_args_t *a) {
+    const bool j = a->json;
+    if (a->conf || a->no_config || a->view || a->sqlite || a->conninfo || a->schema || a->all || a->mode || a->types || a->dry_run || a->serial || a->strict || a->reload ||
+        a->type || a->format || a->verbose || a->dir || a->force || a->audit || a->signer || kz_apply_only(a))
+        return kz_usage_error(j, DC_USAGE_OPTION, "idn takes --json, no other option (it reads no database and no configuration)");
+    if (!j) return kz_usage_error(false, DC_USAGE_OPTION, "idn needs --json: its answer is a JSON document");
+    if (a->nargs != 0) return kz_usage_error(j, DC_USAGE_ARGS, "idn takes no argument; the names come on standard input");
+    return 0;
+}
+
 /* the values of the options, before anything is opened: 0, or 2 (usage error) */
 static int kz_check_args(const kz_args_t *a, bool import) {
     const bool j = a->json;
@@ -1392,7 +1517,8 @@ static int kz_run(int argc, char **argv, bool *json_out) {
     const char *cmd;
     int perr = kz_parse(argc, argv, &cmd, &a);
     *json_out = a.json;
-    const char *known = cmd && (strcmp(cmd, "import") == 0 || strcmp(cmd, "export") == 0 || strcmp(cmd, "apply") == 0 || strcmp(cmd, "render") == 0) ? cmd : NULL;
+    const char *known = cmd && (strcmp(cmd, "import") == 0 || strcmp(cmd, "export") == 0 || strcmp(cmd, "apply") == 0 || strcmp(cmd, "render") == 0 ||
+                                strcmp(cmd, "idn") == 0) ? cmd : NULL;
     if (a.types_list && !known) known = "types";
     if (a.json) {
         dns_diag_json_start(known, KARIDNS_VERSION);
@@ -1414,11 +1540,15 @@ static int kz_run(int argc, char **argv, bool *json_out) {
         if (cmd || a.nargs) return kz_usage_error(a.json, DC_USAGE_OPTION, "--types-list takes no command and no argument");
         return kz_types_list(a.json);
     }
-    if (!cmd) return kz_usage_error(a.json, DC_USAGE_COMMAND_MISSING, "no command given (import, export, apply or render)");
-    if (!known) return kz_usage_error(a.json, DC_USAGE_COMMAND_UNKNOWN, "unknown command '%.64s' (import, export, apply or render)", cmd);
+    if (!cmd) return kz_usage_error(a.json, DC_USAGE_COMMAND_MISSING, "no command given (import, export, apply, render or idn)");
+    if (!known) return kz_usage_error(a.json, DC_USAGE_COMMAND_UNKNOWN, "unknown command '%.64s' (import, export, apply, render or idn)", cmd);
     if (strcmp(cmd, "render") == 0) {                       /* no database and no configuration: a filter */
         int rr = kz_check_render_args(&a);
         return rr != 0 ? rr : kz_cmd_render(&a);
+    }
+    if (strcmp(cmd, "idn") == 0) {                          /* the same: a filter */
+        int rr = kz_check_idn_args(&a);
+        return rr != 0 ? rr : kz_cmd_idn();
     }
     const bool import = strcmp(cmd, "import") == 0;
     const bool apply = strcmp(cmd, "apply") == 0;

@@ -6,8 +6,8 @@ import { query, LIMIT, CURSOR, decodeCursor, encodeCursor } from '../validate.js
 import * as S from '../store.js';
 import { reply } from '../http.js';
 import { isGlobal, zoneGrant, rrVisible, auditVisible } from '../perm.js';
-import { canonicalOwner, inZone, absolute, unicodeOf } from '../names.js';
-import { asciiName, toAscii } from '../idn.js';
+import { canonicalOwner, inZone, absolute } from '../names.js';
+import { asciiNames, unicodeNames } from '../idn.js';
 import { exportArgv, renderArgv } from '../tools.js';
 import { contentProblem, MAX_RRSETS, MAX_RECORDS, ZONE_TEXT_LIMIT } from '../changes.js';
 import { VERSION } from '../app.js';
@@ -26,26 +26,14 @@ export function datasets(ctx) {
   };
 }
 
-// A part of a name to search for (0.7): Unicode is taken; each label with non-ASCII code points becomes its A-label, so it matches as a whole label (punycode
-// keeps no part of a label: '例え' finds 例え.test and www.例え.test, '例' alone does not).  The ASCII parts stay a part of a name as before.  -> the text the
-// store searches for, or a 400 when it is not of `re` then.
-const ZONE_TEXT = { type: 'string', min: 1, max: 255, re: /^[^\0-\x20\x7f]+$/u, reText: 'a part of a name (no spaces or control characters)' };
-function searchText(text, pointer, re) {
-  let ascii;
-  try { ascii = asciiName(text); } catch (e) { throw badRequest(e.message, pointer); }
-  if (!re.test(ascii)) throw badRequest('a part of a name is expected (letters, digits, - _ . and Unicode labels)', pointer);
-  return ascii;
-}
-
 const NAME_CURSOR = (o) => typeof o?.n === 'string' && o.n.length <= 255;
 
 export async function zonesList(ctx) {
   const ds = dataset(ctx);
   const q = query(ctx.query, {
-    limit: LIMIT, cursor: CURSOR, prefix: ZONE_TEXT, contains: ZONE_TEXT,
+    limit: LIMIT, cursor: CURSOR, prefix: { type: 'string', min: 1, max: 255, re: /^[A-Za-z0-9_.-]+$/ }, contains: { type: 'string', min: 1, max: 255, re: /^[A-Za-z0-9_.-]+$/ },
     kind: { type: 'string', values: ['NATIVE', 'MASTER', 'SLAVE', 'PRODUCER', 'CONSUMER'] }, signed: { type: 'bool' },
   });
-  for (const k of ['prefix', 'contains']) if (q[k] !== undefined) q[k] = searchText(q[k], `?${k}`, /^[A-Za-z0-9_.-]+$/);
   const limit = q.limit ?? 100;
   const gs = ctx.auth.grants.filter((g) => g.role === 'global_master' || g.data_schema === ds.schema);
   if (gs.length === 0) return { zones: [], next_cursor: null };
@@ -53,10 +41,11 @@ export async function zonesList(ctx) {
   const after = q.cursor === undefined ? undefined : decodeCursor(q.cursor, NAME_CURSOR).n;
   const rows = await ctx.db((tx) => S.listZones(tx, ds.schema, { names, prefix: q.prefix, contains: q.contains, kind: q.kind, signed: q.signed, after, limit }));
   const p = page(rows, limit, (r) => ({ n: r.raw }));
+  const uni = await unicodeNames(ctx, p.items.map((z) => absolute(z.name)));          // 0.7: the U-label form, as dig +idnout shows it
   const zones = [];
   for (const z of p.items) {
     const role = zoneGrant(gs, ds.schema, z.name);
-    if (role) zones.push({ name: absolute(z.name), unicode: unicodeOf(absolute(z.name)), kind: z.kind, serial: z.serial, presigned: z.presigned, signer: z.signer, catalog: z.catalog, role });
+    if (role) zones.push({ name: absolute(z.name), unicode: uni.get(absolute(z.name)), kind: z.kind, serial: z.serial, presigned: z.presigned, signer: z.signer, catalog: z.catalog, role });
   }
   return { zones, next_cursor: p.next_cursor };
 }
@@ -67,9 +56,10 @@ export async function zoneGet(ctx) {
   const gs = zoneGrants(ctx, ds, zone);
   const z = await ctx.db((tx) => S.getZone(tx, ds.schema, zone));
   if (!z) throw notFound('no such zone');
+  const uni = await unicodeNames(ctx, [absolute(z.name)]);
   return {
     zone: {
-      name: absolute(z.name), unicode: unicodeOf(absolute(z.name)), id: z.id, kind: z.kind, serial: z.serial, catalog: z.catalog, master: z.master, account: z.account, notified_serial: z.notified_serial,
+      name: absolute(z.name), unicode: uni.get(absolute(z.name)), id: z.id, kind: z.kind, serial: z.serial, catalog: z.catalog, master: z.master, account: z.account, notified_serial: z.notified_serial,
       presigned: z.presigned, signer: z.signer, nsec3param: z.nsec3param, generation: z.generation, changed_at: z.changed_at, views: z.views,
       signer_state: z.signer_state, waiting_for_signer: z.signer && (z.signer_state?.signed_serial ?? null) !== z.serial, last_reload_request: z.last_reload_request,
       role: gs[0].role, grants: gs.map((g) => grantView(ctx.app, g)),
@@ -85,8 +75,7 @@ function recordText(type, content, prio) {
 }
 
 const RR_CURSOR = (o) => typeof o?.n === 'string' && typeof o?.t === 'string' && o.n.length <= 255 && o.t.length <= 32;
-const OWNER_TEXT = { ...ZONE_TEXT, reText: 'letters, digits, . _ * / - and Unicode labels (a part of a name; a final dot is not needed)' };
-const OWNER_ASCII = /^[A-Za-z0-9_.*/-]+$/;
+const OWNER_TEXT = { type: 'string', min: 1, max: 255, re: /^[A-Za-z0-9_.*/-]+$/, reText: 'letters, digits and . _ * / - (a part of a name; a final dot is not needed)' };
 
 // G2: the records of these RRsets as the text a change set takes (karidns-zone render: the loader's reader and the zone-file writer, one run for the page).  A record
 // that cannot be rendered (the reader refuses it, a type that has no other form, a text a change set would refuse) gets rdata null: the client shows the stored content
@@ -127,8 +116,8 @@ export async function rrsetsList(ctx) {
     if (!inZone(name, zone)) throw badRequest('the name is not in the zone', '?name');
   }
   // G3: the first owner to list, as stored (lower case, no final dot), and a part of an owner (any case)
-  const from = q.from === undefined ? undefined : searchText(q.from, '?from', OWNER_ASCII).toLowerCase().replace(/\.$/, '');
-  const contains = q.contains === undefined ? undefined : searchText(q.contains, '?contains', OWNER_ASCII).toLowerCase();
+  const from = q.from === undefined ? undefined : q.from.toLowerCase().replace(/\.$/, '');
+  const contains = q.contains === undefined ? undefined : q.contains.toLowerCase();
   const cur = q.cursor === undefined ? undefined : decodeCursor(q.cursor, RR_CURSOR);
   const after = cur && { name: cur.n, type: cur.t };
   // a global or domain master reads the whole zone; a subdomain master the names under its suffixes (and the apex SOA and NS)
@@ -154,10 +143,11 @@ export async function rrsetsList(ctx) {
   const more = sets.length > limit;
   const shown = sets.slice(0, limit);
   const visible = shown.filter((s) => rrVisible(gs, { schema: ds.schema, zone, name: s.name, type: s.type }));
+  const uni = await unicodeNames(ctx, visible.map((s) => absolute(s.name)));
   const rrsets = visible.map((s) => {
     const ttls = s.rows.map((r) => r.ttl).filter((t) => t !== null);
     s.records = s.rows.map((r) => ({ content: recordText(s.type, r.content, r.prio), disabled: r.disabled, ttl: r.ttl }));
-    return { name: absolute(s.name), unicode: unicodeOf(absolute(s.name)), type: s.type, ttl: ttls.length ? Math.min(...ttls) : null, tagged: found.tagged.has(`${s.name} ${s.type}`), records: s.records };
+    return { name: absolute(s.name), unicode: uni.get(absolute(s.name)), type: s.type, ttl: ttls.length ? Math.min(...ttls) : null, tagged: found.tagged.has(`${s.name} ${s.type}`), records: s.records };
   });
   if (q.rdata === true) await addRdata(ctx, zone, visible);
   const lastShown = shown[shown.length - 1];
@@ -282,13 +272,12 @@ export async function health(ctx) {
   return reply(ok ? 200 : 503, { status: ok ? 'ok' : 'unavailable', database: ok ? 'ok' : 'error' });
 }
 
-// GET /idn?name= (0.7): what the API makes of a name it is given, the way dig +idnin converts it -> { ascii, unicode (null: no U-label to show), warnings, dig:
-// whether dig sends the same name }.  Nothing is read or written: a form shows it under a field of a name.
-export function idn(ctx) {
+// GET /idn?name= (0.7): what the API makes of a name it is given, as dig +idnin converts it (karidns-zone idn) -> { ascii, unicode (null: no U-label form),
+// warnings }.  Nothing is read or written: a form shows it under a field of a name.
+export async function idn(ctx) {
   const q = query(ctx.query, { name: { type: 'string', required: true, min: 1, max: 1024 } });
-  let r;
-  try { r = toAscii(q.name); } catch (e) { throw badRequest(e.message, '?name'); }
-  return { ascii: r.name, unicode: unicodeOf(r.name) ?? null, warnings: r.warnings, dig: r.dig };
+  const r = (await asciiNames(ctx, [q.name], () => '?name')).get(q.name) ?? { ascii: q.name, warnings: [] };
+  return { ascii: r.ascii, unicode: (await unicodeNames(ctx, [r.ascii])).get(r.ascii) ?? null, warnings: r.warnings };
 }
 
 // the page the GUI links a name to (0.7, ldns-link): ldns.jp asks public resolvers over DoH from the browser; this service sends nothing to it

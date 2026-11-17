@@ -9,8 +9,8 @@ import { stripDot } from './zonelib.js';
 
 // the warning codes of the service -> the message of the page (an unknown code shows the service's English text)
 const WARNING_TEXT = {
-  'idn-disallowed': 'idn.w-disallowed', 'idn-unassigned': 'idn.w-unassigned', 'idn-hyphen': 'idn.w-hyphen', 'idn-bidi': 'idn.w-bidi', 'idn-bad-alabel': 'idn.w-bad-alabel',
-  'idn-contexto': 'idn.w-contexto', 'idn-mixed-script': 'idn.w-mixed-script', 'idn-transitional': 'idn.w-transitional', 'idn-not-dig': 'idn.w-not-dig',
+  'idn-disallowed': 'idn.w-disallowed', 'idn-bad-alabel': 'idn.w-bad-alabel',
+  'idn-contexto': 'idn.w-contexto', 'idn-mixed-script': 'idn.w-mixed-script', 'idn-transitional': 'idn.w-transitional',
 };
 
 // a name and its U-label form: the U-labels first, the A-labels under them (both are hostile text: format.js); just the name when it has no U-label form
