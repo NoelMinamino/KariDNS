@@ -1496,10 +1496,22 @@ static const dbdir_ops_t g_ops = {
   .worker_attach = worker_attach,
 };
 
+/* 0.7: the store's tables are private memory (store.tables.private_bytes), counted in memory-limit (dbreg_cache_set_fixed()); a WARNING (once an hour at most) when they take half of the
+ * limit or more: the zones get what is left, at least a tenth of the limit */
+static void tables_charge(uint64_t priv, int64_t now_ms, int64_t *warned_ms) {
+  dbreg_cache_set_fixed(priv);
+  const uint64_t lim = dbreg_cache_limit();
+  if (!lim || priv < lim / 2 || (*warned_ms && now_ms - *warned_ms < 3600000)) return;
+  *warned_ms = now_ms ? now_ms : 1;
+  syslog(LOG_WARNING, "[DB] the tables of the zone store hold %" PRIu64 " MB of memory, counted in memory-limit (%" PRIu64 " MB): the zones in memory get %" PRIu64 " MB; raise memory-limit "
+         "by the size of the tables (about 200 bytes a zone) (store.tables.private_bytes)", priv >> 20, lim >> 20, (priv + lim / 10 < lim ? lim - priv : lim / 10) >> 20);
+}
+
 /* the time of the store: group commit and checkpoint, once a second */
 static void *ticker_thread(void *arg) {
   (void)arg;
   rcu_aux_thread_pin();
+  int64_t warned_ms = 0;
   pthread_mutex_lock(&G.wlock);
   while (!G.wstop) {
     struct timespec ts;
@@ -1511,6 +1523,9 @@ static void *ticker_thread(void *arg) {
     if (st) {
       pthread_mutex_unlock(&G.wlock);
       (void)store_tick(st);
+      store_stats_t ss;
+      store_stats(st, &ss);
+      tables_charge(ss.table_private_bytes, mono_ns() / 1000000, &warned_ms);
       pthread_mutex_lock(&G.wlock);
     }
   }

@@ -1882,13 +1882,9 @@ static int run_mode(const char *mode) {
         dbdir_rec_t rr;
         CHECK(evict_zone("r6b.test.") && stored_only("r6b.test."));
         CHECK(dbdir()->rec_get("default", "r6b.test.", &rr));
-        char zcp[700];
-        snprintf(zcp, sizeof(zcp), "%s/zc.1", sdir);
-        int zfd = open(zcp, O_RDWR);
-        CHECK(zfd >= 0);
-        uint32_t odd = 1, even = 0;
-        const off_t cell = (off_t)16384 + (off_t)rr.zid * 64 + 60;           /* (the sequence counter of the cell: odd while a writer is in it) */
-        CHECK(zfd >= 0 && pwrite(zfd, &odd, 4, cell) == 4);
+        store_t *zs = db_store_handle();                                      /* (the tables are private memory since 0.7: the cell is changed there, not in zc.1) */
+        const uint64_t cell = (uint64_t)rr.zid * 64 + 56, w7 = store_test_peek(zs, 1, cell) & 0xffffffffull;
+        store_test_poke(zs, 1, cell, w7 | (1ull << 32));                     /* (the sequence counter of the cell: odd while a writer is in it) */
         struct timespec t0, t1;
         clock_gettime(CLOCK_MONOTONIC, &t0);
         dbdir_rec_t r2;
@@ -1907,11 +1903,10 @@ static int run_mode(const char *mode) {
         CHECK(waited_ms < 100);
         pthread_join(zt, NULL);
         CHECK(!g_zv_found);                                                    /* (the cell was busy the whole time: not known, and the lookup gave up) */
-        CHECK(zfd >= 0 && pwrite(zfd, &even, 4, cell) == 4);
+        store_test_poke(zs, 1, cell, w7);
         int64_t zsid;
         uint32_t zsr;
         CHECK(dbreg_zone_version("default", "r6b.test.", &zsid, &zsr) && zsid == 306);
-        if (zfd >= 0) close(zfd);
     }
 
     /* -- W. 0.7 fix 7: the worker attaches a zone whose image is in the page cache, and answers at once.  MAP mode: no wait, no store thread in the answer, the registration follows;

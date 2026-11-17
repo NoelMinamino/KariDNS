@@ -1472,8 +1472,10 @@ typedef struct {
   uint32_t victim_freq;
   uint64_t room_evictions, room_relaxed;         /* zones taken out on demand for a query that waited for room (also in evictions), and of those the ones younger than the minimum residency */
   uint64_t sampled;                          /* zones of the store taken out because a sample of the attach table chose them (also in evictions): 0.7 store S5, design 4.4 */
+  uint64_t fixed;                            /* 0.7: the zone store's private table bytes, which memory-limit counts before the zones (dbreg_cache_set_fixed()) */
 } dbreg_cache_stats_t;
 void dbreg_cache_set_limit(uint64_t limit);
+void dbreg_cache_set_fixed(uint64_t bytes);                       /* 0.7: memory that memory-limit counts besides the zones: the zone store's private tables (the store glue, once a second) */
 uint64_t dbreg_cache_limit(void);
 uint32_t dbreg_cache_round(void);
 void dbreg_cache_stats(dbreg_cache_stats_t *out);

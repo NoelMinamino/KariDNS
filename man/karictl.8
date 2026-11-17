@@ -806,8 +806,23 @@ disk keeps up
 \fBstore.checkpoint.count\fR, \fB.last_unix\fR, \fB.last_us\fR, \fB.max_us\fR, \fB.cancelled\fR
 Checkpoints since the open, when the last one ended, how long it took, the
 longest one, and the checkpoints that a stop left in the middle (its clean
-checkpoint flushed everything instead). The flush of the tables runs outside the
+checkpoint flushed everything instead). The write of the tables runs outside the
 store's writer mutex: writers go on meanwhile
+.TP 8
+\fBstore.checkpoint.table_bytes\fR, \fB.table_last_bytes\fR
+0.7: the bytes of the tables (\fBzt\fR, \fBzc\fR, \fBnx\fR, \fBix\fR, \fBsx\fR)
+that checkpoints wrote since the open, and the last one: a checkpoint copies the
+pages that changed since the one before and writes the copy, so the writers
+never wait for a page that is being written out (\fB.paced_us\fR: the time a
+checkpoint waited because it had written more than 256 MiB a second, so that the
+writers' journal appends do not queue behind a burst of it)
+.TP 8
+\fBstore.tables.private_bytes\fR
+0.7: the pages of the tables that the server changed since it started: memory of
+the process that the kernel cannot drop (about 200 bytes a zone once every page
+was written; 0 after a restart until a zone changes). \fBmemory\-limit\fR counts
+it: the zones in memory get the limit less this, at least a tenth of the limit
+(docs/karidns.md, "The tables in memory")
 .TP 8
 \fBstore.writes.commits\fR, \fB.puts\fR, \fB.replaces\fR, \fB.deletes\fR, \fB.growths\fR, \fB.errors\fR
 Writer counters since the open (\fBerrors\fR counts a commit or a checkpoint
