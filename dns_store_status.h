@@ -32,6 +32,7 @@
 #define STORE_STATUS_SAMPLE_PAGES  4096     /* the most pages mincore() looks at per sample */
 #define STORE_STATUS_SAMPLE_TTL_MS 10000    /* a sample is reused this long */
 #define STORE_STATUS_HIST_BUCKETS  25       /* <= 1 us, <= 2 us, ... <= 2^23 us (8.4 s), more */
+#define STORE_STATUS_FINE_BUCKETS  177      /* 0.7: the percentiles' histogram: 0 .. 7 us one each, then eight per power of two (an eighth of an octave) up to 2^24 - 1 us, more */
 #define STORE_STATUS_OUT_MAX       32768    /* the reply is always shorter than this (the callers' buffers are this big or larger) */
 
 enum { STORE_FMT_TEXT = 0, STORE_FMT_JSON = 1, STORE_FMT_KV = 2 };
@@ -66,6 +67,8 @@ typedef struct store_attach_stats {
   uint64_t cold[STORE_COLD_PATHS];
   uint64_t attach_hist[STORE_STATUS_HIST_BUCKETS];   /* successful attaches by latency */
   uint64_t cold_hist[STORE_STATUS_HIST_BUCKETS];     /* cold queries answered by an attach, park -> answer */
+  uint64_t attach_fine[STORE_STATUS_FINE_BUCKETS];   /* the same two, finer (the percentiles) */
+  uint64_t cold_fine[STORE_STATUS_FINE_BUCKETS];
   uint64_t attach_max_ns, cold_max_ns;
 } store_attach_stats_t;
 
@@ -78,6 +81,11 @@ void store_status_snapshot(store_attach_stats_t *out);
 void store_status_reset(void);                                /* tests only */
 /* p-th percentile (0..100) of a histogram, in us: the upper bound of the bucket that holds it; the maximum for the last bucket */
 uint64_t store_status_hist_pct(const uint64_t *hist, unsigned p, uint64_t max_ns);
+/* 0.7: the same for a fine histogram (STORE_STATUS_FINE_BUCKETS) and a quantile in tenths of a percent (0..1000: 990 = p99, 999 = p99.9): the upper bound of the bucket, at most an eighth above the value;
+ * the maximum for the last bucket, and the maximum when it is below that bound */
+uint64_t store_status_fine_pct(const uint64_t *fine, unsigned permille, uint64_t max_ns);
+unsigned store_status_fine_bucket(uint64_t ns);               /* the bucket of a time in ns (rounded up to whole us, as the coarse histogram) */
+uint64_t store_status_fine_upper_us(unsigned i);              /* the largest whole us of bucket i (UINT64_MAX for the last) */
 
 /* 0.7 WP7b: the reconcile with the loader (the passes, the background fetch, the mass-delete guard); filled by dns_db_store.c */
 typedef struct store_recon {

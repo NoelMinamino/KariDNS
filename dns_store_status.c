@@ -25,6 +25,7 @@
 typedef struct {
   _Atomic uint64_t attaches, failed[STORE_ATT_CAUSES], detaches, det_by[STORE_DET_REASONS], cold[STORE_COLD_PATHS];
   _Atomic uint64_t ah[STORE_STATUS_HIST_BUCKETS], ch[STORE_STATUS_HIST_BUCKETS];
+  _Atomic uint64_t af[STORE_STATUS_FINE_BUCKETS], cf[STORE_STATUS_FINE_BUCKETS];
   _Atomic uint64_t amax, cmax;
 } shard_t;
 static shard_t g_sh[NSHARD] __attribute__((aligned(64)));
@@ -46,6 +47,20 @@ static unsigned bucket_of(uint64_t ns) {
   unsigned b = 64u - (unsigned)__builtin_clzll(us - 1);
   return b >= STORE_STATUS_HIST_BUCKETS - 1 ? STORE_STATUS_HIST_BUCKETS - 1 : b;
 }
+/* the fine buckets: 0 .. 7 us one each; from 8 us on, the power of two e (2^e <= us) and the three bits below its top bit: bucket (e - 2) x 8 + those bits, up to e = 23 */
+unsigned store_status_fine_bucket(uint64_t ns) {
+  const uint64_t us = (ns + 999) / 1000;
+  if (us < 8) return (unsigned)us;
+  const unsigned e = 63u - (unsigned)__builtin_clzll(us);
+  if (e > 23) return STORE_STATUS_FINE_BUCKETS - 1;
+  return (e - 2) * 8u + (unsigned)((us >> (e - 3)) & 7u);
+}
+uint64_t store_status_fine_upper_us(unsigned i) {
+  if (i >= STORE_STATUS_FINE_BUCKETS - 1) return UINT64_MAX;
+  if (i < 8) return i;
+  const unsigned e = i / 8 + 2, m = i % 8;
+  return ((uint64_t)(9 + m) << (e - 3)) - 1;
+}
 
 void store_status_note_attach(uint64_t ns, int cause) {
   shard_t *s = my_shard();
@@ -55,6 +70,7 @@ void store_status_note_attach(uint64_t ns, int cause) {
   }
   inc(&s->attaches);
   inc(&s->ah[bucket_of(ns)]);
+  inc(&s->af[store_status_fine_bucket(ns)]);
   max_to(&s->amax, ns);
 }
 void store_status_note_detach_why(int reason) {
@@ -69,6 +85,7 @@ void store_status_note_cold(uint64_t ns, int path) {
   inc(&s->cold[path]);
   if (path == STORE_COLD_ATTACH) {
     inc(&s->ch[bucket_of(ns)]);
+    inc(&s->cf[store_status_fine_bucket(ns)]);
     max_to(&s->cmax, ns);
   }
 }
@@ -85,6 +102,10 @@ void store_status_snapshot(store_attach_stats_t *o) {
     for (int k = 0; k < STORE_STATUS_HIST_BUCKETS; k++) {
       o->attach_hist[k] += atomic_load_explicit(&s->ah[k], memory_order_relaxed);
       o->cold_hist[k] += atomic_load_explicit(&s->ch[k], memory_order_relaxed);
+    }
+    for (int k = 0; k < STORE_STATUS_FINE_BUCKETS; k++) {
+      o->attach_fine[k] += atomic_load_explicit(&s->af[k], memory_order_relaxed);
+      o->cold_fine[k] += atomic_load_explicit(&s->cf[k], memory_order_relaxed);
     }
     uint64_t a = atomic_load_explicit(&s->amax, memory_order_relaxed), c = atomic_load_explicit(&s->cmax, memory_order_relaxed);
     if (a > o->attach_max_ns) o->attach_max_ns = a;
@@ -108,6 +129,22 @@ uint64_t store_status_hist_pct(const uint64_t *hist, unsigned p, uint64_t max_ns
     if (cum >= want) return i == STORE_STATUS_HIST_BUCKETS - 1 ? (max_ns + 999) / 1000 : (uint64_t)1 << i;
   }
   return (max_ns + 999) / 1000;
+}
+uint64_t store_status_fine_pct(const uint64_t *fine, unsigned permille, uint64_t max_ns) {
+  uint64_t total = 0;
+  for (int i = 0; i < STORE_STATUS_FINE_BUCKETS; i++) total += fine[i];
+  if (total == 0) return 0;
+  if (permille > 1000) permille = 1000;
+  uint64_t want = (total * permille + 999) / 1000, cum = 0;
+  if (want == 0) want = 1;
+  const uint64_t mx = (max_ns + 999) / 1000;
+  for (unsigned i = 0; i < STORE_STATUS_FINE_BUCKETS; i++) {
+    cum += fine[i];
+    if (cum < want) continue;
+    const uint64_t up = store_status_fine_upper_us(i);
+    return up < mx ? up : mx;
+  }
+  return mx;
 }
 
 /* ------------------------------------------------------------------------------------------------------------------------------ */
@@ -341,9 +378,10 @@ static void add_attach(list_t *l, const store_attach_stats_t *a) {
   U("store.attach.fail.io", a->attach_failed[STORE_ATT_ERR_IO]);
   U("store.attach.fail.memory", a->attach_failed[STORE_ATT_ERR_MEMORY]);
   U("store.attach.fail.other", a->attach_failed[STORE_ATT_ERR_OTHER]);
-  U("store.attach.p50_us", store_status_hist_pct(a->attach_hist, 50, a->attach_max_ns));
-  U("store.attach.p90_us", store_status_hist_pct(a->attach_hist, 90, a->attach_max_ns));
-  U("store.attach.p99_us", store_status_hist_pct(a->attach_hist, 99, a->attach_max_ns));
+  U("store.attach.p50_us", store_status_fine_pct(a->attach_fine, 500, a->attach_max_ns));
+  U("store.attach.p90_us", store_status_fine_pct(a->attach_fine, 900, a->attach_max_ns));
+  U("store.attach.p99_us", store_status_fine_pct(a->attach_fine, 990, a->attach_max_ns));
+  U("store.attach.p999_us", store_status_fine_pct(a->attach_fine, 999, a->attach_max_ns));
   U("store.attach.max_us", (a->attach_max_ns + 999) / 1000);
   add_hist(l, "store.attach", a->attach_hist);
   U("store.detach.count", a->detaches);
@@ -354,9 +392,10 @@ static void add_attach(list_t *l, const store_attach_stats_t *a) {
   U("store.cold.attach", a->cold[STORE_COLD_ATTACH]);
   U("store.cold.fetch", a->cold[STORE_COLD_FETCH]);
   U("store.cold.timeout", a->cold[STORE_COLD_TIMEOUT]);
-  U("store.cold.p50_us", store_status_hist_pct(a->cold_hist, 50, a->cold_max_ns));
-  U("store.cold.p90_us", store_status_hist_pct(a->cold_hist, 90, a->cold_max_ns));
-  U("store.cold.p99_us", store_status_hist_pct(a->cold_hist, 99, a->cold_max_ns));
+  U("store.cold.p50_us", store_status_fine_pct(a->cold_fine, 500, a->cold_max_ns));
+  U("store.cold.p90_us", store_status_fine_pct(a->cold_fine, 900, a->cold_max_ns));
+  U("store.cold.p99_us", store_status_fine_pct(a->cold_fine, 990, a->cold_max_ns));
+  U("store.cold.p999_us", store_status_fine_pct(a->cold_fine, 999, a->cold_max_ns));
   U("store.cold.max_us", (a->cold_max_ns + 999) / 1000);
   add_hist(l, "store.cold", a->cold_hist);
 }
@@ -652,6 +691,20 @@ static void add_store(list_t *l, const store_t *s, const store_attach_stats_t *a
   U("store.lock.writer_holds_slow", st->lock_holds_slow);
   U("store.lock.writer_hold_max_us", st->lock_hold_max_us);
   add_s(l, "store.lock.writer_hold_max_site", st->lock_hold_max_site ? st->lock_hold_max_site : "-");
+  for (uint32_t i = 0; i < st->lock_nsites && i < STORE_LOCK_SITES; i++) {          /* 0.7: the holds of 1 ms or more by function */
+    const store_lock_site_t *w = &st->lock_sites[i];
+    char k[56];
+    snprintf(k, sizeof(k), "store.lock.site.%.24s.slow", w->site);
+    U(k, w->slow);
+    snprintf(k, sizeof(k), "store.lock.site.%.24s.over_10ms", w->site);
+    U(k, w->over_10ms);
+    snprintf(k, sizeof(k), "store.lock.site.%.24s.over_100ms", w->site);
+    U(k, w->over_100ms);
+    snprintf(k, sizeof(k), "store.lock.site.%.24s.slow_us", w->site);
+    U(k, w->slow_us);
+    snprintf(k, sizeof(k), "store.lock.site.%.24s.max_us", w->site);
+    U(k, w->max_us);
+  }
   U("store.flusher", st->flusher ? 1 : 0);
   /* 0.7 WP9: the cleaner (design 3.2) */
   U("store.compact.runs", st->compact_runs);

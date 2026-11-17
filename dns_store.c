@@ -351,6 +351,10 @@ typedef struct seg {
   _Atomic int refs;
 } seg_t;
 
+typedef struct {                                      /* the holds of the writer mutex of 1 ms or more by one function (store.lock.site.*) */
+  _Atomic(const char *) site;
+  _Atomic uint64_t slow, over10, over100, slow_us, max_us;
+} st_wl_site_t;
 typedef struct retire {
   uint64_t epoch;
   ixgen_t *g;
@@ -474,6 +478,7 @@ struct store {
   const char *wl_site;                                /* (the mutex) the function that took it */
   _Atomic uint64_t wl_n, wl_slow, wl_max_us;
   _Atomic(const char *) wl_max_site;                  /* the function of the longest hold (store.lock.writer_hold_max_site) */
+  st_wl_site_t wl_sites[STORE_LOCK_SITES];             /* 0.7: the holds of 1 ms or more by function (the first STORE_LOCK_SITES functions that had one; written under the mutex) */
   uint64_t wl_log_ms;                                 /* (the mutex) the last log line of a hold of a second or more */
 
   _Atomic uint64_t n_puts, n_replaces, n_deletes, n_growths, n_checkpoints, n_commits, n_write_errors;
@@ -1926,6 +1931,21 @@ static int journal_commit_apply(store_t *s) {
 
 /* (the site of a hold is the function that took the mutex: wr_lock_raw(), wr_lock() and wr_lock_ck() are macros that pass __func__; the longest hold names it, and a hold of a second
  * or more is logged with it, at most once a minute) */
+/* a hold of 1 ms or more, by its function (writer mutex held: the only writer of the table; a reader sees a slot's site before its counts) */
+static void wl_site_note(store_t *s, const char *site, uint64_t h) {
+  for (unsigned i = 0; i < STORE_LOCK_SITES; i++) {
+    st_wl_site_t *w = &s->wl_sites[i];
+    const char *at = atomic_load_explicit(&w->site, memory_order_relaxed);
+    if (!at) atomic_store_explicit(&w->site, at = site, memory_order_release);
+    if (at != site) continue;
+    atomic_fetch_add_explicit(&w->slow, 1, memory_order_relaxed);
+    if (h >= 10000) atomic_fetch_add_explicit(&w->over10, 1, memory_order_relaxed);
+    if (h >= 100000) atomic_fetch_add_explicit(&w->over100, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&w->slow_us, h, memory_order_relaxed);
+    if (h > atomic_load_explicit(&w->max_us, memory_order_relaxed)) atomic_store_explicit(&w->max_us, h, memory_order_relaxed);
+    return;
+  }
+}
 static void wr_lock_raw_at(store_t *s, const char *site) {
   pthread_mutex_lock(&s->wlock);
   s->wl_t0 = st_now_us();
@@ -1941,6 +1961,7 @@ static void wr_unlock_raw(store_t *s) {
     atomic_store_explicit(&s->wl_max_us, h, memory_order_relaxed);
     atomic_store_explicit(&s->wl_max_site, site, memory_order_relaxed);
   }
+  if (h >= 1000) wl_site_note(s, site, h);
   bool say = false;
   if (h >= 1000000u) {
     const uint64_t now = st_now_ms();
@@ -4764,6 +4785,11 @@ void store_test_poke(store_t *s, int which, uint64_t off, uint64_t v) {
   }
   wr_unlock_raw(s);
 }
+void store_test_hold(store_t *s, const char *site, uint64_t us) {
+  wr_lock_raw_at(s, site);
+  s->wl_t0 -= us;
+  wr_unlock_raw(s);
+}
 bool store_test_files_match(store_t *s) {
   wr_lock_raw(s);
   const mtab_t *tabs[3] = { &s->zt, &s->zc, &s->nx };
@@ -5290,6 +5316,19 @@ void store_stats(const store_t *s, store_stats_t *o) {
   o->lock_holds_slow = atomic_load_explicit(&s->wl_slow, memory_order_relaxed);
   o->lock_hold_max_us = atomic_load_explicit(&s->wl_max_us, memory_order_relaxed);
   o->lock_hold_max_site = atomic_load_explicit(&s->wl_max_site, memory_order_relaxed);
+  o->lock_nsites = 0;
+  for (unsigned i = 0; i < STORE_LOCK_SITES; i++) {
+    const st_wl_site_t *w = &s->wl_sites[i];
+    const char *at = atomic_load_explicit(&w->site, memory_order_acquire);
+    if (!at) break;
+    store_lock_site_t *o2 = &o->lock_sites[o->lock_nsites++];
+    o2->site = at;
+    o2->slow = atomic_load_explicit(&w->slow, memory_order_relaxed);
+    o2->over_10ms = atomic_load_explicit(&w->over10, memory_order_relaxed);
+    o2->over_100ms = atomic_load_explicit(&w->over100, memory_order_relaxed);
+    o2->slow_us = atomic_load_explicit(&w->slow_us, memory_order_relaxed);
+    o2->max_us = atomic_load_explicit(&w->max_us, memory_order_relaxed);
+  }
   o->growths_background = atomic_load_explicit(&s->n_growths_bg, memory_order_relaxed);
   o->flusher = s->fl_on;
   o->checkpoint_max_us = atomic_load_explicit(&s->ckpt_max_us, memory_order_relaxed);

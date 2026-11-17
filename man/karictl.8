@@ -719,10 +719,11 @@ reader takes the keys it knows and ignores the others. Names ending in
 \fB_bytes\fR are bytes, \fB_us\fR microseconds, \fB_pct\fR an integer
 percentage; a latency percentile is the upper bound of the bucket it falls in
 (the buckets are 1, 2, 4, ... 8388608 microseconds, so it is exact to a factor
-of 2); \fBmax_us\fR is exact. A rate is the difference of a counter between two
-polls divided by the difference of \fBstore.time.mono_ms\fR (the server's
-monotonic clock in milliseconds; \fBstore.time.unix\fR is the wall clock in
-seconds).
+of 2; \fBstore.attach.p*_us\fR and \fBstore.cold.p*_us\fR come from buckets an
+eighth of a power of two wide, exact to an eighth, 0.7); \fBmax_us\fR is
+exact. A rate is the difference of a counter between two polls divided by the
+difference of \fBstore.time.mono_ms\fR (the server's monotonic clock in
+milliseconds; \fBstore.time.unix\fR is the wall clock in seconds).
 .TP 8
 \fBschema\fR
 Version of this key list (1)
@@ -863,6 +864,13 @@ first fill of ten million zones under load; 0.7 no longer appends to a file that
 a sync holds: see \fB.journal.commit_switches\fR and
 \fBstore.writes.prewrites\fR). A hold of a second or more is also logged (at
 most once a minute) with its function
+.TP 8
+\fBstore.lock.site.<function>.slow\fR, \fB.over_10ms\fR, \fB.over_100ms\fR, \fB.slow_us\fR, \fB.max_us\fR
+The holds of the writer mutex of 1 ms or more by the function that took it
+(0.7): how many, how many of 10 ms and of 100 ms or more, their total time and
+the longest. A function appears with its first such hold; at most 24 functions
+are kept (\fB<function>\fR is cut at 24 characters). The distribution says
+whether \fB.writer_hold_max_us\fR was one event or a pattern
 .TP 8
 \fBstore.lock.records_holds\fR, \fB.records_holds_slow\fR, \fB.records_hold_max_us\fR, \fB.records_wait_max_us\fR
 The mutex that orders the writers of the records (the reconcile, the commit of a
@@ -1094,8 +1102,10 @@ Zones attached from the store since the start
 Attaches that failed; \fBstore.attach.fail.checksum\fR, \fB.record\fR,
 \fB.invalid\fR, \fB.io\fR, \fB.memory\fR, \fB.other\fR by cause
 .TP 8
-\fBstore.attach.p50_us\fR, \fB.p90_us\fR, \fB.p99_us\fR, \fB.max_us\fR
-Time of an attach
+\fBstore.attach.p50_us\fR, \fB.p90_us\fR, \fB.p99_us\fR, \fB.p999_us\fR, \fB.max_us\fR
+Time of an attach: the percentiles from a finer histogram than the buckets below
+(0.7: one bucket per microsecond up to 7 us, then eight per power of two), exact
+to an eighth (\fB.p999_us\fR is the 99.9th percentile, 0.7)
 .TP 8
 \fBstore.attach.hist.le_<2^i>us\fR, \fB.hist.more\fR
 The histogram: attaches that took at most 1, 2, 4, ... 8388608 microseconds
@@ -1111,8 +1121,10 @@ database fetch (a zone with no image, or a damaged one: a query that waits for a
 fetch or an attach that another query started is not counted), ended by the park
 time-out
 .TP 8
-\fBstore.cold.p50_us\fR, \fB.p90_us\fR, \fB.p99_us\fR, \fB.max_us\fR, \fB.hist.le_<2^i>us\fR, \fB.hist.more\fR
-Time from the parked query to its answer, for \fBstore.cold.attach\fR
+\fBstore.cold.p50_us\fR, \fB.p90_us\fR, \fB.p99_us\fR, \fB.p999_us\fR, \fB.max_us\fR, \fB.hist.le_<2^i>us\fR, \fB.hist.more\fR
+Time from the parked query to its answer, for \fBstore.cold.attach\fR; the
+percentiles as for \fBstore.attach.*\fR (exact to an eighth), the buckets of
+powers of two
 .TP 8
 \fBstore.memory.available\fR
 1 when the figures below are there

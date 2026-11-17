@@ -209,6 +209,14 @@ typedef struct store_view_stats {
   uint64_t image_bytes;           /* record bytes of the stored images of this view */
 } store_view_stats_t;
 
+/* 0.7: the holds of the writer mutex of 1 ms or more that one function made (store.lock.site.*); the first STORE_LOCK_SITES functions that had one are kept */
+#define STORE_LOCK_SITES 24
+typedef struct store_lock_site {
+  const char *site;               /* the function (a static string) */
+  uint64_t slow, over_10ms, over_100ms;   /* its holds of 1 ms or more, 10 ms or more, 100 ms or more */
+  uint64_t slow_us, max_us;       /* the time of its holds of 1 ms or more, its longest hold */
+} store_lock_site_t;
+
 /* Design section 9.1; every figure is a counter kept at the change, store_stats() is O(views). */
 typedef struct store_stats {
   uint32_t format;
@@ -275,6 +283,8 @@ typedef struct store_stats {
   uint64_t lock_holds_slow;       /* ... of 1 ms or more */
   uint64_t lock_hold_max_us;      /* the longest one */
   const char *lock_hold_max_site;  /* the function that held it (a static string; NULL: no hold yet) */
+  store_lock_site_t lock_sites[STORE_LOCK_SITES];   /* 0.7: the holds of 1 ms or more by function, in the order the functions first had one */
+  uint32_t lock_nsites;
   uint64_t growths_background;    /* index growths that were built outside the mutex (the others: in it, when the index filled up before the build ended) */
   bool     flusher;               /* the flusher thread runs (false: the writers make the due commits and checkpoints themselves, after the mutex) */
   /* ---- 0.7: the flush of a checkpoint converges; the bound of the journal ---- */
@@ -529,6 +539,8 @@ extern _Atomic long store_test_fail_commit;
 extern _Atomic long store_test_fail_ckwrite;
 /* the bytes of the table files (zt, zc, nx, the current ix and sx) equal the memory of the store: true after a checkpoint with the writers kept out (store_checkpoint_clean()) */
 bool store_test_files_match(store_t *s);
+/* a hold of the writer mutex by the function `site` that lasted `us` microseconds (its start is set back): the counters of the holds as for a real one */
+void store_test_hold(store_t *s, const char *site, uint64_t us);
 /* a word (byte offset off, a multiple of 8) of the memory of a table: 0 zt, 1 zc, 2 nx, 3 the current ix, 4 the current sx (the tables are private memory since 0.7: a test that damages a cell
  * does it here, not in the file); poke marks it for the next checkpoint */
 uint64_t store_test_peek(store_t *s, int which, uint64_t off);
