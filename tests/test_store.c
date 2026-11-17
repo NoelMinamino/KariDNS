@@ -3896,6 +3896,201 @@ static void test_append_fault(void) {
   tdir_free(&d);
 }
 
+/* 0.7 (planing_0.7.x_secondary_store.md 2.4): store_put_ex(STORE_PUT_NO_DEGRADE) and store_set_digest() */
+static int fault_set_digest(const char *op, uint32_t zid) {
+  (void)zid;
+  return strcmp(op, "set_digest") == 0 ? -EIO : 0;
+}
+static int put_ex_i(store_t *s, uint16_t view, uint32_t i, uint64_t ver, unsigned fl, uint32_t *zid) {
+  char nm[160];
+  name_of(i, nm, sizeof(nm));
+  size_t n = img_len(i, ver);
+  uint8_t *img = malloc(n);
+  img_fill(img, n, i, ver);
+  store_meta_t m = meta_of(i, ver);
+  m.source_id = 0;
+  int r = store_put_ex(s, view, nm, strlen(nm), &m, img, n, fl, zid);
+  free(img);
+  return r;
+}
+static void test_xfr_writers(void) {
+  printf("[0.7 secondaries: store_put_ex(NO_DEGRADE) keeps the old record on a full disk; store_set_digest() by name, serial-checked]\n");
+  tdir_t d;
+  tdir_new(&d, "xfrw");
+  store_opts_t o;
+  small_opts(&o);
+  o.scrub_interval_s = UINT32_MAX;
+  o.log = log_cb;
+  log_clear();
+  store_t *s = NULL;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (!s) { tdir_free(&d); return; }
+  store_view_add(s, "default");
+  for (uint32_t i = 0; i < 20; i++) CHECK_EQ(put_ex_i(s, 0, i, 1, STORE_PUT_NO_DEGRADE, NULL), 0);
+  store_stats_t st0, st;
+  store_stats(s, &st0);
+  /* 1. the disk fills up between the free-space check and the write, twice (the put and its retry after the cleaner): -ENOSPC, the old record and its image stay, not degraded */
+  atomic_store(&g_fault_left, 2);
+  store_test_append_fault = fault_append;
+  CHECK_EQ(put_ex_i(s, 0, 5, 2, STORE_PUT_NO_DEGRADE, NULL), -ENOSPC);
+  store_test_append_fault = NULL;
+  store_stats(s, &st);
+  CHECK_EQ(st.degraded_puts, st0.degraded_puts);
+  CHECK(st.enospc_events > st0.enospc_events);
+  CHECK(st.space_level < 2);
+  CHECK(!(st.state & STORE_ST_DEGRADED_NOSPC) || st.degraded_since_unix == 0);
+  CHECK(verify_i(s, 0, 5, 1));
+  CHECK_EQ(st.zones_stored, 20);
+  /* a new zone that does not fit is not made at all */
+  usleep(1100000);                                                          /* (the cleaner is tried again after a second) */
+  atomic_store(&g_fault_left, 2);
+  store_test_append_fault = fault_append;
+  CHECK_EQ(put_ex_i(s, 0, 50, 1, STORE_PUT_NO_DEGRADE, NULL), -ENOSPC);
+  store_test_append_fault = NULL;
+  CHECK(find_i(s, 0, 50) == STORE_NONE);
+  check_consistent(s, "put_ex nospc");
+  /* the same fault without the flag: the old behaviour (KNOWN, degraded) */
+  usleep(1100000);
+  atomic_store(&g_fault_left, 2);
+  store_test_append_fault = fault_append;
+  CHECK_EQ(put_ex_i(s, 0, 6, 2, 0, NULL), 0);
+  store_test_append_fault = NULL;
+  store_stats(s, &st);
+  CHECK_EQ(st.degraded_puts, st0.degraded_puts + 1);
+  CHECK_EQ(put_ex_i(s, 0, 6, 3, STORE_PUT_NO_DEGRADE, NULL), 0);         /* (room again: stored, the state ends) */
+  CHECK(verify_i(s, 0, 6, 3));
+  /* 2. store_set_digest(): digest, settings and flags change; the image, the stamp, the state stay */
+  char nm[160];
+  name_of(7, nm, sizeof(nm));
+  uint8_t dg[STORE_DIGEST_LEN];
+  for (int k = 0; k < STORE_DIGEST_LEN; k++) dg[k] = (uint8_t)(0xA0 + k);
+  store_zone_t b, a;
+  uint32_t z7 = find_i(s, 0, 7);
+  CHECK_EQ(store_zone_get(s, z7, &b), 0);
+  CHECK_EQ(store_set_digest(s, 0, nm, strlen(nm), b.serial, 4242, dg, STORE_F_XFR, 0), 0);
+  CHECK_EQ(store_zone_get(s, z7, &a), 0);
+  CHECK(memcmp(a.digest, dg, STORE_DIGEST_LEN) == 0 && a.settings == 4242 && (a.flags & STORE_F_XFR) && a.stamp_gen == b.stamp_gen && a.stamp_time == b.stamp_time && a.loc == b.loc &&
+        a.state == STORE_STATE_STORED);
+  CHECK(verify_i(s, 0, 7, 1));
+  /* the name is folded */
+  char up[160];
+  snprintf(up, sizeof(up), "%s", nm);
+  for (char *p = up; *p; p++) if (*p >= 'a' && *p <= 'z') *p = (char)(*p - 32);
+  dg[0] = 0x11;
+  CHECK_EQ(store_set_digest(s, 0, up, strlen(up), b.serial, 4242, dg, 0, STORE_F_XFR), 0);
+  CHECK_EQ(store_zone_get(s, z7, &a), 0);
+  CHECK(a.digest[0] == 0x11 && !(a.flags & STORE_F_XFR));
+  /* another serial: -ESTALE, nothing changed; no such zone: -ENOENT; a fault: nothing changed */
+  dg[0] = 0x22;
+  CHECK_EQ(store_set_digest(s, 0, nm, strlen(nm), b.serial + 1, 1, dg, 0, 0), -ESTALE);
+  CHECK_EQ(store_set_digest(s, 0, "nosuch.example.test", 19, 1, 1, dg, 0, 0), -ENOENT);
+  CHECK_EQ(store_set_digest(s, 3, nm, strlen(nm), 1, 1, dg, 0, 0), -EINVAL);
+  store_test_write_fault = fault_set_digest;
+  CHECK_EQ(store_set_digest(s, 0, nm, strlen(nm), b.serial, 1, dg, 0, 0), -EIO);
+  store_test_write_fault = NULL;
+  CHECK_EQ(store_zone_get(s, z7, &a), 0);
+  CHECK(a.digest[0] == 0x11 && a.settings == 4242);
+  /* the REJECTED_NEW counter follows the flags it sets */
+  CHECK_EQ(store_set_digest(s, 0, nm, strlen(nm), b.serial, 4242, dg, STORE_F_REJECTED_NEW, 0), 0);
+  store_stats(s, &st);
+  CHECK_EQ(st.zones_rejected, 1);
+  CHECK_EQ(store_set_digest(s, 0, nm, strlen(nm), b.serial, 4242, dg, 0, STORE_F_REJECTED_NEW), 0);
+  check_consistent(s, "set_digest");
+  /* 3. M3: a zone id kept from a lookup, the zone deleted, the id given to another zone: a set_digest by the old name finds nothing and does not touch the other zone */
+  uint32_t z9 = find_i(s, 0, 9);
+  CHECK_EQ(store_delete(s, z9), 0);
+  for (int k = 0; k < 200 && find_i(s, 0, 9) == STORE_NONE; k++) {          /* (the id comes back after the grace period of the delete) */
+    uint32_t nz = STORE_NONE;
+    CHECK_EQ(put_ex_i(s, 0, 300 + (uint32_t)k, 1, 0, &nz), 0);
+    if (nz == z9) break;
+    usleep(1000);
+  }
+  store_zone_t o9;
+  const bool reused = store_zone_get(s, z9, &o9) == 0 && o9.state != STORE_STATE_FREE;
+  CHECK(reused);
+  name_of(9, nm, sizeof(nm));
+  dg[0] = 0x33;
+  CHECK_EQ(store_set_digest(s, 0, nm, strlen(nm), 1, 7, dg, STORE_F_XFR, 0), -ENOENT);
+  store_zone_t o9b;
+  CHECK_EQ(store_zone_get(s, z9, &o9b), 0);
+  CHECK(reused && memcmp(o9b.digest, o9.digest, STORE_DIGEST_LEN) == 0 && o9b.settings == o9.settings && o9b.flags == o9.flags);
+  /* 4. replay: the digest is in the journal (a reopen without a clean stop) */
+  name_of(7, nm, sizeof(nm));
+  dg[0] = 0x44;
+  CHECK_EQ(store_set_digest(s, 0, nm, strlen(nm), b.serial, 99, dg, STORE_F_XFR, 0), 0);
+  CHECK_EQ(store_commit(s), 0);
+  check_consistent(s, "set_digest 2");
+  CHECK_EQ(store_close(s), 0);
+  s = NULL;
+  o.create = false;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (s) {
+    CHECK_EQ(store_zone_get(s, find_i(s, 0, 7), &a), 0);
+    CHECK(a.digest[0] == 0x44 && a.settings == 99 && (a.flags & STORE_F_XFR));
+    CHECK(verify_i(s, 0, 7, 1));
+    CHECK_EQ(store_close(s), 0);
+  }
+  tdir_free(&d);
+  /* 5. kill -9 at every crash point of a store_set_digest() and a store_put_ex(): after the replay the record is the old one or the new one, whole */
+  int runs = 0, olds = 0, news = 0, bad = 0;
+  for (int which = 0; which < 2; which++) {
+    for (long c = 1; c < 200 && !bad; c++) {
+      tdir_t kd;
+      tdir_new(&kd, "xfrk");
+      store_opts_t ko;
+      small_opts(&ko);
+      ko.sync_policy = STORE_SYNC_EVERY;
+      fflush(stdout);
+      pid_t pid = fork();
+      if (pid == 0) {
+        store_t *ks = NULL;
+        if (store_open(kd.fd, &ko, &ks) != 0) _exit(3);
+        store_view_add(ks, "default");
+        if (put_ex_i(ks, 0, 1, 1, STORE_PUT_NO_DEGRADE, NULL) != 0) _exit(4);
+        char kn[160];
+        name_of(1, kn, sizeof(kn));
+        uint8_t kdg[STORE_DIGEST_LEN];
+        memset(kdg, 0x5A, sizeof(kdg));
+        store_test_crash_countdown = c;
+        int r = which == 0 ? store_set_digest(ks, 0, kn, strlen(kn), 1, 77, kdg, STORE_F_XFR, 0) : put_ex_i(ks, 0, 1, 2, STORE_PUT_NO_DEGRADE, NULL);
+        store_test_crash_countdown = 0;
+        _exit(r == 0 ? 0 : 5);
+      }
+      int stt = 0;
+      waitpid(pid, &stt, 0);
+      const bool killed = WIFSIGNALED(stt);
+      if (!killed) CHECK(WIFEXITED(stt) && WEXITSTATUS(stt) == 0);
+      ko.create = false;
+      store_t *ks = NULL;
+      CHECK_EQ(store_open(kd.fd, &ko, &ks), 0);
+      if (ks) {
+        store_zone_t kz;
+        const uint32_t z = find_i(ks, 0, 1);
+        const bool got = z != STORE_NONE && store_zone_get(ks, z, &kz) == 0;
+        if (!got) bad++;
+        else if (which == 0) {
+          const bool isnew = kz.digest[0] == 0x5A && kz.settings == 77 && (kz.flags & STORE_F_XFR);
+          const bool isold = kz.digest[0] == (uint8_t)1 && kz.settings == 1 % 100 && !(kz.flags & STORE_F_XFR);
+          if (!(isnew || isold) || !verify_i(ks, 0, 1, 1)) bad++;
+          if (isnew) news++; else olds++;
+        } else {
+          if (verify_i(ks, 0, 1, 2)) news++;
+          else if (verify_i(ks, 0, 1, 1)) olds++;
+          else bad++;
+        }
+        check_consistent(ks, "xfr kill");
+        CHECK_EQ(store_close(ks), 0);
+      }
+      tdir_free(&kd);
+      runs++;
+      if (!killed) break;
+    }
+  }
+  printf("  kill -9 at each crash point (set_digest, put_ex): %d runs, %d old, %d new\n", runs, olds, news);
+  CHECK_EQ(bad, 0);
+  CHECK(olds > 0 && news > 0);
+}
+
 /* a file system that really is small: KARIDNS_STORE_SMALLFS names a directory on one (a quota dataset, a tmpfs of a few megabytes) */
 static void test_smallfs(const char *base) {
   printf("[space: a real small file system (%s)]\n", base);
@@ -6547,6 +6742,7 @@ int main(void) {
   if (WANT("full")) test_disk_full();
   if (WANT("compact")) { test_compact(STORE_MODE_MAP); test_compact(STORE_MODE_COPY); test_compact_pinned(); test_compact_tick(); test_compact_open_segment(); test_nx_reclaim(); }
   if (WANT("space")) { test_space(STORE_MODE_MAP); test_space(STORE_MODE_COPY); test_append_fault(); }
+  if (WANT("xfrw")) test_xfr_writers();
   if (WANT("scrub")) { test_scrub(STORE_MODE_MAP); test_scrub(STORE_MODE_COPY); test_scrub_tick(); }
   if (WANT("opendef")) test_open_defaults();
   if (WANT("errring")) { test_err_ring(); test_err_index(); }

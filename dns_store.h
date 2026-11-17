@@ -81,6 +81,7 @@ enum { STORE_STATE_FREE = 0, STORE_STATE_KNOWN = 1, STORE_STATE_STORED = 2 };
 #define STORE_F_UPDATED_PIN   0x0020u
 #define STORE_F_NONSTORE      0x0040u   /* 0.7 WP7b: a secondary or catalog zone of the database: the record only remembers the zone for the reconcile (it is a heap zone, never stored, never found by a query) */
 #define STORE_F_STALE         0x0080u   /* 0.7 WP7b: the database has another version of the zone than the image (the record's stamp is the wanted one): the body is fetched in the background; the image keeps serving meanwhile */
+#define STORE_F_XFR           0x0100u   /* 0.7: a secondary's copy (the reserved view `_karidns-xfr`); the digest is the secondary state (dns_xfr_store.h) */
 
 /* access mode of the images */
 enum { STORE_MODE_AUTO = 0, STORE_MODE_MAP = 1, STORE_MODE_COPY = 2 };
@@ -429,6 +430,16 @@ unsigned store_view_depth_max(const store_t *s, uint16_t view);
  * -ENOSPC is returned when even the record cannot be made (a table that cannot grow), and with opts.no_degrade. */
 int  store_put(store_t *s, uint16_t view, const char *name, size_t len, const store_meta_t *meta,
                const void *image, size_t image_len, uint32_t *zid);
+/* 0.7 (a secondary's copy, planing_0.7.x_secondary_store.md 2.4): store_put() with per-call flags.  STORE_PUT_NO_DEGRADE: when there is no room (after the cleaner ran and the put was tried
+ * again) the call returns -ENOSPC and the zone's record (and its old image) stay as they were, instead of the KNOWN fallback; the store is not marked degraded by the call (the disk-full
+ * counters count it).  store_put() == store_put_ex(..., 0, ...). */
+#define STORE_PUT_NO_DEGRADE 0x1u
+int  store_put_ex(store_t *s, uint16_t view, const char *name, size_t len, const store_meta_t *meta,
+                  const void *image, size_t image_len, unsigned flags, uint32_t *zid);
+/* 0.7: the digest, the settings id and the flags (set, then clear) of the zone (view, name), only if its serial is expect_serial: the zone is looked up again under the writer mutex (a zone id
+ * kept from a lookup may have been freed and given to another zone).  The image, the stamp and the state stay.  0; -ENOENT: no such zone; -ESTALE: it has another serial (replaced meanwhile). */
+int  store_set_digest(store_t *s, uint16_t view, const char *name, size_t len, uint32_t expect_serial, uint32_t settings,
+                      const uint8_t digest[STORE_DIGEST_LEN], uint16_t set, uint16_t clear);
 /* The zone exists with name and stamp but without an image (state KNOWN); a stored image of the zone is released. */
 int  store_set_known(store_t *s, uint16_t view, const char *name, size_t len, const store_meta_t *meta, uint32_t *zid);
 /* 0.7 M2, group commit: n entries of one view as n calls of store_set_known(), in order, but the journal record and the commit decision are one per group of up to STORE_GROUP_MAX entries, and the
@@ -597,7 +608,7 @@ int store_test_dirfd_of(store_t *s);
  * does it here, not in the file); poke marks it for the next checkpoint */
 uint64_t store_test_peek(store_t *s, int which, uint64_t off);
 void store_test_poke(store_t *s, int which, uint64_t off, uint64_t v);
-/* a writer (store_put, store_set_known, store_delete, store_set_flags, store_set_stamp, store_set_cursor; `op` is its name without the store_ prefix) returns the errno this returns (not 0) before it changes anything: a full disk, an I/O error (NULL = off) */
+/* a writer (store_put, store_set_known, store_delete, store_set_flags, store_set_stamp, store_set_digest, store_set_cursor; `op` is its name without the store_ prefix) returns the errno this returns (not 0) before it changes anything: a full disk, an I/O error (NULL = off) */
 extern int (*store_test_write_fault)(const char *op, uint32_t zid);
 /* called by store_stats() after it has read the index generation (the window in which a writer may retire it) */
 extern void (*store_test_in_stats)(void);
