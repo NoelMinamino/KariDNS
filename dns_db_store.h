@@ -84,7 +84,9 @@ uint64_t db_store_journal_wait(unsigned factor);
 /* ---- the ingest threads ---- */
 
 /* a batch ended: what it wrote to the store is made durable (group commit) */
-void db_store_batch_end(void);
+int  db_store_batch_end(void);         /* (the commit's result: 0, or -errno; 0.7: it is also the acknowledgement of the deferred calls of the ingest and the reconcile threads) */
+/* 0.7: this thread's store calls do not wait for their journal record (the ingest and the reconcile thread; off before the thread ends) */
+void db_store_defer_thread(bool on);
 
 /* ---- 0.7 WP7b: the loader's manifest and change entries against the store (the ingest thread; store design 5.3, 5.4) ----
  *

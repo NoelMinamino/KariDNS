@@ -288,8 +288,22 @@ static void rec_max(_Atomic uint64_t *m, uint64_t v) {
   uint64_t c = atomic_load_explicit(m, memory_order_relaxed);
   while (v > c && !atomic_compare_exchange_weak_explicit(m, &c, v, memory_order_relaxed, memory_order_relaxed)) {}
 }
+/* 0.7, the journal ring (store_defer()): the store calls of a thread inside the records lock do not wait for their journal record; the thread waits for them when it leaves
+ * the lock (store_settle() in rec_unlock(), with no lock held), so that the records lock is never held while the journal is written.  The ingest and the reconcile threads defer
+ * for good (db_store_defer_thread()): their acknowledgement is the commit at the end of the batch (db_store_batch_end()), so that the ingest loop does not wait for the disk at all. */
+static _Thread_local bool t_df_perm;                   /* this thread defers for good */
+static _Thread_local store_t *t_df_st;                 /* the store this thread's rec_lock() scope deferred on */
+static _Atomic uint64_t g_rec_fine[STORE_FINE_BUCKETS];   /* every hold (store.lock.records_hold_p999_us) */
+static _Atomic uint64_t g_settle_errors;              /* settles that found the journal failed or full (the calls had returned 0) */
+void db_store_defer_thread(bool on) {
+  store_t *st = atomic_load_explicit(&G.st, memory_order_acquire);
+  t_df_perm = on;
+  if (st) (void)store_defer(st, on);                   /* (on: taken lazily by rec_lock() when the store comes later; off: before the thread ends, its slot is freed) */
+}
 static void rec_lock(void) {
   if (t_rec_depth++ != 0) return;
+  t_df_st = atomic_load_explicit(&G.st, memory_order_acquire);
+  if (t_df_st) (void)store_defer(t_df_st, true);      /* (idempotent for a thread that defers for good; -EAGAIN without a flusher: the calls then wait as before) */
   if (pthread_mutex_trylock(&g_rec_mu) != 0) {
     const int64_t w0 = mono_ns();
     atomic_fetch_add_explicit(&g_rec_waiters, 1, memory_order_relaxed);
@@ -307,7 +321,14 @@ static void rec_unlock(void) {
   atomic_fetch_add_explicit(&g_rec_holds, 1, memory_order_relaxed);
   if (h >= 1000) atomic_fetch_add_explicit(&g_rec_slow, 1, memory_order_relaxed);
   rec_max(&g_rec_hold_max_us, h);
+  atomic_fetch_add_explicit(&g_rec_fine[store_fine_bucket_us(h)], 1, memory_order_relaxed);
   pthread_mutex_unlock(&g_rec_mu);
+  store_t *st = t_df_st;
+  t_df_st = NULL;
+  if (st && !t_df_perm) {                              /* (rule A for this thread's calls of the scope: their records are in the kernel when it goes on) */
+    if (store_settle(st) < 0) atomic_fetch_add_explicit(&g_settle_errors, 1, memory_order_relaxed);
+    (void)store_defer(st, false);
+  }
 }
 #ifdef KARIDNS_UNIT_TEST
 void (*db_store_test_commit_hook)(int where, const char *zone);
@@ -1525,7 +1546,7 @@ static void *ticker_thread(void *arg) {
       (void)store_tick(st);
       store_stats_t ss;
       store_stats(st, &ss);
-      tables_charge(ss.table_private_bytes, mono_ns() / 1000000, &warned_ms);
+      tables_charge(ss.table_private_bytes + ss.ring_bytes, mono_ns() / 1000000, &warned_ms);      /* (0.7: the journal ring is the store's memory too, D4) */
       pthread_mutex_lock(&G.wlock);
     }
   }
@@ -1533,9 +1554,20 @@ static void *ticker_thread(void *arg) {
   return NULL;
 }
 
-void db_store_batch_end(void) {
+/* (after the reconcile thread applied the whole batch: sync_all() in the ingest thread; the commit waits for the ring up to the batch's last record, then syncs) */
+static _Atomic uint64_t g_batch_store_errors;
+static _Atomic int g_batch_store_last;
+int db_store_batch_end(void) {
   store_t *st = atomic_load_explicit(&G.st, memory_order_acquire);
-  if (st) (void)store_commit(st);                        /* what the batch wrote to the store is made durable (group commit) */
+  if (!st) return 0;
+  const int r = store_commit(st);                      /* what the batch wrote to the store is made durable (group commit); the acknowledgement of the deferred calls */
+  atomic_store_explicit(&g_batch_store_last, r, memory_order_relaxed);
+  if (r < 0) {
+    const uint64_t n = atomic_fetch_add_explicit(&g_batch_store_errors, 1, memory_order_relaxed) + 1;
+    syslog(LOG_ERR, "[Store] the end of a batch could not make its records durable: %s (%llu such batches); the store's cursor stays where it was durable, the next start reads "
+                    "the changes again (store.journal.state, karictl dbstatus)", strerror(-r), (unsigned long long)n);
+  }
+  return r;
 }
 
 /* ------------------------------------------------------------------------------------------------------------- */
@@ -2826,6 +2858,10 @@ void db_recon_status(db_recon_status_t *out) {
   out->rec_holds_slow = atomic_load_explicit(&g_rec_slow, memory_order_relaxed);
   out->rec_hold_max_us = atomic_load_explicit(&g_rec_hold_max_us, memory_order_relaxed);
   out->rec_wait_max_us = atomic_load_explicit(&g_rec_wait_max_us, memory_order_relaxed);
+  for (unsigned k = 0; k < STORE_FINE_BUCKETS; k++) out->rec_hold_fine[k] = atomic_load_explicit(&g_rec_fine[k], memory_order_relaxed);
+  out->settle_errors = atomic_load_explicit(&g_settle_errors, memory_order_relaxed);
+  out->batch_store_errors = atomic_load_explicit(&g_batch_store_errors, memory_order_relaxed);
+  out->batch_store_last = atomic_load_explicit(&g_batch_store_last, memory_order_relaxed);
   void (*fn)(db_recon_status_t *) = atomic_load_explicit(&g_recon_status_fn, memory_order_acquire);
   if (fn) fn(out);                                          /* (the reconcile thread's own figures) */
 }

@@ -5040,6 +5040,7 @@ static void *cache_thread(void *arg) {
 static void *ingest_thread(void *arg) {
   ing_t *g = arg;
   rcu_aux_thread_pin();
+  db_store_defer_thread(true);                          /* 0.7: its store calls do not wait for the journal; the commit at the end of a batch does (db_store_batch_end()) */
   struct kevent evs[8];
   int64_t win_start = mono_ns(), busy_ns = 0, t_wake = win_start;
   for (;;) {
@@ -5076,6 +5077,7 @@ static void *ingest_thread(void *arg) {
     if (n < 0) {
       if (errno == EINTR) continue;
       syslog(LOG_ERR, "[DB] the ingest thread stops: kevent: %s", strerror(errno));
+      db_store_defer_thread(false);                     /* (its slot is freed before the thread ends: thread ids are reused) */
       return NULL;
     }
     t_wake = mono_ns();
@@ -5703,6 +5705,23 @@ size_t db_ingest_status(const char *zone, const char *view, char *out, size_t ca
     }
     dbreg_cache_stats_t cs;
     dbreg_cache_stats(&cs);
+    {                                                    /* 0.7: the state of the store's journal (written after its lock): a failed journal takes no more changes */
+      store_t *sth = db_store_handle();
+      store_stats_t *ss = sth ? calloc(1, sizeof(*ss)) : NULL;
+      if (ss) {
+        store_read_lock();
+        store_stats(sth, ss);
+        store_read_unlock();
+        static const char *const jst[] = { "ok", "nospace", "failed" };
+        db_recon_status_t rs;
+        db_recon_status(&rs);
+        st_append(&c, "store: journal=%s error=%d failed_at=%llu unwritten=%llu batch_commit_errors=%llu%s\n", jst[ss->journal_state < 0 || ss->journal_state > 2 ? 2 : ss->journal_state],
+                  ss->journal_error, (unsigned long long)ss->journal_failed_unix, (unsigned long long)ss->ring_unwritten_bytes, (unsigned long long)rs.batch_store_errors,
+                  ss->journal_state == STORE_JOURNAL_FAILED ? " (the store takes no more changes; restart the server: the open replays what was written)" :
+                  ss->journal_state == STORE_JOURNAL_NOSPACE ? " (no room for the journal: changes are refused until there is room)" : "");
+        free(ss);
+      }
+    }
     {
       uint64_t nq, nd;
       dbreg_notify_stats(&nq, &nd);

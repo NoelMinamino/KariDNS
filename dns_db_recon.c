@@ -381,6 +381,7 @@ static void rt_status(db_recon_status_t *o) {
 static void *rt_main(void *arg) {
   (void)arg;
   rcu_aux_thread_pin();
+  db_store_defer_thread(true);                          /* 0.7: its store calls do not wait for the journal; the commit at the end of the batch does (after sync_all()) */
   uint64_t my_epoch = atomic_load_explicit(&RT.epoch, memory_order_acquire);
   int64_t win_start = rt_mono_ns(), busy_ns = 0, win_apply_ns = 0;
   uint64_t win_entries = 0;
@@ -445,6 +446,7 @@ static void *rt_main(void *arg) {
       nanosleep(&nap, NULL);
     }
   }
+  db_store_defer_thread(false);
   return NULL;
 }
 
