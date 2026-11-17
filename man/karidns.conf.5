@@ -4295,8 +4295,17 @@ image, 1.3 KB of the 3.2 KB such a zone needs). The entry's share is counted
 with the zone's first version and goes with it when the zone is taken out of
 memory. It does not count the directory (every zone of the database, about 0.45
 KB each, listed by \fBkarictl dbstatus\fR), the park tables or the loader's
-process. A reload of \fBkaridns.conf\fR changes it: within 50 ms when a limit is
-set, within a second when there was none.
+process. \fBWith the zone store it also counts the store's tables (0.7):\fR the
+pages of \fBzt\fR, \fBzc\fR, \fBnx\fR, \fBix\fR and \fBsx\fR that the server
+changed since it started are memory of the process that the kernel cannot drop
+(see "The tables in memory" under the zone store), about 180 bytes a stored zone
+once every page has been written (a first fill writes them all: about 1.8 GB at
+10 million zones), shown as \fBstore.tables.private_bytes\fR by \fBkarictl
+store\fR; the zones in memory get the limit less those bytes, and at least a
+tenth of the limit. Raise \fBmemory\-limit\fR by that much when you move to the
+store; a WARNING says so (at most once an hour) while the tables hold half of
+the limit or more. A reload of \fBkaridns.conf\fR changes it: within 50 ms when
+a limit is set, within a second when there was none.
 .IP \(bu 2
 \fB\fBmemory\-limit\fB is not a limit on the size of the process (design
 8.1).\fR It counts what the zones in memory hold, not what the process holds on
@@ -5110,9 +5119,29 @@ said at a checkpoint (at most every ten minutes) when the free space is below
 twice the reserve or a tenth of the store, or when the store grows so fast that
 the file system is full within a day: it names the free bytes, the size of the
 store, the dead bytes that the cleaner can win and the hours to full at the
-growth of the last hour (\fBstore.space.*\fR has the same figures). \fBThe ARC
-and a restart with many zones (COPY mode).\fR A restart is fast when the records
-of the zones the queries want are in the ARC, and slow when they are not: every
+growth of the last hour (\fBstore.space.*\fR has the same figures). \fBThe
+tables in memory (0.7).\fR The tables of the store (\fBzt.1\fR, \fBzc.1\fR,
+\fBnx.1\fR, \fBix.N\fR, \fBsx.N\fR: the record of every zone, the long names and
+the two indexes) are mapped private: a page is read from its file when it is
+first needed and stays shared with the page cache until the server changes it;
+then the process has its own copy, which the kernel cannot drop. Only a
+checkpoint writes the files: it copies the pages that changed since the last one
+and writes the copy (\fBstore.checkpoint.table_bytes\fR,
+\fB.table_last_bytes\fR), so a write into a table never waits for the disk (with
+the files mapped shared, a write into a page that a checkpoint or the kernel was
+writing out waited for it: up to 2.7 s with the store's writer mutex held at 10
+million zones). The cost is memory: the changed pages
+(\fBstore.tables.private_bytes\fR), about 180 bytes a zone once every page has
+been written, about 1.8 GB at 10 million zones after the first fill;
+\fBmemory\-limit\fR counts them (see "Memory limit"). A restart writes nothing
+until a zone changes, so after a restart the figure starts at 0. Recovery is
+unchanged: the last checkpoint and the replay of the journal; a crash between a
+growth of an index and the next checkpoint (the new \fBix.N\fR / \fBsx.N\fR
+holds nothing yet) makes the next start rebuild the indexes from \fBzt.1\fR, a
+few seconds at 10 million zones. The files stay in the format of earlier
+versions; go back to an earlier version only after a clean stop. \fBThe ARC and
+a restart with many zones (COPY mode).\fR A restart is fast when the records of
+the zones the queries want are in the ARC, and slow when they are not: every
 zone that is not in the ARC costs the read of a whole record of the dataset (16
 KiB with the recommended \fBrecordsize\fR, however small the image is), and the
 zones that are asked for lie in every segment (images are appended in the order

@@ -150,6 +150,7 @@ typedef struct store_recovery {
   uint64_t rebuilt_zones;         /* zone records seen by the rebuild */
   uint64_t dropped_zones;         /* ... of which dropped (CRC, bounds, duplicate name) */
   uint64_t open_us;               /* time of the whole open */
+  uint32_t gen_replays;           /* index generations (OP_GEN) the replay switched to: their files hold what a checkpoint wrote, so the derived tables were rebuilt (0.7, private tables) */
 } store_recovery_t;
 
 /* Zone metadata the caller supplies (everything the store keeps besides the name and the image). */
@@ -286,6 +287,10 @@ typedef struct store_stats {
   uint64_t journal_commit_switches; /* the journal file switched by a commit (0.7: the writers append to a file that no sync holds) */
   uint64_t image_prewrites;         /* image records store_put() wrote before the writer mutex and the change took (0.7) */
   uint64_t image_prewrite_misses;   /* ... that the change wrote again inside the mutex (the zone, its record or the open segment changed in between) */
+  /* ---- 0.7: the tables in private memory, written by the checkpoint ---- */
+  uint64_t table_private_bytes;     /* pages of zt, zc, nx, ix, sx that the writers changed since the open: private memory of the process (counted in memory-limit) */
+  uint64_t checkpoint_table_bytes;  /* bytes of the tables that checkpoints wrote since the open */
+  uint64_t checkpoint_table_last_bytes; /* ... the last one */
 } store_stats_t;
 
 /* What one store_compact() did. */
@@ -503,7 +508,7 @@ int  store_check(store_t *s, store_check_report_t *rep);
 
 /* ---- test support ---- */
 /* in every build (0 / NULL = off): called by a checkpoint after each of its steps outside the writer mutex (1: the journal was switched, 2: the journal before the switch is durable,
- * 3: the tables are flushed, 4: the superblock is written), and by a growth of the index built outside the mutex (1: the bigger index is built, 2: it was put in); tests make a step slow, or kill the process there */
+ * 3: the tables are written, 4: the superblock is written, 5: after each run of table pages written), and by a growth of the index built outside the mutex (1: the bigger index is built, 2: it was put in); tests make a step slow, or kill the process there */
 extern void (*_Atomic store_test_ckpt_hook)(int step);
 extern void (*_Atomic store_test_regrow_hook)(int step);
 /* ... and by a commit (0.7): 1: the journal was switched to the file made ahead (writer mutex held), 2: the file before is synced (not closed yet), 3: the next file is made ahead */
@@ -519,6 +524,14 @@ extern _Atomic long store_test_crash_countdown;
 extern void (*store_test_before_counters)(store_t *s);
 /* a commit fails with -EIO at the n-th one (0 = off): a failed fdatasync */
 extern _Atomic long store_test_fail_commit;
+/* the n-th write of a run of table pages by a checkpoint fails with -EIO (0 = off) */
+extern _Atomic long store_test_fail_ckwrite;
+/* the bytes of the table files (zt, zc, nx, the current ix and sx) equal the memory of the store: true after a checkpoint with the writers kept out (store_checkpoint_clean()) */
+bool store_test_files_match(store_t *s);
+/* a word (byte offset off, a multiple of 8) of the memory of a table: 0 zt, 1 zc, 2 nx, 3 the current ix, 4 the current sx (the tables are private memory since 0.7: a test that damages a cell
+ * does it here, not in the file); poke marks it for the next checkpoint */
+uint64_t store_test_peek(store_t *s, int which, uint64_t off);
+void store_test_poke(store_t *s, int which, uint64_t off, uint64_t v);
 /* a writer (store_put, store_set_known, store_delete, store_set_flags, store_set_stamp, store_set_cursor; `op` is its name without the store_ prefix) returns the errno this returns (not 0) before it changes anything: a full disk, an I/O error (NULL = off) */
 extern int (*store_test_write_fault)(const char *op, uint32_t zid);
 /* called by store_stats() after it has read the index generation (the window in which a writer may retire it) */

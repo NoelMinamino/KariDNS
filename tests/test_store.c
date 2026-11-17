@@ -286,6 +286,12 @@ static void flip_byte(const char *path, off_t off) {
   b ^= 0x5a;
   CHECK_EQ(write_at(path, off, &b, 1), 0);
 }
+/* a byte of a table changes in the store's memory (the tables are private memory: the file is the checkpoint's copy) */
+static void mem_flip(store_t *s, int which, uint64_t off) {
+  uint64_t w = store_test_peek(s, which, off & ~7ull);
+  w ^= 0x5aull << (8 * (off & 7));
+  store_test_poke(s, which, off & ~7ull, w);
+}
 
 /* ------------------------------------------------------------------------------------------------------------------ */
 /* cases                                                                                                                */
@@ -996,7 +1002,7 @@ static void test_damage_cells(void) {
   CHECK_EQ(put_i(s, 0, 11, 2, NULL), 0);
   /* a damaged zt cell (a byte of img_len): the zone is invisible to zone_get / iteration / image_read, no crash */
   fpath(&d, "zt.1", p, sizeof(p));
-  flip_byte(p, (off_t)(ZT_HDR + (uint64_t)zc * 64 + 9));
+  mem_flip(s, 0, (uint64_t)zc * 64 + 9);
   store_read_lock();
   CHECK_EQ(store_zone_get(s, zc, &zi), -EBADMSG);
   CHECK_EQ(store_image_read(s, zc, &im), -EBADMSG);
@@ -1011,7 +1017,7 @@ static void test_damage_cells(void) {
   CHECK_EQ(put_i(s, 0, 12, 5, NULL), -EBADMSG);                         /* cannot be replaced either */
   CHECK_EQ(store_delete(s, zc), -EBADMSG);
   /* a damaged name byte: invisible by name */
-  flip_byte(p, (off_t)(ZT_HDR + (uint64_t)zdd * 64 + 30 + 3));
+  mem_flip(s, 0, (uint64_t)zdd * 64 + 30 + 3);
   store_read_lock();
   CHECK_EQ(store_find(s, 0, "z0000013.example.test", 21), STORE_NONE);
   CHECK_EQ(store_zone_get(s, zdd, &zi), -EBADMSG);
@@ -1037,8 +1043,8 @@ static void test_repair(void) {
   for (uint32_t i = 100; i < 120; i++) { char nm[160]; name_of(i, nm, sizeof(nm)); CHECK_EQ(store_delete_name(s, 0, nm, strlen(nm)), 0); }
   char p[700];
   fpath(&d, "zt.1", p, sizeof(p));
-  flip_byte(p, (off_t)(ZT_HDR + (uint64_t)zc * 64 + 9));                 /* damaged cell */
-  flip_byte(p, (off_t)(ZT_HDR + (uint64_t)zd * 64 + 31));                /* damaged name -> CRC */
+  mem_flip(s, 0, (uint64_t)zc * 64 + 9);                 /* damaged cell */
+  mem_flip(s, 0, (uint64_t)zd * 64 + 31);                /* damaged name -> CRC */
   store_check_report_t rep;
   CHECK(store_check(s, &rep) != 0);
   CHECK(rep.errors >= 2);
@@ -1392,13 +1398,13 @@ typedef struct { _Atomic uint64_t begun, done, acked; } shm_t;
 
 /* modes 3 and 4 of the kill loop (0.7 fix A): a step of a checkpoint that runs outside the writer mutex (3: a thread checkpoints all the time, the flush of the tables is made slow) or of a
  * growth of the index built outside it (4: the build waits before it takes the mutex, so that the writers' changes pile up in its log) is reached while the operations go on, and the child is
- * killed at the n-th time one step is reached (g_hk_step: 1..4 a checkpoint step, 11..12 a growth step; 0: not by a hook) */
+ * killed at the n-th time one step is reached (g_hk_step: 1..5 a checkpoint step (5: between two runs of its write of the tables), 11..12 a growth step; 0: not by a hook) */
 static _Atomic int g_hk_step, g_hk_n;
 static void hk_kill(int step) {
   if (atomic_load(&g_hk_step) == step && atomic_fetch_sub(&g_hk_n, 1) == 1) kill(getpid(), SIGKILL);
 }
 static void hk_ckpt(int step) {
-  if (step == 2) usleep(300);
+  if (step == 2 || step == 5) usleep(300);           /* (5: the writers change pages while the checkpoint copies them) */
   hk_kill(step);
 }
 static void hk_regrow(int step) {
@@ -1465,7 +1471,7 @@ static void test_kill_loop(int iters, int mode) {
   if (shm == MAP_FAILED) { tdir_free(&d); return; }
   model_t *model = calloc(1, sizeof(*model)), *tmp = calloc(1, sizeof(*tmp)), *tmp2 = calloc(1, sizeof(*tmp2)), *tmp3 = calloc(1, sizeof(*tmp3));
   uint64_t K0 = 0, boot = 42, rng = 20261114;
-  int fresh = 0, crashed = 0, countdown_hits = 0, tampered = 0, older = 0, torn = 0, exact = 0, replayed_total = 0, lost_ops = 0, with_free = 0, part_groups = 0;
+  int fresh = 0, crashed = 0, countdown_hits = 0, tampered = 0, older = 0, torn = 0, exact = 0, replayed_total = 0, lost_ops = 0, with_free = 0, part_groups = 0, gen_rebuilds = 0;
   uint32_t max_segs = 0;
   for (int it = 0; it < iters; it++) {
     if (it % (mode == 4 ? 2 : 25) == 0) {                             /* (mode 4: a new store often, so that the index grows from its smallest size again) */
@@ -1490,7 +1496,7 @@ static void test_kill_loop(int iters, int mode) {
     long cd = use_countdown ? 1 + (long)((rng >> 8) % 24000) : 0;
     atomic_store(&g_hk_step, 0);
     if (mode >= 3 && use_countdown && ((rng >> 5) & 1)) {             /* (half of the planned kills at a step of the new code instead of a crash point) */
-      atomic_store(&g_hk_step, mode == 3 ? 1 + (int)((rng >> 8) % 4) : mode == 4 ? 11 + (int)((rng >> 8) % 2) : 21 + (int)((rng >> 8) % 3));
+      atomic_store(&g_hk_step, mode == 3 ? 1 + (int)((rng >> 8) % 5) : mode == 4 ? 11 + (int)((rng >> 8) % 2) : 21 + (int)((rng >> 8) % 3));
       atomic_store(&g_hk_n, 1 + (int)((rng >> 12) % (mode == 3 ? 12 : mode == 4 ? 2 : 40)));
       cd = 0;
       hk_kills++;
@@ -1556,7 +1562,8 @@ static void test_kill_loop(int iters, int mode) {
       model_from_store(s, model);
       K0 = begun;                                                       /* absolute ops: the generator needs no state */
     } else {
-      CHECK(!st.recovery.rebuilt);
+      CHECK(!st.recovery.rebuilt || st.recovery.gen_replays > 0);        /* (a kill between a growth of the index and the next checkpoint: the new generation's file holds nothing yet, the open rebuilds the derived tables) */
+      if (st.recovery.gen_replays) gen_rebuilds++;
       /* the state must be the model after n ops, acked <= n <= begun, or (mode 2) after n ops and the first entries of op n: store_set_known_n() writes a group as more than one record
        * when an entry needs the index (or a table) to grow first, or names a zone pending in the group, and a kill between those records keeps the first ones (each record is whole or
        * not there; the call is not one unit, see dns_store.h) */
@@ -1608,6 +1615,7 @@ static void test_kill_loop(int iters, int mode) {
          "  %d replayed records in total, %d exact-end matches, %d begun-but-lost operations; %d opens found removed segments (%u segment numbers at the most)\n",
          fresh, crashed, countdown_hits, tampered, older, torn, replayed_total, exact, lost_ops, with_free, max_segs);
   if (mode >= 3) printf("  %d kills planned at a step of a %s\n", hk_kills, mode == 3 ? "checkpoint" : mode == 4 ? "growth" : "commit that switches the journal file");
+  if (gen_rebuilds) printf("  %d recoveries rebuilt the derived tables after a growth of the index that no checkpoint had written\n", gen_rebuilds);
   if (mode == 2) printf("  %d recoveries found a group of entries applied in part (a kill between the records of one call)\n", part_groups);
   atomic_store(&g_hk_step, 0);
   free(model);
@@ -2139,10 +2147,8 @@ static void test_reader_nosleep(void) {
   CHECK(store_zid_is(s, z, 0, nm, strlen(nm)));
   CHECK(!store_zid_is(s, z, 1, nm, strlen(nm)));                        /* (another view) */
   /* the sequence counter of the zc cell (bytes 60..63) is made odd */
-  int fd = openat(d.fd, "zc.1", O_RDWR);
-  CHECK(fd >= 0);
-  uint32_t odd = 1, even = 0;
-  CHECK(fd >= 0 && pwrite(fd, &odd, 4, (off_t)16384 + (off_t)z * 64 + 60) == 4);
+  const uint64_t w7 = store_test_peek(s, 1, (uint64_t)z * 64 + 56) & 0xffffffffull;
+  store_test_poke(s, 1, (uint64_t)z * 64 + 56, w7 | (1ull << 32));
   store_reader_nosleep(true);
   (void)store_reader_busy_take();
   struct timespec t0, t1;
@@ -2162,14 +2168,13 @@ static void test_reader_nosleep(void) {
   CHECK(us < 100000);                                                   /* (three looks: a spin each, not the 500 ms of a thread that may wait) */
   printf("  three lookups of the cell that is being written: %ld us in all\n", us);
   /* the writer is done: the same calls see the zone */
-  CHECK(fd >= 0 && pwrite(fd, &even, 4, (off_t)16384 + (off_t)z * 64 + 60) == 4);
+  store_test_poke(s, 1, (uint64_t)z * 64 + 56, w7);
   store_read_lock();
   CHECK_EQ(store_find(s, 0, nm, strlen(nm)), z);
   CHECK_EQ(store_zone_get(s, z, &zz), 0);
   store_read_unlock();
   CHECK(!store_reader_busy_take());
   store_reader_nosleep(false);
-  if (fd >= 0) close(fd);
   CHECK_EQ(store_close(s), 0);
   tdir_free(&d);
 }
@@ -2268,9 +2273,9 @@ static void test_growth_sync_fails(void) {
   if (s) {
     store_stats_t st;
     store_stats(s, &st);
-    CHECK_EQ(st.ix_gen, got[1]);                                         /* the journal and the memory of the process that was killed name the same generation */
+    CHECK(st.recovery.gen_replays > 0 && st.recovery.rebuilt);          /* (no checkpoint wrote the new generations: the open rebuilt the derived tables from zt) */
+    CHECK(st.ix_gen > got[1]);
     CHECK_EQ(st.zones_stored, got[2]);
-    CHECK(!st.recovery.rebuilt);
     check_consistent(s, "growth sync");
     for (uint32_t i = 0; i < got[3]; i += 97) CHECK(verify_i(s, 0, i, 1));
     CHECK_EQ(put_i(s, 0, 9000, 1, NULL), 0);
@@ -2516,7 +2521,7 @@ static void test_no_wait_in_lock(int mode) {
   if (s) {
     store_stats_t st;
     store_stats(s, &st);
-    CHECK(!st.recovery.rebuilt);
+    CHECK(!st.recovery.rebuilt || st.recovery.gen_replays > 0);          /* (the growth was put in after the last checkpoint: its file holds nothing, the open rebuilt the derived tables) */
     check_consistent(s, "no wait, reopen");
     for (uint32_t i = 300; i < next; i += 7) CHECK(find_i(s, 0, i) != STORE_NONE);
     CHECK_EQ(store_close(s), 0);
@@ -2557,6 +2562,82 @@ static void pw_delete_hook(store_t *s) {                     /* (between the rec
   name_of(5, nm, sizeof(nm));
   (void)store_delete_name(s, 0, nm, strlen(nm));
 }
+/* ---- 0.7: the tables in private memory, written by the checkpoint ---- */
+static _Atomic bool g_pt_stop;
+static _Atomic uint32_t g_pt_k;
+static void pt_hook(int step) {
+  if (step == 5) usleep(200);                                            /* (between two runs of the write of the tables: the writer changes pages meanwhile) */
+}
+static void *pt_writer(void *arg) {
+  store_t *s = arg;
+  for (uint32_t k = 0; !atomic_load(&g_pt_stop); k++) {
+    if (put_i(s, 0, k % 400, 2 + k / 400, NULL) != 0) break;
+    atomic_store(&g_pt_k, k + 1);
+  }
+  return NULL;
+}
+static void test_private_tables(void) {
+  printf("[the tables in private memory: the checkpoint writes the changed pages]\n");
+  tdir_t d;
+  tdir_new(&d, "priv");
+  store_opts_t o;
+  small_opts(&o);
+  store_t *s = NULL;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (!s) { tdir_free(&d); return; }
+  store_view_add(s, "default");
+  for (uint32_t i = 0; i < 400; i++) CHECK_EQ(put_i(s, 0, i, 1, NULL), 0);
+  store_stats_t st;
+  store_stats(s, &st);
+  CHECK(st.table_private_bytes > 0);
+  CHECK_EQ(store_checkpoint_clean(s), 0);
+  CHECK(store_test_files_match(s));                                      /* (the writers were out: the files are the memory) */
+  store_stats(s, &st);
+  CHECK(st.checkpoint_table_bytes > 0 && st.checkpoint_table_last_bytes > 0);
+  /* fuzzy checkpoints while a writer changes the pages they copy: a clean checkpoint after them leaves the files equal to the memory (no page that changed was lost) */
+  atomic_store(&store_test_ckpt_hook, pt_hook);
+  atomic_store(&g_pt_stop, false);
+  pthread_t th;
+  CHECK_EQ(pthread_create(&th, NULL, pt_writer, s), 0);
+  for (int j = 0; j < 30; j++) CHECK_EQ(store_checkpoint(s), 0);
+  atomic_store(&g_pt_stop, true);
+  pthread_join(th, NULL);
+  atomic_store(&store_test_ckpt_hook, NULL);
+  const uint32_t K = atomic_load(&g_pt_k);
+  CHECK(K > 0);
+  CHECK_EQ(store_checkpoint_clean(s), 0);
+  CHECK(store_test_files_match(s));
+  /* a write of the tables fails: the checkpoint gives its pages back and the next one writes them */
+  CHECK_EQ(put_i(s, 0, 7, 99, NULL), 0);
+  store_test_fail_ckwrite = 1;
+  CHECK(store_checkpoint(s) < 0);
+  store_test_fail_ckwrite = 0;
+  CHECK(!store_test_files_match(s));
+  CHECK_EQ(store_checkpoint(s), 0);
+  CHECK(store_test_files_match(s));
+  store_stats(s, &st);
+  printf("  %u puts during 30 checkpoints, %" PRIu64 " private bytes, %" PRIu64 " bytes written by checkpoints\n", K, st.table_private_bytes, st.checkpoint_table_bytes);
+  CHECK_EQ(store_close(s), 0);
+  /* the open: no page is private before a writer changes one */
+  o.create = false;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (s) {
+    store_stats(s, &st);
+    CHECK_EQ(st.table_private_bytes, 0);
+    for (uint32_t i = 0; i < 400; i++) {
+      uint32_t last = UINT32_MAX;                                        /* (the last put of zone i by the writer) */
+      for (uint32_t k = i; k < K; k += 400) last = k;
+      CHECK(verify_i(s, 0, i, i == 7 ? 99 : last == UINT32_MAX ? 1 : 2 + last / 400));
+    }
+    check_consistent(s, "private tables");
+    CHECK_EQ(put_i(s, 0, 500, 1, NULL), 0);
+    store_stats(s, &st);
+    CHECK(st.table_private_bytes > 0);
+    CHECK_EQ(store_close(s), 0);
+  }
+  tdir_free(&d);
+}
+
 static void test_commit_switch(void) {
   printf("[a commit switches the journal file; the old files go]\n");
   tdir_t d;
@@ -3758,7 +3839,7 @@ static void test_scrub(int mode) {
   /* a damaged cell: the repair at the end of the pass drops the zone */
   uint32_t zc = find_i(s, 0, 30);
   fpath(&d, "zt.1", p, sizeof(p));
-  flip_byte(p, (off_t)(ZT_HDR + (uint64_t)zc * 64 + 9));
+  mem_flip(s, 0, (uint64_t)zc * 64 + 9);
   CHECK_EQ(store_scrub_run(s, &rep), 0);
   CHECK_EQ(rep.bad_cells, 1);
   CHECK(rep.repaired);
@@ -3767,18 +3848,12 @@ static void test_scrub(int mode) {
   check_consistent(s, "scrub cell");
   /* an index entry that does not lead to its zone: the slot is a tombstone (the zone cannot be found by name) */
   store_stats(s, &st);
-  snprintf(nm, sizeof(nm), "ix.%u", st.ix_gen);
-  fpath(&d, nm, p, sizeof(p));
   uint32_t zx = find_i(s, 0, 40);
-  int fd = open(p, O_RDWR);
-  CHECK(fd >= 0);
   bool hit = false;
-  for (uint64_t k = 0; fd >= 0 && k < st.ix_slots && !hit; k++) {
-    uint64_t v;
-    if (pread(fd, &v, 8, (off_t)(ZT_HDR + k * 8)) != 8) break;
-    if ((uint32_t)v == zx) { v |= 0xffffffffull; hit = pwrite(fd, &v, 8, (off_t)(ZT_HDR + k * 8)) == 8; }
+  for (uint64_t k = 0; k < st.ix_slots && !hit; k++) {
+    uint64_t v = store_test_peek(s, 3, k * 8);
+    if ((uint32_t)v == zx) { store_test_poke(s, 3, k * 8, v | 0xffffffffull); hit = true; }
   }
-  if (fd >= 0) close(fd);
   CHECK(hit);
   CHECK_EQ(find_i(s, 0, 40), STORE_NONE);
   CHECK_EQ(store_scrub_run(s, &rep), 0);
@@ -4926,7 +5001,10 @@ static void test_group_journal(void) {
         store_read_unlock();
         store_stats_t st;
         store_stats(s, &st);
-        if (!prefix || st.zones_known != 500 + found || st.recovery.rebuilt) bad++;
+        if (!prefix || st.zones_known != 500 + found || (st.recovery.rebuilt && !st.recovery.gen_replays)) {
+          bad++;
+          printf("  crash point %ld: found %u (prefix %d), %" PRIu64 " known, rebuilt %d, generation switches replayed %u\n", c, found, (int)prefix, st.zones_known, (int)st.recovery.rebuilt, st.recovery.gen_replays);
+        }
         if (found == 64) whole++;
         else if (found == 0) none++;
         else parts++;
@@ -5003,6 +5081,7 @@ int main(void) {
   if (WANT("kfz")) test_kill_loop(UNDER_TSAN ? 25 : 50, 3);
   if (WANT("kgrow")) test_kill_loop(UNDER_TSAN ? 20 : 50, 4);
   if (WANT("kjsw")) { test_kill_loop(UNDER_TSAN ? 20 : 50, 5); test_commit_switch(); }
+  if (WANT("priv")) test_private_tables();
   if (WANT("clk")) {
     int citers = getenv("KARIDNS_STORE_KILLC_ITERS") ? atoi(getenv("KARIDNS_STORE_KILLC_ITERS")) : (UNDER_TSAN ? 25 : store_long() ? 100 : 50);
     test_kill_loop(citers, 1);

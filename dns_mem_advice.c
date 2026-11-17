@@ -64,14 +64,16 @@ void ma_estimate(const ma_in_t *in, ma_est_t *e) {
     e->mapped = st ? e->tables + img_all : 0;
     e->backend_all = st ? MA_FIXED_ALL + (e->counted_all - img_all) : MA_FIXED_ALL + in->zones * MA_RSS_ZONE_BASE + e->records * MA_RSS_RECORD;
     e->loader_all = st ? MA_LOADER_STORE : MA_LOADER_FIXED + in->zones * MA_LOADER_ZONE_ALL;
-    e->recommended = round_up(e->counted_all / 100 * MA_HEADROOM_PCT, MA_ROUND);
-    e->working_min = round_up(e->counted_all / MA_HIGH_MARK_PCT * MA_WORKING_PCT, MA_ROUND);
+    /* (0.7: the store's tables are private memory once written, and memory-limit counts them before the zones: the limit that keeps every zone is that much higher) */
+    e->recommended = round_up((e->counted_all + e->tables) / 100 * MA_HEADROOM_PCT, MA_ROUND);
+    e->working_min = round_up(e->counted_all / MA_HIGH_MARK_PCT * MA_WORKING_PCT + e->tables, MA_ROUND);
     uint64_t need_zones = (in->fetch_conc > MA_MIN_FETCH_ZONES ? in->fetch_conc : MA_MIN_FETCH_ZONES) * MA_FETCH_FACTOR;
     e->fit_zones = (uint32_t)need_zones;
     e->fit_min = need_zones * e->avg_zone / MA_HIGH_MARK_PCT * 100;
     e->fit_pct = 100;
     if (in->limit == 0 || in->zones == 0) return;
-    uint64_t fit = in->limit / 100 * MA_HIGH_MARK_PCT;
+    const uint64_t lim_zones = in->limit - in->limit / 10 > e->tables ? in->limit - e->tables : in->limit / 10;     /* (what the zones get: cache_lim_eff()) */
+    uint64_t fit = lim_zones / 100 * MA_HIGH_MARK_PCT;
     e->fit_pct = e->counted_all == 0 || fit >= e->counted_all ? 100 : (uint32_t)(fit * 100 / e->counted_all);
     const uint64_t kept = fit < e->counted_all ? fit : e->counted_all;
     const uint64_t kept_img = kept / 100 * imgpct;

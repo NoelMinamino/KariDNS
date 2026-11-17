@@ -7,7 +7,8 @@
  *
  * What is mapped and what is logged.  zt, zc, nx (grow in place), ix, sx (replaced by a new generation file) and the
  * superblock's counters (the flat array v[]: free list, high-water mark, per-view / per-segment counters, ...) are changed
- * *in place* through shared mappings.  Segments are append-only and are not logged: their bytes are written first.
+ * *in place* in memory (the tables: private memory, written to their files by the checkpoint, see "The tables in private memory" below).  Segments are append-only and are not logged:
+ * their bytes are written first.
  *
  * One writer call = one journal record.  The call plans the whole change (reads the current cells, decides every new cell
  * value) without writing a cell, builds the record, and then
@@ -41,20 +42,18 @@
  *     the mutex is released, before the call returns; store_commit() waits for a commit that covers its LSN.
  *   - A checkpoint is fuzzy: under the mutex only its position P (= the last LSN), a copy of the superblock as of P, and the switch to the next
  *     journal file (pre-created, so the switch is a 64-byte pwrite of its header) are taken.  Then, with the mutex released, the journal up to P
- *     and the segments are synced (the baton is given back after this), the tables are msynced and the superblock (checkpoint LSN P, the
- *     journal after the switch) is written.  Writers go on meanwhile, so the flushed tables hold every effect of the records <= P and maybe some
+ *     and the segments are synced (the baton is given back after this), the tables are written and the superblock (checkpoint LSN P, the
+ *     journal after the switch) is written.  Writers go on meanwhile, so the written tables hold every effect of the records <= P and maybe some
  *     of the records > P.  That is what a replay from P is made for: every op is an absolute value ("cell X = V", "slot = value", "counter =
  *     value", the bytes of a name), so a location that a record > P wrote ends with the value of the last such record whatever it held before,
- *     and a location that no record > P wrote holds its value of P (a checkpoint's flush only adds pages that records > P changed); the
+ *     and a location that no record > P wrote holds its value of P (a checkpoint only writes pages that the records before it changed); the
  *     counters of the superblock are those of P, and every record after P carries the absolute value of every counter it changes.  Same boot
- *     (kill -9): the page cache holds every page, the replay is exact as before.  Power loss: pages of records > P that are not in the durable
- *     journal may be on disk, as the kernel's own flush could always put them there; the open rebuilds the derived tables then, as before (a
+ *     (kill -9): the page cache holds every page the checkpoints wrote, the replay is exact.  Power loss: pages of records > P that are not in the
+ *     durable journal may be on disk (a checkpoint's copy is taken after P); the open rebuilds the derived tables then, as before (a
  *     cell that was in the middle of a write when its page was flushed fails its CRC and is dropped by the rebuild: the zone is fetched again).
- *     One checkpoint at a time (ck_busy); the tables, ix / sx and segments it flushes are kept from being freed by io_hold.
- *     The flush is MS_ASYNC + fdatasync() (st_map_flush()): msync(MS_SYNC) of a part of a file rescans the whole range while writers fault pages dirty again and, on ZFS,
- *     commits the ZIL once per cluster; under the writers of a fuzzy checkpoint it did not converge (checkpoints of up to 722 s in a 10M first fill on ZFS).  A close leaves a
- *     fuzzy checkpoint between two pieces of its flush (its clean checkpoint flushes everything), and the journal is bounded by 2 x journal_max_bytes: the bulk writer waits between
- *     its calls, with no lock held, while the journal is at that bound (store_journal_wait()).
+ *     One checkpoint at a time (ck_busy); the ix / sx generations and segments it writes or syncs are kept from being freed by io_hold.  A close
+ *     leaves a fuzzy checkpoint between two runs of its write (its clean checkpoint writes everything), and the journal is bounded by
+ *     2 x journal_max_bytes: the bulk writer waits between its calls, with no lock held, while the journal is at that bound (store_journal_wait()).
  *   - A checkpoint with the clean flag (store_checkpoint_clean(), close), the first one of an open and the one of a repair keep the writers out
  *     for the whole time: the clean flag must name a state that no record follows.  A writer that finds the clean flag on disk writes a
  *     superblock without it first (nothing changed since: no flush), outside any hold of the writer mutex that it cannot give up.
@@ -63,27 +62,39 @@
  *   - No append inside the mutex meets a sync of its file (0.7, the 10M first fill): on UFS kern_fsync() holds the file's vnode lock for the whole sync, and the append of a
  *     record (pwrite() of the journal) or of an image (into the open segment) waited for it, 0.1 to 1.4 s under load.  A commit switches the journal to the next file and syncs
  *     the one before (st_commit_ex()); a fuzzy checkpoint gets the file its superblock names synced the same way; store_put() writes the image before the mutex (st_prewrite()).
- *     What is left in the mutex: the pwrite() of a record still meets the file system's own back-pressure (UFS runningbufspace, the ZFS write throttle), and a store into a
- *     page of the tables (apply_ops()) waits while a checkpoint's flush writes that page out (vm_fault_busy_sleep: holds of up to 2.7 s were measured; the tables in anonymous
- *     memory with copy-based checkpoints would remove it, after 0.7).  The earlier flush by msync(MS_SYNC) held a table's vnode lock for the whole flush, so a writer that grew
- *     the table (posix_fallocate()) waited for all of it: holds of 10 to 24 s.
+ *     What is left in the mutex: the pwrite() of a record still meets the file system's own back-pressure (UFS runningbufspace, the ZFS write throttle).
+ *   - No store into a table meets the write of its page (0.7, the tables in private memory, below).
+ *
+ * The tables in private memory (0.7).  With shared mappings of the table files a store into a page of zt / zc / nx / ix / sx (apply_ops(), inside the mutex) waited while the kernel
+ * wrote that page out (a checkpoint's msync, the syncer: vm_fault_busy_sleep, holds of up to 2.7 s at 10M zones), and the earlier msync(MS_SYNC) held a table's vnode lock for its
+ * whole flush (a growth's posix_fallocate() waited for it: holds of 10 to 24 s).  Now nothing but a checkpoint writes the table files, and never from the pages the writers use:
+ *   - The data a file holds at the open is mapped MAP_PRIVATE (a page is read from the file at its first touch and stays shared with the page cache until a writer changes it, then
+ *     the process has its own copy); a growth maps anonymous memory; a generation made in this session (a growth of ix / sx, a rebuild) is anonymous memory.
+ *   - The writers mark the pages they change (dmap_t, one bit per page, under the mutex).  The begin of a checkpoint (under the mutex) takes the bitmaps of P and gives the writers
+ *     empty ones; then, with no lock, each run of marked pages is copied with word loads into a buffer and pwrite()n to the file, the file is extended to the size of P and
+ *     synced (ck_write_tab()).  The page cache page that the kernel writes out is never the page a writer stores into.  A checkpoint that fails or is left gives its pages back.
+ *     The granule is the page: a larger one would write pages still shared with the page cache, and a writer's first store into one (a copy-on-write fault) would wait for it.
+ *   - The copy is taken after P while the writers go on: what it holds of records > P is made right by the replay from P, as for the fuzzy flush above; a page that no record
+ *     between the last two begins changed was written by the checkpoint before (one at a time) with its value of P.
+ *   - A replayed OP_GEN: the new generation's file holds what a checkpoint wrote, nothing when none followed the growth, so the open rebuilds the derived tables then (gen_replays).
+ *   - The private pages (dmap_t.priv: written since the open) are memory the kernel cannot drop: store.tables.private_bytes, counted in memory-limit by the Backend.
  *
  * Checkpoint (store_checkpoint(), by the journal size limit, by checkpoint_interval_ms, at close, after recovery).
- *     switch to the next journal file; commit up to P; msync + fdatasync every mapped file; fdatasync the new journal and the directory;
+ *     switch to the next journal file; commit up to P; write + fdatasync the changed pages of every table; fdatasync the new journal and the directory;
  *     write the *other* superblock copy (seq+1, checkpoint LSN = P, names the new journal gen and the ix / sx generations of P, counters,
  *     views, cursors, CRC-32C); fdatasync it; delete journals / generations that neither superblock copy names any more.  The older copy plus
  *     the journals it names stays valid, so a damaged newer copy costs nothing: the open uses the older one and replays the longer journal
  *     chain.  Growth of ix / sx (a new generation file) is bridged by an OP_GEN record in the journal chain: a replay from a checkpoint before
- *     it applies the records before it to the old generation and switches to the new one, whose file then holds every change up to the record
- *     (and maybe later ones: the ops are absolute).
+ *     it applies the records before it to the old generation and switches to the new one; since the tables are private memory (0.7) that file may
+ *     hold nothing yet, and the open rebuilds the derived tables.
  *
  * Recovery at open.  Take the newer valid superblock copy whose files check out against fstat sizes; read the journal files
  * from the gen it names (and the ones after, while their base LSN continues); apply every record with LSN > checkpoint LSN
  * in order; stop at the first record that is torn, CRC-bad or out of sequence (kill -9 in the middle of a write).  Then a
  * new checkpoint starts the session (the clean flag is cleared durably before the first modification).  Same boot after
- * kill -9: this is exact, the page cache kept every cell, cost = replay (about 1 s per 3M records).
- * Power loss / OS crash (different boot id, no clean flag): mapped pages may have reached the disk *ahead of* the journal
- * (the kernel flushes dirty pages on its own schedule), so after the replay the derived tables are rebuilt by one sequential
+ * kill -9: this is exact, the page cache kept every page the checkpoints wrote, cost = replay (about 1 s per 3M records).
+ * Power loss / OS crash (different boot id, no clean flag): table pages may have reached the disk *ahead of* the journal
+ * (a checkpoint's copy is taken after its position), so after the replay the derived tables are rebuilt by one sequential
  * pass over zt (drop records with a bad CRC or impossible fields, drop duplicate names, rebuild ix, sx, the free list,
  * counters, live bytes); an image whose bytes did not reach the disk fails its checksum at the first read and the zone goes
  * back to KNOWN in the caller (design 3.4 item 4).  The rebuild is also the repair path whenever the replay meets something
@@ -302,8 +313,20 @@ typedef struct {
 /* run-time structures                                                                                                  */
 /* ------------------------------------------------------------------------------------------------------------------ */
 
+/* The pages of a table that the writers changed (0.7, private tables: see "The tables in private memory" at the top).  Owned by the writer mutex (the build of a generation outside
+ * it writes a generation that is written whole, `all`).  dirty: pages changed since the begin of the last checkpoint, which takes the bitmap; priv: pages changed since the open, the
+ * private copies that store.tables.private_bytes counts (acct, the store's counter: a generation retired by the readers' grace period subtracts its own when it is freed). */
+typedef struct {
+  uint64_t *dirty, *priv;
+  uint64_t npages, npriv;
+  bool all;                            /* every page is to be written: a generation made in this session, until the begin of its first checkpoint */
+  uint8_t shift;                       /* log2 of the page size */
+  _Atomic uint64_t *acct;
+} dmap_t;
+
 typedef struct {                       /* a table that grows in place inside a reserved address range */
   int      fd;
+  dmap_t   d;
   uint8_t *base;
   size_t   reserve;                    /* bytes of address space */
   _Atomic uint64_t mapped;             /* data bytes mapped (multiple of the page size) */
@@ -313,6 +336,7 @@ typedef struct {                       /* a table that grows in place inside a r
 
 typedef struct ixgen {                 /* one generation of ix or sx */
   int      fd;
+  dmap_t   d;
   uint32_t gen;
   uint64_t nslots;
   _Atomic uint64_t *slots;
@@ -355,6 +379,7 @@ struct store {
   int mode;
   char fstype[16];
   size_t pagesz;
+  uint8_t pgshift;                      /* log2 of pagesz */
   uint64_t seg_size;
   pthread_mutex_t wlock;
   pthread_mutex_t seg_mu;
@@ -401,7 +426,7 @@ struct store {
   bool io_busy, ck_busy, ck_handoff, bg_stop, bg_kick, fl_on;
   pthread_t fl_thr, fl_thr2;
   _Atomic bool ck_want;                               /* a checkpoint is wanted soon (after a growth: the old generation can go when the superblocks name the new one) */
-  _Atomic bool ck_cancel;                             /* a clean checkpoint comes (store_checkpoint_clean(), store_close()): the flush of a fuzzy checkpoint ends between two pieces (st_map_flush()) */
+  _Atomic bool ck_cancel;                             /* a clean checkpoint comes (store_checkpoint_clean(), store_close()): the write of a fuzzy checkpoint's tables ends between two runs (ck_write_tab()) */
   _Atomic uint64_t ckpt_max_us, n_ckpt_cancel;        /* the longest checkpoint; fuzzy checkpoints left for a clean one (a stop, a close) */
   /* the bound of the journal (store_journal_wait()): the largest size it reached, the calls that waited for a checkpoint, the longest and the total wait; under
    * bg_mu: ck_ends (checkpoints that ended, also the failed ones: bg_release()), jw_warn_ms (the last WARNING) */
@@ -425,7 +450,11 @@ struct store {
     ixgen_t *ix, *sx;
     uint32_t nseg;
     seg_t *seg[ST_MAXSEG];
+    struct { uint64_t *dirty; uint64_t npages, bytes; bool all; } t[5];   /* zt, zc, nx, ix, sx as of P: the pages to write (taken from the writers), the bytes of P */
   } ck;
+  uint8_t *ck_buf;                                    /* (ck_busy) the copy of a run of pages that the checkpoint writes */
+  _Atomic uint64_t priv_bytes;                        /* the private pages of the tables (store.tables.private_bytes) */
+  _Atomic uint64_t n_ck_bytes, ck_last_bytes;         /* bytes of the tables written by checkpoints: all, the last one */
   struct { uint32_t nseg; seg_t *seg[ST_MAXSEG]; } cm;   /* (baton) the segments of the commit being made */
   /* growth of ix / sx outside the mutex (rg_*; wlock, except the flags the build thread reads) */
   bool rg_active, rg_bad;
@@ -527,6 +556,7 @@ static void st_hook(void (*_Atomic *h)(int), int step) {
 _Atomic long store_test_crash_countdown = 0;
 void (*store_test_before_counters)(store_t *s) = NULL;
 _Atomic long store_test_fail_commit = 0;
+_Atomic long store_test_fail_ckwrite = 0;
 /* a writer function of the store (its name: "put", "set_known", "delete", "set_flags", "set_stamp", "set_cursor") fails before it changes anything with the errno this returns (0: no failure) */
 int (*store_test_write_fault)(const char *op, uint32_t zid) = NULL;
 void (*store_test_in_stats)(void) = NULL;
@@ -541,17 +571,19 @@ static void st_crash_point(void) {
   while (c > 0 && !atomic_compare_exchange_weak_explicit(&store_test_crash_countdown, &c, c - 1, memory_order_relaxed, memory_order_relaxed)) {}
   if (c == 1) kill(getpid(), SIGKILL);
 }
-/* the n-th commit fails (store_test_fail_commit) */
-static bool st_fail_commit(void) {
-  long c = atomic_load_explicit(&store_test_fail_commit, memory_order_relaxed);
-  while (c > 0 && !atomic_compare_exchange_weak_explicit(&store_test_fail_commit, &c, c - 1, memory_order_relaxed, memory_order_relaxed)) {}
+/* the n-th commit fails (store_test_fail_commit), the n-th write of table pages (store_test_fail_ckwrite) */
+static bool st_fail_nth(_Atomic long *n) {
+  long c = atomic_load_explicit(n, memory_order_relaxed);
+  while (c > 0 && !atomic_compare_exchange_weak_explicit(n, &c, c - 1, memory_order_relaxed, memory_order_relaxed)) {}
   return c == 1;
 }
 #define CRASH_POINT() st_crash_point()
-#define FAIL_COMMIT() st_fail_commit()
+#define FAIL_COMMIT() st_fail_nth(&store_test_fail_commit)
+#define FAIL_CKWRITE() st_fail_nth(&store_test_fail_ckwrite)
 #else
 #define CRASH_POINT() ((void)0)
 #define FAIL_COMMIT() false
+#define FAIL_CKWRITE() false
 #define ST_FAULT(op, zid) ((void)0)
 #define ST_FAULT_RES(op, zid, res) ((void)0)
 #endif
@@ -859,9 +891,12 @@ static inline uint64_t st_zc_cap(const store_t *s) { return atomic_load_explicit
  * makes readers wait, never fail early).  An odd counter left behind by a crash is repaired by the replay (the record is rewritten) or
  * by the rebuild. */
 static void nx_write(store_t *s, uint64_t off, const uint8_t *src, size_t len);
+static void dm_mark(dmap_t *d, uint64_t off, uint64_t len);
 /* The same, and (nxlen != 0) the bytes of the zone's long name are written to nx inside the odd window: the nx pass moves a name and the cell that says where it is as one step. */
 static void zrec_write_nx(store_t *s, uint32_t z, const r64_t *zt, const r64_t *zc, uint64_t nxoff, const uint8_t *nxb, size_t nxlen) {
   _Atomic uint64_t *tc = (_Atomic uint64_t *)zt_cell(s, z), *cc = (_Atomic uint64_t *)zc_cell(s, z);
+  dm_mark(&s->zt.d, (uint64_t)z * ST_REC, ST_REC);
+  dm_mark(&s->zc.d, (uint64_t)z * ST_REC, ST_REC);
   uint32_t seq = (uint32_t)(atomic_load_explicit(&cc[7], memory_order_relaxed) >> 32);
   uint32_t odd = seq | 1u, even = odd + 1u;
   uint64_t low7 = zc->w[7] & 0xffffffffu;
@@ -956,6 +991,7 @@ static void nx_read(const store_t *s, uint64_t off, uint8_t *dst, size_t len) {
 static void nx_write(store_t *s, uint64_t off, const uint8_t *src, size_t len) {
   _Atomic uint64_t *w = (_Atomic uint64_t *)(s->nx.base + (off & ~7ull));
   size_t skip = (size_t)(off & 7u), i = 0;
+  dm_mark(&s->nx.d, off, len);
   while (i < len) {
     size_t n = 8 - skip;
     if (n > len - i) n = len - i;
@@ -1112,16 +1148,71 @@ static bool fhdr_ok(const store_t *s, const fhdr_t *in, uint32_t kind, uint32_t 
   return memcmp(in->magic, "KARIFILE", 8) == 0 && in->version == STORE_FORMAT_VERSION && in->kind == kind &&
          in->gen == gen && memcmp(in->uuid, s->uuid, 16) == 0 && in->crc == st_crc32c(0, &h, sizeof(h));
 }
-/* ---- growable mapped table (zt, zc, nx) ---- */
+/* ---- the pages the writers changed (dmap_t) ---- */
 
-static int mtab_map_tail(mtab_t *t, uint64_t from, uint64_t to) {
-  void *p = mmap(t->base + from, (size_t)(to - from), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED | ST_NOCORE, t->fd,
-                 (off_t)(ST_HDR_PAGE + from));
+static void dm_init(store_t *s, dmap_t *d) {
+  d->shift = s->pgshift;
+  d->acct = &s->priv_bytes;
+}
+/* the bitmaps cover npages pages (they never shrink); -ENOMEM leaves them as they were (a size that was reached stays) */
+static int dm_resize(dmap_t *d, uint64_t npages) {
+  if (npages <= d->npages) return 0;
+  const size_t ow = (size_t)((d->npages + 63) / 64), nw = (size_t)((npages + 63) / 64);
+  if (nw > ow) {
+    uint64_t *a = realloc(d->dirty, nw * sizeof(*a));
+    if (!a) return -ENOMEM;
+    memset(a + ow, 0, (nw - ow) * sizeof(*a));
+    d->dirty = a;
+    uint64_t *b = realloc(d->priv, nw * sizeof(*b));
+    if (!b) return -ENOMEM;
+    memset(b + ow, 0, (nw - ow) * sizeof(*b));
+    d->priv = b;
+  }
+  d->npages = npages;
+  return 0;
+}
+static void dm_free(dmap_t *d) {
+  if (d->acct && d->npriv) atomic_fetch_sub_explicit(d->acct, d->npriv << d->shift, memory_order_relaxed);
+  free(d->dirty);
+  free(d->priv);
+  d->dirty = d->priv = NULL;
+  d->npages = d->npriv = 0;
+}
+/* a generation made in this session (anonymous memory): every page is private, and the first checkpoint that names it writes all of it */
+static void dm_set_all(dmap_t *d) {
+  const size_t nw = (size_t)((d->npages + 63) / 64);
+  if (nw) memset(d->priv, 0xff, nw * sizeof(*d->priv));
+  atomic_fetch_add_explicit(d->acct, (d->npages - d->npriv) << d->shift, memory_order_relaxed);
+  d->npriv = d->npages;
+  d->all = true;
+}
+/* bytes [off, off + len) of the table were changed (writer mutex) */
+static void dm_mark(dmap_t *d, uint64_t off, uint64_t len) {
+  if (!len) return;
+  for (uint64_t p = off >> d->shift, e = (off + len - 1) >> d->shift; p <= e && p < d->npages; p++) {
+    const uint64_t b = 1ull << (p & 63);
+    d->dirty[p >> 6] |= b;
+    if (!(d->priv[p >> 6] & b)) {
+      d->priv[p >> 6] |= b;
+      d->npriv++;
+      atomic_fetch_add_explicit(d->acct, 1ull << d->shift, memory_order_relaxed);
+    }
+  }
+}
+
+/* ---- growable table (zt, zc, nx) ----
+ * The data the file held at the open is mapped MAP_PRIVATE (a page is read from the file at its first touch and stays shared with the page cache until a writer changes it); a growth maps
+ * anonymous memory.  Nothing but a checkpoint writes the file (ck_io_tables()). */
+
+static int mtab_map_tail(mtab_t *t, uint64_t from, uint64_t to, bool file) {
+  void *p = mmap(t->base + from, (size_t)(to - from), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_FIXED | ST_NOCORE | (file ? 0 : MAP_ANON), file ? t->fd : -1,
+                 file ? (off_t)(ST_HDR_PAGE + from) : 0);
   return p == MAP_FAILED ? -errno : 0;
 }
 static int mtab_open(store_t *s, mtab_t *t, const char *name, uint32_t kind, uint32_t recsz, size_t reserve, bool create) {
   memset(t, 0, sizeof(*t));
   t->fd = -1;
+  dm_init(s, &t->d);
   int fd = st_openat(s, name, O_RDWR | (create ? (O_CREAT | O_TRUNC) : 0));
   if (fd < 0) return fd;
   t->fd = fd;
@@ -1147,8 +1238,9 @@ static int mtab_open(store_t *s, mtab_t *t, const char *name, uint32_t kind, uin
   if (base == MAP_FAILED) return -errno;
   t->base = base;
   t->reserve = reserve;
+  if (dm_resize(&t->d, data >> s->pgshift) < 0) return -ENOMEM;
   if (data) {
-    int r = mtab_map_tail(t, 0, data);
+    int r = mtab_map_tail(t, 0, data, true);
     if (r < 0) return r;
   }
   atomic_store_explicit(&t->extended, data, memory_order_relaxed);
@@ -1158,6 +1250,7 @@ static int mtab_open(store_t *s, mtab_t *t, const char *name, uint32_t kind, uin
 static void mtab_close(mtab_t *t) {
   if (t->base) munmap(t->base, t->reserve);
   if (t->fd >= 0) close(t->fd);
+  dm_free(&t->d);
   memset(t, 0, sizeof(*t));
   t->fd = -1;
 }
@@ -1174,18 +1267,23 @@ static void mtab_note_extended(mtab_t *t, uint64_t to) {
   uint64_t c = atomic_load_explicit(&t->extended, memory_order_relaxed);
   while (to > c && !atomic_compare_exchange_weak_explicit(&t->extended, &c, to, memory_order_release, memory_order_relaxed)) {}
 }
-/* grow the data area to at least `need` bytes (never shrinks); the address of existing data does not change.  The blocks are allocated here unless the flusher did it already (mtab_ahead()). */
+static bool st_no_fallocate(int r) { return r == EINVAL || r == EOPNOTSUPP || r == ENODEV; }
+/* grow the data area to at least `need` bytes (never shrinks); the address of existing data does not change.  The new pages are anonymous memory.  Where the file system allocates
+ * (posix_fallocate(): UFS) the file's blocks are allocated here unless the flusher did it already (mtab_ahead()), so that a full disk is -ENOSPC now and not a checkpoint that cannot
+ * write; elsewhere (ZFS) the checkpoint extends the file (ck_write_tab()). */
 static int mtab_grow(store_t *s, mtab_t *t, uint64_t need) {
   uint64_t cur = atomic_load_explicit(&t->mapped, memory_order_relaxed);
   if (need <= cur) return 0;
   if (need > t->reserve) return -EFBIG;
   const uint64_t want = mtab_want(s, t, cur, need);
-  if (atomic_load_explicit(&t->extended, memory_order_acquire) < want) {
-    int r = st_extend(t->fd, (off_t)(ST_HDR_PAGE + cur), (off_t)(ST_HDR_PAGE + want));
-    if (r < 0) return r;
-    mtab_note_extended(t, want);
+  if (!atomic_load_explicit(&t->no_alloc, memory_order_relaxed) && atomic_load_explicit(&t->extended, memory_order_acquire) < want) {
+    const int e = posix_fallocate(t->fd, (off_t)(ST_HDR_PAGE + cur), (off_t)(want - cur));
+    if (e == 0) mtab_note_extended(t, want);
+    else if (st_no_fallocate(e)) atomic_store_explicit(&t->no_alloc, true, memory_order_relaxed);
+    else return -e;
   }
-  int r = mtab_map_tail(t, cur, want);
+  if (dm_resize(&t->d, want >> s->pgshift) < 0) return -ENOMEM;
+  int r = mtab_map_tail(t, cur, want, false);
   if (r < 0) return r;
   atomic_store_explicit(&t->mapped, want, memory_order_release);
   return 0;
@@ -1203,33 +1301,10 @@ static void mtab_ahead(store_t *s, mtab_t *t, uint64_t used, uint64_t need) {
   const uint64_t want = mtab_want(s, t, cur, need), have = atomic_load_explicit(&t->extended, memory_order_acquire);
   if (have >= want) return;
   const uint64_t from = have > cur ? have : cur;
-  /* posix_fallocate() only: it never makes a file shorter (an ftruncate() here could undo a growth that the writer made meanwhile).  A file system without it (ZFS) extends a file
-   * with ftruncate(), which is no wait: nothing to do ahead there. */
+  /* posix_fallocate() only: it never makes a file shorter */
   const int r = posix_fallocate(t->fd, (off_t)(ST_HDR_PAGE + from), (off_t)(want - from));
   if (r == 0) mtab_note_extended(t, want);
-  else if (r == EINVAL || r == EOPNOTSUPP || r == ENODEV) atomic_store_explicit(&t->no_alloc, true, memory_order_relaxed);
-}
-/* ---- the flush of a mapping (0.7: the checkpoint on ZFS) ----
- * Not msync(MS_SYNC).  Every mapping of the store starts after the file's header page (ST_HDR_PAGE), so it is never the whole file, and for such a range FreeBSD's vm_object_sync() runs
- * vm_object_page_clean() with OBJPC_SYNC: each dirty cluster is written synchronously (ZFS: zfs_freebsd_putpages() with a zil_commit() per cluster; measured on pc101, 512 MiB with
- * 20,000 dirty pages: 15,905 zil_commit() calls and 45 s, against 2 calls and 0.24 s below), and the scan starts again from the beginning whenever the object's generation changed
- * while a cluster was written, which every write fault of a writer does (the clean made the page read-only).  With the writers of a fuzzy checkpoint going on it chases them: 2,000
- * dirty pages took 5.9 s alone and had not ended after 300 s with 5,000 page writes a second (a 10M first fill on ZFS: checkpoints of 26 to 722 s, the journal at 3 GB).
- * So the pages are queued with MS_ASYNC (one pass, no rescan; the pages dirty at the call are written, a page dirtied again after its turn is the next checkpoint's), in pieces so
- * that a close can leave a fuzzy checkpoint between them, then fdatasync() waits: FreeBSD's kern_fsync() cleans the whole object once more without OBJPC_SYNC (whole-file
- * msync(MS_SYNC) does the same: async writes, then VOP_FSYNC) and VOP_FDATASYNC waits for the writes (ZFS: one zil_commit()).  cancel: NULL, or the flag that ends it early (-ECANCELED). */
-#define ST_FLUSH_PIECE (64u << 20)
-static int st_map_flush(void *addr, size_t len, int fd, const _Atomic bool *cancel) {
-  for (size_t o = 0; o < len; o += ST_FLUSH_PIECE) {
-    if (cancel && atomic_load_explicit(cancel, memory_order_relaxed)) return -ECANCELED;
-    if (msync((uint8_t *)addr + o, len - o < ST_FLUSH_PIECE ? len - o : ST_FLUSH_PIECE, MS_ASYNC) != 0) return -errno;
-  }
-  if (cancel && atomic_load_explicit(cancel, memory_order_relaxed)) return -ECANCELED;
-  if (fdatasync(fd) != 0) return -errno;
-  return 0;
-}
-static int mtab_sync(mtab_t *t, const _Atomic bool *cancel) {
-  return st_map_flush(t->base, (size_t)atomic_load_explicit(&t->mapped, memory_order_relaxed), t->fd, cancel);
+  else if (st_no_fallocate(r)) atomic_store_explicit(&t->no_alloc, true, memory_order_relaxed);
 }
 
 /* ---- index generation files (ix, sx) ---- */
@@ -1240,17 +1315,22 @@ static void ixgen_free(ixgen_t *g) {
   if (!g) return;
   if (g->slots) munmap((void *)g->slots, g->maplen);
   if (g->fd >= 0) close(g->fd);
+  dm_free(&g->d);
   free(g);
 }
-static int ixgen_map(const store_t *s, ixgen_t *g) {
+/* an opened generation: MAP_PRIVATE of its file; a made one (anon): anonymous memory, every page written by the first checkpoint that names it */
+static int ixgen_map(store_t *s, ixgen_t *g, bool anon) {
   g->maplen = (size_t)((g->nslots * 8 + s->pagesz - 1) & ~((uint64_t)s->pagesz - 1));
-  int fl = MAP_SHARED | ST_NOCORE;
+  int fl = MAP_PRIVATE | ST_NOCORE | (anon ? MAP_ANON : 0);
 #if defined(MAP_ALIGNED_SUPER)
   if (g->maplen >= (2u << 20)) fl |= MAP_ALIGNED_SUPER;
 #endif
-  void *p = mmap(NULL, g->maplen, PROT_READ | PROT_WRITE, fl, g->fd, (off_t)ST_HDR_PAGE);
+  dm_init(s, &g->d);
+  if (dm_resize(&g->d, g->maplen >> s->pgshift) < 0) return -ENOMEM;
+  void *p = mmap(NULL, g->maplen, PROT_READ | PROT_WRITE, fl, anon ? -1 : g->fd, anon ? 0 : (off_t)ST_HDR_PAGE);
   if (p == MAP_FAILED) return -errno;
   g->slots = p;
+  if (anon) dm_set_all(&g->d);
   return 0;
 }
 /* create generation file `gen` of kind (FK_IX / FK_SX) with n empty slots */
@@ -1273,7 +1353,7 @@ static int ixgen_create(store_t *s, uint32_t kind, uint32_t gen, uint64_t nslots
   int r = st_pwrite_all(fd, page, ST_HDR_PAGE, 0);
   free(page);
   if (r == 0) r = st_extend(fd, ST_HDR_PAGE, (off_t)(ST_HDR_PAGE + ((nslots * 8 + s->pagesz - 1) & ~((uint64_t)s->pagesz - 1))));
-  if (r == 0) r = ixgen_map(s, g);
+  if (r == 0) r = ixgen_map(s, g, true);
   if (r < 0) { ixgen_free(g); return r; }
   s->dir_dirty = true;
   *out = g;
@@ -1299,7 +1379,7 @@ static int ixgen_open(store_t *s, uint32_t kind, uint32_t gen, uint64_t nslots, 
     ixgen_free(g);
     return -EBADMSG;
   }
-  r = ixgen_map(s, g);
+  r = ixgen_map(s, g, false);
   if (r < 0) { ixgen_free(g); return r; }
   *out = g;
   return 0;
@@ -1665,6 +1745,7 @@ static int apply_ops(store_t *s, const uint8_t *ops, size_t len) {
         memcpy(&pos, p + 8 + i * 16, 8);
         memcpy(&val, p + 16 + i * 16, 8);
         if (!g || pos >= g->nslots) { bad = -EINVAL; continue; }
+        dm_mark(&g->d, pos * 8, 8);
         atomic_store_explicit(&g->slots[pos], val, memory_order_release);
       }
       break;
@@ -1720,7 +1801,11 @@ static int apply_ops(store_t *s, const uint8_t *ops, size_t len) {
       memcpy(&which, p, 4);
       memcpy(&gen, p + 4, 4);
       memcpy(&ns, p + 8, 8);
-      if (which > 1 || switch_gen(s, which, gen, ns) < 0) bad = -EINVAL;
+      /* Only a replay meets this op (the growth writes it without applying it: rg_publish_locked()).  The file of the new generation holds what a checkpoint wrote to it, and nothing
+       * when none followed the growth before the stop (the tables are private memory): the generation is switched to, so that the ops after it fit, and the open rebuilds the derived
+       * tables from zt (-EINVAL: the anomaly) */
+      if (which <= 1 && switch_gen(s, which, gen, ns) == 0) s->rec.gen_replays++;
+      bad = -EINVAL;
       break;
     }
     case OP_REBUILD:
@@ -2112,11 +2197,18 @@ static void unlink_old_gens(store_t *s) {
 /* The begin of a checkpoint (writer mutex, ck_busy and the baton held): its position P is the last LSN; the journal goes on in the next file (records > P); the superblock as of P is made
  * in s->sbbuf (counters, views, cursors, the index generations of P); what the commit of P has to sync is taken (the dirty segments, the old journal's fd), and the index generations that
  * the flush syncs.  io_hold keeps all of it from being freed until ck_run() / ck_full_locked() is done with it.  No wait for the disk here. */
+static int ck_take_locked(store_t *s);
+static void ck_merge_locked(store_t *s);
+static void ck_drop_taken(store_t *s);
 static int ck_begin_locked(store_t *s, bool clean) {
   const uint64_t P = s->lsn;
-  int oldfd = -1;
-  int r = journal_switch_locked(s, P + 1, &oldfd, true);
+  s->ck.ix = atomic_load_explicit(&s->ix, memory_order_relaxed);
+  s->ck.sx = atomic_load_explicit(&s->sx, memory_order_relaxed);
+  int r = ck_take_locked(s);                         /* (the pages the writers changed up to P) */
   if (r < 0) return r;
+  int oldfd = -1;
+  r = journal_switch_locked(s, P + 1, &oldfd, true);
+  if (r < 0) { ck_merge_locked(s); return r; }
   CRASH_POINT();
   atomic_store_explicit(&s->ck_want, false, memory_order_relaxed);
   sb_fill(s, s->sbbuf, clean, s->sb_seq + 1, s->jrn_gen);
@@ -2127,8 +2219,6 @@ static int ck_begin_locked(store_t *s, bool clean) {
   s->ck.oldfd = oldfd;
   s->ck.newfd = s->jfd;
   s->ck.gen = s->jrn_gen;
-  s->ck.ix = atomic_load_explicit(&s->ix, memory_order_relaxed);
-  s->ck.sx = atomic_load_explicit(&s->sx, memory_order_relaxed);
   return 0;
 }
 
@@ -2149,15 +2239,125 @@ static int ck_io_commit(store_t *s, bool full) {
   return r;
 }
 
-/* the flush: every mapped table and the index generations of P (no lock: writers go on; what they change after P is replayed from the new journal).  cancel: the fuzzy checkpoint's
- * (a close leaves it, see bg_stop_join()); NULL for one with the writers kept out */
+/* ---- the write of the tables (0.7: the tables in private memory) ----
+ * Table i of a checkpoint: 0 zt, 1 zc, 2 nx, 3 / 4 the ix / sx generation of P (s->ck.ix / ck.sx). */
+
+#define ST_CK_RUN (1u << 20)                /* the longest run of pages copied and written at once (the size of ck_buf) */
+
+static dmap_t *ck_dmap(store_t *s, int i) {
+  switch (i) {
+  case 0: return &s->zt.d;
+  case 1: return &s->zc.d;
+  case 2: return &s->nx.d;
+  case 3: return s->ck.ix ? &s->ck.ix->d : NULL;
+  default: return s->ck.sx ? &s->ck.sx->d : NULL;
+  }
+}
+/* The begin of a checkpoint takes the pages the writers changed (writer mutex, ck_busy): each table's dirty bitmap is the checkpoint's now, and the writers mark into a new empty one; a
+ * generation made in this session gives its "write all of it".  The sizes as of P: what sb_fill() names.  -ENOMEM: nothing taken. */
+static int ck_take_locked(store_t *s) {
+  uint64_t *fresh[5] = { NULL, NULL, NULL, NULL, NULL };
+  for (int i = 0; i < 5; i++) {
+    const dmap_t *d = ck_dmap(s, i);
+    if (!d) continue;
+    const size_t nw = (size_t)((d->npages + 63) / 64);
+    if (!(fresh[i] = calloc(nw ? nw : 1, sizeof(uint64_t)))) {
+      for (int k = 0; k < i; k++) free(fresh[k]);
+      return -ENOMEM;
+    }
+  }
+  const mtab_t *tabs[3] = { &s->zt, &s->zc, &s->nx };
+  for (int i = 0; i < 5; i++) {
+    dmap_t *d = ck_dmap(s, i);
+    s->ck.t[i].dirty = NULL;
+    s->ck.t[i].npages = s->ck.t[i].bytes = 0;
+    s->ck.t[i].all = false;
+    if (!d) continue;
+    s->ck.t[i].dirty = d->dirty;
+    s->ck.t[i].npages = d->npages;
+    s->ck.t[i].all = d->all;
+    s->ck.t[i].bytes = i < 3 ? atomic_load_explicit(&tabs[i]->mapped, memory_order_relaxed) : (i == 3 ? s->ck.ix : s->ck.sx)->maplen;
+    d->dirty = fresh[i];
+    d->all = false;
+  }
+  return 0;
+}
+/* A checkpoint that did not reach its superblock gives the pages back (writer mutex): the next one writes them.  A generation that is no longer the current one is left: the checkpoint
+ * that names the one after it writes that one whole. */
+static void ck_merge_locked(store_t *s) {
+  for (int i = 0; i < 5; i++) {
+    uint64_t *t = s->ck.t[i].dirty;
+    if (!t) continue;
+    dmap_t *d = ck_dmap(s, i);
+    const ixgen_t *cur = i == 3 ? atomic_load_explicit(&s->ix, memory_order_relaxed) : i == 4 ? atomic_load_explicit(&s->sx, memory_order_relaxed) : NULL;
+    if (i < 3 || (i == 3 ? s->ck.ix : s->ck.sx) == cur) {
+      const uint64_t n = s->ck.t[i].npages < d->npages ? s->ck.t[i].npages : d->npages;
+      for (uint64_t w = 0; w < (n + 63) / 64; w++) d->dirty[w] |= t[w];
+      if (s->ck.t[i].all) d->all = true;
+    }
+    free(t);
+    s->ck.t[i].dirty = NULL;
+  }
+}
+static void ck_drop_taken(store_t *s) {
+  for (int i = 0; i < 5; i++) {
+    free(s->ck.t[i].dirty);
+    s->ck.t[i].dirty = NULL;
+  }
+}
+/* Write the pages of table i that the checkpoint took (no lock: the writers go on).  A run of pages is copied into ck_buf with word loads (the writers store words into those pages
+ * meanwhile: a copy may hold the effect of records after P, which the replay from P makes right again, see "The tables in private memory") and written with pwrite(); the page that
+ * a writer stores into is never the page the kernel writes out.  Then the file is extended to the size of P and synced.  *done: the bytes written. */
+static int ck_write_tab(store_t *s, int i, int fd, const uint8_t *base, const _Atomic bool *cancel, uint64_t *done) {
+  const uint64_t *dirty = s->ck.t[i].dirty, bytes = s->ck.t[i].bytes;
+  const bool all = s->ck.t[i].all;
+  uint64_t np = bytes >> s->pgshift;
+  if (!all && np > s->ck.t[i].npages) np = s->ck.t[i].npages;
+  const uint64_t run_max = ST_CK_RUN >> s->pgshift;
+  bool wrote = false;
+  for (uint64_t p = 0; p < np; ) {
+    if (!all && dirty[p >> 6] == 0) { p = (p | 63) + 1; continue; }
+    if (!all && !((dirty[p >> 6] >> (p & 63)) & 1)) { p++; continue; }
+    const uint64_t start = p;
+    while (p < np && p - start < run_max && (all || ((dirty[p >> 6] >> (p & 63)) & 1))) p++;
+    const size_t len = (size_t)((p - start) << s->pgshift);
+    const _Atomic uint64_t *src = (const _Atomic uint64_t *)(base + (start << s->pgshift));
+    uint64_t *dst = (uint64_t *)s->ck_buf;
+    for (size_t k = 0; k < len / 8; k++) dst[k] = atomic_load_explicit(&src[k], memory_order_relaxed);
+    int r = FAIL_CKWRITE() ? -EIO : st_pwrite_all(fd, s->ck_buf, len, (off_t)(ST_HDR_PAGE + (start << s->pgshift)));
+    if (r < 0) return r;
+    *done += len;
+    wrote = true;
+    CRASH_POINT();
+    st_hook(&store_test_ckpt_hook, 5);
+    if (cancel && atomic_load_explicit(cancel, memory_order_relaxed)) return -ECANCELED;
+  }
+  struct stat st;
+  if (fstat(fd, &st) != 0) return -errno;
+  if ((uint64_t)st.st_size < ST_HDR_PAGE + bytes) {
+    int r = st_extend(fd, st.st_size, (off_t)(ST_HDR_PAGE + bytes));
+    if (r < 0) return r;
+    wrote = true;
+  }
+  if (wrote && fdatasync(fd) != 0) return -errno;
+  return 0;
+}
+/* the write of the tables and the index generations of P (no lock).  cancel: the fuzzy checkpoint's (a close leaves it, see bg_stop_join()); NULL for one with the writers kept out */
 static int ck_io_tables(store_t *s, const _Atomic bool *cancel) {
   mtab_t *tabs[3] = { &s->zt, &s->zc, &s->nx };
+  uint64_t done = 0;
   int r = 0;
-  for (int i = 0; i < 3 && r == 0; i++) r = mtab_sync(tabs[i], cancel);
-  const ixgen_t *gens[2] = { s->ck.ix, s->ck.sx };
-  for (int i = 0; i < 2 && r == 0; i++)
-    if (gens[i]) r = st_map_flush((void *)gens[i]->slots, gens[i]->maplen, gens[i]->fd, cancel);
+  for (int i = 0; i < 5 && r == 0; i++) {
+    if (i < 3) {
+      r = ck_write_tab(s, i, tabs[i]->fd, tabs[i]->base, cancel, &done);
+      if (r == 0) mtab_note_extended(tabs[i], s->ck.t[i].bytes);
+    } else {
+      const ixgen_t *g = i == 3 ? s->ck.ix : s->ck.sx;
+      if (g) r = ck_write_tab(s, i, g->fd, (const uint8_t *)g->slots, cancel, &done);
+    }
+  }
+  atomic_fetch_add_explicit(&s->n_ck_bytes, done, memory_order_relaxed);
+  if (r == 0) atomic_store_explicit(&s->ck_last_bytes, done, memory_order_relaxed);
   return r;
 }
 
@@ -2214,6 +2414,12 @@ static int ck_run(store_t *s) {
     st_hook(&store_test_ckpt_hook, 3);
     r = ck_io_super(s, false);
   }
+  if (r == 0) ck_drop_taken(s);
+  else {                                              /* (the pages it took are given back before io_hold lets their generations go) */
+    wr_lock_raw(s);
+    ck_merge_locked(s);
+    wr_unlock_raw(s);
+  }
   atomic_fetch_sub_explicit(&s->io_hold, 1, memory_order_acq_rel);
   if (r == 0) {
     CRASH_POINT();
@@ -2255,6 +2461,7 @@ static int ck_full_locked(store_t *s, bool clean) {
   r = ck_io_commit(s, true);
   if (r == 0) { CRASH_POINT(); r = ck_io_tables(s, NULL); }
   if (r == 0) { CRASH_POINT(); r = ck_io_super(s, true); }
+  if (r == 0) ck_drop_taken(s); else ck_merge_locked(s);
   atomic_fetch_sub_explicit(&s->io_hold, 1, memory_order_acq_rel);
   if (r < 0) return r;
   CRASH_POINT();
@@ -2410,7 +2617,7 @@ static int rg_fill(store_t *s, ixgen_t *nix, ixgen_t *nsx, uint64_t hwm, bool lo
 }
 
 /* The new generations are put in (writer mutex): the bridge in the journal chain (GEN ops and the counters of the new tables), then the pointers.  The record is in the journal before the
- * memory follows it; it needs no sync of its own (a replay after kill -9 has the page cache; after a power loss the open rebuilds the derived tables, and so the old generation, which the
+ * memory follows it; it needs no sync of its own (a replay that meets it rebuilds the derived tables, the new file holding only what a checkpoint wrote, and so the old generation, which the
  * superblocks still name, is kept until two checkpoints name the new one).  On failure nothing changes. */
 static int rg_publish_locked(store_t *s, ixgen_t *nix, ixgen_t *nsx, uint64_t ix_used, uint64_t ix_live, uint64_t sx_used, uint64_t sx_live) {
   jb_reset(&s->jb);
@@ -4492,8 +4699,62 @@ int store_checkpoint_clean(store_t *s) {
   return r;
 }
 
+#ifdef KARIDNS_UNIT_TEST
+/* the bytes of a table file from its data area equal len bytes of memory at base (the first difference is printed) */
+static bool file_matches(int fd, const uint8_t *base, uint64_t len, int which) {
+  uint8_t buf[65536];
+  for (uint64_t o = 0; o < len; o += sizeof(buf)) {
+    const size_t n = (size_t)(len - o < sizeof(buf) ? len - o : sizeof(buf));
+    if (st_pread_all(fd, buf, n, (off_t)(ST_HDR_PAGE + o)) < 0) { printf("  table %d: the file is shorter than %" PRIu64 " bytes\n", which, len); return false; }
+    for (size_t k = 0; k < n; k += 8) {
+      uint64_t f, m = atomic_load_explicit((const _Atomic uint64_t *)(base + o + k), memory_order_relaxed);
+      memcpy(&f, buf + k, 8);
+      if (f != m) { printf("  table %d: offset %" PRIu64 " of %" PRIu64 ": file %016" PRIx64 ", memory %016" PRIx64 "\n", which, o + k, len, f, m); return false; }
+    }
+  }
+  return true;
+}
+/* the word at byte offset off (a multiple of 8) of the memory of table which (0 zt, 1 zc, 2 nx, 3 the current ix, 4 the current sx); 0 beyond it */
+static _Atomic uint64_t *test_word(store_t *s, int which, uint64_t off, dmap_t **d) {
+  const mtab_t *tabs[3] = { &s->zt, &s->zc, &s->nx };
+  if (which < 3) {
+    *d = (dmap_t *)&tabs[which]->d;
+    return off + 8 <= atomic_load_explicit(&tabs[which]->mapped, memory_order_relaxed) ? (_Atomic uint64_t *)(tabs[which]->base + off) : NULL;
+  }
+  ixgen_t *g = atomic_load_explicit(which == 3 ? &s->ix : &s->sx, memory_order_relaxed);
+  *d = &g->d;
+  return off + 8 <= g->nslots * 8 ? &g->slots[off / 8] : NULL;
+}
+uint64_t store_test_peek(store_t *s, int which, uint64_t off) {
+  dmap_t *d;
+  const _Atomic uint64_t *w = test_word(s, which, off, &d);
+  return w ? atomic_load_explicit(w, memory_order_relaxed) : 0;
+}
+/* a word of a table changes in memory (damage, a writer in the middle of a cell), marked for the next checkpoint as a writer's change is */
+void store_test_poke(store_t *s, int which, uint64_t off, uint64_t v) {
+  wr_lock_raw(s);
+  dmap_t *d;
+  _Atomic uint64_t *w = test_word(s, which, off, &d);
+  if (w) {
+    dm_mark(d, off, 8);
+    atomic_store_explicit(w, v, memory_order_relaxed);
+  }
+  wr_unlock_raw(s);
+}
+bool store_test_files_match(store_t *s) {
+  wr_lock_raw(s);
+  const mtab_t *tabs[3] = { &s->zt, &s->zc, &s->nx };
+  bool ok = true;
+  for (int i = 0; i < 3 && ok; i++) ok = file_matches(tabs[i]->fd, tabs[i]->base, atomic_load_explicit(&tabs[i]->mapped, memory_order_relaxed), i);
+  const ixgen_t *gens[2] = { atomic_load_explicit(&s->ix, memory_order_relaxed), atomic_load_explicit(&s->sx, memory_order_relaxed) };
+  for (int i = 0; i < 2 && ok; i++) ok = file_matches(gens[i]->fd, (const uint8_t *)gens[i]->slots, gens[i]->maplen, 3 + i);
+  wr_unlock_raw(s);
+  return ok;
+}
+#endif
+
 /* ------------------------------------------------------------------------------------------------------------------ */
-/* readers                                                                                                              */
+/* readers                                                                                                            */
 /* ------------------------------------------------------------------------------------------------------------------ */
 
 void store_read_lock(void) { rcu_aux_read_lock(); }
@@ -5018,6 +5279,9 @@ void store_stats(const store_t *s, store_stats_t *o) {
   o->journal_commit_switches = atomic_load_explicit(&s->n_jswitch, memory_order_relaxed);
   o->image_prewrites = atomic_load_explicit(&s->n_prew, memory_order_relaxed);
   o->image_prewrite_misses = atomic_load_explicit(&s->n_prew_miss, memory_order_relaxed);
+  o->table_private_bytes = atomic_load_explicit(&s->priv_bytes, memory_order_relaxed);
+  o->checkpoint_table_bytes = atomic_load_explicit(&s->n_ck_bytes, memory_order_relaxed);
+  o->checkpoint_table_last_bytes = atomic_load_explicit(&s->ck_last_bytes, memory_order_relaxed);
   rcu_aux_read_unlock();
 }
 
@@ -5367,8 +5631,7 @@ static int rebuild_locked(store_t *s) {
   NS(V_SX_LIVE, live_sx);
   NS(V_NX_DEAD, nx_used >= nxlive ? nx_used - nxlive : 0);
   /* the segment counters of segments no record uses stay 0 live; V_SEG(n, 0) were restored above */
-  if ((r = st_map_flush((void *)nix->slots, nix->maplen, nix->fd, NULL)) == 0) r = st_map_flush((void *)nsx->slots, nsx->maplen, nsx->fd, NULL);
-  if (r < 0) { ixgen_free(nix); ixgen_free(nsx); free(nv); return r; }
+  /* (the new generations are anonymous memory: the checkpoint that follows the rebuild writes them whole, ck_write_tab()) */
   for (uint32_t i = 0; i < ST_NV; i++) VS(s, i, nv[i]);
   free(nv);
   index_publish(s, 0, nix);
@@ -5761,7 +6024,8 @@ int store_open(int dirfd, const store_opts_t *opts, store_t **out) {
   s->seg_size = s->o.seg_size ? s->o.seg_size : (256ull << 20);
   if (s->seg_size < 65536) s->seg_size = 65536;
   s->pagesz = (size_t)sysconf(_SC_PAGESIZE);
-  if (s->pagesz == 0 || s->pagesz > ST_HDR_PAGE) { free(s); return -EINVAL; }
+  if (s->pagesz == 0 || s->pagesz > ST_HDR_PAGE || (s->pagesz & (s->pagesz - 1))) { free(s); return -EINVAL; }
+  while ((1ull << s->pgshift) < s->pagesz) s->pgshift++;
   pthread_mutex_init(&s->wlock, NULL);
   pthread_mutex_init(&s->seg_mu, NULL);
   pthread_mutex_init(&s->sc_mu, NULL);
@@ -5788,11 +6052,12 @@ int store_open(int dirfd, const store_opts_t *opts, store_t **out) {
   s->sb_fd[0] = s->sb_fd[1] = -1;
   s->zt.fd = s->zc.fd = s->nx.fd = -1;
   s->sbbuf = calloc(1, sizeof(sb_t));
+  s->ck_buf = malloc(ST_CK_RUN);
   s->jb.p = malloc(4096);
   s->jb.cap = s->jb.p ? 4096 : 0;
   sb_t *cand[2] = { NULL, NULL };
   int r = 0;
-  if (!s->sbbuf || !s->jb.p) { r = -ENOMEM; goto fail; }
+  if (!s->sbbuf || !s->jb.p || !s->ck_buf) { r = -ENOMEM; goto fail; }
   strcpy(s->fstype, "unknown");
 #if defined(__FreeBSD__)
   struct statfs sfs;
@@ -5920,6 +6185,7 @@ fail:
   free(s->sbbuf);
   free(s->jb.p);
   free(s->cl_buf);
+  free(s->ck_buf);
   free(s);
   return r < 0 ? r : -EIO;
 }
@@ -5952,6 +6218,7 @@ int store_close(store_t *s) {
   free(s->sbbuf);
   free(s->jb.p);
   free(s->cl_buf);
+  free(s->ck_buf);
   free(s);
   return r;
 }

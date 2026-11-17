@@ -106,6 +106,27 @@ static void test_bases(void) {
     CHECK(e.level == MA_LEVEL_INFO && e.backend_limit == 0, "limit, no zones: level %d", e.level);
 }
 
+/* 0.7: with the zone store memory-limit counts the store's tables (private memory once written) before the zones: the recommended limit holds them on top, and a limit that holds the zones
+ * alone does not fit them all any more */
+static void test_store_tables(void) {
+    ma_est_t e;
+    ma_in_t in = mk(1000000, 11000000, 0);
+    in.store_mode = MA_STORE_COPY;
+    ma_estimate(&in, &e);
+    const uint64_t all = e.counted_all, tab = e.tables;
+    CHECK(tab == 1000000 * MA_STORE_TABLE_PER_ZONE, "tables %llu", (unsigned long long)tab);
+    CHECK(e.recommended >= (all + tab) * 12 / 10 && e.recommended % (64ull << 20) == 0, "recommended with the tables %llu", (unsigned long long)e.recommended);
+    in.limit = e.recommended;
+    ma_estimate(&in, &e);
+    CHECK(e.fit_pct == 100 && e.level == MA_LEVEL_INFO, "the recommended limit with the tables: fit %u level %d", e.fit_pct, e.level);
+    in.limit = all / 95 * 100 + 100;                             /* (the zones alone at the high mark) */
+    ma_estimate(&in, &e);
+    CHECK(e.fit_pct < 100, "the tables take their share: fit %u", e.fit_pct);
+    in.limit = tab;                                              /* (the tables alone fill the limit: the zones keep a tenth of it) */
+    ma_estimate(&in, &e);
+    CHECK(e.fit_pct < 10 && e.level != MA_LEVEL_INFO, "a limit the tables fill: fit %u", e.fit_pct);
+}
+
 static void test_levels(void) {
     ma_est_t e;
     /* 1M small zones: counted_all about 2.2 GB, recommended 2.2 GB x 1.2 rounded up to 64 MB */
@@ -473,6 +494,7 @@ int main(void) {
     test_w9_points();
     test_bases();
     test_levels();
+    test_store_tables();
     test_format();
     test_texts();
     test_report_due();

@@ -5196,6 +5196,15 @@ void dbreg_touch_loaded(const char *view, const char *zone) {
     pthread_mutex_unlock(&g_zone_db_rebuild_lock);
 }
 
+/* 0.7 (the zone store's tables in private memory): the bytes of the tables that the store's writers changed (store.tables.private_bytes) are memory the kernel cannot drop, and memory-limit
+ * counts them: the zones get the limit less those bytes.  When the tables alone leave less than a tenth of the limit, the zones keep that tenth (the WARNING of the store glue says to raise
+ * memory-limit): a limit that the tables fill must not stop every fetch. */
+static _Atomic uint64_t g_cache_fixed;
+void dbreg_cache_set_fixed(uint64_t bytes) { atomic_store_explicit(&g_cache_fixed, bytes, memory_order_relaxed); }
+STATIC_TEST uint64_t cache_lim_eff(uint64_t lim) {
+    const uint64_t fixed = atomic_load_explicit(&g_cache_fixed, memory_order_relaxed), floor = lim / 10;
+    return lim - floor > fixed ? lim - fixed : floor;
+}
 void dbreg_cache_set_limit(uint64_t limit) { atomic_store_explicit(&g_cache_limit, limit, memory_order_relaxed); }
 uint64_t dbreg_cache_limit(void) { return atomic_load_explicit(&g_cache_limit, memory_order_relaxed); }
 void dbreg_cache_note_miss(void) { atomic_fetch_add_explicit(&g_cache_misses, 1, memory_order_relaxed); }
@@ -5204,6 +5213,7 @@ void dbreg_cache_note_miss(void) { atomic_fetch_add_explicit(&g_cache_misses, 1,
 bool dbreg_cache_over_high(uint64_t extra) {
     uint64_t lim = atomic_load_explicit(&g_cache_limit, memory_order_relaxed);
     if (!lim) return false;
+    lim = cache_lim_eff(lim);
     zone_bytes_t zb;
     zone_bytes_get(ZBYTES_DB, &zb);
     return dbreg_cache_used_bytes(&zb, cache_excluded_retired(&zb)) + extra > lim / 100 * CACHE_HIGH_PCT;
@@ -5221,6 +5231,7 @@ static uint64_t cache_hard_line(uint64_t lim) {
 bool dbreg_cache_over_limit(void) {
     uint64_t lim = atomic_load_explicit(&g_cache_limit, memory_order_relaxed);
     if (!lim) return false;
+    lim = cache_lim_eff(lim);
     zone_bytes_t zb;
     zone_bytes_get(ZBYTES_DB, &zb);
     return zb.resident > cache_hard_line(lim);
@@ -5233,6 +5244,7 @@ void dbreg_cache_stats(dbreg_cache_stats_t *o) {
     zone_bytes_t zb;
     zone_bytes_get(ZBYTES_DB, &zb);
     o->limit = atomic_load_explicit(&g_cache_limit, memory_order_relaxed);
+    o->fixed = atomic_load_explicit(&g_cache_fixed, memory_order_relaxed);
     o->resident = zb.resident;
     o->retired = zb.retired;
     o->previous = zb.previous;
@@ -5444,6 +5456,7 @@ static void cache_enext_locked(uint32_t now32, uint32_t *evicted) {
 uint32_t dbreg_cache_round(void) {
     uint64_t limit = atomic_load_explicit(&g_cache_limit, memory_order_relaxed);
     if (!limit) return 0;
+    limit = cache_lim_eff(limit);
 #ifdef KARIDNS_UNIT_TEST
     if (atomic_load_explicit(&g_cache_paused, memory_order_relaxed)) return 0;
 #endif
@@ -5666,8 +5679,9 @@ uint32_t dbreg_cache_make_room(uint32_t nwant, uint32_t *relaxed_out) {
 #ifdef KARIDNS_UNIT_TEST
     if (atomic_load_explicit(&g_room_paused, memory_order_relaxed)) return 0;
 #endif
-    const uint64_t limit = atomic_load_explicit(&g_cache_limit, memory_order_relaxed);
-    if (!limit) return 0;
+    const uint64_t limit0 = atomic_load_explicit(&g_cache_limit, memory_order_relaxed);
+    if (!limit0) return 0;
+    const uint64_t limit = cache_lim_eff(limit0);
     if (nwant == 0) nwant = 1;
     uint32_t boundary = 0;
     bool took_unflagged = false;
