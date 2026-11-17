@@ -867,6 +867,23 @@ static void test_backend_direction_rejects(void) {
       kdb_enc_u64(&e, 1, 1); kdb_enc_bytes(&e, 2, ids, 12); kdb_enc_u32(&e, 3, 0); kdb_enc_u32(&e, 4, 0); kdb_enc_u32(&e, 5, 0); kdb_enc_u32(&e, 6, 0); }
     kdb_enc_end(&e);
     CHECK_RC("request ids of 12 bytes", decode_backend(&e, 2), KDB_E_TLV_LEN);
+    /* 0.7: tag 7, the store error of the batch (KDB_FEAT_BATCH_STATUS); absent = 0 */
+    for (int with = 0; with < 2; with++) {
+      kdb_enc_reset(&e); kdb_enc_begin(&e, KDB_T_BATCH_RESULT);
+      kdb_enc_u64(&e, 1, 9); kdb_enc_u32(&e, 3, 1); kdb_enc_u32(&e, 4, 2); kdb_enc_u32(&e, 5, 3); kdb_enc_u32(&e, 6, 4);
+      if (with) kdb_enc_u32(&e, 7, 5);
+      kdb_enc_end(&e);
+      kdb_framer_t f;
+      kdb_framer_init(&f, KDB_FROM_BACKEND, g_rbuf, sizeof(g_rbuf));
+      kdb_rc_t rc = kdb_framer_feed(&f, e.buf, e.len);
+      kdb_frame_t fr;
+      if (rc == KDB_OK) rc = kdb_framer_next(&f, &fr);
+      kdb_msg_t m;
+      char why[KDB_REASON_LEN];
+      if (rc == KDB_OK) rc = kdb_decode(&fr, 1, &m, why, sizeof(why));
+      CHECK_RC("BATCH_RESULT with / without tag 7", rc, KDB_OK);
+      CHECK(rc == KDB_OK && m.u.batch_result.batch_id == 9 && m.u.batch_result.n_deleted == 4 && m.u.batch_result.store_error == (with ? 5u : 0u));
+    }
     /* loader types on the Backend stream are unknown there */
     kdb_enc_reset(&e); m_hello(&e, 1);
     CHECK_RC("HELLO on Backend stream", decode_backend(&e, 2), KDB_E_TYPE);

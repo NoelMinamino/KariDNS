@@ -715,6 +715,7 @@ struct lio {
     uint64_t all_req_id;                     /* the request id of the last scope all request, 0 = none */
     uint64_t batch_seq;
     uint64_t batches_ended, batch_results;   /* BATCH_ENDs sent / BATCH_RESULTs received: a load waits for the difference */
+    uint32_t batch_store_err;            /* 0.7: BATCH_RESULT tag 7 of the batch being waited for (the errno; 0 = recorded) */
     uint64_t n_results, n_rejected, n_shadowed;   /* ZONE_RESULTs of the current batch */
     char first_reject[130];
     /* the inventory and the per-view state, by view name */
@@ -2305,7 +2306,7 @@ static int send_hello(ctx_t *x, const char *driver_list, uint32_t pid) {
         kdb_enc_str(&x->enc, 2, KARIDNS_VERSION) != 0 || kdb_enc_str(&x->enc, 3, driver_list) != 0 ||
         kdb_enc_u32(&x->enc, 4, pid) != 0 ||
         /* 0.7 M3: every zone of the database travels as a zone image, in the image version of this build: the Backend takes no other loader (KDB_FEAT_IMAGE, tag 6) */
-        kdb_enc_u32(&x->enc, 5, (x->io ? KDB_FEAT_STORE | KDB_FEAT_LOOKUP | KDB_FEAT_LOOKUP_BODY : 0u) | KDB_FEAT_IMAGE) != 0 || kdb_enc_u32(&x->enc, 6, ZONE_IMAGE_VERSION) != 0 ||
+        kdb_enc_u32(&x->enc, 5, (x->io ? KDB_FEAT_STORE | KDB_FEAT_LOOKUP | KDB_FEAT_LOOKUP_BODY | KDB_FEAT_BATCH_STATUS : 0u) | KDB_FEAT_IMAGE) != 0 || kdb_enc_u32(&x->enc, 6, ZONE_IMAGE_VERSION) != 0 ||
         kdb_enc_end(&x->enc) != 0 || send_enc(x) != 0)
         return -1;
     return 0;
@@ -5153,6 +5154,7 @@ static void io_dispatch(struct lio *io, const kdb_frame_t *fr) {
     }
     case KDB_T_BATCH_RESULT:
         io->batch_results++;
+        if (m.u.batch_result.store_error) io->batch_store_err = m.u.batch_result.store_error;     /* (0.7: the store did not record it: do_load() sets the change log back) */
         lg(LOG_INFO, "Backend result for batch %llu: %u applied, %u unchanged, %u rejected, %u deleted%s%s "
                      "(%llu zone result(s), %llu hidden by karidns.conf)",
            (unsigned long long)m.u.batch_result.batch_id, m.u.batch_result.n_applied, m.u.batch_result.n_unchanged,
@@ -5367,6 +5369,12 @@ static int do_load(ctx_t *x, struct lio *io, uint8_t kind, int only_view, const 
     io->first_reject[0] = '\0';
     int errs = 0;
     bool seen_view = false;
+    /* 0.7 (KDB_FEAT_BATCH_STATUS): where each view's change log stood before this batch; a batch the Backend's store could not record (BATCH_RESULT tag 7) sets them
+     * back, so the next load reads those changes again instead of going past them */
+    struct vsave { uint64_t seq; bool seq_valid, need_full; } *vsave = io->nvn ? calloc(io->nvn, sizeof(*vsave)) : NULL;
+    const size_t nsave = vsave ? io->nvn : 0;
+    for (size_t i = 0; vsave && i < nsave; i++) { vsave[i].seq = io->vst[i].seq; vsave[i].seq_valid = io->vst[i].seq_valid; vsave[i].need_full = io->vst[i].need_full; }
+    io->batch_store_err = 0;
     lgd(1, "batch %llu (%s): reading %s%s%s%s%s", (unsigned long long)x->batch_id, batch_kind_name(kind), only_view >= 0 ? "one view" : "every view",
         only_zone ? ", zone " : "", only_zone ? only_zone : "", force ? ", forced" : "", req_id ? ", answers a request" : "");
     for (size_t i = 0; i < c->nviews; i++) {
@@ -5376,6 +5384,7 @@ static int do_load(ctx_t *x, struct lio *io, uint8_t kind, int only_view, const 
         int slot = vslot_get(io, v->name);
         if (slot < 0) {
             lg(LOG_ERR, "out of memory");
+            free(vsave);
             return -1;
         }
         x->vslot = (uint16_t)slot;
@@ -5397,6 +5406,7 @@ static int do_load(ctx_t *x, struct lio *io, uint8_t kind, int only_view, const 
         }
         if (x->io_error || x->oom || g_stop) {
             ctx_view_reset(x);
+            free(vsave);
             return -1;
         }
         if (st == EXIT_ERROR || st == EXIT_RETRY) {
@@ -5408,12 +5418,15 @@ static int do_load(ctx_t *x, struct lio *io, uint8_t kind, int only_view, const 
     }
     ctx_view_reset(x);
     x->map_view = NULL;
-    if (x->io_error) return -1;
-    if (only_zone && !seen_view && send_request_failure(x, (uint16_t)only_view, only_zone, "the view takes no zones from the database") != 0)
+    if (x->io_error) { free(vsave); return -1; }
+    if (only_zone && !seen_view && send_request_failure(x, (uint16_t)only_view, only_zone, "the view takes no zones from the database") != 0) {
+        free(vsave);
         return -1;
+    }
     if (!x->batch_open && (req_id || (errs == 0 && (kind == KDB_BATCH_STARTUP || kind == KDB_BATCH_DIFF)))) {
         if (send_simple_header(x) != 0) {          /* an empty batch still tells the Backend the load is complete */
             lg(LOG_ERR, "cannot write the output: %s", strerror(errno));
+            free(vsave);
             return -1;
         }
     }
@@ -5421,6 +5434,7 @@ static int do_load(ctx_t *x, struct lio *io, uint8_t kind, int only_view, const 
         x->batch_open = false;
         if (send_batch_end(x) != 0) {
             lg(LOG_ERR, "cannot write the output: %s", strerror(errno));
+            free(vsave);
             return -1;
         }
         io->batches_ended++;
@@ -5429,10 +5443,19 @@ static int do_load(ctx_t *x, struct lio *io, uint8_t kind, int only_view, const 
         lg(LOG_INFO, "batch %llu (%s) sent: %u zone(s) read, %u sent, %u failed in the loader, %u deleted, %u unchanged%s%s",
            (unsigned long long)x->batch_id, batch_kind_name(kind), x->n_read, x->n_zones, x->n_failed, x->n_deleted,
            x->n_unchanged, req_id ? " (answers a request)" : "", vtxt);
-        if (io_wait_results(io) != 0) return -1;
+        if (io_wait_results(io) != 0) { free(vsave); return -1; }
+        if (io->batch_store_err) {
+            for (size_t i = 0; vsave && i < nsave; i++) { io->vst[i].seq = vsave[i].seq; io->vst[i].seq_valid = vsave[i].seq_valid; io->vst[i].need_full = vsave[i].need_full; }
+            for (size_t i = nsave; i < io->nvn; i++) io->vst[i].seq_valid = false;   /* (a view first read by this batch: listed again) */
+            lg(LOG_ERR, "the Backend's store could not record batch %llu (%s): the changes of the batch are read again by the next load", (unsigned long long)x->batch_id,
+               strerror((int)io->batch_store_err));
+            io->batch_store_err = 0;
+            errs++;
+        }
         lgd(2, "batch %llu: the Backend answered %llu zone(s), %llu rejected, %llu hidden by karidns.conf", (unsigned long long)x->batch_id,
             (unsigned long long)io->n_results, (unsigned long long)io->n_rejected, (unsigned long long)io->n_shadowed);
     }
+    free(vsave);
     return errs ? 1 : 0;
 }
 

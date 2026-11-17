@@ -3869,6 +3869,8 @@ static uint32_t g_fx_zid;
 static const char *g_fx_op;
 static int g_fx_err;
 static int fx_fault(const char *op, uint32_t zid) { return (g_fx_op && strcmp(op, g_fx_op) == 0 && zid == g_fx_zid) ? g_fx_err : 0; }
+static _Atomic int g_dbs_jw_nospc;                                     /* 0.7: the journal ring's write meets ENOSPC while it is set */
+static int dbs_jw_fault(uint64_t pos, uint64_t len) { (void)pos; (void)len; return atomic_load(&g_dbs_jw_nospc) ? ENOSPC : 0; }
 
 static void fx_pass(int fd, kdb_enc_t *e, uint64_t batch, int n, const bool *omit, uint64_t cursor, bool complete) {
     static pz_t page[2048];
@@ -3996,7 +3998,7 @@ static int run_fixes(const char *dir) {
     g_query_bg_attach = no_bg_fetch;
     for (int i = 0; i < PN + 16; i++) g_pserial[i] = 1;
     kdb_enc_begin(&e, KDB_T_HELLO);
-    kdb_enc_u16(&e, 1, 1); kdb_enc_str(&e, 2, "test-loader"); kdb_enc_str(&e, 3, "sqlite3"); kdb_enc_u32(&e, 4, 4242); kdb_enc_u32(&e, 5, (KDB_FEAT_STORE) | KDB_FEAT_IMAGE); kdb_enc_u32(&e, 6, ZONE_IMAGE_VERSION);
+    kdb_enc_u16(&e, 1, 1); kdb_enc_str(&e, 2, "test-loader"); kdb_enc_str(&e, 3, "sqlite3"); kdb_enc_u32(&e, 4, 4242); kdb_enc_u32(&e, 5, KDB_FEAT_STORE | KDB_FEAT_BATCH_STATUS | KDB_FEAT_IMAGE); kdb_enc_u32(&e, 6, ZONE_IMAGE_VERSION);
     kdb_enc_end(&e);
     ch_send(a[0], &e);
     CHECK(ch_next(&mainc, &m, 5000) && m.type == KDB_T_CONFIG && m.u.config.store_proto);
@@ -4055,6 +4057,31 @@ static int run_fixes(const char *dir) {
     CHECK(wait_stored(st, NF - 1, 30000));
     CHECK(!zrec(st, "m1100.test", &z) && zrec(st, "m0003.test", &z) && z.serial == 2 && z.stamp_gen == 2 && cursor_is(st, 300));
 
+    /* -- 0.7: the store cannot make a batch durable (its journal meets ENOSPC at the batch end): BATCH_RESULT says so in tag 7 (this loader has KDB_FEAT_BATCH_STATUS), the counter
+     *    and the status show it; once the journal is written again the next batch is answered as recorded */
+    {
+      db_recon_status_t rs0, rs1;
+      db_recon_status(&rs0);
+      p_batch_begin(a[0], &e, 40, KDB_BATCH_AUTO, 0);
+      fx_pass(a[0], &e, 40, NF, omit, 350, true);
+      atomic_store(&g_dbs_jw_nospc, 1);
+      store_test_jw_fault = dbs_jw_fault;
+      p_batch_end(a[0], &e, 40, NF - 1, 0);
+      CHECK(p_result(&mainc, &m, 10000) && m.u.batch_result.batch_id == 40 && m.u.batch_result.store_error == ENOSPC);
+      db_recon_status(&rs1);
+      CHECK(rs1.batch_store_errors == rs0.batch_store_errors + 1 && rs1.batch_store_last == -ENOSPC);
+      atomic_store(&g_dbs_jw_nospc, 0);                                 /* the room comes back: the flusher writes the journal again */
+      store_stats_t ss;
+      for (int w = 0; w < 5000; w++) { store_stats(st, &ss); if (ss.journal_state == STORE_JOURNAL_OK) break; usleep(1000); }
+      CHECK(ss.journal_state == STORE_JOURNAL_OK);
+      store_test_jw_fault = NULL;
+      p_batch_begin(a[0], &e, 41, KDB_BATCH_AUTO, 0);
+      fx_pass(a[0], &e, 41, NF, omit, 360, true);
+      p_batch_end(a[0], &e, 41, NF - 1, 0);
+      CHECK(p_result(&mainc, &m, 10000) && m.u.batch_result.batch_id == 41 && m.u.batch_result.store_error == 0);
+      CHECK(cursor_is(st, 360));
+    }
+
     /* -- H1: the bit of a zone that the pass lists cannot be set (no memory): the same, nothing is swept */
     omit[1101] = true;
     db_store_test_bits_fail = 4;
@@ -4062,7 +4089,7 @@ static int run_fixes(const char *dir) {
     fx_pass(a[0], &e, 4, NF, omit, 400, true);
     p_batch_end(a[0], &e, 4, NF - 2, 0);
     CHECK(p_result(&mainc, &m, 10000) && m.u.batch_result.n_deleted == 0);
-    CHECK(zrec(st, "m1101.test", &z) && zones_now(st) == NF - 1 && cursor_is(st, 300));
+    CHECK(zrec(st, "m1101.test", &z) && zones_now(st) == NF - 1 && cursor_is(st, 360));
     db_store_test_bits_fail = 0;
     p_batch_begin(a[0], &e, 5, KDB_BATCH_AUTO, 0);
     fx_pass(a[0], &e, 5, NF, omit, 500, true);

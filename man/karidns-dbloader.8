@@ -1,4 +1,4 @@
-.TH KARIDNS\-DBLOADER 8 "2026-11-16" "KariDNS" "KariDNS Manual"
+.TH KARIDNS\-DBLOADER 8 "2026-11-17" "KariDNS" "KariDNS Manual"
 .\" Generated from docs/karidns-dbloader.md by man/md2man.pl (make man): edit the Markdown manual, not this page.
 .SH NAME
 karidns\-dbloader \- reads the PowerDNS 5.1 tables of a SQLite3 or PostgreSQL
@@ -664,6 +664,20 @@ are deleted, the guard is let go and the cursor is kept. A pass that is not
 complete (\fBcomplete = 0\fR) deletes nothing and keeps no cursor. Changes
 (\fBCHANGES\fR deletes) are explicit and are applied as they come; the guard
 concerns the sweep only.
+.IP \(bu 2
+\fBA batch the store could not record\fR (0.7, \fBKDB_FEAT_BATCH_STATUS\fR,
+HELLO bit 0x10). When the Backend's store cannot record a batch (its disk is
+full, a write fails, the journal is in the state \fIfailed\fR),
+\fBBATCH_RESULT\fR carries tag 7, the errno (\fBENOSPC\fR, \fBEIO\fR). The
+loader then sets the change-log position of every view back to where it stood
+before the batch (views it met only in that batch start with a pass), logs
+\fBERROR\fR, exits the load with an error and reads the same changes again on
+the next load: no change is skipped. The tag is sent only to a loader whose
+\fBHELLO\fR has the bit (an older loader would reject the unknown tag); to an
+older loader the Backend logs \fBERROR\fR and the batch counts as done. After a
+restart of the loader or the server, the loader starts from the cursor the
+Backend sends in \fBCONFIG\fR, which is the last one the store made durable: a
+batch that was not recorded is read again either way.
 .IP \(bu 2
 \fBSecondary and catalog zones\fR are heap zones (the Backend transfers them
 from their masters); the store keeps a record for each, flagged \fInonstore\fR,

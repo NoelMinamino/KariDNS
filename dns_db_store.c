@@ -295,6 +295,7 @@ static _Thread_local bool t_df_perm;                   /* this thread defers for
 static _Thread_local store_t *t_df_st;                 /* the store this thread's rec_lock() scope deferred on */
 static _Atomic uint64_t g_rec_fine[STORE_FINE_BUCKETS];   /* every hold (store.lock.records_hold_p999_us) */
 static _Atomic uint64_t g_settle_errors;              /* settles that found the journal failed or full (the calls had returned 0) */
+static _Atomic bool g_settle_failed;                   /* a settle failed since the last batch end */
 void db_store_defer_thread(bool on) {
   store_t *st = atomic_load_explicit(&G.st, memory_order_acquire);
   t_df_perm = on;
@@ -326,7 +327,10 @@ static void rec_unlock(void) {
   store_t *st = t_df_st;
   t_df_st = NULL;
   if (st && !t_df_perm) {                              /* (rule A for this thread's calls of the scope: their records are in the kernel when it goes on) */
-    if (store_settle(st) < 0) atomic_fetch_add_explicit(&g_settle_errors, 1, memory_order_relaxed);
+    if (store_settle(st) < 0) {                        /* (the calls returned 0 but their records may be lost: the next batch end fails, so the loader does not go past them) */
+      atomic_fetch_add_explicit(&g_settle_errors, 1, memory_order_relaxed);
+      atomic_store_explicit(&g_settle_failed, true, memory_order_release);
+    }
     (void)store_defer(st, false);
   }
 }
@@ -1560,7 +1564,8 @@ static _Atomic int g_batch_store_last;
 int db_store_batch_end(void) {
   store_t *st = atomic_load_explicit(&G.st, memory_order_acquire);
   if (!st) return 0;
-  const int r = store_commit(st);                      /* what the batch wrote to the store is made durable (group commit); the acknowledgement of the deferred calls */
+  int r = store_commit(st);                            /* what the batch wrote to the store is made durable (group commit); the acknowledgement of the deferred calls */
+  if (atomic_exchange_explicit(&g_settle_failed, false, memory_order_acq_rel) && r == 0) r = -EIO;
   atomic_store_explicit(&g_batch_store_last, r, memory_order_relaxed);
   if (r < 0) {
     const uint64_t n = atomic_fetch_add_explicit(&g_batch_store_errors, 1, memory_order_relaxed) + 1;
