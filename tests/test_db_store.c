@@ -5938,6 +5938,8 @@ static int run_recon_thread(const char *dir) {
         static pz_t page[10];
         uint64_t kn0, sd0, kn1, sd1;
         store_counts(st, &kn0, &sd0);
+        db_recon_status_t r0;
+        db_recon_status(&r0);                                              /* (the passes so far: the slow pass is the next one) */
         db_recon_test_entry_hook = slow_entry;                             /* (a millisecond for every entry: 600 entries, 600 ms) */
         p_batch_begin(a[0], &e, 2, KDB_BATCH_FULL, 0);
         p_manifest_begin(a[0], &e, 2, 600, 6, true);
@@ -5974,7 +5976,7 @@ static int run_recon_thread(const char *dir) {
         CHECK_MSG(got_lookup, "the lookup request was not on the fetch stream (%d other requests)", n_fill);
         const int64_t dt = now_us() - t0;
         db_recon_status(&r);
-        CHECK_MSG(r.active && r.entries < 600, "the pass was over when the lookup request came (%llu entries)", (unsigned long long)r.entries);   /* (the request did not wait for the pass) */
+        CHECK_MSG(r.active ? r.entries < 600 : r.passes == r0.passes, "the pass was over when the lookup request came (%llu entries, %llu passes, %llu before)", (unsigned long long)r.entries, (unsigned long long)r.passes, (unsigned long long)r0.passes);   /* (the request did not wait for the pass: the pass runs, or the thread has not begun it while its pages wait) */
         printf("    the request of a lookup was on the fetch stream %lld us after it was made, with %llu pages of the slow pass waiting\n", (long long)dt, (unsigned long long)maxq);
         CHECK_MSG(dt < 150000, "the lookup waited %lld us", (long long)dt);
         {
