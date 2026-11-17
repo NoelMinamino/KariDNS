@@ -366,6 +366,10 @@ typedef struct retire {
 /* An index change of a record, kept for a growth that is being built outside the mutex (rg_*): which index (0 ix, 1 sx), put or take out, the
  * hash and the zone id.  The bigger index is brought up to date with these, in their order, before it is put in. */
 typedef struct { uint64_t h; uint32_t z; uint8_t which, ins; uint16_t pad; } rgent_t;
+#define RG_LOG_MAX (8u << 20)                 /* index changes kept for one build (128 MiB): more drops it */
+#define RG_CH_SHIFT 16                        /* the log is kept in chunks of 2^16 entries (1 MiB) */
+#define RG_CH (1u << RG_CH_SHIFT)
+#define RG_NCH (RG_LOG_MAX / RG_CH)
 #define JB_MAXPL 208                      /* index ops of one record: three for each entry of a group of KN_MAX (64), with room */
 typedef struct {
   uint8_t *p;
@@ -470,8 +474,8 @@ struct store {
   uint32_t ix_gen_next, sx_gen_next;                  /* the number of the next generation file (a dropped build does not reuse its number) */
   uint64_t rg_hwm, rg_nix, rg_nsx;
   uint32_t rg_ixgen, rg_sxgen;
-  rgent_t *rg_log;
-  size_t rg_n, rg_cap;
+  rgent_t *rg_ch[RG_NCH];                             /* the build's log of index changes, in chunks that never move (the build reads the part before rg_n with no lock while the writers append) */
+  _Atomic size_t rg_n;                                /* (written under the mutex, after the entries it covers: release) */
   _Atomic uint64_t n_growths_bg;
   /* holds of the writer mutex */
   uint64_t wl_t0;
@@ -2720,22 +2724,34 @@ static int regrow_locked(store_t *s, uint64_t ix_slots, uint64_t sx_slots) {
  * writer mutex, makes the logged changes on the new generations, in their order ("this hash leads to this zone" / "... no longer": each one sets the presence of one entry, so whatever
  * state of a zone the pass read, the last change of the entry decides), and puts them in with their OP_GEN record.  A build is dropped when a generation was changed meanwhile (a growth
  * inside the mutex, a repair: tabgen), when its log could not grow, or when the store closes; its files go.  If the index reaches one half before the build ends, the growth is made inside
- * the mutex as before. */
-#define RG_LOG_MAX (8u << 20)                 /* index changes kept for one build (128 MiB): more drops it */
+ * the mutex as before.
+ * The catch-up (0.7): at 10M zones the log of one build held up to 2.1 M changes, and making them inside the mutex took 0.18 to 0.34 s.  Now the build makes them in rounds with no lock
+ * (the log is in chunks that never move: the entries before rg_n, read with acquire, are not written again until the build ends; the writers append after them) until the part that is
+ * left is at most RG_TAIL changes (or after RG_ROUNDS rounds), and only that part is made inside the mutex, with the OP_GEN record.  The order is the order of the log either way. */
+#define RG_TAIL 4096u                         /* changes the build makes inside the mutex at most, unless the writers outrun RG_ROUNDS rounds */
+#define RG_ROUNDS 16
+#ifdef KARIDNS_UNIT_TEST
+_Atomic long store_test_rg_tail = -1;
+#define RG_TAIL_NOW() (atomic_load_explicit(&store_test_rg_tail, memory_order_relaxed) >= 0 ? (size_t)atomic_load_explicit(&store_test_rg_tail, memory_order_relaxed) : (size_t)RG_TAIL)
+#else
+#define RG_TAIL_NOW() ((size_t)RG_TAIL)
+#endif
 
 static void rg_note_locked(store_t *s, const jb_t *j) {
   if (!s->rg_active || s->rg_bad || j->npl == 0) return;
-  if (s->rg_n + j->npl > s->rg_cap) {
-    size_t nc = s->rg_cap ? s->rg_cap * 2 : 4096;
-    while (nc < s->rg_n + j->npl) nc *= 2;
-    rgent_t *nl = nc > RG_LOG_MAX ? NULL : realloc(s->rg_log, nc * sizeof(*nl));
-    if (!nl) { s->rg_bad = true; return; }
-    s->rg_log = nl;
-    s->rg_cap = nc;
+  size_t n = atomic_load_explicit(&s->rg_n, memory_order_relaxed);
+  if (n + j->npl > RG_LOG_MAX) { s->rg_bad = true; return; }
+  for (unsigned k = 0; k < j->npl;) {
+    rgent_t **c = &s->rg_ch[n >> RG_CH_SHIFT];
+    const size_t at = n & (RG_CH - 1), m = RG_CH - at < j->npl - k ? RG_CH - at : j->npl - k;
+    if (!*c && !(*c = malloc((size_t)RG_CH * sizeof(rgent_t)))) { s->rg_bad = true; return; }
+    memcpy(*c + at, j->pl + k, m * sizeof(rgent_t));
+    k += (unsigned)m;
+    n += m;
+    atomic_store_explicit(&s->rg_n, n, memory_order_release);
   }
-  memcpy(s->rg_log + s->rg_n, j->pl, (size_t)j->npl * sizeof(rgent_t));
-  s->rg_n += j->npl;
 }
+static inline const rgent_t *rg_ent(const store_t *s, size_t k) { return &s->rg_ch[k >> RG_CH_SHIFT][k & (RG_CH - 1)]; }
 
 /* one logged change on a new generation: the entry (hash, zone) is there (ins) or not; *used / *live follow */
 static int rg_apply(ixgen_t *g, const rgent_t *e, uint64_t *used, uint64_t *live) {
@@ -2755,6 +2771,18 @@ static int rg_apply(ixgen_t *g, const rgent_t *e, uint64_t *used, uint64_t *live
   return 0;
 }
 
+/* the logged changes [from, to) on the new generations (the counters follow) */
+typedef struct { uint64_t iu, il, su, sl; } rg_cnt_t;
+static int rg_catch_up(const store_t *s, ixgen_t *nix, ixgen_t *nsx, size_t from, size_t to, rg_cnt_t *c) {
+  int r = 0;
+  for (size_t k = from; k < to && r == 0; k++) {
+    const rgent_t *e = rg_ent(s, k);
+    if (e->which == 0 && nix) r = rg_apply(nix, e, &c->iu, &c->il);
+    else if (e->which == 1 && nsx) r = rg_apply(nsx, e, &c->su, &c->sl);
+  }
+  return r;
+}
+
 /* The build (the thread of rg_start_locked(), or the caller of store_reserve()): 0 put in, -ECANCELED dropped, or -errno. */
 static int rg_build(store_t *s) {
   ixgen_t *nix = NULL, *nsx = NULL;
@@ -2766,29 +2794,38 @@ static int rg_build(store_t *s) {
   /* (no flush here: the build has to end before the writers fill the old index to one half, and the checkpoint that follows the growth flushes the new files) */
   CRASH_POINT();
   st_hook(&store_test_regrow_hook, 1);
+  rg_cnt_t c = { li, li, ls, ls };
+  size_t done = 0;
+  for (int round = 0; r == 0 && round < RG_ROUNDS; round++) {         /* the catch-up with no lock (rg_active keeps the log: no other build starts until this one ends) */
+    if (atomic_load_explicit(&s->rg_cancel, memory_order_relaxed) || atomic_load_explicit(&s->rg_stop, memory_order_relaxed)) { r = -ECANCELED; break; }
+    const size_t n = atomic_load_explicit(&s->rg_n, memory_order_acquire);
+    if (n - done <= RG_TAIL_NOW()) break;
+    r = rg_catch_up(s, nix, nsx, done, n, &c);
+    done = n;
+    CRASH_POINT();
+    st_hook(&store_test_regrow_hook, 3);
+  }
   const int lr = wr_lock(s);                          /* (a clean flag on disk is cleared first, with the mutex given up while the flags are waited for, as for every writer: the OP_GEN record is a
                                                        * change after it; journal_append()'s guard would only try the flags, and fail the growth when a commit or a checkpoint has them) */
   if (lr < 0) {
     wr_lock_raw(s);
     if (r == 0) r = lr;
   }
-  uint64_t iu = li, il = li, su = ls, sl = ls;
   if (r == 0 && (atomic_load_explicit(&s->rg_cancel, memory_order_relaxed) || atomic_load_explicit(&s->rg_stop, memory_order_relaxed) || s->tabgen != s->rg_tabgen || s->rg_bad))
     r = -ECANCELED;
-  for (size_t k = 0; k < s->rg_n && r == 0; k++) {
-    const rgent_t *e = &s->rg_log[k];
-    if (e->which == 0 && nix) r = rg_apply(nix, e, &iu, &il);
-    else if (e->which == 1 && nsx) r = rg_apply(nsx, e, &su, &sl);
-  }
-  if (r == 0) r = rg_publish_locked(s, nix, nsx, iu, il, su, sl);
+  if (r == 0) r = rg_catch_up(s, nix, nsx, done, atomic_load_explicit(&s->rg_n, memory_order_relaxed), &c);
+  if (r == 0) r = rg_publish_locked(s, nix, nsx, c.iu, c.il, c.su, c.sl);
   if (r == 0) {
     atomic_fetch_add_explicit(&s->n_growths_bg, 1, memory_order_relaxed);
     nix = nsx = NULL;
   }
   s->rg_active = false;
-  s->rg_n = 0;
-  if (s->rg_cap > 65536) { free(s->rg_log); s->rg_log = NULL; s->rg_cap = 0; }
+  atomic_store_explicit(&s->rg_n, 0, memory_order_relaxed);
+  rgent_t *spare[RG_NCH];                             /* (the chunks past the first are freed after the mutex) */
+  memcpy(spare, s->rg_ch, sizeof(spare));
+  memset(s->rg_ch + 1, 0, sizeof(s->rg_ch) - sizeof(s->rg_ch[0]));
   wr_unlock_raw(s);
+  for (unsigned k = 1; k < RG_NCH; k++) free(spare[k]);
   if (r == 0) st_hook(&store_test_regrow_hook, 2);
   ixgen_drop(s, nix, FK_IX);
   ixgen_drop(s, nsx, FK_SX);
@@ -2814,7 +2851,7 @@ static bool rg_start_locked(store_t *s, uint64_t nix, uint64_t nsx, bool spawn) 
   s->rg_sxgen = nsx ? s->sx_gen_next++ : 0;
   s->rg_hwm = hwm;
   s->rg_tabgen = s->tabgen;
-  s->rg_n = 0;
+  atomic_store_explicit(&s->rg_n, 0, memory_order_relaxed);
   s->rg_bad = false;
   atomic_store_explicit(&s->rg_cancel, false, memory_order_relaxed);
   s->rg_active = true;
@@ -6277,7 +6314,7 @@ int store_close(store_t *s) {
   pthread_mutex_destroy(&s->ap_mu);
   pthread_cond_destroy(&s->bg_cv);
   err_ring_close(s);
-  free(s->rg_log);
+  for (unsigned k = 0; k < RG_NCH; k++) free(s->rg_ch[k]);
   free(s->sbbuf);
   free(s->jb.p);
   free(s->cl_buf);

@@ -845,7 +845,10 @@ new zone and a full segment are written inside the mutex
 \fBstore.writes.growths_background\fR
 Of \fBgrowths\fR: the index growths that were built outside the writer mutex (a
 growth is made inside it only when the index fills up to one half before the
-build ends)
+build ends). The changes the writers made to the index while it was built are
+made on the new one with no lock too, in rounds (0.7); only the last few
+thousand of them are made inside the mutex, with the record that puts the new
+index in
 .TP 8
 \fBstore.flusher\fR
 1: the store's flusher threads make the commits (every 100 ms while records

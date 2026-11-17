@@ -519,7 +519,8 @@ int  store_check(store_t *s, store_check_report_t *rep);
 
 /* ---- test support ---- */
 /* in every build (0 / NULL = off): called by a checkpoint after each of its steps outside the writer mutex (1: the journal was switched, 2: the journal before the switch is durable,
- * 3: the tables are written, 4: the superblock is written, 5: after each run of table pages written), and by a growth of the index built outside the mutex (1: the bigger index is built, 2: it was put in); tests make a step slow, or kill the process there */
+ * 3: the tables are written, 4: the superblock is written, 5: after each run of table pages written), and by a growth of the index built outside the mutex (1: the bigger index is built, 2: it was put in,
+ * 3: after each round of its catch-up of the logged changes, with no lock held); tests make a step slow, or kill the process there */
 extern void (*_Atomic store_test_ckpt_hook)(int step);
 extern void (*_Atomic store_test_regrow_hook)(int step);
 /* ... and by a commit (0.7): 1: the journal was switched to the file made ahead (writer mutex held), 2: the file before is synced (not closed yet), 3: the next file is made ahead */
@@ -533,6 +534,8 @@ extern _Atomic bool store_test_no_flusher;
 extern _Atomic long store_test_crash_countdown;
 /* called by the writer between the ops of a journal record that publish a zone (cells, indexes) and the counters op of the same record: the window in which a reader can see a new zone before the counters of its segment (0 = off) */
 extern void (*store_test_before_counters)(store_t *s);
+/* the logged index changes a growth's build makes inside the writer mutex at most (-1: the built-in 4096); the rest it makes in rounds with no lock */
+extern _Atomic long store_test_rg_tail;
 /* a commit fails with -EIO at the n-th one (0 = off): a failed fdatasync */
 extern _Atomic long store_test_fail_commit;
 /* the n-th write of a run of table pages by a checkpoint fails with -EIO (0 = off) */

@@ -1398,7 +1398,7 @@ typedef struct { _Atomic uint64_t begun, done, acked; } shm_t;
 
 /* modes 3 and 4 of the kill loop (0.7 fix A): a step of a checkpoint that runs outside the writer mutex (3: a thread checkpoints all the time, the flush of the tables is made slow) or of a
  * growth of the index built outside it (4: the build waits before it takes the mutex, so that the writers' changes pile up in its log) is reached while the operations go on, and the child is
- * killed at the n-th time one step is reached (g_hk_step: 1..5 a checkpoint step (5: between two runs of its write of the tables), 11..12 a growth step; 0: not by a hook) */
+ * killed at the n-th time one step is reached (g_hk_step: 1..5 a checkpoint step (5: between two runs of its write of the tables), 11..13 a growth step (13: after a round of its catch-up with no lock); 0: not by a hook) */
 static _Atomic int g_hk_step, g_hk_n;
 static void hk_kill(int step) {
   if (atomic_load(&g_hk_step) == step && atomic_fetch_sub(&g_hk_n, 1) == 1) kill(getpid(), SIGKILL);
@@ -1409,6 +1409,7 @@ static void hk_ckpt(int step) {
 }
 static void hk_regrow(int step) {
   if (step == 1) usleep(3000);
+  if (step == 3) usleep(500);                         /* (3: after a round of the catch-up with no lock: the writers log more meanwhile) */
   hk_kill(10 + step);
 }
 static void hk_commit(int step) { hk_kill(20 + step); }
@@ -1437,7 +1438,10 @@ static void child_main(const char *path, shm_t *shm, uint64_t K0, uint64_t count
   if (g_kill_mode == 1) { o.compact_rate = UINT64_MAX; o.nx_reclaim_min = 256; }
   store_test_crash_countdown = countdown;
   if (g_kill_mode == 3) atomic_store(&store_test_ckpt_hook, hk_ckpt);
-  if (g_kill_mode == 4) atomic_store(&store_test_regrow_hook, hk_regrow);
+  if (g_kill_mode == 4) {
+    atomic_store(&store_test_regrow_hook, hk_regrow);
+    atomic_store(&store_test_rg_tail, 0);             /* (every logged change is made in the rounds with no lock, but what the writers add during the last one) */
+  }
   if (g_kill_mode == 5) atomic_store(&store_test_commit_hook, hk_commit);
   store_t *s = NULL;
   if (store_open(fd, &o, &s) != 0) _exit(11);
@@ -1496,7 +1500,7 @@ static void test_kill_loop(int iters, int mode) {
     long cd = use_countdown ? 1 + (long)((rng >> 8) % 24000) : 0;
     atomic_store(&g_hk_step, 0);
     if (mode >= 3 && use_countdown && ((rng >> 5) & 1)) {             /* (half of the planned kills at a step of the new code instead of a crash point) */
-      atomic_store(&g_hk_step, mode == 3 ? 1 + (int)((rng >> 8) % 5) : mode == 4 ? 11 + (int)((rng >> 8) % 2) : 21 + (int)((rng >> 8) % 3));
+      atomic_store(&g_hk_step, mode == 3 ? 1 + (int)((rng >> 8) % 5) : mode == 4 ? 11 + (int)((rng >> 8) % 3) : 21 + (int)((rng >> 8) % 3));
       atomic_store(&g_hk_n, 1 + (int)((rng >> 12) % (mode == 3 ? 12 : mode == 4 ? 2 : 40)));
       cd = 0;
       hk_kills++;
@@ -2706,6 +2710,90 @@ static void test_commit_switch(void) {
     CHECK_EQ(store_close(s), 0);
   }
   tdir_free(&d);
+}
+
+/* 0.7: a growth built outside the mutex catches up with its log in rounds with no lock, and makes only the rest inside it.  The changes come at the two places where they can: before
+ * the first round (the build was waiting) and during a round (the hook after the first round writes more); with no tail every logged change but the last round's is made with no
+ * lock (two rounds), with the built-in tail (4096) the few changes are all made inside the mutex (no round).  Either way the new index holds every change, before and after a reopen. */
+static store_t *g_gc_store;
+static _Atomic int g_gc_rounds, g_gc_go, g_gc_idle, g_gc_bad;
+static _Atomic uint32_t g_gc_next;
+static int gc_delete(store_t *s, uint32_t i) {
+  char nm[160];
+  name_of(i, nm, sizeof(nm));
+  return store_delete_name(s, 0, nm, strlen(nm));
+}
+static void gc_hook(int step) {
+  store_t *s = g_gc_store;
+  if (step == 1) {
+    atomic_store(&g_gc_go, 1);                                            /* (the main thread stops writing: the changes of the test are the hook's alone) */
+    for (int w = 0; w < 5000 && !atomic_load(&g_gc_idle); w++) usleep(1000);
+    for (int k = 0; k < 40; k++) if (put_i(s, 0, atomic_fetch_add(&g_gc_next, 1), 1, NULL) != 0) atomic_store(&g_gc_bad, 1);
+    if (gc_delete(s, 5) != 0 || put_src(s, 6, 3, 777) != 0) atomic_store(&g_gc_bad, 2);
+  } else if (step == 3 && atomic_fetch_add(&g_gc_rounds, 1) == 0) {     /* (logged while the build catches up: the next round or the rest inside the mutex makes them) */
+    for (int k = 0; k < 10; k++) if (put_i(s, 0, atomic_fetch_add(&g_gc_next, 1), 1, NULL) != 0) atomic_store(&g_gc_bad, 3);
+    if (gc_delete(s, 7) != 0 || put_src(s, 8, 3, 778) != 0) atomic_store(&g_gc_bad, 4);
+  }
+}
+static bool gc_model_ok(store_t *s, uint32_t next, bool round_writes) {      /* (round_writes: the hook after the first round made its changes) */
+  for (uint32_t i = 0; i < next; i++) {
+    const bool gone = i == 5 || (round_writes && i == 7);
+    if (gone ? find_i(s, 0, i) != STORE_NONE : !verify_i(s, 0, i, i == 6 || (round_writes && i == 8) ? 3 : 1)) { printf("  zone %u not as the model says\n", i); return false; }
+  }
+  return store_find_source(s, 6 % 4, 777, 0) == find_i(s, 0, 6) && store_find_source(s, 6 % 4, 7, 0) == STORE_NONE &&
+         (round_writes ? store_find_source(s, 8 % 4, 778, 0) == find_i(s, 0, 8) && store_find_source(s, 7 % 4, 8, 0) == STORE_NONE
+                       : store_find_source(s, 8 % 4, 9, 0) == find_i(s, 0, 8));
+}
+static void test_growth_catchup(void) {
+  printf("[a growth built outside the mutex catches up with its log in rounds with no lock]\n");
+  for (int run = 0; run < 2; run++) {
+    tdir_t d;
+    tdir_new(&d, "gcatch");
+    store_opts_t o;
+    small_opts(&o);
+    o.checkpoint_interval_ms = UINT32_MAX;
+    o.scrub_interval_s = UINT32_MAX;
+    store_t *s = NULL;
+    CHECK_EQ(store_open(d.fd, &o, &s), 0);
+    if (!s) { tdir_free(&d); return; }
+    CHECK_EQ(store_view_add(s, "default"), 0);
+    g_gc_store = s;
+    atomic_store(&g_gc_rounds, 0);
+    atomic_store(&g_gc_go, 0);
+    atomic_store(&g_gc_idle, 0);
+    atomic_store(&g_gc_bad, 0);
+    atomic_store(&g_gc_next, 0);
+    atomic_store(&store_test_rg_tail, run == 0 ? 0 : -1);
+    atomic_store(&store_test_regrow_hook, gc_hook);
+    store_stats_t st;
+    while (!atomic_load(&g_gc_go) && atomic_load(&g_gc_next) < 5000) {
+      CHECK_EQ(put_i(s, 0, atomic_fetch_add(&g_gc_next, 1), 1, NULL), 0);
+      store_stats(s, &st);
+      if (st.ix_used * 8 > st.ix_slots * 3) usleep(2000);               /* (the build began: it reaches its hook long before the old index is half full) */
+    }
+    atomic_store(&g_gc_idle, 1);
+    store_stats(s, &st);
+    for (int w = 0; w < 5000 && st.growths_background == 0; w++) { usleep(1000); store_stats(s, &st); }
+    atomic_store(&store_test_regrow_hook, NULL);
+    atomic_store(&store_test_rg_tail, -1);
+    CHECK_EQ(st.growths_background, 1);
+    CHECK_EQ(st.growths, st.growths_background);
+    CHECK_EQ(atomic_load(&g_gc_bad), 0);
+    CHECK_EQ(atomic_load(&g_gc_rounds), run == 0 ? 2 : 0);
+    const uint32_t next = atomic_load(&g_gc_next);
+    CHECK(next > 300);
+    CHECK(gc_model_ok(s, next, run == 0));
+    check_consistent(s, "after the catch-up");
+    CHECK_EQ(store_close(s), 0);
+    o.create = false;
+    CHECK_EQ(store_open(d.fd, &o, &s), 0);
+    if (s) {
+      CHECK(gc_model_ok(s, next, run == 0));
+      check_consistent(s, "reopened after the catch-up");
+      CHECK_EQ(store_close(s), 0);
+    }
+    tdir_free(&d);
+  }
 }
 
 static void test_journal_bound(int mode) {
@@ -5084,7 +5172,7 @@ int main(void) {
   if (WANT("group")) { test_group_commit(STORE_MODE_MAP); test_group_commit(STORE_MODE_COPY); test_group_journal(); }
   if (WANT("kill")) test_kill_loop(iters, 0);
   if (WANT("kgrp")) test_kill_loop(UNDER_TSAN ? 25 : 50, 2);
-  if (WANT("nowait")) { test_no_wait_in_lock(STORE_MODE_MAP); test_no_wait_in_lock(STORE_MODE_COPY); }
+  if (WANT("nowait")) { test_no_wait_in_lock(STORE_MODE_MAP); test_no_wait_in_lock(STORE_MODE_COPY); test_growth_catchup(); }
   if (WANT("jbound")) { test_journal_bound(STORE_MODE_MAP); test_journal_bound(STORE_MODE_COPY); }
   if (WANT("kfz")) test_kill_loop(UNDER_TSAN ? 25 : 50, 3);
   if (WANT("kgrow")) test_kill_loop(UNDER_TSAN ? 20 : 50, 4);
