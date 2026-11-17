@@ -464,6 +464,35 @@ static void test_amtrelay_layout(void) {
 
 /* dig 9.18 compatibility: no quotes around ipv4hint/ipv6hint values; NID/L64 identifiers print like an
  * IPv6 address's low 64 bits, without leading zeros in each hextet group. */
+/* +idnin / +idnout as dig 9.20 (libidn2) does them: names and results measured on pc200 with dig 9.20.30 / libidn2 2.3.8 (tests/run_dag_idn_test.sh has the rest) */
+static void test_idn_like_dig(void) {
+    bool alloc = true;
+    const char *ascii = "WWW.Example.TEST";
+    assert(idn_to_ascii(ascii, &alloc) == ascii && !alloc);            /* an ASCII name is sent as typed */
+#ifdef HAVE_LIBIDN2
+    static const struct { const char *in, *out; } v[] = {
+        { "\xe2\x98\x83.example", "xn--n3h.example" },                                     /* ☃: DISALLOWED, so the transitional mapping */
+        { "stra\xc3\x9f" "e.\xe2\x98\x83.example", "strasse.xn--n3h.example" },             /* ... of the whole name: ß becomes ss */
+        { "stra\xc3\x9f" "e.example", "xn--strae-oqa.example" },                           /* non-transitional otherwise: ß kept */
+        { "\xe4\xbe\x8b\xe3\x81\x88.test.", "xn--r8jz45g.test." },
+    };
+    for (size_t i = 0; i < sizeof(v) / sizeof(v[0]); i++) {
+        const char *r = idn_to_ascii(v[i].in, &alloc);
+        assert(alloc && strcmp(r, v[i].out) == 0);
+        idn2_free((void *)r);
+    }
+    const char *bidi = "a\xd9\xa1.\xe2\x98\x83.example";                                 /* a١.☃: BIDI comes first, dig sends the octets */
+    assert(idn_to_ascii(bidi, &alloc) == bidi && !alloc);
+    char buf[256];
+    assert(strcmp(idn_to_unicode("XN--R8JZ45G.test", buf, sizeof(buf)), "\xe4\xbe\x8b\xe3\x81\x88.test") == 0);
+    assert(strcmp(idn_to_unicode("xn--zz.test", buf, sizeof(buf)), "xn--zz.test") == 0);
+#else
+    const char *snow = "\xe2\x98\x83.example";
+    assert(idn_to_ascii(snow, &alloc) == snow && !alloc);
+#endif
+    printf("  [OK] +idnin / +idnout as dig 9.20\n");
+}
+
 static void test_dig_compat_formatting(void) {
     printf("[TEST] dag: dig-compatible SVCB hints and NID/L64 formatting...\n");
     char out[256];
@@ -1132,6 +1161,7 @@ int main(void) {
     test_compression_limits();
     test_txt_like_wire_check();
     test_amtrelay_layout();
+    test_idn_like_dig();
     test_dig_compat_formatting();
     test_rrsig_cache_signature();
     test_round_trip_all_types();

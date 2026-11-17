@@ -3585,13 +3585,19 @@ static void test_space(int mode) {
   CHECK_EQ(st.space_level, 2);
   CHECK(st.degraded_since_unix != 0);
   CHECK_EQ(log_count(3, "no room for zone images"), 1);                    /* once a minute */
-  /* the zones before it are stored and served; the zones after it have their record (name, version) without an image */
+  /* the zones before it are stored and served; every zone after it has its record (name, version), without an image or, when room came back meanwhile, with its image whole.  (Room
+   * can come back between two puts: the journal files that a checkpoint cut are deleted, and the estimate of the free space is read again after a second or a megabyte, so on a
+   * slow machine a later zone may fit again: what must not happen is a record with a wrong version or an image that is not the zone's.) */
   for (uint32_t i = 1000; i < first_known; i++) CHECK(verify_i(s, 0, i, 1));
+  unsigned after_known = 0;
   for (uint32_t i = first_known; i < first_known + 40; i++) {
     store_zone_t zi;
     uint32_t z = find_i(s, 0, i);
-    CHECK(z != STORE_NONE && store_zone_get(s, z, &zi) == 0 && zi.state == STORE_STATE_KNOWN && zi.img_len == 0 && zi.serial == 1 && zi.stamp_gen == 1);
+    const bool rec = z != STORE_NONE && store_zone_get(s, z, &zi) == 0 && zi.serial == 1 && zi.stamp_gen == 1;
+    CHECK(rec && ((zi.state == STORE_STATE_KNOWN && zi.img_len == 0) || (zi.state == STORE_STATE_STORED && verify_i(s, 0, i, 1))));
+    after_known += rec && zi.state == STORE_STATE_KNOWN;
   }
+  CHECK(after_known >= 20);                                               /* (most of them: the disk stays full) */
   /* a changed zone that is stored loses its image (its old record is released) and gets the new version as a record */
   store_stats_t before;
   store_stats(s, &before);

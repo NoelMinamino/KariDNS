@@ -36,6 +36,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/uio.h>
+#include <sys/wait.h>
 
 #include "../dns_config_parser.h"
 #include "../dns_db_ingest.h"
@@ -182,10 +183,14 @@ static bool wake_for(const char *zone, park_key_t *k, int ms) {
 }
 
 /* is the lookup of the name remembered as shed (the table of the shed names) at this moment? */
-static bool shed_held_now(const char *name) {
+static int run_part(const char *cmd);
+static int64_t mono_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
-    return park_shed_held(park_lookup_claim_key("default", name), (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+static bool shed_held_now(const char *name) {
+    return park_shed_held(park_lookup_claim_key("default", name), mono_ms());
 }
 
 /* the counters of the lookups (store.lookup.*) */
@@ -2349,10 +2354,10 @@ static int run_mode(const char *mode) {
     if (strcmp(mode, "map") == 0 && g_self[0]) {                             /* the next start (a process of its own): hot.list is read and attached in the background */
         for (int ph = 0; ph < 5; ph++) {
             snprintf(cmd, sizeof(cmd), "%s hot %s %d", g_self, dir, ph);
-            CHECK(system(cmd) == 0);
+            CHECK(run_part(cmd) == 0);
         }
         snprintf(cmd, sizeof(cmd), "%s attab %s", g_self, dir);                 /* 0.7 M4: the attach table grows outside the registry's lock */
-        CHECK(system(cmd) == 0);
+        CHECK(run_part(cmd) == 0);
     }
     snprintf(cmd, sizeof(cmd), "rm -rf %s", dir);
     (void)!system(cmd);
@@ -5511,10 +5516,12 @@ static int run_lookup_body(const char *dir) {
         }
         CHECK(!ch_next(&fetchc, &m, 300));
         CHECK(lk_stats().in_flight == 6 && lk_stats().pending == 3 && lk_stats().shed == shed0 + 3);
+        for (int t = 0; t < 400 && lk_stats().remembered < rem0 + 3; t++) usleep(1000);            /* (the counter of the shed goes up before the name is remembered) */
+        const int64_t t_shed = mono_ms();                                                       /* (the sheds are done; the check below looks at this moment, not after the waits: a slow runner may pass park-timeout) */
         for (int i = 9; i < 12; i++) {
             snprintf(nm, sizeof(nm), "s%d.nz.test.", i);
+            CHECK(park_shed_held(park_lookup_claim_key("default", nm), t_shed));                  /* (a name that was shed is remembered: its worker asks no more for it) */
             CHECK(wake_for(nm, &k, 5000) && k.ask == PARK_ASK_DROP && !k.failed && !park_claim_held(park_lookup_claim_key("default", nm)));
-            CHECK(shed_held_now(nm));                                                             /* (a name that was shed is remembered: its worker asks no more for it) */
         }
         CHECK(!shed_held_now("s0.nz.test.") && !shed_held_now("s8.nz.test."));                    /* (the ones that were asked for, or wait, are not) */
         for (int i = 6; i < 9; i++) {
@@ -6137,6 +6144,15 @@ static int run_recon_thread(const char *dir) {
 }
 
 
+/* a part of the test in a process of its own: a part that ends without its "checks" line (a signal, an exit from a thread) says how it ended */
+static int run_part(const char *cmd) {
+    const int rc = system(cmd);
+    if (rc == -1) printf("  [FAIL] %s: system() failed\n", cmd);
+    else if (WIFSIGNALED(rc)) printf("  [FAIL] %s: killed by signal %d\n", cmd, WTERMSIG(rc));
+    else if (WIFEXITED(rc) && WEXITSTATUS(rc) != 0) printf("  [FAIL] %s: exit status %d\n", cmd, WEXITSTATUS(rc));
+    return rc;
+}
+
 static int proto_main(const char *self) {
     char dir[600];
     const char *tmp = getenv("TMPDIR");
@@ -6146,7 +6162,7 @@ static int proto_main(const char *self) {
     for (int phase = 0; phase < 9; phase++) {
         char cmd[900];
         snprintf(cmd, sizeof(cmd), "%s proto%d %s", self, phase, dir);
-        if (system(cmd) != 0) bad++;
+        if (run_part(cmd) != 0) bad++;
         if (phase == 0 || phase == 2 || phase == 3 || phase == 5 || phase == 6 || phase == 7) {                   /* (phase 0 is the legacy loader on an empty store, phase 3 the fixes of the review, phase 4 the settings: the next phases start on a new store; phase 5 follows phase 4 on its store) */
             char rm[700];
             snprintf(rm, sizeof(rm), "rm -rf %s/s", dir);
@@ -6341,6 +6357,7 @@ static int run_heap(int nz, const char *mode) {
 }
 
 int main(int argc, char **argv) {
+    signal(SIGPIPE, SIG_IGN);                               /* (as the server does, dns_server_core.c: a write to a stream whose other end the test closed is EPIPE, not the end of the process; the parts inherit it) */
     zi_www_varies = 1;                                      /* (the www address of a zone follows its serial) */
     setvbuf(stdout, NULL, _IOLBF, 0);                       /* (a log that shows where the time goes, also through a pipe) */
     g_self = argv[0];
@@ -6360,12 +6377,12 @@ int main(int argc, char **argv) {
     /* the second mode is a second process: the ingest thread and the store are process wide */
     char cmd[512];
     snprintf(cmd, sizeof(cmd), "%s copy", argv[0]);
-    int rc = system(cmd);
+    int rc = run_part(cmd);
     int rc2 = run_mode("map");
     int rc3 = proto_main(argv[0]);
     snprintf(cmd, sizeof(cmd), "%s s5 map", argv[0]);
-    int rc4 = system(cmd);
+    int rc4 = run_part(cmd);
     snprintf(cmd, sizeof(cmd), "%s s5 copy", argv[0]);
-    int rc5 = system(cmd);
+    int rc5 = run_part(cmd);
     return (rc != 0 || rc2 != 0 || rc3 != 0 || rc4 != 0 || rc5 != 0) ? 1 : 0;
 }
