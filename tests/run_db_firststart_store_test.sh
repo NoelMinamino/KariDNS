@@ -1,11 +1,11 @@
 #!/bin/sh
-# run_db_firststart_store_test.sh - 0.7 M2, the first start of a zone store: the manifest pass is applied by the reconcile thread (dns_db_recon.c) in groups of up to 64 entries, off the thread that
+# run_db_firststart_store_test.sh - 0.7 M2, the first start of a zone store: the manifest pass is applied by the reconcile thread (dns_db_recon.c) in groups of up to 32 entries, off the thread that
 # answers the fetches and the lookups.
 #
 # A database of FIRSTSTART_ZONES zones (default 30000, tests/db/gen_sqlite3_zones.sh) is read into an empty store by the real server and loader.  Checked:
 #   1. queries during the pass: a cold burst for FIRSTSTART_QUERIES zones (default 5000, in a random order) starts with the server, while the pass and the fill go on; every one is NOERROR (a zone the pass
 #      has not listed yet is looked up, one that is listed and has no body is fetched), none is REFUSED or SERVFAIL, none is lost, and the drops are 0 at this load (store.lookup.drop.*, store.park.drop.*);
-#      the pass is applied by the thread (store.recon.thread, entries, pages) in group records (store.recon.group_entries = the zones, group_records about zones / 64: one journal record for 64 entries);
+#      the pass is applied by the thread (store.recon.thread, entries, pages) in group records (store.recon.group_entries = the zones, group_records about zones / 32: one journal record for 32 entries, STORE_GROUP_MAX);
 #      the stream thread of the Backend is not kept long by a frame: store.ingest.stream_max_us is at most FIRSTSTART_STREAM_US (default 250000, a generous bound: a loaded VM stalls a thread for tens of ms,
 #      and the bound only shows that the thread is not busy for a pass; that no page is decoded or recorded there is shown by the counters, store.recon.thread_entries and pages, and by tests/test_db_store.c)
 #      and the loop of the ingest thread is reported (store.ingest.loop_max_us, it also has the bodies of the fill: the zones the fill reads are built on that thread);
@@ -121,7 +121,7 @@ waitfor 120 stored_n "$NZ" && pass "the store holds all $NZ zones" || fail "the 
 [ "$(sf store.recon.thread)" = 1 ] && pass "the reconcile thread runs (store.recon.thread=1)" || fail "store.recon.thread=$(sf store.recon.thread)"
 [ "$(sf store.recon.thread_entries)" = "$NZ" ] && [ "$(sf store.recon.pass.entries)" = "$NZ" ] && pass "the thread applied the $NZ entries of the pass (store.recon.thread_entries, pages $(sf store.recon.thread_pages))" || fail "thread_entries=$(sf store.recon.thread_entries) pass.entries=$(sf store.recon.pass.entries)"
 GE=$(sf store.recon.group_entries); GR=$(sf store.recon.group_records)
-[ "${GE:-0}" -ge "$NZ" ] 2>/dev/null && [ "${GR:-0}" -ge $((NZ / 64)) ] 2>/dev/null && [ "${GR:-0}" -le $((NZ / 64 + NZ / 200 + 10)) ] 2>/dev/null && pass "the entries were recorded in groups: $GE entries in $GR journal records (64 an entry at most)" || fail "group_entries=$GE group_records=$GR"
+[ "${GE:-0}" -ge "$NZ" ] 2>/dev/null && [ "${GR:-0}" -ge $((NZ / 32)) ] 2>/dev/null && [ "${GR:-0}" -le $((NZ / 32 + NZ / 200 + 10)) ] 2>/dev/null && pass "the entries were recorded in groups: $GE entries in $GR journal records (32 a record at most)" || fail "group_entries=$GE group_records=$GR"
 SM=$(sf store.ingest.stream_max_us); LM=$(sf store.ingest.loop_max_us)
 [ -n "$SM" ] && [ "$SM" -le "$STREAM_US" ] 2>/dev/null && pass "the stream thread was not kept more than ${STREAM_US} us by a frame (store.ingest.stream_max_us=$SM; the loop of the thread: store.ingest.loop_max_us=$LM)" || fail "store.ingest.stream_max_us=$SM (limit $STREAM_US), loop_max_us=$LM"
 WH=$(sf store.lock.writer_hold_max_us); RH=$(sf store.lock.records_hold_max_us); RW=$(sf store.lock.records_wait_max_us)
