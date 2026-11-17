@@ -5272,6 +5272,13 @@ static int run_lookup_body(const char *dir) {
     g_query_bg_fetch = no_bg_fetch;
     g_query_bg_attach = no_bg_fetch;
 
+    /* -- 0. before the loader's HELLO (the first second of a start: the list of the zones is unknown, the loader not up yet): a query for a name that no zone covers waits for the loader that is
+     *       expected, it is not REFUSED; its lookup is made once the HELLO says the loader looks names up */
+    CHECK(db_ingest_lookup_wanted() && !db_ingest_lookup_ready());
+    drain_wakes();
+    CHECK(lk_asked("www.early.test."));
+    CHECK(!wake_for("www.early.test.", &k, 300) && lk_stats().refused == 0 && lk_stats().pending == 1);
+
     kdb_enc_begin(&e, KDB_T_HELLO);
     kdb_enc_u16(&e, 1, 1); kdb_enc_str(&e, 2, "test-loader"); kdb_enc_str(&e, 3, "sqlite3"); kdb_enc_u32(&e, 4, 4242); kdb_enc_u32(&e, 5, KDB_FEAT_STORE | KDB_FEAT_LOOKUP | KDB_FEAT_LOOKUP_BODY | KDB_FEAT_IMAGE); kdb_enc_u32(&e, 6, ZONE_IMAGE_VERSION);
     kdb_enc_end(&e);
@@ -5279,6 +5286,12 @@ static int run_lookup_body(const char *dir) {
     CHECK(ch_next(&mainc, &m, 5000) && m.type == KDB_T_CONFIG && m.u.config.store_proto);
     CHECK(ch_next(&mainc, &m, 5000) && m.type == KDB_T_DEBUG);
     CHECK(db_ingest_lookup_ready());
+    {
+        const uint64_t r0 = lk_next(&fetchc, "www.early.test.");                          /* (the request that waited for the HELLO) */
+        CHECK(r0 != 0);
+        lk_none(f[0], &e, r0);
+        CHECK(wake_for("www.early.test.", &k, 5000) && !k.failed && places_are(0, 2000) && lk_stats().none == 1 && lk_stats().refused == 0 && lk_stats().pending == 0);
+    }
     usleep(300000);                                                                        /* (the manager's thread has taken fetch-concurrency 8 and park-timeout 1000 ms) */
     CHECK(!ch_next(&fetchc, &m, 200));
     const int vid = store_view_id(st, "default");
@@ -5321,7 +5334,7 @@ static int run_lookup_body(const char *dir) {
     rid = lk_next(&fetchc, "www.nothing.test.");
     CHECK(places_are(1, 2000));
     lk_none(f[0], &e, rid);
-    CHECK(wake_for("www.nothing.test.", &k, 5000) && !k.failed && park_places_used() == 0 && lk_stats().none == 1);
+    CHECK(wake_for("www.nothing.test.", &k, 5000) && !k.failed && park_places_used() == 0 && lk_stats().none == 2);            /* (and the one of step 0) */
 
     /* -- 4. a loader that cannot be believed (the stream is hostile input).  Nothing it says is installed unless the answer announced it; the request goes on until the right body or the time is up. */
     {

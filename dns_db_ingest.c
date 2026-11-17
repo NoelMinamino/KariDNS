@@ -1600,7 +1600,7 @@ static _Atomic uint64_t g_fq_hist[FQ_HIST_N];              /* fetches installed,
 static _Atomic uint32_t g_ing_busy_pct;                    /* share of the last window (~10 s) the ingest thread was not waiting for events */
 /* 0.7, the by-name lookups of the first start (FETCH_REQ mode KDB_FETCH_LOOKUP): the loader answers them (HELLO features, the store protocol on), and what became of them */
 static _Atomic bool g_lookup_on;
-static _Atomic bool g_lookup_hold;                         /* the last loader that said its HELLO looks names up, connected now or not: while its pass is pending a query for a name no zone covers waits for the loader's return (it is dropped at its time-out), it is not refused (0.7) */
+static _Atomic bool g_lookup_hold;                         /* the last loader that said its HELLO looks names up, connected now or not (or, with the store on, no loader has said its HELLO since the start): while its pass is pending a query for a name no zone covers waits for the loader's return (it is dropped at its time-out), it is not refused (0.7) */
 static _Atomic uint64_t g_lk_found, g_lk_none, g_lk_failed, g_lk_refused, g_lk_dup;
 static _Atomic uint64_t g_lk_asked, g_lk_body, g_lk_covered, g_lk_shed, g_lk_expired, g_lk_bad, g_lk_max_ns;     /* requests of the workers taken; bodies that came with the answer and were taken; names whose zone was known by the time they were to go; requests dropped because the queue was full; queue entries whose time was up; bodies that were thrown away; the longest time to an answer */
 static _Atomic uint32_t g_fp_max_n;                        /* the most requests one pass of fetch_issue() handled, since the start */
@@ -3780,7 +3780,7 @@ static void lq_expire(ing_t *g, int64_t now) {
 /* a request of a worker (mode KDB_FETCH_LOOKUP) taken from a ring: vi is the loader's index of its view (-1: none).  It is made now, or it waits for a place in the queue. */
 static void lookup_offer(ing_t *g, const park_fetch_req_t *q, int vi) {
   atomic_fetch_add_explicit(&g_lk_asked, 1, memory_order_relaxed);
-  if (vi < 0 || !atomic_load_explicit(&g_lookup_hold, memory_order_acquire) || !lookup_name_ok(q->zone)) {      /* (the worker did not know: it asked, and is woken as for the end of a lookup; a loader that is away for a while is not this case: the request waits for it) */
+  if ((vi < 0 && g->hello_done) || !atomic_load_explicit(&g_lookup_hold, memory_order_acquire) || !lookup_name_ok(q->zone)) {      /* (the worker did not know: it asked, and is woken as for the end of a lookup; a loader that is away for a while is not this case: the request waits for it.  Before the first HELLO the views of the database are not known yet: the request waits, lq_pump_one() looks at its view again) */
     atomic_fetch_add_explicit(&g_lk_refused, 1, memory_order_relaxed);
     if (q->worker >= 0) park_wake_queue_one(q->worker, q->view, q->zone, false);
     else park_wake_queue_all(q->view, q->zone, false);
@@ -5150,6 +5150,10 @@ bool db_ingest_start(int stream_fd, int ctrl_fd, int fetch_fd) {
   g->wq = s_wq;
   if (!s_lq) s_lq = calloc(ING_LQ_MAX, sizeof(*s_lq));       /* (NULL: a lookup that finds no place is dropped) */
   g->lq = s_lq;
+  /* 0.7: until the first loader's HELLO says whether it looks names up, one that does is expected when the store is on (it is the loader of this package): a query for a name that no
+   * listed zone covers, while a view's list of zones is not complete (a first fill), waits for that loader as it waits for one that is away (its lookup is queued and made after the
+   * HELLO, or dropped at its time-out, counted), not REFUSED in the second before the loader is up.  The HELLO sets the hold for what the loader is (on_hello()). */
+  atomic_store_explicit(&g_lookup_hold, db_store_enabled(), memory_order_release);
   g->stream_fd = -1;
   g->fetch_fd = -1;
   g->cur_req = -1;

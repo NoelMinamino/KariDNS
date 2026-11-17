@@ -4870,9 +4870,14 @@ not answer within \fBpark\-timeout\fR the query is dropped, and SERVFAIL + EDE
 pass of the view is pending the lookup waits in the Backend's queue for the
 loader and is dropped when \fBpark\-timeout\fR is up; REFUSED is for a loader
 that has no lookup (its HELLO says so), a view that takes no database zones, and
-a pass that has ended.  A loader that answers "busy" is overload, and the
-queries are dropped, not answered SERVFAIL.  This is done only for a QUERY of
-the class IN, only while the first pass of that view has not ended and the
+a pass that has ended.  The same holds for the moment after a start, before the
+first loader has said its HELLO: the Backend expects a loader that looks names
+up (the one of the package), so a query that comes in that moment waits for it
+as well (until then such queries were REFUSED for about the first second of a
+first start); a loader whose HELLO says it has no lookup ends the wait, and the
+queries are REFUSED as before.  A loader that answers "busy" is overload, and
+the queries are dropped, not answered SERVFAIL.  This is done only for a QUERY
+of the class IN, only while the first pass of that view has not ended and the
 loader offers it (after the pass an unknown name is REFUSED at once, with no
 round trip, so that random names never reach the database), once per query (a
 query that comes back with the answer of the lookup, or after its time was up,
