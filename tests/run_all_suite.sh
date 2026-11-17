@@ -804,6 +804,7 @@ register_test "dag" "sh" "tests/run_dag_badcookie_transport_test.sh" "dag BADCOO
 register_test "dag" "sh" "tests/run_dag_bind_address_family_mismatch_test.sh" "dag -b bind address family mismatch detection"
 register_test "dag" "sh" "tests/run_dag_break_help_examples_test.sh" "dag --break help examples syntax and execution test"
 register_test "dag" "sh" "tests/run_dag_cli_options_test.sh" "dag CLI Options, IDN, EDNSOPT, Prereq, and Break Validation"
+register_test "dag" "sh" "tests/run_dag_idn_test.sh" "dag +idnin / +idnout byte for byte as dig 9.20 (libidn2), from measured vectors"
 register_test "dag" "sh" "tests/run_dag_compat_test.sh" "dag BIND 9.20.26 compatibility test suite"
 register_test "dag" "sh" "tests/run_dag_cookie_mismatch_discard_test.sh" "dag RFC 7873 DNS Cookie echo verification & mismatch discard"
 register_test "dag" "sh" "tests/run_dag_dig_anomalous_suite.sh" "dag & dig anomalous DNS packet comprehensive validation suite"

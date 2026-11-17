@@ -1,4 +1,4 @@
-.TH KARICTL 8 "2026-11-16" "KariDNS" "KariDNS Manual"
+.TH KARICTL 8 "2026-11-17" "KariDNS" "KariDNS Manual"
 .\" Generated from docs/karictl.md by man/md2man.pl (make man): edit the Markdown manual, not this page.
 .SH NAME
 karictl \- Remote Control and Management Utility for KariDNS
@@ -792,15 +792,16 @@ size at which a checkpoint is forced (100 MiB: a replay of that takes about a
 second)
 .TP 8
 \fBstore.journal.bound_bytes\fR, \fB.peak_bytes\fR, \fB.limit_waits\fR, \fB.limit_wait_us\fR, \fB.limit_wait_max_us\fR
-0.7: the bound of the journal (twice \fB.max_bytes\fR), the largest size a
-journal file reached since the open, and the writes that waited at that bound
-for a checkpoint (their number, total and longest wait). When a checkpoint takes
-longer than the writing of \fB.max_bytes\fR of records (the disk does not keep
-up), the pass of the loader (the reconcile thread) waits there for it between
-two groups of entries, with no lock held, and the thread that also answers
-lookups waits only at four times \fB.max_bytes\fR: the journal, the replay after
-a crash and the clean stop stay bounded; a WARNING at most once a
-minute. \fB.limit_waits\fR stays 0 when the disk keeps up
+0.7: the bound of the journal (twice \fB.max_bytes\fR), the largest size the
+journal (every file since the last checkpoint) reached since the open, and the
+writes that waited at that bound for a checkpoint (their number, total and
+longest wait). When a checkpoint takes longer than the writing of
+\fB.max_bytes\fR of records (the disk does not keep up), the pass of the loader
+(the reconcile thread) waits there for it between two groups of entries, with no
+lock held, and the thread that also answers lookups waits only at four times
+\fB.max_bytes\fR: the journal, the replay after a crash and the clean stop stay
+bounded; a WARNING at most once a minute. \fB.limit_waits\fR stays 0 when the
+disk keeps up
 .TP 8
 \fBstore.checkpoint.count\fR, \fB.last_unix\fR, \fB.last_us\fR, \fB.max_us\fR, \fB.cancelled\fR
 Checkpoints since the open, when the last one ended, how long it took, the
@@ -812,6 +813,19 @@ store's writer mutex: writers go on meanwhile
 Writer counters since the open (\fBerrors\fR counts a commit or a checkpoint
 that failed in the background too; it is tried again)
 .TP 8
+\fBstore.journal.commit_switches\fR
+0.7: commits that switched the journal to the next file (made ahead): the
+records of a commit are synced in their file while the writers append to the
+next one, so an append never waits for the sync of its file (UFS holds the
+file's lock for a sync). A file goes once neither superblock names the chain it
+is in
+.TP 8
+\fBstore.writes.prewrites\fR, \fB.prewrite_misses\fR
+0.7: image records that \fBstore_put()\fR wrote before the writer mutex (the
+change inside it only records where they are), and those it wrote again inside
+the mutex because the zone, its record or the open segment changed in between. A
+new zone and a full segment are written inside the mutex
+.TP 8
 \fBstore.writes.growths_background\fR
 Of \fBgrowths\fR: the index growths that were built outside the writer mutex (a
 growth is made inside it only when the index fills up to one half before the
@@ -822,11 +836,18 @@ build ends)
 wait) and the checkpoints; 0: the writers make them after their call (no thread
 could be started)
 .TP 8
-\fBstore.lock.writer_holds\fR, \fB.writer_holds_slow\fR, \fB.writer_hold_max_us\fR
-Holds of the store's writer mutex since the open, those of 1 ms or more, and the
-longest one in microseconds. No store I/O wait is made inside it (0.7): a long
-hold means CPU work of one call (an nx pass, a repair, a growth inside the
-mutex)
+\fBstore.lock.writer_holds\fR, \fB.writer_holds_slow\fR, \fB.writer_hold_max_us\fR, \fB.writer_hold_max_site\fR
+Holds of the store's writer mutex since the open, those of 1 ms or more, the
+longest one in microseconds, and the function that held it (\fB\-\fR before the
+first hold). No sync of the disk is waited for inside it (0.7); a long hold is
+CPU work of one call (an nx pass, a repair, a growth inside the mutex), or a
+wait of the disk that another thread causes: a store into a page of the tables
+waits while a checkpoint writes that page out, and the append of a journal
+record meets the file system's back-pressure (up to 2.7 s were measured in a
+first fill of ten million zones under load; 0.7 no longer appends to a file that
+a sync holds: see \fB.journal.commit_switches\fR and
+\fBstore.writes.prewrites\fR). A hold of a second or more is also logged (at
+most once a minute) with its function
 .TP 8
 \fBstore.lock.records_holds\fR, \fB.records_holds_slow\fR, \fB.records_hold_max_us\fR, \fB.records_wait_max_us\fR
 The mutex that orders the writers of the records (the reconcile, the commit of a

@@ -265,6 +265,7 @@ DoH notes: like `dig`, the DNS message ID is random (RFC 8484 §4.1 recommends 0
 
 `+[no]idnin`, `+[no]idnout`
 : Independently control IDN conversion for input query domain names (Punycode encoding via `libidn2`) and output response domain names (Unicode decoding).
+  The conversion is dig 9.20's, byte for byte: a name that is all ASCII is sent as typed (its case and its `xn--` labels are kept); otherwise IDNA2008 with the UTS #46 non-transitional mapping, and when the first problem libidn2 finds is a code point IDNA2008 does not allow (RFC 5892), the whole name again with the transitional mapping (`☃.example` → `xn--n3h.example`, `straße.☃.example` → `strasse.xn--n3h.example`, while `straße.example` → `xn--strae-oqa.example`). A name with no IDNA2008 form (a misplaced hyphen or joiner, the bidi rule of RFC 5893, a label over 63 octets) is sent as its UTF-8 octets, with `;; IDN conversion failed: <reason>` on standard error.
 
 ---
 
