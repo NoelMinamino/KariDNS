@@ -273,6 +273,7 @@ typedef struct store_stats {
   uint64_t lock_holds;            /* holds of the writer mutex since the open */
   uint64_t lock_holds_slow;       /* ... of 1 ms or more */
   uint64_t lock_hold_max_us;      /* the longest one */
+  const char *lock_hold_max_site;  /* the function that held it (a static string; NULL: no hold yet) */
   uint64_t growths_background;    /* index growths that were built outside the mutex (the others: in it, when the index filled up before the build ended) */
   bool     flusher;               /* the flusher thread runs (false: the writers make the due commits and checkpoints themselves, after the mutex) */
   /* ---- 0.7: the flush of a checkpoint converges; the bound of the journal ---- */

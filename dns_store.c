@@ -60,6 +60,12 @@
  *     superblock without it first (nothing changed since: no flush), outside any hold of the writer mutex that it cannot give up.
  *   - A growth of ix / sx is built outside the mutex (see rg_* below), and its OP_GEN record is written under the mutex once the bigger index
  *     is up to date.
+ *   - What is left (0.7, measured in a 10M first fill on UFS under load): the append of a record (pwrite() of the journal) or of an image (of the open segment) is
+ *     made inside the mutex, and while a commit or a checkpoint runs fdatasync() on that file, kern_fsync() holds its vnode lock: the append waits for the sync (holds of
+ *     0.1 to 0.9 s; store.lock.writer_hold_max_site names store_set_known_n / store_put), and a write of a table cell (apply_ops()) faults on a page that a checkpoint's flush is
+ *     writing out and waits for that write (vm_fault_busy_sleep: up to 0.9 s while the flush fills the disk queue).  Holds of 1.3 to 2 s were seen.
+ *     The earlier flush by msync(MS_SYNC) held a table's vnode lock for
+ *     the whole flush, so a writer that grew the table (posix_fallocate()) waited for all of it: holds of 10 to 24 s.
  *
  * Checkpoint (store_checkpoint(), by the journal size limit, by checkpoint_interval_ms, at close, after recovery).
  *     switch to the next journal file; commit up to P; msync + fdatasync every mapped file; fdatasync the new journal and the directory;
@@ -426,7 +432,10 @@ struct store {
   _Atomic uint64_t n_growths_bg;
   /* holds of the writer mutex */
   uint64_t wl_t0;
+  const char *wl_site;                                /* (the mutex) the function that took it */
   _Atomic uint64_t wl_n, wl_slow, wl_max_us;
+  _Atomic(const char *) wl_max_site;                  /* the function of the longest hold (store.lock.writer_hold_max_site) */
+  uint64_t wl_log_ms;                                 /* (the mutex) the last log line of a hold of a second or more */
 
   _Atomic uint64_t n_puts, n_replaces, n_deletes, n_growths, n_checkpoints, n_commits, n_write_errors;
   _Atomic uint64_t n_group_records, n_group_entries;      /* 0.7 M2: journal records of a group commit (store_set_known_n()) and the entries they carried */
@@ -1761,7 +1770,8 @@ static bool ck_try_locked(store_t *s);
 static void bg_release(store_t *s, bool io, bool ck);
 static int unclean_now_locked(store_t *s);
 static void rg_note_locked(store_t *s, const jb_t *j);
-static int wr_lock(store_t *s);
+static int wr_lock_at(store_t *s, const char *site);
+#define wr_lock(s) wr_lock_at((s), __func__)
 
 /* finish the builder's record (counters last), give it its LSN and CRC, write it.  The cells are not touched. */
 static int journal_append(store_t *s) {
@@ -1808,17 +1818,31 @@ static int journal_commit_apply(store_t *s) {
 
 /* ---- the writer mutex: every hold is timed (store.lock.*) ---- */
 
-static void wr_lock_raw(store_t *s) {
+/* (the site of a hold is the function that took the mutex: wr_lock_raw(), wr_lock() and wr_lock_ck() are macros that pass __func__; the longest hold names it, and a hold of a second
+ * or more is logged with it, at most once a minute) */
+static void wr_lock_raw_at(store_t *s, const char *site) {
   pthread_mutex_lock(&s->wlock);
   s->wl_t0 = st_now_us();
+  s->wl_site = site;
 }
+#define wr_lock_raw(s) wr_lock_raw_at((s), __func__)
 static void wr_unlock_raw(store_t *s) {
   const uint64_t h = st_now_us() - s->wl_t0;
+  const char *site = s->wl_site;
   atomic_fetch_add_explicit(&s->wl_n, 1, memory_order_relaxed);
   if (h >= 1000) atomic_fetch_add_explicit(&s->wl_slow, 1, memory_order_relaxed);
-  uint64_t m = atomic_load_explicit(&s->wl_max_us, memory_order_relaxed);
-  while (h > m && !atomic_compare_exchange_weak_explicit(&s->wl_max_us, &m, h, memory_order_relaxed, memory_order_relaxed)) {}
+  if (h > atomic_load_explicit(&s->wl_max_us, memory_order_relaxed)) {       /* (every writer of the two holds the mutex) */
+    atomic_store_explicit(&s->wl_max_us, h, memory_order_relaxed);
+    atomic_store_explicit(&s->wl_max_site, site, memory_order_relaxed);
+  }
+  bool say = false;
+  if (h >= 1000000u) {
+    const uint64_t now = st_now_ms();
+    say = s->wl_log_ms == 0 || now - s->wl_log_ms >= 60000u;
+    if (say) s->wl_log_ms = now ? now : 1;
+  }
   pthread_mutex_unlock(&s->wlock);
+  if (say) st_log(s, 4, "store: the writer mutex was held for %" PRIu64 " ms by %s (store.lock.writer_hold_max_us)", h / 1000u, site);
 }
 
 /* ---- the I/O baton (io_busy: one commit at a time) and the checkpoint flag (ck_busy), under bg_mu ----
@@ -2164,10 +2188,11 @@ static int ck_full_locked(store_t *s, bool clean) {
   return 0;
 }
 /* the writer mutex with the checkpoint's flags (for a ck_full_locked()); the clean flag on disk is cleared first when the caller writes records */
-static void wr_lock_ck(store_t *s) {
+static void wr_lock_ck_at(store_t *s, const char *site) {
   ck_acquire(s);
-  wr_lock_raw(s);
+  wr_lock_raw_at(s, site);
 }
+#define wr_lock_ck(s) wr_lock_ck_at((s), __func__)
 static void wr_unlock_ck(store_t *s) {
   wr_unlock_raw(s);
   bg_release(s, true, true);
@@ -2623,12 +2648,12 @@ static int post_write(store_t *s) {
 
 /* The writer mutex for a call that writes records: a clean flag on disk is cleared first (the mutex is given up while the checkpoint's flags are waited for).  0, or the error of that
  * superblock write (the mutex is not held then). */
-static int wr_lock(store_t *s) {
-  wr_lock_raw(s);
+static int wr_lock_at(store_t *s, const char *site) {
+  wr_lock_raw_at(s, site);
   while (atomic_load_explicit(&s->clean_on_disk, memory_order_relaxed)) {
     wr_unlock_raw(s);
     ck_acquire(s);
-    wr_lock_raw(s);
+    wr_lock_raw_at(s, site);
     const int r = unclean_now_locked(s);
     bg_release(s, true, true);
     if (r < 0) {
@@ -4143,12 +4168,13 @@ static int cleaner_work(store_t *s, uint64_t budget, uint64_t until_ms, store_co
 
 /* the writer mutex with the checkpoint's flags, for a caller that writes records and then a checkpoint with the writers kept out (store_compact(finish), the operator's clean-now,
  * store_repair()): the clean flag on disk goes first.  wr_unlock_ck() gives all of it up. */
-static int wr_lock_ck_w(store_t *s) {
-  wr_lock_ck(s);
+static int wr_lock_ck_w_at(store_t *s, const char *site) {
+  wr_lock_ck_at(s, site);
   const int r = unclean_now_locked(s);
   if (r < 0) { wr_unlock_ck(s); note_error(s, r); }
   return r;
 }
+#define wr_lock_ck_w(s) wr_lock_ck_w_at((s), __func__)
 
 int store_compact(store_t *s, uint64_t max_bytes, bool finish, store_compact_report_t *rep) {
   if (!s) return -EINVAL;
@@ -4781,6 +4807,7 @@ void store_stats(const store_t *s, store_stats_t *o) {
   o->lock_holds = atomic_load_explicit(&s->wl_n, memory_order_relaxed);
   o->lock_holds_slow = atomic_load_explicit(&s->wl_slow, memory_order_relaxed);
   o->lock_hold_max_us = atomic_load_explicit(&s->wl_max_us, memory_order_relaxed);
+  o->lock_hold_max_site = atomic_load_explicit(&s->wl_max_site, memory_order_relaxed);
   o->growths_background = atomic_load_explicit(&s->n_growths_bg, memory_order_relaxed);
   o->flusher = s->fl_on;
   o->checkpoint_max_us = atomic_load_explicit(&s->ckpt_max_us, memory_order_relaxed);

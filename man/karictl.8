@@ -1,4 +1,4 @@
-.TH KARICTL 8 "2026-11-16" "KariDNS" "KariDNS Manual"
+.TH KARICTL 8 "2026-11-17" "KariDNS" "KariDNS Manual"
 .\" Generated from docs/karictl.md by man/md2man.pl (make man): edit the Markdown manual, not this page.
 .SH NAME
 karictl \- Remote Control and Management Utility for KariDNS
@@ -822,11 +822,17 @@ build ends)
 wait) and the checkpoints; 0: the writers make them after their call (no thread
 could be started)
 .TP 8
-\fBstore.lock.writer_holds\fR, \fB.writer_holds_slow\fR, \fB.writer_hold_max_us\fR
-Holds of the store's writer mutex since the open, those of 1 ms or more, and the
-longest one in microseconds. No store I/O wait is made inside it (0.7): a long
-hold means CPU work of one call (an nx pass, a repair, a growth inside the
-mutex)
+\fBstore.lock.writer_holds\fR, \fB.writer_holds_slow\fR, \fB.writer_hold_max_us\fR, \fB.writer_hold_max_site\fR
+Holds of the store's writer mutex since the open, those of 1 ms or more, the
+longest one in microseconds, and the function that held it (\fB\-\fR before the
+first hold). No sync of the disk is waited for inside it (0.7); a long hold is
+CPU work of one call (an nx pass, a repair, a growth inside the mutex), or a
+wait of the disk that another thread's sync causes: on UFS the append of a
+journal record or of an image waits while a commit or a checkpoint syncs the
+same file (the file system locks the file for the sync), and a write to a page
+of the tables waits while a checkpoint writes that page out (0.1 to 2 s were
+seen in a first fill of ten million zones under load). A hold of a second or
+more is also logged (at most once a minute) with its function
 .TP 8
 \fBstore.lock.records_holds\fR, \fB.records_holds_slow\fR, \fB.records_hold_max_us\fR, \fB.records_wait_max_us\fR
 The mutex that orders the writers of the records (the reconcile, the commit of a

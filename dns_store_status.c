@@ -644,6 +644,7 @@ static void add_store(list_t *l, const store_t *s, const store_attach_stats_t *a
   U("store.lock.writer_holds", st->lock_holds);
   U("store.lock.writer_holds_slow", st->lock_holds_slow);
   U("store.lock.writer_hold_max_us", st->lock_hold_max_us);
+  add_s(l, "store.lock.writer_hold_max_site", st->lock_hold_max_site ? st->lock_hold_max_site : "-");
   U("store.flusher", st->flusher ? 1 : 0);
   /* 0.7 WP9: the cleaner (design 3.2) */
   U("store.compact.runs", st->compact_runs);

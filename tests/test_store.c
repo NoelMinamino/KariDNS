@@ -2561,6 +2561,7 @@ static void test_journal_bound(int mode) {
   CHECK(st.journal_limit_waits >= 1);
   CHECK(st.journal_limit_wait_max_us > 0 && st.journal_limit_wait_us >= st.journal_limit_wait_max_us);
   CHECK(st.lock_hold_max_us < 500000);                                    /* (the wait is outside the writer mutex; the hook slept 1 s) */
+  CHECK(st.lock_hold_max_site != NULL && st.lock_hold_max_site[0] != 0);              /* (the function of the longest hold is named: store.lock.writer_hold_max_site) */
   CHECK(st.checkpoint_max_us >= 900000);                                  /* (the slow one) */
   CHECK_EQ(log_count(4, "2 x journal_max_bytes"), 1);                   /* (at most one a minute) */
   CHECK_EQ(store_close(s), 0);
