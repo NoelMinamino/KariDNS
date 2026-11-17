@@ -2066,26 +2066,43 @@ const char *format_class_name(uint16_t klass, char *buf, size_t buf_size) {
     }
 }
 
+#ifdef HAVE_LIBIDN2
+/* dig (BIND 9.20) の +idnin と同じ変換: IDNA2008 + UTS #46 の非移行処理。最初の誤りが IDN2_DISALLOWED (IDNA2008 で使えない符号位置、RFC 5892) のときだけ、
+ * 名前全体を移行処理 (UTS #46 section 4.1: ß→ss、ς→σ、ZWJ/ZWNJ を消す) でやり直す。pc200 の dig 9.20.30 / libidn2 2.3.8 で実測 (☃.example → xn--n3h.example、
+ * straße.☃.example → strasse.xn--n3h.example、a١.☃.example は BIDI が先なので変換しない)。locale: 入力を UTF-8 でなく locale の文字コードとして読む */
+static int dag_idn2_lookup(const char *name, char **out, bool locale) {
+    int rc = locale ? idn2_lookup_ul(name, out, IDN2_NONTRANSITIONAL) : idn2_lookup_u8((const uint8_t *)name, (uint8_t **)out, IDN2_NONTRANSITIONAL);
+    if (rc == IDN2_DISALLOWED) {
+        rc = locale ? idn2_lookup_ul(name, out, IDN2_TRANSITIONAL) : idn2_lookup_u8((const uint8_t *)name, (uint8_t **)out, IDN2_TRANSITIONAL);
+    }
+    return rc;
+}
+#endif
+
 KARIDNS_TOOL_FN const char *idn_to_ascii(const char *name, bool *allocated) {
     if (allocated) *allocated = false;
+    /* dig: ASCII だけの名前は変換しない (大文字も xn-- のラベルも入力のまま送る) */
+    bool non_ascii = false;
+    for (const unsigned char *c = (const unsigned char *)name; *c; c++) {
+        if (*c >= 0x80) { non_ascii = true; break; }
+    }
+    if (!non_ascii) return name;
 #ifdef HAVE_LIBIDN2
     char *p = NULL;
-    int rc = idn2_lookup_u8((const uint8_t *)name, (uint8_t **)&p, 0);
+    int rc = dag_idn2_lookup(name, &p, false);
+    int rc_utf8 = rc;
     if (rc != IDN2_OK) {
-        rc = idn2_lookup_ul(name, &p, 0);
+        rc = dag_idn2_lookup(name, &p, true);
     }
     if (rc == IDN2_OK) {
         if (allocated) *allocated = true;
         return p;
     }
-    fprintf(stderr, ";; IDN conversion failed: %s\n", idn2_strerror(rc));
+    /* (the reason of the UTF-8 attempt: the locale's usually only says the text is no UTF-8 of the locale) */
+    fprintf(stderr, ";; IDN conversion failed: %s\n", idn2_strerror(rc_utf8));
 #else
     static bool warned = false;
-    bool looks_non_ascii = false;
-    for (const unsigned char *p = (const unsigned char *)name; *p; p++) {
-        if (*p >= 0x80) { looks_non_ascii = true; break; }
-    }
-    if (looks_non_ascii && !warned) {
+    if (!warned) {
         fprintf(stderr, ";; WARNING: this build of dag was compiled without libidn2; "
                         "IDN conversion for '%s' was skipped and the name will be sent as-is\n", name);
         warned = true;

@@ -1,4 +1,4 @@
-.TH DAG 1 "2026-11-13" "KariDNS" "KariDNS Manual"
+.TH DAG 1 "2026-11-17" "KariDNS" "KariDNS Manual"
 .\" Generated from docs/dag.md by man/md2man.pl (make man): edit the Markdown manual, not this page.
 .SH NAME
 dag \- DNS Anomaly Generator, Protocol Inspector, and Multi-Server Verification
@@ -491,7 +491,18 @@ simultaneously.
 .TP 8
 \fB+[no]idnin\fR, \fB+[no]idnout\fR
 Independently control IDN conversion for input query domain names (Punycode
-encoding via \fBlibidn2\fR) and output response domain names (Unicode decoding).
+encoding via \fBlibidn2\fR) and output response domain names (Unicode
+decoding). The conversion is dig 9.20's, byte for byte: a name that is all ASCII
+is sent as typed (its case and its \fBxn\-\-\fR labels are kept); otherwise
+IDNA2008 with the UTS #46 non-transitional mapping, and when the first problem
+libidn2 finds is a code point IDNA2008 does not allow (RFC 5892), the whole name
+again with the transitional mapping (\fB\[u2603].example\fR \[u2192]
+\fBxn\-\-n3h.example\fR, \fBstra\[u00DF]e.\[u2603].example\fR \[u2192]
+\fBstrasse.xn\-\-n3h.example\fR, while \fBstra\[u00DF]e.example\fR \[u2192]
+\fBxn\-\-strae\-oqa.example\fR). A name with no IDNA2008 form (a misplaced
+hyphen or joiner, the bidi rule of RFC 5893, a label over 63 octets) is sent as
+its UTF-8 octets, with \fB;; IDN conversion failed: <reason>\fR on standard
+error.
 .SH EDNS0 EXTENSIONS
 Queries carry an EDNS0 OPT record and a client cookie by default (like
 \fBdig\fR). UPDATE and NOTIFY messages get an OPT record only when one of the
