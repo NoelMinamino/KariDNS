@@ -5121,7 +5121,40 @@ said at a checkpoint (at most every ten minutes) when the free space is below
 twice the reserve or a tenth of the store, or when the store grows so fast that
 the file system is full within a day: it names the free bytes, the size of the
 store, the dead bytes that the cleaner can win and the hours to full at the
-growth of the last hour (\fBstore.space.*\fR has the same figures). \fBThe
+growth of the last hour (\fBstore.space.*\fR has the same figures). Since 0.7
+the journal keeps a band of its own below the reserve: images are refused when
+less than the reserve plus that band is free, and journal records (and so the
+zones kept without an image) when less than the band is free; the band is what a
+running checkpoint may still allocate (on ZFS every page it writes, on UFS only
+the growth of the tables) plus 8 MiB (24 MiB on ZFS), at most an eighth of the
+file system. The free space is read by the writers before the store's lock when
+the last reading is a second old or a megabyte was written since, not inside the
+lock. \fBThe journal ring (0.7).\fR A change of the store is planned, put in a
+ring in memory (64 MiB at the most, counted in \fBmemory\-limit\fR) and applied
+inside the store's writer lock; the record is written to the journal file after
+the lock, by the first thread that needs it written (a writer, or the flusher
+for the ingest and reconcile threads), many records in one \fBwrite()\fR. A
+store call returns only when its record and every record it saw are in the
+kernel, so after \fBkill \-9\fR every call that returned is there, as before;
+the ingest and the reconcile threads do not wait for each call: the commit at
+the end of a batch waits for all of them before the batch is answered. What
+changes for a reader: a zone changed by a call that has not returned yet is
+already visible, and if the Backend is killed (\fBkill \-9\fR, a crash) before
+its record was written, the change is gone after the restart: \fBa zone may come
+back older than what was served\fR (a SOA serial a secondary saw may go back
+until the loader's next pass brings the zone forward again; before 0.7 only a
+power loss could do this). A checkpoint never writes a table page whose change
+the kernel's journal does not hold yet (it waits, \fBstore.journal.ck_waits\fR),
+so the files are never ahead of the journal after a \fBkill \-9\fR. When the
+disk is full the write of the journal is tried again by the flusher until there
+is room (\fBstore.journal.state\fR \fBnospace\fR, a WARNING once a minute; new
+changes are refused meanwhile, as with a full disk before); when it fails
+otherwise (EIO) three times the store goes to \fBfailed\fR: it takes no more
+changes, writes no table page and makes no clean checkpoint at the stop, an
+ERROR is said once a minute and \fBkarictl dbstatus\fR / \fBkarictl store\fR
+show it; restart the server: the open replays what was written. The writer lock
+is then held only for the planning and the apply of a call
+(\fBstore.lock.writer_hold_p999_us\fR), not while the disk is slow. \fBThe
 tables in memory (0.7).\fR The tables of the store (\fBzt.1\fR, \fBzc.1\fR,
 \fBnx.1\fR, \fBix.N\fR, \fBsx.N\fR: the record of every zone, the long names and
 the two indexes) are mapped private: a page is read from its file when it is
