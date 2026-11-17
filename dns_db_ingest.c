@@ -276,6 +276,7 @@ typedef struct {
   /* 0.7 WP7b, the store protocol: negotiated by HELLO features and CONFIG store_proto.  The loader lists the zones (MANIFEST) or the changes (CHANGES); the bodies are fetched
    * (the scan of the store below, or a query) */
   uint32_t loader_feat;        /* HELLO features of this loader */
+  int b_store_err;             /* 0.7: the errno for which the store could not record the batch (BATCH_RESULT tag 7); 0 = recorded */
   bool store_proto;
   /* 0.7 M2: the pages of a MANIFEST pass go to the reconcile thread (dns_db_recon.h).  A frame of the first stream that has to wait for it (a free slot of its ring, or everything before it applied) is kept here and the
    * stream is not read meanwhile (the read event of its descriptor is off): the pointers of the frame are into rbuf / body, which nothing touches while it waits */
@@ -2144,6 +2145,7 @@ static void on_batch_begin(ing_t *g, const kdb_msg_t *m) {
   batch_table_begin(g, m->u.batch_begin.cfg_generation);
   g->batch_kind = m->u.batch_begin.kind;
   g->b_applied = g->b_rejected = g->b_shadowed = g->b_deleted = g->b_failed = g->b_unchanged = 0;
+  g->b_store_err = 0;
   g->ch_failed = false;
   clear_profiles(g);                                     /* B7a: the profiles of the previous batch */
   g->rejects_logged = 0;
@@ -2444,6 +2446,7 @@ static void batch_finish(ing_t *g, uint64_t batch_id) {
   if (kdb_enc_begin(&g->enc, KDB_T_BATCH_RESULT) != 0 || kdb_enc_u64(&g->enc, 1, batch_id) != 0 ||
       kdb_enc_u32(&g->enc, 3, g->b_applied + g->b_shadowed) != 0 || kdb_enc_u32(&g->enc, 4, g->b_unchanged) != 0 ||
       kdb_enc_u32(&g->enc, 5, g->b_rejected) != 0 || kdb_enc_u32(&g->enc, 6, g->b_deleted) != 0 ||
+      (g->b_store_err && (g->loader_feat & KDB_FEAT_BATCH_STATUS) && kdb_enc_u32(&g->enc, 7, (uint32_t)g->b_store_err) != 0) ||    /* (0.7: the store could not record it: the loader does not go past it) */
       kdb_enc_end(&g->enc) != 0) {
     g->enc.err = true;
   }
@@ -2453,7 +2456,11 @@ static void batch_finish(ing_t *g, uint64_t batch_id) {
 static void on_batch_end(ing_t *g, const kdb_msg_t *m) {
   const kdb_batch_end_t *b = &m->u.batch_end;
   sync_all(g);
-  db_store_batch_end();                                  /* 0.7 store S2: what the batch wrote to the store is made durable */
+  const int sr = db_store_batch_end();                   /* 0.7 store S2: what the batch wrote to the store is made durable (after sync_all(): the reconcile thread's records are in it) */
+  g->b_store_err = sr < 0 ? -sr : 0;
+  if (sr < 0 && !(g->loader_feat & KDB_FEAT_BATCH_STATUS))
+    syslog(LOG_ERR, "[DB] batch %llu: the store could not record it (%s) and the loader cannot be told (it does not read BATCH_RESULT tag 7): it is read again only after a restart",
+           (unsigned long long)b->batch_id, strerror(-sr));
   atomic_store_explicit(&g_st.b_applied, g->b_applied, memory_order_relaxed);
   atomic_store_explicit(&g_st.b_rejected, g->b_rejected, memory_order_relaxed);
   atomic_store_explicit(&g_st.b_shadowed, g->b_shadowed, memory_order_relaxed);
@@ -5040,6 +5047,7 @@ static void *cache_thread(void *arg) {
 static void *ingest_thread(void *arg) {
   ing_t *g = arg;
   rcu_aux_thread_pin();
+  db_store_defer_thread(true);                          /* 0.7: its store calls do not wait for the journal; the commit at the end of a batch does (db_store_batch_end()) */
   struct kevent evs[8];
   int64_t win_start = mono_ns(), busy_ns = 0, t_wake = win_start;
   for (;;) {
@@ -5076,6 +5084,7 @@ static void *ingest_thread(void *arg) {
     if (n < 0) {
       if (errno == EINTR) continue;
       syslog(LOG_ERR, "[DB] the ingest thread stops: kevent: %s", strerror(errno));
+      db_store_defer_thread(false);                     /* (its slot is freed before the thread ends: thread ids are reused) */
       return NULL;
     }
     t_wake = mono_ns();
@@ -5703,6 +5712,23 @@ size_t db_ingest_status(const char *zone, const char *view, char *out, size_t ca
     }
     dbreg_cache_stats_t cs;
     dbreg_cache_stats(&cs);
+    {                                                    /* 0.7: the state of the store's journal (written after its lock): a failed journal takes no more changes */
+      store_t *sth = db_store_handle();
+      store_stats_t *ss = sth ? calloc(1, sizeof(*ss)) : NULL;
+      if (ss) {
+        store_read_lock();
+        store_stats(sth, ss);
+        store_read_unlock();
+        static const char *const jst[] = { "ok", "nospace", "failed" };
+        db_recon_status_t rs;
+        db_recon_status(&rs);
+        st_append(&c, "store: journal=%s error=%d failed_at=%llu unwritten=%llu batch_commit_errors=%llu%s\n", jst[ss->journal_state < 0 || ss->journal_state > 2 ? 2 : ss->journal_state],
+                  ss->journal_error, (unsigned long long)ss->journal_failed_unix, (unsigned long long)ss->ring_unwritten_bytes, (unsigned long long)rs.batch_store_errors,
+                  ss->journal_state == STORE_JOURNAL_FAILED ? " (the store takes no more changes; restart the server: the open replays what was written)" :
+                  ss->journal_state == STORE_JOURNAL_NOSPACE ? " (no room for the journal: changes are refused until there is room)" : "");
+        free(ss);
+      }
+    }
     {
       uint64_t nq, nd;
       dbreg_notify_stats(&nq, &nd);

@@ -218,6 +218,46 @@ static void test_hist(void) {
   CHECK_EQ(store_status_hist_pct(a.attach_hist, 50, a.attach_max_ns), 2);       /* the 3rd of 6 lies in bucket 1 (<= 2 us) */
   CHECK_EQ(store_status_hist_pct(a.attach_hist, 100, a.attach_max_ns), 8388609);/* the last bucket answers with the maximum */
   CHECK_EQ(store_status_hist_pct(a.cold_hist, 99, 0), 0);                       /* empty histogram */
+  /* 0.7: the fine histogram of the percentiles (an eighth of a power of two) */
+  CHECK_EQ(store_status_fine_bucket(0), 0);
+  CHECK_EQ(store_status_fine_bucket(7000), 7);
+  CHECK_EQ(store_status_fine_bucket(8000), 8);                                  /* 8 us: e = 3, exact */
+  CHECK_EQ(store_status_fine_bucket(15000), 15);
+  CHECK_EQ(store_status_fine_bucket(16000), 16);                                /* 16 and 17 us share a bucket */
+  CHECK_EQ(store_status_fine_bucket(17000), 16);
+  CHECK_EQ(store_status_fine_bucket(18000), 17);
+  CHECK_EQ(store_status_fine_bucket(20001), store_status_fine_bucket(20480));   /* 20.001 ms rounds up to 21 us ... */
+  CHECK_EQ(store_status_fine_upper_us(store_status_fine_bucket(20000 * 1000ull)), 20479);   /* 20 ms: the bucket 18432 .. 20479 us */
+  CHECK_EQ(store_status_fine_upper_us(store_status_fine_bucket(33000 * 1000ull)), 36863);   /* 33 ms: 32768 .. 36863 us (the coarse bucket was 32768 .. 65536) */
+  CHECK_EQ(store_status_fine_bucket(16777215ull * 1000), 175);                  /* 2^24 - 1 us: the last bucket of a value */
+  CHECK_EQ(store_status_fine_upper_us(175), 16777215);
+  CHECK_EQ(store_status_fine_bucket(16777216ull * 1000), STORE_STATUS_FINE_BUCKETS - 1);
+  CHECK(store_status_fine_upper_us(STORE_STATUS_FINE_BUCKETS - 1) == UINT64_MAX);
+  for (unsigned i = 1; i + 1 < STORE_STATUS_FINE_BUCKETS; i++) {               /* the buckets are adjacent, each at most an eighth of its lower bound wide (from 8 us on) */
+    const uint64_t lo = store_status_fine_upper_us(i - 1) + 1, hi = store_status_fine_upper_us(i);
+    if (store_status_fine_bucket(lo * 1000) != i || store_status_fine_bucket(hi * 1000) != i || (lo >= 8 && (hi - lo + 1) * 8 > lo)) { printf("  (fine bucket %u: %llu .. %llu)\n", i, (unsigned long long)lo, (unsigned long long)hi); g_failed++; break; }
+  }
+  CHECK_EQ(a.attach_fine[0], 0);                                                /* 0.5 and 1 us round up to 1 us (bucket 1), 1.001 us to 2, 3 us is bucket 3 */
+  CHECK_EQ(a.attach_fine[1], 2);
+  CHECK_EQ(a.attach_fine[2], 1);
+  CHECK_EQ(a.attach_fine[3], 1);
+  CHECK_EQ(a.attach_fine[STORE_STATUS_FINE_BUCKETS - 1], 0);                    /* 2^23 + 1 us is below 2^24 */
+  CHECK_EQ(store_status_fine_pct(a.attach_fine, 500, a.attach_max_ns), 2);      /* the 3rd of 6: 1.001 us -> 2 us */
+  CHECK_EQ(store_status_fine_pct(a.attach_fine, 1000, a.attach_max_ns), 8388609);   /* the maximum caps the bucket's bound */
+  CHECK_EQ(store_status_fine_pct(a.attach_fine, 2000, a.attach_max_ns), 8388609);   /* (above 1000: 1000) */
+  CHECK_EQ(store_status_fine_pct(a.cold_fine, 990, 0), 0);                      /* empty */
+  {
+    uint64_t f[STORE_STATUS_FINE_BUCKETS];
+    memset(f, 0, sizeof(f));
+    f[store_status_fine_bucket(1000000)] = 989;                                 /* 989 at 1 ms, 10 at 19 ms, 1 at 40 ms: p99 is the 990th */
+    f[store_status_fine_bucket(19000000)] = 10;
+    f[store_status_fine_bucket(40000000)] = 1;
+    CHECK_EQ(store_status_fine_pct(f, 500, 40000000), 1023);
+    CHECK_EQ(store_status_fine_pct(f, 990, 40000000), 20479);
+    CHECK_EQ(store_status_fine_pct(f, 999, 40000000), 20479);
+    CHECK_EQ(store_status_fine_pct(f, 1000, 40000000), 40000);                  /* (the bucket 38912 .. 40959 us, capped by the maximum) */
+    CHECK_EQ(store_status_fine_pct(f, 0, 40000000), 1023);                      /* (at least the first) */
+  }
   store_status_note_attach(0, STORE_ATT_ERR_CHECKSUM);
   store_status_note_attach(0, STORE_ATT_ERR_IO);
   store_status_note_attach(0, 99);                                              /* out of range: "other" */
@@ -240,6 +280,7 @@ static void test_hist(void) {
   CHECK_EQ(a.cold[STORE_COLD_FETCH], 1);
   CHECK_EQ(a.cold[STORE_COLD_TIMEOUT], 1);
   CHECK_EQ(a.cold_hist[1], 1);
+  CHECK_EQ(a.cold_fine[2], 1);
 }
 
 static void *note_thread(void *arg) {
@@ -263,6 +304,8 @@ static void test_threads(void) {
   CHECK_EQ(a.cold[STORE_COLD_ATTACH], 160000);
   CHECK_EQ(a.detach_by[STORE_DET_ROOM], 160000);
   CHECK_EQ(a.attach_hist[1], 160000);
+  CHECK_EQ(a.attach_fine[2], 160000);
+  CHECK_EQ(a.cold_fine[2], 160000);
 }
 
 static bool g_recon_guard;
@@ -453,6 +496,10 @@ static void test_store(int mode, const char *base) {
   store_status_note_attach(900000, 0);
   store_status_note_attach(0, STORE_ATT_ERR_CHECKSUM);
   store_status_note_detach_why(STORE_DET_LIMIT);
+  store_test_hold(s, "site_a", 2000);                    /* 0.7: the holds of 1 ms or more by function (store.lock.site.*) */
+  store_test_hold(s, "site_a", 15000);
+  store_test_hold(s, "site_b", 150000);
+  store_test_hold(s, "site_c", 0);                       /* (under 1 ms: not counted) */
   store_status_note_cold(3000, STORE_COLD_ATTACH);
   store_status_note_cold(0, STORE_COLD_FETCH);
 
@@ -481,8 +528,20 @@ static void test_store(int mode, const char *base) {
   CHECK_EQ(kv_num("store.detach.limit"), 1);
   CHECK_EQ(kv_num("store.cold.attach"), 1);
   CHECK_EQ(kv_num("store.cold.fetch"), 1);
-  CHECK_EQ(kv_num("store.cold.p99_us"), 4);
+  CHECK_EQ(kv_num("store.cold.p99_us"), 3);              /* (the fine buckets: 3 us exactly; the coarse bucket said <= 4) */
+  CHECK_EQ(kv_num("store.cold.p999_us"), 3);
+  CHECK_EQ(kv_num("store.attach.p999_us"), 900);
   CHECK_EQ(kv_num("store.writes.puts"), 4);              /* (store_set_known counts as a put) */
+  CHECK_EQ(kv_num("store.lock.site.site_a.slow"), 2);
+  CHECK_EQ(kv_num("store.lock.site.site_a.over_10ms"), 1);
+  CHECK_EQ(kv_num("store.lock.site.site_a.over_100ms"), 0);
+  CHECK(kv_num("store.lock.site.site_a.slow_us") >= 17000 && kv_num("store.lock.site.site_a.slow_us") < 100000);
+  CHECK(kv_num("store.lock.site.site_a.max_us") >= 15000 && kv_num("store.lock.site.site_a.max_us") < 100000);
+  CHECK_EQ(kv_num("store.lock.site.site_b.over_100ms"), 1);
+  CHECK(kv_num("store.lock.site.site_b.max_us") >= 150000);
+  CHECK(kv_num("store.lock.writer_hold_max_us") >= 150000);
+  CHECK(strcmp(kv_str("store.lock.writer_hold_max_site"), "site_b") == 0);
+  CHECK(kv_get("store.lock.site.site_c.slow") == NULL);
   /* 0.7 WP9: the cleaner, the space, the scrub, the open: the keys are there, a store that has done nothing of it says so */
   static const char *const WP9[] = { "store.compact.runs", "store.compact.moved_records", "store.compact.moved_bytes", "store.compact.segments_freed", "store.compact.bad_records",
                                      "store.compact.pinned_skips", "store.compact.incomplete", "store.compact.last_unix", "store.compact.rate_bytes", "store.compact.candidates",
@@ -673,6 +732,11 @@ static void test_bounded(const char *base) {
   }
   store_status_reset();
   for (int i = 0; i < 100; i++) { store_status_note_attach((uint64_t)i * 1000003u, 0); store_status_note_cold((uint64_t)i * 77777u, STORE_COLD_ATTACH); }
+  static char sites[STORE_LOCK_SITES + 4][32];               /* (more functions than slots, with names of the longest kept length: the first STORE_LOCK_SITES are kept) */
+  for (int i = 0; i < STORE_LOCK_SITES + 4; i++) {
+    snprintf(sites[i], sizeof(sites[i]), "a_function_name_%02d_long_enough", i);
+    store_test_hold(s, sites[i], 1000000 + (uint64_t)i);
+  }
   store_status_bind(s);
   store_status_set_memory_fn(mem_fn);
   char *js = malloc(STORE_STATUS_OUT_MAX);
@@ -682,6 +746,15 @@ static void test_bounded(const char *base) {
   CHECK(parse_json(js));
   CHECK_EQ(kv_num("store.views.count"), 32);
   CHECK_EQ(kv_num("store.view.31.stored"), 1);
+  CHECK_EQ(kv_num("store.lock.site.a_function_name_00_long_.slow"), 1);   /* (cut at 24 characters) */
+  CHECK(kv_get("store.lock.site.a_function_name_27_long_.slow") == NULL);
+  {                                                                       /* (every slot is taken: some by the store's own holds of the open on a slow host, the rest by the test's) */
+    int nsite = 0;
+    for (int i = 0; i < g_nkv; i++) nsite += strncmp(g_kv[i].key, "store.lock.site.", 16) == 0 && strstr(g_kv[i].key, ".over_100ms") != NULL;
+    printf("  %d keys, %d functions with slow holds\n", g_nkv, nsite);
+    CHECK_EQ(nsite, STORE_LOCK_SITES);
+    CHECK(g_nkv < MAXKV);
+  }
   CHECK(kv_get("error") == NULL);
   store_status_bind(NULL);
   free(js);

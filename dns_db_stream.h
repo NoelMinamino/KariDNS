@@ -176,7 +176,9 @@
  *   ZONE_RESULT (0x8005) 1 view view R | 2 zone name R | 3 status u8 R (0 applied,1 unchanged,2 rejected,
  *                     3 shadowed,4 deleted) | 4 reason str<=255 O
  *   BATCH_RESULT (0x8006) 1 batch_id u64 R | 2 request_ids bytes O (n * u64, <= 2048 bytes) | 3 n_applied u32 R |
- *                     4 n_unchanged u32 R | 5 n_rejected u32 R | 6 n_deleted u32 R
+ *                     4 n_unchanged u32 R | 5 n_rejected u32 R | 6 n_deleted u32 R | 7 store_error u32 O (0.7, only to a loader whose HELLO features have
+ *                     KDB_FEAT_BATCH_STATUS: the errno for which the store could not make the batch durable; the loader then reads the changes of the batch
+ *                     again from where it was before it, so a batch the store did not record is never passed; absent = 0, recorded)
  *   FETCH_REQ (0x8007) D1a, fetch stream only: 1 request_id u64 R (> 0) | 2 view view R | 3 zone name R (mode 2: a query name) |
  *                     4 priority u8 R (0 a query waits for it, 1 warm-up, 2 background) | 5 mode u8 R (0 the zone, 1 its summary, 2 lookup, 3 lookup and body) |
  *                     6 range_lo name O | 7 range_hi name O (D1b: both or none; a loader that does not read ranges answers ZONE_FAILED) |
@@ -218,6 +220,7 @@
 #define KDB_FEAT_LOOKUP 0x2u         /* HELLO features: the loader answers FETCH_REQ mode KDB_FETCH_LOOKUP with LOOKUP_RESULT (the zone that encloses a name, 0.7 first start) */
 #define KDB_FEAT_LOOKUP_BODY 0x4u    /* HELLO features: the loader answers FETCH_REQ mode KDB_FETCH_LOOKUP_FULL with LOOKUP_RESULT and, when it found a zone, the body of that zone (0.7 first start) */
 #define KDB_FEAT_IMAGE 0x8u          /* HELLO features: the loader sends a zone as a zone image (ZONE_BEGIN flag KDB_ZF_IMAGE, ZONE_IMAGE messages), tag 6 says which image version (0.7 M3) */
+#define KDB_FEAT_BATCH_STATUS 0x10u  /* HELLO features: the loader reads BATCH_RESULT tag 7 (the batch was not recorded by the store) and does not go past such a batch (0.7) */
 #define KDB_MF_VERIFY 0x1u           /* MANIFEST_BEGIN flags: a verify pass (entries carry digests; reserved) */
 #define KDB_MF_PLAIN 0x2u            /* ... a plain PowerDNS schema: no stamps, serials */
 #define KDB_EF_STAMPED 0x1u          /* MANIFEST / CHANGES entry flags: the stamp (generation, changed_at) is real */
@@ -398,6 +401,7 @@ typedef struct { uint16_t view; char name[DNS_NAME_TEXT_SIZE]; uint8_t status; k
 typedef struct {
     uint64_t batch_id; const uint8_t *request_ids; uint32_t n_request_ids;   /* big-endian u64 each */
     uint32_t n_applied, n_unchanged, n_rejected, n_deleted;
+    uint32_t store_error;                               /* tag 7 (0.7, only to a loader with KDB_FEAT_BATCH_STATUS): the errno for which the Backend's store could not record the batch; 0 = recorded */
 } kdb_batch_result_t;
 typedef struct {
     uint64_t list_id; uint32_t part; bool last; uint32_t n_entries;

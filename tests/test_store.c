@@ -1394,11 +1394,11 @@ static bool model_from_store(store_t *s, model_t *m) {
   return true;
 }
 
-typedef struct { _Atomic uint64_t begun, done, acked; } shm_t;
+typedef struct { _Atomic uint64_t begun, done, acked, dcur; } shm_t;      /* dcur: mode 6, the cursor of source 7 that a deferring thread's commit made durable */
 
 /* modes 3 and 4 of the kill loop (0.7 fix A): a step of a checkpoint that runs outside the writer mutex (3: a thread checkpoints all the time, the flush of the tables is made slow) or of a
  * growth of the index built outside it (4: the build waits before it takes the mutex, so that the writers' changes pile up in its log) is reached while the operations go on, and the child is
- * killed at the n-th time one step is reached (g_hk_step: 1..5 a checkpoint step (5: between two runs of its write of the tables), 11..12 a growth step; 0: not by a hook) */
+ * killed at the n-th time one step is reached (g_hk_step: 1..5 a checkpoint step (5: between two runs of its write of the tables), 11..13 a growth step (13: after a round of its catch-up with no lock); 0: not by a hook) */
 static _Atomic int g_hk_step, g_hk_n;
 static void hk_kill(int step) {
   if (atomic_load(&g_hk_step) == step && atomic_fetch_sub(&g_hk_n, 1) == 1) kill(getpid(), SIGKILL);
@@ -1409,9 +1409,54 @@ static void hk_ckpt(int step) {
 }
 static void hk_regrow(int step) {
   if (step == 1) usleep(3000);
+  if (step == 3) usleep(500);                         /* (3: after a round of the catch-up with no lock: the writers log more meanwhile) */
   hk_kill(10 + step);
 }
 static void hk_commit(int step) { hk_kill(20 + step); }
+/* mode 6 (0.7, the journal ring): the leader's rounds are slowed now and then and killed at their steps (31: a round begins, 32: a span was written); a second thread makes
+ * no-op calls (they wait for the records before them) and deferred ones with a settle; the main thread's calls are acknowledged when they return (rule A): after kill -9 every
+ * call that returned is there */
+static void hk_jw(store_t *s, int step) {
+  (void)s;
+  if (step == 1 && (mix64(now_us()) & 7) == 0) usleep((useconds_t)(mix64(now_us() ^ 0x77) % 400));
+  hk_kill(30 + step);
+}
+static _Atomic bool g_noop_stop;
+static void *noop_main(void *arg) {
+  store_t *s = arg;
+  uint64_t k = 0;
+  while (!atomic_load(&g_noop_stop)) {
+    k++;
+    const bool df = (k & 15) == 0 && store_defer(s, true) == 0;
+    for (int j = 0; j < 8; j++) {
+      const uint32_t z = (uint32_t)(mix64(k * 131 + (uint64_t)j) % 64);
+      const int r = store_set_flags(s, z, 0, 0);                         /* (no change: no record of its own; it waits for those it came after) */
+      if (r != 0 && r != -ENOENT) _exit(16);
+    }
+    if (df) { if (store_settle(s) != 0) _exit(17); (void)store_defer(s, false); }
+    usleep(200);
+  }
+  return NULL;
+}
+/* mode 6: a thread whose calls do not wait (the ingest thread's way): cursors of source 7, a commit every eight of them (the batch end), whose value is then durable */
+static shm_t *g_kshm;
+static void *dwriter_main(void *arg) {
+  store_t *s = arg;
+  bool v = false;
+  uint64_t k = 0;
+  (void)store_get_cursor(s, 7, &v, &k, NULL, NULL);
+  if (store_defer(s, true) != 0) _exit(18);
+  while (!atomic_load(&g_noop_stop)) {
+    k++;
+    if (store_set_cursor(s, 7, k, "d", 1) != 0) _exit(19);
+    if ((k & 7) == 0) {
+      if (store_commit(s) != 0) _exit(20);
+      atomic_store(&g_kshm->dcur, k);
+    }
+    usleep(300);
+  }
+  return NULL;
+}
 static void *ckthr_main(void *arg) {
   store_t *s = arg;
   for (;;) {
@@ -1437,10 +1482,19 @@ static void child_main(const char *path, shm_t *shm, uint64_t K0, uint64_t count
   if (g_kill_mode == 1) { o.compact_rate = UINT64_MAX; o.nx_reclaim_min = 256; }
   store_test_crash_countdown = countdown;
   if (g_kill_mode == 3) atomic_store(&store_test_ckpt_hook, hk_ckpt);
-  if (g_kill_mode == 4) atomic_store(&store_test_regrow_hook, hk_regrow);
+  if (g_kill_mode == 4) {
+    atomic_store(&store_test_regrow_hook, hk_regrow);
+    atomic_store(&store_test_rg_tail, 0);             /* (every logged change is made in the rounds with no lock, but what the writers add during the last one) */
+  }
   if (g_kill_mode == 5) atomic_store(&store_test_commit_hook, hk_commit);
+  if (g_kill_mode == 6) store_test_jw_hook = hk_jw;
   store_t *s = NULL;
   if (store_open(fd, &o, &s) != 0) _exit(11);
+  if (g_kill_mode == 6) {
+    pthread_t th;
+    g_kshm = shm;
+    if (pthread_create(&th, NULL, noop_main, s) != 0 || pthread_create(&th, NULL, ckthr_main, s) != 0 || pthread_create(&th, NULL, dwriter_main, s) != 0) _exit(15);
+  }
   if (g_kill_mode == 3) {
     pthread_t th;
     if (pthread_create(&th, NULL, ckthr_main, s) != 0) _exit(14);
@@ -1450,6 +1504,7 @@ static void child_main(const char *path, shm_t *shm, uint64_t K0, uint64_t count
     atomic_store(&shm->begun, K + 1);
     if (store_do_op(s, K) != 0) _exit(12);
     atomic_store(&shm->done, K + 1);
+    if (g_kill_mode == 6) atomic_store(&shm->acked, K + 1);               /* (rule A: returned = in the kernel, no commit needed for kill -9) */
     if ((K & 7) == 7) {
       if (store_commit(s) != 0) _exit(13);
       atomic_store(&shm->acked, K + 1);
@@ -1462,7 +1517,7 @@ static void test_kill_loop(int iters, int mode) {
   g_kill_mode = mode;
   printf("[kill -9 loop%s: %d iterations]\n", mode == 1 ? " with the cleaner, the nx pass and the scrub" : mode == 2 ? " with groups of zones made known in one record (store_set_known_n)" :
          mode == 3 ? " with a thread that checkpoints all the time (a fuzzy checkpoint killed at its steps)" : mode == 4 ? " with growths of the index built outside the mutex (killed at their steps)" :
-         mode == 5 ? " with commits that switch the journal file (killed at their steps)" : "", iters);
+         mode == 5 ? " with commits that switch the journal file (killed at their steps)" : mode == 6 ? " with the journal ring (a call is there once it returned; the leader killed at its steps)" : "", iters);
   int hk_kills = 0;
   tdir_t d;
   tdir_new(&d, "kill");
@@ -1496,8 +1551,8 @@ static void test_kill_loop(int iters, int mode) {
     long cd = use_countdown ? 1 + (long)((rng >> 8) % 24000) : 0;
     atomic_store(&g_hk_step, 0);
     if (mode >= 3 && use_countdown && ((rng >> 5) & 1)) {             /* (half of the planned kills at a step of the new code instead of a crash point) */
-      atomic_store(&g_hk_step, mode == 3 ? 1 + (int)((rng >> 8) % 5) : mode == 4 ? 11 + (int)((rng >> 8) % 2) : 21 + (int)((rng >> 8) % 3));
-      atomic_store(&g_hk_n, 1 + (int)((rng >> 12) % (mode == 3 ? 12 : mode == 4 ? 2 : 40)));
+      atomic_store(&g_hk_step, mode == 3 ? 1 + (int)((rng >> 8) % 5) : mode == 4 ? 11 + (int)((rng >> 8) % 3) : mode == 6 ? 31 + (int)((rng >> 8) % 2) : 21 + (int)((rng >> 8) % 3));
+      atomic_store(&g_hk_n, 1 + (int)((rng >> 12) % (mode == 3 ? 12 : mode == 4 ? 2 : mode == 6 ? 300 : 40)));
       cd = 0;
       hk_kills++;
     }
@@ -1505,6 +1560,7 @@ static void test_kill_loop(int iters, int mode) {
     atomic_store(&shm->begun, K0);
     atomic_store(&shm->done, K0);
     atomic_store(&shm->acked, K0);
+    atomic_store(&shm->dcur, 0);
     fflush(stdout);
     pid_t pid = fork();
     if (pid < 0) { CHECK(0); break; }
@@ -1547,6 +1603,11 @@ static void test_kill_loop(int iters, int mode) {
     store_t *s = NULL;
     int r = store_open(d.fd, &o, &s);
     if (r != 0) { printf("  iteration %d: open failed %d\n", it, r); CHECK(0); break; }
+    if (mode == 6 && !tamper && atomic_load(&shm->dcur)) {                          /* (the deferred thread's commit: its cursor is durable after kill -9; the power-loss variant cuts durable bytes, as for acked) */
+      bool v = false;
+      uint64_t c7 = 0;
+      CHECK(store_get_cursor(s, 7, &v, &c7, NULL, NULL) == 0 && v && c7 >= atomic_load(&shm->dcur));
+    }
     store_stats_t st;
     store_stats(s, &st);
     if (st.recovery.used_older_super) older++;
@@ -1614,7 +1675,7 @@ static void test_kill_loop(int iters, int mode) {
   printf("  %d stores, %d children killed (%d at a crash point), %d journal tails cut (rebuild path), %d older-superblock opens, %d torn tails,\n"
          "  %d replayed records in total, %d exact-end matches, %d begun-but-lost operations; %d opens found removed segments (%u segment numbers at the most)\n",
          fresh, crashed, countdown_hits, tampered, older, torn, replayed_total, exact, lost_ops, with_free, max_segs);
-  if (mode >= 3) printf("  %d kills planned at a step of a %s\n", hk_kills, mode == 3 ? "checkpoint" : mode == 4 ? "growth" : "commit that switches the journal file");
+  if (mode >= 3) printf("  %d kills planned at a step of a %s\n", hk_kills, mode == 3 ? "checkpoint" : mode == 4 ? "growth" : mode == 6 ? "leader of the journal ring" : "commit that switches the journal file");
   if (gen_rebuilds) printf("  %d recoveries rebuilt the derived tables after a growth of the index that no checkpoint had written\n", gen_rebuilds);
   if (mode == 2) printf("  %d recoveries found a group of entries applied in part (a kill between the records of one call)\n", part_groups);
   atomic_store(&g_hk_step, 0);
@@ -2708,6 +2769,128 @@ static void test_commit_switch(void) {
   tdir_free(&d);
 }
 
+/* 0.7: a growth built outside the mutex catches up with its log in rounds with no lock, and makes only the rest inside it.  The changes come at the two places where they can: before
+ * the first round (the build was waiting) and during a round (the hook after the first round writes more); with no tail every logged change but the last round's is made with no
+ * lock (two rounds), with the built-in tail (4096) the few changes are all made inside the mutex (no round).  Either way the new index holds every change, before and after a reopen. */
+static store_t *g_gc_store;
+static _Atomic int g_gc_rounds, g_gc_go, g_gc_idle, g_gc_bad;
+static _Atomic uint32_t g_gc_next;
+static int gc_delete(store_t *s, uint32_t i) {
+  char nm[160];
+  name_of(i, nm, sizeof(nm));
+  return store_delete_name(s, 0, nm, strlen(nm));
+}
+static void gc_hook(int step) {
+  store_t *s = g_gc_store;
+  if (step == 1) {
+    atomic_store(&g_gc_go, 1);                                            /* (the main thread stops writing: the changes of the test are the hook's alone) */
+    for (int w = 0; w < 5000 && !atomic_load(&g_gc_idle); w++) usleep(1000);
+    for (int k = 0; k < 40; k++) if (put_i(s, 0, atomic_fetch_add(&g_gc_next, 1), 1, NULL) != 0) atomic_store(&g_gc_bad, 1);
+    if (gc_delete(s, 5) != 0 || put_src(s, 6, 3, 777) != 0) atomic_store(&g_gc_bad, 2);
+  } else if (step == 3 && atomic_fetch_add(&g_gc_rounds, 1) == 0) {     /* (logged while the build catches up: the next round or the rest inside the mutex makes them) */
+    for (int k = 0; k < 10; k++) if (put_i(s, 0, atomic_fetch_add(&g_gc_next, 1), 1, NULL) != 0) atomic_store(&g_gc_bad, 3);
+    if (gc_delete(s, 7) != 0 || put_src(s, 8, 3, 778) != 0) atomic_store(&g_gc_bad, 4);
+  }
+}
+static bool gc_model_ok(store_t *s, uint32_t next, bool round_writes) {      /* (round_writes: the hook after the first round made its changes) */
+  for (uint32_t i = 0; i < next; i++) {
+    const bool gone = i == 5 || (round_writes && i == 7);
+    if (gone ? find_i(s, 0, i) != STORE_NONE : !verify_i(s, 0, i, i == 6 || (round_writes && i == 8) ? 3 : 1)) { printf("  zone %u not as the model says\n", i); return false; }
+  }
+  return store_find_source(s, 6 % 4, 777, 0) == find_i(s, 0, 6) && store_find_source(s, 6 % 4, 7, 0) == STORE_NONE &&
+         (round_writes ? store_find_source(s, 8 % 4, 778, 0) == find_i(s, 0, 8) && store_find_source(s, 7 % 4, 8, 0) == STORE_NONE
+                       : store_find_source(s, 8 % 4, 9, 0) == find_i(s, 0, 8));
+}
+static void test_growth_catchup(void) {
+  printf("[a growth built outside the mutex catches up with its log in rounds with no lock]\n");
+  for (int run = 0; run < 2; run++) {
+    tdir_t d;
+    tdir_new(&d, "gcatch");
+    store_opts_t o;
+    small_opts(&o);
+    o.checkpoint_interval_ms = UINT32_MAX;
+    o.scrub_interval_s = UINT32_MAX;
+    store_t *s = NULL;
+    CHECK_EQ(store_open(d.fd, &o, &s), 0);
+    if (!s) { tdir_free(&d); return; }
+    CHECK_EQ(store_view_add(s, "default"), 0);
+    g_gc_store = s;
+    atomic_store(&g_gc_rounds, 0);
+    atomic_store(&g_gc_go, 0);
+    atomic_store(&g_gc_idle, 0);
+    atomic_store(&g_gc_bad, 0);
+    atomic_store(&g_gc_next, 0);
+    atomic_store(&store_test_rg_tail, run == 0 ? 0 : -1);
+    atomic_store(&store_test_regrow_hook, gc_hook);
+    store_stats_t st;
+    while (!atomic_load(&g_gc_go) && atomic_load(&g_gc_next) < 5000) {
+      CHECK_EQ(put_i(s, 0, atomic_fetch_add(&g_gc_next, 1), 1, NULL), 0);
+      store_stats(s, &st);
+      if (st.ix_used * 8 > st.ix_slots * 3) usleep(2000);               /* (the build began: it reaches its hook long before the old index is half full) */
+    }
+    atomic_store(&g_gc_idle, 1);
+    store_stats(s, &st);
+    for (int w = 0; w < 5000 && st.growths_background == 0; w++) { usleep(1000); store_stats(s, &st); }
+    atomic_store(&store_test_regrow_hook, NULL);
+    atomic_store(&store_test_rg_tail, -1);
+    CHECK_EQ(st.growths_background, 1);
+    CHECK_EQ(st.growths, st.growths_background);
+    CHECK_EQ(atomic_load(&g_gc_bad), 0);
+    CHECK_EQ(atomic_load(&g_gc_rounds), run == 0 ? 2 : 0);
+    const uint32_t next = atomic_load(&g_gc_next);
+    CHECK(next > 300);
+    CHECK(gc_model_ok(s, next, run == 0));
+    check_consistent(s, "after the catch-up");
+    CHECK_EQ(store_close(s), 0);
+    o.create = false;
+    CHECK_EQ(store_open(d.fd, &o, &s), 0);
+    if (s) {
+      CHECK(gc_model_ok(s, next, run == 0));
+      check_consistent(s, "reopened after the catch-up");
+      CHECK_EQ(store_close(s), 0);
+    }
+    tdir_free(&d);
+  }
+}
+
+/* 0.7: a retired index generation is released (munmap, close) after the writer mutex is given up, not inside it (20 to 60 ms holds at 10M zones) */
+static _Atomic int g_rf_n, g_rf_locked;
+static void rf_hook(store_t *s) {
+  atomic_fetch_add(&g_rf_n, 1);
+  if (!store_test_writer_free(s)) atomic_fetch_add(&g_rf_locked, 1);
+}
+static void test_retire_after_unlock(void) {
+  printf("[a retired index generation is released after the writer mutex]\n");
+  tdir_t d;
+  tdir_new(&d, "rfree");
+  store_opts_t o;
+  small_opts(&o);
+  o.checkpoint_interval_ms = UINT32_MAX;
+  o.scrub_interval_s = UINT32_MAX;
+  atomic_store(&store_test_no_flusher, true);                            /* (no other thread takes the mutex while the hook looks at it) */
+  store_t *s = NULL;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (s) {
+    CHECK_EQ(store_view_add(s, "default"), 0);
+    atomic_store(&g_rf_n, 0);
+    atomic_store(&g_rf_locked, 0);
+    store_test_retire_free = rf_hook;
+    store_stats_t st;
+    uint32_t i = 0;
+    for (store_stats(s, &st); st.growths == 0 && i < 5000; i++) { CHECK_EQ(put_i(s, 0, i, 1, NULL), 0); store_stats(s, &st); }
+    for (int w = 0; w < 5000 && st.growths_background != st.growths; w++) { usleep(1000); store_stats(s, &st); }    /* (a build on its thread: it has ended) */
+    for (uint32_t k = 0; k < 50 && atomic_load(&g_rf_n) == 0; k++) { CHECK_EQ(put_i(s, 0, i++, 1, NULL), 0); usleep(1000); }
+    store_test_retire_free = NULL;
+    CHECK(st.growths >= 1);
+    CHECK(atomic_load(&g_rf_n) >= 1);
+    CHECK_EQ(atomic_load(&g_rf_locked), 0);
+    check_consistent(s, "after the release");
+    CHECK_EQ(store_close(s), 0);
+  }
+  atomic_store(&store_test_no_flusher, false);
+  tdir_free(&d);
+}
+
 static void test_journal_bound(int mode) {
   printf("[the journal stays below 2 x journal_max_bytes while a checkpoint is slow; a close leaves a fuzzy checkpoint (%s)]\n", mode == STORE_MODE_MAP ? "MAP" : "COPY");
   tdir_t d;
@@ -3539,6 +3722,7 @@ static void test_space(int mode) {
   g_fake_dir = d.path;
   g_fake_cap = base + (1800u << 10);
   store_test_fs_free = fake_fs_free;
+  atomic_store(&store_test_jr_floor, 0);                                 /* (0.7: the journal's own floor, jr_floor(), is tested in test_jr_space(); here the thresholds of the reserve alone) */
   store_stats_t st;
   store_stats(s, &st);
   CHECK_EQ(st.reserve_bytes, 256u << 10);
@@ -3634,11 +3818,14 @@ static void test_space(int mode) {
   CHECK(st.state & STORE_ST_DEGRADED_NOSPC);
   /* 3. the way back: zones are deleted (the room comes from the cleaner), then a zone is stored again and the state ends */
   log_clear();
+  unsigned ndel = 0;
   for (uint32_t i = 1000; i < first_known; i++) {
     if (i % 4 == 0) continue;
     char nm[160];
     name_of(i, nm, sizeof(nm));
     CHECK_EQ(store_delete_name(s, 0, nm, strlen(nm)), 0);
+    if (++ndel % 100 == 0) CHECK_EQ(store_checkpoint(s), 0);            /* (0.7: a delete's record needs room on the full disk too, and the journal is checked against the free
+                                                                         * space before the record is taken: the checkpoints cut the journal files, as the flusher's would) */
   }
   for (int k = 0; k < 6; k++) CHECK_EQ(store_compact(s, 0, true, NULL), 0);
   CHECK_EQ(put_i(s, 0, first_known, 2, NULL), 0);
@@ -3650,6 +3837,7 @@ static void test_space(int mode) {
   CHECK_EQ(st.degraded_since_unix, 0);
   check_consistent(s, "space 3");
   store_test_fs_free = NULL;
+  atomic_store(&store_test_jr_floor, -1);
   CHECK_EQ(store_close(s), 0);
   tdir_free(&d);
 }
@@ -4907,16 +5095,16 @@ static void test_group_journal(void) {
       store_t *c = NULL;
       if (store_open(d.fd, &o, &c) != 0) _exit(3);
       for (uint32_t i = 0; i < 10; i++) { store_meta_t m = meta_of(i, 1); char nm[160]; name_of(i, nm, sizeof(nm)); if (store_set_known(c, 0, nm, strlen(nm), &m, NULL) != 0) _exit(4); }
-      gk_t g[64];
-      store_known_t in[64];
-      int r[64];
-      for (unsigned j = 0; j < 64; j++) {
+      gk_t g[STORE_GROUP_MAX];                                                 /* (a full group: one record) */
+      store_known_t in[STORE_GROUP_MAX];
+      int r[STORE_GROUP_MAX];
+      for (unsigned j = 0; j < STORE_GROUP_MAX; j++) {
         name_of(100 + j, g[j].nm, sizeof(g[j].nm));
         g[j].m = meta_of(100 + j, 1);
         in[j].name = g[j].nm; in[j].len = strlen(g[j].nm); in[j].meta = &g[j].m;
       }
-      if (store_set_known_n(c, 0, in, 64, r, NULL) != 0) _exit(5);
-      for (unsigned j = 0; j < 64; j++) if (r[j] != 0) _exit(6);
+      if (store_set_known_n(c, 0, in, STORE_GROUP_MAX, r, NULL) != 0) _exit(5);
+      for (unsigned j = 0; j < STORE_GROUP_MAX; j++) if (r[j] != 0) _exit(6);
       _exit(0);                                                               /* no close, no commit: the record is in the kernel */
     }
     int stt = 0;
@@ -4936,7 +5124,7 @@ static void test_group_journal(void) {
       store_stats_t st;
       store_stats(s, &st);
       int found = 0;
-      for (uint32_t j = 0; j < 64; j++) { char nm[160]; name_of(100 + j, nm, sizeof(nm)); store_read_lock(); if (store_find(s, 0, nm, strlen(nm)) != STORE_NONE) found++; store_read_unlock(); }
+      for (uint32_t j = 0; j < STORE_GROUP_MAX; j++) { char nm[160]; name_of(100 + j, nm, sizeof(nm)); store_read_lock(); if (store_find(s, 0, nm, strlen(nm)) != STORE_NONE) found++; store_read_unlock(); }
       if (torn) {
         CHECK(st.recovery.journal_torn);
         for (uint32_t i = 0; i < 10; i++) { char nm[160]; name_of(i, nm, sizeof(nm)); store_read_lock(); CHECK(store_find(s, 0, nm, strlen(nm)) != STORE_NONE); store_read_unlock(); }
@@ -4945,16 +5133,16 @@ static void test_group_journal(void) {
       } else {
         CHECK(!st.recovery.rebuilt);
         CHECK(st.recovery.records_replayed >= 11);                            /* (the ten singles and the group) */
-        CHECK_EQ(found, 64);
-        CHECK_EQ(st.zones_known, 74);
+        CHECK_EQ(found, STORE_GROUP_MAX);
+        CHECK_EQ(st.zones_known, 10 + STORE_GROUP_MAX);
       }
       check_consistent(s, torn ? "torn group" : "replayed group");
       CHECK_EQ(store_close(s), 0);
     }
     tdir_free(&d);
   }
-  /* 3. a group that the index growth splits: the entries past one half of the index wait for the growth (the build outside the mutex is held back here), so the call writes the first
-   * entries as one record, the growth as the next, the rest as a third.  kill -9 at every crash point of the call: after the replay the group's zones are a prefix of the entries in the
+  /* 3. a group that the index growth splits: the entries past one half of the index wait for the growth (the build outside the mutex is held back here), so the call (64 entries) writes the first
+   * entries as records of up to STORE_GROUP_MAX, the growth as the next, the rest after it.  kill -9 at every crash point of the call: after the replay the group's zones are a prefix of the entries in the
    * order of the call (each record whole or not there), and some kills keep only the first record (the call is not one unit: what the kill -9 loop's model allows) */
   {
     int parts = 0, whole = 0, none = 0, bad = 0, runs = 0;
@@ -5025,9 +5213,1297 @@ static void test_group_journal(void) {
     }
     printf("  a group split by the index growth, killed at each of %d crash points: %d whole, %d none, %d in part (a prefix)\n", runs, whole, none, parts);
     CHECK_EQ(bad, 0);
-    CHECK(parts > 0);
-    CHECK(whole > 0 && none > 0);
+    CHECK(whole > 0 && none > 0);                                         /* (0.7: the records of a call are written after it, in one span: a kill keeps them all or none, but across a switch of the journal file) */
   }
+}
+
+/* ------------------------------------------------------------------------------------------------------------------ */
+/* 0.7: the journal ring (the record is written after the writer mutex; planning planing_0.7.x_store_journal_offlock.md, 4.2)            */
+/* ------------------------------------------------------------------------------------------------------------------ */
+
+/* the leader's hook: while g_jh_hold is set, a leader that begins a round waits there (its records are applied and not in the kernel: the window the ring opens); a kill at
+ * the n-th time a step is reached (1: a round begins, 2: a span was written) */
+static _Atomic int g_jh_hold, g_jh_in, g_jh_kill_step, g_jh_kill_n, g_jh_sleep_us;
+static void jh_hook(store_t *s, int step) {
+  (void)s;
+  if (atomic_load(&g_jh_kill_step) == step && atomic_fetch_sub(&g_jh_kill_n, 1) == 1) kill(getpid(), SIGKILL);
+  if (step == 1 && atomic_load(&g_jh_sleep_us)) usleep((useconds_t)(mix64(now_us()) % (uint64_t)atomic_load(&g_jh_sleep_us)));
+  if (step != 1 || !atomic_load(&g_jh_hold)) return;
+  atomic_store(&g_jh_in, 1);
+  while (atomic_load(&g_jh_hold)) usleep(300);
+  atomic_store(&g_jh_in, 0);
+}
+static bool jh_wait_in(void) {
+  for (int w = 0; w < 5000 && !atomic_load(&g_jh_in); w++) usleep(1000);
+  return atomic_load(&g_jh_in) != 0;
+}
+/* the leader's write fails g_jf_n times (-1: every time) with g_jf_err */
+static _Atomic int g_jf_n, g_jf_err;
+static int jf_fault(uint64_t pos, uint64_t len) {
+  (void)pos;
+  (void)len;
+  const int n = atomic_load(&g_jf_n);
+  if (n == 0) return 0;
+  if (n > 0) atomic_fetch_sub(&g_jf_n, 1);
+  return atomic_load(&g_jf_err);
+}
+static void jr_hooks_off(void) {
+  store_test_jw_hook = NULL;
+  store_test_jw_fault = NULL;
+  atomic_store(&g_jh_hold, 0);
+  atomic_store(&g_jh_kill_step, 0);
+  atomic_store(&g_jh_sleep_us, 0);
+  atomic_store(&g_jf_n, 0);
+}
+/* a call on a thread of its own */
+typedef struct jr_call { int (*fn)(struct jr_call *); store_t *s; uint32_t a; uint64_t b; int r; _Atomic int done, flag; pthread_t th; } jr_call_t;
+static void *jr_call_main(void *arg) {
+  jr_call_t *c = arg;
+  c->r = c->fn(c);
+  atomic_store(&c->done, 1);
+  return NULL;
+}
+static bool jr_start(jr_call_t *c) { atomic_store(&c->done, 0); return pthread_create(&c->th, NULL, jr_call_main, c) == 0; }
+static int jc_put(jr_call_t *c) { return put_i(c->s, 0, c->a, c->b, NULL); }
+static int jc_noop(jr_call_t *c) { return store_set_flags(c->s, c->a, 0, 0); }
+static int jc_flag(jr_call_t *c) { return store_set_flags(c->s, c->a, STORE_F_REJECTED_NEW, 0); }
+static int jc_commit(jr_call_t *c) { return store_commit(c->s); }
+static int jc_ckpt(jr_call_t *c) { return store_checkpoint(c->s); }
+static int jc_close(jr_call_t *c) { return store_close(c->s); }
+static int jc_jwait(jr_call_t *c) { (void)store_journal_wait(c->s, 1); return 0; }
+static int jc_fill(jr_call_t *c) {                                        /* (b zones from a, deferred, then a settle) */
+  int r = store_defer(c->s, true);
+  for (uint64_t k = 0; k < c->b && r == 0; k++) r = put_i(c->s, 0, c->a + (uint32_t)k, 1, NULL);
+  if (r == 0) r = store_settle(c->s);
+  (void)store_defer(c->s, false);
+  return r;
+}
+static int jc_defer_nosettle(jr_call_t *c) {                               /* (the bytes are left to the flusher and to whoever waits next) */
+  int r = store_defer(c->s, true);
+  if (r == 0) r = put_i(c->s, 0, c->a, 1, NULL);
+  (void)store_defer(c->s, false);
+  return r;
+}
+static store_t *jr_open_o(tdir_t *d, bool create, uint64_t boot, store_opts_t *o) {
+  store_t *s = NULL;
+  o->create = create;
+  o->boot_id = boot;
+  if (store_open(d->fd, o, &s) != 0) return NULL;
+  if (create) store_view_add(s, "default");
+  return s;
+}
+static store_t *jr_open(tdir_t *d, bool create, uint64_t boot) {
+  store_opts_t o;
+  small_opts(&o);
+  o.checkpoint_interval_ms = UINT32_MAX;
+  o.scrub_interval_s = UINT32_MAX;
+  return jr_open_o(d, create, boot, &o);
+}
+
+/* (A, B2; 4.2 tests 2 and 4) A call returns only after the ring is written up to its unlock: its own record, and every record it planned on.  A no-op call of another thread made
+ * after a record was applied (and before it is written) waits for it; store_commit() waits for a held leader; readers see the record before it is written; after the commit the
+ * state survives a power loss (another boot id: the rebuild path). */
+static void test_jr_ack(void) {
+  printf("[journal ring: a call returns after its bytes and the bytes it planned on are written; a commit waits for a held leader]\n");
+  tdir_t d;
+  tdir_new(&d, "jrack");
+  store_t *s = jr_open(&d, true, 42);
+  CHECK(s != NULL);
+  if (!s) { tdir_free(&d); return; }
+  for (uint32_t i = 0; i < 20; i++) CHECK_EQ(put_i(s, 0, i, 1, NULL), 0);
+  const uint32_t z5 = find_i(s, 0, 5);
+  store_test_jw_hook = jh_hook;
+  atomic_store(&g_jh_hold, 1);
+  jr_call_t a = { .fn = jc_put, .s = s, .a = 100, .b = 1 }, b = { .fn = jc_noop, .s = s, .a = z5 }, c = { .fn = jc_commit, .s = s };
+  CHECK(jr_start(&a));
+  CHECK(jh_wait_in());                                                     /* (the put is applied: its leader waits in the hook) */
+  CHECK(find_i(s, 0, 100) != STORE_NONE);                                  /* (readers see it before it is written) */
+  store_stats_t st;
+  store_stats(s, &st);
+  CHECK(st.ring_unwritten_bytes > 0);
+  CHECK(jr_start(&b));
+  CHECK(jr_start(&c));
+  usleep(100000);
+  CHECK(!atomic_load(&a.done) && !atomic_load(&b.done) && !atomic_load(&c.done));    /* (the no-op call and the commit wait for the record they came after) */
+  atomic_store(&g_jh_hold, 0);
+  pthread_join(a.th, NULL);
+  pthread_join(b.th, NULL);
+  pthread_join(c.th, NULL);
+  CHECK_EQ(a.r, 0);
+  CHECK_EQ(b.r, 0);
+  CHECK_EQ(c.r, 0);
+  store_stats(s, &st);
+  CHECK_EQ(st.ring_unwritten_bytes, 0);
+  CHECK(st.leader_writes > 0 && st.committed_lsn == st.lsn);
+  jr_hooks_off();
+  CHECK_EQ(store_close(s), 0);
+  /* a commit made while its leader was held, then a crash with another boot (a power loss): the open rebuilds and the committed zones are there */
+  fflush(stdout);
+  pid_t pid = fork();
+  if (pid == 0) {
+    store_t *c = jr_open(&d, false, 42);
+    if (!c) _exit(2);
+    store_test_jw_hook = jh_hook;
+    atomic_store(&g_jh_hold, 1);
+    jr_call_t p = { .fn = jc_put, .s = c, .a = 500, .b = 1 }, cm = { .fn = jc_commit, .s = c };
+    if (!jr_start(&p) || !jh_wait_in() || !jr_start(&cm)) _exit(3);
+    usleep(50000);
+    if (atomic_load(&cm.done)) _exit(4);                                   /* (the commit waits for the held write) */
+    atomic_store(&g_jh_hold, 0);
+    pthread_join(p.th, NULL);
+    pthread_join(cm.th, NULL);
+    if (p.r != 0 || cm.r != 0) _exit(5);
+    kill(getpid(), SIGKILL);
+    _exit(6);
+  }
+  int stt = 0;
+  waitpid(pid, &stt, 0);
+  CHECK(WIFSIGNALED(stt));
+  store_t *s2 = jr_open(&d, false, 77);                                    /* (another boot: the rebuild path, after the commit's sync) */
+  CHECK(s2 != NULL);
+  if (s2) {
+    store_stats_t st2;
+    store_stats(s2, &st2);
+    CHECK(st2.recovery.rebuilt);
+    CHECK(verify_i(s2, 0, 500, 1) && verify_i(s2, 0, 100, 1));
+    for (uint32_t i = 0; i < 20; i++) CHECK(verify_i(s2, 0, i, 1));
+    check_consistent(s2, "ack reopen");
+    CHECK_EQ(store_close(s2), 0);
+  }
+  tdir_free(&d);
+}
+
+/* (4.2 test 3) kill -9 right after a call returned, for every writer's way out of the mutex: with no flusher (no background leader writes behind the call), the change is
+ * there after the reopen, and the replay is exact (same boot, no rebuild but after an index growth's OP_GEN). */
+enum { JK_PUT, JK_KNOWN, JK_KNOWN_N, JK_DELETE, JK_DELETE_NAME, JK_FLAGS, JK_STAMP, JK_CURSOR, JK_VIEW, JK_RESERVE, JK_COMPACT, JK_REPAIR, JK_TICK, JK_SCRUB, JK_NX, JK_N };
+static const char *const jk_names[JK_N] = { "store_put", "store_set_known", "store_set_known_n", "store_delete", "store_delete_name", "store_set_flags", "store_set_stamp",
+                                             "store_set_cursor", "store_view_add", "store_reserve", "store_compact", "store_repair", "store_tick (cleaner, segment removal)",
+                                             "store_scrub_run", "store_compact (the nx pass)" };
+static store_opts_t jk_opts(void) {
+  store_opts_t o;
+  small_opts(&o);
+  o.seg_size = 64u << 10;                                                  /* (several segments: the cleaner and the removal have work) */
+  o.compact_rate = UINT64_MAX;
+  o.nx_reclaim_min = 1;
+  o.checkpoint_interval_ms = UINT32_MAX;
+  o.scrub_interval_s = UINT32_MAX;
+  return o;
+}
+/* the parent's part before the call (acknowledged, closed): what the call then changes */
+static void jk_prep(store_t *s, int k) {
+  if (k == JK_COMPACT || k == JK_TICK)
+    for (uint32_t i = 0; i < 120; i++) { char nm[160]; name_of(i, nm, sizeof(nm)); (void)store_delete_name(s, 0, nm, strlen(nm)); }    /* (dead segments) */
+  if (k == JK_NX)
+    for (uint32_t i = 3; i < 200; i += 7) { char nm[160]; name_of(i, nm, sizeof(nm)); (void)store_delete_name(s, 0, nm, strlen(nm)); }  /* (holes in nx: long names gone) */
+}
+static int jk_call(store_t *s, int k) {
+  char nm[160];
+  store_meta_t m;
+  switch (k) {
+  case JK_PUT: return put_i(s, 0, 200, 3, NULL);
+  case JK_KNOWN: name_of(201, nm, sizeof(nm)); m = meta_of(201, 1); return store_set_known(s, 0, nm, strlen(nm), &m, NULL);
+  case JK_KNOWN_N: {
+    char n4[4][160];
+    store_meta_t m4[4];
+    store_known_t in[4];
+    int res[4];
+    for (int j = 0; j < 4; j++) { name_of(202 + (uint32_t)j, n4[j], sizeof(n4[j])); m4[j] = meta_of(202 + (uint32_t)j, 1); in[j].name = n4[j]; in[j].len = strlen(n4[j]); in[j].meta = &m4[j]; }
+    int r = store_set_known_n(s, 0, in, 4, res, NULL);
+    for (int j = 0; j < 4 && r == 0; j++) r = res[j];
+    return r;
+  }
+  case JK_DELETE: return store_delete(s, find_i(s, 0, 130));
+  case JK_DELETE_NAME: name_of(131, nm, sizeof(nm)); return store_delete_name(s, 0, nm, strlen(nm));
+  case JK_FLAGS: return store_set_flags(s, find_i(s, 0, 136), STORE_F_REJECTED_NEW, 0);
+  case JK_STAMP: return store_set_stamp(s, find_i(s, 0, 137), 99, 990, 0, 0);
+  case JK_CURSOR: return store_set_cursor(s, 1, 1234, "id", 2);
+  case JK_VIEW: return store_view_add(s, "v9") >= 0 ? 0 : -1;
+  case JK_RESERVE: return store_reserve(s, 5000);
+  case JK_COMPACT: return store_compact(s, 0, true, NULL);
+  case JK_REPAIR: mem_flip(s, 0, (uint64_t)find_i(s, 0, 138) * 64 + 24); return store_repair(s);    /* (a damaged cell: the repair drops the zone) */
+  case JK_TICK: {
+    int r = store_tick(s);                                                 /* (the cleaner and the marking of the empty segments) */
+    if (r == 0) r = store_checkpoint(s);
+    if (r == 0) r = store_tick(s);                                         /* (their removal) */
+    return r;
+  }
+  case JK_SCRUB: {
+    store_zone_t zi;
+    if (store_zone_get(s, find_i(s, 0, 139), &zi) != 0) return -1;
+    char p[64];
+    snprintf(p, sizeof(p), "seg.%u", (unsigned)(zi.loc >> 36));
+    const int fd = openat(store_test_dirfd_of(s), p, O_RDWR);
+    if (fd < 0) return -1;
+    uint8_t b;
+    const off_t off = (off_t)((zi.loc & ((1ull << 36) - 1)) * 64 + 64 + 32 + 21);
+    if (pread(fd, &b, 1, off) != 1) { close(fd); return -1; }
+    b ^= 0x5a;
+    if (pwrite(fd, &b, 1, off) != 1) { close(fd); return -1; }
+    close(fd);
+    return store_scrub_run(s, NULL);                                       /* (the damaged image: the zone becomes KNOWN, a record) */
+  }
+  default: return store_compact(s, 0, false, NULL);                         /* JK_NX: the nx pass moves the names down */
+  }
+}
+static bool jk_check(store_t *s, int k, const store_stats_t *before) {
+  store_zone_t zi;
+  store_stats_t st;
+  store_stats(s, &st);
+  switch (k) {
+  case JK_PUT: return verify_i(s, 0, 200, 3);
+  case JK_KNOWN: return find_i(s, 0, 201) != STORE_NONE;
+  case JK_KNOWN_N: for (uint32_t j = 0; j < 4; j++) if (find_i(s, 0, 202 + j) == STORE_NONE) return false; return true;
+  case JK_DELETE: return find_i(s, 0, 130) == STORE_NONE;
+  case JK_DELETE_NAME: return find_i(s, 0, 131) == STORE_NONE;
+  case JK_FLAGS: return store_zone_get(s, find_i(s, 0, 136), &zi) == 0 && (zi.flags & STORE_F_REJECTED_NEW);
+  case JK_STAMP: return store_zone_get(s, find_i(s, 0, 137), &zi) == 0 && zi.stamp_gen == 99;
+  case JK_CURSOR: { bool v = false; uint64_t cur = 0; return store_get_cursor(s, 1, &v, &cur, NULL, NULL) == 0 && v && cur == 1234; }
+  case JK_VIEW: return store_view_id(s, "v9") >= 0;
+  case JK_RESERVE: return st.ix_slots >= 5000 || st.recovery.gen_replays > 0;   /* (its OP_GEN record: replayed, the open rebuilt the index at its own size) */
+  case JK_COMPACT: case JK_TICK: return st.seg_free_numbers > before->seg_free_numbers;    /* (segments were removed by records that survived) */
+  case JK_REPAIR: return find_i(s, 0, 138) == STORE_NONE;                 /* (the repair dropped the damaged zone; its checkpoint is on disk) */
+  case JK_SCRUB: return store_zone_get(s, find_i(s, 0, 139), &zi) == 0 && zi.state == STORE_STATE_KNOWN;
+  default: return st.nx_dead < before->nx_dead;                           /* JK_NX: the holes are gone */
+  }
+}
+static void test_jr_kill_after_return(void) {
+  printf("[journal ring: kill -9 right after each writer call returned: the change is there]\n");
+  for (int k = 0; k < JK_N; k++) {
+    tdir_t d;
+    tdir_new(&d, "jrkr");
+    store_opts_t o = jk_opts();
+    store_t *s = jr_open_o(&d, true, 42, &o);
+    CHECK(s != NULL);
+    if (!s) { tdir_free(&d); continue; }
+    for (uint32_t i = 0; i < 200; i++) CHECK_EQ(put_i(s, 0, i, 1, NULL), 0);
+    jk_prep(s, k);
+    CHECK_EQ(store_close(s), 0);
+    s = jr_open_o(&d, false, 42, &o);
+    store_stats_t before;
+    memset(&before, 0, sizeof(before));
+    if (s) { store_stats(s, &before); CHECK_EQ(store_close(s), 0); }
+    fflush(stdout);
+    pid_t pid = fork();
+    if (pid == 0) {
+      atomic_store(&store_test_no_flusher, true);
+      store_t *c = jr_open_o(&d, false, 42, &o);
+      if (!c) _exit(2);
+      if (jk_call(c, k) != 0) _exit(3);
+      kill(getpid(), SIGKILL);
+      _exit(4);
+    }
+    int stt = 0;
+    waitpid(pid, &stt, 0);
+    if (!WIFSIGNALED(stt)) printf("  %s: the child ended with %d\n", jk_names[k], WIFEXITED(stt) ? WEXITSTATUS(stt) : -1);
+    CHECK(WIFSIGNALED(stt));
+    s = jr_open_o(&d, false, 42, &o);
+    CHECK(s != NULL);
+    if (s) {
+      store_stats_t st;
+      store_stats(s, &st);
+      const bool ok = jk_check(s, k, &before);
+      if (!ok) printf("  %s: the change is not there after kill -9\n", jk_names[k]);
+      CHECK(ok);
+      CHECK(!st.recovery.rebuilt || st.recovery.gen_replays > 0 || k == JK_REPAIR);
+      check_consistent(s, jk_names[k]);
+      CHECK_EQ(store_close(s), 0);
+    }
+    tdir_free(&d);
+  }
+}
+
+/* (4.2 tests 5, 6, 16, 18 and the no-flusher case of 4.1) the write of the journal fails: ENOSPC -> nospace (only the flusher, or the tick without one, writes again; every other
+ * wait and every new record fails at once; the stop gets through), EIO -> three tries, then failed (no records, no table page, no clean checkpoint; the reopen replays the
+ * written prefix); a write that fails once is written again whole (the state stays ok). */
+static void test_jr_states(bool flusher) {
+  printf("[journal ring: ENOSPC (nospace, the retry), EIO (failed), a transient error (%s)]\n", flusher ? "flusher" : "no flusher");
+  /* 1. ENOSPC: the retry passes when the room comes back */
+  {
+    tdir_t d;
+    tdir_new(&d, "jrnospc");
+    atomic_store(&store_test_no_flusher, !flusher);
+    store_t *s = jr_open(&d, true, 42);
+    atomic_store(&store_test_no_flusher, false);
+    CHECK(s != NULL);
+    if (!s) { tdir_free(&d); return; }
+    for (uint32_t i = 0; i < 20; i++) CHECK_EQ(put_i(s, 0, i, 1, NULL), 0);
+    store_test_jw_fault = jf_fault;
+    atomic_store(&g_jf_err, ENOSPC);
+    atomic_store(&g_jf_n, -1);
+    CHECK_EQ(put_i(s, 0, 100, 1, NULL), -ENOSPC);                          /* (its own leader met the error: the outcome is unknown, the record is applied) */
+    store_stats_t st;
+    store_stats(s, &st);
+    CHECK_EQ(st.journal_state, STORE_JOURNAL_NOSPACE);
+    uint64_t t0 = now_us();
+    CHECK_EQ(put_i(s, 0, 101, 1, NULL), -ENOSPC);                          /* (at once: no wait at the admission) */
+    CHECK(find_i(s, 0, 101) == STORE_NONE);
+    CHECK_EQ(store_commit(s), -ENOSPC);
+    CHECK(store_checkpoint(s) < 0);
+    CHECK(now_us() - t0 < 2000000);
+    atomic_store(&g_jf_n, 0);                                              /* the room comes back */
+    for (int w = 0; w < 5000; w++) {
+      if (!flusher) (void)store_tick(s);
+      store_stats(s, &st);
+      if (st.journal_state == STORE_JOURNAL_OK) break;
+      usleep(1000);
+    }
+    CHECK_EQ(st.journal_state, STORE_JOURNAL_OK);
+    CHECK_EQ(st.ring_unwritten_bytes, 0);
+    CHECK_EQ(put_i(s, 0, 102, 1, NULL), 0);
+    CHECK_EQ(store_commit(s), 0);
+    check_consistent(s, "nospace, back");
+    jr_hooks_off();
+    CHECK_EQ(store_close(s), 0);
+    s = jr_open(&d, false, 42);
+    CHECK(s != NULL);
+    if (s) {
+      CHECK(verify_i(s, 0, 100, 1) && verify_i(s, 0, 102, 1));            /* (the record of the call that got -ENOSPC was written by the retry) */
+      check_consistent(s, "nospace reopen");
+      CHECK_EQ(store_close(s), 0);
+    }
+    tdir_free(&d);
+  }
+  /* 2. ENOSPC that lasts: the stop gets through (no clean checkpoint), the reopen replays the written prefix */
+  {
+    tdir_t d;
+    tdir_new(&d, "jrnospc2");
+    atomic_store(&store_test_no_flusher, !flusher);
+    store_t *s = jr_open(&d, true, 42);
+    atomic_store(&store_test_no_flusher, false);
+    CHECK(s != NULL);
+    if (!s) { tdir_free(&d); return; }
+    for (uint32_t i = 0; i < 20; i++) CHECK_EQ(put_i(s, 0, i, 1, NULL), 0);
+    store_test_jw_fault = jf_fault;
+    atomic_store(&g_jf_err, ENOSPC);
+    atomic_store(&g_jf_n, -1);
+    CHECK_EQ(put_i(s, 0, 100, 1, NULL), -ENOSPC);
+    uint64_t t0 = now_us();
+    CHECK(store_close(s) != 0 || true);                                    /* (the clean checkpoint cannot be made: logged) */
+    CHECK(now_us() - t0 < 5000000);
+    jr_hooks_off();
+    s = jr_open(&d, false, 42);
+    CHECK(s != NULL);
+    if (s) {
+      store_stats_t st;
+      store_stats(s, &st);
+      CHECK(!st.recovery.rebuilt);
+      CHECK(find_i(s, 0, 100) == STORE_NONE);                              /* (never written) */
+      for (uint32_t i = 0; i < 20; i++) CHECK(verify_i(s, 0, i, 1));
+      check_consistent(s, "nospace stop");
+      CHECK_EQ(store_close(s), 0);
+    }
+    tdir_free(&d);
+  }
+  /* 3. EIO: failed; the writers that take the mutex themselves get -EIO too; no clean checkpoint; the reopen replays the written prefix */
+  {
+    tdir_t d;
+    tdir_new(&d, "jreio");
+    atomic_store(&store_test_no_flusher, !flusher);
+    store_t *s = jr_open(&d, true, 42);
+    atomic_store(&store_test_no_flusher, false);
+    CHECK(s != NULL);
+    if (!s) { tdir_free(&d); return; }
+    for (uint32_t i = 0; i < 20; i++) CHECK_EQ(put_i(s, 0, i, 1, NULL), 0);
+    log_clear();
+    store_test_jw_fault = jf_fault;
+    atomic_store(&g_jf_err, EIO);
+    atomic_store(&g_jf_n, -1);
+    CHECK_EQ(put_i(s, 0, 100, 1, NULL), -EIO);
+    store_stats_t st;
+    store_stats(s, &st);
+    CHECK_EQ(st.journal_state, STORE_JOURNAL_FAILED);
+    CHECK_EQ(st.journal_error, EIO);
+    CHECK(st.journal_failed_unix != 0 && st.leader_retries >= 3);
+    CHECK_EQ(put_i(s, 0, 101, 1, NULL), -EIO);
+    CHECK(store_compact(s, 0, true, NULL) < 0);
+    CHECK(store_repair(s) < 0);
+    CHECK(store_reserve(s, 50000) < 0);
+    CHECK(store_checkpoint(s) < 0);
+    CHECK_EQ(store_commit(s), -EIO);
+    CHECK(store_close(s) != 0 || true);
+    jr_hooks_off();
+    s = jr_open(&d, false, 42);
+    CHECK(s != NULL);
+    if (s) {
+      store_stats(s, &st);
+      CHECK(!st.recovery.rebuilt);
+      CHECK(find_i(s, 0, 100) == STORE_NONE);
+      for (uint32_t i = 0; i < 20; i++) CHECK(verify_i(s, 0, i, 1));
+      check_consistent(s, "failed reopen");
+      CHECK_EQ(store_close(s), 0);
+    }
+    tdir_free(&d);
+  }
+  /* 4. one failed write (a span that is written again whole): the state stays ok */
+  {
+    tdir_t d;
+    tdir_new(&d, "jrretry");
+    store_t *s = jr_open(&d, true, 42);
+    CHECK(s != NULL);
+    if (!s) { tdir_free(&d); return; }
+    store_test_jw_fault = jf_fault;
+    atomic_store(&g_jf_err, EIO);
+    atomic_store(&g_jf_n, 1);
+    for (uint32_t i = 0; i < 20; i++) CHECK_EQ(put_i(s, 0, i, 1, NULL), 0);
+    store_stats_t st;
+    store_stats(s, &st);
+    CHECK_EQ(st.journal_state, STORE_JOURNAL_OK);
+    CHECK(st.leader_retries >= 1);
+    jr_hooks_off();
+    CHECK_EQ(store_close(s), 0);
+    s = jr_open(&d, false, 42);
+    if (s) {
+      for (uint32_t i = 0; i < 20; i++) CHECK(verify_i(s, 0, i, 1));
+      check_consistent(s, "retry reopen");
+      CHECK_EQ(store_close(s), 0);
+    }
+    tdir_free(&d);
+  }
+}
+
+/* (4.2 test 9, rule T, and its negative control) A checkpoint copies a page while a record that changed it is applied and not written (its leader is held): with rule T the
+ * copy waits (store.journal.ck_waits), and a kill -9 there leaves the table files as the journal says; without it (store_test_no_rule_t) the copied page reaches the file with the
+ * change of a record the journal does not hold, and the reopen finds the counters wrong: the test sees the bug the rule prevents. */
+static _Atomic int g_rt_at, g_rt_go;
+static void rt_ckpt_hook(int step) {
+  if (step != 2) return;
+  atomic_store(&g_rt_at, 1);
+  while (!atomic_load(&g_rt_go)) usleep(300);
+}
+static int jc_del(jr_call_t *c) { char nm[160]; name_of(c->a, nm, sizeof(nm)); return store_delete_name(c->s, 0, nm, strlen(nm)); }
+/* the record > P of each variant: 0 zt (the flags of zone 63), 1 ix (zone 5 deleted: its name slot), 2 sx (a new zone with a source id and a long name: its source slot, its
+ * name slot, its cell and its name in nx), 3 nx (zone 10, a long name, deleted: the name's bytes become dead in nx).  (A change of a zone's source id alone keeps every structure
+ * consistent when all its pages are copied: no check can tell it from a call that was applied, so the variant is a new zone.) */
+static const char *const rt_names[4] = { "zt", "ix", "sx", "nx" };
+static bool jr_rule_t_run(bool rule, int variant) {
+  tdir_t d;
+  tdir_new(&d, rule ? "jrrt" : "jrrt0");
+  store_t *s = jr_open(&d, true, 42);
+  if (!s) { tdir_free(&d); return false; }
+  for (uint32_t i = 0; i < 64; i++) (void)put_i(s, 0, i, 1, NULL);        /* (zone ids 0..63: the first page of zt) */
+  (void)store_checkpoint(s);
+  (void)store_close(s);
+  fflush(stdout);
+  pid_t pid = fork();
+  if (pid == 0) {
+    atomic_store(&store_test_no_flusher, true);                            /* (no background leader: the record stays unwritten while its own leader is held) */
+    store_t *c = jr_open(&d, false, 42);
+    if (!c) _exit(2);
+    if (put_i(c, 0, 62, 2, NULL) != 0) _exit(3);                          /* (the first page of zt is dirty for the next checkpoint) */
+    for (uint32_t k = 0; k < 60; k++) if (put_i(c, 0, 300 + k * 7, 1, NULL) != 0) _exit(3);       /* (and the pages of ix, sx and nx: new zones, long names) */
+    atomic_store(&store_test_no_rule_t, !rule);
+    atomic_store(&store_test_ckpt_hook, rt_ckpt_hook);
+    jr_call_t ck = { .fn = jc_ckpt, .s = c };
+    if (!jr_start(&ck)) _exit(4);
+    for (int w = 0; w < 5000 && !atomic_load(&g_rt_at); w++) usleep(1000);
+    store_test_jw_hook = jh_hook;
+    atomic_store(&g_jh_hold, 1);
+    jr_call_t fl = { .fn = jc_flag, .s = c, .a = find_i(c, 0, 63) };       /* (a record > P that changes zone 63: same page, last written before the previous checkpoint) */
+    if (variant == 1) fl = (jr_call_t){ .fn = jc_del, .s = c, .a = 5 };
+    if (variant == 2) fl = (jr_call_t){ .fn = jc_put, .s = c, .a = 2003, .b = 1 };     /* (a new zone: its name and source slots, its cell) */
+    if (variant == 3) fl = (jr_call_t){ .fn = jc_del, .s = c, .a = 10 };
+    if (!jr_start(&fl)) _exit(5);
+    if (!jh_wait_in()) _exit(6);
+    atomic_store(&g_rt_go, 1);                                             /* the checkpoint copies the page now */
+    store_stats_t st;
+    for (int w = 0; w < 3000; w++) { store_stats(c, &st); if (st.checkpoint_journal_waits > 0) break; usleep(1000); }
+    if (!rule) usleep(300000);                                             /* (without the rule the page is written: give it the time) */
+    kill(getpid(), SIGKILL);
+    _exit(7);
+  }
+  int stt = 0;
+  waitpid(pid, &stt, 0);
+  CHECK(WIFSIGNALED(stt));
+  s = jr_open(&d, false, 42);
+  bool consistent = false;
+  if (s) {
+    store_stats_t st;
+    store_stats(s, &st);
+    store_check_report_t rep;
+    store_zone_t zi;
+    bool absent = true;                                                   /* (R's record was never written: its change must not be there) */
+    if (variant == 0) absent = store_zone_get(s, find_i(s, 0, 63), &zi) == 0 && !(zi.flags & STORE_F_REJECTED_NEW);
+    if (variant == 1) absent = find_i(s, 0, 5) != STORE_NONE;
+    if (variant == 2) absent = find_i(s, 0, 2003) == STORE_NONE && store_find_source(s, 2003 % 4, 2004, 0) == STORE_NONE;
+    if (variant == 3) absent = find_i(s, 0, 10) != STORE_NONE;
+    consistent = store_check(s, &rep) == 0 && !st.recovery.rebuilt && absent;
+    if (!consistent && rule) printf("  rule T on (%s): store_check: %s\n", rt_names[variant], rep.first_error);
+    store_close(s);
+  }
+  tdir_free(&d);
+  return consistent;
+}
+static void test_jr_rule_t(void) {
+  printf("[journal ring: rule T, a checkpoint's copy waits for the journal; and without it the files get ahead of the journal (negative control)]\n");
+  for (int v = 0; v < 4; v++) {
+    CHECK(jr_rule_t_run(true, v));
+    const bool without = jr_rule_t_run(false, v);
+    printf("  %s: the rule kept the files exact; without it the reopen %s\n", rt_names[v], without ? "found nothing wrong (the negative control did not show the bug)" : "found the files ahead of the journal");
+    CHECK(!without);
+  }
+}
+
+/* (4.2 tests 1, 7, 8, 11) switches with only a header; a small ring: records across its wrap, the ring full (the admission and the drain inside the mutex), a record too big
+ * for it; the close and store_journal_wait() while the leader is held */
+static void test_jr_ring(void) {
+  printf("[journal ring: header-only switches, a small ring (wrap, full, too big), the close and the journal bound while the leader is held]\n");
+  /* 1. header-only switches */
+  {
+    tdir_t d;
+    tdir_new(&d, "jrhdr");
+    store_t *s = jr_open(&d, true, 42);
+    CHECK(s != NULL);
+    if (!s) { tdir_free(&d); return; }
+    CHECK_EQ(store_checkpoint(s), 0);
+    CHECK_EQ(store_checkpoint(s), 0);
+    CHECK_EQ(store_checkpoint_clean(s), 0);
+    CHECK_EQ(store_checkpoint_clean(s), 0);
+    store_test_jw_hook = jh_hook;                                          /* a checkpoint whose only bytes are the header of its file: it waits for them */
+    atomic_store(&g_jh_hold, 1);
+    jr_call_t ck = { .fn = jc_ckpt, .s = s };
+    CHECK(jr_start(&ck));
+    CHECK(jh_wait_in());
+    usleep(50000);
+    CHECK(!atomic_load(&ck.done));
+    atomic_store(&g_jh_hold, 0);
+    pthread_join(ck.th, NULL);
+    CHECK_EQ(ck.r, 0);
+    jr_hooks_off();
+    CHECK_EQ(store_close(s), 0);
+    s = jr_open(&d, false, 42);
+    CHECK(s != NULL);
+    if (s) { check_consistent(s, "header-only"); CHECK_EQ(store_close(s), 0); }
+    /* kill -9 at the leader's steps while checkpoints switch the journal */
+    for (int step = 1; step <= 2; step++)
+      for (int n = 1; n <= 4; n++) {
+        fflush(stdout);
+        pid_t pid = fork();
+        if (pid == 0) {
+          store_t *c = jr_open(&d, false, 42);
+          if (!c) _exit(2);
+          store_test_jw_hook = jh_hook;
+          atomic_store(&g_jh_kill_n, n);
+          atomic_store(&g_jh_kill_step, step);
+          for (int k = 0; k < 8; k++) { (void)store_checkpoint(c); (void)put_i(c, 0, (uint32_t)(300 + k), 1, NULL); }
+          kill(getpid(), SIGKILL);
+          _exit(3);
+        }
+        waitpid(pid, NULL, 0);
+        s = jr_open(&d, false, 42);
+        CHECK(s != NULL);
+        if (s) {
+          store_stats_t st;
+          store_stats(s, &st);
+          CHECK(!st.recovery.rebuilt);
+          check_consistent(s, "kill at a header");
+          CHECK_EQ(store_close(s), 0);
+        }
+      }
+    tdir_free(&d);
+  }
+  /* 2. a small ring */
+  {
+    tdir_t d;
+    tdir_new(&d, "jrsmall");
+    atomic_store(&store_test_jr_cap, 64u << 10);
+    store_t *s = jr_open(&d, true, 42);
+    atomic_store(&store_test_jr_cap, 0);
+    CHECK(s != NULL);
+    if (!s) { tdir_free(&d); return; }
+    for (uint32_t i = 0; i < 2000; i++) CHECK_EQ(put_i(s, 0, i % 500, 1 + i / 500, NULL), 0);    /* (about 1.5 MB of records through 64 KiB: many wraps) */
+    store_stats_t st;
+    store_stats(s, &st);
+    CHECK(st.leader_bytes > (256u << 10));
+    /* the ring full while the leader is held: the next writers wait before the mutex (admission), then inside it (drain) */
+    store_test_jw_hook = jh_hook;
+    atomic_store(&g_jh_hold, 1);
+    jr_call_t a = { .fn = jc_put, .s = s, .a = 600, .b = 1 }, fill = { .fn = jc_fill, .s = s, .a = 601, .b = 200 };
+    CHECK(jr_start(&a));
+    CHECK(jh_wait_in());
+    store_stats(s, &st);
+    const uint64_t rw0 = st.ring_waits;
+    CHECK(jr_start(&fill));
+    for (int w = 0; w < 5000; w++) { store_stats(s, &st); if (st.ring_waits > rw0) break; usleep(1000); }
+    CHECK(st.ring_waits > rw0 && !atomic_load(&fill.done));                /* (the ring is full of deferred records: the next call waits before the mutex) */
+    atomic_store(&g_jh_hold, 0);
+    pthread_join(a.th, NULL);
+    pthread_join(fill.th, NULL);
+    CHECK_EQ(fill.r, 0);
+    jr_hooks_off();
+    store_stats(s, &st);
+    CHECK(st.ring_waits + st.ring_full_in_lock > 0);
+    CHECK(st.ring_peak_bytes <= (64u << 10));
+    /* a record bigger than half the ring is refused before anything is applied */
+    {
+      char n32[32][160];
+      store_meta_t m32[32];
+      store_known_t in[32];
+      int res[32];
+      for (int j = 0; j < 32; j++) { name_of(3000 + (uint32_t)j * 7 + 3, n32[j], sizeof(n32[j])); m32[j] = meta_of(3000 + (uint32_t)j * 7 + 3, 1); in[j].name = n32[j]; in[j].len = strlen(n32[j]); in[j].meta = &m32[j]; }
+      CHECK_EQ(store_set_known_n(s, 0, in, 32, res, NULL), 0);
+      int bad = 0;
+      for (int j = 0; j < 32; j++) bad += res[j] != 0;
+      CHECK_EQ(bad, 0);                                                    /* (32 long names fit: about 12 KB) */
+    }
+    check_consistent(s, "small ring");
+    CHECK_EQ(store_close(s), 0);
+    s = jr_open(&d, false, 42);
+    if (s) {
+      for (uint32_t i = 0; i < 500; i++) CHECK(verify_i(s, 0, i, 4));
+      for (uint32_t k = 0; k < 201; k++) if (!verify_i(s, 0, 600 + k, 1)) { printf("  small ring: zone %u (found %d)\n", 600 + k, (int)(find_i(s, 0, 600 + k) != STORE_NONE)); CHECK(0); break; }
+      check_consistent(s, "small ring reopen");
+      CHECK_EQ(store_close(s), 0);
+    }
+    tdir_free(&d);
+  }
+  /* 3. the close and store_journal_wait() while the leader is held: both wait for it, neither deadlocks */
+  {
+    tdir_t d;
+    tdir_new(&d, "jrclose");
+    store_opts_t o;
+    small_opts(&o);
+    o.scrub_interval_s = UINT32_MAX;
+    o.journal_max_bytes = 16u << 10;
+    store_t *s = jr_open_o(&d, true, 42, &o);
+    CHECK(s != NULL);
+    if (!s) { tdir_free(&d); return; }
+    for (uint32_t i = 0; i < 300; i++) CHECK_EQ(put_i(s, 0, i, 1, NULL), 0);
+    store_test_jw_hook = jh_hook;
+    atomic_store(&g_jh_hold, 1);
+    jr_call_t a = { .fn = jc_put, .s = s, .a = 900, .b = 1 }, jw = { .fn = jc_jwait, .s = s };
+    CHECK(jr_start(&a));
+    CHECK(jh_wait_in());
+    CHECK(jr_start(&jw));
+    usleep(100000);
+    atomic_store(&g_jh_hold, 0);
+    for (int w = 0; w < 10000 && !(atomic_load(&jw.done) && atomic_load(&a.done)); w++) usleep(1000);
+    CHECK(atomic_load(&jw.done) && atomic_load(&a.done));
+    pthread_join(a.th, NULL);
+    pthread_join(jw.th, NULL);
+    atomic_store(&g_jh_hold, 1);
+    jr_call_t b = { .fn = jc_defer_nosettle, .s = s, .a = 901 };           /* (a deferred call: it returns at once, the flusher leads its write and is held in the hook) */
+    CHECK(jr_start(&b));
+    pthread_join(b.th, NULL);
+    CHECK_EQ(b.r, 0);
+    CHECK(jh_wait_in());
+    jr_call_t cl = { .fn = jc_close, .s = s };
+    CHECK(jr_start(&cl));
+    usleep(100000);
+    CHECK(!atomic_load(&cl.done));                                         /* (the close drains the ring: it waits for the held write) */
+    atomic_store(&g_jh_hold, 0);
+    pthread_join(cl.th, NULL);
+    CHECK_EQ(cl.r, 0);
+    jr_hooks_off();
+    s = jr_open(&d, false, 42);
+    if (s) {
+      CHECK(verify_i(s, 0, 900, 1) && verify_i(s, 0, 901, 1));
+      check_consistent(s, "close while held");
+      CHECK_EQ(store_close(s), 0);
+    }
+    tdir_free(&d);
+  }
+}
+
+/* (4.2 tests 13, 15, 17) the journal's floor on the free space: images are refused below the reserve + jr_floor() (the degraded mode records zones), records below jr_floor()
+ * (-ENOSPC before anything is applied); a refusal that more room ends passes at once (the probe again); a checkpoint of an overwrite on UFS does not raise the floor; the probe is
+ * made by the writers while the flusher is held in a commit. */
+static _Atomic int g_jr_probes;
+static int64_t g_jr_free;
+static int64_t jr_fs_free(void) { atomic_fetch_add(&g_jr_probes, 1); return g_jr_free; }
+static int64_t jr_fs_total(void) { return 64ll << 20; }               /* (64 MiB: the floor is capped at 8 MiB, the slack) */
+static _Atomic int g_cm_hold;
+static void jr_commit_hold(int step) { if (step == 2) while (atomic_load(&g_cm_hold)) usleep(500); }
+static void test_jr_space(void) {
+  printf("[journal ring: the journal's floor on the free space, the probe outside the mutex]\n");
+  tdir_t d;
+  tdir_new(&d, "jrspace");
+  store_t *s = jr_open(&d, true, 42);
+  CHECK(s != NULL);
+  if (!s) { tdir_free(&d); return; }
+  store_stats_t st;
+  store_stats(s, &st);
+  const uint64_t floor = 8ull << 20, reserve = st.reserve_bytes;
+  store_test_fs_total = jr_fs_total;
+  store_test_fs_free = jr_fs_free;
+  g_jr_free = (int64_t)(reserve + floor + (4u << 20));
+  usleep(1100000);                                                         /* (the next call probes: a second since the last) */
+  CHECK_EQ(put_i(s, 0, 1, 1, NULL), 0);
+  CHECK(verify_i(s, 0, 1, 1));
+  g_jr_free = (int64_t)(floor + (256u << 10));                             /* below the reserve + floor: images refused, the zone is kept without one */
+  usleep(1100000);
+  CHECK_EQ(put_i(s, 0, 2, 1, NULL), 0);
+  store_zone_t zi;
+  CHECK(store_zone_get(s, find_i(s, 0, 2), &zi) == 0 && zi.state == STORE_STATE_KNOWN);
+  g_jr_free = 64u << 10;                                                   /* below the floor: no record */
+  usleep(1100000);
+  CHECK_EQ(put_i(s, 0, 3, 1, NULL), -ENOSPC);
+  CHECK(find_i(s, 0, 3) == STORE_NONE);                                    /* (refused before the apply) */
+  store_stats(s, &st);
+  CHECK_EQ(st.journal_state, STORE_JOURNAL_OK);
+  usleep(150000);                                                          /* (the probe inside the mutex is made at most every 100 ms) */
+  g_jr_free = 1ll << 34;                                                   /* more room: the refusal probes again and the call passes at once */
+  CHECK_EQ(put_i(s, 0, 4, 1, NULL), 0);
+  CHECK(verify_i(s, 0, 4, 1));
+  /* a checkpoint that overwrites (no growth) on a file system that is not copy-on-write takes no room: the floor does not move, the images are stored */
+  if (strcmp(st.fstype, "zfs") != 0) {
+    for (uint32_t i = 10; i < 600; i++) CHECK_EQ(put_i(s, 0, i, 1, NULL), 0);
+    CHECK_EQ(store_checkpoint(s), 0);
+    for (uint32_t i = 10; i < 600; i++) CHECK_EQ(put_i(s, 0, i, 2, NULL), 0);       /* (every page dirty again: an overwrite of what the files hold) */
+    g_jr_free = (int64_t)(reserve + floor + (512u << 10));                 /* (less than the dirty pages) */
+    usleep(1100000);
+    CHECK_EQ(store_checkpoint(s), 0);
+    store_stats(s, &st);
+    const uint64_t deg0 = st.degraded_puts;
+    CHECK_EQ(put_i(s, 0, 700, 1, NULL), 0);
+    store_stats(s, &st);
+    CHECK_EQ(st.degraded_puts, deg0);
+    CHECK(verify_i(s, 0, 700, 1));
+  }
+  /* the probe while the flusher is held in a commit */
+  g_jr_free = 1ll << 34;
+  atomic_store(&store_test_commit_hook, jr_commit_hold);
+  atomic_store(&g_cm_hold, 1);
+  usleep(300000);                                                          /* (the flusher's next commit stops in the hook) */
+  const int p0 = atomic_load(&g_jr_probes);
+  for (int k = 0; k < 30; k++) { CHECK_EQ(put_i(s, 0, (uint32_t)(800 + k), 1, NULL), 0); usleep(50000); }
+  CHECK(atomic_load(&g_jr_probes) > p0);
+  atomic_store(&g_cm_hold, 0);
+  atomic_store(&store_test_commit_hook, NULL);
+  store_test_fs_free = NULL;
+  store_test_fs_total = NULL;
+  check_consistent(s, "space");
+  CHECK_EQ(store_close(s), 0);
+  tdir_free(&d);
+}
+
+/* (4.2 tests 10, 19) two stores in one process (the deferral of a thread is per store), STORE_SYNC_EVERY, the deferral without a flusher (refused), the slots (taken, freed by
+ * store_defer(false) before a thread ends) */
+static int jc_defer_put(jr_call_t *c) {
+  int r = store_defer(c->s, true);
+  if (r != 0) return r;
+  r = put_i(c->s, 0, c->a, 1, NULL);
+  if (r == 0) r = store_settle(c->s);
+  (void)store_defer(c->s, false);
+  return r;
+}
+static int jc_defer_hold(jr_call_t *c) {                                   /* (takes a slot and keeps it until c->flag is cleared) */
+  int r = store_defer(c->s, true);
+  atomic_store(&c->done, 2);
+  while (atomic_load(&c->flag)) usleep(500);
+  (void)store_defer(c->s, false);
+  return r;
+}
+static void test_jr_multi(void) {
+  printf("[journal ring: two stores, deferral per store and its slots, STORE_SYNC_EVERY, no flusher]\n");
+  tdir_t da, db;
+  tdir_new(&da, "jrma");
+  tdir_new(&db, "jrmb");
+  store_t *a = jr_open(&da, true, 42), *b = jr_open(&db, true, 42);
+  CHECK(a && b);
+  if (!a || !b) { if (a) store_close(a); if (b) store_close(b); tdir_free(&da); tdir_free(&db); return; }
+  /* a thread that defers on a: its call on b waits (the leader of b is held: the call does not return before it) */
+  CHECK_EQ(store_defer(a, true), 0);
+  CHECK_EQ(put_i(a, 0, 1, 1, NULL), 0);
+  store_test_jw_hook = jh_hook;
+  atomic_store(&g_jh_hold, 1);
+  jr_call_t hb = { .fn = jc_put, .s = b, .a = 2, .b = 1 };
+  CHECK(jr_start(&hb));
+  CHECK(jh_wait_in());
+  jr_call_t nb = { .fn = jc_put, .s = b, .a = 3, .b = 1 };
+  CHECK(jr_start(&nb));
+  usleep(50000);
+  CHECK(!atomic_load(&nb.done));
+  atomic_store(&g_jh_hold, 0);
+  pthread_join(hb.th, NULL);
+  pthread_join(nb.th, NULL);
+  jr_hooks_off();
+  CHECK_EQ(store_settle(a), 0);
+  CHECK_EQ(store_defer(a, false), 0);
+  /* the slots: 32 threads hold one, one more gets -EBUSY (counted); one that leaves frees its slot */
+  jr_call_t hold[32];
+  for (int k = 0; k < 32; k++) {
+    hold[k] = (jr_call_t){ .fn = jc_defer_hold, .s = a };
+    atomic_store(&hold[k].flag, 1);
+    CHECK(jr_start(&hold[k]));
+    for (int w = 0; w < 2000 && atomic_load(&hold[k].done) != 2; w++) usleep(500);
+  }
+  CHECK_EQ(store_defer(a, true), -EBUSY);
+  atomic_store(&hold[0].flag, 0);
+  pthread_join(hold[0].th, NULL);
+  CHECK_EQ(hold[0].r, 0);
+  jr_call_t dp = { .fn = jc_defer_put, .s = a, .a = 10 };
+  CHECK(jr_start(&dp));
+  pthread_join(dp.th, NULL);
+  CHECK_EQ(dp.r, 0);
+  for (int k = 1; k < 32; k++) { atomic_store(&hold[k].flag, 0); pthread_join(hold[k].th, NULL); }
+  CHECK(verify_i(a, 0, 10, 1));
+  CHECK_EQ(store_close(a), 0);
+  CHECK_EQ(store_close(b), 0);
+  tdir_free(&da);
+  tdir_free(&db);
+  /* no flusher: deferral is refused (no background leader), the calls wait */
+  {
+    tdir_t d;
+    tdir_new(&d, "jrnf");
+    atomic_store(&store_test_no_flusher, true);
+    store_t *s = jr_open(&d, true, 42);
+    atomic_store(&store_test_no_flusher, false);
+    if (s) {
+      CHECK_EQ(store_defer(s, true), -EAGAIN);
+      CHECK_EQ(put_i(s, 0, 1, 1, NULL), 0);
+      store_stats_t st;
+      store_stats(s, &st);
+      CHECK_EQ(st.ring_unwritten_bytes, 0);
+      CHECK_EQ(store_close(s), 0);
+    }
+    tdir_free(&d);
+  }
+  /* STORE_SYNC_EVERY: a call returns after its record and its sync; a power loss keeps it */
+  {
+    tdir_t d;
+    tdir_new(&d, "jrevery");
+    store_opts_t o;
+    small_opts(&o);
+    o.sync_policy = STORE_SYNC_EVERY;
+    o.checkpoint_interval_ms = UINT32_MAX;
+    o.scrub_interval_s = UINT32_MAX;
+    store_t *s = jr_open_o(&d, true, 42, &o);
+    if (s) {
+      for (uint32_t i = 0; i < 30; i++) CHECK_EQ(put_i(s, 0, i, 1, NULL), 0);
+      store_stats_t st;
+      store_stats(s, &st);
+      CHECK_EQ(st.committed_lsn, st.lsn);
+      CHECK_EQ(store_close(s), 0);
+      s = jr_open_o(&d, false, 77, &o);
+      if (s) { for (uint32_t i = 0; i < 30; i++) CHECK(verify_i(s, 0, i, 1)); check_consistent(s, "every"); CHECK_EQ(store_close(s), 0); }
+    }
+    tdir_free(&d);
+  }
+}
+
+/* (4.2 test 7, the rest) the extents of the ring all in use: the next writer waits before the mutex; a record that takes exactly the room that is left is reserved without a wait,
+ * and the next one waits for the leader */
+static uint64_t jr_unwritten(store_t *s) { store_stats_t st; store_stats(s, &st); return st.ring_unwritten_bytes; }
+/* a zone made known whose name is exactly len bytes (labels of at most 63) */
+static int jr_known_len(store_t *s, uint32_t id, size_t len) {
+  char nm[300];
+  int n = snprintf(nm, sizeof(nm), "k%06u", id);
+  const int r = (int)len - n - 5, k = (r + 60) / 61;                     /* (the bytes of the labels and their dots before ".test") */
+  for (int i = 0; i < k; i++) {
+    const int lab = (r - k) / k + (i < (r - k) % k ? 1 : 0);
+    nm[n++] = '.';
+    memset(nm + n, 'a', (size_t)lab);
+    n += lab;
+  }
+  memcpy(nm + n, ".test", 6);
+  n += 5;
+  if ((size_t)n != len) return -EINVAL;
+  store_meta_t m = meta_of(900000 + id, 1);
+  return store_set_known(s, 0, nm, len, &m, NULL);
+}
+static int jr_group(store_t *s, uint32_t base) {                           /* (32 zones with long names of one length: the record has the same size for every base) */
+  char nm[32][160];
+  store_meta_t m[32];
+  store_known_t in[32];
+  int res[32];
+  for (int j = 0; j < 32; j++) { const uint32_t i = base + (uint32_t)j * 7; name_of(i, nm[j], sizeof(nm[j])); m[j] = meta_of(i, 1); in[j].name = nm[j]; in[j].len = strlen(nm[j]); in[j].meta = &m[j]; }
+  int r = store_set_known_n(s, 0, in, 32, res, NULL);
+  for (int j = 0; j < 32 && r == 0; j++) r = res[j];
+  return r;
+}
+static void test_jr_edges(void) {
+  printf("[journal ring: the extents all in use; a record that fits the room exactly]\n");
+  /* 1. the extents: four at the most (test knob); the leader is held, a commit switches the journal (its wait holds one more extent): the next writer waits before the mutex */
+  {
+    tdir_t d;
+    tdir_new(&d, "jrext");
+    atomic_store(&store_test_jx_cap, 4);
+    store_t *s = jr_open(&d, true, 42);
+    atomic_store(&store_test_jx_cap, 0);
+    CHECK(s != NULL);
+    if (!s) { tdir_free(&d); return; }
+    for (uint32_t i = 0; i < 10; i++) CHECK_EQ(put_i(s, 0, i, 1, NULL), 0);
+    CHECK_EQ(store_commit(s), 0);                                          /* (a commit makes the next journal file ahead: the next commit switches to it) */
+    CHECK_EQ(put_i(s, 0, 11, 1, NULL), 0);
+    store_stats_t st;
+    store_stats(s, &st);
+    const uint64_t sw0 = st.journal_commit_switches, w0 = st.ring_waits;
+    store_test_jw_hook = jh_hook;
+    atomic_store(&g_jh_hold, 1);
+    jr_call_t a = { .fn = jc_put, .s = s, .a = 100, .b = 1 }, c = { .fn = jc_commit, .s = s }, b = { .fn = jc_put, .s = s, .a = 101, .b = 1 };
+    CHECK(jr_start(&a));
+    CHECK(jh_wait_in());
+    CHECK(jr_start(&c));
+    for (int w = 0; w < 3000; w++) { store_stats(s, &st); if (st.journal_commit_switches > sw0) break; usleep(1000); }
+    CHECK(st.journal_commit_switches > sw0);                               /* (the commit switched: a second extent waits behind the held write) */
+    CHECK(jr_start(&b));
+    usleep(100000);
+    store_stats(s, &st);
+    CHECK(!atomic_load(&b.done) && st.ring_waits > w0);                    /* (no room among the extents: the writer waits before the mutex) */
+    atomic_store(&g_jh_hold, 0);
+    pthread_join(a.th, NULL);
+    pthread_join(c.th, NULL);
+    pthread_join(b.th, NULL);
+    CHECK(a.r == 0 && c.r == 0 && b.r == 0);
+    jr_hooks_off();
+    check_consistent(s, "extents");
+    CHECK_EQ(store_close(s), 0);
+    s = jr_open(&d, false, 42);
+    if (s) { CHECK(verify_i(s, 0, 100, 1) && verify_i(s, 0, 101, 1)); check_consistent(s, "extents reopen"); CHECK_EQ(store_close(s), 0); }
+    tdir_free(&d);
+  }
+  /* 2. the exact fit: a 32 KiB ring (the admission's margin is an eighth of it), the leader held; deferred calls fill it until exactly the size of a group record is left (the last
+   * ones are zones made known with names of a chosen length: their records grow by 8 bytes for 8 more bytes of name), the group is reserved with no wait and fills the ring, the
+   * next call waits for the leader */
+  {
+    tdir_t d;
+    tdir_new(&d, "jrexact");
+    const uint64_t cap = 32u << 10;
+    atomic_store(&store_test_jr_cap, cap);
+    store_t *s = jr_open(&d, true, 42);
+    atomic_store(&store_test_jr_cap, 0);
+    CHECK(s != NULL);
+    if (!s) { tdir_free(&d); return; }
+    store_test_jw_hook = jh_hook;
+    atomic_store(&g_jh_hold, 1);
+    jr_call_t a = { .fn = jc_put, .s = s, .a = 1, .b = 1 };
+    CHECK(jr_start(&a));
+    CHECK(jh_wait_in());
+    CHECK_EQ(store_defer(s, true), 0);                                     /* (this thread's calls do not wait: the ring fills while the leader is held) */
+    uint64_t u = jr_unwritten(s);
+    CHECK_EQ(jr_group(s, 1003), 0);                                        /* the size of a group record */
+    const uint64_t L = jr_unwritten(s) - u;
+    if (!(L >= cap / 8 && L <= cap / 4)) printf("  the group record is %llu bytes\n", (unsigned long long)L);
+    CHECK(L >= cap / 8 && L <= cap / 4);
+    uint32_t id = 0;
+    u = jr_unwritten(s);
+    CHECK_EQ(jr_known_len(s, id++, 80), 0);
+    const uint64_t r80 = jr_unwritten(s) - u;
+    u = jr_unwritten(s);
+    CHECK_EQ(jr_known_len(s, id++, 88), 0);
+    const uint64_t r88 = jr_unwritten(s) - u;
+    if (r88 - r80 != 8) printf("  name records: %llu, %llu bytes\n", (unsigned long long)r80, (unsigned long long)r88);
+    CHECK(r88 - r80 == 8);
+    uint32_t z = 10;
+    /* name records of 40 .. 248 bytes: sizes ra .. ra + rw (8 more for 8 more bytes) */
+    const uint64_t ra = r80 - 40, rw = 208;
+    while (cap - jr_unwritten(s) > L + 6 * (ra + rw) + 1500) CHECK_EQ(put_i(s, 0, z++, 1, NULL), 0);
+    uint64_t x = cap - jr_unwritten(s) - L;                                /* (what must be taken before the group: k name records of sizes in [ra, ra + rw]) */
+    const uint64_t k = (x + ra + rw - 1) / (ra + rw);
+    CHECK(k >= 1 && k * ra <= x && x <= k * (ra + rw) && (x & 7) == 0);
+    uint64_t rem = x - k * ra;
+    for (uint64_t j = 0; j < k; j++) {
+      const uint64_t extra = rem > rw ? rw : rem;
+      rem -= extra;
+      CHECK_EQ(jr_known_len(s, id++, (size_t)(40 + extra)), 0);
+    }
+    CHECK_EQ(cap - jr_unwritten(s), L);                                    /* exactly the group's room is left */
+    store_stats_t st;
+    store_stats(s, &st);
+    const uint64_t w0 = st.ring_waits, f0 = st.ring_full_in_lock;
+    CHECK_EQ(jr_group(s, 3003), 0);                                        /* it fits: no wait */
+    store_stats(s, &st);
+    CHECK_EQ(st.ring_unwritten_bytes, cap);
+    CHECK(st.ring_waits == w0 && st.ring_full_in_lock == f0);
+    (void)store_defer(s, false);
+    jr_call_t b = { .fn = jc_put, .s = s, .a = 5000, .b = 1 };
+    CHECK(jr_start(&b));
+    usleep(100000);
+    CHECK(!atomic_load(&b.done));                                          /* (the ring is full: the next call waits for the leader) */
+    atomic_store(&g_jh_hold, 0);
+    pthread_join(a.th, NULL);
+    pthread_join(b.th, NULL);
+    CHECK(a.r == 0 && b.r == 0);
+    jr_hooks_off();
+    check_consistent(s, "exact fit");
+    CHECK_EQ(store_close(s), 0);
+    s = jr_open(&d, false, 42);
+    if (s) {
+      CHECK(find_i(s, 0, 3003) != STORE_NONE && verify_i(s, 0, 5000, 1));
+      check_consistent(s, "exact fit reopen");
+      CHECK_EQ(store_close(s), 0);
+    }
+    tdir_free(&d);
+  }
+}
+
+/* (4.2 test 17, the estimate) the free space the store reckons with is the file system's less what the ring holds and has not written yet */
+static void test_jr_estimate(void) {
+  printf("[journal ring: the estimate of the free space is statfs less the ring's unwritten bytes]\n");
+  tdir_t d;
+  tdir_new(&d, "jrest");
+  store_t *s = jr_open(&d, true, 42);
+  CHECK(s != NULL);
+  if (!s) { tdir_free(&d); return; }
+  store_test_fs_total = jr_fs_total;
+  store_test_fs_free = jr_fs_free;
+  g_jr_free = 1ll << 33;
+  store_test_jw_hook = jh_hook;
+  atomic_store(&g_jh_hold, 1);
+  jr_call_t a = { .fn = jc_put, .s = s, .a = 1, .b = 1 };
+  CHECK(jr_start(&a));
+  CHECK(jh_wait_in());
+  CHECK_EQ(store_defer(s, true), 0);
+  for (uint32_t i = 10; i < 40; i++) CHECK_EQ(put_i(s, 0, i, 1, NULL), 0);
+  store_test_probe(s);
+  store_stats_t st;
+  store_stats(s, &st);
+  CHECK(st.ring_unwritten_bytes > 0);
+  CHECK_EQ(st.space_estimate_bytes, (int64_t)((1ull << 33) - st.ring_unwritten_bytes));
+  (void)store_defer(s, false);
+  atomic_store(&g_jh_hold, 0);
+  pthread_join(a.th, NULL);
+  jr_hooks_off();
+  CHECK_EQ(store_commit(s), 0);
+  store_test_probe(s);
+  store_stats(s, &st);
+  CHECK_EQ(st.space_estimate_bytes, (int64_t)(1ull << 33));                /* (all written: statfs itself) */
+  store_test_fs_free = NULL;
+  store_test_fs_total = NULL;
+  CHECK_EQ(store_close(s), 0);
+  tdir_free(&d);
+}
+
+/* (4.2 test 18) a write that put half of its span in the file and failed is written again whole at the same offset: the journal file is byte for byte that of a store that did the
+ * same calls with no fault */
+static void test_jr_partial(void) {
+  printf("[journal ring: a span half written, then written again whole: the journal file is the same bytes]\n");
+  tdir_t da, db;
+  tdir_new(&da, "jrpa");
+  tdir_new(&db, "jrpb");
+  atomic_store(&store_test_no_flusher, true);                              /* (no commit switches the journal on its own time: both stores have one file of records) */
+  store_t *a = jr_open(&da, true, 42), *b = jr_open(&db, true, 42);
+  atomic_store(&store_test_no_flusher, false);
+  CHECK(a && b);
+  if (!a || !b) { if (a) store_close(a); if (b) store_close(b); tdir_free(&da); tdir_free(&db); return; }
+  for (uint32_t i = 0; i < 50; i++) CHECK_EQ(put_i(b, 0, i, 1, NULL), 0);
+  store_test_jw_fault = jf_fault;
+  for (uint32_t i = 0; i < 50; i++) {
+    if (i == 20) { atomic_store(&g_jf_err, -1); atomic_store(&g_jf_n, 1); }     /* (the span of zone 20's record: half reaches the file, the write fails, the retry writes it all) */
+    CHECK_EQ(put_i(a, 0, i, 1, NULL), 0);
+  }
+  jr_hooks_off();
+  store_stats_t st;
+  store_stats(a, &st);
+  CHECK(st.leader_retries >= 1 && st.journal_state == STORE_JOURNAL_OK);
+  CHECK_EQ(store_commit(a), 0);
+  CHECK_EQ(store_commit(b), 0);
+  char pa[700], pb[700];
+  CHECK(jrn_newest(&da, pa, sizeof(pa)) && jrn_newest(&db, pb, sizeof(pb)));
+  CHECK(file_tail_equal(pa, pb, 64));                                      /* (past the file header, which holds the store's uuid) */
+  CHECK_EQ(store_close(a), 0);
+  CHECK_EQ(store_close(b), 0);
+  tdir_free(&da);
+  tdir_free(&db);
+}
+
+/* (review defect 1) the flusher does not spin in JW_NOSPACE (it retries at most every 20 ms) nor in JW_FAILED (once a second), while records wait for a commit that is not made */
+static void test_jr_flusher_states(void) {
+  printf("[journal ring: the flusher's loop in the states nospace and failed]\n");
+  tdir_t d;
+  tdir_new(&d, "jrfl");
+  store_t *s = jr_open(&d, true, 42);
+  CHECK(s != NULL);
+  if (!s) { tdir_free(&d); return; }
+  for (uint32_t i = 0; i < 10; i++) CHECK_EQ(put_i(s, 0, i, 1, NULL), 0);
+  store_test_jw_fault = jf_fault;
+  atomic_store(&g_jf_err, ENOSPC);
+  atomic_store(&g_jf_n, -1);
+  CHECK_EQ(put_i(s, 0, 100, 1, NULL), -ENOSPC);
+  uint64_t l0 = atomic_load(&store_test_fl_loops);
+  usleep(500000);
+  uint64_t l1 = atomic_load(&store_test_fl_loops);
+  printf("  nospace: %llu rounds of the flusher in 0.5 s\n", (unsigned long long)(l1 - l0));
+  CHECK(l1 - l0 <= 60);
+  atomic_store(&g_jf_err, EIO);                                            /* (the retry meets EIO: three tries, then failed) */
+  store_stats_t st;
+  for (int w = 0; w < 5000; w++) { store_stats(s, &st); if (st.journal_state == STORE_JOURNAL_FAILED) break; usleep(1000); }
+  CHECK_EQ(st.journal_state, STORE_JOURNAL_FAILED);
+  l0 = atomic_load(&store_test_fl_loops);
+  usleep(1500000);
+  l1 = atomic_load(&store_test_fl_loops);
+  printf("  failed: %llu rounds of the flusher in 1.5 s\n", (unsigned long long)(l1 - l0));
+  CHECK(l1 - l0 <= 4);
+  jr_hooks_off();
+  (void)store_close(s);
+  tdir_free(&d);
+}
+
+/* (review defect 2, N8) a segment whose removal record is in the ring when the journal cannot be written keeps its file, marked; once the journal is written again a later pass
+ * removes the file */
+static void test_jr_seg_pending(void) {
+  printf("[journal ring: a segment's file waits for its record, then goes]\n");
+  tdir_t d;
+  tdir_new(&d, "jrsegp");
+  store_opts_t o;
+  small_opts(&o);
+  o.seg_size = 64u << 10;
+  o.compact_rate = UINT64_MAX;
+  o.compact_min_dead_pct = 100;                                            /* (no victim for the cleaner: only the removal of the empty segment) */
+  o.checkpoint_interval_ms = UINT32_MAX;
+  o.scrub_interval_s = UINT32_MAX;
+  store_t *s = jr_open_o(&d, true, 42, &o);
+  CHECK(s != NULL);
+  if (!s) { tdir_free(&d); return; }
+  for (uint32_t i = 0; i < 200; i++) CHECK_EQ(put_i(s, 0, i, 1, NULL), 0);
+  for (uint32_t i = 0; i < 120; i++) { char nm[160]; name_of(i, nm, sizeof(nm)); CHECK_EQ(store_delete_name(s, 0, nm, strlen(nm)), 0); }   /* (the first segment holds only dead records) */
+  char p1[700];
+  fpath(&d, "seg.1", p1, sizeof(p1));
+  struct stat sb;
+  CHECK_EQ(stat(p1, &sb), 0);
+  CHECK_EQ(store_tick(s), 0);                                              /* (the segment is draining) */
+  CHECK_EQ(store_checkpoint(s), 0);                                        /* (a checkpoint after the drain: it may go now) */
+  store_stats_t st;
+  store_stats(s, &st);
+  const uint64_t fr0 = st.compact_segs_freed;
+  store_test_jw_fault = jf_fault;
+  atomic_store(&g_jf_err, ENOSPC);
+  atomic_store(&g_jf_n, -1);
+  (void)store_tick(s);                                                     /* the removal's record is reserved; its write meets ENOSPC: the file stays */
+  store_stats(s, &st);
+  CHECK_EQ(st.journal_state, STORE_JOURNAL_NOSPACE);
+  CHECK_EQ(stat(p1, &sb), 0);
+  CHECK_EQ(st.compact_segs_freed, fr0);
+  atomic_store(&g_jf_n, 0);                                                /* the room comes back: the flusher's retry writes the record */
+  for (int w = 0; w < 5000; w++) { store_stats(s, &st); if (st.journal_state == STORE_JOURNAL_OK) break; usleep(1000); }
+  CHECK_EQ(st.journal_state, STORE_JOURNAL_OK);
+  jr_hooks_off();
+  (void)store_tick(s);                                                     /* a later pass: the file goes */
+  store_stats(s, &st);
+  CHECK(stat(p1, &sb) != 0 || st.compact_segs_freed > fr0);
+  CHECK(st.compact_segs_freed > fr0);
+  for (uint32_t i = 120; i < 200; i++) CHECK(verify_i(s, 0, i, 1));
+  check_consistent(s, "segment pending");
+  CHECK_EQ(store_close(s), 0);
+  s = jr_open_o(&d, false, 42, &o);
+  if (s) { for (uint32_t i = 120; i < 200; i++) CHECK(verify_i(s, 0, i, 1)); check_consistent(s, "segment pending reopen"); CHECK_EQ(store_close(s), 0); }
+  tdir_free(&d);
+}
+
+/* (review: test_jr_multi) a thread that defers on store a waits for its call on store b; (4.2 test 19) after the flusher stopped (the first step of a close) a deferring thread's
+ * calls wait */
+typedef struct { store_t *a, *b; _Atomic int done; int r; pthread_t th; } jr_two_t;
+static void *jr_two_main(void *arg) {
+  jr_two_t *t = arg;
+  int r = store_defer(t->a, true);
+  if (r == 0) r = put_i(t->a, 0, 50, 1, NULL);                             /* (on a: no wait) */
+  if (r == 0) r = put_i(t->b, 0, 51, 1, NULL);                             /* (on b: it waits for its record) */
+  (void)store_settle(t->a);
+  (void)store_defer(t->a, false);
+  t->r = r;
+  atomic_store(&t->done, 1);
+  return NULL;
+}
+static int jc_defer_one(jr_call_t *c) {
+  int r = store_defer(c->s, true);
+  atomic_store(&c->flag, r == 0 ? 1 : -1);
+  while (atomic_load(&c->flag) == 1) usleep(300);                          /* (the test stops the flusher meanwhile) */
+  if (r == 0) r = put_i(c->s, 0, c->a, 1, NULL);
+  (void)store_defer(c->s, false);
+  return r;
+}
+static void test_jr_defer_more(void) {
+  printf("[journal ring: deferral is per store; it ends with the flusher]\n");
+  tdir_t da, db;
+  tdir_new(&da, "jrda");
+  tdir_new(&db, "jrdb");
+  store_t *a = jr_open(&da, true, 42), *b = jr_open(&db, true, 42);
+  CHECK(a && b);
+  if (!a || !b) { if (a) store_close(a); if (b) store_close(b); tdir_free(&da); tdir_free(&db); return; }
+  store_test_jw_hook = jh_hook;
+  atomic_store(&g_jh_hold, 1);
+  jr_call_t hb = { .fn = jc_put, .s = b, .a = 2, .b = 1 };
+  CHECK(jr_start(&hb));
+  CHECK(jh_wait_in());                                                     /* (b's leader is held) */
+  jr_two_t t = { .a = a, .b = b };
+  CHECK_EQ(pthread_create(&t.th, NULL, jr_two_main, &t), 0);
+  usleep(150000);
+  CHECK(!atomic_load(&t.done));                                            /* (deferring on a does not defer on b) */
+  atomic_store(&g_jh_hold, 0);
+  pthread_join(hb.th, NULL);
+  pthread_join(t.th, NULL);
+  CHECK_EQ(t.r, 0);
+  CHECK(verify_i(a, 0, 50, 1) && verify_i(b, 0, 51, 1));
+  /* deferral ends with the flusher */
+  jr_call_t x = { .fn = jc_defer_one, .s = a, .a = 60 };
+  CHECK(jr_start(&x));
+  for (int w = 0; w < 3000 && atomic_load(&x.flag) == 0; w++) usleep(1000);
+  CHECK_EQ(atomic_load(&x.flag), 1);
+  store_test_stop_flusher(a);
+  atomic_store(&g_jh_hold, 1);
+  jr_call_t ha = { .fn = jc_put, .s = a, .a = 61, .b = 1 };
+  CHECK(jr_start(&ha));
+  CHECK(jh_wait_in());
+  atomic_store(&x.flag, 2);                                                /* (its put now: the flusher is gone, the call waits for the held leader) */
+  usleep(150000);
+  CHECK(!atomic_load(&x.done));
+  atomic_store(&g_jh_hold, 0);
+  pthread_join(ha.th, NULL);
+  pthread_join(x.th, NULL);
+  CHECK_EQ(x.r, 0);
+  store_stats_t st;
+  store_stats(a, &st);
+  CHECK(!st.flusher && st.ring_unwritten_bytes == 0);
+  jr_hooks_off();
+  CHECK_EQ(store_close(a), 0);
+  CHECK_EQ(store_close(b), 0);
+  tdir_free(&da);
+  tdir_free(&db);
+}
+
+/* (review: test_group_journal) a group of 64 entries is two records; spans of 200 bytes cut them; kill -9 after each span: after the replay the group's zones are a prefix of the
+ * entries (the records that are whole), and some kills keep the first record only */
+static void test_jr_group_torn(void) {
+  printf("[journal ring: a group whose records are cut by the spans of the write, kill -9 after each span]\n");
+  int parts = 0, whole = 0, none = 0, bad = 0;
+  for (int n = 1; n < 400 && !bad; n++) {
+    tdir_t d;
+    tdir_new(&d, "jrgt");
+    store_t *s = jr_open(&d, true, 42);
+    if (!s) { tdir_free(&d); break; }
+    for (uint32_t i = 0; i < 100; i++) (void)put_i(s, 0, i, 1, NULL);
+    (void)store_close(s);
+    fflush(stdout);
+    pid_t pid = fork();
+    if (pid == 0) {
+      atomic_store(&store_test_no_flusher, true);
+      store_t *c = jr_open(&d, false, 42);
+      if (!c) _exit(2);
+      gk_t g[64];
+      store_known_t in[64];
+      int r[64];
+      for (unsigned j = 0; j < 64; j++) { name_of(1000 + j, g[j].nm, sizeof(g[j].nm)); g[j].m = meta_of(1000 + j, 1); in[j].name = g[j].nm; in[j].len = strlen(g[j].nm); in[j].meta = &g[j].m; }
+      atomic_store(&store_test_jw_run, 200);
+      store_test_jw_hook = jh_hook;
+      atomic_store(&g_jh_kill_n, n);
+      atomic_store(&g_jh_kill_step, 2);
+      if (store_set_known_n(c, 0, in, 64, r, NULL) != 0) _exit(3);
+      _exit(0);                                                            /* (past the last span) */
+    }
+    int stt = 0;
+    waitpid(pid, &stt, 0);
+    const bool killed = WIFSIGNALED(stt);
+    s = jr_open(&d, false, 42);
+    if (s) {
+      unsigned found = 0;
+      bool prefix = true;
+      for (uint32_t j = 0; j < 64; j++) {
+        const bool f = find_i(s, 0, 1000 + j) != STORE_NONE;
+        if (f && found != j) prefix = false;
+        if (f) found++;
+      }
+      if (!prefix) { bad++; printf("  span %d: the group's zones are not a prefix\n", n); }
+      if (found == 64) whole++; else if (found == 0) none++; else parts++;
+      store_check_report_t rep;
+      if (store_check(s, &rep) != 0) { bad++; printf("  span %d: store_check: %s\n", n, rep.first_error); }
+      store_close(s);
+    }
+    tdir_free(&d);
+    if (!killed) break;
+  }
+  printf("  %d whole, %d none, %d in part (a prefix)\n", whole, none, parts);
+  CHECK_EQ(bad, 0);
+  CHECK(parts > 0 && whole > 0 && none > 0);
 }
 
 int main(void) {
@@ -5084,11 +6560,13 @@ int main(void) {
   if (WANT("group")) { test_group_commit(STORE_MODE_MAP); test_group_commit(STORE_MODE_COPY); test_group_journal(); }
   if (WANT("kill")) test_kill_loop(iters, 0);
   if (WANT("kgrp")) test_kill_loop(UNDER_TSAN ? 25 : 50, 2);
-  if (WANT("nowait")) { test_no_wait_in_lock(STORE_MODE_MAP); test_no_wait_in_lock(STORE_MODE_COPY); }
+  if (WANT("nowait")) { test_no_wait_in_lock(STORE_MODE_MAP); test_no_wait_in_lock(STORE_MODE_COPY); test_growth_catchup(); test_retire_after_unlock(); }
   if (WANT("jbound")) { test_journal_bound(STORE_MODE_MAP); test_journal_bound(STORE_MODE_COPY); }
   if (WANT("kfz")) test_kill_loop(UNDER_TSAN ? 25 : 50, 3);
   if (WANT("kgrow")) test_kill_loop(UNDER_TSAN ? 20 : 50, 4);
   if (WANT("kjsw")) { test_kill_loop(UNDER_TSAN ? 20 : 50, 5); test_commit_switch(); }
+  if (WANT("kjr")) test_kill_loop(UNDER_TSAN ? 20 : 60, 6);
+  if (WANT("jring")) { test_jr_ack(); test_jr_kill_after_return(); test_jr_states(true); test_jr_states(false); test_jr_rule_t(); test_jr_ring(); test_jr_space(); test_jr_multi(); test_jr_edges(); test_jr_estimate(); test_jr_partial(); test_jr_flusher_states(); test_jr_seg_pending(); test_jr_defer_more(); test_jr_group_torn(); }
   if (WANT("priv")) test_private_tables();
   if (WANT("clk")) {
     int citers = getenv("KARIDNS_STORE_KILLC_ITERS") ? atoi(getenv("KARIDNS_STORE_KILLC_ITERS")) : (UNDER_TSAN ? 25 : store_long() ? 100 : 50);

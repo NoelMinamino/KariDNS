@@ -7,7 +7,7 @@
  * The loader lists the zones of a view (a pass: MANIFEST_BEGIN, pages of up to 16,384 entries, MANIFEST_END).  Decoding a page and recording its entries in the store was done by the thread that also
  * answers the fetches and the lookups of the queries, one entry at a time (about 16 us each: 160 s for ten million zones, and the thread was busy all the time).  Now the stream thread (the ingest
  * thread, dns_db_ingest.c) only checks that a page is legal in the state of the stream (kdb_sm_legal_frame(), dns_db_stream.h) and copies it into a ring of 8 slots; this thread decodes it, checks
- * it against the pass (kdb_man_t: the batch, the view, the page number, the sum at the end: the checks kdb_sm_accept() does for a page) and records the entries in groups of up to 64 (db_recon_entry_n(),
+ * it against the pass (kdb_man_t: the batch, the view, the page number, the sum at the end: the checks kdb_sm_accept() does for a page) and records the entries in groups of up to 32 (STORE_GROUP_MAX; db_recon_entry_n(),
  * dns_db_store.h: one journal record, one hold of the mutex of the writers of the records and one decision of the commit policy for a group).
  *
  * Order.  The ring is in the order of the stream and there is one consumer, so the pass is applied in the order the loader sent it: MANIFEST_BEGIN (db_recon_begin()), the pages, MANIFEST_END (the check of the

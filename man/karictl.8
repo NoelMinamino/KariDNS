@@ -586,12 +586,15 @@ requests of the workers that the ingest thread did not send because there is
 nothing to ask (a name the stream does not take, a view that takes no database
 zones, a loader that does not look names up; a loader that is only away does not
 count: the lookup waits for it and is dropped at its time); \fBsame_name\fR,
-requests that joined a lookup of the same name that was on its way), the NOTIFY
-of zones that are out of memory (D1a: \fBnotify of zones out of memory: queued=N
-deferred=N\fR, the zones whose serial changed while their data was out of memory
-that were handed to the control thread, and the ones that did not fit in the
-ring of 1024 and are queued later), the zone transfers of zones that are out of
-memory (D1a, \fBtransfers of zones out of memory: waited=N loaded=N failed=N
+requests that joined a lookup of the same name that was on its way), with the
+zone store the state of its journal (0.7: \fBstore: journal=ok|nospace|failed
+error=N failed_at=T unwritten=N batch_commit_errors=N\fR, see
+\fBstore.journal.state\fR under \fBstore\fR), the NOTIFY of zones that are out
+of memory (D1a: \fBnotify of zones out of memory: queued=N deferred=N\fR, the
+zones whose serial changed while their data was out of memory that were handed
+to the control thread, and the ones that did not fit in the ring of 1024 and are
+queued later), the zone transfers of zones that are out of memory (D1a,
+\fBtransfers of zones out of memory: waited=N loaded=N failed=N
 summary_answers=N marked=N timeout=Nms\fR: transfers that had to wait for the
 zone, the zones they got, the ones that ended with SERVFAIL, the IXFRs answered
 from the summary without reading the zone, the zones marked evict-next, and
@@ -719,10 +722,11 @@ reader takes the keys it knows and ignores the others. Names ending in
 \fB_bytes\fR are bytes, \fB_us\fR microseconds, \fB_pct\fR an integer
 percentage; a latency percentile is the upper bound of the bucket it falls in
 (the buckets are 1, 2, 4, ... 8388608 microseconds, so it is exact to a factor
-of 2); \fBmax_us\fR is exact. A rate is the difference of a counter between two
-polls divided by the difference of \fBstore.time.mono_ms\fR (the server's
-monotonic clock in milliseconds; \fBstore.time.unix\fR is the wall clock in
-seconds).
+of 2; \fBstore.attach.p*_us\fR and \fBstore.cold.p*_us\fR come from buckets an
+eighth of a power of two wide, exact to an eighth, 0.7); \fBmax_us\fR is
+exact. A rate is the difference of a counter between two polls divided by the
+difference of \fBstore.time.mono_ms\fR (the server's monotonic clock in
+milliseconds; \fBstore.time.unix\fR is the wall clock in seconds).
 .TP 8
 \fBschema\fR
 Version of this key list (1)
@@ -835,6 +839,39 @@ next one, so an append never waits for the sync of its file (UFS holds the
 file's lock for a sync). A file goes once neither superblock names the chain it
 is in
 .TP 8
+\fBstore.journal.state\fR, \fB.error\fR, \fB.failed_at_unix\fR
+0.7: the write of the journal, which is made after the writer mutex (see "The
+journal ring" under the zone store in karidns.md): \fBok\fR; \fBnospace\fR (a
+write met ENOSPC: new records and every wait for the journal get "no space" at
+once, the flusher writes again every 0.1 to 1 s until there is room, then
+\fBok\fR; a WARNING once a minute); \fBfailed\fR (a write failed three times
+with another error, EIO: the store takes no more records, writes no table page
+and makes no clean checkpoint at the stop; an ERROR once a minute; restart the
+server, the open replays what was written). \fB.error\fR is the errno of the
+last failed write, \fB.failed_at_unix\fR when the state became \fBfailed\fR
+.TP 8
+\fBstore.journal.ring_bytes\fR, \fB.ring_unwritten_bytes\fR, \fB.ring_peak_bytes\fR
+0.7: the memory of the journal ring (the records wait there for their write: at
+most 64 MiB, counted in \fBmemory\-limit\fR), what waits now, and the most that
+waited since the start
+.TP 8
+\fBstore.journal.ring_waits\fR, \fB.ring_wait_max_us\fR, \fB.ring_full_in_lock\fR
+0.7: writer calls that waited before the writer mutex because the ring was
+nearly full (a write that stalls for seconds), the longest such wait, and the
+reservations that found it full inside the mutex and wrote it there (the old
+behaviour; should stay 0)
+.TP 8
+\fBstore.journal.leader_writes\fR, \fB.bytes_per_write\fR, \fB.write_max_us\fR, \fB.retries\fR, \fB.ck_waits\fR
+0.7: the \fBpwrite()\fR calls that wrote the ring (a writer, or the flusher,
+writes every record that waits, in order), their mean size, the longest one, the
+writes tried again after an error, and the runs of table pages a checkpoint held
+until the journal was written up to them (a checkpoint never writes a table page
+whose change the kernel's journal does not hold yet)
+.TP 8
+\fBstore.journal.defer_busy\fR
+0.7: calls of a thread that wanted to defer (not wait for its journal records)
+and found no free slot: they waited instead. Should stay 0
+.TP 8
 \fBstore.writes.prewrites\fR, \fB.prewrite_misses\fR
 0.7: image records that \fBstore_put()\fR wrote before the writer mutex (the
 change inside it only records where they are), and those it wrote again inside
@@ -844,7 +881,10 @@ new zone and a full segment are written inside the mutex
 \fBstore.writes.growths_background\fR
 Of \fBgrowths\fR: the index growths that were built outside the writer mutex (a
 growth is made inside it only when the index fills up to one half before the
-build ends)
+build ends). The changes the writers made to the index while it was built are
+made on the new one with no lock too, in rounds (0.7); only the last few
+thousand of them are made inside the mutex, with the record that puts the new
+index in
 .TP 8
 \fBstore.flusher\fR
 1: the store's flusher threads make the commits (every 100 ms while records
@@ -855,20 +895,40 @@ could be started)
 Holds of the store's writer mutex since the open, those of 1 ms or more, the
 longest one in microseconds, and the function that held it (\fB\-\fR before the
 first hold). No sync of the disk is waited for inside it (0.7); a long hold is
-CPU work of one call (an nx pass, a repair, a growth inside the mutex), or a
-wait of the disk that another thread causes: a store into a page of the tables
-waits while a checkpoint writes that page out, and the append of a journal
-record meets the file system's back-pressure (up to 2.7 s were measured in a
-first fill of ten million zones under load; 0.7 no longer appends to a file that
-a sync holds: see \fB.journal.commit_switches\fR and
-\fBstore.writes.prewrites\fR). A hold of a second or more is also logged (at
-most once a minute) with its function
+CPU work of one call (an nx pass, a repair, a growth inside the mutex; the
+memory of a replaced index generation is released after it, 0.7), or a wait of
+the disk that another thread causes: a store into a page of the tables waits
+while a checkpoint writes that page out, and the append of a journal record
+meets the file system's back-pressure (up to 2.7 s were measured in a first fill
+of ten million zones under load; 0.7 no longer appends to a file that a sync
+holds: see \fB.journal.commit_switches\fR and \fBstore.writes.prewrites\fR). A
+hold of a second or more is also logged (at most once a minute) with its
+function
+.TP 8
+\fBstore.lock.site.<function>.slow\fR, \fB.over_10ms\fR, \fB.over_100ms\fR, \fB.slow_us\fR, \fB.max_us\fR
+The holds of the writer mutex of 1 ms or more by the function that took it
+(0.7): how many, how many of 10 ms and of 100 ms or more, their total time and
+the longest. A function appears with its first such hold; at most 24 functions
+are kept (\fB<function>\fR is cut at 24 characters). The distribution says
+whether \fB.writer_hold_max_us\fR was one event or a pattern
 .TP 8
 \fBstore.lock.records_holds\fR, \fB.records_holds_slow\fR, \fB.records_hold_max_us\fR, \fB.records_wait_max_us\fR
 The mutex that orders the writers of the records (the reconcile, the commit of a
 body, a lookup's answer): holds since the start, those of 1 ms or more, the
 longest hold and the longest wait for it, in microseconds (the line is there
 when a loader is running)
+.TP 8
+\fBstore.lock.writer_hold_p50_us\fR, \fB.writer_hold_p99_us\fR, \fB.writer_hold_p999_us\fR, \fB.records_hold_p999_us\fR
+0.7: percentiles of every hold of the writer mutex (and the 99.9th of the
+records mutex) since the start, from a histogram of an eighth of an octave
+(exact to an eighth, at most the longest hold). The target of 0.7 is a p99.9 of
+2 ms
+.TP 8
+\fBstore.recon.settle_errors\fR, \fB.batch_store_errors\fR, \fB.batch_store_last_error\fR
+0.7: the waits for the journal after the records mutex that found it full or
+failed (the store calls had returned), the batch ends whose commit failed (the
+store's cursor stays where it was durable: the next start reads the changes
+again), and the errno of the last one (0: it worked)
 .TP 8
 \fBstore.recovery.created\fR, \fB.was_clean\fR, \fB.used_older_super\fR, \fB.rebuilt\fR, \fB.journals_read\fR, \fB.records_replayed\fR, \fB.journal_torn\fR, \fB.rebuilt_zones\fR, \fB.dropped_zones\fR, \fB.open_us\fR
 What the last open found and did, and how long it took
@@ -1038,6 +1098,13 @@ every second while images are written)
 Free bytes that only the cleaner may use (images are refused below that: half a
 segment, 256 KiB to 128 MiB); what the store occupies
 .TP 8
+\fBstore.space.estimate_bytes\fR, \fB.reprobe_in_lock\fR
+0.7: the free space the store reckons with between two readings (the last
+reading less every byte written or reserved since, the journal ring's unwritten
+bytes included), and the readings made inside the store's writer lock to confirm
+a refusal (only when the estimate says the call does not fit, i.e. the file
+system is nearly full, and at most every 100 ms)
+.TP 8
 \fBstore.space.growth_bytes_per_hour\fR, \fB.full_in_hours\fR
 The growth over the last hour (0 until five minutes of history exist, or when
 the store shrinks) and the hours until the file system is full at that growth (0
@@ -1094,8 +1161,10 @@ Zones attached from the store since the start
 Attaches that failed; \fBstore.attach.fail.checksum\fR, \fB.record\fR,
 \fB.invalid\fR, \fB.io\fR, \fB.memory\fR, \fB.other\fR by cause
 .TP 8
-\fBstore.attach.p50_us\fR, \fB.p90_us\fR, \fB.p99_us\fR, \fB.max_us\fR
-Time of an attach
+\fBstore.attach.p50_us\fR, \fB.p90_us\fR, \fB.p99_us\fR, \fB.p999_us\fR, \fB.max_us\fR
+Time of an attach: the percentiles from a finer histogram than the buckets below
+(0.7: one bucket per microsecond up to 7 us, then eight per power of two), exact
+to an eighth (\fB.p999_us\fR is the 99.9th percentile, 0.7)
 .TP 8
 \fBstore.attach.hist.le_<2^i>us\fR, \fB.hist.more\fR
 The histogram: attaches that took at most 1, 2, 4, ... 8388608 microseconds
@@ -1111,8 +1180,10 @@ database fetch (a zone with no image, or a damaged one: a query that waits for a
 fetch or an attach that another query started is not counted), ended by the park
 time-out
 .TP 8
-\fBstore.cold.p50_us\fR, \fB.p90_us\fR, \fB.p99_us\fR, \fB.max_us\fR, \fB.hist.le_<2^i>us\fR, \fB.hist.more\fR
-Time from the parked query to its answer, for \fBstore.cold.attach\fR
+\fBstore.cold.p50_us\fR, \fB.p90_us\fR, \fB.p99_us\fR, \fB.p999_us\fR, \fB.max_us\fR, \fB.hist.le_<2^i>us\fR, \fB.hist.more\fR
+Time from the parked query to its answer, for \fBstore.cold.attach\fR; the
+percentiles as for \fBstore.attach.*\fR (exact to an eighth), the buckets of
+powers of two
 .TP 8
 \fBstore.memory.available\fR
 1 when the figures below are there
@@ -1175,7 +1246,7 @@ on a thread of their own, not on the one that answers the fetches and the
 lookups): 1 when it runs; the share of the last second it was busy, the entries
 it applied a second in that second, the pages that wait for it now (a ring of 8;
 the thread that reads the stream stops reading when it is full), the wall time
-of the apply of an entry (records in groups of up to 64) in the last second that
+of the apply of an entry (records in groups of up to 32) in the last second that
 had entries
 .TP 8
 \fBstore.recon.thread_entries\fR, \fB.thread_pages\fR, \fB.ring_full_stops\fR
@@ -1186,8 +1257,8 @@ served all the time)
 .TP 8
 \fBstore.recon.group_records\fR, \fB.group_entries\fR
 Journal records the store wrote for groups of entries (one record, one hold of
-the writer's mutex and one decision of the commit for up to 64 new zones) and
-the entries they carried: the entries of a first fill are about 64 to a record,
+the writer's mutex and one decision of the commit for up to 32 new zones) and
+the entries they carried: the entries of a first fill are about 32 to a record,
 and a record that is cut off by a crash is dropped whole
 .TP 8
 \fBstore.ingest.loop_max_us\fR, \fB.stream_max_us\fR

@@ -112,7 +112,7 @@ static const kdb_tspec_t sp_zone_result[] = {
 TDEF(td_zone_result, "ZONE_RESULT", sp_zone_result);
 static const kdb_tspec_t sp_batch_result[] = {
     S(KT_U64, KS_REQ, 0), S(KT_BYTES, KS_MUL8, 2048), S(KT_U32, KS_REQ, 0), S(KT_U32, KS_REQ, 0), S(KT_U32, KS_REQ, 0),
-    S(KT_U32, KS_REQ, 0) };
+    S(KT_U32, KS_REQ, 0), S(KT_U32, 0, 0) };      /* (tag 7, 0.7: the store error of the batch) */
 TDEF(td_batch_result, "BATCH_RESULT", sp_batch_result);
 static const kdb_tspec_t sp_fetch_req[] = {
     S(KT_U64, KS_REQ, 0), S(KT_U16, KS_REQ | KS_VIEW, 0), S(KT_NAME, KS_REQ, 0), S(KT_U8, KS_REQ | KS_MAXV, KDB_FETCH_PRIO_N - 1),
@@ -718,6 +718,7 @@ kdb_rc_t kdb_decode(const kdb_frame_t *fr, uint32_t vc, kdb_msg_t *m, char *why,
         m->u.batch_result.n_unchanged = (uint32_t)V(4).u;
         m->u.batch_result.n_rejected = (uint32_t)V(5).u;
         m->u.batch_result.n_deleted = (uint32_t)V(6).u;
+        m->u.batch_result.store_error = V(7).present ? (uint32_t)V(7).u : 0;
         break;
     default:
         FAIL(why, wl, KDB_E_TYPE, "unknown message type %u", fr->type);

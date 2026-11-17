@@ -25,6 +25,7 @@
 typedef struct {
   _Atomic uint64_t attaches, failed[STORE_ATT_CAUSES], detaches, det_by[STORE_DET_REASONS], cold[STORE_COLD_PATHS];
   _Atomic uint64_t ah[STORE_STATUS_HIST_BUCKETS], ch[STORE_STATUS_HIST_BUCKETS];
+  _Atomic uint64_t af[STORE_STATUS_FINE_BUCKETS], cf[STORE_STATUS_FINE_BUCKETS];
   _Atomic uint64_t amax, cmax;
 } shard_t;
 static shard_t g_sh[NSHARD] __attribute__((aligned(64)));
@@ -46,6 +47,14 @@ static unsigned bucket_of(uint64_t ns) {
   unsigned b = 64u - (unsigned)__builtin_clzll(us - 1);
   return b >= STORE_STATUS_HIST_BUCKETS - 1 ? STORE_STATUS_HIST_BUCKETS - 1 : b;
 }
+/* the fine buckets: 0 .. 7 us one each; from 8 us on, the power of two e (2^e <= us) and the three bits below its top bit: bucket (e - 2) x 8 + those bits, up to e = 23 */
+unsigned store_status_fine_bucket(uint64_t ns) { return store_fine_bucket_us((ns + 999) / 1000); }    /* (the scheme is the store's: store_fine_bucket_us()) */
+uint64_t store_status_fine_upper_us(unsigned i) {
+  if (i >= STORE_STATUS_FINE_BUCKETS - 1) return UINT64_MAX;
+  if (i < 8) return i;
+  const unsigned e = i / 8 + 2, m = i % 8;
+  return ((uint64_t)(9 + m) << (e - 3)) - 1;
+}
 
 void store_status_note_attach(uint64_t ns, int cause) {
   shard_t *s = my_shard();
@@ -55,6 +64,7 @@ void store_status_note_attach(uint64_t ns, int cause) {
   }
   inc(&s->attaches);
   inc(&s->ah[bucket_of(ns)]);
+  inc(&s->af[store_status_fine_bucket(ns)]);
   max_to(&s->amax, ns);
 }
 void store_status_note_detach_why(int reason) {
@@ -69,6 +79,7 @@ void store_status_note_cold(uint64_t ns, int path) {
   inc(&s->cold[path]);
   if (path == STORE_COLD_ATTACH) {
     inc(&s->ch[bucket_of(ns)]);
+    inc(&s->cf[store_status_fine_bucket(ns)]);
     max_to(&s->cmax, ns);
   }
 }
@@ -85,6 +96,10 @@ void store_status_snapshot(store_attach_stats_t *o) {
     for (int k = 0; k < STORE_STATUS_HIST_BUCKETS; k++) {
       o->attach_hist[k] += atomic_load_explicit(&s->ah[k], memory_order_relaxed);
       o->cold_hist[k] += atomic_load_explicit(&s->ch[k], memory_order_relaxed);
+    }
+    for (int k = 0; k < STORE_STATUS_FINE_BUCKETS; k++) {
+      o->attach_fine[k] += atomic_load_explicit(&s->af[k], memory_order_relaxed);
+      o->cold_fine[k] += atomic_load_explicit(&s->cf[k], memory_order_relaxed);
     }
     uint64_t a = atomic_load_explicit(&s->amax, memory_order_relaxed), c = atomic_load_explicit(&s->cmax, memory_order_relaxed);
     if (a > o->attach_max_ns) o->attach_max_ns = a;
@@ -108,6 +123,22 @@ uint64_t store_status_hist_pct(const uint64_t *hist, unsigned p, uint64_t max_ns
     if (cum >= want) return i == STORE_STATUS_HIST_BUCKETS - 1 ? (max_ns + 999) / 1000 : (uint64_t)1 << i;
   }
   return (max_ns + 999) / 1000;
+}
+uint64_t store_status_fine_pct(const uint64_t *fine, unsigned permille, uint64_t max_ns) {
+  uint64_t total = 0;
+  for (int i = 0; i < STORE_STATUS_FINE_BUCKETS; i++) total += fine[i];
+  if (total == 0) return 0;
+  if (permille > 1000) permille = 1000;
+  uint64_t want = (total * permille + 999) / 1000, cum = 0;
+  if (want == 0) want = 1;
+  const uint64_t mx = (max_ns + 999) / 1000;
+  for (unsigned i = 0; i < STORE_STATUS_FINE_BUCKETS; i++) {
+    cum += fine[i];
+    if (cum < want) continue;
+    const uint64_t up = store_status_fine_upper_us(i);
+    return up < mx ? up : mx;
+  }
+  return mx;
 }
 
 /* ------------------------------------------------------------------------------------------------------------------------------ */
@@ -341,9 +372,10 @@ static void add_attach(list_t *l, const store_attach_stats_t *a) {
   U("store.attach.fail.io", a->attach_failed[STORE_ATT_ERR_IO]);
   U("store.attach.fail.memory", a->attach_failed[STORE_ATT_ERR_MEMORY]);
   U("store.attach.fail.other", a->attach_failed[STORE_ATT_ERR_OTHER]);
-  U("store.attach.p50_us", store_status_hist_pct(a->attach_hist, 50, a->attach_max_ns));
-  U("store.attach.p90_us", store_status_hist_pct(a->attach_hist, 90, a->attach_max_ns));
-  U("store.attach.p99_us", store_status_hist_pct(a->attach_hist, 99, a->attach_max_ns));
+  U("store.attach.p50_us", store_status_fine_pct(a->attach_fine, 500, a->attach_max_ns));
+  U("store.attach.p90_us", store_status_fine_pct(a->attach_fine, 900, a->attach_max_ns));
+  U("store.attach.p99_us", store_status_fine_pct(a->attach_fine, 990, a->attach_max_ns));
+  U("store.attach.p999_us", store_status_fine_pct(a->attach_fine, 999, a->attach_max_ns));
   U("store.attach.max_us", (a->attach_max_ns + 999) / 1000);
   add_hist(l, "store.attach", a->attach_hist);
   U("store.detach.count", a->detaches);
@@ -354,9 +386,10 @@ static void add_attach(list_t *l, const store_attach_stats_t *a) {
   U("store.cold.attach", a->cold[STORE_COLD_ATTACH]);
   U("store.cold.fetch", a->cold[STORE_COLD_FETCH]);
   U("store.cold.timeout", a->cold[STORE_COLD_TIMEOUT]);
-  U("store.cold.p50_us", store_status_hist_pct(a->cold_hist, 50, a->cold_max_ns));
-  U("store.cold.p90_us", store_status_hist_pct(a->cold_hist, 90, a->cold_max_ns));
-  U("store.cold.p99_us", store_status_hist_pct(a->cold_hist, 99, a->cold_max_ns));
+  U("store.cold.p50_us", store_status_fine_pct(a->cold_fine, 500, a->cold_max_ns));
+  U("store.cold.p90_us", store_status_fine_pct(a->cold_fine, 900, a->cold_max_ns));
+  U("store.cold.p99_us", store_status_fine_pct(a->cold_fine, 990, a->cold_max_ns));
+  U("store.cold.p999_us", store_status_fine_pct(a->cold_fine, 999, a->cold_max_ns));
   U("store.cold.max_us", (a->cold_max_ns + 999) / 1000);
   add_hist(l, "store.cold", a->cold_hist);
 }
@@ -443,6 +476,10 @@ static void add_recon(list_t *l) {
   U("store.lock.records_holds", r->rec_holds);
   U("store.lock.records_holds_slow", r->rec_holds_slow);
   U("store.lock.records_hold_max_us", r->rec_hold_max_us);
+  U("store.lock.records_hold_p999_us", store_status_fine_pct(r->rec_hold_fine, 999, r->rec_hold_max_us * 1000));
+  U("store.recon.settle_errors", r->settle_errors);
+  U("store.recon.batch_store_errors", r->batch_store_errors);
+  U("store.recon.batch_store_last_error", r->batch_store_last < 0 ? -r->batch_store_last : 0);
   U("store.lock.records_wait_max_us", r->rec_wait_max_us);
   U("store.recon.guard.held_views", r->guard_views);
   if (r->guard_views) {
@@ -630,6 +667,24 @@ static void add_store(list_t *l, const store_t *s, const store_attach_stats_t *a
   U("store.journal.limit_wait_us", st->journal_limit_wait_us);
   U("store.journal.limit_wait_max_us", st->journal_limit_wait_max_us);
   U("store.journal.commit_switches", st->journal_commit_switches);
+  {                                                                              /* 0.7: the journal ring (the record is written after the writer mutex) */
+    static const char *const jst[] = { "ok", "nospace", "failed" };
+    add_s(l, "store.journal.state", jst[st->journal_state < 0 || st->journal_state > 2 ? 2 : st->journal_state]);
+  }
+  U("store.journal.error", st->journal_error);
+  U("store.journal.failed_at_unix", st->journal_failed_unix);
+  U("store.journal.ring_bytes", st->ring_bytes);
+  U("store.journal.ring_unwritten_bytes", st->ring_unwritten_bytes);
+  U("store.journal.ring_peak_bytes", st->ring_peak_bytes);
+  U("store.journal.ring_waits", st->ring_waits);
+  U("store.journal.ring_wait_max_us", st->ring_wait_max_us);
+  U("store.journal.ring_full_in_lock", st->ring_full_in_lock);
+  U("store.journal.leader_writes", st->leader_writes);
+  U("store.journal.bytes_per_write", st->leader_writes ? st->leader_bytes / st->leader_writes : 0);
+  U("store.journal.write_max_us", st->leader_write_max_us);
+  U("store.journal.retries", st->leader_retries);
+  U("store.journal.ck_waits", st->checkpoint_journal_waits);
+  U("store.journal.defer_busy", st->defer_busy);
   U("store.writes.prewrites", st->image_prewrites);
   U("store.writes.prewrite_misses", st->image_prewrite_misses);
   U("store.checkpoint.count", st->checkpoints);
@@ -651,7 +706,24 @@ static void add_store(list_t *l, const store_t *s, const store_attach_stats_t *a
   U("store.lock.writer_holds", st->lock_holds);
   U("store.lock.writer_holds_slow", st->lock_holds_slow);
   U("store.lock.writer_hold_max_us", st->lock_hold_max_us);
+  U("store.lock.writer_hold_p50_us", store_status_fine_pct(st->lock_hold_fine, 500, st->lock_hold_max_us * 1000));
+  U("store.lock.writer_hold_p99_us", store_status_fine_pct(st->lock_hold_fine, 990, st->lock_hold_max_us * 1000));
+  U("store.lock.writer_hold_p999_us", store_status_fine_pct(st->lock_hold_fine, 999, st->lock_hold_max_us * 1000));
   add_s(l, "store.lock.writer_hold_max_site", st->lock_hold_max_site ? st->lock_hold_max_site : "-");
+  for (uint32_t i = 0; i < st->lock_nsites && i < STORE_LOCK_SITES; i++) {          /* 0.7: the holds of 1 ms or more by function */
+    const store_lock_site_t *w = &st->lock_sites[i];
+    char k[56];
+    snprintf(k, sizeof(k), "store.lock.site.%.24s.slow", w->site);
+    U(k, w->slow);
+    snprintf(k, sizeof(k), "store.lock.site.%.24s.over_10ms", w->site);
+    U(k, w->over_10ms);
+    snprintf(k, sizeof(k), "store.lock.site.%.24s.over_100ms", w->site);
+    U(k, w->over_100ms);
+    snprintf(k, sizeof(k), "store.lock.site.%.24s.slow_us", w->site);
+    U(k, w->slow_us);
+    snprintf(k, sizeof(k), "store.lock.site.%.24s.max_us", w->site);
+    U(k, w->max_us);
+  }
   U("store.flusher", st->flusher ? 1 : 0);
   /* 0.7 WP9: the cleaner (design 3.2) */
   U("store.compact.runs", st->compact_runs);
@@ -674,6 +746,8 @@ static void add_store(list_t *l, const store_t *s, const store_attach_stats_t *a
   U("store.space.fs_free_bytes", st->fs_free_bytes);
   U("store.space.checked_unix", st->fs_checked_unix);
   U("store.space.reserve_bytes", st->reserve_bytes);
+  add_u(l, false, "store.space.estimate_bytes", st->space_estimate_bytes < 0 ? 0 : (uint64_t)st->space_estimate_bytes);
+  U("store.space.reprobe_in_lock", st->space_reprobe_in_lock);
   U("store.space.store_bytes", st->store_bytes);
   U("store.space.growth_bytes_per_hour", st->growth_bytes_per_hour);
   U("store.space.full_in_hours", st->full_in_hours);
