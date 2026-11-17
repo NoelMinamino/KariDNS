@@ -182,10 +182,13 @@ static bool wake_for(const char *zone, park_key_t *k, int ms) {
 }
 
 /* is the lookup of the name remembered as shed (the table of the shed names) at this moment? */
-static bool shed_held_now(const char *name) {
+static int64_t mono_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
-    return park_shed_held(park_lookup_claim_key("default", name), (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+static bool shed_held_now(const char *name) {
+    return park_shed_held(park_lookup_claim_key("default", name), mono_ms());
 }
 
 /* the counters of the lookups (store.lookup.*) */
@@ -5516,10 +5519,12 @@ static int run_lookup_body(const char *dir) {
         }
         CHECK(!ch_next(&fetchc, &m, 300));
         CHECK(lk_stats().in_flight == 6 && lk_stats().pending == 3 && lk_stats().shed == shed0 + 3);
+        for (int t = 0; t < 400 && lk_stats().remembered < rem0 + 3; t++) usleep(1000);            /* (the counter of the shed goes up before the name is remembered) */
+        const int64_t t_shed = mono_ms();                                                       /* (the sheds are done; the check below looks at this moment, not after the waits: a slow runner may pass park-timeout) */
         for (int i = 9; i < 12; i++) {
             snprintf(nm, sizeof(nm), "s%d.nz.test.", i);
+            CHECK(park_shed_held(park_lookup_claim_key("default", nm), t_shed));                  /* (a name that was shed is remembered: its worker asks no more for it) */
             CHECK(wake_for(nm, &k, 5000) && k.ask == PARK_ASK_DROP && !k.failed && !park_claim_held(park_lookup_claim_key("default", nm)));
-            CHECK(shed_held_now(nm));                                                             /* (a name that was shed is remembered: its worker asks no more for it) */
         }
         CHECK(!shed_held_now("s0.nz.test.") && !shed_held_now("s8.nz.test."));                    /* (the ones that were asked for, or wait, are not) */
         for (int i = 6; i < 9; i++) {
