@@ -127,6 +127,7 @@ typedef struct store_extra {
    * image or the entry could not be made; declined: a name server zone has to be attached first; full: the staging table or the ring was full; adopted / lost: staged zones that were registered / found in memory, changed or gone)
    * and hot.list (state 0 none, 1 attaching, 2 done, 3 stopped at the high mark, 4 off) */
   uint64_t wa_ok, wa_cold, wa_over, wa_claim, wa_fail, wa_decline, wa_full, wa_adopted, wa_lost, wa_ns;
+  uint64_t build_n, build_ns;     /* 0.7: the first half of the store threads' attaches (read, check, entry), timed for one in 8: count and nanoseconds */
   uint64_t hot_state, hot_listed, hot_attached, hot_skipped, hot_written;
   uint64_t hot_threads, hot_per_s;
 } store_extra_t;

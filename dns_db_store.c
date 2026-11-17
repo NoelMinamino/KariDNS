@@ -245,6 +245,7 @@ static struct {
   _Atomic uint64_t attach_ok, attach_stale, attach_missing, attach_damaged, attach_fallback, attach_resident, attach_busy;
   _Atomic uint64_t attached_bytes, versions_live;
   _Atomic uint64_t validated, validate_ns;       /* images checked by zone_image_validate() at an attach, and the time they took */
+  _Atomic uint64_t build_n, build_ns;           /* 0.7: attaches by the store threads whose first half (attach_build(): read, check, entry) was timed (one in VAL_SAMPLE), and the time they took */
   _Atomic uint64_t pin_waits, pinned_peak;
   /* 0.7 fix 7 (the worker's attach): on only in MAP mode; what it did and why it did not */
   _Atomic uint32_t dir_pending;         /* 0.7 fix 8: the views whose list of zones (the name index) is not complete: no valid cursor at the start, and no complete pass since; bit = the view's id in the store */
@@ -1483,6 +1484,8 @@ static bool extra_status_cb(store_extra_t *x) {
   x->wa_adopted = atomic_load(&G.wa_adopted);
   x->wa_lost = atomic_load(&G.wa_lost);
   x->wa_ns = atomic_load(&G.wa_ns);
+  x->build_n = atomic_load(&G.build_n);
+  x->build_ns = atomic_load(&G.build_ns);
   x->hot_state = atomic_load(&G.hot_state);
   x->hot_listed = atomic_load(&G.hot_listed);
   x->hot_attached = atomic_load(&G.hot_attached);
@@ -1769,6 +1772,9 @@ static int attach_build(const char *view, const char *zone, uint32_t zid, const 
     b->why = "missing";
     return rc;
   }
+  static _Thread_local unsigned bld_n;
+  const bool btimed = !wview && (bld_n++ % VAL_SAMPLE) == 0;
+  const int64_t tb0 = btimed ? mono_ns() : 0;
   if (!wview) store_read_lock();
   int r = store_image_read(st, zid, &img);
   if (!wview) store_read_unlock();
@@ -1893,6 +1899,10 @@ static int attach_build(const char *view, const char *zone, uint32_t zid, const 
   /* (the entry is new: nobody can reach it before it is registered or staged, so its writer lock is not taken, and a light entry never makes the lock's block (libthr makes it at the first lock; ~112 octets for every attached zone)) */
   zone_install_version(entry, ver, NULL, false);
   b->entry = entry;
+  if (btimed) {
+    atomic_fetch_add_explicit(&G.build_ns, (uint64_t)(mono_ns() - tb0), memory_order_relaxed);
+    atomic_fetch_add_explicit(&G.build_n, 1, memory_order_relaxed);
+  }
   return ATB_OK;
 fail:
   if (have_img) store_img_release(st, &img);
