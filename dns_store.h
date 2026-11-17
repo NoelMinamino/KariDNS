@@ -283,6 +283,9 @@ typedef struct store_stats {
   uint64_t journal_bound_bytes;   /* the bound: 2 x journal_max_bytes (the writers wait at it for the checkpoint in progress) */
   uint64_t journal_limit_waits;   /* writer calls that waited at their end for a checkpoint because the journal was at the bound */
   uint64_t journal_limit_wait_us, journal_limit_wait_max_us;   /* the total and the longest of those waits */
+  uint64_t journal_commit_switches; /* the journal file switched by a commit (0.7: the writers append to a file that no sync holds) */
+  uint64_t image_prewrites;         /* image records store_put() wrote before the writer mutex and the change took (0.7) */
+  uint64_t image_prewrite_misses;   /* ... that the change wrote again inside the mutex (the zone, its record or the open segment changed in between) */
 } store_stats_t;
 
 /* What one store_compact() did. */
@@ -503,6 +506,10 @@ int  store_check(store_t *s, store_check_report_t *rep);
  * 3: the tables are flushed, 4: the superblock is written), and by a growth of the index built outside the mutex (1: the bigger index is built, 2: it was put in); tests make a step slow, or kill the process there */
 extern void (*_Atomic store_test_ckpt_hook)(int step);
 extern void (*_Atomic store_test_regrow_hook)(int step);
+/* ... and by a commit (0.7): 1: the journal was switched to the file made ahead (writer mutex held), 2: the file before is synced (not closed yet), 3: the next file is made ahead */
+extern void (*_Atomic store_test_commit_hook)(int step);
+/* ... and by store_put() after it wrote the record before the writer mutex (no lock held but the writers of images'): a test changes the zone there */
+extern void (*_Atomic store_test_prewrite_hook)(store_t *s);
 /* the stores opened while this is set start no flusher thread (the writers make the due commits and checkpoints after the mutex) */
 extern _Atomic bool store_test_no_flusher;
 #ifdef KARIDNS_UNIT_TEST
