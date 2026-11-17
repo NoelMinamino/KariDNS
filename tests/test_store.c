@@ -140,6 +140,26 @@ static void small_opts(store_opts_t *o) {
   o->sync_policy = STORE_SYNC_BATCH;
 }
 
+/* the newest journal file of a store directory whose size is more than min_size (0: none).  A commit switches the file (0.7): the generations run into the hundreds, and the old ones are
+ * deleted, so the directory is read, not a range of numbers */
+static uint32_t jrn_newest_gen(const char *dir, off_t min_size) {
+  DIR *dp = opendir(dir);
+  if (!dp) return 0;
+  uint32_t best = 0;
+  struct dirent *de;
+  while ((de = readdir(dp)) != NULL) {
+    unsigned g;
+    char tail;
+    if (sscanf(de->d_name, "jrn.%u%c", &g, &tail) != 1 || g <= best) continue;
+    char p[1024];
+    struct stat sb;
+    snprintf(p, sizeof(p), "%s/%s", dir, de->d_name);
+    if (stat(p, &sb) == 0 && sb.st_size > min_size) best = g;
+  }
+  closedir(dp);
+  return best;
+}
+
 /* ---- names and images: deterministic functions of (i, version) ---- */
 
 static void name_of(uint32_t i, char *buf, size_t n) {
@@ -1122,7 +1142,7 @@ static void test_superblock_damage(void) {
   /* find the newest journal and cut it in the middle of a record */
   char jp[700];
   uint32_t best = 0;
-  for (uint32_t g = 1; g < 100; g++) { struct stat sbuf; snprintf(jp, sizeof(jp), "%s/jrn.%u", d.path, g); if (stat(jp, &sbuf) == 0 && sbuf.st_size > 64) best = g; }   /* (not the next journal, made ahead and empty) */
+  best = jrn_newest_gen(d.path, 64);                                    /* (not the next journal, made ahead and empty, nor one with a header only) */
   snprintf(jp, sizeof(jp), "%s/jrn.%u", d.path, best);
   struct stat jst;
   CHECK_EQ(stat(jp, &jst), 0);
@@ -1385,6 +1405,7 @@ static void hk_regrow(int step) {
   if (step == 1) usleep(3000);
   hk_kill(10 + step);
 }
+static void hk_commit(int step) { hk_kill(20 + step); }
 static void *ckthr_main(void *arg) {
   store_t *s = arg;
   for (;;) {
@@ -1411,6 +1432,7 @@ static void child_main(const char *path, shm_t *shm, uint64_t K0, uint64_t count
   store_test_crash_countdown = countdown;
   if (g_kill_mode == 3) atomic_store(&store_test_ckpt_hook, hk_ckpt);
   if (g_kill_mode == 4) atomic_store(&store_test_regrow_hook, hk_regrow);
+  if (g_kill_mode == 5) atomic_store(&store_test_commit_hook, hk_commit);
   store_t *s = NULL;
   if (store_open(fd, &o, &s) != 0) _exit(11);
   if (g_kill_mode == 3) {
@@ -1433,7 +1455,8 @@ static void child_main(const char *path, shm_t *shm, uint64_t K0, uint64_t count
 static void test_kill_loop(int iters, int mode) {
   g_kill_mode = mode;
   printf("[kill -9 loop%s: %d iterations]\n", mode == 1 ? " with the cleaner, the nx pass and the scrub" : mode == 2 ? " with groups of zones made known in one record (store_set_known_n)" :
-         mode == 3 ? " with a thread that checkpoints all the time (a fuzzy checkpoint killed at its steps)" : mode == 4 ? " with growths of the index built outside the mutex (killed at their steps)" : "", iters);
+         mode == 3 ? " with a thread that checkpoints all the time (a fuzzy checkpoint killed at its steps)" : mode == 4 ? " with growths of the index built outside the mutex (killed at their steps)" :
+         mode == 5 ? " with commits that switch the journal file (killed at their steps)" : "", iters);
   int hk_kills = 0;
   tdir_t d;
   tdir_new(&d, "kill");
@@ -1467,8 +1490,8 @@ static void test_kill_loop(int iters, int mode) {
     long cd = use_countdown ? 1 + (long)((rng >> 8) % 24000) : 0;
     atomic_store(&g_hk_step, 0);
     if (mode >= 3 && use_countdown && ((rng >> 5) & 1)) {             /* (half of the planned kills at a step of the new code instead of a crash point) */
-      atomic_store(&g_hk_step, mode == 3 ? 1 + (int)((rng >> 8) % 4) : 11 + (int)((rng >> 8) % 2));
-      atomic_store(&g_hk_n, 1 + (int)((rng >> 12) % (mode == 3 ? 12 : 2)));
+      atomic_store(&g_hk_step, mode == 3 ? 1 + (int)((rng >> 8) % 4) : mode == 4 ? 11 + (int)((rng >> 8) % 2) : 21 + (int)((rng >> 8) % 3));
+      atomic_store(&g_hk_n, 1 + (int)((rng >> 12) % (mode == 3 ? 12 : mode == 4 ? 2 : 40)));
       cd = 0;
       hk_kills++;
     }
@@ -1499,7 +1522,7 @@ static void test_kill_loop(int iters, int mode) {
     if (tamper) {
       uint32_t best = 0;
       char jp[700];
-      for (uint32_t g = 1; g < 400; g++) { struct stat sbuf; snprintf(jp, sizeof(jp), "%s/jrn.%u", d.path, g); if (stat(jp, &sbuf) == 0 && sbuf.st_size > 64) best = g; }   /* (not the next journal, made ahead and empty) */
+      best = jrn_newest_gen(d.path, 64);                                /* (not the next journal, made ahead and empty, nor one with a header only) */
       snprintf(jp, sizeof(jp), "%s/jrn.%u", d.path, best);
       struct stat jst;
       if (best && stat(jp, &jst) == 0 && jst.st_size > 200) {
@@ -1584,7 +1607,7 @@ static void test_kill_loop(int iters, int mode) {
   printf("  %d stores, %d children killed (%d at a crash point), %d journal tails cut (rebuild path), %d older-superblock opens, %d torn tails,\n"
          "  %d replayed records in total, %d exact-end matches, %d begun-but-lost operations; %d opens found removed segments (%u segment numbers at the most)\n",
          fresh, crashed, countdown_hits, tampered, older, torn, replayed_total, exact, lost_ops, with_free, max_segs);
-  if (mode >= 3) printf("  %d kills planned at a step of a %s\n", hk_kills, mode == 3 ? "checkpoint" : "growth");
+  if (mode >= 3) printf("  %d kills planned at a step of a %s\n", hk_kills, mode == 3 ? "checkpoint" : mode == 4 ? "growth" : "commit that switches the journal file");
   if (mode == 2) printf("  %d recoveries found a group of entries applied in part (a kill between the records of one call)\n", part_groups);
   atomic_store(&g_hk_step, 0);
   free(model);
@@ -1965,7 +1988,7 @@ static void test_forged_journal(void) {
     CHECK_EQ(store_close(s), 0);
     char jp[700];
     uint32_t best = 0;
-    for (uint32_t g = 1; g < 100; g++) { struct stat sb; snprintf(jp, sizeof(jp), "%s/jrn.%u", d.path, g); if (stat(jp, &sb) == 0) best = g; }
+    best = jrn_newest_gen(d.path, -1);
     snprintf(jp, sizeof(jp), "%s/jrn.%u", d.path, best);
     fj_t j;
     memset(&j, 0, sizeof(j));
@@ -2322,6 +2345,7 @@ static void test_clean_then_growth(void) {
   waitpid(pid, &stt, 0);
   CHECK(WIFEXITED(stt) && WEXITSTATUS(stt) == 0);
   if (WIFEXITED(stt) && WEXITSTATUS(stt) != 0) printf("  child exit %d\n", WEXITSTATUS(stt));
+  if (WIFSIGNALED(stt)) printf("  child killed by signal %d\n", WTERMSIG(stt));
   o.create = false;
   o.boot_id = 77;                                                        /* (the host was rebooted) */
   store_t *s = NULL;
@@ -2517,6 +2541,90 @@ static void jb_hook(int step) {
   usleep((useconds_t)atomic_load(&g_jb_ms) * 1000u);
   atomic_store(&g_jb_in, false);
 }
+/* 0.7: a commit switches the journal file (the writers append to a file that no sync holds).  The files of the chain are deleted once neither superblock names them, also when there are
+ * hundreds; a file a checkpoint left before it deleted the old ones is found by the next open and deleted; what was written is there after a reopen */
+static unsigned jrn_count(const char *dir) {
+  DIR *dp = opendir(dir);
+  if (!dp) return 0;
+  unsigned n = 0;
+  struct dirent *de;
+  while ((de = readdir(dp)) != NULL) n += strncmp(de->d_name, "jrn.", 4) == 0;
+  closedir(dp);
+  return n;
+}
+static void pw_delete_hook(store_t *s) {                     /* (between the record written ahead and the mutex: the zone goes) */
+  char nm[160];
+  name_of(5, nm, sizeof(nm));
+  (void)store_delete_name(s, 0, nm, strlen(nm));
+}
+static void test_commit_switch(void) {
+  printf("[a commit switches the journal file; the old files go]\n");
+  tdir_t d;
+  tdir_new(&d, "jsw");
+  store_opts_t o;
+  small_opts(&o);
+  o.sync_interval_ms = 2;
+  o.journal_max_bytes = 64u << 10;
+  o.checkpoint_interval_ms = 50;
+  o.scrub_interval_s = UINT32_MAX;
+  store_t *s = NULL;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (!s) { tdir_free(&d); return; }
+  store_view_add(s, "default");
+  unsigned most = 0;
+  for (uint32_t i = 0; i < 3000; i++) {
+    CHECK_EQ(put_i(s, 0, i % 700, 1 + i / 700, NULL), 0);
+    if ((i & 15) == 15) { CHECK_EQ(store_commit(s), 0); usleep(500); }
+    if ((i & 255) == 0) { const unsigned c = jrn_count(d.path); if (c > most) most = c; }
+  }
+  store_stats_t st;
+  store_stats(s, &st);
+  printf("  %" PRIu64 " commits switched the file, %" PRIu64 " checkpoints, at most %u journal files, journal %" PRIu64 " bytes\n", st.journal_commit_switches, st.checkpoints, most,
+         st.journal_bytes);
+  CHECK(st.journal_commit_switches >= 20);
+  CHECK(st.checkpoints >= 2);
+  CHECK(st.journal_bytes <= 2 * o.journal_max_bytes + 4096);   /* (the size is the chain's since the checkpoint, every file of it) */
+  printf("  %" PRIu64 " image records written before the writer mutex, %" PRIu64 " written again\n", st.image_prewrites, st.image_prewrite_misses);
+  CHECK(st.image_prewrites >= 2000);                            /* (every put of a zone that is there: 3000 puts of 700 zones) */
+  CHECK_EQ(store_checkpoint(s), 0);
+  CHECK_EQ(store_checkpoint(s), 0);                              /* (nothing written between the two: no commit switches) */
+  CHECK(jrn_count(d.path) <= 4);                                 /* (the chains of the two superblocks and the file made ahead) */
+  store_stats(s, &st);
+  const uint32_t gen = st.journal_gen;
+  CHECK_EQ(store_close(s), 0);
+  /* a file of an old chain that a crash left (the checkpoint had not deleted it yet) */
+  char p[700];
+  snprintf(p, sizeof(p), "%s/jrn.%u", d.path, gen > 40 ? gen - 40 : 1);
+  int fd = open(p, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+  CHECK(fd >= 0 && write(fd, "junk", 4) == 4);
+  if (fd >= 0) close(fd);
+  o.create = false;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (!s) { tdir_free(&d); return; }
+  struct stat sb;
+  CHECK(gen <= 40 || stat(p, &sb) != 0);                         /* (the open's checkpoint deleted it) */
+  bool all = true;
+  for (uint32_t i = 0; i < 700; i++) all = all && verify_i(s, 0, i, 1 + (2999 - ((2999 - i) % 700)) / 700);
+  CHECK(all);
+  /* the zone is deleted between the record written ahead and the change: the change makes the zone again and writes its record inside the mutex */
+  store_stats(s, &st);
+  const uint64_t miss0 = st.image_prewrite_misses;
+  atomic_store(&store_test_prewrite_hook, pw_delete_hook);
+  CHECK_EQ(put_i(s, 0, 5, 99, NULL), 0);
+  atomic_store(&store_test_prewrite_hook, NULL);
+  store_stats(s, &st);
+  CHECK_EQ(st.image_prewrite_misses, miss0 + 1);
+  CHECK(verify_i(s, 0, 5, 99));
+  CHECK_EQ(store_close(s), 0);
+  o.create = false;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (s) {
+    CHECK(verify_i(s, 0, 5, 99) && verify_i(s, 0, 6, 1 + (2999 - ((2999 - 6) % 700)) / 700));
+    CHECK_EQ(store_close(s), 0);
+  }
+  tdir_free(&d);
+}
+
 static void test_journal_bound(int mode) {
   printf("[the journal stays below 2 x journal_max_bytes while a checkpoint is slow; a close leaves a fuzzy checkpoint (%s)]\n", mode == STORE_MODE_MAP ? "MAP" : "COPY");
   tdir_t d;
@@ -2561,6 +2669,7 @@ static void test_journal_bound(int mode) {
   CHECK(st.journal_limit_waits >= 1);
   CHECK(st.journal_limit_wait_max_us > 0 && st.journal_limit_wait_us >= st.journal_limit_wait_max_us);
   CHECK(st.lock_hold_max_us < 500000);                                    /* (the wait is outside the writer mutex; the hook slept 1 s) */
+  CHECK(st.lock_hold_max_site != NULL && st.lock_hold_max_site[0] != 0);              /* (the function of the longest hold is named: store.lock.writer_hold_max_site) */
   CHECK(st.checkpoint_max_us >= 900000);                                  /* (the slow one) */
   CHECK_EQ(log_count(4, "2 x journal_max_bytes"), 1);                   /* (at most one a minute) */
   CHECK_EQ(store_close(s), 0);
@@ -3393,13 +3502,19 @@ static void test_space(int mode) {
   CHECK_EQ(st.space_level, 2);
   CHECK(st.degraded_since_unix != 0);
   CHECK_EQ(log_count(3, "no room for zone images"), 1);                    /* once a minute */
-  /* the zones before it are stored and served; the zones after it have their record (name, version) without an image */
+  /* the zones before it are stored and served; every zone after it has its record (name, version), without an image or, when room came back meanwhile, with its image whole.  (Room
+   * can come back between two puts: the journal files that a checkpoint cut are deleted, and the estimate of the free space is read again after a second or a megabyte, so on a
+   * slow machine a later zone may fit again: what must not happen is a record with a wrong version or an image that is not the zone's.) */
   for (uint32_t i = 1000; i < first_known; i++) CHECK(verify_i(s, 0, i, 1));
+  unsigned after_known = 0;
   for (uint32_t i = first_known; i < first_known + 40; i++) {
     store_zone_t zi;
     uint32_t z = find_i(s, 0, i);
-    CHECK(z != STORE_NONE && store_zone_get(s, z, &zi) == 0 && zi.state == STORE_STATE_KNOWN && zi.img_len == 0 && zi.serial == 1 && zi.stamp_gen == 1);
+    const bool rec = z != STORE_NONE && store_zone_get(s, z, &zi) == 0 && zi.serial == 1 && zi.stamp_gen == 1;
+    CHECK(rec && ((zi.state == STORE_STATE_KNOWN && zi.img_len == 0) || (zi.state == STORE_STATE_STORED && verify_i(s, 0, i, 1))));
+    after_known += rec && zi.state == STORE_STATE_KNOWN;
   }
+  CHECK(after_known >= 20);                                               /* (most of them: the disk stays full) */
   /* a changed zone that is stored loses its image (its old record is released) and gets the new version as a record */
   store_stats_t before;
   store_stats(s, &before);
@@ -4646,7 +4761,7 @@ static void test_group_commit(int mode) {
 /* the record of a group is the record of a single call: one entry per call, in both ways, writes the same journal bytes (the format did not change), and a group is one record that a torn tail drops whole */
 static int jrn_newest(const tdir_t *d, char *jp, size_t n) {
   uint32_t best = 0;
-  for (uint32_t g = 1; g < 100; g++) { struct stat sbuf; snprintf(jp, n, "%s/jrn.%u", d->path, g); if (stat(jp, &sbuf) == 0 && sbuf.st_size > 64) best = g; }   /* (not the next journal, made ahead and empty) */
+  best = jrn_newest_gen(d->path, 64);                                   /* (not the next journal, made ahead and empty, nor one with a header only) */
   snprintf(jp, n, "%s/jrn.%u", d->path, best);
   return best != 0;
 }
@@ -4893,6 +5008,7 @@ int main(void) {
   if (WANT("jbound")) { test_journal_bound(STORE_MODE_MAP); test_journal_bound(STORE_MODE_COPY); }
   if (WANT("kfz")) test_kill_loop(UNDER_TSAN ? 25 : 50, 3);
   if (WANT("kgrow")) test_kill_loop(UNDER_TSAN ? 20 : 50, 4);
+  if (WANT("kjsw")) { test_kill_loop(UNDER_TSAN ? 20 : 50, 5); test_commit_switch(); }
   if (WANT("clk")) {
     int citers = getenv("KARIDNS_STORE_KILLC_ITERS") ? atoi(getenv("KARIDNS_STORE_KILLC_ITERS")) : (UNDER_TSAN ? 25 : store_long() ? 100 : 50);
     test_kill_loop(citers, 1);

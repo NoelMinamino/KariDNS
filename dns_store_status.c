@@ -629,6 +629,9 @@ static void add_store(list_t *l, const store_t *s, const store_attach_stats_t *a
   U("store.journal.limit_waits", st->journal_limit_waits);
   U("store.journal.limit_wait_us", st->journal_limit_wait_us);
   U("store.journal.limit_wait_max_us", st->journal_limit_wait_max_us);
+  U("store.journal.commit_switches", st->journal_commit_switches);
+  U("store.writes.prewrites", st->image_prewrites);
+  U("store.writes.prewrite_misses", st->image_prewrite_misses);
   U("store.checkpoint.count", st->checkpoints);
   U("store.checkpoint.last_unix", st->last_checkpoint_unix);
   U("store.checkpoint.last_us", st->last_checkpoint_us);
@@ -644,6 +647,7 @@ static void add_store(list_t *l, const store_t *s, const store_attach_stats_t *a
   U("store.lock.writer_holds", st->lock_holds);
   U("store.lock.writer_holds_slow", st->lock_holds_slow);
   U("store.lock.writer_hold_max_us", st->lock_hold_max_us);
+  add_s(l, "store.lock.writer_hold_max_site", st->lock_hold_max_site ? st->lock_hold_max_site : "-");
   U("store.flusher", st->flusher ? 1 : 0);
   /* 0.7 WP9: the cleaner (design 3.2) */
   U("store.compact.runs", st->compact_runs);
