@@ -4687,6 +4687,28 @@ static int run_stamp_race(const char *dir) {
     n = rq_collect(&fetchc, rq, 16, 500);
     CHECK(n == 0 || (n == 1 && rq_find(rq, n, nc) == NULL));
     CHECK(!atomic_load(&g_hk_timeout));
+    /* -- 0.7: this loader has no KDB_FEAT_BATCH_STATUS: a batch the store cannot make durable (its journal meets ENOSPC) is counted, but BATCH_RESULT has no tag 7
+     *    (an older decoder would reject the unknown tag) */
+    {
+      db_recon_status_t rs0, rs1;
+      db_recon_status(&rs0);
+      atomic_store(&g_dbs_jw_nospc, 1);
+      store_test_jw_fault = dbs_jw_fault;
+      memset(c, 0, sizeof(c));
+      c[0] = (pc_t){ .sid = p_sid(ZD), .op = KDB_CH_UPSERT, .has_name = true, .stamped = true, .gen = 8, .time = 80 };  snprintf(c[0].name, sizeof(c[0].name), "%s", nd);
+      p_batch_begin(a[0], &e, bid, KDB_BATCH_AUTO, 0);
+      p_changes(a[0], &e, bid, ++cur, true, c, 1);
+      p_batch_end(a[0], &e, bid, 1, 0);
+      CHECK(p_result(&mainc, &m, 10000) && m.u.batch_result.batch_id == bid && m.u.batch_result.store_error == 0);
+      bid++;
+      db_recon_status(&rs1);
+      CHECK(rs1.batch_store_errors == rs0.batch_store_errors + 1 && rs1.batch_store_last == -ENOSPC);
+      atomic_store(&g_dbs_jw_nospc, 0);
+      store_stats_t ss;
+      for (int w = 0; w < 5000; w++) { store_stats(st, &ss); if (ss.journal_state == STORE_JOURNAL_OK) break; usleep(1000); }
+      CHECK(ss.journal_state == STORE_JOURNAL_OK);
+      store_test_jw_fault = NULL;
+    }
     gc_snapshot_wait_idle();                                             /* (the reclaim thread that the last delta started: joined, not left to the exit) */
     db_store_batch_end();
     printf("%d checks, %d failed\n", g_checks, g_failed);

@@ -28,6 +28,8 @@
  *   --postgresql=CONNINFO:SCHEMA   the PostgreSQL driver (DBFILE is then ignored)
  *   --log=FILE              every manifest / changes entry, one line each:  M view id name kind stamped gen time serial   /   C view op id name kind stamped force gen time serial
  *   --signer-wait=0         CONFIG signer_wait 0
+ *   --fail-batch=N[:ERRNO]  answer the N-th BATCH_END (counted from 1) with BATCH_RESULT tag 7 = ERRNO (default ENOSPC): the store could not record the batch (0.7,
+ *                           KDB_FEAT_BATCH_STATUS); only when the loader's HELLO offers the feature
  * More items:
  *   sh:COMMAND              run COMMAND (system()) while the loader runs: it changes the database
  *   batches:N               serve the streams until N batches have ended (BATCH_END seen) in all
@@ -35,7 +37,7 @@
  *   state                   print the cursor the Backend would keep for every view (the last MANIFEST_END / CHANGES with last = 1)
  * Printed (store protocol): HELLO features=N; BB kind=K req=R; MB view=V count=N cursor=C valid=B ident=TEXT flags=F; ME view=V n=N seen=N skipped=N cursor=C valid=B
  * complete=B ident=TEXT ok=B (ok: the ids of the pages were strictly ascending and their number is n); CH view=V cursor=C last=B up=N del=N; ZD view=V id=I name=NAME;
- * BE zones=N failed=N deleted=N; STATE view=V cursor=C valid=B ident=TEXT; at the end RSS kb=N (the peak of the loader process) before DONE.
+ * BE zones=N failed=N deleted=N; BR batch=N store_error=E (the BATCH_RESULT sent); STATE view=V cursor=C valid=B ident=TEXT; at the end RSS kb=N (the peak of the loader process) before DONE.
  */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
@@ -103,6 +105,8 @@ static struct { bool valid; uint64_t cursor; uint8_t ident[KDB_IDENT_MAX]; uint8
 static FILE *g_log;
 static kdb_sm_t g_msm;
 static unsigned g_batches;
+static unsigned g_fail_batch, g_fail_errno = ENOSPC;   /* --fail-batch */
+static uint32_t g_loader_feat;          /* HELLO features of the loader */
 static uint64_t g_reqid = 100;
 static struct { bool open; uint16_t view; uint64_t last_id, n, seen; bool ok; } g_man;
 
@@ -271,6 +275,7 @@ static void main_msg(const kdb_msg_t *m) {
     switch (m->type) {
     case KDB_T_HELLO:
         if (g_store) printf("HELLO features=%u\n", m->u.hello.features);
+        g_loader_feat = m->u.hello.features;
         send_config();
         break;
     case KDB_T_INVENTORY_REQ:
@@ -291,9 +296,12 @@ static void main_msg(const kdb_msg_t *m) {
         kdb_enc_u32(&g_enc, 4, 0);
         kdb_enc_u32(&g_enc, 5, 0);
         kdb_enc_u32(&g_enc, 6, 0);
+        const uint32_t serr = (g_fail_batch == g_batches && (g_loader_feat & KDB_FEAT_BATCH_STATUS)) ? g_fail_errno : 0;
+        if (serr) kdb_enc_u32(&g_enc, 7, serr);
         kdb_enc_end(&g_enc);
         send_enc(g_main.fd);
         g_startup_done = true;
+        if (g_store) printf("BR batch=%llu store_error=%u\n", (unsigned long long)m->u.batch_end.batch_id, serr);
         break;
     default:
         break;
@@ -504,6 +512,12 @@ int main(int argc, char **argv) {
         else if (strncmp(o, "--views=", 8) == 0) g_nviews = (unsigned)atoi(o + 8);
         else if (strncmp(o, "--auto", 6) == 0) { g_auto = true; if (o[6] == '=') g_auto_sec = (unsigned)atoi(o + 7); }
         else if (strcmp(o, "--signer-wait=0") == 0) g_signer_wait = false;
+        else if (strncmp(o, "--fail-batch=", 13) == 0) {
+            char *p = NULL;
+            g_fail_batch = (unsigned)strtoul(o + 13, &p, 10);
+            if (p && *p == ':') g_fail_errno = (unsigned)atoi(p + 1);
+            if (g_fail_batch == 0 || g_fail_errno == 0) die("--fail-batch=N[:ERRNO], N and ERRNO from 1");
+        }
         else if (strncmp(o, "--log=", 6) == 0) { g_log = fopen(o + 6, "w"); if (!g_log) die("cannot open the log file"); setvbuf(g_log, NULL, _IOFBF, 1 << 16); }
         else if (strncmp(o, "--postgresql=", 13) == 0) {
             char *c = strdup(o + 13), *sc = c ? strrchr(c, '|') : NULL;

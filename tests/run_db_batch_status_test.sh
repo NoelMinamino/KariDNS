@@ -29,7 +29,7 @@ pass() { PASS=$((PASS + 1)); echo "  [ OK ] $1"; }
 fail() { FAILS=$((FAILS + 1)); echo "  [FAIL] $1"; }
 
 DB="$T/z.db"
-sh tests/db/gen_sqlite3_zones.sh "$DB" 40 3 > /dev/null || { fail "cannot build the database"; exit 1; }
+sh tests/db/gen_sqlite3_zones.sh "$DB" 40 7 > /dev/null || { fail "cannot build the database"; exit 1; }
 
 # run NAME OPTION... -- ITEM...: the harness output in $T/NAME.out (the entries in $T/NAME.log, the loader's log in $T/NAME.err), its status in $RC
 run() {
