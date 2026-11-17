@@ -1,4 +1,4 @@
-.TH KARICHECK 8 "2026-11-15" "KariDNS" "KariDNS Manual"
+.TH KARICHECK 8 "2026-11-17" "KariDNS" "KariDNS Manual"
 .\" Generated from docs/karicheck.md by man/md2man.pl (make man): edit the Markdown manual, not this page.
 .SH NAME
 karicheck \- Configuration and Zone File Validation Utility for KariDNS
@@ -2530,6 +2530,18 @@ not a primary zone, or the change would take its SOA away
 .br
 \fIMeaning:\fR render: the records on standard input are not lines of the form
 owner TAB type TAB prio TAB content, or there are too many
+.TP 8
+\fBdb.idn.input\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR idn: the names on standard input are not lines of the form a TAB
+name or u TAB name, or there are too many
+.TP 8
+\fBdb.idn.unavailable\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR idn: this karidns-zone was built without libidn2 and cannot
+convert internationalized names
 .TP 8
 \fBdb.import.signer\fR
 \fISeverity:\fR error

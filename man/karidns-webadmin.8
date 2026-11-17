@@ -730,17 +730,24 @@ unlinks, in the user's page under \fIAdministration\fR). A group has no
 identity.
 .IP \(bu 2
 \fBInternationalized names\fR (0.7). A zone name or a record name may be typed
-in Unicode; the service stores its A-labels, converted the way \fBdig +idnin\fR
-converts the name (UTS #46 non-transitional, and the transitional mapping for
-the whole name when a label has a code point IDNA2008 does not allow, as dig
-does). Under the field the page shows the name that will be stored
-(\fB\[u4F8B]\[u3048].test\fR \[u2192] \fBxn\-\-r8jz45g.test\fR) and the
-warnings: a name that breaks a rule of IDNA2008 (a disallowed symbol, hyphens,
-the bidi rule, a katakana middle dot without kana, mixed scripts) is stored all
-the same, with a warning; only a name with no A-label form is refused. Lists and
-the zone page show the U-labels with the A-labels under them; the search takes
-either form (a label typed in Unicode matches a whole label). The API reference
-has the rules ("INTERNATIONALIZED NAMES AND LDNS.JP").
+in Unicode. The service stores its A-labels, converted by libidn2 exactly as
+\fBdig +idnin\fR converts the name: \fBkaridns\-zone idn\fR does it, so
+karidns-zone must be built with libidn2 (the packages are). Under the field the
+page shows the name that will be stored (\fB\[u4F8B]\[u3048].test\fR \[u2192]
+\fBxn\-\-r8jz45g.test\fR) and the warnings.
+.RS 2
+.IP \(bu 2
+Warnings: a symbol IDNA2008 does not allow (dig then uses the transitional
+mapping), a CONTEXTO rule such as a katakana middle dot without kana, or mixed
+scripts. These names are stored all the same.
+.IP \(bu 2
+Refused: a name dig would not convert (a hyphen in the wrong place, the bidi
+rule, a joiner out of place), with libidn2's reason.
+.IP \(bu 2
+Lists and the zone page show the U-labels with the A-labels under them. The
+search takes either form; a label typed in Unicode matches a whole label. The
+API reference has the rules ("INTERNATIONALIZED NAMES AND LDNS.JP").
+.RE
 .IP \(bu 2
 \fBldns.jp\fR (0.7). Each zone (its SOA) and each record set has a link
 "ldns.jp" that opens ldns.jp <https://ldns.jp/> in a new tab, which asks a
