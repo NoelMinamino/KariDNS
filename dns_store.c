@@ -2312,9 +2312,9 @@ static void ck_drop_taken(store_t *s) {
 /* A fuzzy checkpoint writes at most ST_CK_RATE bytes a second (0.7): written at full speed, a burst of table pages (a first fill changes every page, a growth's generation is written
  * whole) filled the file system's write queue that the writers' journal appends inside the mutex then waited for (ZFS: the transaction group, txg_wait_synced(), 1.0 to 5.0 s in a 10M
  * first fill; UFS: runningbufspace).  A checkpoint with the writers kept out does not wait (cancel NULL).  (Also tried, not kept: a sleep as long as a slow write, which made the
- * checkpoints of a 10M first start on UFS 60 to 98 s long and left the longest hold where it was.) */
+ * checkpoints of a 10M first start on UFS 60 to 98 s long and left the longest hold where it was; a sync every 64 MiB, which made the 10M first fill on ZFS slower, 371 to 411 s against
+ * 316 to 336 s, with no shorter hold.) */
 #define ST_CK_RATE (256ull << 20)
-#define ST_CK_SYNC (64u << 20)
 static void ck_pace(store_t *s, uint64_t done, const _Atomic bool *cancel) {
   const uint64_t el = st_now_us() - s->ck.tw0, due = done / (ST_CK_RATE / 1000000);
   if (due <= el) return;
@@ -2336,7 +2336,6 @@ static int ck_write_tab(store_t *s, int i, int fd, const uint8_t *base, const _A
   if (!all && np > s->ck.t[i].npages) np = s->ck.t[i].npages;
   const uint64_t run_max = ST_CK_RUN >> s->pgshift;
   bool wrote = false;
-  uint64_t pend = 0;                                  /* (bytes written since the last sync of a fuzzy checkpoint) */
   for (uint64_t p = 0; p < np; ) {
     if (!all && dirty[p >> 6] == 0) { p = (p | 63) + 1; continue; }
     if (!all && !((dirty[p >> 6] >> (p & 63)) & 1)) { p++; continue; }
@@ -2352,12 +2351,6 @@ static int ck_write_tab(store_t *s, int i, int fd, const uint8_t *base, const _A
     wrote = true;
     CRASH_POINT();
     st_hook(&store_test_ckpt_hook, 5);
-    /* a fuzzy checkpoint syncs every ST_CK_SYNC bytes: the file system then has at most that much of it on its way (UFS: runningbufspace, about 16 MB, is what the writers' journal appends wait
-     * for; a sync of the whole table at the end had hundreds of megabytes in flight) */
-    if (cancel && (pend += len) >= ST_CK_SYNC) {
-      if (fdatasync(fd) != 0) return -errno;
-      pend = 0;
-    }
     if (cancel) ck_pace(s, *done, cancel);
     if (cancel && atomic_load_explicit(cancel, memory_order_relaxed)) return -ECANCELED;
   }
