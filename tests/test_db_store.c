@@ -36,6 +36,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/uio.h>
+#include <sys/wait.h>
 
 #include "../dns_config_parser.h"
 #include "../dns_db_ingest.h"
@@ -182,6 +183,7 @@ static bool wake_for(const char *zone, park_key_t *k, int ms) {
 }
 
 /* is the lookup of the name remembered as shed (the table of the shed names) at this moment? */
+static int run_part(const char *cmd);
 static int64_t mono_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -2357,10 +2359,10 @@ static int run_mode(const char *mode) {
     if (strcmp(mode, "map") == 0 && g_self[0]) {                             /* the next start (a process of its own): hot.list is read and attached in the background */
         for (int ph = 0; ph < 5; ph++) {
             snprintf(cmd, sizeof(cmd), "%s hot %s %d", g_self, dir, ph);
-            CHECK(system(cmd) == 0);
+            CHECK(run_part(cmd) == 0);
         }
         snprintf(cmd, sizeof(cmd), "%s attab %s", g_self, dir);                 /* 0.7 M4: the attach table grows outside the registry's lock */
-        CHECK(system(cmd) == 0);
+        CHECK(run_part(cmd) == 0);
     }
     snprintf(cmd, sizeof(cmd), "rm -rf %s", dir);
     (void)!system(cmd);
@@ -6147,6 +6149,15 @@ static int run_recon_thread(const char *dir) {
 }
 
 
+/* a part of the test in a process of its own: a part that ends without its "checks" line (a signal, an exit from a thread) says how it ended */
+static int run_part(const char *cmd) {
+    const int rc = system(cmd);
+    if (rc == -1) printf("  [FAIL] %s: system() failed\n", cmd);
+    else if (WIFSIGNALED(rc)) printf("  [FAIL] %s: killed by signal %d\n", cmd, WTERMSIG(rc));
+    else if (WIFEXITED(rc) && WEXITSTATUS(rc) != 0) printf("  [FAIL] %s: exit status %d\n", cmd, WEXITSTATUS(rc));
+    return rc;
+}
+
 static int proto_main(const char *self) {
     char dir[600];
     const char *tmp = getenv("TMPDIR");
@@ -6156,7 +6167,7 @@ static int proto_main(const char *self) {
     for (int phase = 0; phase < 9; phase++) {
         char cmd[900];
         snprintf(cmd, sizeof(cmd), "%s proto%d %s", self, phase, dir);
-        if (system(cmd) != 0) bad++;
+        if (run_part(cmd) != 0) bad++;
         if (phase == 0 || phase == 2 || phase == 3 || phase == 5 || phase == 6 || phase == 7) {                   /* (phase 0 is the legacy loader on an empty store, phase 3 the fixes of the review, phase 4 the settings: the next phases start on a new store; phase 5 follows phase 4 on its store) */
             char rm[700];
             snprintf(rm, sizeof(rm), "rm -rf %s/s", dir);
@@ -6370,12 +6381,12 @@ int main(int argc, char **argv) {
     /* the second mode is a second process: the ingest thread and the store are process wide */
     char cmd[512];
     snprintf(cmd, sizeof(cmd), "%s copy", argv[0]);
-    int rc = system(cmd);
+    int rc = run_part(cmd);
     int rc2 = run_mode("map");
     int rc3 = proto_main(argv[0]);
     snprintf(cmd, sizeof(cmd), "%s s5 map", argv[0]);
-    int rc4 = system(cmd);
+    int rc4 = run_part(cmd);
     snprintf(cmd, sizeof(cmd), "%s s5 copy", argv[0]);
-    int rc5 = system(cmd);
+    int rc5 = run_part(cmd);
     return (rc != 0 || rc2 != 0 || rc3 != 0 || rc4 != 0 || rc5 != 0) ? 1 : 0;
 }
