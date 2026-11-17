@@ -1191,7 +1191,7 @@ on a thread of their own, not on the one that answers the fetches and the
 lookups): 1 when it runs; the share of the last second it was busy, the entries
 it applied a second in that second, the pages that wait for it now (a ring of 8;
 the thread that reads the stream stops reading when it is full), the wall time
-of the apply of an entry (records in groups of up to 64) in the last second that
+of the apply of an entry (records in groups of up to 32) in the last second that
 had entries
 .TP 8
 \fBstore.recon.thread_entries\fR, \fB.thread_pages\fR, \fB.ring_full_stops\fR
@@ -1202,8 +1202,8 @@ served all the time)
 .TP 8
 \fBstore.recon.group_records\fR, \fB.group_entries\fR
 Journal records the store wrote for groups of entries (one record, one hold of
-the writer's mutex and one decision of the commit for up to 64 new zones) and
-the entries they carried: the entries of a first fill are about 64 to a record,
+the writer's mutex and one decision of the commit for up to 32 new zones) and
+the entries they carried: the entries of a first fill are about 32 to a record,
 and a record that is cut off by a crash is dropped whole
 .TP 8
 \fBstore.ingest.loop_max_us\fR, \fB.stream_max_us\fR

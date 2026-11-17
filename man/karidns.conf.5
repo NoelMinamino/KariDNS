@@ -4975,50 +4975,52 @@ the pass (the batch, the view, the number of the page, and at the end the sum of
 the pages: the checks that were made when the page was decoded on the ingest
 thread, with the same reasons; a failure ends the stream as any other protocol
 error and nothing after the bad page is applied) and records its entries in the
-store in \fBgroups of up to 64\fR: one journal record, one hold of the mutex
-that orders the writers of the records and one decision of the commit policy for
-the group, where a record, a \fBwrite()\fR and two locks were made for each
-zone. The order of the effects is the order of the entries: a zone that already
-has a record (a changed stamp, a rename, a name another id held) first writes
-the group and is then decided as before, and an entry that has the name or the
-id of one that waits in the group writes the group before it looks. A group is
-one journal record with one checksum, so after \fBkill \-9\fR (or a power loss
-in the middle of the write) it is there whole or not at all, and the loader's
-cursor, which is made durable only after the entries it covers, has not passed
-it; the format of the journal did not change (a record with more entries), an
-older store replays as before. When the ring is full the ingest thread does not
-read the stream (the loader waits on its socket: nothing is dropped and nothing
-grows; the fetch stream, the lookups and the bodies are served all the
-time). Every other frame of the stream (the end of the batch and its answer, the
-next batch, a \fBCHANGES\fR message, a delete, the sweep at the end of the pass,
-which also runs on the reconcile thread) waits until the thread has recorded
-everything before it, so that it sees the pass whole: the numbers of
-\fBBATCH_RESULT\fR, the log lines and the cursor are the ones of the whole
-pass. The ingest thread stops reading the stream after about a millisecond of
-work (whether or not a request waits) and goes to the other streams and the
-requests first; the longest read is \fBstore.ingest.stream_max_us\fR. \fBkarictl
-store\fR has \fBstore.recon.thread\fR, \fB.busy_pct\fR, \fB.entries_per_s\fR,
-\fB.queued\fR, \fB.apply_ns_per_entry\fR, \fB.ring_full_stops\fR,
-\fB.group_records\fR and \fB.group_entries\fR, and
-\fBstore.ingest.loop_max_us\fR (docs/karictl.md). Measured on the build host
-with the tables in the page cache (200,000 zones, SQLite3): a pass took 380 to
-480 ms before and 230 to 300 ms with the thread and the groups, on a host that
-other jobs share (the apply of an entry about 1 microsecond on the thread, 3,125
-journal records for the 200,000 entries); at millions of zones the entry is
-dominated by the cache misses in the tables, which grouping does not change, the
-thread is what keeps the pass from taking the ingest thread's time. The entries
-of \fBCHANGES\fR messages are recorded in groups too, on the ingest thread (a
-delete or a zone a \fBkarictl reload\fR waits for needs that
-thread). \fBAttach.\fR A query for a zone that is stored and not in memory is
-\fBnot\fR read from the loader: the query is parked, a store thread reads the
-image (\fBmap\fR: a pointer into the mapped segment; \fBcopy\fR: a buffer),
-checks the record's checksum, the whole structure of the image
-(\fBzone_image_validate()\fR, every time: it holds the NSEC3 iteration cap of
-RFC 9276 section 3.2, 150), the rules of the zone that every source of a zone
-has (\fBzone_image_check_policy()\fR: owners under the apex, no meta type, the
-SOA, ALIAS and LUA RDATA, an ALIAS beside A / AAAA or DNSSEC records, one CNAME
-/ DNAME / RESINFO to a name) and the limits of the configuration as they are now
-(\fBmax\-records\fR, \fBmax\-records\-per\-type\fR, \fBmax\-types\-per\-name\fR,
+store in \fBgroups of up to 32\fR (a group is applied inside the store's writer
+mutex: at ten million zones a group of 64 kept it 15 to 45 ms): one journal
+record, one hold of the mutex that orders the writers of the records and one
+decision of the commit policy for the group, where a record, a \fBwrite()\fR and
+two locks were made for each zone. The order of the effects is the order of the
+entries: a zone that already has a record (a changed stamp, a rename, a name
+another id held) first writes the group and is then decided as before, and an
+entry that has the name or the id of one that waits in the group writes the
+group before it looks. A group is one journal record with one checksum, so after
+\fBkill \-9\fR (or a power loss in the middle of the write) it is there whole or
+not at all, and the loader's cursor, which is made durable only after the
+entries it covers, has not passed it; the format of the journal did not change
+(a record with more entries), an older store replays as before. When the ring is
+full the ingest thread does not read the stream (the loader waits on its socket:
+nothing is dropped and nothing grows; the fetch stream, the lookups and the
+bodies are served all the time). Every other frame of the stream (the end of the
+batch and its answer, the next batch, a \fBCHANGES\fR message, a delete, the
+sweep at the end of the pass, which also runs on the reconcile thread) waits
+until the thread has recorded everything before it, so that it sees the pass
+whole: the numbers of \fBBATCH_RESULT\fR, the log lines and the cursor are the
+ones of the whole pass. The ingest thread stops reading the stream after about a
+millisecond of work (whether or not a request waits) and goes to the other
+streams and the requests first; the longest read is
+\fBstore.ingest.stream_max_us\fR. \fBkarictl store\fR has
+\fBstore.recon.thread\fR, \fB.busy_pct\fR, \fB.entries_per_s\fR, \fB.queued\fR,
+\fB.apply_ns_per_entry\fR, \fB.ring_full_stops\fR, \fB.group_records\fR and
+\fB.group_entries\fR, and \fBstore.ingest.loop_max_us\fR
+(docs/karictl.md). Measured on the build host with the tables in the page cache
+(200,000 zones, SQLite3): a pass took 380 to 480 ms before and 230 to 300 ms
+with the thread and the groups (of 64), on a host that other jobs share (the
+apply of an entry about 1 microsecond on the thread, 3,125 journal records for
+the 200,000 entries); at millions of zones the entry is dominated by the cache
+misses in the tables, which grouping does not change, the thread is what keeps
+the pass from taking the ingest thread's time. The entries of \fBCHANGES\fR
+messages are recorded in groups too, on the ingest thread (a delete or a zone a
+\fBkarictl reload\fR waits for needs that thread). \fBAttach.\fR A query for a
+zone that is stored and not in memory is \fBnot\fR read from the loader: the
+query is parked, a store thread reads the image (\fBmap\fR: a pointer into the
+mapped segment; \fBcopy\fR: a buffer), checks the record's checksum, the whole
+structure of the image (\fBzone_image_validate()\fR, every time: it holds the
+NSEC3 iteration cap of RFC 9276 section 3.2, 150), the rules of the zone that
+every source of a zone has (\fBzone_image_check_policy()\fR: owners under the
+apex, no meta type, the SOA, ALIAS and LUA RDATA, an ALIAS beside A / AAAA or
+DNSSEC records, one CNAME / DNAME / RESINFO to a name) and the limits of the
+configuration as they are now (\fBmax\-records\fR,
+\fBmax\-records\-per\-type\fR, \fBmax\-types\-per\-name\fR,
 \fBmax\-zone\-ttl\fR: a stored image that is over a limit that was tightened
 since is read from the database again, where it is refused with the reason), and
 that the image is the zone's, makes the zone's entry the way an install does

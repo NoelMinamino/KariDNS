@@ -3035,7 +3035,7 @@ int db_recon_apply(const char *view, const db_recon_entry_t *e, uint32_t *zid_ou
  * store_set_known_n().  Every other entry (a record exists: the stamp is compared, a rename, a name taken over) first writes the group and then goes the way of db_recon_apply(), so the order
  * of the effects is the order of the entries and an entry decides from the records its predecessors left.  An entry that has the name or the source id of one waiting in the group writes the group
  * before it looks (its look would not see the record that waits).  The result of an entry that waits is known when the group is written. */
-#define RG_MAX 64
+#define RG_MAX STORE_GROUP_MAX                  /* (one call of store_set_known_n(): one hold of the writer mutex) */
 typedef struct {
   unsigned n;
   store_known_t in[RG_MAX];

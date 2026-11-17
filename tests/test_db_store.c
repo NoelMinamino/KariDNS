@@ -5920,7 +5920,7 @@ static int run_recon_thread(const char *dir) {
         const uint64_t g0 = r0.rt_group_entries;
         CHECK(!db_store_directory_wait());                               /* (the pass has ended: BATCH_RESULT is answered after it) */
         CHECK_MSG(r1.passes == r0.passes + 1 && r1.created - 0 == 3000 && r1.entries == 3000, "the pass: %llu entries, %llu new", (unsigned long long)r1.entries, (unsigned long long)r1.created);
-        CHECK_MSG(r1.rt_group_entries - g0 >= 2900 && r1.rt_group_records - r0.rt_group_records <= 3000 / 64 + 6, "group commit: %llu entries in %llu records", (unsigned long long)(r1.rt_group_entries - g0), (unsigned long long)(r1.rt_group_records - r0.rt_group_records));
+        CHECK_MSG(r1.rt_group_entries - g0 >= 2900 && r1.rt_group_records - r0.rt_group_records <= 3000 / STORE_GROUP_MAX + 6, "group commit: %llu entries in %llu records", (unsigned long long)(r1.rt_group_entries - g0), (unsigned long long)(r1.rt_group_records - r0.rt_group_records));
         CHECK(r1.rt_entries >= 3000 && r1.rt_pages >= 2 && r1.rt_queued == 0 && r1.recon_thread);
         CHECK(kn >= 3000);
         printf("    the pass: %llu entries in %llu group records\n", (unsigned long long)(r1.rt_group_entries - g0), (unsigned long long)(r1.rt_group_records - r0.rt_group_records));

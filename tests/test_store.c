@@ -5033,16 +5033,16 @@ static void test_group_journal(void) {
       store_t *c = NULL;
       if (store_open(d.fd, &o, &c) != 0) _exit(3);
       for (uint32_t i = 0; i < 10; i++) { store_meta_t m = meta_of(i, 1); char nm[160]; name_of(i, nm, sizeof(nm)); if (store_set_known(c, 0, nm, strlen(nm), &m, NULL) != 0) _exit(4); }
-      gk_t g[64];
-      store_known_t in[64];
-      int r[64];
-      for (unsigned j = 0; j < 64; j++) {
+      gk_t g[STORE_GROUP_MAX];                                                 /* (a full group: one record) */
+      store_known_t in[STORE_GROUP_MAX];
+      int r[STORE_GROUP_MAX];
+      for (unsigned j = 0; j < STORE_GROUP_MAX; j++) {
         name_of(100 + j, g[j].nm, sizeof(g[j].nm));
         g[j].m = meta_of(100 + j, 1);
         in[j].name = g[j].nm; in[j].len = strlen(g[j].nm); in[j].meta = &g[j].m;
       }
-      if (store_set_known_n(c, 0, in, 64, r, NULL) != 0) _exit(5);
-      for (unsigned j = 0; j < 64; j++) if (r[j] != 0) _exit(6);
+      if (store_set_known_n(c, 0, in, STORE_GROUP_MAX, r, NULL) != 0) _exit(5);
+      for (unsigned j = 0; j < STORE_GROUP_MAX; j++) if (r[j] != 0) _exit(6);
       _exit(0);                                                               /* no close, no commit: the record is in the kernel */
     }
     int stt = 0;
@@ -5062,7 +5062,7 @@ static void test_group_journal(void) {
       store_stats_t st;
       store_stats(s, &st);
       int found = 0;
-      for (uint32_t j = 0; j < 64; j++) { char nm[160]; name_of(100 + j, nm, sizeof(nm)); store_read_lock(); if (store_find(s, 0, nm, strlen(nm)) != STORE_NONE) found++; store_read_unlock(); }
+      for (uint32_t j = 0; j < STORE_GROUP_MAX; j++) { char nm[160]; name_of(100 + j, nm, sizeof(nm)); store_read_lock(); if (store_find(s, 0, nm, strlen(nm)) != STORE_NONE) found++; store_read_unlock(); }
       if (torn) {
         CHECK(st.recovery.journal_torn);
         for (uint32_t i = 0; i < 10; i++) { char nm[160]; name_of(i, nm, sizeof(nm)); store_read_lock(); CHECK(store_find(s, 0, nm, strlen(nm)) != STORE_NONE); store_read_unlock(); }
@@ -5071,16 +5071,16 @@ static void test_group_journal(void) {
       } else {
         CHECK(!st.recovery.rebuilt);
         CHECK(st.recovery.records_replayed >= 11);                            /* (the ten singles and the group) */
-        CHECK_EQ(found, 64);
-        CHECK_EQ(st.zones_known, 74);
+        CHECK_EQ(found, STORE_GROUP_MAX);
+        CHECK_EQ(st.zones_known, 10 + STORE_GROUP_MAX);
       }
       check_consistent(s, torn ? "torn group" : "replayed group");
       CHECK_EQ(store_close(s), 0);
     }
     tdir_free(&d);
   }
-  /* 3. a group that the index growth splits: the entries past one half of the index wait for the growth (the build outside the mutex is held back here), so the call writes the first
-   * entries as one record, the growth as the next, the rest as a third.  kill -9 at every crash point of the call: after the replay the group's zones are a prefix of the entries in the
+  /* 3. a group that the index growth splits: the entries past one half of the index wait for the growth (the build outside the mutex is held back here), so the call (64 entries) writes the first
+   * entries as records of up to STORE_GROUP_MAX, the growth as the next, the rest after it.  kill -9 at every crash point of the call: after the replay the group's zones are a prefix of the entries in the
    * order of the call (each record whole or not there), and some kills keep only the first record (the call is not one unit: what the kill -9 loop's model allows) */
   {
     int parts = 0, whole = 0, none = 0, bad = 0, runs = 0;

@@ -20,7 +20,7 @@
  * call (killed before 2 finished) or the whole record, and the replay applies it again (idempotent: ops are absolute values
  * "cell X = V", never deltas; counters are logged as absolute values too).
  *
- * The group record (0.7 M2, store_set_known_n()).  One call may carry up to 64 entries (the first fill: the manifest pass lists millions of zones, and a record, a write() and a mutex round per zone
+ * The group record (0.7 M2, store_set_known_n()).  One call may carry up to STORE_GROUP_MAX (32; 64 before the writer-hold fixes of 0.7) entries (the first fill: the manifest pass lists millions of zones, and a record, a write() and a mutex round per zone
  * was most of the cost).  The record is the same record: the ops of the entries one after the other (NX, ZREC, SX, IX per entry, in the order a lock-free reader is safe with), then ONE OP_V
  * with the counters as absolute values at the end of the group.  No new op, no new version of the format: an older server replays it as it replays any record, and a newer one replays an older
  * journal as before.  The group is the unit of the CRC, so a record that is torn (kill -9 or power loss in the write) is dropped whole at the replay: none of its entries is there, and the loader's
@@ -370,7 +370,7 @@ typedef struct { uint64_t h; uint32_t z; uint8_t which, ins; uint16_t pad; } rge
 #define RG_CH_SHIFT 16                        /* the log is kept in chunks of 2^16 entries (1 MiB) */
 #define RG_CH (1u << RG_CH_SHIFT)
 #define RG_NCH (RG_LOG_MAX / RG_CH)
-#define JB_MAXPL 208                      /* index ops of one record: three for each entry of a group of KN_MAX (64), with room */
+#define JB_MAXPL 208                      /* index ops of one record: three for each entry of a group of KN_MAX (STORE_GROUP_MAX, 32), with room */
 typedef struct {
   uint8_t *p;
   size_t   len, cap;
@@ -3347,7 +3347,7 @@ static int release_old_record(store_t *s, const zt_t *old) {
 /* Group commit (store_set_known_n(), 0.7 M2): the entries of one call are planned one after the other into the one journal builder and written as one record.  A pending entry has not written a
  * cell: what a later entry reads (the name index, the source index, the cells) is the state before the group, so the group holds no two entries that touch the same name or source id (put_locked()
  * returns KN_FLUSH_FIRST and the call writes the group, then plans the entry again) and a later entry probes past the index slots the earlier ones have claimed. */
-#define KN_MAX 64
+#define KN_MAX STORE_GROUP_MAX
 #define KN_FLUSH_FIRST (-0x7000)
 typedef struct {
   unsigned n, nix, nsx, nsrc, nnew;     /* entries pending; index slots claimed (name, source); source ids held; of the pending entries, the ones that make a new record */
