@@ -1969,7 +1969,6 @@ static void jw_hook_now(store_t *s, int k) { void (*f)(store_t *, int) = atomic_
 static int st_pwritev_all(int fd, const struct iovec *iov, int niov, uint64_t rlen, off_t off);
 static void fs_probe(store_t *s);
 static void space_used(store_t *s, uint64_t n);
-static void space_unused(store_t *s, uint64_t n);
 static inline bool is_nospc_err(int r) { return r == -ENOSPC || r == -EFBIG || r == -EDQUOT; }
 
 /* the bytes [p, p + n) of the ring to fd at foff (two pieces at the wrap); the whole span or an error (a short write is continued by st_pwritev_all()) */
@@ -2286,7 +2285,11 @@ static int journal_reserve_locked(store_t *s) {
     if (r < 0) return r;
   }
   if ((r = jr_space_locked(s, j->len)) < 0) return r;
-  if ((r = jr_room_locked(s, j->len, 0)) < 0) { space_unused(s, j->len); return r; }   /* (nothing was taken: the estimate gets the bytes back) */
+  if ((r = jr_room_locked(s, j->len, 0)) < 0) {                                       /* (nothing was taken: the estimate gets the bytes back) */
+    int64_t c = atomic_load_explicit(&s->avail_est, memory_order_relaxed);
+    while (c >= 0 && !atomic_compare_exchange_weak_explicit(&s->avail_est, &c, c + (int64_t)j->len, memory_order_relaxed, memory_order_relaxed)) {}
+    return r;
+  }
   jrec_t h;
   h.magic = ST_MAGIC_JREC;
   h.len = (uint32_t)j->len;
@@ -3466,11 +3469,6 @@ static void space_used(store_t *s, uint64_t n) {
   atomic_fetch_add_explicit(&s->probe_bytes, n, memory_order_relaxed);
   int64_t c = atomic_load_explicit(&s->avail_est, memory_order_relaxed);
   while (c >= 0 && !atomic_compare_exchange_weak_explicit(&s->avail_est, &c, (uint64_t)c > n ? c - (int64_t)n : 0, memory_order_relaxed, memory_order_relaxed)) {}
-}
-
-static void space_unused(store_t *s, uint64_t n) {
-  int64_t c = atomic_load_explicit(&s->avail_est, memory_order_relaxed);
-  while (c >= 0 && !atomic_compare_exchange_weak_explicit(&s->avail_est, &c, c + (int64_t)n, memory_order_relaxed, memory_order_relaxed)) {}
 }
 
 /* is a commit due? (no lock: atomics) */
