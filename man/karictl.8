@@ -813,11 +813,13 @@ store's writer mutex: writers go on meanwhile
 0.7: the bytes of the tables (\fBzt\fR, \fBzc\fR, \fBnx\fR, \fBix\fR, \fBsx\fR)
 that checkpoints wrote since the open, and the last one: a checkpoint copies the
 pages that changed since the one before and writes the copy, so the writers
-never wait for a page that is being written out
+never wait for a page that is being written out (\fB.paced_us\fR: the time a
+checkpoint waited because it had written more than 256 MiB a second, so that the
+writers' journal appends do not queue behind a burst of it)
 .TP 8
 \fBstore.tables.private_bytes\fR
 0.7: the pages of the tables that the server changed since it started: memory of
-the process that the kernel cannot drop (about 180 bytes a zone once every page
+the process that the kernel cannot drop (about 200 bytes a zone once every page
 was written; 0 after a restart until a zone changes). \fBmemory\-limit\fR counts
 it: the zones in memory get the limit less this, at least a tenth of the limit
 (docs/karidns.md, "The tables in memory")
