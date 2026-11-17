@@ -9,6 +9,7 @@ import { diffCounts, diffPage, lineText } from '../diffmodel.js';
 import { relName } from '../zonelib.js';
 import { reloadOffer } from '../version.js';
 import { reloadNote } from './reload.js';
+import { warningList } from '../idnui.js';
 
 const SIGN = { add: '+', replace: '~', delete: '-' };
 
@@ -164,7 +165,7 @@ export function changeFlow(ctx, o) {
     } else {
       kids.push(h('p', { class: 'msg ok', role: 'status' }, t('result.preview')));
     }
-    kids.push(summaryList(ctx, r, committed), messageList(ctx, r.messages));
+    kids.push(summaryList(ctx, r, committed), warningList(t, r.warnings), messageList(ctx, r.messages));
     if (r.conflicts?.length) kids.push(messageList(ctx, r.conflicts));
     kids.push(diffView(ctx, r.diff ?? [], o.zone));
     fill(out, kids);

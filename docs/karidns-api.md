@@ -121,6 +121,8 @@ Lines are `key = value`; `#` starts a comment; a value may be in double quotes; 
 | `audit-retention` | 0 | days the audit log is kept (7 to 36500); the hourly sweep deletes older rows, at most 10,000 at a time per table until none is left. `0`: for ever. PostgreSQL: through `karidns_auth.prune_audit(days)` (below, the bullet "Audit log pruning") |
 | `ui` | yes | serve the files of the web interface under `/` and `/ui/` (below, "THE WEB INTERFACE"); `no` serves only `/api/v1/` |
 | `ui-dir` | `webadmin/ui` of the installation | the directory of the files of the web interface (absolute); read once at the start. Not with `ui = no` |
+| `ldns-link` | yes | the web interface links each zone and RRset to [ldns.jp](https://ldns.jp/), which looks the name up through a public resolver over DoH from the browser (0.7; "INTERNATIONALIZED NAMES AND LDNS.JP" below). The service itself sends nothing; a click sends the name to ldns.jp and to that resolver. `no` for zones whose names should not leave the house (internal views, zones not yet delegated) |
+| `ldns-resolver` | `google` | the resolver ldns.jp asks: `google`, `cloudflare`, `iij` or `alidns` |
 | `log` | `stderr` | `stderr` or a syslog facility (through `logger(1)`) |
 | `[dataset NAME]` `schema`, `views` | | PostgreSQL: a dataset is a schema of zone tables (default one dataset `main` in `public`); SQLite3 has the one dataset `main` |
 | `[oidc NAME]` `issuer`, `client-id`, `client-secret-file`, `scopes`, `label`, `mfa` | | an OpenID Connect provider (up to 8; see "OpenID Connect" under AUTHENTICATION). `issuer`: its issuer identifier, an https URL (`http://` only for a provider on this machine), kept exactly as written because the `iss` claim is compared with it; `client-id`; `client-secret-file`: the file with the client secret on one line (checked like a connection file: the service user's, mode 0600 or 0400; `--check` reads it and fetches nothing); `scopes` (default `openid`; `openid` is always asked for); `label`: the text of the sign-in button (default the name); `mfa`: `totp` (default) or `idp` (the TOTP step is left to the provider when its ID token shows two factors). The name is 1 to 32 characters: lower case letters, digits, `-` and `_`. Sections come after the global keys, like `[dataset]`; one issuer once |
@@ -174,7 +176,7 @@ A **policy** (`rr_policy`) lists the record types allowed (never the DNSSEC type
 
 ## CONVENTIONS
 
-Base path `/api/v1`; JSON (`application/json; charset=utf-8`), UTF-8, every document has `"api": 1`. Names are absolute with the final dot (`www.example.test.`), canonical (lower case); in a request the dot may be left out. Zone names are plain LDH names (letters, digits, `-`, `_`); an owner name may also hold `*` as a whole label and `/`; no backslash escapes, no non-ASCII (use the A-label). Unknown fields in a request are refused (400, with a JSON pointer), so a typo is not ignored. Request bodies are limited to 1 MiB (the login to 16 KiB; an import and the creation of a zone from a text to 16 MiB); headers to 16 KiB; the body of a request has 30 seconds to arrive (408 after that; an import 300 seconds). Responses carry `Cache-Control: no-store`, `X-Content-Type-Options: nosniff`, `Content-Security-Policy: default-src 'self'; frame-ancestors 'none'` and an `X-Request-Id` (the files of the web interface have their own policy, "THE WEB INTERFACE" below). A query parameter that is a flag takes `true`, `false`, `1` or `0`.
+Base path `/api/v1`; JSON (`application/json; charset=utf-8`), UTF-8, every document has `"api": 1`. Names are absolute with the final dot (`www.example.test.`), canonical (lower case); in a request the dot may be left out. Zone names are plain LDH names (letters, digits, `-`, `_`); an owner name may also hold `*` as a whole label and `/`; no backslash escapes. A name may be written in Unicode (0.7): it is stored with its A-labels, the way `dig +idnin` converts it ("INTERNATIONALIZED NAMES AND LDNS.JP" below); the names in RDATA (the target of a CNAME, an MX, ...) are taken as A-labels only. Unknown fields in a request are refused (400, with a JSON pointer), so a typo is not ignored. Request bodies are limited to 1 MiB (the login to 16 KiB; an import and the creation of a zone from a text to 16 MiB); headers to 16 KiB; the body of a request has 30 seconds to arrive (408 after that; an import 300 seconds). Responses carry `Cache-Control: no-store`, `X-Content-Type-Options: nosniff`, `Content-Security-Policy: default-src 'self'; frame-ancestors 'none'` and an `X-Request-Id` (the files of the web interface have their own policy, "THE WEB INTERFACE" below). A query parameter that is a flag takes `true`, `false`, `1` or `0`.
 
 **Lists** take `?limit=` (1 to 500, default 100) and `?cursor=` (opaque, from `next_cursor` of the previous page; `null` at the end). A page of the audit log may hold fewer rows than `limit` when the principal may not see some; follow `next_cursor`.
 
@@ -203,7 +205,8 @@ All paths are relative to `/api/v1`. "Global" means a global master.
 | | |
 |---|---|
 | `GET /health` | no login. `{"status":"ok","database":"ok"}`, or 503 when the database does not answer within 3 seconds |
-| `GET /version` | login. `{version, tools, datasets, types, ui}`: the version, the versions of `karidns-zone` and `karicheck`, the datasets, `types` (the record types a change set takes, sorted, as `karidns-zone --types-list` names them; `null` when the service did not ask) and `ui`, what a client (the web interface) follows: `{reload_after_change, reload_available, reload_all, require_totp (global\|all\|none), max_rrsets (1000), max_records (1000, an RRset), zone_text_limit (16777216 octets: a zone text in an import or a zone creation)}`. `reload_all` (0.7) is `true` on PostgreSQL only, where `POST /datasets/{ds}/reload` (every zone) can be asked for (SQLite3 answers it with 409 `unsupported`). `reload_available` is `false` exactly where a request with `"reload": true` (and `POST .../reload`) is refused with 400: SQLite3 without `karictl-config`; the web interface then offers no reload |
+| `GET /version` | login. `{version, tools, datasets, types, ui}`: the version, the versions of `karidns-zone` and `karicheck`, the datasets, `types` (the record types a change set takes, sorted, as `karidns-zone --types-list` names them; `null` when the service did not ask) and `ui`, what a client (the web interface) follows: `{reload_after_change, reload_available, reload_all, require_totp (global\|all\|none), max_rrsets (1000), max_records (1000, an RRset), zone_text_limit (16777216 octets: a zone text in an import or a zone creation)}`. `reload_all` (0.7) is `true` on PostgreSQL only, where `POST /datasets/{ds}/reload` (every zone) can be asked for (SQLite3 answers it with 409 `unsupported`). `reload_available` is `false` exactly where a request with `"reload": true` (and `POST .../reload`) is refused with 400: SQLite3 without `karictl-config`; the web interface then offers no reload. `ldns` (0.7): `{url, resolver}` for the links to ldns.jp, `null` with `ldns-link = no` |
+| `GET /idn?name=` | login (0.7). What the service makes of a name, without reading or writing anything: `{ascii, unicode, warnings}` (one run of `karidns-zone idn`). `ascii`: the name with A-labels, as `dig +idnin` sends it (a final dot is kept); `unicode`: its U-label form, `null` when it has none; `warnings`: as in a change set ("INTERNATIONALIZED NAMES AND LDNS.JP"). 400 `bad-request` (pointer `?name`) when dig would not convert the name, with the reason of libidn2. The web interface shows it under a field of a name |
 
 ### Login and self
 
@@ -297,6 +300,45 @@ Paths are `/datasets/{ds}/zones/{zone}/...`. Any principal with a grant on the z
 |---|---|
 | `GET /audit` | newest first. `?zone=`, `?principal=ID`, `?change_set=`, `?table=`, `?since=`, `?until=` (ISO 8601). `{audit:[{id, at, source, principal_id, principal, db_role, change_set, schema, table, op (I U D), zone, row_id, before, after}]}`. A global master reads all; a domain master the rows of its zones (data rows and the grants made on them); others none. Secrets are `"<redacted>"` in the log itself. `source` is `audit` (PostgreSQL), or `zone` / `auth` (SQLite3: the two files) |
 | `GET /servers` | PostgreSQL: per dataset and server the generation applied, whether every zone loaded, and the zones that did not (lines filtered to the zones the principal has a grant on). SQLite3: empty, with a note (ask the server with `karictl status`) |
+
+## INTERNATIONALIZED NAMES AND LDNS.JP
+
+**Names in Unicode (0.7).** Every field and parameter that takes a zone name or an owner name also takes it in Unicode:
+
+- the name of a new zone;
+- `{zone}` in a path (percent-encoded);
+- the `name` of an RRset in a change set;
+- the owner of a template record;
+- the zone and suffix of a grant;
+- `?name=`, `?zone=`, `?from=`, `?prefix=` and `?contains=`.
+
+The service turns such a name into its A-labels before anything else looks at the request. The database holds A-labels only (lower case, no final dot), so everything that reads it (the server, `karidns-zone`, the signer) is unchanged.
+
+**The conversion is dig's.** It is made by libidn2 through `karidns-zone idn` (docs/karidns-zone.md, "idn"), called the way `dig +idnin` calls it in BIND 9.20. The service runs it once per request, and only for names that are not ASCII.
+
+1. A name that is all ASCII is taken as it is.
+2. Otherwise the name goes through IDNA2008 with the UTS #46 non-transitional mapping: case folded, full-width forms and compatibility characters mapped, `。` `．` `｡` read as dots.
+3. When that fails because of a code point IDNA2008 does not allow (RFC 5892: a symbol such as `☃`), the whole name is converted again with the transitional mapping, as dig does: `ß` becomes `ss`, `ς` becomes `σ`, ZWJ and ZWNJ are dropped. `straße.☃.example` is stored as `strasse.xn--n3h.example`; `straße.example` as `xn--strae-oqa.example`.
+4. A name dig would not convert is refused: 400 `bad-request` with the pointer of the field and libidn2's reason. Examples are a hyphen in the wrong place (RFC 5891 4.2.3.1), the bidi rule of RFC 5893, a zero width joiner out of place, a label over 63 octets, or a code point UTS #46 does not allow. dig would send such a name as raw octets, so it has no A-label form.
+
+The service does not use Node's own IDNA code (`url.domainToASCII`): it gives different answers on different builds of Node. With libidn2, the stored name is the same on every host and the same as dig's. A karidns-zone built without libidn2 cannot convert: a name in Unicode is then refused with a message that says so, and names are shown with their A-labels only.
+
+**Warnings.** A rule that a name dig converts still breaks does not stop it (it is the operator's name). The reply of the write lists them in `warnings: [{code, label, message}]`; the field is absent when there are none. The codes:
+
+- `idn-disallowed` and `idn-transitional`: step 3 above. Most registries refuse such a name.
+- `idn-contexto`: a CONTEXTO rule of RFC 5892 appendix A is broken, such as the katakana middle dot `・` in a label without kana or kanji. dig converts the name, but registration refuses it (RFC 5891 4.2.3.3).
+- `idn-mixed-script`: a label of several scripts beyond the combinations of UTS #39 5.2 "Highly Restrictive", such as Latin with Cyrillic.
+- `idn-bad-alabel`: an ASCII name with an `xn--` label that libidn2 does not accept. The name is stored as it is, as dig sends it.
+
+The replies that carry them are `PATCH .../rrsets`, `POST .../zones`, `POST /templates`, `PATCH /templates/{id}`, `POST /grants`, and their dry runs. `idn-contexto` and `idn-mixed-script` are judged by the Unicode data of the JavaScript engine; they are warnings only.
+
+**The U-label form.** The zone list, a zone and the RRsets carry `unicode` beside `name` when the name has an A-label that libidn2 decodes, as `dig +idnout` shows it. It is for display; the name itself is `name`.
+
+**Search.** A part of a name written in Unicode is converted as a name, so a Unicode label matches **as a whole label** (punycode keeps no part of a label). `?contains=例え` finds `例え.test` and `www.例え.test`; `?contains=例` does not find `例え.test`. The ASCII parts stay a part of a name as before, and `?contains=xn--r8jz45g` finds the same zones.
+
+**How close to dig.** `tests/run_karidns_zone_idn_test.sh` compares `karidns-zone idn` with what dig 9.20.30 (libidn2 2.3.8) sent and showed for about 90 names on the build host. The vectors are in `webadmin/test/idn_dig_vectors.json`, made by `webadmin/test/idn_dig_vectors_gen.mjs`. Every one is the same, byte for byte.
+
+**ldns.jp.** With `ldns-link = yes` (the default) the web interface puts a link to `https://ldns.jp/?q=<name>&t=<type>&c=dig&r=<ldns-resolver>&auto=1` beside each zone (type SOA) and each RRset (its type). The page opens in a new tab without a Referer or an opener, and from the browser asks the public resolver (Google, Cloudflare, IIJ or Alibaba) over DNS over HTTPS: what the name looks like from outside, through that resolver's cache. The service sends nothing, so it is no relay of queries (no SSRF). A click sends the name to ldns.jp and to the resolver; set `ldns-link = no` where zone names are private.
 
 ## CHANGE SETS
 

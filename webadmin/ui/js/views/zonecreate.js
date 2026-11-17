@@ -8,6 +8,7 @@ import { datasetPath, absName, recordLines, parseRecordLine, PRIMARY_KINDS, kind
 import { placeOnFields } from '../pointer.js';
 import { changeFlow } from './change.js';
 import { zoneTextInput } from './zonetext.js';
+import { idnHint } from '../idnui.js';
 
 const SOA_FIELDS = ['refresh', 'retry', 'expire', 'minimum', 'ttl'];
 
@@ -49,6 +50,7 @@ export function zoneCreateView(ctx, { params }) {
 
   function draw(templates) {
     const name = field({ label: t('create.name'), name: 'name', required: true, maxlength: 255, spellcheck: false, autocapitalize: 'none', hint: t('create.name-hint') });
+    idnHint(ctx, name);
     const kind = select({ label: t('create.kind'), name: 'type', options: PRIMARY_KINDS.map((k) => ({ value: k, label: kindLabel(t, k) })), value: 'NATIVE', hint: t('kind.hint') });
     const how = select({ label: t('create.how'), name: 'how', options: [{ value: 'form', label: t('create.how-form') }, { value: 'template', label: t('create.how-template') }, { value: 'text', label: t('create.how-text') }], value: 'form' });
     const tplSel = select({ label: t('create.template'), name: 'template', options: templates.map((x) => ({ value: x.name, label: x.name })), value: templates[0]?.name });

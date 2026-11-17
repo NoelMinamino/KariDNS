@@ -17,6 +17,7 @@ karidns-zone apply [options] --changes <file|-> <zone>
 karidns-zone apply [options] --zone-file <file|-> [--delete-others] <zone>
 karidns-zone --types-list [--json]
 karidns-zone render --json <zone>
+karidns-zone idn --json
 karidns-zone --version | -h | --help
 ```
 
@@ -185,6 +186,35 @@ Each record is read as the loader reads a row (`dns_pdns_reader.c`: the line-saf
 ```
 
 `rdata` has one entry for each input line, in order: the text, or `null`; `errors` says why for each `null` (the reader's reason without the zone or the row; `index` counts from 0). The exit status is 0 when the input was understood, whatever became of the records. `--json` is required, and no other option is (the answer is a document of the schema of `karicheck --json`, `"command": "render"`). The input path is fuzzed (`tests/fuzz/fuzz_zone_changes.c`, which also checks that a rendered text is one safe line that renders again, to a fixed point).
+
+### idn (0.7, the WebAdmin)
+
+`karidns-zone idn --json` converts internationalized names exactly as `dig +idnin` and `dig +idnout` do. The WebAdmin API runs it, once per request, for the names given in Unicode and for the names it shows with their U-labels. It reads no database and no configuration. Standard input holds one name a line:
+
+```text
+a TAB <name>        the name dig +idnin sends (A-labels)
+u TAB <name>        the name dig +idnout shows (U-labels)
+```
+
+The conversion is libidn2's, called the way dig 9.20 calls it (BIND `dighost.c`; measured on the build host with dig 9.20.30 and libidn2 2.3.8):
+
+- A name of ASCII alone is not converted. Its case and its `xn--` labels are kept.
+- Otherwise the name goes through IDNA2008 with the UTS #46 non-transitional mapping (`IDN2_NONTRANSITIONAL`).
+- When that fails with `IDN2_DISALLOWED` (a code point IDNA2008 does not allow, RFC 5892), the whole name is converted again with the transitional mapping (`IDN2_TRANSITIONAL`: `ß` becomes `ss`, `ς` becomes `σ`, ZWJ and ZWNJ are dropped). For example, `straße.☃.example` becomes `strasse.xn--n3h.example`.
+- Any other problem (hyphens, the bidi rule of RFC 5893, a joiner out of place, a label over 63 octets) means dig sends the UTF-8 octets. Here the answer is `null` with the reason.
+
+The document has the key `idn`, one entry per input line, in order:
+
+```json
+"idn": [ { "ascii": "xn--r8jz45g.test", "transitional": false, "error": null, "reason": null },
+         { "ascii": null, "transitional": false, "error": "IDN2_BIDI", "reason": "string has forbidden bi-directional properties" },
+         { "unicode": "例え.test" } ]
+```
+
+- `ascii` of an ASCII name is the name itself. `error` then says what libidn2 finds in it, for example an `xn--` label that is not an A-label. The WebAdmin turns that into a warning.
+- `unicode` is `null` when the name has no A-label that libidn2 decodes; the name is then shown as it is.
+
+A line that is neither `a` nor `u`, a TAB and a name of 1 to 1024 octets, or more than 100,000 lines, refuses the whole input: exit status 1, `db.idn.input`. A karidns-zone built without libidn2 answers every input with exit status 1 and `db.idn.unavailable`; the WebAdmin then refuses names in Unicode.
 
 ## OPTIONS
 

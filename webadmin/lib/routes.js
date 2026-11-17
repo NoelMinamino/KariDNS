@@ -15,6 +15,7 @@ import { ZONE_TEXT_LIMIT as ZIP } from './changes.js';           // a zone text 
 export const ROUTES = [
   { method: 'GET', path: '/health', auth: 'none', handler: zones.health },
   { method: 'GET', path: '/version', handler: zones.version },
+  { method: 'GET', path: '/idn', handler: zones.idn },
 
   { method: 'POST', path: '/auth/login', auth: 'none', bodyLimit: 16384, handler: auth.login },
   { method: 'POST', path: '/auth/logout', preTotp: true, sessionOnly: true, handler: auth.logout },
@@ -49,20 +50,20 @@ export const ROUTES = [
   { method: 'PATCH', path: '/rr-policies/:id', handler: admin.policyUpdate },
   { method: 'DELETE', path: '/rr-policies/:id', handler: admin.policyDelete },
 
-  { method: 'GET', path: '/grants', handler: admin.grantsList },
-  { method: 'POST', path: '/grants', handler: admin.grantCreate },
+  { method: 'GET', path: '/grants', idn: { query: ['zone'] }, handler: admin.grantsList },
+  { method: 'POST', path: '/grants', idn: { body: ['zone', 'suffix'], warnings: true }, handler: admin.grantCreate },
   { method: 'DELETE', path: '/grants/:id', handler: admin.grantDelete },
 
   { method: 'GET', path: '/datasets', handler: zones.datasets },
-  { method: 'GET', path: '/datasets/:ds/zones', handler: zones.zonesList },
+  { method: 'GET', path: '/datasets/:ds/zones', idn: { query: ['prefix', 'contains'] }, handler: zones.zonesList },
   { method: 'GET', path: '/datasets/:ds/zones/:zone', handler: zones.zoneGet },
-  { method: 'GET', path: '/datasets/:ds/zones/:zone/rrsets', handler: zones.rrsetsList },
+  { method: 'GET', path: '/datasets/:ds/zones/:zone/rrsets', idn: { query: ['name', 'from', 'contains'] }, handler: zones.rrsetsList },
   { method: 'GET', path: '/datasets/:ds/zones/:zone/export', handler: zones.zoneExport },
 
-  { method: 'POST', path: '/datasets/:ds/zones', bodyLimit: ZIP, readTimeoutMs: IMPORT_MS, handler: write.zoneCreate },
+  { method: 'POST', path: '/datasets/:ds/zones', bodyLimit: ZIP, readTimeoutMs: IMPORT_MS, idn: { body: ['name', 'rrsets.*.name'], warnings: true }, handler: write.zoneCreate },
   { method: 'PATCH', path: '/datasets/:ds/zones/:zone', handler: write.zonePatch },
   { method: 'DELETE', path: '/datasets/:ds/zones/:zone', handler: write.zoneDelete },
-  { method: 'PATCH', path: '/datasets/:ds/zones/:zone/rrsets', handler: write.rrsetsPatch },
+  { method: 'PATCH', path: '/datasets/:ds/zones/:zone/rrsets', idn: { body: ['rrsets.*.name'], warnings: true }, handler: write.rrsetsPatch },
   { method: 'POST', path: '/datasets/:ds/zones/:zone/import', bodyLimit: ZIP, readTimeoutMs: IMPORT_MS, handler: write.importZone },
   { method: 'POST', path: '/datasets/:ds/zones/:zone/reload', bucket: 'reload', handler: write.reloadZone },
   { method: 'POST', path: '/datasets/:ds/reload', bucket: 'reload', handler: write.reloadAll },
@@ -79,12 +80,15 @@ export const ROUTES = [
   { method: 'POST', path: '/datasets/:ds/zones/:zone/apply-template', handler: templates.applyTemplate },
 
   { method: 'GET', path: '/templates', handler: templates.list },
-  { method: 'POST', path: '/templates', handler: templates.create },
+  { method: 'POST', path: '/templates', idn: { body: ['records.*.owner'], warnings: true }, handler: templates.create },
   { method: 'GET', path: '/templates/:id', handler: templates.get },
-  { method: 'PATCH', path: '/templates/:id', handler: templates.update },
+  { method: 'PATCH', path: '/templates/:id', idn: { body: ['records.*.owner'], warnings: true }, handler: templates.update },
   { method: 'DELETE', path: '/templates/:id', handler: templates.remove },
   { method: 'POST', path: '/templates/:id/validate', handler: templates.validate },
 
-  { method: 'GET', path: '/audit', handler: zones.auditList },
+  { method: 'GET', path: '/audit', idn: { query: ['zone'] }, handler: zones.auditList },
   { method: 'GET', path: '/servers', handler: zones.serversList },
 ];
+
+// 0.7: a zone in the path may be written in Unicode (idn.js); the A-labels reach the handler
+for (const r of ROUTES) if (r.path.includes(':zone')) r.idn = { ...r.idn, params: ['zone'] };

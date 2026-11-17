@@ -7,6 +7,7 @@ import * as S from '../store.js';
 import { reply } from '../http.js';
 import { isGlobal, zoneGrant, rrVisible, auditVisible } from '../perm.js';
 import { canonicalOwner, inZone, absolute } from '../names.js';
+import { asciiNames, unicodeNames } from '../idn.js';
 import { exportArgv, renderArgv } from '../tools.js';
 import { contentProblem, MAX_RRSETS, MAX_RECORDS, ZONE_TEXT_LIMIT } from '../changes.js';
 import { VERSION } from '../app.js';
@@ -40,10 +41,11 @@ export async function zonesList(ctx) {
   const after = q.cursor === undefined ? undefined : decodeCursor(q.cursor, NAME_CURSOR).n;
   const rows = await ctx.db((tx) => S.listZones(tx, ds.schema, { names, prefix: q.prefix, contains: q.contains, kind: q.kind, signed: q.signed, after, limit }));
   const p = page(rows, limit, (r) => ({ n: r.raw }));
+  const uni = await unicodeNames(ctx, p.items.map((z) => absolute(z.name)));          // 0.7: the U-label form, as dig +idnout shows it
   const zones = [];
   for (const z of p.items) {
     const role = zoneGrant(gs, ds.schema, z.name);
-    if (role) zones.push({ name: absolute(z.name), kind: z.kind, serial: z.serial, presigned: z.presigned, signer: z.signer, catalog: z.catalog, role });
+    if (role) zones.push({ name: absolute(z.name), unicode: uni.get(absolute(z.name)), kind: z.kind, serial: z.serial, presigned: z.presigned, signer: z.signer, catalog: z.catalog, role });
   }
   return { zones, next_cursor: p.next_cursor };
 }
@@ -54,9 +56,10 @@ export async function zoneGet(ctx) {
   const gs = zoneGrants(ctx, ds, zone);
   const z = await ctx.db((tx) => S.getZone(tx, ds.schema, zone));
   if (!z) throw notFound('no such zone');
+  const uni = await unicodeNames(ctx, [absolute(z.name)]);
   return {
     zone: {
-      name: absolute(z.name), id: z.id, kind: z.kind, serial: z.serial, catalog: z.catalog, master: z.master, account: z.account, notified_serial: z.notified_serial,
+      name: absolute(z.name), unicode: uni.get(absolute(z.name)), id: z.id, kind: z.kind, serial: z.serial, catalog: z.catalog, master: z.master, account: z.account, notified_serial: z.notified_serial,
       presigned: z.presigned, signer: z.signer, nsec3param: z.nsec3param, generation: z.generation, changed_at: z.changed_at, views: z.views,
       signer_state: z.signer_state, waiting_for_signer: z.signer && (z.signer_state?.signed_serial ?? null) !== z.serial, last_reload_request: z.last_reload_request,
       role: gs[0].role, grants: gs.map((g) => grantView(ctx.app, g)),
@@ -140,10 +143,11 @@ export async function rrsetsList(ctx) {
   const more = sets.length > limit;
   const shown = sets.slice(0, limit);
   const visible = shown.filter((s) => rrVisible(gs, { schema: ds.schema, zone, name: s.name, type: s.type }));
+  const uni = await unicodeNames(ctx, visible.map((s) => absolute(s.name)));
   const rrsets = visible.map((s) => {
     const ttls = s.rows.map((r) => r.ttl).filter((t) => t !== null);
     s.records = s.rows.map((r) => ({ content: recordText(s.type, r.content, r.prio), disabled: r.disabled, ttl: r.ttl }));
-    return { name: absolute(s.name), type: s.type, ttl: ttls.length ? Math.min(...ttls) : null, tagged: found.tagged.has(`${s.name} ${s.type}`), records: s.records };
+    return { name: absolute(s.name), unicode: uni.get(absolute(s.name)), type: s.type, ttl: ttls.length ? Math.min(...ttls) : null, tagged: found.tagged.has(`${s.name} ${s.type}`), records: s.records };
   });
   if (q.rdata === true) await addRdata(ctx, zone, visible);
   const lastShown = shown[shown.length - 1];
@@ -268,6 +272,17 @@ export async function health(ctx) {
   return reply(ok ? 200 : 503, { status: ok ? 'ok' : 'unavailable', database: ok ? 'ok' : 'error' });
 }
 
+// GET /idn?name= (0.7): what the API makes of a name it is given, as dig +idnin converts it (karidns-zone idn) -> { ascii, unicode (null: no U-label form),
+// warnings }.  Nothing is read or written: a form shows it under a field of a name.
+export async function idn(ctx) {
+  const q = query(ctx.query, { name: { type: 'string', required: true, min: 1, max: 1024 } });
+  const r = (await asciiNames(ctx, [q.name], () => '?name')).get(q.name) ?? { ascii: q.name, warnings: [] };
+  return { ascii: r.ascii, unicode: (await unicodeNames(ctx, [r.ascii])).get(r.ascii) ?? null, warnings: r.warnings };
+}
+
+// the page the GUI links a name to (0.7, ldns-link): ldns.jp asks public resolvers over DoH from the browser; this service sends nothing to it
+export const LDNS_URL = 'https://ldns.jp/';
+
 // G5: what a client (the GUI) needs to follow the service: the record types a change set takes (karidns-zone's own list; null when the service could not ask) and the
 // settings and limits that change what a form should offer
 export function version(ctx) {
@@ -275,6 +290,7 @@ export function version(ctx) {
   const s = app.settings;
   return {
     version: VERSION, tools: app.versions, datasets: app.datasets.map((d) => d.name), types: app.types ? [...app.types].sort() : null,
-    ui: { reload_after_change: s['reload-after-change'], reload_available: reloadAvailable(s), reload_all: s.database === 'pg', require_totp: s['require-totp'], max_rrsets: MAX_RRSETS, max_records: MAX_RECORDS, zone_text_limit: ZONE_TEXT_LIMIT },
+    ui: { reload_after_change: s['reload-after-change'], reload_available: reloadAvailable(s), reload_all: s.database === 'pg', require_totp: s['require-totp'],
+      ldns: s['ldns-link'] ? { url: LDNS_URL, resolver: s['ldns-resolver'] } : null, max_rrsets: MAX_RRSETS, max_records: MAX_RECORDS, zone_text_limit: ZONE_TEXT_LIMIT },
   };
 }

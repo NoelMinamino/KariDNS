@@ -29,19 +29,16 @@ export function relName(name, zone) {
 }
 
 // What a person typed as an owner -> the absolute name in the zone, or null when it cannot be one.  "@" is the apex; a name that ends with a dot is absolute; a name that
-// is the zone or ends with the zone's name is taken as absolute; anything else is relative to the zone.  U-labels become A-labels (the service takes no non-ASCII).
+// is the zone or ends with the zone's name is taken as absolute; anything else is relative to the zone.  U-labels stay (0.7): the service turns them into A-labels
+// the way dig +idnin does (GET /idn; idnui.js asciiOf), which the URL parser of a browser does not quite; the dots of UTS #46 (。．｡) are dots here already.
 export function absName(input, zone) {
-  let s = String(input ?? '').trim();
+  let s = String(input ?? '').trim().replace(/[。．｡]/g, '.');
   if (s === '') return null;
   if (s === '@') return lower(zone);
-  // eslint-disable-next-line no-control-regex
-  if (/[^\x00-\x7f]/.test(s)) {
-    try { s = new URL('http://' + s).hostname; } catch { return null; }
-    if (s === '') return null;
-  }
   s = lower(s);
-  // (what an owner name may hold: letters, digits, - and _, a * label and /; the service checks it again and says where)
-  if (!/^[a-z0-9_.*/-]+$/.test(s)) return null;
+  // (what an owner name may hold: letters, digits, - and _, a * label and /, and non-ASCII code points that are no space; the service checks it again and says where)
+  // eslint-disable-next-line no-control-regex
+  if (!/^(?:[a-z0-9_.*/-]|[^\x00-\x7f\s\p{Cc}])+$/u.test(s)) return null;
   const z = lower(zone);
   if (s.endsWith('.')) return s;
   const bare = stripDot(z);

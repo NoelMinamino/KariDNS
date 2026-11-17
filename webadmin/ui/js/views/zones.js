@@ -6,9 +6,10 @@ import { render } from '../format.js';
 import { field, select, message, problemNodes, confirmButton, isGlobal } from '../widgets.js';
 import { datasetPath, PRIMARY_KINDS, kindLabel } from '../zonelib.js';
 import { reloadText } from './change.js';
+import { nameNodes } from '../idnui.js';
 
 const KINDS = [...PRIMARY_KINDS, 'SLAVE', 'PRODUCER', 'CONSUMER'];
-const SEARCH = /^[A-Za-z0-9_.-]+$/;
+const SEARCH = /^[^\s\x00-\x1f\x7f]+$/u;                 // (0.7: Unicode too; the service turns its labels into A-labels)
 
 export function zonesView(ctx, { query }) {
   const { api, i18n, router } = ctx;
@@ -43,7 +44,7 @@ export function zonesView(ctx, { query }) {
       router.go('zones', undefined, { ds: dsSel ? dsSel.input.value : ds, q: text, mode: mode.input.value, kind: kind.input.value, signed: signed.input.value });
     });
     const rows = r.zones.map((z) => h('tr', null,
-      h('th', { scope: 'row' }, link(router.href('zone', { ds, zone: z.name }), null, render(z.name))),
+      h('th', { scope: 'row' }, link(router.href('zone', { ds, zone: z.name }), null, nameNodes(z.name, z.unicode))),
       h('td', null, t(`role.${z.role}`)),
       h('td', null, render(z.kind)),
       h('td', null, z.serial === null || z.serial === undefined ? '-' : String(z.serial)),

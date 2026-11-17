@@ -92,6 +92,18 @@ export function oidcLink(name, route, props, ...kids) {
   return el;
 }
 
+// a link to a page of another site that opens in a new tab (0.7: ldns.jp, which looks a name up through public resolvers): `base` is the service's (GET /version,
+// its configuration), an https origin with the path "/" only; the query is built here from the pairs, each value encoded.  No Referer and no opener go with it, so
+// the other page learns neither the address of this one nor gets a handle on it.  Never a URL from data.
+export function outsideLink(base, query, props, ...kids) {
+  if (typeof base !== 'string' || !/^https:\/\/[a-z0-9.-]+\/$/.test(base)) throw new Error('dom.outsideLink: only an https origin');
+  const el = h('a', props, ...kids);
+  el.setAttribute('href', `${base}?${new URLSearchParams(query)}`);
+  el.setAttribute('target', '_blank');
+  el.setAttribute('rel', 'noopener noreferrer');
+  return el;
+}
+
 // a drawing: svg('svg', { viewBox: '0 0 10 10' }, svg('path', { d: '...' }))
 export function svg(tag, attrs, ...kids) {
   const el = doc.createElementNS(SVG_NS, tag);

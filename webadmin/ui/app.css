@@ -246,3 +246,10 @@ dialog.modal::backdrop { background: var(--backdrop); }
   .card { padding: 1rem; }
   main { padding: 0 .75rem; margin-top: 1rem; }
 }
+/* 0.7: a name with its U-labels first and its A-labels under them (idnui.js); the link to ldns.jp (a new tab) */
+.idn { display: inline-flex; flex-direction: column; }
+.idn .alabel { color: var(--muted); font-size: .8em; }
+a.outside { font-size: .875rem; margin-left: .5rem; }
+a.outside::after { content: " \2197"; }
+.idn-hint p { margin: .2rem 0 0; }
+.idn-warnings { margin: .3rem 0 0; padding-left: 1.2rem; }

@@ -1,4 +1,4 @@
-.TH KARIDNS\-ZONE 8 "2026-11-15" "KariDNS" "KariDNS Manual"
+.TH KARIDNS\-ZONE 8 "2026-11-17" "KariDNS" "KariDNS Manual"
 .\" Generated from docs/karidns-zone.md by man/md2man.pl (make man): edit the Markdown manual, not this page.
 .SH NAME
 karidns\-zone \- writes a zone file into a PowerDNS 5.1 database (\fBimport\fR)
@@ -16,6 +16,7 @@ karidns\-zone apply [options] \-\-changes <file|\-> <zone>
 karidns\-zone apply [options] \-\-zone\-file <file|\-> [\-\-delete\-others] <zone>
 karidns\-zone \-\-types\-list [\-\-json]
 karidns\-zone render \-\-json <zone>
+karidns\-zone idn \-\-json
 karidns\-zone \-\-version | \-h | \-\-help
 .fi
 .RE
@@ -573,6 +574,61 @@ required, and no other option is (the answer is a document of the schema of
 \fBkaricheck \-\-json\fR, \fB"command": "render"\fR). The input path is fuzzed
 (\fBtests/fuzz/fuzz_zone_changes.c\fR, which also checks that a rendered text is
 one safe line that renders again, to a fixed point).
+.SS idn (0.7, the WebAdmin)
+\fBkaridns\-zone idn \-\-json\fR converts internationalized names exactly as
+\fBdig +idnin\fR and \fBdig +idnout\fR do. The WebAdmin API runs it, once per
+request, for the names given in Unicode and for the names it shows with their
+U-labels. It reads no database and no configuration. Standard input holds one
+name a line:
+.PP
+.RS 2
+.nf
+a TAB <name>        the name dig +idnin sends (A\-labels)
+u TAB <name>        the name dig +idnout shows (U\-labels)
+.fi
+.RE
+.PP
+The conversion is libidn2's, called the way dig 9.20 calls it (BIND
+\fBdighost.c\fR; measured on the build host with dig 9.20.30 and libidn2 2.3.8):
+.IP \(bu 2
+A name of ASCII alone is not converted. Its case and its \fBxn\-\-\fR labels are
+kept.
+.IP \(bu 2
+Otherwise the name goes through IDNA2008 with the UTS #46 non-transitional
+mapping (\fBIDN2_NONTRANSITIONAL\fR).
+.IP \(bu 2
+When that fails with \fBIDN2_DISALLOWED\fR (a code point IDNA2008 does not
+allow, RFC 5892), the whole name is converted again with the transitional
+mapping (\fBIDN2_TRANSITIONAL\fR: \fB\[u00DF]\fR becomes \fBss\fR,
+\fB\[u03C2]\fR becomes \fB\[u03C3]\fR, ZWJ and ZWNJ are dropped). For example,
+\fBstra\[u00DF]e.\[u2603].example\fR becomes \fBstrasse.xn\-\-n3h.example\fR.
+.IP \(bu 2
+Any other problem (hyphens, the bidi rule of RFC 5893, a joiner out of place, a
+label over 63 octets) means dig sends the UTF-8 octets. Here the answer is
+\fBnull\fR with the reason.
+.PP
+The document has the key \fBidn\fR, one entry per input line, in order:
+.PP
+.RS 2
+.nf
+"idn": [ { "ascii": "xn\-\-r8jz45g.test", "transitional": false, "error": null, "reason": null },
+         { "ascii": null, "transitional": false, "error": "IDN2_BIDI", "reason": "string has forbidden bi\-directional properties" },
+         { "unicode": "\[u4F8B]\[u3048].test" } ]
+.fi
+.RE
+.IP \(bu 2
+\fBascii\fR of an ASCII name is the name itself. \fBerror\fR then says what
+libidn2 finds in it, for example an \fBxn\-\-\fR label that is not an
+A-label. The WebAdmin turns that into a warning.
+.IP \(bu 2
+\fBunicode\fR is \fBnull\fR when the name has no A-label that libidn2 decodes;
+the name is then shown as it is.
+.PP
+A line that is neither \fBa\fR nor \fBu\fR, a TAB and a name of 1 to 1024
+octets, or more than 100,000 lines, refuses the whole input: exit status 1,
+\fBdb.idn.input\fR. A karidns-zone built without libidn2 answers every input
+with exit status 1 and \fBdb.idn.unavailable\fR; the WebAdmin then refuses names
+in Unicode.
 .SH OPTIONS
 .TP 8
 \fB\-c\fR, \fB\-\-config FILE\fR

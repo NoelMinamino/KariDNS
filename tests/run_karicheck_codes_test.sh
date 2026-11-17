@@ -368,6 +368,8 @@ db.import.summary
 db.import.change
 db.import.changed
 db.render.input
+db.idn.input
+db.idn.unavailable
 db.import.signer
 db.import.signer-zone
 db.import.analyze

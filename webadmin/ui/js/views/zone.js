@@ -11,6 +11,7 @@ import { reloadControl } from './reload.js';
 import { openEditor, draftDelete } from './editor.js';
 import { draftPanel } from './draftpanel.js';
 import { diffView, messageList, summaryList } from './change.js';
+import { nameNodes, warningList, ldnsLink } from '../idnui.js';
 
 const SIZES = [25, 50, 100, 250, 500];
 const OPS = { add: 'draft.op-add', replace: 'draft.op-replace', delete: 'draft.op-delete', soa: 'draft.op-soa' };
@@ -54,12 +55,12 @@ export function zoneView(ctx, { params, query }) {
         actions.push(h('button', { type: 'button', on: { click: () => openEditor(ctx, { kind: 'soa', zone: zname, info, draft, types: [], rr }) } }, t('rr.edit-soa')));
       }
       return h('tr', { class: entry ? `drafted op-${entry.op}` : '' },
-        h('th', { scope: 'row', title: plain(rr.name) }, h('code', null, render(relName(rr.name, zname)))),
+        h('th', { scope: 'row', title: plain(rr.name) }, h('code', null, nameNodes(relName(rr.name, zname), rr.unicode && relName(rr.unicode, info.unicode ?? zname)))),
         h('td', null, render(rr.type)),
         h('td', null, rr.ttl === null ? '-' : String(rr.ttl)),
         h('td', null, rr.records.map((rec) => h('div', { class: 'rec' }, render(rdataOf(rec)), rec.disabled ? [' ', h('em', null, t('rr.disabled'))] : null))),
         h('td', null, entry ? h('strong', null, t(OPS[entry.op])) : reasonNode(reason)),
-        h('td', { class: 'actions-cell' }, actions));
+        h('td', { class: 'actions-cell' }, actions, ldnsLink(ctx, rr.name, rr.type)));
     }
 
     // an RRset that is only in the draft (a new one) is listed in the panel; the table shows what the service has
@@ -102,7 +103,7 @@ export function zoneView(ctx, { params, query }) {
     // ------------------------------------------------------------------------------------------------------------ the draft
     function committed(r) {
       fill(result, h('section', { class: 'card', 'aria-labelledby': 'last-title' }, h('h2', { id: 'last-title' }, t('result.last')),
-        h('p', { class: 'msg ok', role: 'status' }, t(r.committed === false ? 'result.nothing' : 'result.committed')), summaryList(ctx, r, true), messageList(ctx, r.messages), diffView(ctx, r.diff ?? [], zname)));
+        h('p', { class: 'msg ok', role: 'status' }, t(r.committed === false ? 'result.nothing' : 'result.committed')), summaryList(ctx, r, true), warningList(t, r.warnings), messageList(ctx, r.messages), diffView(ctx, r.diff ?? [], zname)));
       if (r.reload === 'requested') reload.watch();
       frame.refresh();
       loadPage();

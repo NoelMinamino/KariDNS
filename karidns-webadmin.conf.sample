@@ -73,6 +73,11 @@ check-conninfo-file = /usr/local/etc/karidns/check.conninfo
 # The files of the web interface are read once at the start and served under / and /ui/ (no login is needed for them).  `no` serves only /api/v1/.
 # ui = yes
 # ui-dir = /usr/local/libexec/karidns-webadmin/webadmin/ui
+# Links from each zone and record set to ldns.jp, which looks the name up through a public resolver (DoH) from the browser; the service sends nothing.
+# A click sends the name to ldns.jp and to that resolver: say no where zone names are private.
+# ldns-link = yes
+# The resolver ldns.jp asks: google, cloudflare, iij or alidns.
+# ldns-resolver = google
 
 # stderr, or a syslog facility (daemon, local0 ... local7, ...).
 log = daemon

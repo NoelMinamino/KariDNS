@@ -9,6 +9,7 @@ import { ApiError, problem, mapDbError } from './errors.js';
 import { authenticate } from './session.js';
 import { listenHost } from './config.js';
 import { serveStatic } from './static.js';
+import { idnPrepass } from './idn.js';
 import { readPrivateFile } from '../../node/lib/conf.js';
 
 export const PREFIX = '/api/v1';
@@ -219,8 +220,12 @@ export async function dispatch(app, router, req, res) {
         try { ctx.body = JSON.parse(raw.toString('utf8')); } catch { throw new ApiError(400, 'malformed-json', 'the body is not valid JSON'); }
       }
     }
+    // 0.7: the names of the route given in Unicode become A-labels first (idn.js); a write says what in them breaks a rule
+    if (m.route.idn) await idnPrepass(ctx, m.route.idn);
     const result = await m.route.handler(ctx);
-    sendReply(ctx, result instanceof Reply ? result : new Reply(200, result));
+    const out = result instanceof Reply ? result : new Reply(200, result);
+    if (m.route.idn?.warnings && ctx.idnWarnings?.length && out.body && typeof out.body === 'object' && !Array.isArray(out.body)) out.body = { ...out.body, warnings: ctx.idnWarnings };
+    sendReply(ctx, out);
   } catch (e) {
     sendError(ctx, e);
   } finally {
