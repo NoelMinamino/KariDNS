@@ -62,6 +62,48 @@ const char *db_store_dir_of(const database_config_t *db, bool *is_default) {
   return KARIDNS_DB_DEFAULT_STORE_DIR;
 }
 
+static void parent_of(const char *path, char *out, size_t cap);
+
+/* 0.7 (secondary store D1): does the configuration have a secondary (a zone { type slave; }, a catalog zone that is one)?  Its copies want a store without a database block. */
+static bool cfg_has_secondary(const server_config_t *cfg) {
+  for (const view_config_t *v = cfg->views; v; v = v->next)
+    for (const zone_config_t *z = v->zones; z; z = z->next)
+      if (z->type && (strcasecmp(z->type, "slave") == 0 || strcasecmp(z->type, "secondary") == 0)) return true;
+  for (const zone_config_t *z = cfg->zones; z; z = z->next)        /* (a configuration made by hand: the zones not moved into a view) */
+    if (z->type && (strcasecmp(z->type, "slave") == 0 || strcasecmp(z->type, "secondary") == 0)) return true;
+  return false;
+}
+
+const char *db_store_dir_cfg(const server_config_t *cfg, bool *is_default, bool *soft) {
+  if (is_default) *is_default = false;
+  if (soft) *soft = false;
+  if (!cfg) return NULL;
+  const database_config_t *db = &cfg->database;
+  if (db->enabled && (db->store_dir || db->store_none)) return db_store_dir_of(db, is_default);     /* (zone-store may say the same; a difference is refused by the parser) */
+  if (cfg->zone_store_set) {
+    if (soft) *soft = !db->enabled;                   /* (D1: an unusable zone-store is a refused start only when a database block uses it) */
+    return cfg->zone_store_none ? NULL : cfg->zone_store_dir;
+  }
+  if (db->enabled) return db_store_dir_of(db, is_default);
+  if (!cfg_has_secondary(cfg)) return NULL;
+  if (is_default) *is_default = true;
+  if (soft) *soft = true;
+  return KARIDNS_DB_DEFAULT_STORE_DIR;
+}
+
+bool db_store_wanted(const server_config_t *cfg) {
+  bool dflt = false;
+  const char *path = db_store_dir_cfg(cfg, &dflt, NULL);
+  if (!path) return false;
+  if (!dflt) return true;
+  const char *nodef = getenv("KARIDNS_NO_DEFAULT_STORE");
+  if (nodef && strcmp(nodef, "1") == 0) return false;
+  char parent[PATH_MAX];
+  struct stat st;
+  parent_of(path, parent, sizeof(parent));
+  return stat(parent, &st) == 0 && S_ISDIR(st.st_mode);
+}
+
 int db_store_dir_fd(void) { return g_dir.dirfd; }
 
 void db_store_frontend_close(void) {
@@ -123,12 +165,35 @@ static int lock_file_open(int dfd, bool privileged, uid_t uid, gid_t gid, char *
   return -1;
 }
 
+static bool frontend_open_path(const char *path, bool dflt, bool privileged, uid_t uid, gid_t gid, char *msg, size_t msglen);
+
 bool db_store_frontend_open(const database_config_t *db, bool privileged, uid_t uid, gid_t gid, char *msg, size_t msglen) {
   if (msg && msglen) msg[0] = '\0';
   db_store_frontend_close();
   bool dflt = false;
   const char *path = db_store_dir_of(db, &dflt);
   if (!path) return true;                                       /* no database block, or `store none;` */
+  return frontend_open_path(path, dflt, privileged, uid, gid, msg, msglen);
+}
+
+bool db_store_frontend_open_cfg(const server_config_t *cfg, bool privileged, uid_t uid, gid_t gid, char *msg, size_t msglen, int *level) {
+  if (msg && msglen) msg[0] = '\0';
+  if (level) *level = LOG_NOTICE;
+  db_store_frontend_close();
+  bool dflt = false, soft = false;
+  const char *path = db_store_dir_cfg(cfg, &dflt, &soft);
+  if (!path) return true;                                       /* no store wanted, or `store none;` / `zone-store none;` */
+  if (frontend_open_path(path, dflt, privileged, uid, gid, msg, msglen)) return true;
+  if (!soft) return false;
+  /* D1: a zone-store of a server without a database block that cannot be used is not fatal: the secondaries are kept in memory only, as before 0.7 */
+  char why[512];
+  snprintf(why, sizeof(why), "%s", msg ? msg : "");
+  snprintf(msg, msglen, "the zone store is off: %s; the secondary zones are kept in memory only (no copies across restarts)", why);
+  if (level) *level = LOG_ERR;
+  return true;
+}
+
+static bool frontend_open_path(const char *path, bool dflt, bool privileged, uid_t uid, gid_t gid, char *msg, size_t msglen) {
   int dfd = -1, lfd = -1;
   char why[320] = "";
   struct stat st;
@@ -1419,6 +1484,12 @@ static uint64_t dir_counters(int what) {
   if (!st) return 0;
   store_stats_t ss;
   store_stats(st, &ss);
+  /* 0.7 (2.2): the secondaries' copies (the reserved view) are no zones of the database: their figures are taken out */
+  const int xv = db_store_xfr_vid();
+  if (xv >= 0 && xv < STORE_MAX_VIEWS) {
+    ss.zones_known -= ss.views[xv].known <= ss.zones_known ? ss.views[xv].known : ss.zones_known;
+    ss.zones_stored -= ss.views[xv].stored <= ss.zones_stored ? ss.views[xv].stored : ss.zones_stored;
+  }
   switch (what) {
   case 0: return ss.zones_known + ss.zones_stored > ss.zones_nonstore ? ss.zones_known + ss.zones_stored - ss.zones_nonstore : 0;      /* (the records of the database's secondary and catalog zones are the memory of a zone that the heap directory holds: counted there) */
   case 1: return ss.zones_stored;
@@ -3547,6 +3618,7 @@ int db_recon_scan(uint32_t *cursor, unsigned budget, db_scan_item_t *out) {
       break;
     }
     if (more < 0) continue;
+    if ((int)z.view == db_store_xfr_vid() || (z.flags & STORE_F_XFR)) continue;     /* (0.7, 2.2 W6: a secondary's copy is no zone of a database view: never asked of the loader) */
     const bool np = (z.flags & STORE_F_NONSTORE) != 0;
     bool want;
     const char *vn = store_view_name(st, z.view);
@@ -3690,27 +3762,53 @@ static bool recon_status_cb(store_recon_t *o) {
   return true;
 }
 
-bool db_store_start(const server_config_t *cfg) {
-  if (g_dir.dirfd < 0 || !cfg || !cfg->database.enabled) return true;
+/* 0.7 (secondary store D8): the store view of the secondaries' copies, `_karidns-xfr`, allocated at the core start before the views of the database (so that 32 database views
+ * and the reserved one never meet silently); -1 when the store is full of views or there is no store */
+static _Atomic int g_xfr_vid = -1;
+int db_store_xfr_vid(void) { return atomic_load_explicit(&g_xfr_vid, memory_order_acquire); }
+static void xfr_view_alloc(store_t *st, bool quarantined) {
+  (void)quarantined;
+  int vid = store_view_id(st, KARIDNS_XFR_STORE_VIEW);
+  if (vid < 0) vid = store_view_add(st, KARIDNS_XFR_STORE_VIEW);
+  if (vid < 0)
+    syslog(LOG_ERR, "[Store] no room for the view '%s' of the secondaries' copies in the store (%d views at most): the secondaries are kept in memory only",
+           KARIDNS_XFR_STORE_VIEW, STORE_MAX_VIEWS);
+  atomic_store_explicit(&g_xfr_vid, vid < 0 ? -1 : vid, memory_order_release);
+}
+
+/* 0.7 (secondary store 10): the core of the store, with or without a database block: open (quarantine, create), the rights of the directory, settings.dat, the ticker, the reserved view
+ * of the secondaries' copies and their restore thread, the status binding.  NULL: no store (logged; the server runs without one) */
+static store_t *core_start(const server_config_t *cfg, bool *created_out) {
   const database_config_t *db = &cfg->database;
+  const bool dbz = db->enabled;
   store_opts_t o;
   store_opts_default(&o);
-  o.mode = db->store_mode == 1 ? STORE_MODE_MAP : db->store_mode == 2 ? STORE_MODE_COPY : STORE_MODE_AUTO;
-  o.scrub_interval_s = db->store_scrub_interval;             /* 0.7 S6 (WP9): the scrub of the store: its interval, and the structure check it makes of every image it reads */
-  o.seg_size = db->store_segment_size;                       /* (0 = 256 MiB) */
+  if (dbz) {
+    o.mode = db->store_mode == 1 ? STORE_MODE_MAP : db->store_mode == 2 ? STORE_MODE_COPY : STORE_MODE_AUTO;
+    o.scrub_interval_s = db->store_scrub_interval;           /* 0.7 S6 (WP9): the scrub of the store: its interval, and the structure check it makes of every image it reads */
+    o.seg_size = db->store_segment_size;                     /* (0 = 256 MiB) */
+  }
   o.validate = zone_image_validate;
   o.bad_image = bad_image_hook;                             /* a zone whose image the scrub or the cleaner found damaged is taken out of memory */
   o.create = true;
   o.log = store_log_cb;
+  {
+    const char *bid = getenv("KARIDNS_TEST_STORE_BOOT_ID");  /* (tests/run_secondary_store_test.sh: another boot after an unclean stop, the rebuild of the derived tables) */
+    if (bid && *bid) o.boot_id = strtoull(bid, NULL, 10);
+  }
   store_t *st = NULL;
+  bool quarantined = false;
   int r = store_open(g_dir.dirfd, &o, &st);
-  if (r == -EBADMSG) {                                       /* damaged or of another format: it is moved aside and made again from the database */
-    syslog(LOG_WARNING, "[Store] the store in the directory cannot be opened (damaged or of another format); it is moved aside and made again from the database");
-    if (store_quarantine(g_dir.dirfd) == 0) r = store_open(g_dir.dirfd, &o, &st);
+  if (r == -EBADMSG) {                                       /* damaged or of another format: it is moved aside and made again (the database refills it; the secondaries' copies are lost, W3) */
+    syslog(LOG_WARNING, "[Store] the store in the directory cannot be opened (damaged or of another format); it is moved aside and made again%s", dbz ? " from the database" : "");
+    if (store_quarantine(g_dir.dirfd) >= 0) {                 /* (it returns the number of files it moved: before 0.7 this compared with 0, and a quarantine that moved files never reopened) */
+      quarantined = true;
+      r = store_open(g_dir.dirfd, &o, &st);
+    }
   }
   if (r != 0 || !st) {
-    syslog(LOG_ERR, "[Store] cannot open the store: %s; the zones are read from the database only", strerror(-r));
-    return true;
+    syslog(LOG_ERR, "[Store] cannot open the store: %s; %s", strerror(-r), dbz ? "the zones are read from the database only" : "the secondary zones are kept in memory only");
+    return NULL;
   }
 #if defined(__FreeBSD__)
   {
@@ -3724,6 +3822,36 @@ bool db_store_start(const server_config_t *cfg) {
 #endif
   store_open_segments(st);                                   /* (0.7 fix 7: the worker's attach looks at pages of segments that are open) */
   set_load(g_dir.dirfd);                                     /* the settings texts: a zone that is not in memory is answered and attached with them */
+  store_stats_t ss;
+  store_stats(st, &ss);
+  *created_out = ss.recovery.created;
+  /* D8: the reserved view before the views of the database, so that 32 of those and the reserved one never meet silently */
+  xfr_view_alloc(st, quarantined);
+  atomic_store(&G.st, st);
+  store_status_bind(st);
+  store_status_set_extra_fn(extra_status_cb);
+  G.wstop = false;
+  if (pthread_create(&G.wthr, NULL, ticker_thread, NULL) == 0) G.wthr_started = true;
+  else syslog(LOG_ERR, "[Store] the store's ticker thread cannot be started; the writers make the due commits and checkpoints");
+  return st;
+}
+
+bool db_store_start(const server_config_t *cfg) {
+  if (!cfg) return true;
+  if (g_dir.dirfd < 0) {                                     /* (no store: the secondaries made restore-pending by the initial load run without a restore) */
+    return true;
+  }
+  bool created = false;
+  store_t *st = core_start(cfg, &created);
+  if (!st || !cfg->database.enabled) {
+    if (st) {
+      syslog(LOG_NOTICE, "[Store] the zone store is on for the copies of the secondary zones (no database block)%s", created ? ": created (first use)" : "");
+    }
+    return true;
+  }
+  const database_config_t *db = &cfg->database;
+  if (!G.wthr_started) return false;                         /* (the ticker keeps the store's time for the database zones: a start without it is refused, as before) */
+  const int xvid = db_store_xfr_vid();
   for (const view_config_t *v = cfg->views; v; v = v->next) {
     if (v->database_none || !v->name) continue;
     int vid = store_view_add(st, v->name);
@@ -3749,19 +3877,14 @@ bool db_store_start(const server_config_t *cfg) {
       if (vid < 32) atomic_fetch_or(&G.dir_pending, 1u << vid);          /* (the store has no list of this view's zones: a first fill; a pass has to make it) */
     }
   }
-  for (int vid = 0; vid < STORE_MAX_VIEWS; vid++) dmax_refresh(st, vid);
+  for (int vid = 0; vid < STORE_MAX_VIEWS; vid++)
+    if (vid != xvid) dmax_refresh(st, vid);                  /* (2.2: the reserved view is no directory of the query path) */
   atomic_fetch_add(&G.view_gen, 1);
-  atomic_store(&G.st, st);
-  store_status_bind(st);
   store_status_set_attached_fn(attached_fn);
   store_status_set_attached_count_fn(attached_count_fn);
   store_status_set_recon_fn(recon_status_cb);
-  store_status_set_extra_fn(extra_status_cb);
   dbreg_err_set_sink(&g_err_sink);                           /* design 6.7: the rejection texts of zones that have a record go to err.ring */
   dbreg_set_evict_hook(evict_hook);
-  G.wstop = false;
-  if (pthread_create(&G.wthr, NULL, ticker_thread, NULL) != 0) return false;
-  G.wthr_started = true;
 #if defined(__FreeBSD__)
   G.akq = kqueue();
   if (G.akq >= 0) {

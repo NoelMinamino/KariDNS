@@ -776,6 +776,7 @@ typedef struct {
 #define KARIDNS_DB_HOT_INTERVAL_MAX 86400
 #define KARIDNS_DB_HOT_INTERVAL_DEFAULT 60
 #define KARIDNS_DB_DEFAULT_STORE_DIR "/var/db/karidns/store"   /* the store of a database { } block that names none: made when its parent exists (docs/karidns.md) */
+#define KARIDNS_XFR_STORE_VIEW "_karidns-xfr"                 /* 0.7 (D8): the store view of the secondaries' copies; refused as the name of a configured view */
 #define KARIDNS_DB_STORE_SEGMENT_MIN (1ull << 20)
 #define KARIDNS_DB_STORE_SEGMENT_MAX (4ull << 30)
 #define KARIDNS_DB_STORE_SCRUB_MIN 60
@@ -887,6 +888,11 @@ typedef struct server_config_s {
   control_channel_config_t control;
   dnstap_config_t dnstap;
   database_config_t database;  /* options { database { } }; .enabled == false when absent */
+  /* 0.7 (planing_0.7.x_secondary_store.md D1): options { zone-store "<dir>" | none; } (restart-only): the zone store without a database block (the copies of the secondaries); a synonym of
+   * database { store } (both given and different is an error).  zone_store_set: written; zone_store_none: `none`; zone_store_dir: the directory (NULL with none) */
+  char *zone_store_dir;
+  bool zone_store_none;
+  bool zone_store_set;
   rate_limit_config_t rrl;
   alerts_config_t alerts;        /* options { alerts { } } */
   bool serve_stale;

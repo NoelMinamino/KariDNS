@@ -1259,6 +1259,8 @@ void free_server_config_fields(server_config_t *cfg) {
   if (cfg->user) { free(cfg->user); cfg->user = NULL; }
   if (cfg->group) { free(cfg->group); cfg->group = NULL; }
   if (cfg->pid_file) { free(cfg->pid_file); cfg->pid_file = NULL; }
+  free(cfg->zone_store_dir);
+  cfg->zone_store_dir = NULL;
   free(cfg->directory);
   cfg->directory = NULL;
   if (cfg->nsid_string) { free(cfg->nsid_string); cfg->nsid_string = NULL; }
@@ -7296,6 +7298,7 @@ static int config_apply_directory(token_ctx_t *ctx, server_config_t *config) {
     ok = ok && dir_prefix_path(&config->database.database_file, eff) && dir_prefix_path(&config->database.conninfo_file, eff);
     ok = ok && dir_prefix_path(&config->database.loader_state_file, eff);
     ok = ok && dir_prefix_path(&config->database.store_dir, eff);
+    ok = ok && dir_prefix_path(&config->zone_store_dir, eff);
     if (!ok) goto oom;
     logev_post(LOGC_CONFIG, 2, NULL, 0, "[Config] options { directory \"%s\" }: the relative paths of the configuration are taken from it; the built-in "
                "default_debug is %s", eff, config->logging.debug_file);
@@ -7308,6 +7311,17 @@ static int config_apply_directory(token_ctx_t *ctx, server_config_t *config) {
       path_absolutize(ctx, &config->database.loader_path, "database loader-path", KARIDNS_DB_PATH_MAX) != 0) goto out;
   if (path_absolutize(ctx, &config->database.loader_state_file, "database loader-state-file", KARIDNS_DB_PATH_MAX) != 0) goto out;
   if (path_absolutize(ctx, &config->database.store_dir, "database store", KARIDNS_DB_PATH_MAX) != 0) goto out;
+  if (path_absolutize(ctx, &config->zone_store_dir, "zone-store", KARIDNS_DB_PATH_MAX) != 0) goto out;
+  /* 0.7 (D1): zone-store is a synonym of database { store }: both written and different is an error (the directory is one store) */
+  if (config->zone_store_set && config->database.enabled && (config->database.store_dir || config->database.store_none)) {
+    const bool same = config->zone_store_none ? config->database.store_none
+                                              : (!config->database.store_none && config->database.store_dir && strcmp(config->database.store_dir, config->zone_store_dir) == 0);
+    if (!same) {
+      conf_error(ctx, "options", "zone-store \"%.200s\" and database { store \"%.200s\"; } name different stores (write one of them)",
+                 config->zone_store_none ? "none" : config->zone_store_dir, config->database.store_none ? "none" : config->database.store_dir);
+      goto out;
+    }
+  }
   for (view_config_t *v = config->views; v; v = v->next)
     if (path_absolutize(ctx, &v->database_file, "view database-file", KARIDNS_DB_PATH_MAX) != 0) goto out;
   rc = 0;
@@ -8470,7 +8484,7 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
         char *key = tok.value;
         tok.value = NULL;
         free_token(&tok);
-        if (strcmp(key, "port") == 0 || strcmp(key, "user") == 0 ||
+        if (strcmp(key, "port") == 0 || strcmp(key, "user") == 0 || strcmp(key, "zone-store") == 0 ||
             strcmp(key, "group") == 0 || strcmp(key, "pid-file") == 0 || strcmp(key, "directory") == 0) {
           tok = get_next_token(ctx);
           if (tok.type != TOKEN_STRING) {
@@ -8525,6 +8539,20 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
           } else if (strcmp(key, "pid-file") == 0) {
             if (config->pid_file) free(config->pid_file);
             config->pid_file = val;
+          } else if (strcmp(key, "zone-store") == 0) {
+            /* 0.7 (D1): the directory of the zone store without a database block, or none (restart-only); the copies of the secondaries are kept there */
+            if (val[0] == '\0' || strlen(val) > KARIDNS_DB_PATH_MAX) {
+              conf_error(ctx, "options", "zone-store: an empty or too long directory name (expected a directory or none)");
+              free(key);
+              free(val);
+              return -1;
+            }
+            free(config->zone_store_dir);
+            config->zone_store_dir = NULL;
+            config->zone_store_set = true;
+            config->zone_store_none = strcasecmp(val, "none") == 0;
+            if (config->zone_store_none) free(val);
+            else config->zone_store_dir = val;
           }
         } else if (strcmp(key, "bind-address") == 0) {
           int bind_first_new = config->bind_address_count;
@@ -9111,6 +9139,14 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
                tok.value, KARIDNS_VIEW_NAME_MAX - 1);
         cfg_diag(ctx, DIAG_ERROR, DC_CONF_VIEW_NAME_LENGTH, "View name '%.40s...' is longer than %d characters\n", tok.value,
                 KARIDNS_VIEW_NAME_MAX - 1);
+        free_token(&tok);
+        if (ctx) ctx->error_occurred = true;
+        return -1;
+      }
+      /* 0.7 (planing_0.7.x_secondary_store.md D8): the store keeps the secondaries' copies in a view of this name; no configured view may have it */
+      if (strcasecmp(tok.value, KARIDNS_XFR_STORE_VIEW) == 0) {
+        syslog(LOG_ERR, "[Config] View name '%s' is reserved (the zone store keeps the copies of the secondary zones under it); rejecting configuration", tok.value);
+        cfg_diag(ctx, DIAG_ERROR, DC_CONF_VIEW_NAME_LENGTH, "View name '%s' is reserved (the zone store keeps the copies of the secondary zones under it)\n", tok.value);
         free_token(&tok);
         if (ctx) ctx->error_occurred = true;
         return -1;

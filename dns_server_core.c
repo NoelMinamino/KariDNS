@@ -8285,16 +8285,17 @@ int main(int argc, char **argv) {
   }
   // 0.7 store S2: the zone store directory is opened (made, checked, locked) here, as root, and the Backend inherits the descriptor (design 2.1)
   {
-    char st_msg[512];
-    if (!db_store_frontend_open(&g_config_db.config_a.database, g_run_identity.privileged, g_run_identity.has_user ? g_run_identity.uid : (uid_t)-1,
-                                g_run_identity.has_group ? g_run_identity.gid : (gid_t)-1, st_msg, sizeof(st_msg))) {
+    char st_msg[1024];
+    int st_level = LOG_NOTICE;
+    if (!db_store_frontend_open_cfg(&g_config_db.config_a, g_run_identity.privileged, g_run_identity.has_user ? g_run_identity.uid : (uid_t)-1,
+                                    g_run_identity.has_group ? g_run_identity.gid : (gid_t)-1, st_msg, sizeof(st_msg), &st_level)) {
       syslog(LOG_CRIT, "[Startup] %s", st_msg);
       fprintf(stderr, "[ERROR] %s\n", st_msg);
       if (g_broker_pid > 0) kill(g_broker_pid, SIGTERM);
       cleanup_pid_file();
       exit(1);
     }
-    if (st_msg[0]) syslog(LOG_NOTICE, "[Startup] %s", st_msg);
+    if (st_msg[0]) syslog(st_level, "[Startup] %s", st_msg);
   }
   // beta design 1.2 step 2: the loader sockets exist before the Backend is forked
   {
@@ -8808,7 +8809,7 @@ int main(int argc, char **argv) {
 
   // beta design 1.3 / 1.5: the db ingest thread.  It limits the rights of the two descriptors the supervisor made
   // (stream, control) and uses only them (read / write / recvmsg / kevent) once the sandbox is on.
-  if (cfg->database.enabled && !db_store_start(cfg)) {     // 0.7 store S2: the store and its threads exist before the first zone is installed
+  if (!db_store_start(cfg)) {     // 0.7 store S2: the store and its threads exist before the first zone is installed (0.7: also the core without a database block, for the secondaries' copies)
     syslog(LOG_ERR, "[Backend] Cannot start the zone store; aborting startup");
     fprintf(stderr, "[ERROR] [Backend] Cannot start the zone store; aborting startup\n");
     backend_exit(EXIT_FAILURE);

@@ -2054,6 +2054,7 @@ static bool inv_store_pass(ing_t *g, inv_ctx_t *c) {
     int more = store_iter(st, &g->inv_zid, &z);
     if (more == 0) break;
     if (more < 0 || (z.flags & STORE_F_REJECTED_NEW) || (z.state != STORE_STATE_STORED && z.state != STORE_STATE_KNOWN)) continue;
+    if ((z.flags & STORE_F_XFR) || (int)z.view == db_store_xfr_vid()) continue;     /* (0.7, W6: the secondaries' copies are not the loader's zones; explicit, not only because the view is not configured) */
     const char *vn = store_view_name(st, z.view);
     int idx = -1;
     for (uint32_t i = 0; vn && i < g->nview_names; i++) {
