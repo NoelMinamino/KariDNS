@@ -903,12 +903,12 @@ int parse_xfr_packet(const uint8_t *packet, size_t packet_len,
         }
 
         if (session->client_serial != 0) {
-          if (current_serial == session->client_serial) {
+          if (current_serial == session->client_serial && !(session->take_same_serial && !session->is_ixfr)) {
             session->is_finished = true;
             standby->count = 0;
             return 0;
           }
-          if (!serial_is_newer(current_serial, session->client_serial)) {
+          if (!serial_is_newer(current_serial, session->client_serial) && current_serial != session->client_serial) {   /* (equal: only with take_same_serial, above) */
             /* the primary is behind us (RFC 1982): not a transfer to accept.  A refresh from several primaries goes on to the next one
              * (BIND zone.c refresh_callback(): "serial number received from primary < ours", quiet with multi-master); the caller
              * that sets session->eff logs it that way, the others (the database loader's stream) keep the warning. */
@@ -1450,9 +1450,14 @@ int handle_axfr_event(int tcp_fd, zone_db_entry_t *entry,
           free(rx_text);
           return -1;
         }
+        entry->xfr_origin = XFR_ORIGIN_XFR;            /* 0.7: a transferred version; a restore never replaces it (planing_0.7.x_secondary_store.md 4.1) */
         pthread_mutex_unlock(&entry->writer_lock);
         zone_ext_shared_unref(rx_prev);
         free(rx_text);
+        {
+          zone_x_t *ax = zone_x(entry);
+          if (ax) atomic_store_explicit(&ax->xfr_axfr_once, false, memory_order_relaxed);
+        }
 
         {
           zone_x_t *ox = zone_x_need(entry);       /* (a transfer is not the hot path: a zone that had no extension gets one) */
@@ -1703,6 +1708,7 @@ static int xfr_attempt(axfr_bg_ctx_t *ctx, const xfr_primary_t *p, struct sockad
   session->is_ixfr = ixfr_serial != 0;
   /* AXFR に切り替えたときも、手元より古い版は受け取らない (parse_xfr_packet() のロールバック検査) */
   session->client_serial = active_serial;
+  session->take_same_serial = ixfr_serial == 0 && ctx->entry && atomic_load_explicit(&zone_xr(ctx->entry)->xfr_axfr_once, memory_order_relaxed);
   session->max_records = ctx->max_records;         /* I2: the limits of the zone (max-zone-records / max-zone-bytes) */
   session->max_bytes = ctx->max_bytes;
   session->eff = ctx->has_eff ? &ctx->eff : NULL;                        /* batch 4: the timers are held to min/max-refresh/retry-time */
@@ -1833,6 +1839,8 @@ static int xfr_try_primary_with(void *arg, int idx, tsig_key_t *kst) {
   uint8_t ext_state = ctx->entry ? xfr_ext_effective(zone_xr(ctx->entry)->xfr_ext_state, zone_xr(ctx->entry)->xfr_ext_set, ext_now) : XFR_EXT_UNKNOWN;
   uint8_t ext_ver = p->no_edns ? 0 : xfr_ext_request_version(ext_state);   /* edns no: no OPT, so no Extended AXFR either */
   uint32_t ixfr_serial = probed_newer ? 0 : active_serial;   /* the SOA said the primary is ahead: the whole zone (request-ixfr no) */
+  /* 0.7 (secondary store R2): a copy restored without the settings its primary had sent (they are not persisted) asks for the whole zone once, which brings them again */
+  if (ctx->entry && atomic_load_explicit(&zone_xr(ctx->entry)->xfr_axfr_once, memory_order_relaxed)) ixfr_serial = 0;
   /* (the key's name only, never its secret) */
   logev_post(LOGC_XFER_IN, 1, NULL, 0, "[AXFR] zone %s: asking primary %s#%d (%d of %d) for %s (our serial %u%s), %s%s, Extended AXFR version %u",
              ctx->domain, p->ip, p->port > 0 ? p->port : 53, idx + 1, ctx->nprim, ixfr_serial ? "IXFR" : "AXFR", active_serial,
@@ -1901,6 +1909,7 @@ void *axfr_bg_thread_func(void *arg) {
   /* the primaries in order (BIND refresh_callback(): the next one is asked after a failure, an up-to-date answer or a primary that is behind;
    * a transfer ends the refresh) */
   xfr_run_t run;
+  const time_t attempt_at = time(NULL);
   xfr_run_primaries(ctx->nprim, xfr_try_primary, ctx, &run);
   logev_post(LOGC_XFER_IN, 1, NULL, 0, "[AXFR] zone %s: refresh done: %d of %d primary(ies) asked, transferred from #%d (0: none), up to date %d, behind %d, failed %d, deferred by quota %d",
              ctx->domain, run.tried, ctx->nprim, run.transferred_idx + 1, run.uptodate, run.behind, run.failed, run.deferred);
@@ -1914,6 +1923,15 @@ void *axfr_bg_thread_func(void *arg) {
       /* every primary was at its transfers-per-ns quota: look again at the next tick instead of waiting for the retry time */
       atomic_store_explicit(&ctx->entry->next_check, time(NULL) + 1, memory_order_release);
     }
+    /* 0.7 (planing_0.7.x_secondary_store.md 3.1): the copy in the zone store follows the outcome, while this thread still holds is_transferring (the one writer of the
+     * record's state) and no lock; the transfer slot stays held during the put */
+    const int outcome = run.transferred_idx >= 0 ? XFR_OUT_TRANSFERRED : run.uptodate > 0 ? XFR_OUT_UPTODATE : run.tried > 0 ? XFR_OUT_FAILED : XFR_OUT_NONE;
+    if (outcome == XFR_OUT_TRANSFERRED || outcome == XFR_OUT_UPTODATE) {
+      zone_x_t *rx = zone_x_need(ctx->entry);
+      if (rx) atomic_store_explicit(&rx->xfr_refreshed, true, memory_order_release);
+    }
+    const xfr_store_ops_t *xo = atomic_load_explicit(&g_xfr_ops, memory_order_acquire);
+    if (xo && xo->after_refresh && outcome != XFR_OUT_NONE) xo->after_refresh(ctx->entry, outcome, attempt_at);
     atomic_store_explicit(&ctx->entry->is_transferring, false, memory_order_release);
   }
   for (int i = 0; i < ctx->nprim; i++)             /* the decoded TSIG secrets copied into the primaries */

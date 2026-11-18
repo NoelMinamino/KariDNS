@@ -75,9 +75,7 @@ bool db_store_frontend_open_cfg(const server_config_t *cfg, bool privileged, uid
 /* Open the store on the descriptor the process inherited, make the views, check that the store belongs to the configured databases, start the threads.  Before
  * enter_capsicum_sandbox().  true: running with the store, or without one (no directory handed over; a store that cannot be opened is logged and not used: the zones are
  * read from the database as before).  false: out of memory or a thread that does not start. */
-bool db_store_start(const server_config_t *cfg);    /* (0.7: also without a database block: the core of the store for the secondaries' copies) */
-/* 0.7 (D8): the store view `_karidns-xfr` of the secondaries' copies (-1: none); every walk of the store's records for the database skips it */
-int db_store_xfr_vid(void);
+bool db_store_start(const server_config_t *cfg);    /* (0.7: also without a database block: the core of the store for the secondaries' copies, dns_xfr_store.h) */
 /* Stop the threads after they have done what is queued, checkpoint the store.  The Backend calls it at its end; the store stays open (workers may still look). */
 void db_store_stop(void);
 bool db_store_enabled(void);

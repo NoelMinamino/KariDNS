@@ -65,6 +65,7 @@
 #include "dns_plugin_sup.h"
 #include "dns_db_ingest.h"
 #include "dns_db_store.h"
+#include "dns_xfr_store.h"
 #include "dns_store_status.h"
 #include "dns_db_stream.h"
 #include "dns_park.h"
@@ -5817,7 +5818,7 @@ void *control_thread_func(void *arg) {
                 static const char multi[] = "ERROR zone exists in multiple views; specify view (e.g. 'zonestatus <zone> <view>')\n";
                 (void)ctl_send_all(cfd, multi, sizeof(multi) - 1);
               } else if (lr.entry) {
-                char smsg[384];
+                char smsg[1024];
                 char rx_note[160];
                 /* B8t-2: a secondary says that settings received from its primary are in force (and which part is not) */
                 bool rx_on = zone_rx_settings_status(lr.entry, rx_note, sizeof(rx_note));
@@ -5829,6 +5830,12 @@ void *control_thread_func(void *arg) {
                                     (uint32_t)lr.entry->refresh, (uint32_t)lr.entry->retry, (uint32_t)lr.entry->expire,
                                     rx_on ? " settings=primary" : "", rbtxt, rx_note[0] ? " note: " : "", rx_note);
                 if (slen >= (int)sizeof(smsg)) slen = (int)sizeof(smsg) - 1, smsg[slen - 1] = '\n';
+                /* 0.7 (secondary store 11, 4.5): a secondary's copy in the store, its refresh times and, when it is expired, how it answers */
+                if (lr.entry->is_secondary && slen > 0 && (size_t)slen < sizeof(smsg) - 1) {
+                  rcu_aux_read_lock();
+                  slen += (int)xfr_store_zonestatus(lr.entry, active_cfg, smsg + slen, sizeof(smsg) - (size_t)slen);
+                  rcu_aux_read_unlock();
+                }
                 (void)ctl_send_all(cfd, smsg, slen);
               } else {
                 (void)ctl_send_all(cfd, "ERROR zone not found\n", 21);
@@ -6269,6 +6276,9 @@ void *control_thread_func(void *arg) {
              * entry costs about 100-250 ms with 1,000,000 database zones, during which this thread answers no karictl and the
              * read section held here blocks the grace period of the ingest thread's batch (zone_retire_process(true)). */
             bool walk_all = atomic_exchange_explicit(&g_zone_notify_pending, 0, memory_order_acq_rel) != 0;
+            const bool xfr_stuck = xfr_restore_stuck();     /* 0.7 (R2'): the restore thread made no progress for 30 s while entries wait for it */
+            uint64_t xfr_timeouts = 0;
+            xfr_expiry_begin(now);
             rcu_aux_read_lock();
             for (size_t v = 0; v < snap->view_count; v++) {
                 /* The zones to look at: the view's tick list (the secondaries and catalog members, in the order of the configuration and then
@@ -6315,20 +6325,15 @@ void *control_thread_func(void *arg) {
                         }
                     }
 
+                    if (is_slave && have_primary && atomic_load_explicit(&entry->restore_pending, memory_order_acquire)) {
+                        /* 0.7 (secondary store 4.1, M4): the stored copy is not looked at yet: no refresh, not even refresh_now or next_check (no serial-0 AXFR before the restore decided);
+                         * the safety net of R2' gives up on the bit when the restore thread made no progress for 30 s */
+                        if (xfr_stuck && zone_restore_pending_clear(entry)) xfr_timeouts++;
+                        else continue;
+                    }
                     if (is_slave && have_primary) {
-                        time_t deadline = zone_expire_deadline(entry);
-                        if (deadline > 0 && now > deadline) {
-                            zone_x_t *sx = zone_x_need(entry);
-                            time_t last_log = sx ? atomic_load_explicit(&sx->last_stale_log_time, memory_order_acquire) : 0;
-                            if (now - last_log > 900) {
-                                if (active && active->serve_stale) {
-                                    kdns_logc(LOGC_GENERAL, LOG_WARNING, "[Zone] Zone %s is expired (master unreachable), serving stale data", entry->domain);
-                                } else {
-                                    kdns_logc(LOGC_GENERAL, LOG_ERR, "[Zone] Zone %s is expired (master unreachable), returning SERVFAIL", entry->domain);
-                                }
-                                if (sx) atomic_store_explicit(&sx->last_stale_log_time, now, memory_order_release);
-                            }
-                        }
+                        /* 0.7 (D9): `[Zone] secondary-expired:` lines with stable event tokens (expired, still-expired, stale-limit, refreshed, summary) instead of the free-form line */
+                        xfr_expiry_entry(entry, active, now);
 
                         bool force = atomic_exchange_explicit(&entry->refresh_now, false, memory_order_acquire);
                         time_t entry_next_check = atomic_load_explicit(&entry->next_check, memory_order_acquire);
@@ -6390,7 +6395,9 @@ void *control_thread_func(void *arg) {
                 (void)attach_walk(manual_notify_walk_fn, NULL, &mw);
             }
             g_tick_rotor++;
+            xfr_expiry_end(now);
             rcu_aux_read_unlock();
+            xfr_restore_note_timeouts(xfr_timeouts);
             release_zone_snapshot(snap);
         }
         release_config_snapshot(active);
@@ -8114,6 +8121,9 @@ int main(int argc, char **argv) {
   }
 
   atomic_init(&g_config_db.active, &g_config_db.config_a);
+  /* 0.7 (secondary store 4.1, R2): a store is configured, so the secondaries the initial load makes wait for the restore of their copies (the Backend's core start clears the bits
+   * when the store does not open) */
+  xfr_store_want(db_store_wanted(&g_config_db.config_a));
   {
     char failed_zones[384];
     int nfailed = rebuild_zone_db_from_config_ext(&g_config_db.config_a, false, failed_zones, sizeof(failed_zones));
@@ -8825,6 +8835,7 @@ int main(int argc, char **argv) {
   // 0.6.2: the plugins of the start-up configuration are up (or refused) before the first query, as when the Backend started them itself.
   // The control thread waits for g_privilege_drop_complete, so this thread is the only one that touches the plugin table here.
   plug_backend_wait_startup(5000);
+  xfr_store_wait_start(5000);     // 0.7 (secondary store D4): the stored copies of the secondaries are restored before the first query, up to this budget; the rest in the background
 
   // 特権分離(setuid+Capsicum)が完了したため、各Workerスレッドにクエリ処理の開始を許可する
   atomic_store_explicit(&g_privilege_drop_complete, true, memory_order_release);

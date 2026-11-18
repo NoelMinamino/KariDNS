@@ -3741,7 +3741,7 @@ static const struct { const char *name; int chk; } k_zv_checks[] = {   /* chk >=
 
 static bool zv_option_name(const char *key) {
   static const char *const names[] = { "max-records", "max-records-per-type", "max-types-per-name", "max-zone-ttl", "serial-update-method",
-                                       "masterfile-format", "check-names", "rollback-window", NULL };
+                                       "masterfile-format", "check-names", "rollback-window", "secondary-stale-max", NULL };
   for (size_t i = 0; names[i]; i++)
     if (strcmp(names[i], key) == 0) return true;
   for (size_t i = 0; i < sizeof(k_zv_checks) / sizeof(k_zv_checks[0]); i++)
@@ -3821,6 +3821,16 @@ static int parse_zv_option(token_ctx_t *ctx, const char *what, const char *key, 
     }
     zv->rollback_window = u;
     zv->set |= ZV_ROLLBACK_WINDOW;
+  } else if (strcmp(key, "secondary-stale-max") == 0) {
+    /* KariDNS 0.7: how long after its expire deadline a secondary still answers with its data under serve-stale (RFC 8767 §5 bounds the stale period of a resolver; the idea is
+     * applied to an expired secondary); a TTL value (1w, 7d, 604800), 0 = no limit (the default) */
+    if (!parse_ttl_strict(tok.value, UINT32_MAX, &u)) {
+      conf_error(ctx, what, "secondary-stale-max: invalid value '%.64s' (expected a number of seconds, or a time with the units s, m, h, d, w; 0 is no limit)", tok.value);
+      free_token(&tok);
+      return -1;
+    }
+    zv->stale_max = u;
+    zv->set |= ZV_STALE_MAX;
   } else if (strcmp(key, "masterfile-format") == 0) {
     /* masterformat_enums: raw, text.  KariDNS reads text zone files only; a raw file read as text would fail in a confusing way (or be
      * taken for something else), so raw is refused here (decision 2026-10-29). */
@@ -4054,6 +4064,7 @@ void zone_vopts_effective(const server_config_t *cfg, const zone_config_t *zone,
     if (w & ZV_MAX_ZONE_TTL) out->max_zone_ttl = l->max_zone_ttl;
     if (w & ZV_SERIAL_METHOD) out->serial_method = l->serial_method;
     if (w & ZV_ROLLBACK_WINDOW) out->rollback_window = l->rollback_window;
+    if (w & ZV_STALE_MAX) out->stale_max = l->stale_max;
     for (int c = 0; c < ZC_N; c++)
       if (w & ZV_CHK(c)) out->chk[c] = l->chk[c];
     done |= l->set;

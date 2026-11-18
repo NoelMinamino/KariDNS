@@ -32,6 +32,7 @@
 #include "dns_store_status.h"
 #include "dns_utils.h"
 #include "dns_zone_image.h"
+#include "dns_xfr_store.h"
 
 #define DBS_NAME_MAX 258          /* a store name (at most STORE_NAME_MAX) with its dot and NUL: the canonical name of a zref_t */
 _Static_assert(DBS_NAME_MAX >= STORE_NAME_MAX + 3, "DBS_NAME_MAX");
@@ -1485,7 +1486,7 @@ static uint64_t dir_counters(int what) {
   store_stats_t ss;
   store_stats(st, &ss);
   /* 0.7 (2.2): the secondaries' copies (the reserved view) are no zones of the database: their figures are taken out */
-  const int xv = db_store_xfr_vid();
+  const int xv = xfr_store_vid();
   if (xv >= 0 && xv < STORE_MAX_VIEWS) {
     ss.zones_known -= ss.views[xv].known <= ss.zones_known ? ss.views[xv].known : ss.zones_known;
     ss.zones_stored -= ss.views[xv].stored <= ss.zones_stored ? ss.views[xv].stored : ss.zones_stored;
@@ -1561,6 +1562,12 @@ static bool extra_status_cb(store_extra_t *x) {
   x->hot_written = atomic_load(&G.hot_written);
   x->hot_threads = atomic_load(&G.hot_nthr);
   x->hot_per_s = hot_rate(x->hot_attached);
+  return true;
+}
+
+/* 0.7 (secondary store 11): `karictl store` xfr.* */
+static bool xfr_status_cb(store_xfr_t *x) {
+  xfr_store_counters(x);
   return true;
 }
 
@@ -3618,7 +3625,7 @@ int db_recon_scan(uint32_t *cursor, unsigned budget, db_scan_item_t *out) {
       break;
     }
     if (more < 0) continue;
-    if ((int)z.view == db_store_xfr_vid() || (z.flags & STORE_F_XFR)) continue;     /* (0.7, 2.2 W6: a secondary's copy is no zone of a database view: never asked of the loader) */
+    if ((int)z.view == xfr_store_vid() || (z.flags & STORE_F_XFR)) continue;     /* (0.7, 2.2 W6: a secondary's copy is no zone of a database view: never asked of the loader) */
     const bool np = (z.flags & STORE_F_NONSTORE) != 0;
     bool want;
     const char *vn = store_view_name(st, z.view);
@@ -3762,20 +3769,6 @@ static bool recon_status_cb(store_recon_t *o) {
   return true;
 }
 
-/* 0.7 (secondary store D8): the store view of the secondaries' copies, `_karidns-xfr`, allocated at the core start before the views of the database (so that 32 database views
- * and the reserved one never meet silently); -1 when the store is full of views or there is no store */
-static _Atomic int g_xfr_vid = -1;
-int db_store_xfr_vid(void) { return atomic_load_explicit(&g_xfr_vid, memory_order_acquire); }
-static void xfr_view_alloc(store_t *st, bool quarantined) {
-  (void)quarantined;
-  int vid = store_view_id(st, KARIDNS_XFR_STORE_VIEW);
-  if (vid < 0) vid = store_view_add(st, KARIDNS_XFR_STORE_VIEW);
-  if (vid < 0)
-    syslog(LOG_ERR, "[Store] no room for the view '%s' of the secondaries' copies in the store (%d views at most): the secondaries are kept in memory only",
-           KARIDNS_XFR_STORE_VIEW, STORE_MAX_VIEWS);
-  atomic_store_explicit(&g_xfr_vid, vid < 0 ? -1 : vid, memory_order_release);
-}
-
 /* 0.7 (secondary store 10): the core of the store, with or without a database block: open (quarantine, create), the rights of the directory, settings.dat, the ticker, the reserved view
  * of the secondaries' copies and their restore thread, the status binding.  NULL: no store (logged; the server runs without one) */
 static store_t *core_start(const server_config_t *cfg, bool *created_out) {
@@ -3808,6 +3801,7 @@ static store_t *core_start(const server_config_t *cfg, bool *created_out) {
   }
   if (r != 0 || !st) {
     syslog(LOG_ERR, "[Store] cannot open the store: %s; %s", strerror(-r), dbz ? "the zones are read from the database only" : "the secondary zones are kept in memory only");
+    xfr_store_core_off();
     return NULL;
   }
 #if defined(__FreeBSD__)
@@ -3826,10 +3820,11 @@ static store_t *core_start(const server_config_t *cfg, bool *created_out) {
   store_stats(st, &ss);
   *created_out = ss.recovery.created;
   /* D8: the reserved view before the views of the database, so that 32 of those and the reserved one never meet silently */
-  xfr_view_alloc(st, quarantined);
+  (void)xfr_store_core_start(st, quarantined, ss.recovery.created);
   atomic_store(&G.st, st);
   store_status_bind(st);
   store_status_set_extra_fn(extra_status_cb);
+  store_status_set_xfr_fn(xfr_status_cb);
   G.wstop = false;
   if (pthread_create(&G.wthr, NULL, ticker_thread, NULL) == 0) G.wthr_started = true;
   else syslog(LOG_ERR, "[Store] the store's ticker thread cannot be started; the writers make the due commits and checkpoints");
@@ -3839,6 +3834,7 @@ static store_t *core_start(const server_config_t *cfg, bool *created_out) {
 bool db_store_start(const server_config_t *cfg) {
   if (!cfg) return true;
   if (g_dir.dirfd < 0) {                                     /* (no store: the secondaries made restore-pending by the initial load run without a restore) */
+    xfr_store_core_off();
     return true;
   }
   bool created = false;
@@ -3851,7 +3847,7 @@ bool db_store_start(const server_config_t *cfg) {
   }
   const database_config_t *db = &cfg->database;
   if (!G.wthr_started) return false;                         /* (the ticker keeps the store's time for the database zones: a start without it is refused, as before) */
-  const int xvid = db_store_xfr_vid();
+  const int xvid = xfr_store_vid();
   for (const view_config_t *v = cfg->views; v; v = v->next) {
     if (v->database_none || !v->name) continue;
     int vid = store_view_add(st, v->name);
@@ -3955,6 +3951,7 @@ bool db_store_start(const server_config_t *cfg) {
 void db_store_stop(void) {
   store_t *st = atomic_load_explicit(&G.st, memory_order_acquire);
   if (!st) return;
+  xfr_store_stop();                                           /* 0.7 (secondary store 10): the restore thread first */
   atomic_store(&G.hstop, true);                               /* 0.7 fix 8: the background attach of hot.list ends first */
   for (int i = 0; G.hthr_started && i < G.hot_nstarted; i++) pthread_join(G.hthr[i], NULL);
   att_prep_stop(true);                                        /* 0.7 M4: no growth of the attach table is started from here on */

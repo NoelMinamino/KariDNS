@@ -46,7 +46,7 @@ run_unit test_zone_dir-tsan "inconsistencies"
 
 # part 1c (D1a milestone 2): the park table, the wake and fetch rings, workers and the ingest thread; the Backend side of the fetch stream
 # with the real ingest thread; a worker parking and answering a UDP query
-for t in test_park test_db_fetch test_park_worker test_db_stream test_pdns_reader test_db_registry test_server_core; do
+for t in test_park test_db_fetch test_park_worker test_db_stream test_pdns_reader test_db_registry test_server_core test_xfr_store; do
     echo "--- part 1c: ${t}-tsan"
     run_unit "${t}-tsan" "checks,"
 done

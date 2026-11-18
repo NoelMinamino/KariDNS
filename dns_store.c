@@ -5116,7 +5116,10 @@ static void scrub_note_bad_image(store_t *s, uint32_t z, const store_zone_t *zz,
   if (r == 0) {
     bad_note(s, z);
     s->sc_p_bad_img++;
-    st_log(s, 4, "store: scrub: the image of zone '%s' (view %u) is damaged (%s); the zone is read from the database again", zz->name, (unsigned)zz->view, why);
+    if (zz->flags & STORE_F_XFR)            /* (0.7, 2.2 W6: a secondary's copy is not read from a database: its next refresh stores it again) */
+      st_log(s, 4, "store: scrub: the image of the secondary's stored copy %s (view %u) is damaged (%s); it is stored again by the next refresh", zz->name, (unsigned)zz->view, why);
+    else
+      st_log(s, 4, "store: scrub: the image of zone '%s' (view %u) is damaged (%s); the zone is read from the database again", zz->name, (unsigned)zz->view, why);
   }
 }
 
