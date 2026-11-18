@@ -4770,6 +4770,76 @@ static void test_resident(int mode) {
   tdir_free(&d);
 }
 
+/* 0.7 (Round 6): COPY mode reads a record through the reading thread's buffer (store_image_read()): images of a size that fits the first buffer, one that makes it grow, and one past the
+ * largest buffer (read into its own buffer directly) read back the same, with the buffer and without it (store_test_rbuf_off), and from a thread that ends (its buffer is freed: ASan) */
+typedef struct {
+  store_t *s;
+  const uint32_t *zid;
+  const size_t *len;
+  int n, bad;
+} rbuf_arg_t;
+static int rbuf_read_all(store_t *s, const uint32_t *zid, const size_t *len, int n) {
+  int bad = 0;
+  for (int k = 0; k < n; k++) {
+    store_img_t im;
+    store_read_lock();
+    const int r = store_image_read(s, zid[k], &im);
+    store_read_unlock();
+    if (r != 0) {
+      bad++;
+      continue;
+    }
+    const uint8_t *p = im.data;
+    bool same = im.len == len[k];
+    for (size_t o = 0; same && o < len[k]; o++) same = p[o] == (uint8_t)(o * 7u + (size_t)k);
+    bad += !same;
+    store_img_release(s, &im);
+  }
+  return bad;
+}
+static void *rbuf_thread(void *arg) {
+  rbuf_arg_t *a = arg;
+  a->bad = rbuf_read_all(a->s, a->zid, a->len, a->n);
+  return NULL;
+}
+static void test_rbuf(void) {
+  printf("[COPY reads through the thread's buffer]\n");
+  tdir_t d;
+  tdir_new(&d, "rbuf");
+  store_opts_t o;
+  small_opts(&o);
+  o.mode = STORE_MODE_COPY;
+  o.scrub_interval_s = UINT32_MAX;
+  store_t *s = NULL;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (!s) { tdir_free(&d); return; }
+  store_view_add(s, "default");
+  const size_t len[4] = { 1000, 100000, 300000, 1500000 };      /* (fits 64 KiB; grows it to 128 KiB; grows it again; past 1 MiB: direct) */
+  uint32_t zid[4];
+  for (int k = 0; k < 4; k++) {
+    uint8_t *img = malloc(len[k]);
+    for (size_t x = 0; x < len[k]; x++) img[x] = (uint8_t)(x * 7u + (size_t)k);
+    char nm[32];
+    snprintf(nm, sizeof(nm), "rbuf%d.example", k);
+    store_meta_t m = meta_of((uint32_t)k, 1);
+    CHECK_EQ(store_put(s, 0, nm, strlen(nm), &m, img, len[k], &zid[k]), 0);
+    free(img);
+  }
+  CHECK_EQ(store_commit(s), 0);
+  CHECK_EQ(rbuf_read_all(s, zid, len, 4), 0);
+  CHECK_EQ(rbuf_read_all(s, zid, len, 4), 0);                    /* (the buffer reused) */
+  atomic_store(&store_test_rbuf_off, 1);
+  CHECK_EQ(rbuf_read_all(s, zid, len, 4), 0);
+  atomic_store(&store_test_rbuf_off, 0);
+  rbuf_arg_t a = { s, zid, len, 4, -1 };
+  pthread_t th;
+  CHECK_EQ(pthread_create(&th, NULL, rbuf_thread, &a), 0);
+  pthread_join(th, NULL);
+  CHECK_EQ(a.bad, 0);
+  CHECK_EQ(store_close(s), 0);
+  tdir_free(&d);
+}
+
 static void test_hot_list(void) {
   printf("[hot.list: write, read, and what is not trusted]\n");
   tdir_t d, d2;
@@ -6553,6 +6623,7 @@ int main(void) {
   if (WANT("badimg")) test_bad_image_hook();
   if (WANT("raclose")) test_readahead_close();
   if (WANT("resident")) { test_resident(STORE_MODE_MAP); test_resident(STORE_MODE_COPY); test_hot_list(); }
+  if (WANT("rbuf")) test_rbuf();
   if (WANT("smallfs") && getenv("KARIDNS_STORE_SMALLFS")) test_smallfs(getenv("KARIDNS_STORE_SMALLFS"));
   if (WANT("zfs") && getenv("KARIDNS_STORE_ZFS_128K")) test_zfs_dir(getenv("KARIDNS_STORE_ZFS_128K"), true, "128K dataset");
   if (WANT("zfs") && getenv("KARIDNS_STORE_ZFS_16K")) test_zfs_dir(getenv("KARIDNS_STORE_ZFS_16K"), false, "16K dataset");

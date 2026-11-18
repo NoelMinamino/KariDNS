@@ -575,6 +575,7 @@ static void add_extra(list_t *l) {
   U("store.errors.memory_noted", x.err_noted);
   U("store.errors.memory_pushed_out", x.err_dropped);
   U("store.detach.sampled", x.sampled_detaches);
+  U("store.attach.build_ns_per_zone", x.build_n ? x.build_ns / x.build_n : 0);
   U("store.attach.worker.ok", x.wa_ok);
   U("store.attach.worker.mean_us", x.wa_ok ? x.wa_ns / x.wa_ok / 1000 : 0);
   U("store.attach.worker.not_resident", x.wa_cold);

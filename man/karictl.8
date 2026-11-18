@@ -970,6 +970,11 @@ still has them; \fBstore.errors.total\fR)
 Zones that were taken out of memory because the sample of the attach table chose
 them (also in \fBstore.detach.count\fR)
 .TP 8
+\fBstore.attach.build_ns_per_zone\fR
+0.7: the mean time of the first half of an attach on the store threads (the
+record and image read, the checks, the entry made; not the registration), in
+nanoseconds, timed for one attach in eight
+.TP 8
 \fBstore.attach.worker.ok\fR, \fB.mean_us\fR
 0.7: zones that a worker attached itself and answered from (MAP mode, the image
 in the page cache; also in \fBstore.attach.count\fR), and the mean time that
