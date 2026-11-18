@@ -406,6 +406,7 @@ void (*db_store_test_commit_hook)(int where, const char *zone);
 #endif
 store_t *db_store_handle(void) { return atomic_load_explicit(&G.st, memory_order_acquire); }
 uint64_t db_store_journal_wait(unsigned factor) { return store_journal_wait(atomic_load_explicit(&G.st, memory_order_acquire), factor); }
+uint64_t db_store_index_wait(void) { return store_index_wait(atomic_load_explicit(&G.st, memory_order_acquire)); }
 
 /* the zones the list has attached in a second, from its start until now (until its end, when it has ended) */
 static uint64_t hot_rate(uint64_t attached) {
@@ -3358,9 +3359,14 @@ bool db_recon_begin(const char *view, uint64_t estimate, bool force, char *why, 
     have = ss->zt_records;
     free(ss);
   }
-  /* (a first fill: the tables are made big enough in one step; the estimate is the loader's claim, and a hostile loader must not make the Backend reserve sixteen million records on disk for a handful of zones: the
-   * reserve is at most twice what the store holds plus a million, and the tables grow by themselves beyond that) */
-  const uint64_t cap = 2 * have + 1000000ull, want = estimate < cap ? estimate : cap;
+  /* (a first fill: the tables and the indexes are made big enough in one step, so that a 10M-zone fill does not grow them (and does not hold the writer mutex for the pass of a growth: round 9);
+   * the estimate is the loader's claim, and a hostile loader must not make the Backend reserve gigabytes for a handful of zones.  So it is bounded by what the store can hold (the address
+   * space of zt / zc: 1 << 25 records) and by what memory-limit can give the two indexes: 8 bytes a slot, 8/3 slots a zone, in ix and in sx = 43 bytes a zone, a quarter of memory-limit
+   * at the most (10M zones: 430 MB, 11 percent of 3840M).  Beyond that the tables grow by themselves, with the pass waiting for the build, store_index_wait()) */
+  const uint64_t lim = dbreg_cache_limit();
+  uint64_t cap = (1ull << 25) - 1;
+  if (lim && lim / 4 / 43 < cap) cap = lim / 4 / 43;
+  const uint64_t want = estimate < cap ? estimate : cap;
   if (want > have) (void)store_reserve(st, want);
   un_mark(view);
   rc_lock();

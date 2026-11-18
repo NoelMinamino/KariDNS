@@ -310,6 +310,7 @@ static void rt_page(const rt_item_t *it, int64_t *apply_ns, uint64_t *entries) {
     db_recon_entry_n(RT.re, k, RT.res, RT.zid);
     *apply_ns += rt_mono_ns() - t0;
     (void)db_store_journal_wait(2);                       /* (0.7: the journal at twice its limit: the pass waits for a checkpoint here, with no lock held) */
+    (void)db_store_index_wait();                          /* (0.7 round 10: the build of the next index is waited for here, past 7/16 of the index, rather than the old index filled to one half and grown inside the writer mutex) */
     *entries += k;
     for (unsigned i = 0; i < k; i++) c.wanted |= db_recon_note(&c, RT.res[i], RT.ents[i].name, &unst);
     RT.man_n += k;

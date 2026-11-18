@@ -508,9 +508,13 @@ struct store {
   struct { uint32_t nseg; seg_t *seg[ST_MAXSEG]; } cm;   /* (baton) the segments of the commit being made */
   /* growth of ix / sx outside the mutex (rg_*; wlock, except the flags the build thread reads) */
   bool rg_active, rg_bad;
+  bool rg_noalloc;                                     /* the running build is a reserve (store_reserve()): its files get their size and no blocks when they are made */
   _Atomic bool rg_cancel, rg_stop;
   _Atomic int rg_live;                                /* build threads that may still touch the store: a count, not a flag (a build clears rg_active under the mutex before its thread ends, so
                                                        * the next one can start while the last is still on its way out; with a flag the first one's end let store_close() free the store under the second) */
+  _Atomic bool rg_press;                              /* a build runs and the index is past RG_PRESS (7/16) of its slots: store_index_wait() waits while it is set (set by ix_make_room(), cleared when the build ends or the wait gave up) */
+  _Atomic bool rg_nowait;                             /* a wait gave up on this build: no more waits for it (cleared when the next build begins) */
+  _Atomic uint64_t iw_n, iw_us, iw_max_us, iw_giveups;   /* the waits of store_index_wait(): their number, total and longest time, and those that gave up */
   uint64_t tabgen, rg_tabgen;                         /* tabgen: +1 at every change of a generation; a build made against another one is dropped */
   uint32_t ix_gen_next, sx_gen_next;                  /* the number of the next generation file (a dropped build does not reuse its number) */
   uint64_t rg_hwm, rg_nix, rg_nsx;
@@ -1397,7 +1401,7 @@ static int ixgen_map(store_t *s, ixgen_t *g, bool anon) {
   return 0;
 }
 /* create generation file `gen` of kind (FK_IX / FK_SX) with n empty slots */
-static int ixgen_create(store_t *s, uint32_t kind, uint32_t gen, uint64_t nslots, ixgen_t **out) {
+static int ixgen_create(store_t *s, uint32_t kind, uint32_t gen, uint64_t nslots, bool alloc, ixgen_t **out) {
   char name[32];
   st_name_ix(name, sizeof(name), kind == FK_IX ? "ix" : "sx", gen);
   ixgen_t *g = calloc(1, sizeof(*g));
@@ -1415,7 +1419,8 @@ static int ixgen_create(store_t *s, uint32_t kind, uint32_t gen, uint64_t nslots
   memcpy(page, &h, sizeof(h));
   int r = st_pwrite_all(fd, page, ST_HDR_PAGE, 0);
   free(page);
-  if (r == 0) r = st_extend(fd, ST_HDR_PAGE, (off_t)(ST_HDR_PAGE + ((nslots * 8 + s->pagesz - 1) & ~((uint64_t)s->pagesz - 1))));
+  const off_t fsize = (off_t)(ST_HDR_PAGE + ((nslots * 8 + s->pagesz - 1) & ~((uint64_t)s->pagesz - 1)));
+  if (r == 0) r = alloc ? st_extend(fd, ST_HDR_PAGE, fsize) : ftruncate(fd, fsize) == 0 ? 0 : -errno;    /* (not alloc, for the generation of a reserve: the file has its size, with no blocks; the checkpoint that names it writes every page.  The allocation of 400 MB on UFS stalls the files that other writers make meanwhile: a growth inside the mutex of the first zones, 425 ms) */
   if (r == 0) r = ixgen_map(s, g, true);
   if (r < 0) { ixgen_free(g); return r; }
   s->dir_dirty = true;
@@ -3185,8 +3190,8 @@ static int regrow_locked(store_t *s, uint64_t ix_slots, uint64_t sx_slots) {
   if (hwm > st_zt_cap(s)) hwm = st_zt_cap(s);
   ixgen_t *nix = NULL, *nsx = NULL;
   int r = 0;
-  if (ix_slots && (r = ixgen_create(s, FK_IX, s->ix_gen_next++, ix_slots, &nix)) < 0) return r;
-  if (sx_slots && (r = ixgen_create(s, FK_SX, s->sx_gen_next++, sx_slots, &nsx)) < 0) { ixgen_drop(s, nix, FK_IX); return r; }
+  if (ix_slots && (r = ixgen_create(s, FK_IX, s->ix_gen_next++, ix_slots, true, &nix)) < 0) return r;
+  if (sx_slots && (r = ixgen_create(s, FK_SX, s->sx_gen_next++, sx_slots, true, &nsx)) < 0) { ixgen_drop(s, nix, FK_IX); return r; }
   r = rg_fill(s, nix, nsx, hwm, false, &live_ix, &live_sx);
   CRASH_POINT();
   if (r == 0) r = rg_publish_locked(s, nix, nsx, live_ix, live_ix, live_sx, live_sx);
@@ -3206,6 +3211,7 @@ static int regrow_locked(store_t *s, uint64_t ix_slots, uint64_t sx_slots) {
  * left is at most RG_TAIL changes (or after RG_ROUNDS rounds), and only that part is made inside the mutex, with the OP_GEN record.  The order is the order of the log either way. */
 #define RG_TAIL 4096u                         /* changes the build makes inside the mutex at most, unless the writers outrun RG_ROUNDS rounds */
 #define RG_ROUNDS 16
+#define RG_PRESS 7u                           /* store_index_wait() waits while a build runs and the index is past RG_PRESS / 16 of its slots (the build began at 3/8 = 6/16, the growth inside the mutex is at 8/16) */
 #ifdef KARIDNS_UNIT_TEST
 _Atomic long store_test_rg_tail = -1;
 #define RG_TAIL_NOW() (atomic_load_explicit(&store_test_rg_tail, memory_order_relaxed) >= 0 ? (size_t)atomic_load_explicit(&store_test_rg_tail, memory_order_relaxed) : (size_t)RG_TAIL)
@@ -3264,8 +3270,8 @@ static int rg_build(store_t *s) {
   ixgen_t *nix = NULL, *nsx = NULL;
   uint64_t li = 0, ls = 0;
   int r = 0;
-  if (s->rg_nix) r = ixgen_create(s, FK_IX, s->rg_ixgen, s->rg_nix, &nix);
-  if (r == 0 && s->rg_nsx) r = ixgen_create(s, FK_SX, s->rg_sxgen, s->rg_nsx, &nsx);
+  if (s->rg_nix) r = ixgen_create(s, FK_IX, s->rg_ixgen, s->rg_nix, !s->rg_noalloc, &nix);
+  if (r == 0 && s->rg_nsx) r = ixgen_create(s, FK_SX, s->rg_sxgen, s->rg_nsx, !s->rg_noalloc, &nsx);
   if (r == 0) r = rg_fill(s, nix, nsx, s->rg_hwm, true, &li, &ls);
   /* (no flush here: the build has to end before the writers fill the old index to one half, and the checkpoint that follows the growth flushes the new files) */
   CRASH_POINT();
@@ -3296,6 +3302,7 @@ static int rg_build(store_t *s) {
     nix = nsx = NULL;
   }
   s->rg_active = false;
+  atomic_store_explicit(&s->rg_press, false, memory_order_release);     /* (the producers that wait for the build, store_index_wait(), go on) */
   atomic_store_explicit(&s->rg_n, 0, memory_order_relaxed);
   rgent_t *spare[RG_NCH];                             /* (the chunks past the first are freed after the mutex) */
   memcpy(spare, s->rg_ch, sizeof(spare));
@@ -3327,10 +3334,13 @@ static bool rg_start_locked(store_t *s, uint64_t nix, uint64_t nsx, bool spawn) 
   s->rg_ixgen = nix ? s->ix_gen_next++ : 0;
   s->rg_sxgen = nsx ? s->sx_gen_next++ : 0;
   s->rg_hwm = hwm;
+  s->rg_noalloc = !spawn;
   s->rg_tabgen = s->tabgen;
   atomic_store_explicit(&s->rg_n, 0, memory_order_relaxed);
   s->rg_bad = false;
   atomic_store_explicit(&s->rg_cancel, false, memory_order_relaxed);
+  atomic_store_explicit(&s->rg_nowait, false, memory_order_relaxed);
+  atomic_store_explicit(&s->rg_press, false, memory_order_relaxed);
   s->rg_active = true;
   if (!spawn) return true;
   pthread_attr_t at;
@@ -3363,7 +3373,46 @@ static int ix_make_room(store_t *s, bool need_sx) {
   if (nix || nsx) return regrow_locked(s, nix, nsx);
   if (!s->rg_active && ((iu + 1) * 8 > ix->nslots * 3 || (su + 1) * 8 > sx->nslots * 3))
     (void)rg_start_locked(s, (iu + 1) * 8 > ix->nslots * 3 ? ix_slots_for(il + il / 3 + 1) : 0, (su + 1) * 8 > sx->nslots * 3 ? ix_slots_for(sl + sl / 3 + 1) : 0, true);
+  /* a build runs and one of the indexes is past RG_PRESS: the bulk producers (store_index_wait()) wait for its end rather than fill the old index to one half */
+  atomic_store_explicit(&s->rg_press, s->rg_active && !atomic_load_explicit(&s->rg_nowait, memory_order_relaxed) &&
+                        ((iu + 1) * 16 > ix->nslots * RG_PRESS || (su + 1) * 16 > sx->nslots * RG_PRESS), memory_order_release);
   return 0;
+}
+
+/* The wait for a build (0.7, round 10).  The first fill of a database adds 0.4 to 0.9 M zones a second; the build of the next generation takes 0.63 us a zone, so it can lose the race
+ * against the producer: at one half of the old index the writer grew it inside the mutex, dropped the build and made the pass over every zone again, with the file system of the new
+ * files behind it (UFS, waiting for the checkpoint): holds of 1 to 7 seconds at 7M zones.  The bulk producer (the reconcile thread of a pass) that holds no lock calls this between its
+ * groups: while a build runs and the index is past RG_PRESS (7/16, the build began at 3/8) it waits, with no lock held, for the build to end (it is not dropped, the mutex stays free:
+ * lookups, bodies, checkpoints go on), so that the growth is the build's and not the mutex's.  The wait is bounded (RG_WAIT_MS): a build that does not end (the disk) is given up on once
+ * (rg_nowait, a WARNING, store.index.wait_giveups) and the producer goes on as before, the growth inside the mutex being the last resort.  Callers that are not bulk producers (a
+ * transfer, a dynamic update, the thread that also answers lookups) do not call it.  Returns the microseconds waited (0: no wait). */
+#define RG_WAIT_MS 30000u
+#ifdef KARIDNS_UNIT_TEST
+_Atomic long store_test_rg_wait_ms = -1;
+#define RG_WAIT_NOW() (atomic_load_explicit(&store_test_rg_wait_ms, memory_order_relaxed) >= 0 ? (uint64_t)atomic_load_explicit(&store_test_rg_wait_ms, memory_order_relaxed) : (uint64_t)RG_WAIT_MS)
+#else
+#define RG_WAIT_NOW() ((uint64_t)RG_WAIT_MS)
+#endif
+uint64_t store_index_wait(store_t *s) {
+  if (!s || !atomic_load_explicit(&s->rg_press, memory_order_acquire) || atomic_load_explicit(&s->rg_nowait, memory_order_relaxed)) return 0;
+  const uint64_t t0 = st_now_us(), lim = RG_WAIT_NOW() * 1000u;
+  bool gave_up = false;
+  while (atomic_load_explicit(&s->rg_press, memory_order_acquire) && !atomic_load_explicit(&s->rg_stop, memory_order_relaxed)) {
+    if (st_now_us() - t0 >= lim) { gave_up = true; break; }
+    usleep(1000);
+  }
+  const uint64_t us = st_now_us() - t0;
+  atomic_fetch_add_explicit(&s->iw_n, 1, memory_order_relaxed);
+  atomic_fetch_add_explicit(&s->iw_us, us, memory_order_relaxed);
+  uint64_t m = atomic_load_explicit(&s->iw_max_us, memory_order_relaxed);
+  while (us > m && !atomic_compare_exchange_weak_explicit(&s->iw_max_us, &m, us, memory_order_relaxed, memory_order_relaxed)) {}
+  if (gave_up) {
+    atomic_store_explicit(&s->rg_nowait, true, memory_order_relaxed);
+    atomic_store_explicit(&s->rg_press, false, memory_order_release);
+    atomic_fetch_add_explicit(&s->iw_giveups, 1, memory_order_relaxed);
+    st_log(s, 4, "store: the build of the next index did not end in %" PRIu64 " ms; the pass goes on and the index may be grown inside the writer mutex (store.index.wait_giveups)", lim / 1000u);
+  }
+  return us ? us : 1;
 }
 
 /* ------------------------------------------------------------------------------------------------------------------ */
@@ -5002,34 +5051,52 @@ int store_get_cursor(store_t *s, uint16_t source, bool *valid, uint64_t *cursor,
   return 0;
 }
 
-/* The first fill announces its size: the tables and the indexes are made big enough once.  The bigger indexes are built outside the writer mutex, on this thread (a build that runs is
- * waited for first); a build that is dropped meanwhile leaves the growth to the writers (at one half). */
+/* The first fill announces its size: the indexes and the tables are made big enough once.  The bigger indexes are built outside the writer mutex, on this thread (a build that runs is
+ * waited for first), and before the blocks of zt and zc are allocated: the allocation of gigabytes on UFS stalls every file that another writer makes meanwhile (an index growth inside
+ * the mutex of the first zones of a fill that the queries bring, 740 ms at 10M zones), so the index is there before it starts.  A build that is dropped meanwhile (another writer's growth
+ * inside the mutex, regrow_locked(): the index of a store that is still small filled up to one half; a repair) is made again with the sizes the store has by then, up to RESERVE_TRIES
+ * times (the zones are few then, the build short); the last try makes the growth inside the mutex, which nothing can drop.  A close ends the reserve without a growth.  It is never a
+ * dropped build that counts as a reserve made (round 9: it returned 0 and the first fill of 10M zones went through 17 growths). */
+#define RESERVE_TRIES 8
 static void tables_ahead(store_t *s, uint64_t zones);
 int store_reserve(store_t *s, uint64_t zones) {
   if (!s) return -EINVAL;
-  for (int wait = 0; wait < 100000 && atomic_load_explicit(&s->rg_live, memory_order_acquire); wait++) usleep(1000);
-  tables_ahead(s, zones + 1);                          /* (the blocks of zt and zc outside the mutex: inside it the growth is a mapping) */
-  int r = wr_lock(s);
-  if (r < 0) return r;
-  r = ensure_zt_cap(s, zones + 1);
-  bool built = false;
-  if (r == 0) {
+  int r = 0;
+  for (int attempt = 0; attempt < RESERVE_TRIES; attempt++) {
+    for (int wait = 0; wait < 100000 && atomic_load_explicit(&s->rg_live, memory_order_acquire); wait++) usleep(1000);
+    r = wr_lock(s);
+    if (r < 0) return r;
+    bool built = false, again = false;
     ixgen_t *ix = atomic_load_explicit(&s->ix, memory_order_relaxed), *sx = atomic_load_explicit(&s->sx, memory_order_relaxed);
-    uint64_t want = zones * 8 / 3 + 16;               /* (the announced zones stay below the 3/8 at which a growth begins) */
+    uint64_t want = zones * 8 / 3 + 16;                 /* (the announced zones stay below the 3/8 at which a growth begins) */
     uint64_t nix = want > ix->nslots ? want : 0, nsx = want > sx->nslots ? want : 0;
     if (nix || nsx) {
-      if (rg_start_locked(s, nix, nsx, false)) built = true;
-      else r = regrow_locked(s, nix, nsx);
+      if (attempt < RESERVE_TRIES - 1 && rg_start_locked(s, nix, nsx, false)) {
+        built = true;
+        atomic_fetch_add_explicit(&s->rg_live, 1, memory_order_release);              /* (a build on this thread counts like one on its own: a second reserve and a close wait for it) */
+      }
+      else if (attempt < RESERVE_TRIES - 1 && s->rg_active) again = true;            /* (a writer's build began meanwhile: it is waited for, and the sizes it made looked at) */
+      else r = regrow_locked(s, nix, nsx);                                            /* (the last try, or the store closes) */
     }
+    if (r < 0) note_error(s, r);
+    const int w = wr_unlock_w(s);
+    if (r == 0) r = w;
+    if (built) {
+      const int br = rg_build(s);
+      atomic_fetch_sub_explicit(&s->rg_live, 1, memory_order_release);
+      if (br == -ECANCELED) again = r == 0 && !atomic_load_explicit(&s->rg_stop, memory_order_relaxed);
+      else r = br;
+    }
+    if (r != 0 || !again) break;
   }
+  if (r < 0) return r;
+  tables_ahead(s, zones + 1);                          /* (the blocks of zt and zc outside the mutex: inside it the growth is a mapping) */
+  r = wr_lock(s);
+  if (r < 0) return r;
+  r = ensure_zt_cap(s, zones + 1);
   if (r < 0) note_error(s, r);
   const int w = wr_unlock_w(s);
-  if (r == 0) r = w;
-  if (built) {
-    r = rg_build(s);
-    if (r == -ECANCELED) r = 0;
-  }
-  return r;
+  return r == 0 ? w : r;
 }
 
 /* ------------------------------------------------------------------------------------------------------------------ */
@@ -6075,6 +6142,10 @@ void store_stats(const store_t *s, store_stats_t *o) {
   o->journal_limit_waits = atomic_load_explicit(&s->jw_n, memory_order_relaxed);
   o->journal_limit_wait_us = atomic_load_explicit(&s->jw_us, memory_order_relaxed);
   o->journal_limit_wait_max_us = atomic_load_explicit(&s->jw_max_us, memory_order_relaxed);
+  o->index_waits = atomic_load_explicit(&s->iw_n, memory_order_relaxed);
+  o->index_wait_us = atomic_load_explicit(&s->iw_us, memory_order_relaxed);
+  o->index_wait_max_us = atomic_load_explicit(&s->iw_max_us, memory_order_relaxed);
+  o->index_wait_giveups = atomic_load_explicit(&s->iw_giveups, memory_order_relaxed);
   o->journal_commit_switches = atomic_load_explicit(&s->n_jswitch, memory_order_relaxed);
   o->image_prewrites = atomic_load_explicit(&s->n_prew, memory_order_relaxed);
   o->image_prewrite_misses = atomic_load_explicit(&s->n_prew_miss, memory_order_relaxed);
@@ -6325,8 +6396,8 @@ static int rebuild_locked(store_t *s) {
   ixgen_t *nix = NULL, *nsx = NULL;
   uint64_t slots = ix_slots_for(hwm);
   if (s->rg_active) atomic_store_explicit(&s->rg_cancel, true, memory_order_relaxed);       /* (a build in progress is dropped: the generations change here) */
-  int r = ixgen_create(s, FK_IX, s->ix_gen_next++, slots, &nix);
-  if (r == 0) r = ixgen_create(s, FK_SX, s->sx_gen_next++, slots, &nsx);
+  int r = ixgen_create(s, FK_IX, s->ix_gen_next++, slots, true, &nix);
+  if (r == 0) r = ixgen_create(s, FK_SX, s->sx_gen_next++, slots, true, &nsx);
   if (r < 0) { ixgen_free(nix); free(nv); return r; }
   /* counters are recomputed: clear everything except the segment tables, which are recomputed below too */
   uint64_t nsegs = NG(V_NSEGS), cur_seg = NG(V_CUR_SEG), nx_used = NG(V_NX_USED);
@@ -6617,8 +6688,8 @@ static int create_store(store_t *s) {
   ixgen_t *ix = NULL, *sx = NULL;
   uint64_t slots = zones ? zones * 8 / 3 + 16 : ST_IX_MIN;
   if (slots < ST_IX_MIN) slots = ST_IX_MIN;
-  if (r == 0) r = ixgen_create(s, FK_IX, 1, slots, &ix);
-  if (r == 0) r = ixgen_create(s, FK_SX, 1, slots, &sx);
+  if (r == 0) r = ixgen_create(s, FK_IX, 1, slots, true, &ix);
+  if (r == 0) r = ixgen_create(s, FK_SX, 1, slots, true, &sx);
   if (r < 0) { ixgen_free(ix); return r; }
   atomic_store(&s->ix, ix);
   atomic_store(&s->sx, sx);

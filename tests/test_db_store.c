@@ -4268,14 +4268,19 @@ static int run_fixes(const char *dir) {
         (void)serve_fetches(&fetchc, f[0], &e, 1500, -1, -1);
     }
 
-    /* -- L11: a loader that claims four million zones makes the store reserve what it can hold plus a million, not four million records */
+    /* -- L11: the loader's estimate is a claim.  A first fill reserves what the loader announces (round 10: the whole estimate, so that a fill of 10M zones grows the index no more than once), up to what
+     *    memory-limit can give the two indexes (a quarter of it at 43 bytes a zone) and the address space of the tables; a loader that claims four million zones with a limit that holds 1.5 million
+     *    makes the store reserve about that, not four million records */
     {
         char why[200];
         store_stats_t s1;
+        dbreg_cache_set_limit(1500000ull * 43 * 4);
         CHECK(db_recon_begin("default", 4000000, false, why, sizeof(why)));
         store_stats(st, &s1);
-        CHECK(s1.zt_capacity < 3000000);
+        CHECK(s1.zt_capacity >= 1400000 && s1.zt_capacity < 3000000);
+        CHECK(s1.ix_slots >= 1400000 * 8 / 3 && s1.ix_slots < 3000000 * 8 / 3);
         db_recon_abort();
+        dbreg_cache_set_limit(0);
     }
 
     /* -- L7: the guard holds a pass that lists 100 of the zones; the hold is in the store (the cursor of the view is not valid), and nothing is deleted.  (Before: the old cursor stayed, and a restart read
