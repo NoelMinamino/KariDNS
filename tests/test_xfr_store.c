@@ -102,6 +102,26 @@ static int u64_cmp(const void *a, const void *b) {
   const uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
   return x < y ? -1 : x > y;
 }
+/* two view names of one CRC-32C (found by a search, the birthday bound of 32 bits) */
+static bool find_collision(char *va, char *vb, size_t cap) {
+  enum { NV = 1 << 19 };
+  uint64_t *tags = malloc(NV * sizeof(uint64_t));                         /* (tag << 32 | index, sorted: equal neighbours are a collision) */
+  int ca = -1, cb = -1;
+  for (int i = 0; tags && i < NV; i++) {
+    char v[32];
+    snprintf(v, sizeof(v), "v%016llx", (unsigned long long)vmix((uint64_t)i));
+    tags[i] = (uint64_t)xfr_view_tag(v) << 32 | (uint32_t)i;
+  }
+  if (tags) qsort(tags, NV, sizeof(uint64_t), u64_cmp);
+  for (int i = 1; tags && i < NV && ca < 0; i++)
+    if (tags[i] >> 32 == tags[i - 1] >> 32) { ca = (int)(uint32_t)tags[i - 1]; cb = (int)(uint32_t)tags[i]; }
+  free(tags);
+  if (ca < 0) return false;
+  snprintf(va, cap, "v%016llx", (unsigned long long)vmix((uint64_t)ca));
+  snprintf(vb, cap, "v%016llx", (unsigned long long)vmix((uint64_t)cb));
+  return true;
+}
+
 static void test_key(void) {
   printf("[the key: the root, 245 / 246 octets, the case of the view, a forced tag collision, the view order]\n");
   char k[XFR_KEY_MAX + 1], z[STORE_NAME_MAX + 2];
@@ -136,23 +156,10 @@ static void test_key(void) {
   CHECK_EQ(xfr_key_parse("01234567c-a", 11, &tag, &kc, z, sizeof(z)), -1);
   CHECK_EQ(xfr_key_parse("01234567c.", 10, &tag, &kc, z, sizeof(z)), -1);
   CHECK_EQ(xfr_key_parse("01234567c.abc", 13, &tag, &kc, z, 3), -1);
-  /* a forced tag collision: two view names of one CRC-32C (found by a search, the birthday bound of 32 bits) give one key and two identities */
-  enum { NV = 1 << 19 };
-  uint64_t *tags = malloc(NV * sizeof(uint64_t));                         /* (tag << 32 | index, sorted: equal neighbours are a collision) */
-  int ca = -1, cb = -1;
-  for (int i = 0; tags && i < NV; i++) {
-    char v[32];
-    snprintf(v, sizeof(v), "v%016llx", (unsigned long long)vmix((uint64_t)i));
-    tags[i] = (uint64_t)xfr_view_tag(v) << 32 | (uint32_t)i;
-  }
-  if (tags) qsort(tags, NV, sizeof(uint64_t), u64_cmp);
-  for (int i = 1; tags && i < NV && ca < 0; i++)
-    if (tags[i] >> 32 == tags[i - 1] >> 32) { ca = (int)(uint32_t)tags[i - 1]; cb = (int)(uint32_t)tags[i]; }
-  free(tags);
-  if (ca >= 0) {
-    char va[32], vb[32], ka[XFR_KEY_MAX + 1], kb[XFR_KEY_MAX + 1];
-    snprintf(va, sizeof(va), "v%016llx", (unsigned long long)vmix((uint64_t)ca));
-    snprintf(vb, sizeof(vb), "v%016llx", (unsigned long long)vmix((uint64_t)cb));
+  /* a forced tag collision: two view names of one CRC-32C give one key and two identities */
+  char va[32], vb[32];
+  if (find_collision(va, vb, sizeof(va))) {
+    char ka[XFR_KEY_MAX + 1], kb[XFR_KEY_MAX + 1];
     CHECK(xfr_key_make(va, XFR_K_CONFIG, "z.test.", ka, sizeof(ka)) > 0 && xfr_key_make(vb, XFR_K_CONFIG, "z.test.", kb, sizeof(kb)) > 0 && strcmp(ka, kb) == 0);
     CHECK(xfr_identity(XFR_K_CONFIG, "z.test.", va, NULL, 0) != xfr_identity(XFR_K_CONFIG, "z.test.", vb, NULL, 0));
     printf("  tag collision: '%s' and '%s' (tag %08x): one key, two identities\n", va, vb, xfr_view_tag(va));
@@ -306,6 +313,8 @@ static void conf_text(char *out, size_t cap, const char *store_stmt) {
            "  zone \"h.test\" { type slave; masters { 192.0.2.1; }; primary-settings no; };\n"
            "  zone \"i.test\" { type slave; masters { 192.0.2.1; }; primary-settings no; };\n"
            "  zone \"j.test\" { type slave; masters { 192.0.2.1; }; primary-settings no; };\n"
+           "  zone \"k.test\" { type slave; masters { 192.0.2.1; }; primary-settings no; };\n"
+           "  zone \"l.test\" { type slave; masters { 192.0.2.1; }; primary-settings no; };\n"
            "  zone \"p.test\" { type slave; masters { 192.0.2.2; }; primary-settings no; };\n"
            "  zone \"cat.test\" { type slave; masters { 192.0.2.1; }; primary-settings no; catalog-zone yes; };\n"
            "%s"
@@ -478,7 +487,49 @@ static int life1(void) {
   refresh_end(a, XFR_OUT_FAILED, now + 1);
   xfr_store_counters_t c2 = ctr();
   CHECK_EQ(c2.state_skipped, c1.state_skipped + 1);
+  /* up to date and the record of this key is of another zone (an identity that is not this zone's, the same serial): the state alone is not written over it, the whole image is put (2.3) */
+  zone_db_entry_t *k = ent("k.test.");
+  install(k, 12, XFR_ORIGIN_XFR, now, 0);
+  put_raw("k.test.", 12, 12, 999, now);
+  xfr_store_counters_t ck0 = ctr();
+  refresh_end(k, XFR_OUT_UPTODATE, now);
+  xfr_store_counters_t ck1 = ctr();
+  CHECK_EQ(ck1.puts_uptodate, ck0.puts_uptodate + 1);
+  CHECK_EQ(ck1.state_writes, ck0.state_writes);
+  CHECK(rec_state("k.test.", XFR_K_CONFIG, &s, &z) && s.identity == xfr_identity(XFR_K_CONFIG, "k.test.", "v1", NULL, 0) && z.state == STORE_STATE_STORED);
+  /* a record whose state cannot be read is put whole as well */
+  {
+    store_t *sto = db_store_handle();
+    char kk[XFR_KEY_MAX + 1];
+    const int kn = xfr_key_make("v1", XFR_K_CONFIG, "k.test.", kk, sizeof(kk));
+    uint8_t zero[STORE_DIGEST_LEN];
+    memset(zero, 0, sizeof(zero));
+    CHECK_EQ(store_set_digest(sto, (uint16_t)xfr_store_vid(), kk, (size_t)kn, 12, 0, zero, STORE_F_XFR, 0), 0);
+    refresh_end(k, XFR_OUT_UPTODATE, now);
+    CHECK_EQ(ctr().puts_uptodate, ck1.puts_uptodate + 1);
+    CHECK(rec_state("k.test.", XFR_K_CONFIG, &s, NULL) && s.identity == xfr_identity(XFR_K_CONFIG, "k.test.", "v1", NULL, 0));
+  }
+  /* R2: a copy restored without the settings its primary sent (xfr_axfr_once) keeps XFR_SF_RX_LOST in the state while the whole transfer it asks for has not come: an up-to-date
+   * answer (a primary that was asked in another way) and a failure write the state with the bit (and the restore of life 2 sets xfr_axfr_once again) */
+  zone_db_entry_t *l = ent("l.test.");
+  install(l, 20, XFR_ORIGIN_XFR, now, 0);
+  refresh_end(l, XFR_OUT_TRANSFERRED, now);
+  CHECK(rec_state("l.test.", XFR_K_CONFIG, &s, NULL) && !(s.flags & XFR_SF_RX_LOST));
+  zone_x_t *lx = zone_x_need(l);
+  CHECK(lx != NULL);
+  if (lx) atomic_store(&lx->xfr_axfr_once, true);
+  xfr_store_counters_t cl0 = ctr();
+  refresh_end(l, XFR_OUT_UPTODATE, now + 1);
+  CHECK_EQ(ctr().state_writes, cl0.state_writes + 1);                     /* (the state alone: the record holds this serial) */
+  CHECK(rec_state("l.test.", XFR_K_CONFIG, &s, NULL) && (s.flags & XFR_SF_RX_LOST));
+  if (lx) atomic_store(&lx->xfr_axfr_once, false);
+  refresh_end(l, XFR_OUT_UPTODATE, now + 2);
+  CHECK(rec_state("l.test.", XFR_K_CONFIG, &s, NULL) && !(s.flags & XFR_SF_RX_LOST));   /* (the bit goes when the transfer has come) */
+  if (lx) atomic_store(&lx->xfr_axfr_once, true);
+  refresh_end(l, XFR_OUT_TRANSFERRED, now + 3);                           /* (the whole image: the bit is in the state too) */
+  CHECK(rec_state("l.test.", XFR_K_CONFIG, &s, NULL) && (s.flags & XFR_SF_RX_LOST));
   /* a scrub made the record KNOWN (a damaged image): the next up-to-date refresh stores the whole image (M2), and the scrub's text names the secondary's copy */
+  xfr_store_counters_t c2u = ctr();
   damage("a.test.");
   store_scrub_report_t sr;
   CHECK_EQ(store_scrub_run(db_store_handle(), &sr), 0);
@@ -486,7 +537,7 @@ static int life1(void) {
   CHECK(rec("a.test.", XFR_K_CONFIG, &z) && z.state == STORE_STATE_KNOWN && (z.flags & STORE_F_XFR));
   refresh_end(a, XFR_OUT_UPTODATE, now);
   xfr_store_counters_t c3 = ctr();
-  CHECK_EQ(c3.puts_uptodate, c2.puts_uptodate + 1);
+  CHECK_EQ(c3.puts_uptodate, c2u.puts_uptodate + 1);
   CHECK(rec_state("a.test.", XFR_K_CONFIG, &s, &z) && z.state == STORE_STATE_STORED && z.serial == 10 && !(s.flags & XFR_SF_FAILED));
   /* the EXPIRE option of 0 (b.test): bit1 and a delta of 0 */
   zone_db_entry_t *b = ent("b.test.");
@@ -633,6 +684,26 @@ static int life2(void) {
   /* h: expired while stopped; i: a recent failure: next_check at last attempt + retry */
   zone_db_entry_t *h = ent("h.test.");
   CHECK(h && atomic_load(&h->serial) == 4 && zone_expire_deadline(h) < now);
+  /* (D9, 2.5: the restore thread says nothing about it and does not touch the tick's state: the tick is told with exp_stopped and says `expired while stopped` through its rate limit) */
+  zone_x_t *hx = h ? zone_x(h) : NULL;
+  CHECK(hx && hx->exp_stopped && hx->exp_state == 0);
+  const uint64_t ev0 = ctr().expire_events;
+  if (h) {
+    rcu_aux_read_lock();
+    server_config_t *hc = acquire_config_snapshot();
+    xfr_expiry_begin(now);
+    xfr_expiry_entry(h, hc, now);
+    xfr_expiry_end(now);
+    release_config_snapshot(hc);
+    rcu_aux_read_unlock();
+  }
+  CHECK(hx && !hx->exp_stopped && hx->exp_state == 1);
+  CHECK_EQ(ctr().expire_events, ev0 + 1);
+  CHECK(ctr().expired_zones >= 1);
+  zone_x_t *lx2 = ent("l.test.") ? zone_x(ent("l.test.")) : NULL;
+  CHECK(lx2 && atomic_load(&lx2->xfr_axfr_once));                         /* (R2: the bit of life 1's state) */
+  zone_x_t *ax2 = a ? zone_x(a) : NULL;
+  CHECK(!ax2 || !atomic_load(&ax2->xfr_axfr_once));
   zone_db_entry_t *i = ent("i.test.");
   CHECK(i && atomic_load(&i->serial) == 4 && atomic_load(&i->next_check) > now && atomic_load(&i->next_check) <= now + 600);
   zone_db_entry_t *j = ent("j.test.");
@@ -670,6 +741,37 @@ static int life2b(void) {
   CHECK(p && atomic_load(&p->serial) == 2 && atomic_load(&p->refresh_now));
   /* a name too long for a key (W12): memory only, counted */
   CHECK(ctr().unstorable == 0);
+  db_store_stop();
+  return g_failed;
+}
+
+/* life 2c: a version is installed by a transfer while the entry is still pending (the restore thread, held at its first entry, is overtaken: the tick's safety net gave up on the bit
+ * between the check of restore_one() and the install of restore_do(), so the late restore meets a transferred version): it installs nothing over it (4.1) */
+static void transfer_hook(zone_db_entry_t *e) {
+  if (strcmp(e->domain, "a.test.") == 0) install(e, 11, XFR_ORIGIN_XFR, time(NULL), 0);
+}
+static int life2c(void) {
+  printf("[life 2c: the restore meets a transferred version]\n");
+  rcu_aux_thread_pin();
+  atomic_store(&xfr_store_test_restore_hook, transfer_hook);
+  if (life_start(g_store, true) != 0) return 1;
+  xfr_store_wait_start(5000);
+  wait_pass();
+  CHECK_EQ(atomic_load(&g_xfr_pending), 0);
+  zone_db_entry_t *a = ent("a.test.");
+  CHECK(a != NULL);
+  if (!a) return 1;
+  CHECK_EQ(atomic_load(&a->serial), 11);                                  /* (not the stored 10) */
+  CHECK_EQ(a->xfr_origin, XFR_ORIGIN_XFR);
+  zone_version_t *av = atomic_load(&a->rcu.active);
+  zone_image_soa_t nums;
+  const uint32_t soa = av && av->image ? zone_image_apex_soa(av->image) : ZONE_IMAGE_NONE;
+  CHECK(soa != ZONE_IMAGE_NONE && zone_image_soa(av->image, soa, NULL, 0, NULL, 0, &nums) == 0 && nums.serial == 11);
+  xfr_store_counters_t c = ctr();
+  CHECK(c.restored >= 6);                                                 /* (the others were restored) */
+  store_zone_t z;
+  CHECK(rec("a.test.", XFR_K_CONFIG, &z) && z.serial == 10);              /* (the record is the copy of before: the next refresh outcome replaces it) */
+  atomic_store(&xfr_store_test_restore_hook, NULL);
   db_store_stop();
   return g_failed;
 }
@@ -785,6 +887,85 @@ static int life5(void) {
   return g_failed;
 }
 
+/* life 7 (2.2): two configured views whose names have one store tag: the later view's secondaries are not persisted (a WARNING at the check, xfr_store_config_check()); the first view's are */
+static zone_db_entry_t *entv(const char *view, const char *zone) {
+  zone_db_snapshot_t *s = acquire_retained_zone_snapshot();
+  zone_db_entry_t *e = s ? snapshot_get_zone_in_view(s, view, zone) : NULL;
+  if (s) release_zone_snapshot(s);
+  return e;
+}
+static int life7(void) {
+  printf("[life 7: two views whose names have one store tag]\n");
+  rcu_aux_thread_pin();
+  char va[32], vb[32];
+  if (!find_collision(va, vb, sizeof(va))) {
+    printf("  (no tag collision found in the search; the case is left out)\n");
+    return 0;
+  }
+  CHECK_EQ(xfr_view_tag(va), xfr_view_tag(vb));
+  char conf[4096];
+  snprintf(conf, sizeof(conf),
+           "options { %s };\n"
+           "view \"%s\" { match-clients { 127.0.0.1; }; zone \"z.test\" { type slave; masters { 192.0.2.1; }; primary-settings no; }; };\n"
+           "view \"%s\" { match-clients { any; }; zone \"z.test\" { type slave; masters { 192.0.2.1; }; primary-settings no; }; };\n",
+           g_store, va, vb);
+  memset(&g_cfg, 0, sizeof(g_cfg));
+  if (parse_named_conf(conf, &g_cfg) != 0) { printf("  [FAIL] the configuration of two views does not parse\n"); return 1; }
+  atomic_store_explicit(&g_config_db.active, &g_cfg, memory_order_release);
+  xfr_store_want(true);
+  rebuild_zone_db_from_config(&g_cfg, false);
+  char msg[1024];
+  int lvl = 0;
+  CHECK(db_store_frontend_open_cfg(&g_cfg, false, (uid_t)-1, (gid_t)-1, msg, sizeof(msg), &lvl));
+  CHECK(db_store_start(&g_cfg));
+  xfr_store_wait_start(5000);
+  wait_pass();
+  CHECK(xfr_store_active());
+  CHECK_EQ(atomic_load(&g_xfr_pending), 0);                               /* (the entry of the left-out view is not held either: its pending bit is cleared by the pass) */
+  CHECK_EQ(xfr_store_config_check(&g_cfg), 1);                            /* (the later view is left out; asked again: the same, and no second WARNING) */
+  zone_db_entry_t *e1 = entv(va, "z.test."), *e2 = entv(vb, "z.test.");
+  CHECK(e1 && e2 && e1 != e2);
+  if (!e1 || !e2) return 1;
+  const time_t now = time(NULL);
+  install(e1, 5, XFR_ORIGIN_XFR, now, 0);
+  install(e2, 6, XFR_ORIGIN_XFR, now, 0);
+  xfr_store_counters_t c0 = ctr();
+  refresh_end(e1, XFR_OUT_TRANSFERRED, now);
+  refresh_end(e2, XFR_OUT_TRANSFERRED, now);
+  xfr_store_counters_t c1 = ctr();
+  CHECK_EQ(c1.puts, c0.puts + 1);                                         /* (only the first view's copy) */
+  char key[XFR_KEY_MAX + 1];
+  const int kn = xfr_key_make(va, XFR_K_CONFIG, "z.test.", key, sizeof(key));
+  store_zone_t z;
+  store_read_lock();
+  const uint32_t zid = store_find(db_store_handle(), (uint16_t)xfr_store_vid(), key, (size_t)kn);
+  const bool have = zid != STORE_NONE && store_zone_get(db_store_handle(), zid, &z) == 0;
+  store_read_unlock();
+  CHECK(have && z.serial == 5);
+  xfr_state_t s;
+  CHECK(have && xfr_state_decode(z.digest, sizeof(z.digest), &s) == 0 && s.identity == xfr_identity(XFR_K_CONFIG, "z.test.", va, NULL, 0));
+  /* the up-to-date and the failed outcomes of the left-out view write nothing either */
+  refresh_end(e2, XFR_OUT_UPTODATE, now + 1);
+  refresh_end(e2, XFR_OUT_FAILED, now + 2);
+  xfr_store_counters_t c2 = ctr();
+  CHECK(c2.puts == c1.puts && c2.state_writes == c1.state_writes && c2.puts_uptodate == c1.puts_uptodate);
+  char zs[1024];
+  rcu_aux_read_lock();
+  server_config_t *cfg = acquire_config_snapshot();
+  size_t zl1 = xfr_store_zonestatus(e1, cfg, zs, sizeof(zs));
+  CHECK(zl1 > 0 && strstr(zs, "Store: copy serial 5, "));
+  size_t zl2 = xfr_store_zonestatus(e2, cfg, zs, sizeof(zs));
+  release_config_snapshot(cfg);
+  rcu_aux_read_unlock();
+  CHECK(zl2 > 0 && strstr(zs, "Store: not kept (the view's name has the store tag of another view"));
+  /* the configuration without the second view: the set is empty again */
+  CHECK_EQ(xfr_store_config_check(NULL), 0);
+  refresh_end(e2, XFR_OUT_TRANSFERRED, now + 3);
+  CHECK_EQ(ctr().puts, c2.puts + 1);
+  db_store_stop();
+  return g_failed;
+}
+
 /* life 6 (TSan): the restore against a concurrent "tick" and transfer on one entry, and the rebuild hooks from several threads */
 static _Atomic bool g_race_done;
 static _Atomic int g_race_skips, g_race_early;
@@ -883,11 +1064,14 @@ int main(void) {
   snprintf(g_sdir, sizeof(g_sdir), "%s/store", g_dir);
   run_child(life2);
   run_child(life2b);
+  run_child(life2c);
   run_child(life3);
   run_child(life4);
   run_child(life5);
   run_child(life6a);
   run_child(life6);
+  snprintf(g_store, sizeof(g_store), "zone-store \"%s/store7\";", g_dir);
+  run_child(life7);
   char cmd[600];
   snprintf(cmd, sizeof(cmd), "rm -rf '%s'", g_dir);
   if (system(cmd) != 0) printf("  (could not remove %s)\n", g_dir);

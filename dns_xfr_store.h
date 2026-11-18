@@ -48,6 +48,8 @@ void xfr_store_stop(void);
 /* the store view of the copies (-1: none) */
 int  xfr_store_vid(void);
 bool xfr_store_active(void);
+/* 2.2: two configured views whose names have one store tag: the later view's secondaries are not persisted (a WARNING once).  Called by every pass of the restore thread; returns the number of views left out */
+int  xfr_store_config_check(const server_config_t *cfg);
 
 /* ---- the control channel ---- */
 /* zonestatus of a secondary: the `Store:` and `Last-refresh` lines (and `Expired:` when it is) appended to out (a NUL-terminated text); the length written */
@@ -69,11 +71,6 @@ void xfr_store_counters(xfr_store_counters_t *out);
 #ifdef KARIDNS_UNIT_TEST
 /* tests: the restore thread calls this before every entry it restores (a test holds it there, or stops it); the queue's walk is asked for again */
 extern void (*_Atomic xfr_store_test_restore_hook)(struct zone_db_entry_s *e);
-/* tests: the restore of one entry on the calling thread (what the thread does for it) */
-int  xfr_store_test_restore_one(struct zone_db_entry_s *e);
-/* tests: a pass of the restore thread now, on the calling thread (restores + GC); returns the copies the GC deleted */
-uint64_t xfr_store_test_pass(void);
-void xfr_store_test_reset_counters(void);
 #endif
 
 #endif /* DNS_XFR_STORE_H */

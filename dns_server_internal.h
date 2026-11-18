@@ -502,6 +502,7 @@ struct zone_x_s {
    * catalog's members, 5).  xfr_axfr_once: the next refresh asks for the whole zone (a restored copy whose received settings were not kept, R2) */
   uint8_t exp_state;
   time_t exp_since;
+  bool exp_stopped;                             /* the restore installed it expired (it expired while the server was stopped): the tick says so in its `expired` line */
   _Atomic bool xfr_refreshed;
   _Atomic bool xfr_axfr_once;
   _Atomic(time_t) last_denial_gap_log;          /* 0.7 (audit): when a missing NSEC / NSEC3 proof of this zone was last logged (dns_query_engine.c note_denial_gap()) */

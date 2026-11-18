@@ -1806,7 +1806,10 @@ static int xfr_try_primary_with(void *arg, int idx, tsig_key_t *kst) {
   uint32_t active_serial = ctx->entry ? ctx->entry->serial : 0;
   int axfr_res;
   bool probed_newer = false;
-  if (!ctx_request_ixfr(ctx, p) && active_serial != 0) {
+  /* 0.7 (secondary store R2): a copy restored without the settings its primary had sent asks for the whole zone once, so the SOA check of request-ixfr no is not made: its
+   * "same serial" answer would end the refresh as up to date and the settings would be fetched only when the serial changes (xfr_axfr_once below) */
+  const bool axfr_once = ctx->entry && atomic_load_explicit(&zone_xr(ctx->entry)->xfr_axfr_once, memory_order_relaxed);
+  if (!ctx_request_ixfr(ctx, p) && active_serial != 0 && !axfr_once) {
     /* request-ixfr no: SOA first, and the AXFR only when the primary is ahead */
     int pr = xfr_soa_probe(ctx, p, &master_addr, domain_family, tsig_key_ptr, active_serial, &session);
     logev_post(LOGC_XFER_IN, 1, NULL, 0, "[AXFR] zone %s: request-ixfr no: SOA query to primary %s: %s (theirs %u, ours %u)", ctx->domain, p->ip,
@@ -1840,7 +1843,7 @@ static int xfr_try_primary_with(void *arg, int idx, tsig_key_t *kst) {
   uint8_t ext_ver = p->no_edns ? 0 : xfr_ext_request_version(ext_state);   /* edns no: no OPT, so no Extended AXFR either */
   uint32_t ixfr_serial = probed_newer ? 0 : active_serial;   /* the SOA said the primary is ahead: the whole zone (request-ixfr no) */
   /* 0.7 (secondary store R2): a copy restored without the settings its primary had sent (they are not persisted) asks for the whole zone once, which brings them again */
-  if (ctx->entry && atomic_load_explicit(&zone_xr(ctx->entry)->xfr_axfr_once, memory_order_relaxed)) ixfr_serial = 0;
+  if (axfr_once) ixfr_serial = 0;
   /* (the key's name only, never its secret) */
   logev_post(LOGC_XFER_IN, 1, NULL, 0, "[AXFR] zone %s: asking primary %s#%d (%d of %d) for %s (our serial %u%s), %s%s, Extended AXFR version %u",
              ctx->domain, p->ip, p->port > 0 ? p->port : 53, idx + 1, ctx->nprim, ixfr_serial ? "IXFR" : "AXFR", active_serial,
