@@ -571,6 +571,8 @@ extern void (*_Atomic store_test_commit_hook)(int step);
 extern void (*_Atomic store_test_prewrite_hook)(store_t *s);
 /* the stores opened while this is set start no flusher thread (the writers make the due commits and checkpoints after the mutex) */
 extern _Atomic bool store_test_no_flusher;
+/* COPY mode reads a record into the image's buffer directly, not through the reading thread's buffer (0.7, store_image_read()) */
+extern _Atomic int store_test_rbuf_off;
 #ifdef KARIDNS_UNIT_TEST
 /* SIGKILL the process at the n-th crash point (0 = off); the points lie between every step of a write sequence (in every thread of the store) */
 extern _Atomic long store_test_crash_countdown;
