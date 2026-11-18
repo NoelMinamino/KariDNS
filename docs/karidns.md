@@ -1397,7 +1397,9 @@ CONSUMER) are not stored yet: they still start empty after a restart (see "Datab
   catalog's members are kept until every catalog zone of the view has refreshed once after a start, so that a catalog whose own copy
   could not be used does not take them with it). A change of ownership of a member with the same unique-id (RFC 9432 §5.5) keeps it.
 - **Not stored** (memory only, counted as `xfr.unstorable`): a zone name longer than 245 octets; zones of a store whose 32 views are all
-  used by the database (ERROR at the start); an image over 2 GiB.
+  used by the database (ERROR at the start); an image over 2 GiB; the zones of a view whose name has the same store tag (CRC-32C of the
+  lower-cased name) as an earlier view of the configuration (WARNING `the views 'a' and 'b' map to the same store tag`; rename one of
+  them; `karictl zonestatus` says `Store: not kept`).
 - **The store is the only copy.** A store that is quarantined at the start (damaged superblocks, another format), a store made new and
   `zone-store none` drop every copy and its expire clock: the secondaries then start as before 0.7 (their file or nothing, the expire
   clock from the file's mtime or the first transfer). The start says so (`[Store] secondaries: the store was quarantined: N secondary
@@ -1866,8 +1868,8 @@ For complete configuration syntax, query evaluation flows, and Extended AXFR det
 `KARIDNS_NO_DEFAULT_STORE=1`
 : A test hook (0.7): a `database { }` block without `store` runs without a zone store, as if `/var/db/karidns` did not exist (logged as `the zone store is off: KARIDNS_NO_DEFAULT_STORE=1 ...`); a store the block names is used as before. Only the value `1` counts. The integration tests export it (`tests/lib_proc.sh`, `tests/run_all_suite.sh`), so that their result does not depend on whether the build host has `/var/db/karidns`; the tests of the store name their directory.
 
-`KARIDNS_TEST_XFR_PUT_FAIL=n`, `KARIDNS_TEST_XFR_KILL_BEFORE_PUT=<zone>|1`, `KARIDNS_TEST_STALE_LOG_INTERVAL=s`, `KARIDNS_TEST_STORE_BOOT_ID=n`
-: Test hooks of the secondaries' copies (0.7, `tests/run_secondary_store_test.sh`): the first n puts of a copy fail as if the disk were full; the process kills itself between the install of a transfer of the zone (or of any zone) and the put of its copy; the hourly `secondary-expired` lines come every s seconds; the store is opened as if the host had booted with id n. Not for production.
+`KARIDNS_TEST_XFR_PUT_FAIL=n`, `KARIDNS_TEST_XFR_KILL_BEFORE_PUT=<zone>|1`, `KARIDNS_TEST_STALE_LOG_INTERVAL=s`, `KARIDNS_TEST_STORE_BOOT_ID=n`, `KARIDNS_TEST_XFR_RESTORE_HOLD_MS=ms`, `KARIDNS_TEST_XFR_RESTORE_NET_MS=ms`
+: Test hooks of the secondaries' copies (0.7, `tests/run_secondary_store_test.sh`): the first n puts of a copy fail as if the disk were full; the process kills itself between the install of a transfer of the zone (or of any zone) and the put of its copy; the hourly `secondary-expired` lines come every s seconds; the store is opened as if the host had booted with id n; the restore thread waits ms milliseconds, making no progress, before its first pass; the tick's safety net for a stuck restore fires after ms milliseconds instead of 30 s. They exist only in the test build (`karidns-evict`, `make evict`, and the instrumented build of `make coverage`, compiled with `-DKARIDNS_TEST_EVICT`): the release binary does not read these variables.
 
 `KARIDNS_XFER_MINUTE_SECS=n`
 : A test hook: a "minute" of the transfer time limits is n seconds (1..60); see `max-transfer-time-in` and the related options.

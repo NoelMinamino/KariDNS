@@ -31,11 +31,19 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$DIR/.." && pwd)"
 . "$DIR/lib_proc.sh"
 
-for b in karicheck karidns dag karictl; do
+# the server with the test knobs (KARIDNS_TEST_XFR_*, KARIDNS_TEST_STALE_LOG_INTERVAL, KARIDNS_TEST_STORE_BOOT_ID): they are compiled only into the test build, ./karidns-evict (make evict; ./karidns
+# of `make coverage` has them too), never into the release binary (-DKARIDNS_TEST_EVICT)
+has_hook() { [ -x "$1" ] && grep -q 'KARIDNS_TEST_XFR_RESTORE_HOLD_MS' "$1" 2>/dev/null; }
+for b in karicheck dag karictl; do
     [ -x "$ROOT/$b" ] || make -C "$ROOT" "$b"
 done
+if has_hook "$ROOT/karidns"; then KARIDNS="$ROOT/karidns"; else
+    [ -x "$ROOT/karidns-evict" ] || make -C "$ROOT" karidns-evict
+    KARIDNS="$ROOT/karidns-evict"
+fi
+has_hook "$KARIDNS" || { echo "SKIP: $KARIDNS has no test knobs (make evict)"; exit 0; }
+export ASAN_OPTIONS="detect_leaks=0:abort_on_error=0"      # (the sanitizer build leaks what a SIGKILL'd test never frees; no effect on a build without ASan)
 KARICHECK="$ROOT/karicheck"
-KARIDNS="$ROOT/karidns"
 DAG="$ROOT/dag"
 KARICTL="$ROOT/karictl"
 
@@ -89,6 +97,8 @@ zone gc.test 1 20
 zone d7.test 50 20
 zone m1.test 1 20
 zone m2.test 1 20
+zone ri.test 1 20
+zone h1.test 1 20
 for i in 01 02 03 04 05 06 07 08 09 10 11 12 13 14 15 16 17 18 19 20 21; do zone "s$i.test" 1 4; done
 catalog() { # serial m2-unique-id [extra]
     cat > "$W/p/cat.test.zone" <<EOF
@@ -117,7 +127,7 @@ pzone() { echo "zone \"$1\" { type primary; file \"$W/p/$1.zone\"; allow-transfe
 write_primary() { # [extra zones]
     {
         echo "options { port $PPORT; bind-address { 127.0.0.1; }; pid-file \"none\"; $USER_OPT };"
-        for z in sec.test exp.test file.test gc.test d7.test m1.test m2.test; do pzone "$z" ""; done
+        for z in sec.test exp.test file.test gc.test d7.test m1.test m2.test ri.test h1.test; do pzone "$z" ""; done
         for i in 01 02 03 04 05 06 07 08 09 10 11 12 13 14 15 16 17 18 19 20 21; do pzone "s$i.test" ""; done
         pzone cat.test "catalog-zone yes;"
         pzone cat2.test "catalog-zone yes;"
@@ -156,7 +166,7 @@ start_secondary() {
     i=0
     while ! ctl status > /dev/null 2>&1; do
         i=$((i + 1))
-        [ "$i" -lt 100 ] || fail "the secondary did not start"
+        [ "$i" -lt 200 ] || fail "the secondary did not start"
         kill -0 "$SPID" 2>/dev/null || fail "the secondary exited"
         sleep 0.1
     done
@@ -241,7 +251,8 @@ grep -q "^Store: copy serial 1" "$W/zs.txt" || { cat "$W/zs.txt"; fail "1: zones
 pass "1: restart with the primary down: the copy is answered at once, no transfer"
 q exp.test SOA
 grep -q "status: SERVFAIL" "$W/q.txt" && grep -q "EDE: 24" "$W/q.txt" || fail "2a: exp.test expired while stopped is not SERVFAIL + EDE 24 at once"
-grep -q "\[Zone\] secondary-expired: expired zone 'exp.test.' view '[^']*' expired while stopped at" "$W/s.log" || fail "D9: no 'expired while stopped' line"
+# (the line is the tick's, not the restore thread's: it comes at the first tick after the restore, through the rate limit of the event lines)
+kari_wait_log "$W/s.log" "\[Zone\] secondary-expired: expired zone 'exp.test.' view '[^']*' expired while stopped at" 5 || fail "D9: no 'expired while stopped' line"
 pass "2a: a zone that expired while stopped answers SERVFAIL + EDE 24 from the first query"
 q file.test SOA
 grep -q "status: NOERROR" "$W/q.txt" || fail "3: the up-to-date-only zone lost its expire clock (its file is two days old)"
@@ -312,6 +323,67 @@ start_secondary KARIDNS_TEST_STORE_BOOT_ID=4242
 [ "$(serial_of sec.test)" = 3 ] || fail "10: the copy after a start under another boot id"
 [ "$(xfr store.recovery.rebuilt)" = 1 ] || fail "10: the store did not rebuild its tables under another boot id"
 pass "10: an unclean stop and another boot id: the tables are rebuilt, the copy is restored"
+stop_secondary
+
+# =========================================================================================================== R2 with request-ixfr no
+# A zone with request-ixfr no asks the SOA first and the transfer only when the primary is ahead: a restored copy whose received settings were not kept asks for the whole zone once all the same
+# (the SOA check's "same serial" must not end the refresh as up to date, and the state of the copy keeps its XFR_SF_RX_LOST bit meanwhile)
+[ -n "$PPID_" ] || start_primary
+write_secondary "$STORE" "$(szone ri.test 'request-ixfr no;')"
+start_secondary
+wait_serial ri.test 1 10 || fail "R2/ri: ri.test was not transferred"
+i=0; until ctl zonestatus ri.test | grep -q "settings=primary"; do i=$((i + 1)); [ "$i" -lt 50 ] || fail "R2/ri: the settings of the primary are not in force after the transfer"; sleep 0.2; done
+i=0; until ctl zonestatus ri.test | grep -q "^Store: copy serial 1"; do i=$((i + 1)); [ "$i" -lt 50 ] || fail "R2/ri: the copy was not stored"; sleep 0.2; done
+stop_secondary
+RI0=$(grep -c "transfer of .ri.test/IN.: Extended AXFR started (serial 1)" "$W/p.log" || true)
+start_secondary
+wait_serial ri.test 1 10 || fail "R2/ri: the restored copy is not answered"
+i=0
+while [ "$(grep -c "transfer of .ri.test/IN.: Extended AXFR started (serial 1)" "$W/p.log" || true)" -le "$RI0" ]; do
+    i=$((i + 1)); [ "$i" -lt 100 ] || { grep "ri.test" "$W/p.log" | tail -5; fail "R2/ri: the restored copy of a zone with request-ixfr no did not ask for the whole zone (the SOA check ended the refresh as up to date)"; }
+    sleep 0.2
+done
+i=0; until ctl zonestatus ri.test | grep -q "settings=primary"; do i=$((i + 1)); [ "$i" -lt 50 ] || fail "R2/ri: the settings of the primary are not in force after the restart's whole transfer"; sleep 0.2; done
+stop_secondary
+pass "R2: request-ixfr no: the restored copy asks for the whole zone (the SOA check is skipped) and the settings of the primary are in force again"
+
+# =========================================================================================================== the tick skips what waits for its restore; the safety net
+# KARIDNS_TEST_XFR_RESTORE_HOLD_MS: the restore thread is stalled (no progress) before its first pass.  The workers start after the budget of 5 s (D4) with the entry still pending:
+#  (a) the tick does not refresh it (M4 a: no serial-0 AXFR before the restore decided; M4 b: no transfer that a late restore would overwrite) - the primary is at serial 2, the copy at 1,
+#      and a zone that the tick refreshed would answer serial 2 long before the restore comes; (b) KARIDNS_TEST_XFR_RESTORE_NET_MS: a restore that makes no progress for that long is given up on
+#      by the tick (R2'): ERROR with the count, the zone transfers, and the restore that comes later does not replace the transferred version (RS_HAS_VERSION / the pending bit is gone)
+write_secondary "$STORE" "$(szone h1.test '')"
+start_secondary
+wait_serial h1.test 1 10 || fail "tick: h1.test was not transferred"
+i=0; until ctl zonestatus h1.test | grep -q "^Store: copy serial 1"; do i=$((i + 1)); [ "$i" -lt 50 ] || fail "tick: the copy was not stored"; sleep 0.2; done
+stop_secondary
+zone h1.test 2 20
+kill -HUP "$PPID_"
+sleep 1
+H0=$(grep -c "transfer of .h1.test/IN." "$W/p.log" || true)
+start_secondary KARIDNS_TEST_XFR_RESTORE_HOLD_MS=10000
+ctl zonestatus h1.test | grep -q "^Store: restore pending" || fail "tick: h1.test is not restore pending while the restore is held"
+sleep 2                                                     # (a tick that did not skip the entry would have refreshed it by now: the first tick starts it at once)
+[ "$(grep -c "transfer of .h1.test/IN." "$W/p.log" || true)" = "$H0" ] || fail "tick: the primary was asked for h1.test while its restore was pending"
+[ "$(xfr xfr.restored)" = 0 ] || fail "tick: restored before the hold ended"
+q h1.test SOA
+grep -q "status: NOERROR" "$W/q.txt" && fail "tick: h1.test is answered while its restore is pending and nothing was transferred"
+wait_serial h1.test 2 20 || fail "tick: h1.test was not refreshed after the restore"
+[ "$(xfr xfr.restored)" = 1 ] || fail "tick: the copy was not restored (xfr.restored $(xfr xfr.restored))"
+pass "tick: an entry that waits for its restore is not refreshed (no transfer before the copy is restored), then restored and refreshed"
+stop_secondary
+zone h1.test 3 20
+kill -HUP "$PPID_"
+sleep 1
+start_secondary KARIDNS_TEST_XFR_RESTORE_HOLD_MS=13000 KARIDNS_TEST_XFR_RESTORE_NET_MS=1500
+kari_wait_log "$W/s.log" "the restore of the stored secondaries made no progress for 30 s; 1 zone(s) refresh without their stored copy" 5 || fail "net: no ERROR from the safety net"
+wait_serial h1.test 3 8 || fail "net: h1.test did not transfer after the safety net gave up on the restore"
+[ "$(xfr xfr.restore_timeouts)" = 1 ] || fail "net: xfr.restore_timeouts"
+kari_wait_log "$W/s.log" "\[Store\] secondaries: [0-9]* restored" 15 || fail "net: the held restore never ran"
+sleep 1
+[ "$(serial_of h1.test)" = 3 ] || fail "net: a late restore replaced the transferred version (serial $(serial_of h1.test))"
+[ "$(xfr xfr.restored)" = 0 ] || fail "net: the late restore installed a copy (xfr.restored $(xfr xfr.restored))"
+pass "R2': a stuck restore is given up on by the tick (one ERROR with the count, the zone transfers); the restore that comes late changes nothing"
 stop_secondary
 
 # =========================================================================================================== 7 (D7)

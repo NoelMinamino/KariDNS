@@ -3796,10 +3796,13 @@ static store_t *core_start(const server_config_t *cfg, bool *created_out) {
   o.bad_image = bad_image_hook;                             /* a zone whose image the scrub or the cleaner found damaged is taken out of memory */
   o.create = true;
   o.log = store_log_cb;
+#ifdef KARIDNS_TEST_EVICT
   {
-    const char *bid = getenv("KARIDNS_TEST_STORE_BOOT_ID");  /* (tests/run_secondary_store_test.sh: another boot after an unclean stop, the rebuild of the derived tables) */
+    /* TEST ONLY (karidns-evict, make evict; never a production build): another boot after an unclean stop, the rebuild of the derived tables (tests/run_secondary_store_test.sh) */
+    const char *bid = getenv("KARIDNS_TEST_STORE_BOOT_ID");
     if (bid && *bid) o.boot_id = strtoull(bid, NULL, 10);
   }
+#endif
   store_t *st = NULL;
   bool quarantined = false;
   int r = store_open(g_dir.dirfd, &o, &st);

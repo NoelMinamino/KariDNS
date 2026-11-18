@@ -6851,7 +6851,11 @@ it.
 .IP \(bu 2
 \fBNot stored\fR (memory only, counted as \fBxfr.unstorable\fR): a zone name
 longer than 245 octets; zones of a store whose 32 views are all used by the
-database (ERROR at the start); an image over 2 GiB.
+database (ERROR at the start); an image over 2 GiB; the zones of a view whose
+name has the same store tag (CRC-32C of the lower-cased name) as an earlier view
+of the configuration (WARNING \fBthe views 'a' and 'b' map to the same store
+tag\fR; rename one of them; \fBkarictl zonestatus\fR says \fBStore: not
+kept\fR).
 .IP \(bu 2
 \fBThe store is the only copy.\fR A store that is quarantined at the start
 (damaged superblocks, another format), a store made new and \fBzone\-store

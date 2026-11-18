@@ -1174,13 +1174,18 @@ used as before. Only the value \fB1\fR counts. The integration tests export it
 does not depend on whether the build host has \fB/var/db/karidns\fR; the tests
 of the store name their directory.
 .TP 8
-\fBKARIDNS_TEST_XFR_PUT_FAIL=n\fR, \fBKARIDNS_TEST_XFR_KILL_BEFORE_PUT=<zone>|1\fR, \fBKARIDNS_TEST_STALE_LOG_INTERVAL=s\fR, \fBKARIDNS_TEST_STORE_BOOT_ID=n\fR
+\fBKARIDNS_TEST_XFR_PUT_FAIL=n\fR, \fBKARIDNS_TEST_XFR_KILL_BEFORE_PUT=<zone>|1\fR, \fBKARIDNS_TEST_STALE_LOG_INTERVAL=s\fR, \fBKARIDNS_TEST_STORE_BOOT_ID=n\fR, \fBKARIDNS_TEST_XFR_RESTORE_HOLD_MS=ms\fR, \fBKARIDNS_TEST_XFR_RESTORE_NET_MS=ms\fR
 Test hooks of the secondaries' copies (0.7,
 \fBtests/run_secondary_store_test.sh\fR): the first n puts of a copy fail as if
 the disk were full; the process kills itself between the install of a transfer
 of the zone (or of any zone) and the put of its copy; the hourly
 \fBsecondary\-expired\fR lines come every s seconds; the store is opened as if
-the host had booted with id n. Not for production.
+the host had booted with id n; the restore thread waits ms milliseconds, making
+no progress, before its first pass; the tick's safety net for a stuck restore
+fires after ms milliseconds instead of 30 s. They exist only in the test build
+(\fBkaridns\-evict\fR, \fBmake evict\fR, and the instrumented build of \fBmake
+coverage\fR, compiled with \fB\-DKARIDNS_TEST_EVICT\fR): the release binary does
+not read these variables.
 .TP 8
 \fBKARIDNS_XFER_MINUTE_SECS=n\fR
 A test hook: a "minute" of the transfer time limits is n seconds (1..60); see
