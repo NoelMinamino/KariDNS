@@ -1,4 +1,4 @@
-.TH KARIDNS 8 "2026-11-16" "KariDNS" "KariDNS Manual"
+.TH KARIDNS 8 "2026-11-18" "KariDNS" "KariDNS Manual"
 .\" Generated from docs/karidns.md by man/md2man.pl (make man): edit the Markdown manual, not this page.
 .SH NAME
 karidns \- Authoritative DNS Server Daemon for FreeBSD
@@ -1173,6 +1173,14 @@ used as before. Only the value \fB1\fR counts. The integration tests export it
 (\fBtests/lib_proc.sh\fR, \fBtests/run_all_suite.sh\fR), so that their result
 does not depend on whether the build host has \fB/var/db/karidns\fR; the tests
 of the store name their directory.
+.TP 8
+\fBKARIDNS_TEST_XFR_PUT_FAIL=n\fR, \fBKARIDNS_TEST_XFR_KILL_BEFORE_PUT=<zone>|1\fR, \fBKARIDNS_TEST_STALE_LOG_INTERVAL=s\fR, \fBKARIDNS_TEST_STORE_BOOT_ID=n\fR
+Test hooks of the secondaries' copies (0.7,
+\fBtests/run_secondary_store_test.sh\fR): the first n puts of a copy fail as if
+the disk were full; the process kills itself between the install of a transfer
+of the zone (or of any zone) and the put of its copy; the hourly
+\fBsecondary\-expired\fR lines come every s seconds; the store is opened as if
+the host had booted with id n. Not for production.
 .TP 8
 \fBKARIDNS_XFER_MINUTE_SECS=n\fR
 A test hook: a "minute" of the transfer time limits is n seconds (1..60); see

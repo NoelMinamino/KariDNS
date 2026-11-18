@@ -1,4 +1,4 @@
-.TH KARICTL 8 "2026-11-17" "KariDNS" "KariDNS Manual"
+.TH KARICTL 8 "2026-11-18" "KariDNS" "KariDNS Manual"
 .\" Generated from docs/karictl.md by man/md2man.pl (make man): edit the Markdown manual, not this page.
 .SH NAME
 karictl \- Remote Control and Management Utility for KariDNS
@@ -415,7 +415,17 @@ the store (its serial and id) and \fB(in the zone store, not in memory)\fR, or
 has not read from the database yet. A secondary that applies settings received
 from its primary (Extended AXFR version 3, see karidns(8)) adds
 \fBsettings=primary\fR (and \fBnote: ...\fR when part of them is not in force,
-e.g. a TSIG key the received \fBallow\-transfer\fR names is not defined here).
+e.g. a TSIG key the received \fBallow\-transfer\fR names is not defined here). A
+secondary of karidns.conf or a catalog member (0.7) adds lines: \fBStore: copy
+serial <n>, <bytes> bytes, saved <UTC>\fR (its copy in the zone store; or
+\fBStore: no copy\fR, \fBStore: off\fR without a store or for a database
+secondary, \fBStore: restore pending\fR while the start has not looked at the
+copy yet), \fBLast\-refresh: <UTC>  Last\-attempt: <UTC> [(failed)]  Expires:
+<UTC>\fR, and when the zone is expired \fBExpired: since <UTC> (<duration>),
+serving stale data (serve\-stale)\fR or \fBExpired: since <UTC> (<duration>),
+answering SERVFAIL (serve\-stale no | secondary\-stale\-max <d> reached)\fR
+(karidns(8) "Secondary zones: the copies in the zone store"). \fBkarictl
+store\fR lists the copies as the \fBxfr.*\fR and \fBsecondary.*\fR keys.
 .TP 8
 \fBobservatory [zone [view]]\fR
 Display per-zone statistics for all zones, or only for the given zone (and
