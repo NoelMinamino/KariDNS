@@ -803,7 +803,7 @@ points into (MAP mode)
 \fBstore.journal.lsn\fR, \fB.checkpoint_lsn\fR, \fB.committed_lsn\fR, \fB.bytes\fR, \fB.gen\fR, \fB.max_bytes\fR
 Journal position, last checkpoint, last durable commit, size, generation, the
 size at which a checkpoint is forced (100 MiB: a replay of that takes about a
-second)
+second; 400 MiB while a first fill runs, see \fBstore.journal.boost\fR)
 .TP 8
 \fBstore.journal.bound_bytes\fR, \fB.peak_bytes\fR, \fB.limit_waits\fR, \fB.limit_wait_us\fR, \fB.limit_wait_max_us\fR
 0.7: the bound of the journal (twice \fB.max_bytes\fR), the largest size the
@@ -816,6 +816,25 @@ lock held, and the thread that also answers lookups waits only at four times
 \fB.max_bytes\fR: the journal, the replay after a crash and the clean stop stay
 bounded; a WARNING at most once a minute. \fB.limit_waits\fR stays 0 when the
 disk keeps up
+.TP 8
+\fBstore.journal.boost\fR, \fB.boosts\fR
+0.7: \fB.boost\fR is 1 while a first fill (the manifest pass that had to reserve
+the tables and the index for the zones the loader announces) asks for the larger
+journal, \fB.boosts\fR counts the times it did. Every checkpoint of such a pass
+writes the whole reserved index (10M zones: 430 to 600 MB), so a checkpoint
+every 100 MiB of journal kept the disk busy for the whole pass; while the fill
+runs a checkpoint is forced at 400 MiB instead (a fourth of them), and the bound
+of the journal (\fB.bound_bytes\fR) follows (800 MiB for the pass, 1.6 GiB for
+the thread that also answers lookups). \fB.max_bytes\fR shows the size in force:
+the larger one is used only while an eighth of the free space of the file system
+covers the journal at its hard bound (12.5 GiB free at the default), and an
+unknown free space never raises it; a disk that fills during the fill takes it
+back at the next checkpoint. At the end of the pass, or when it is cut off or
+replaced by the next one, the size is the normal one again and the checkpoint
+that cuts the journal is begun at once. A clean stop is not affected (its
+checkpoint is clean whatever the journal holds); a crash during the first fill
+replays up to 400 MiB (about 4 s) instead of 100 MiB, a crash after it replays
+what it did before
 .TP 8
 \fBstore.checkpoint.count\fR, \fB.last_unix\fR, \fB.last_us\fR, \fB.max_us\fR, \fB.cancelled\fR
 Checkpoints since the open, when the last one ended, how long it took, the
@@ -895,6 +914,18 @@ build ends). The changes the writers made to the index while it was built are
 made on the new one with no lock too, in rounds (0.7); only the last few
 thousand of them are made inside the mutex, with the record that puts the new
 index in
+.TP 8
+\fBstore.index.waits\fR, \fB.wait_us\fR, \fB.wait_max_us\fR, \fB.wait_giveups\fR
+0.7: the waits of the reconcile thread (the pass of the loader) for the build of
+the next index generation. A build begins at 3/8 of the index; when the index is
+past 7/16 before it ends, the pass waits between two groups of entries, with no
+lock held, instead of filling the old index to one half, where the growth would
+be made inside the writer mutex (the build dropped, every zone put in again:
+seconds at millions of zones). The waits (their number, total and longest time)
+and those that ended at their bound (30 s) with the build still running: the
+pass goes on then and the growth inside the mutex is the last resort (a
+WARNING). A first fill that announces its size (the loader's estimate, up to a
+quarter of \fBmemory\-limit\fR) makes its index once and waits for nothing
 .TP 8
 \fBstore.flusher\fR
 1: the store's flusher threads make the commits (every 100 ms while records
