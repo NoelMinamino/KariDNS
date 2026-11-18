@@ -4128,8 +4128,12 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
   }
     if (db_entry) {
         time_t deadline = zone_expire_deadline(db_entry);
-        if (deadline > 0 && time(NULL) > deadline) {
-            bool serve_stale = (cfg_for_ede != NULL && cfg_for_ede->serve_stale);
+        const time_t qnow = deadline > 0 ? time(NULL) : 0;
+        if (deadline > 0 && qnow > deadline) {
+            /* 0.7 (secondary store D9): serve-stale answers with the data (RFC 8767 §4) until secondary-stale-max, when set, has passed after the deadline (RFC 8767 §5: a bounded
+             * stale period); then SERVFAIL + EDE 24 as without serve-stale.  (Only an expired zone gets here: the lookup of the limit is not on the path of a live zone.) */
+            bool serve_stale = zone_expired_serves_stale(cfg_for_ede, zone_cfg_any, zone_vname(db_entry), deadline, qnow);
+            if (serve_stale) atomic_fetch_add_explicit(&g_secondary_stale_answers, 1, memory_order_relaxed);
             if (!serve_stale) {
                 /* R-18: 期限切れのゾーンは答えられない。RFC 8914 §4.25 (24 Invalid Data) が
                  * 「最新のゾーンが古すぎる、または期限切れ」を例に挙げる。EDE 3 (§4.4) は古いデータで

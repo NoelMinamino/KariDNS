@@ -88,6 +88,9 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
 
     parse_xfr_packet(data, size, &standby, &active.ver, &session, "fuzz.example.com.");
     if (sel & 0x10) parse_xfr_packet(data, size, &standby, &active.ver, &session, "fuzz.example.com.");
+    /* 0.7 (secondary store 13): the settings text a version 3 transfer carried goes through the restricted parser, as handle_axfr_event() gives it */
+    if (session.has_settings && session.settings_len <= KARIDNS_SETTINGS_MAX)
+        zone_ext_shared_unref(zone_rx_settings_parse("fuzz.example.com.", session.settings_text, session.settings_len));
 
     zone_arena_destroy(&standby);
     zone_arena_destroy(&active);

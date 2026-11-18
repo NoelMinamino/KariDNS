@@ -317,6 +317,7 @@ enum {
 #define ZV_MAX_ZONE_TTL       (1u << 3)
 #define ZV_SERIAL_METHOD      (1u << 4)
 #define ZV_ROLLBACK_WINDOW    (1u << 5)
+#define ZV_STALE_MAX          (1u << 6)   /* 0.7: secondary-stale-max (planing_0.7.x_secondary_store.md D9) */
 #define ROLLBACK_WINDOW_DEFAULT 3600u    /* seconds: how long the version before the last reload / database install is kept for `karictl rollback` */
 #define ZV_CHK(c)             (1u << (8 + (c)))      /* the check-* option ZC_c is written at this level */
 typedef struct zone_vopts {
@@ -327,6 +328,7 @@ typedef struct zone_vopts {
   uint32_t max_zone_ttl;           /* seconds; 0 = no limit (`unlimited`) */
   uint8_t serial_method;           /* SUM_* */
   uint32_t rollback_window;        /* seconds; 0 = no previous version is kept (rollback-window) */
+  uint32_t stale_max;              /* secondary-stale-max: seconds after the expire deadline that an expired secondary still answers with its data (serve-stale); 0 = no limit */
   uint8_t chk[ZC_N];               /* CHK_FAIL / CHK_WARN / CHK_IGNORE */
   uint8_t zone_check_names;       /* zone { check-names <mode>; }: applies to the zone's own type */
 } zone_vopts_t;
@@ -336,6 +338,7 @@ typedef struct {
   uint32_t max_records, max_per_type, max_types_per_name, max_zone_ttl;
   uint8_t serial_method;
   uint32_t rollback_window;        /* seconds; 0 = off (ROLLBACK_WINDOW_DEFAULT when not written) */
+  uint32_t stale_max;              /* secondary-stale-max; 0 = no limit (the default, D9 b) */
   uint8_t chk[ZC_N];               /* ZC_NAMES_PRIMARY .. : the effective severity, CHK_DEFAULT when not written; check_names: for the zone's type */
   uint8_t check_names;             /* the zone's check-names severity (primary or secondary one, or the zone's own) */
 } zone_veff_t;
@@ -776,6 +779,7 @@ typedef struct {
 #define KARIDNS_DB_HOT_INTERVAL_MAX 86400
 #define KARIDNS_DB_HOT_INTERVAL_DEFAULT 60
 #define KARIDNS_DB_DEFAULT_STORE_DIR "/var/db/karidns/store"   /* the store of a database { } block that names none: made when its parent exists (docs/karidns.md) */
+#define KARIDNS_XFR_STORE_VIEW "_karidns-xfr"                 /* 0.7 (D8): the store view of the secondaries' copies; refused as the name of a configured view */
 #define KARIDNS_DB_STORE_SEGMENT_MIN (1ull << 20)
 #define KARIDNS_DB_STORE_SEGMENT_MAX (4ull << 30)
 #define KARIDNS_DB_STORE_SCRUB_MIN 60
@@ -887,6 +891,11 @@ typedef struct server_config_s {
   control_channel_config_t control;
   dnstap_config_t dnstap;
   database_config_t database;  /* options { database { } }; .enabled == false when absent */
+  /* 0.7 (planing_0.7.x_secondary_store.md D1): options { zone-store "<dir>" | none; } (restart-only): the zone store without a database block (the copies of the secondaries); a synonym of
+   * database { store } (both given and different is an error).  zone_store_set: written; zone_store_none: `none`; zone_store_dir: the directory (NULL with none) */
+  char *zone_store_dir;
+  bool zone_store_none;
+  bool zone_store_set;
   rate_limit_config_t rrl;
   alerts_config_t alerts;        /* options { alerts { } } */
   bool serve_stale;

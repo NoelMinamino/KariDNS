@@ -264,6 +264,7 @@ typedef struct {
   bool no_ext_answer;     /* set when handle_axfr_event() stopped for that reason */
   /* batch 4 (BIND 9.20 zone.c refresh_callback(), zone_xfrdone()) */
   bool serial_behind;     /* the primary's serial is older than ours: "serial number received from primary < ours" -- not a failure, the next primary is asked */
+  bool take_same_serial;  /* 0.7 (secondary store R2): an AXFR of our own serial is taken whole (a restored copy asks once for the settings its primary sends), not "up to date" */
   const xfr_eff_t *eff;   /* the transfer / timer options of the zone (NULL: the SOA timers are stored as received, no time limit) */
   time_t deadline;        /* max-transfer-time-in: the time at which the transfer is given up (0 = none) */
   uint32_t idle_secs;     /* max-transfer-idle-in: the longest wait for the next message (0 = none) */
@@ -496,6 +497,14 @@ struct zone_x_s {
   uint8_t xfr_ext_state;                        /* B8t-2: what the primary speaks (XFR_EXT_*, dns_axfr_ixfr.h); written by the transfer thread only */
   time_t notify_next;                           /* notify-delay: the time before which the next set of NOTIFY messages for the zone is not sent (the control thread only) */
   _Atomic(time_t) last_stale_log_time;
+  /* 0.7 (secondary store D9): the `[Zone] secondary-expired:` events of the control thread's tick (only it writes them): 0 not expired, 1 expired (the event was said), 2 the
+   * secondary-stale-max limit was reached; exp_since is the deadline that passed.  xfr_refreshed: a refresh (transferred or up to date) ended since the start (the GC exemption of a
+   * catalog's members, 5).  xfr_axfr_once: the next refresh asks for the whole zone (a restored copy whose received settings were not kept, R2) */
+  uint8_t exp_state;
+  time_t exp_since;
+  bool exp_stopped;                             /* the restore installed it expired (it expired while the server was stopped): the tick says so in its `expired` line */
+  _Atomic bool xfr_refreshed;
+  _Atomic bool xfr_axfr_once;
   _Atomic(time_t) last_denial_gap_log;          /* 0.7 (audit): when a missing NSEC / NSEC3 proof of this zone was last logged (dns_query_engine.c note_denial_gap()) */
   time_t last_loaded_mtime;
   off_t last_loaded_size;                       /* with the mtime: a reload re-reads a file only when one of them changed (reload_master_zone()) */
@@ -534,6 +543,10 @@ struct zone_db_entry_s {
   uint8_t pooled;                 /* the entry (and the name behind it) is a slot of the entry pool, not a malloc block (zone_entry_free_block()) */
   uint32_t block_bytes;           /* 0.7 (B1): the size of the block create_new_zone_entry() got from the allocator (0: the entry is not from there); never changes */
   uint8_t light;                  /* 0.7 store S5: made by create_light_zone_entry(): no extension from the start, and a writer lock that libthr makes when it is first used */
+  /* 0.7 (planing_0.7.x_secondary_store.md 4.1): the stored copy of this secondary has not been looked at yet: the tick does not refresh it (no serial-0 AXFR before the restore decided, no
+   * transfer whose N+1 a later restore would overwrite with N).  Set at creation only when a restore will run (zone_restore_pending_mark()), cleared on every way out of the restore */
+  _Atomic bool restore_pending;
+  uint8_t xfr_origin;             /* 0.7: where the active version of a secondary came from (XFR_ORIGIN_*), written under writer_lock */
   zone_rcu_t rcu;
   pthread_mutex_t writer_lock;
   _Atomic(uint32_t) serial;
@@ -668,6 +681,30 @@ static inline uint32_t zone_expire_option_value(zone_db_entry_t *e, time_t now) 
   if (left > (time_t)expire && expire > 0) return expire;
   return left > (time_t)UINT32_MAX ? UINT32_MAX : (uint32_t)left;   /* the option is 32 bits (RFC 7314 §3) */
 }
+
+/* ---- 0.7: the copies of the secondaries in the zone store (planing_0.7.x_secondary_store.md; dns_xfr_store.c) ----
+ * The modules that do not link the store (the transfer, the snapshot rebuild, the query path in the unit tests) reach it through g_xfr_ops, which dns_xfr_store.c sets
+ * when the store core runs (NULL: no copies).  g_xfr_store_mode says whether a restore will run: XFRM_WANTED while the supervisor loads the configuration (a store is
+ * configured; the core start clears the bits when it does not open), XFRM_ACTIVE once the restore thread runs with the reserved view, XFRM_OFF otherwise. */
+enum { XFRM_OFF = 0, XFRM_WANTED = 1, XFRM_ACTIVE = 2 };
+enum { XFR_ORIGIN_NONE = 0, XFR_ORIGIN_FILE, XFR_ORIGIN_XFR, XFR_ORIGIN_STORE, XFR_ORIGIN_STORE_FILE };
+enum { XFR_OUT_NONE = 0, XFR_OUT_TRANSFERRED, XFR_OUT_UPTODATE, XFR_OUT_FAILED };
+typedef struct {
+  void (*after_refresh)(zone_db_entry_t *e, int outcome, time_t attempt_at);   /* the end of a refresh (the transfer thread, it holds is_transferring and no lock) */
+  void (*rebuilt)(void);                                                        /* a snapshot of the zones was published (a reconfiguration, a catalog change) */
+} xfr_store_ops_t;
+extern _Atomic(const xfr_store_ops_t *) g_xfr_ops;
+extern _Atomic int g_xfr_store_mode;
+extern _Atomic uint64_t g_xfr_pending;                 /* entries with restore_pending (a gauge) */
+extern _Atomic int64_t g_xfr_restore_progress_ms;     /* CLOCK_MONOTONIC ms of the restore thread's last step (the 30 s safety net of the tick, R2') */
+extern _Atomic uint64_t g_secondary_stale_answers;    /* answers from an expired secondary with EDE 3 (secondary.stale_answers) */
+/* a new secondary entry (a zone { type slave; }, a catalog member): restore_pending when a restore will run */
+void zone_restore_pending_mark(zone_db_entry_t *e);
+/* clear the bit; true when it was set (the gauge follows) */
+bool zone_restore_pending_clear(zone_db_entry_t *e);
+/* secondary-stale-max of the zone (options, view, zone; 0 = no limit) and whether an expired zone answers with its data: serve-stale and not past the limit (RFC 8767 §4, §5) */
+uint32_t zone_secondary_stale_max(const server_config_t *cfg, const zone_config_t *zcfg, const char *view);
+bool zone_expired_serves_stale(const server_config_t *cfg, const zone_config_t *zcfg, const char *view, time_t deadline, time_t now);
 
 /* ---- The zone directory (D1a, design 3.1, 3.2) ----
  * Every view has one directory: the list of the zones it can answer for, one element per zone name.  An element is the

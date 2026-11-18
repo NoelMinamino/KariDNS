@@ -162,6 +162,15 @@ typedef struct store_fill {
 } store_fill_t;
 void store_status_set_fill_fn(bool (*fn)(store_fill_t *out));
 
+/* 0.7 (planing_0.7.x_secondary_store.md 11): the copies of the secondary zones in the reserved view `_karidns-xfr` (dns_xfr_store.c): `xfr.*` and `secondary.*` */
+typedef struct store_xfr {
+  uint64_t records, image_bytes, puts, puts_uptodate, put_nospc, put_errors, state_writes, state_stale, state_skipped, orphans_deleted, unstorable;
+  uint64_t restored, restored_expired, file_won, restore_bad, restore_identity, restore_pending, restore_ms, restore_timeouts, gc_deleted, stale_capped;
+  uint64_t expired_zones, stale_answers, expire_events;
+  int64_t vid;                   /* the store view of the copies (-1: none) */
+} store_xfr_t;
+void store_status_set_xfr_fn(bool (*fn)(store_xfr_t *out));
+
 /* ---- what the server tells this module ---- */
 /* the open store (NULL: "store not configured", state=none) */
 void store_status_bind(store_t *s);

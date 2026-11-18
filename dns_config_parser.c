@@ -1259,6 +1259,8 @@ void free_server_config_fields(server_config_t *cfg) {
   if (cfg->user) { free(cfg->user); cfg->user = NULL; }
   if (cfg->group) { free(cfg->group); cfg->group = NULL; }
   if (cfg->pid_file) { free(cfg->pid_file); cfg->pid_file = NULL; }
+  free(cfg->zone_store_dir);
+  cfg->zone_store_dir = NULL;
   free(cfg->directory);
   cfg->directory = NULL;
   if (cfg->nsid_string) { free(cfg->nsid_string); cfg->nsid_string = NULL; }
@@ -3739,7 +3741,7 @@ static const struct { const char *name; int chk; } k_zv_checks[] = {   /* chk >=
 
 static bool zv_option_name(const char *key) {
   static const char *const names[] = { "max-records", "max-records-per-type", "max-types-per-name", "max-zone-ttl", "serial-update-method",
-                                       "masterfile-format", "check-names", "rollback-window", NULL };
+                                       "masterfile-format", "check-names", "rollback-window", "secondary-stale-max", NULL };
   for (size_t i = 0; names[i]; i++)
     if (strcmp(names[i], key) == 0) return true;
   for (size_t i = 0; i < sizeof(k_zv_checks) / sizeof(k_zv_checks[0]); i++)
@@ -3819,6 +3821,16 @@ static int parse_zv_option(token_ctx_t *ctx, const char *what, const char *key, 
     }
     zv->rollback_window = u;
     zv->set |= ZV_ROLLBACK_WINDOW;
+  } else if (strcmp(key, "secondary-stale-max") == 0) {
+    /* KariDNS 0.7: how long after its expire deadline a secondary still answers with its data under serve-stale (RFC 8767 §5 bounds the stale period of a resolver; the idea is
+     * applied to an expired secondary); a TTL value (1w, 7d, 604800), 0 = no limit (the default) */
+    if (!parse_ttl_strict(tok.value, UINT32_MAX, &u)) {
+      conf_error(ctx, what, "secondary-stale-max: invalid value '%.64s' (expected a number of seconds, or a time with the units s, m, h, d, w; 0 is no limit)", tok.value);
+      free_token(&tok);
+      return -1;
+    }
+    zv->stale_max = u;
+    zv->set |= ZV_STALE_MAX;
   } else if (strcmp(key, "masterfile-format") == 0) {
     /* masterformat_enums: raw, text.  KariDNS reads text zone files only; a raw file read as text would fail in a confusing way (or be
      * taken for something else), so raw is refused here (decision 2026-10-29). */
@@ -4052,6 +4064,7 @@ void zone_vopts_effective(const server_config_t *cfg, const zone_config_t *zone,
     if (w & ZV_MAX_ZONE_TTL) out->max_zone_ttl = l->max_zone_ttl;
     if (w & ZV_SERIAL_METHOD) out->serial_method = l->serial_method;
     if (w & ZV_ROLLBACK_WINDOW) out->rollback_window = l->rollback_window;
+    if (w & ZV_STALE_MAX) out->stale_max = l->stale_max;
     for (int c = 0; c < ZC_N; c++)
       if (w & ZV_CHK(c)) out->chk[c] = l->chk[c];
     done |= l->set;
@@ -7296,6 +7309,7 @@ static int config_apply_directory(token_ctx_t *ctx, server_config_t *config) {
     ok = ok && dir_prefix_path(&config->database.database_file, eff) && dir_prefix_path(&config->database.conninfo_file, eff);
     ok = ok && dir_prefix_path(&config->database.loader_state_file, eff);
     ok = ok && dir_prefix_path(&config->database.store_dir, eff);
+    ok = ok && dir_prefix_path(&config->zone_store_dir, eff);
     if (!ok) goto oom;
     logev_post(LOGC_CONFIG, 2, NULL, 0, "[Config] options { directory \"%s\" }: the relative paths of the configuration are taken from it; the built-in "
                "default_debug is %s", eff, config->logging.debug_file);
@@ -7308,6 +7322,17 @@ static int config_apply_directory(token_ctx_t *ctx, server_config_t *config) {
       path_absolutize(ctx, &config->database.loader_path, "database loader-path", KARIDNS_DB_PATH_MAX) != 0) goto out;
   if (path_absolutize(ctx, &config->database.loader_state_file, "database loader-state-file", KARIDNS_DB_PATH_MAX) != 0) goto out;
   if (path_absolutize(ctx, &config->database.store_dir, "database store", KARIDNS_DB_PATH_MAX) != 0) goto out;
+  if (path_absolutize(ctx, &config->zone_store_dir, "zone-store", KARIDNS_DB_PATH_MAX) != 0) goto out;
+  /* 0.7 (D1): zone-store is a synonym of database { store }: both written and different is an error (the directory is one store) */
+  if (config->zone_store_set && config->database.enabled && (config->database.store_dir || config->database.store_none)) {
+    const bool same = config->zone_store_none ? config->database.store_none
+                                              : (!config->database.store_none && config->database.store_dir && strcmp(config->database.store_dir, config->zone_store_dir) == 0);
+    if (!same) {
+      conf_error(ctx, "options", "zone-store \"%.200s\" and database { store \"%.200s\"; } name different stores (write one of them)",
+                 config->zone_store_none ? "none" : config->zone_store_dir, config->database.store_none ? "none" : config->database.store_dir);
+      goto out;
+    }
+  }
   for (view_config_t *v = config->views; v; v = v->next)
     if (path_absolutize(ctx, &v->database_file, "view database-file", KARIDNS_DB_PATH_MAX) != 0) goto out;
   rc = 0;
@@ -8470,7 +8495,7 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
         char *key = tok.value;
         tok.value = NULL;
         free_token(&tok);
-        if (strcmp(key, "port") == 0 || strcmp(key, "user") == 0 ||
+        if (strcmp(key, "port") == 0 || strcmp(key, "user") == 0 || strcmp(key, "zone-store") == 0 ||
             strcmp(key, "group") == 0 || strcmp(key, "pid-file") == 0 || strcmp(key, "directory") == 0) {
           tok = get_next_token(ctx);
           if (tok.type != TOKEN_STRING) {
@@ -8525,6 +8550,20 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
           } else if (strcmp(key, "pid-file") == 0) {
             if (config->pid_file) free(config->pid_file);
             config->pid_file = val;
+          } else if (strcmp(key, "zone-store") == 0) {
+            /* 0.7 (D1): the directory of the zone store without a database block, or none (restart-only); the copies of the secondaries are kept there */
+            if (val[0] == '\0' || strlen(val) > KARIDNS_DB_PATH_MAX) {
+              conf_error(ctx, "options", "zone-store: an empty or too long directory name (expected a directory or none)");
+              free(key);
+              free(val);
+              return -1;
+            }
+            free(config->zone_store_dir);
+            config->zone_store_dir = NULL;
+            config->zone_store_set = true;
+            config->zone_store_none = strcasecmp(val, "none") == 0;
+            if (config->zone_store_none) free(val);
+            else config->zone_store_dir = val;
           }
         } else if (strcmp(key, "bind-address") == 0) {
           int bind_first_new = config->bind_address_count;
@@ -9111,6 +9150,14 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
                tok.value, KARIDNS_VIEW_NAME_MAX - 1);
         cfg_diag(ctx, DIAG_ERROR, DC_CONF_VIEW_NAME_LENGTH, "View name '%.40s...' is longer than %d characters\n", tok.value,
                 KARIDNS_VIEW_NAME_MAX - 1);
+        free_token(&tok);
+        if (ctx) ctx->error_occurred = true;
+        return -1;
+      }
+      /* 0.7 (planing_0.7.x_secondary_store.md D8): the store keeps the secondaries' copies in a view of this name; no configured view may have it */
+      if (strcasecmp(tok.value, KARIDNS_XFR_STORE_VIEW) == 0) {
+        syslog(LOG_ERR, "[Config] View name '%s' is reserved (the zone store keeps the copies of the secondary zones under it); rejecting configuration", tok.value);
+        cfg_diag(ctx, DIAG_ERROR, DC_CONF_VIEW_NAME_LENGTH, "View name '%s' is reserved (the zone store keeps the copies of the secondary zones under it)\n", tok.value);
         free_token(&tok);
         if (ctx) ctx->error_occurred = true;
         return -1;

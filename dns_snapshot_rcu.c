@@ -1225,8 +1225,39 @@ static void zone_x_release(zone_x_t *x) {
   free(x);
 }
 
+/* ---- 0.7: the copies of the secondaries in the zone store (dns_server_internal.h; dns_xfr_store.c) ---- */
+_Atomic(const xfr_store_ops_t *) g_xfr_ops;
+_Atomic int g_xfr_store_mode;
+_Atomic uint64_t g_xfr_pending;
+_Atomic int64_t g_xfr_restore_progress_ms;
+_Atomic uint64_t g_secondary_stale_answers;
+
+void zone_restore_pending_mark(zone_db_entry_t *e) {
+  if (!e || atomic_load_explicit(&g_xfr_store_mode, memory_order_acquire) == XFRM_OFF) return;
+  if (!atomic_exchange_explicit(&e->restore_pending, true, memory_order_acq_rel)) atomic_fetch_add_explicit(&g_xfr_pending, 1, memory_order_relaxed);
+}
+bool zone_restore_pending_clear(zone_db_entry_t *e) {
+  if (!e || !atomic_exchange_explicit(&e->restore_pending, false, memory_order_acq_rel)) return false;
+  atomic_fetch_sub_explicit(&g_xfr_pending, 1, memory_order_relaxed);
+  return true;
+}
+
+uint32_t zone_secondary_stale_max(const server_config_t *cfg, const zone_config_t *zcfg, const char *view) {
+  zone_veff_t v;
+  zone_vopts_effective(cfg, zcfg, view, &v);
+  return v.stale_max;
+}
+/* RFC 8767 §4 (serve stale data when the authoritative answer cannot be had) and §5 (bound the stale period), written for resolvers; KariDNS applies them to a secondary whose
+ * expire timer ran out (RFC 1034 §4.3.5): serve-stale yes answers with the data and EDE 3, until secondary-stale-max (when set) has passed after the deadline */
+bool zone_expired_serves_stale(const server_config_t *cfg, const zone_config_t *zcfg, const char *view, time_t deadline, time_t now) {
+  if (!cfg || !cfg->serve_stale) return false;
+  const uint32_t lim = zone_secondary_stale_max(cfg, zcfg, view);
+  return lim == 0 || now - deadline <= (time_t)lim;
+}
+
 void free_zone_db_entry(zone_db_entry_t *entry) {
   if (!entry) return;
+  (void)zone_restore_pending_clear(entry);          /* 0.7: a secondary that leaves before its restore (the gauge) */
   /* (an outbound transfer holds a reference of its own, xfr_entry_hold(): no transfer runs on an entry that is freed) */
   zone_prev_release_on_free(entry);                 /* the version kept for karictl rollback goes with the entry */
   pthread_mutex_destroy(&entry->writer_lock);
@@ -2782,6 +2813,7 @@ reload_result_t reload_master_zone(zone_db_entry_t *entry, zone_config_t *zcfg) 
   if (entry->is_secondary && root_st.st_mtime != 0) {
     atomic_store_explicit(&entry->last_successful_transfer, (time_t)root_st.st_mtime, memory_order_release);
   }
+  if (entry->is_secondary) entry->xfr_origin = XFR_ORIGIN_FILE;      /* 0.7: the file's version (D7 compares it with the stored copy; never written to the file) */
   pthread_mutex_unlock(&entry->writer_lock);
   syslog(LOG_NOTICE, "[Zone] Reload successful for '%s'", entry->domain);
   {
@@ -7439,6 +7471,7 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
                         ixfr_history_set_depth(entry, ixfr_history_effective(active_config, z));
                         entry->kind = zone_kind_from_type(z->type);
                         entry->is_secondary = (entry->kind == ZONE_KIND_SECONDARY);
+                        if (entry->is_secondary) zone_restore_pending_mark(entry);    /* 0.7: its stored copy is looked at before the first refresh (4.1) */
                     }
                     if (entry && z->file) {
                         reload_master_zone(entry, z);
@@ -7720,6 +7753,7 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
             entry->source = ZONE_SRC_CATALOG;
             entry->kind = ZONE_KIND_SECONDARY;
             entry->is_secondary = true;
+            zone_restore_pending_mark(entry);         /* 0.7: the member's stored copy is looked at before its first refresh (planing_0.7.x_secondary_store.md 4.1, 7) */
             if (added_members[i].group_count > 0) {
                 mx->groups = calloc(added_members[i].group_count, sizeof(char*));
                 if (mx->groups) {
@@ -7903,6 +7937,12 @@ zone_db_snapshot_t *rebuild_zone_db_snapshot(
      * nothing; the alias thread is asked after the publish, so that its scan sees the snapshot.  A rebuild is a reconfiguration or a catalog change, not a
      * per-zone event, so the scan is asked for without looking for ALIAS records first. */
     alias_notify();
+
+    /* 0.7 (secondary store 3.4, M4 d): the hook only asks the restore thread for a pass (the new secondaries' copies, the GC of the ones that left); nothing of the store is done here */
+    {
+        const xfr_store_ops_t *xo = atomic_load_explicit(&g_xfr_ops, memory_order_acquire);
+        if (xo && xo->rebuilt) xo->rebuilt();
+    }
 
     if (old_snap) gc_start_pending();
 

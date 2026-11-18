@@ -4574,7 +4574,7 @@ static uint64_t emergency_free_locked(store_t *s) {
 }
 
 /* store_put with a full disk: try, clean and try again (at most once a second), then keep the zone without an image. */
-static int put_stored_locked(store_t *s, uint16_t view, const char *name, size_t len, const store_meta_t *meta, const void *image, size_t ilen, uint32_t *zid) {
+static int put_stored_locked(store_t *s, uint16_t view, const char *name, size_t len, const store_meta_t *meta, const void *image, size_t ilen, unsigned pflags, uint32_t *zid) {
   int r = put_locked(s, view, name, len, meta, image, ilen, STORE_STATE_STORED, zid, NULL);
   s->prew = NULL;                                     /* (a record written ahead is for the first try only) */
   if (!is_nospc(r)) return r;
@@ -4585,7 +4585,9 @@ static int put_stored_locked(store_t *s, uint16_t view, const char *name, size_t
     r = put_locked(s, view, name, len, meta, image, ilen, STORE_STATE_STORED, zid, NULL);
     if (!is_nospc(r)) return r;
   }
-  if (s->o.no_degrade) return r;
+  /* 0.7 (STORE_PUT_NO_DEGRADE, a secondary's copy): no KNOWN fallback.  A STORED put_locked() that failed wrote no journal record (its ops are only in the builder, which the next
+   * call resets; release_old_record() is an op of the record that was not written), so the zone's old record and its image are as they were; the store is not marked degraded */
+  if (s->o.no_degrade || (pflags & STORE_PUT_NO_DEGRADE)) return r;
   int r2 = put_locked(s, view, name, len, meta, NULL, 0, STORE_STATE_KNOWN, zid, NULL);
   if (r2 < 0) return r2;
   atomic_fetch_add_explicit(&s->n_degraded, 1, memory_order_relaxed);
@@ -4601,6 +4603,10 @@ static int check_name_args(const store_t *s, uint16_t view, size_t nlen, const s
 
 int store_put(store_t *s, uint16_t view, const char *name, size_t len, const store_meta_t *meta, const void *image,
               size_t image_len, uint32_t *zid) {
+  return store_put_ex(s, view, name, len, meta, image, image_len, 0, zid);
+}
+int store_put_ex(store_t *s, uint16_t view, const char *name, size_t len, const store_meta_t *meta, const void *image,
+                 size_t image_len, unsigned flags, uint32_t *zid) {
   if (!s || !name || !meta || !image || image_len == 0 || image_len > 0x7fffffffu) return -EINVAL;
   ST_FAULT("put", STORE_NONE);
   int r = check_name_args(s, view, len, meta);
@@ -4613,7 +4619,7 @@ int store_put(store_t *s, uint16_t view, const char *name, size_t len, const sto
   bool locked = false;
   if ((r = wr_lock(s)) < 0) goto out;
   s->prew = pre ? &pw : NULL;
-  r = put_stored_locked(s, view, name, len, meta, image, image_len, zid);
+  r = put_stored_locked(s, view, name, len, meta, image, image_len, flags, zid);
   s->prew = NULL;
   if (r < 0) { if (!is_nospc(r)) note_error(s, r); } else { note_ok(s); r = post_write(s); }       /* (a full disk was counted where it was found) */
   my = s->lsn;
@@ -4890,6 +4896,51 @@ int store_set_stamp(store_t *s, uint32_t zid, uint64_t gen, uint64_t time, uint1
   return wr_done(s, r);
 }
 
+/* 0.7 (a secondary's copy, planing_0.7.x_secondary_store.md 2.4): the digest, the settings id and the flags of the zone (view, name), only when its serial is expect_serial.  The zone is looked up
+ * by name under the writer mutex, so a zone id that a delete freed and a put gave to another zone meanwhile is never written; the image, the stamp and the state stay.  One journal record. */
+int store_set_digest(store_t *s, uint16_t view, const char *name, size_t len, uint32_t expect_serial, uint32_t settings, const uint8_t digest[STORE_DIGEST_LEN], uint16_t set,
+                     uint16_t clear) {
+  if (!s || !name || !digest || len > STORE_NAME_MAX || view >= atomic_load_explicit(&s->nviews, memory_order_relaxed)) return -EINVAL;
+  ST_FAULT("set_digest", STORE_NONE);
+  uint8_t fn[256];
+  for (size_t i = 0; i < len; i++) fn[i] = st_lc((uint8_t)name[i]);
+  int r = wr_lock(s);
+  if (r < 0) return r;
+  ixgen_t *ix = atomic_load_explicit(&s->ix, memory_order_relaxed);
+  const uint32_t zid = ix_lookup(s, ix, view, fn, len, st_hash_name(s, view, fn, len));
+  r64_t rt, rc;
+  if (zid == STORE_NONE || (uint64_t)zid >= st_zt_cap(s) || zt_state_fast(s, zid) == STORE_STATE_FREE) r = -ENOENT;
+  else if ((r = zrec_read_locked(s, zid, &rt, &rc)) == 0) {
+    zt_t t;
+    zc_t c;
+    zt_unpack(&rt, &t);
+    zc_unpack(&rc, &c);
+    const uint16_t nf = (uint16_t)((t.flags | set) & ~clear);
+    if (t.state == STORE_STATE_FREE) r = -ENOENT;
+    else if (t.serial != expect_serial) r = -ESTALE;
+    else if (nf != t.flags || t.settings != settings || memcmp(c.digest, digest, STORE_DIGEST_LEN) != 0) {
+      jb_t *j = &s->jb;
+      jb_reset(j);
+      int64_t dr = ((nf & STORE_F_REJECTED_NEW) ? 1 : 0) - ((t.flags & STORE_F_REJECTED_NEW) ? 1 : 0);
+      int64_t dn = ((nf & STORE_F_NONSTORE) ? 1 : 0) - ((t.flags & STORE_F_NONSTORE) ? 1 : 0);
+      t.flags = nf;
+      t.settings = settings;
+      memcpy(c.digest, digest, STORE_DIGEST_LEN);
+      zt_pack(&t, &rt);
+      zc_pack(&c, &rc);
+      zrec_seal(&rt, &rc);
+      if ((r = jb_zrec(j, zid, &rt, &rc)) == 0 && dr != 0) {
+        r = jb_vadd(s, j, V_REJECTED, dr);
+        if (r == 0) r = jb_vadd(s, j, V_VIEW(t.view, 2), dr);
+      }
+      if (r == 0 && dn != 0) r = jb_vadd(s, j, V_NONSTORE, dn);
+      if (r == 0) r = journal_commit_apply(s);
+    }
+  }
+  if (r < 0 && r != -ENOENT && r != -ESTALE) note_error(s, r); else if (r == 0) { note_ok(s); r = post_write(s); }
+  return wr_done(s, r);
+}
+
 int store_view_add(store_t *s, const char *name) {
   if (!s || !name || !*name || strlen(name) > STORE_VIEW_NAME_MAX) return -EINVAL;
   int r = wr_lock(s);
@@ -5065,7 +5116,10 @@ static void scrub_note_bad_image(store_t *s, uint32_t z, const store_zone_t *zz,
   if (r == 0) {
     bad_note(s, z);
     s->sc_p_bad_img++;
-    st_log(s, 4, "store: scrub: the image of zone '%s' (view %u) is damaged (%s); the zone is read from the database again", zz->name, (unsigned)zz->view, why);
+    if (zz->flags & STORE_F_XFR)            /* (0.7, 2.2 W6: a secondary's copy is not read from a database: its next refresh stores it again) */
+      st_log(s, 4, "store: scrub: the image of the secondary's stored copy %s (view %u) is damaged (%s); it is stored again by the next refresh", zz->name, (unsigned)zz->view, why);
+    else
+      st_log(s, 4, "store: scrub: the image of zone '%s' (view %u) is damaged (%s); the zone is read from the database again", zz->name, (unsigned)zz->view, why);
   }
 }
 

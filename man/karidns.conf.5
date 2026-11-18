@@ -627,6 +627,26 @@ returned a shorter EDNS EXPIRE value, RFC 7314), keep answering from the stale
 data (with EDE 3, Stale Answer). With \fBno\fR such queries get SERVFAIL with
 EDE 24 (Invalid Data, RFC 8914 \[u00A7]4.25).
 .TP 8
+\fBsecondary\-stale\-max <duration>;\fR
+\fIDefault:\fR \fB0\fR (no limit)
+.br
+\fIDescription:\fR 0.7: how long after its expire deadline a secondary still
+answers from its data under \fBserve\-stale\fR (a TTL value: \fB3d\fR, \fB1w\fR,
+seconds); past it the zone answers SERVFAIL with EDE 24 although
+\fBserve\-stale\fR is on (the data is kept). RFC 8767 \[u00A7]5 suggests a
+maximum stale timer of 1 to 3 days for a resolver's stale data. Also in
+\fBview\fR and \fBzone\fR. See "Secondary zones: the copies in the zone store".
+.TP 8
+\fBzone\-store "<dir>" | none;\fR
+\fIDefault:\fR \fB/var/db/karidns/store\fR when \fB/var/db/karidns\fR exists and
+there is a database block or a secondary zone; else none
+.br
+\fIDescription:\fR 0.7, restart only: the zone store without a database block,
+for the copies of the secondary zones (a synonym of \fBdatabase { store }\fR;
+both written and different is an error). A directory that cannot be used is an
+ERROR and a start without the store (only with a database block is it a refused
+start). See "Secondary zones: the copies in the zone store".
+.TP 8
 \fBnsid "<string>";\fR
 \fIDefault:\fR not set
 .br
@@ -2646,6 +2666,9 @@ supported. Limits: a named \fBacl { }\fR block, a \fBremote\-servers\fR /
 \fBprimaries\fR list and the settings of a database zone are global and can name
 only global keys.
 .SS view \(dq<name>\(dq { ... }
+The name \fB_karidns\-xfr\fR is reserved (0.7: the zone store keeps the copies
+of the secondary zones under it) and refused as the name of a view (\fBkaricheck
+conf\fR reports it).
 .TP 8
 \fBmatch\-clients { <acl>; ... };\fR
 Clients that use this view: an address match list (addresses, prefixes,
@@ -5991,14 +6014,16 @@ options of the view and of \fBoptions\fR (timers,
 \fBtransfer\-source\fR, ...) apply; a master's \fBsource\fR cannot be written in
 the settings text.
 .PP
-\fBData lives in memory only.\fR PowerDNS writes what a slave transfers into the
-database; KariDNS does not. After a restart of \fBkaridns\fR a \fBSLAVE\fR zone
-is empty until its first transfer, and the rows of \fBrecords\fR of a
-\fBSLAVE\fR zone (a copy PowerDNS made) are ignored. A restart of the
-\fBloader\fR costs nothing: the loader compares the settings of every zone with
-what the Backend has (the digest of a secondary covers its settings text,
-profile and kind, not its data) and sends nothing for an unchanged zone, so no
-zone is transferred again.
+\fBData lives in memory only\fR (database secondaries; the secondaries of
+karidns.conf and their catalog members keep a copy in the zone store since 0.7,
+see "Secondary zones: the copies in the zone store"). PowerDNS writes what a
+slave transfers into the database; KariDNS does not. After a restart of
+\fBkaridns\fR a \fBSLAVE\fR zone is empty until its first transfer, and the rows
+of \fBrecords\fR of a \fBSLAVE\fR zone (a copy PowerDNS made) are ignored. A
+restart of the \fBloader\fR costs nothing: the loader compares the settings of
+every zone with what the Backend has (the digest of a secondary covers its
+settings text, profile and kind, not its data) and sends nothing for an
+unchanged zone, so no zone is transferred again.
 .PP
 \fBChanges.\fR A change of \fBdomains.master\fR, of \fBAXFR\-MASTER\-TSIG\fR, of
 the ACL metadata or of the profile is applied by the next reload (\fBkarictl
@@ -6347,22 +6372,25 @@ between views.
 .br
 \fIDescription:\fR Zone file. For a secondary zone the file is optional: if it
 exists it is loaded at startup as the initial data, and the zone is then
-refreshed from the primary. Transferred data is kept in memory only and is never
-written to the file, so after a restart a secondary serves the file's data (or
-nothing) until its first transfer. Ignored (with a warning) for \fBforward\fR
-and \fBprogram\fR zones. Records whose owner is not at or below the zone name
-(out-of-zone data, including address records for name servers outside the zone)
-are not loaded; each is logged as "ignoring out-of-zone data", as BIND does (RFC
-1034 \[u00A7]4.2). A secondary likewise skips and logs out-of-zone records
-received in a transfer instead of rejecting the transfer. It does reject a
-transfer that has a record after the final SOA in the same message (RFC 5936
-\[u00A7]2.2), one that ends without a SOA at the apex of the zone, and one with
-records of the extension class (65302) when the primary did not answer the
-Extended AXFR option. A record that the zone file parser accepts but whose RDATA
-cannot be encoded for its type (for example a WKS port name that is not in the
-built-in service table) is also left out with a warning ("its RDATA cannot be
-encoded"); the rest of the zone is served and transferred. \fBkaricheck\fR
-reports such a record as an error.
+refreshed from the primary. Transferred data is never written to the file; since
+0.7 it is kept in the zone store, and at a restart the stored copy is served
+unless the file is newer than the copy and has a greater serial (see "Secondary
+zones: the copies in the zone store"; with \fBzone\-store none\fR a restart
+serves the file's data, or nothing, until the first transfer, as
+before). Ignored (with a warning) for \fBforward\fR and \fBprogram\fR
+zones. Records whose owner is not at or below the zone name (out-of-zone data,
+including address records for name servers outside the zone) are not loaded;
+each is logged as "ignoring out-of-zone data", as BIND does (RFC 1034
+\[u00A7]4.2). A secondary likewise skips and logs out-of-zone records received
+in a transfer instead of rejecting the transfer. It does reject a transfer that
+has a record after the final SOA in the same message (RFC 5936 \[u00A7]2.2), one
+that ends without a SOA at the apex of the zone, and one with records of the
+extension class (65302) when the primary did not answer the Extended AXFR
+option. A record that the zone file parser accepts but whose RDATA cannot be
+encoded for its type (for example a WKS port name that is not in the built-in
+service table) is also left out with a warning ("its RDATA cannot be encoded");
+the rest of the zone is served and transferred. \fBkaricheck\fR reports such a
+record as an error.
 .TP 8
 \fBfile\-format bind|tinydns;\fR
 \fIApplies to:\fR master
@@ -6753,6 +6781,124 @@ after \fBconnect()\fR: lowers the send MSS only, for the same FreeBSD reason as
 above
 T}
 .TE
+.SS Secondary zones: the copies in the zone store (0.7)
+A secondary keeps what it transferred in the zone store, so that a restart
+serves the last good copy at once (also with the primary down) and its SOA
+timers carry across the restart. This covers the zones of karidns.conf (\fBtype
+slave;\fR / \fBtype secondary;\fR, with or without \fBfile\fR), catalog zones
+that are secondaries and their member zones (RFC 9432). The secondaries of the
+database (\fBdomains.type\fR SLAVE and CONSUMER) are not stored yet: they still
+start empty after a restart (see "Database zone types").
+.IP \(bu 2
+\fBWhere.\fR In the store directory (\fBoptions { zone\-store "<dir>"; }\fR, or
+the \fBstore\fR of the database block; both written and different is an error),
+in a store view of its own named \fB_karidns\-xfr\fR; that name is reserved and
+refused as the name of a view. Without a \fBzone\-store\fR statement and without
+a database block the default directory \fB/var/db/karidns/store\fR is used when
+\fB/var/db/karidns\fR exists and the configuration has a secondary
+zone. \fBzone\-store none;\fR keeps the secondaries in memory only, as before
+0.7. A \fBzone\-store\fR of a server without a database block that cannot be
+used is an ERROR and the server starts without it (memory only); with a database
+block an unusable named directory refuses the start, as before. No file outside
+that directory is written (Capsicum: everything is beneath the directory the
+Frontend opened).
+.IP \(bu 2
+\fBWhat.\fR The frozen image of the version the zone serves and a 32-byte state:
+who the zone is (its kind, its name, the view, a member's unique-id), a digest
+of its primaries, the last successful refresh, the expire deadline and the last
+attempt (unix seconds as 32 bits: until 2106). A transfer stores image and state
+in one write; an up-to-date answer writes the state alone when the store holds
+the copy of that serial, otherwise the whole image (so a zone that came from
+\fBfile\fR and never changes is stored too); a failure writes only the attempt
+time. When the disk is full the copy stored before and its state are kept
+(WARNING, \fBxfr.put_nospc\fR); the next refresh tries again. The copy is
+written after the version is in service: a crash in between loses that transfer
+only.
+.IP \(bu 2
+\fBStart.\fR Every secondary waits for the restore of its copy before its first
+refresh (no transfer starts before it is decided). The restore installs the copy
+when the zone has no data, or when the copy beats the zone's \fBfile\fR: \fBthe
+file wins only when its mtime is newer than the time the copy was saved and its
+serial is greater (RFC 1982); otherwise the copy is served\fR (a retransfer to a
+lower serial is not undone by an old file with a higher serial). The server
+never writes the file. The serial and the timers come from the copy's SOA (held
+to \fBmin\-refresh\-time\fR and the other limits of the configuration in force);
+the last successful refresh and the expire deadline come from the state: \fBa
+restart does not reset the expire clock\fR (RFC 1034 \[u00A7]4.3.5; an EXPIRE
+option of the primary, RFC 7314 \[u00A7]4, is kept as such). A zone that expired
+while the server was stopped starts expired (SERVFAIL + EDE 24, or the stale
+data with EDE 3 under \fBserve\-stale\fR) and is refreshed at once; the EXPIRE
+option given to downstream secondaries is the time left (RFC 7314
+\[u00A7]3). The first refresh after a restore happens at the first tick (NOTIFYs
+sent while the server was stopped are lost, RFC 1996), except after a recent
+failed attempt (then at the retry time). Primaries that changed since the copy
+was stored: the copy is served and the zone refreshed at once. A copy of another
+zone (another view of the same name tag, another kind, a member with a new
+unique-id, RFC 9432 \[u00A7]5.4) is deleted; a copy that is damaged is not used
+(it is stored again by the next refresh). Settings the primary sent with the
+zone (Extended AXFR version 3) are not stored: the first refresh after a restore
+asks for the whole zone once, which brings them again. The server lets the
+queries in after the restore, or after 5 s at the most (the rest goes on in the
+background); if the restore makes no progress for 30 s the zones that still wait
+refresh without their copy (ERROR, \fBxfr.restore_timeouts\fR).
+.IP \(bu 2
+\fBRemoval.\fR A zone that leaves the configuration, changes to another type or
+leaves its catalog loses its copy (the copies of a catalog's members are kept
+until every catalog zone of the view has refreshed once after a start, so that a
+catalog whose own copy could not be used does not take them with it). A change
+of ownership of a member with the same unique-id (RFC 9432 \[u00A7]5.5) keeps
+it.
+.IP \(bu 2
+\fBNot stored\fR (memory only, counted as \fBxfr.unstorable\fR): a zone name
+longer than 245 octets; zones of a store whose 32 views are all used by the
+database (ERROR at the start); an image over 2 GiB; the zones of a view whose
+name has the same store tag (CRC-32C of the lower-cased name) as an earlier view
+of the configuration (WARNING \fBthe views 'a' and 'b' map to the same store
+tag\fR; rename one of them; \fBkarictl zonestatus\fR says \fBStore: not
+kept\fR).
+.IP \(bu 2
+\fBThe store is the only copy.\fR A store that is quarantined at the start
+(damaged superblocks, another format), a store made new and \fBzone\-store
+none\fR drop every copy and its expire clock: the secondaries then start as
+before 0.7 (their file or nothing, the expire clock from the file's mtime or the
+first transfer). The start says so (\fB[Store] secondaries: the store was
+quarantined: N secondary zone(s) start without their copy\fR, ERROR).
+.IP \(bu 2
+\fBA primary that went back to a lower serial\fR (a new primary): the zone keeps
+its serial across a restart and refuses the lower one as before; \fBkarictl
+retransfer <zone>\fR takes the primary's zone (and its copy is the one stored
+from then on).
+.IP \(bu 2
+\fBExpired zones.\fR \fBserve\-stale yes\fR (the default) answers an expired
+secondary from its data with EDE 3; since the copy survives a restart, this can
+be data that expired long ago. \fBsecondary\-stale\-max <duration>;\fR (options,
+view, zone; default 0 = no limit) ends that: a zone whose deadline is more than
+that in the past answers SERVFAIL + EDE 24 even with \fBserve\-stale\fR (the
+copy is kept as the base of the next transfer). RFC 8767 \[u00A7]5 suggests a
+maximum stale timer of "between 1 and 3 days" for resolvers; KariDNS applies the
+idea to an expired secondary and leaves the choice to the operator. While a
+secondary is expired the log has lines with the fixed prefix \fB[Zone]
+secondary\-expired:\fR and a stable event token (an interface for log monitors;
+the rest of the line may gain fields): \fBexpired\fR (WARNING, when the deadline
+passes, \fBexpired while stopped\fR at a restore), \fBstill\-expired\fR
+(WARNING, every hour), \fBstale\-limit\fR (ERROR, once, when
+\fBsecondary\-stale\-max\fR is reached), \fBrefreshed\fR (NOTICE, the first
+successful refresh after it), and \fBsummary\fR (WARNING, hourly, instead of the
+per-zone hourly lines when more than 20 zones are expired). At most 20 event
+lines a minute; the others are counted in the next summary (\fBN event line(s)
+suppressed\fR).
+.IP \(bu 2
+\fBStatus.\fR \fBkarictl zonestatus <zone>\fR of a secondary adds \fBStore: copy
+serial N, B bytes, saved <UTC>\fR (or \fBno copy\fR, \fBoff\fR, \fBrestore
+pending\fR), \fBLast\-refresh: ... Last\-attempt: ... (failed) Expires: ...\fR,
+and when it is expired \fBExpired: since <UTC> (<duration>), serving stale data
+(serve\-stale)\fR or \fB..., answering SERVFAIL (serve\-stale no |
+secondary\-stale\-max <d> reached)\fR. \fBkarictl store\fR has the \fBxfr.*\fR
+keys (records, image bytes, puts, puts of up-to-date zones, puts without room,
+state writes, restores, file won, damaged, identity mismatches, pending, the
+restore time, GC deletions, \fBxfr.stale_capped\fR) and
+\fBsecondary.expired_zones\fR, \fBsecondary.stale_answers\fR,
+\fBsecondary.expire_events\fR.
 .SS Secondary zones: Extended AXFR version 3 and the settings of the primary (milestone B8t-2)
 Between two KariDNS servers the transfer carries more than the RRs (EDNS option
 65153, see "Extended AXFR" in

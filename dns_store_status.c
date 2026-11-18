@@ -162,6 +162,8 @@ void store_status_set_extra_fn(bool (*fn)(store_extra_t *out)) { atomic_store_ex
 void store_status_set_recon_fn(bool (*fn)(store_recon_t *out)) { atomic_store_explicit(&g_recon_fn, fn, memory_order_release); }
 void store_status_set_lookup_fn(bool (*fn)(store_lookup_t *out)) { atomic_store_explicit(&g_lookup_fn, fn, memory_order_release); }
 void store_status_set_fill_fn(bool (*fn)(store_fill_t *out)) { atomic_store_explicit(&g_fill_fn, fn, memory_order_release); }
+static bool (*_Atomic g_xfr_fn)(store_xfr_t *);
+void store_status_set_xfr_fn(bool (*fn)(store_xfr_t *out)) { atomic_store_explicit(&g_xfr_fn, fn, memory_order_release); }
 
 /* ------------------------------------------------------------------------------------------------------------------------------ */
 /* the entry list                                                                                                                 */
@@ -175,7 +177,7 @@ typedef struct {
   uint64_t u;
   char s[104];
 } ent_t;
-#define MAX_ENT 800
+#define MAX_ENT 900
 typedef struct {
   ent_t *e;
   unsigned n;
@@ -421,6 +423,38 @@ static void add_memory(list_t *l) {
   U("store.memory.backend_limit_bytes", m.backend_limit);
   U("store.memory.loader_limit_bytes", m.loader_limit);
   add_s(l, "store.memory.level", ma_level_name(m.level));
+}
+
+/* 0.7: the copies of the secondaries (the `secondaries:` block of the text form is the xfr section) */
+static void add_xfr(list_t *l) {
+  bool (*fn)(store_xfr_t *) = atomic_load_explicit(&g_xfr_fn, memory_order_acquire);
+  store_xfr_t x;
+  if (!fn || !fn(&x)) return;
+  add_s(l, "xfr.view", x.vid >= 0 ? "_karidns-xfr" : "none");
+  U("xfr.records", x.records);
+  U("xfr.image_bytes", x.image_bytes);
+  U("xfr.puts", x.puts);
+  U("xfr.puts_uptodate", x.puts_uptodate);
+  U("xfr.put_nospc", x.put_nospc);
+  U("xfr.put_errors", x.put_errors);
+  U("xfr.state_writes", x.state_writes);
+  U("xfr.state_stale", x.state_stale);
+  U("xfr.state_skipped", x.state_skipped);
+  U("xfr.orphans_deleted", x.orphans_deleted);
+  U("xfr.unstorable", x.unstorable);
+  U("xfr.restored", x.restored);
+  U("xfr.restored_expired", x.restored_expired);
+  U("xfr.file_won", x.file_won);
+  U("xfr.restore_bad", x.restore_bad);
+  U("xfr.restore_identity", x.restore_identity);
+  U("xfr.restore_pending", x.restore_pending);
+  U("xfr.restore_ms", x.restore_ms);
+  U("xfr.restore_timeouts", x.restore_timeouts);
+  U("xfr.gc_deleted", x.gc_deleted);
+  U("xfr.stale_capped", x.stale_capped);
+  U("secondary.expired_zones", x.expired_zones);
+  U("secondary.stale_answers", x.stale_answers);
+  U("secondary.expire_events", x.expire_events);
 }
 
 /* 0.7 WP7b: the reconcile with the loader: the pass (entries, wanted bodies, fetched, swept, the guard) and what the background fetch has done since the start */
@@ -895,6 +929,7 @@ size_t store_status_format(char *out, size_t cap, int fmt, const char *zone) {
     add_attach(&l, a);
     add_memory(&l);
     add_extra(&l);
+    add_xfr(&l);
     add_recon(&l);
     add_lookup(&l);
     add_fill(&l);
