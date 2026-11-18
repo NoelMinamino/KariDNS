@@ -2496,7 +2496,8 @@ static void hot_attach_batch(store_t *st, const uint32_t *ids, size_t n, att_job
     if (r == 0) vn = store_view_name(st, h->sz.view);
     if (vn) snprintf(h->view, sizeof(h->view), "%s", vn);
     store_read_unlock();
-    bool ok = vn && h->sz.state == STORE_STATE_STORED && !(h->sz.flags & STORE_F_NONSTORE);
+    /* (0.7, 2.2: a secondary's copy is no zone of a database view, whatever a list says: a zone id the database used once is the store's to give to a copy later) */
+    bool ok = vn && h->sz.state == STORE_STATE_STORED && !(h->sz.flags & (STORE_F_NONSTORE | STORE_F_XFR)) && (int)h->sz.view != xfr_store_vid();
     if (ok) {
       rcu_aux_read_lock();
       const zdir_elem_t *el = dir_attach_get(zid);

@@ -51,6 +51,8 @@
 #include "../dns_store.h"
 #include "../dns_store_status.h"
 #include "../dns_utils.h"
+#include "../dns_xfr_state.h"
+#include "../dns_xfr_store.h"
 #include "../dns_zone_image.h"
 #include "db/zimg_msgs.h"
 #include "../dns_zone_image.h"
@@ -2705,6 +2707,9 @@ static int run_attab(const char *dir) {
  * zone at the end of the list is attached at once (the queries come first), and a clean stop writes the list again.  Phase 1 (store-hot-list no): the list is not read, nothing is attached, and a
  * stop writes no list. */
 static uint32_t g_hot_seen[8192];
+static char g_hot_xkey[XFR_KEY_MAX + 1];                 /* the key of the copy that the list names (phases 0, 2, 4, 3) */
+static int g_hot_xklen;
+static uint32_t g_hot_xzid;
 static _Atomic int g_hot_nseen;
 static int g_hot_delay_us;
 static _Atomic int g_hot_limit_at;                       /* the number of zones after which the hook puts the memory-limit on (0: never) */
@@ -2748,6 +2753,23 @@ static int run_hot(const char *dir, int phase) {
         CHECK(dfd >= 0 && store_open(dfd, &so, &s0) == 0 && s0);
         /* The list is made here, from the zones that the store holds (every stored zone, by id), and not left to what the stop of the earlier process wrote: that is the zones that happened to be in
          * memory then, and the cache manager's tests before it take a part of them out (a CI machine had fewer than 256).  Every phase starts from this list; a phase's own stop rewrites it. */
+        /* 0.7 (secondary store 2.2, 13): a secondary's copy (the reserved view) is on the list too, as a zone id that the database used and the store gave to a copy later may be: the list never attaches it
+         * as a zone of a database view (it is looked at and skipped) */
+        {
+            int xv = store_view_id(s0, KARIDNS_XFR_STORE_VIEW);
+            if (xv < 0) xv = store_view_add(s0, KARIDNS_XFR_STORE_VIEW);
+            g_hot_xklen = xfr_key_make("default", XFR_K_CONFIG, "xfr.test.", g_hot_xkey, sizeof(g_hot_xkey));
+            zone_image_t *ximg = zone_img("xfr.test.", 1);
+            xfr_state_t xs = { .kind = XFR_K_CONFIG, .identity = 1, .last_ok = 1 };
+            store_meta_t xm;
+            memset(&xm, 0, sizeof(xm));
+            xm.flags = STORE_F_XFR;
+            xm.serial = 1;
+            xm.stamp_time = 1;
+            xfr_state_encode(&xs, xm.digest);
+            CHECK(s0 && xv >= 0 && ximg && g_hot_xklen > 0 && store_put(s0, (uint16_t)xv, g_hot_xkey, (size_t)g_hot_xklen, &xm, ximg, ximg->total_size, &g_hot_xzid) == 0);
+            zone_image_free(ximg);
+        }
         {
             uint32_t *ids = malloc((size_t)4096 * sizeof(*ids));
             size_t nid = 0;
@@ -2755,9 +2777,14 @@ static int run_hot(const char *dir, int phase) {
             store_zone_t sz0;
             int ir;
             while (s0 && ids && nid < 4096 && (ir = store_iter(s0, &cursor, &sz0)) != 0) {
-                if (ir > 0 && sz0.state == STORE_STATE_STORED && !(sz0.flags & STORE_F_NONSTORE)) ids[nid++] = sz0.zid;
+                if (ir > 0 && sz0.state == STORE_STATE_STORED && !(sz0.flags & (STORE_F_NONSTORE | STORE_F_XFR))) ids[nid++] = sz0.zid;
             }
             CHECK(nid >= 512);                                                    /* (the store holds about a thousand zones by now) */
+            if (ids && nid < 4096) {                                              /* the copy is the first of the list (the last one is a zone of the database: the query test asks for it) */
+                memmove(ids + 1, ids, nid * sizeof(*ids));
+                ids[0] = g_hot_xzid;
+                nid++;
+            }
             CHECK(s0 && ids && store_hot_write(s0, ids, nid) == 0);
             free(ids);
         }
@@ -2856,6 +2883,13 @@ static int run_hot(const char *dir, int phase) {
             CHECK(nseen >= (int)(nwant / 4) && nseen <= (int)(nwant / 4) + 6 + 2);                   /* (the limit is looked at for every zone: each thread goes one zone past it at the most, and what was made is registered) */
             CHECK(c.hot_attached < nwant && dbdir()->attach_count() < nwant);
         }
+        {
+            zref_t zr;
+            memset(&zr, 0, sizeof(zr));
+            const int xv = store_view_id(st, KARIDNS_XFR_STORE_VIEW);
+            CHECK(xv >= 0 && g_hot_xklen > 0);
+            CHECK(!(dbdir()->find(xv, g_hot_xkey, (size_t)g_hot_xklen, &zr) && zr.el));          /* (the copy on the list was not attached as a zone) */
+        }
         atomic_store(&db_store_test_hot_pending, false);
         atomic_store(&db_store_test_hot_stuck, false);
         db_store_test_hot_hook = NULL;
@@ -2905,6 +2939,14 @@ static int run_hot(const char *dir, int phase) {
     CHECK(in_mem + 8 >= nwant);                                                       /* (every zone of the list is in memory now, but the few that the configuration shadows, and the name servers' zones that an attach brings) */
     uint8_t out[1232];
     CHECK(ask_engine(&g_wctx, &g_cc, "www.wq5.test.", 1, out) > 12 && (out[3] & 0x0F) == 0);
+    {
+        zref_t zr;
+        memset(&zr, 0, sizeof(zr));
+        const int xv = store_view_id(st, KARIDNS_XFR_STORE_VIEW);
+        CHECK(xv >= 0 && g_hot_xklen > 0);
+        CHECK(!(dbdir()->find(xv, g_hot_xkey, (size_t)g_hot_xklen, &zr) && zr.el));              /* (the copy on the list was not attached as a zone: it is the skipped one besides the query's) */
+        CHECK(c.hot_skipped >= 2);
+    }
     db_store_test_hot_hook = NULL;
     db_store_stop();
     db_store_counters(&c);
@@ -3190,13 +3232,50 @@ static int run_proto(int phase, const char *dir) {
     }
     CHECK(ch_next(&mainc, &m, 5000) && m.type == KDB_T_DEBUG);
     if (phase == 0) {
+        /* 0.7 (secondary store 2.2, 13): a server with a database block and secondaries: their copies are records of the reserved view of the same store (STORE_F_XFR), and none of the database's
+         * walks sees them: the reconcile's scan (db_recon_scan(): not even a KNOWN copy is asked of the loader), the inventory, and the lookup of a name in a configured view */
+        const int xv = xfr_store_vid();
+        char xkey[XFR_KEY_MAX + 1], xkey2[XFR_KEY_MAX + 1];
+        const int xkl = xfr_key_make("default", XFR_K_CONFIG, "sec.test.", xkey, sizeof(xkey)), xkl2 = xfr_key_make("default", XFR_K_CONFIG, "known.test.", xkey2, sizeof(xkey2));
+        CHECK(xv >= 0 && xv == store_view_id(st, KARIDNS_XFR_STORE_VIEW) && xkl > 0 && xkl2 > 0);
+        if (xv >= 0 && xkl > 0 && xkl2 > 0) {
+            zone_image_t *ximg = zone_img("sec.test.", 3);
+            xfr_state_t xs = { .kind = XFR_K_CONFIG, .identity = 1, .last_ok = 1 };
+            store_meta_t xm;
+            memset(&xm, 0, sizeof(xm));
+            xm.flags = STORE_F_XFR;
+            xm.serial = 3;
+            xm.stamp_time = 1;
+            xfr_state_encode(&xs, xm.digest);
+            CHECK(ximg && store_put_ex(st, (uint16_t)xv, xkey, (size_t)xkl, &xm, ximg, ximg->total_size, STORE_PUT_NO_DEGRADE, NULL) == 0);
+            zone_image_free(ximg);
+            xm.serial = 4;                                                   /* a KNOWN copy (a scrub or a bad image made it so): the reconcile's scan asks the loader for KNOWN records */
+            CHECK(store_set_known(st, (uint16_t)xv, xkey2, (size_t)xkl2, &xm, NULL) == 0);
+            uint32_t cur = 0;
+            db_scan_item_t it;
+            int items = 0, rc;
+            while ((rc = db_recon_scan(&cur, 64, &it)) != 0)
+                if (rc == 1) items++;
+            CHECK_MSG(items == 0, "db_recon_scan() gave %d item(s) of a store that holds only secondaries' copies", items);
+            zref_t zr;
+            memset(&zr, 0, sizeof(zr));
+            const int dsid = store_view_id(st, "default");
+            CHECK(dsid >= 0);
+            CHECK(!dbdir()->find(dsid, "sec.test", 8, &zr) && !dbdir()->find(dsid, xkey, (size_t)xkl, &zr));      /* (the name of a copy is no name of a configured view, and its key is none) */
+            CHECK(dbdir()->counters(0) == 0 && dbdir()->counters(1) == 0 && dbdir()->counters(2) == 0);      /* (no zone of the database: the copies are not counted with them) */
+        }
         /* the loader that does not offer the protocol gets the inventory as before: INVENTORY_REQ is answered (an inventory of the store: empty) */
         kdb_enc_begin(&e, KDB_T_INVENTORY_REQ);
         kdb_enc_end(&e);
         ch_send(a[0], &e);
         bool end = false;
-        while (!end && ch_next(&mainc, &m, 5000)) end = m.type == KDB_T_INVENTORY_END;
+        uint64_t inv_n = 0;
+        while (!end && ch_next(&mainc, &m, 5000)) {
+            if (m.type == KDB_T_INVENTORY) inv_n += m.u.inventory.n_entries;
+            end = m.type == KDB_T_INVENTORY_END;
+        }
         CHECK(end);
+        CHECK(inv_n == 0 && m.u.inventory_end.n_zones == 0);            /* (the copies are not in the inventory: an inventory with them would tell the loader of zones that it does not have) */
         CHECK(!ch_next(&fetchc, &m, 200));
         goto done;
     }
