@@ -3026,6 +3026,207 @@ static void test_index_wait(void) {
   }
 }
 
+/* 0.7 round 12: the first fill (the manifest pass of a store that reserved its index) raises the size at which a checkpoint is forced, and the bound of the journal, to 4 x journal_max_bytes while
+ * the free space allows (store_journal_boost()); the end of the fill brings it back and the journal that grew is cut at once, not at the next write.  A small disk keeps the normal size, and a disk
+ * that fills during the fill takes the raise back.  A crash during the fill replays the larger journal and loses nothing.  journal_max_bytes is 256 KiB here: the raise needs 128 times that
+ * free (32 MiB), more than the floor that the writes need (jr_floor(): 8 MiB and what a checkpoint may still allocate), so that "small" can still take records. */
+#define JBO_MAX (256u << 10)
+#define JBO_BIG (1ll << 40)
+#define JBO_SMALL (24ll << 20)
+static _Atomic int64_t g_jbo_free;
+static int64_t jbo_fs_free(void) { return atomic_load(&g_jbo_free); }
+/* puts (new versions of the zones 0..149, from put k0 on) until the journal holds `bytes` or a checkpoint cut it (*cut); returns the number of the next put */
+static uint32_t jbo_fill(store_t *s, uint32_t k0, uint64_t bytes, bool *cut) {
+  store_stats_t st;
+  store_stats(s, &st);
+  const uint64_t c0 = st.checkpoints;
+  uint32_t k = k0;
+  *cut = false;
+  while (k < k0 + 60000) {
+    if (put_i(s, 0, k % 150, 1 + k / 150, NULL) != 0) { CHECK(!"put"); break; }
+    k++;
+    (void)store_journal_wait(s, 2);                                      /* (as the reconcile thread does between its groups) */
+    store_stats(s, &st);
+    if (st.checkpoints > c0) { *cut = true; break; }
+    if (st.journal_bytes >= bytes) break;
+  }
+  return k;
+}
+static bool jbo_verify(store_t *s, uint32_t k) {                         /* every zone in the version of its last put among the first k */
+  bool ok = true;
+  for (uint32_t i = 0; i < 150; i++) {
+    uint64_t ver = 0;
+    for (uint32_t j = i; j < k; j += 150) ver = 1 + j / 150;
+    if (ver && !verify_i(s, 0, i, ver)) ok = false;
+  }
+  return ok;
+}
+static void test_journal_boost(void) {
+  printf("[a bulk fill raises the size at which a checkpoint is forced and the bound of the journal; its end brings them back and cuts the journal]\n");
+  tdir_t d;
+  tdir_new(&d, "jboost");
+  store_opts_t o;
+  small_opts(&o);
+  o.journal_max_bytes = JBO_MAX;
+  o.checkpoint_interval_ms = UINT32_MAX;
+  o.scrub_interval_s = UINT32_MAX;
+  o.log = log_cb;
+  log_clear();
+  atomic_store(&g_jbo_free, JBO_BIG);
+  store_test_fs_free = jbo_fs_free;
+  store_t *s = NULL;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (!s) { store_test_fs_free = NULL; tdir_free(&d); return; }
+  CHECK_EQ(store_view_add(s, "default"), 0);
+  CHECK_EQ(store_reserve(s, 3000), 0);                                   /* (no growth of the index during the test: a growth asks for a checkpoint) */
+  CHECK_EQ(store_checkpoint(s), 0);
+  store_stats_t st;
+  store_stats(s, &st);
+  const uint64_t base = st.checkpoints;
+  CHECK(st.flusher);
+  CHECK_EQ(st.journal_max_bytes, JBO_MAX);
+  CHECK_EQ(st.journal_bound_bytes, 2 * JBO_MAX);
+  CHECK_EQ(st.journal_boost, 0);
+  CHECK_EQ(st.journal_boosts, 0);
+  store_journal_boost(NULL, true);                                       /* (no store: nothing) */
+  store_journal_boost(s, false);                                         /* (not raised: nothing, no log) */
+  CHECK_EQ(log_count(-1, "bulk fill"), 0);
+  /* 1. raised: 4 x, the bound 2 x that; the journal passes 2 x the normal size, the bound of the normal one, with no checkpoint and no wait; a checkpoint is forced at the raised size */
+  store_journal_boost(s, true);
+  store_journal_boost(s, true);                                          /* (idempotent: one raise, one log line) */
+  store_stats(s, &st);
+  CHECK_EQ(st.journal_max_bytes, 4 * JBO_MAX);
+  CHECK_EQ(st.journal_bound_bytes, 8 * JBO_MAX);
+  CHECK_EQ(st.journal_boost, 1);
+  CHECK_EQ(st.journal_boosts, 1);
+  CHECK_EQ(log_count(6, "a bulk fill begins: a checkpoint is forced at 1024 KiB of journal"), 1);
+  bool cut = false;
+  uint32_t k = jbo_fill(s, 0, 5 * JBO_MAX / 2, &cut);
+  store_stats(s, &st);
+  CHECK(!cut);
+  CHECK(st.journal_bytes >= 5 * JBO_MAX / 2);                            /* (past 2 x the normal size: with the normal one the writes would have waited here) */
+  CHECK_EQ(st.checkpoints, base);
+  CHECK_EQ(st.journal_limit_waits, 0);
+  k = jbo_fill(s, k, 8 * JBO_MAX, &cut);                                 /* (on to the raised size: the writer that reaches it begins the checkpoint) */
+  store_stats(s, &st);
+  CHECK(cut);
+  CHECK(st.journal_peak_bytes >= 4 * JBO_MAX && st.journal_peak_bytes <= 8 * JBO_MAX + 4096);
+  for (int w = 0; w < 3000 && st.checkpoints < base + 1; w++) { usleep(1000); store_stats(s, &st); }
+  CHECK(st.checkpoints >= base + 1);
+  /* 2. the end of the fill: the journal is between the two sizes, the checkpoint that cuts it is made at once (the flusher is woken), the sizes are the normal ones */
+  k = jbo_fill(s, k, 3 * JBO_MAX / 2, &cut);
+  store_stats(s, &st);
+  CHECK(!cut);
+  CHECK(st.journal_bytes >= 3 * JBO_MAX / 2 && st.journal_bytes < 4 * JBO_MAX);
+  const uint64_t c1 = st.checkpoints;
+  log_clear();
+  const uint64_t t0 = now_ms();
+  store_journal_boost(s, false);
+  store_stats(s, &st);
+  CHECK_EQ(st.journal_max_bytes, JBO_MAX);
+  CHECK_EQ(st.journal_bound_bytes, 2 * JBO_MAX);
+  CHECK_EQ(st.journal_boost, 0);
+  CHECK_EQ(st.journal_boosts, 1);
+  CHECK_EQ(log_count(6, "the bulk fill is over: a checkpoint is forced at 256 KiB of journal again"), 1);
+  for (int w = 0; w < 5000 && (st.checkpoints == c1 || st.journal_bytes >= JBO_MAX); w++) { usleep(1000); store_stats(s, &st); }
+  printf("  the journal of %u KiB was cut %" PRIu64 " ms after the end of the fill\n", (unsigned)(3 * JBO_MAX / 2 >> 10), now_ms() - t0);
+  CHECK(st.checkpoints > c1);
+  CHECK(st.journal_bytes < JBO_MAX);
+  store_journal_boost(s, false);                                         /* (idempotent) */
+  CHECK_EQ(log_count(6, "the bulk fill is over"), 1);
+  /* 3. a small disk keeps the normal size (the raise is asked for, and logged as not in force); the checkpoint is forced at 256 KiB */
+  atomic_store(&g_jbo_free, JBO_SMALL);
+  CHECK_EQ(store_checkpoint(s), 0);                                      /* (the probe) */
+  log_clear();
+  store_journal_boost(s, true);
+  store_stats(s, &st);
+  CHECK_EQ(st.journal_boost, 1);
+  CHECK_EQ(st.journal_boosts, 2);
+  CHECK_EQ(st.journal_max_bytes, JBO_MAX);                               /* (not in force) */
+  CHECK_EQ(log_count(6, "the free space is too small"), 1);
+  k = jbo_fill(s, k, 3 * JBO_MAX, &cut);
+  CHECK(cut);
+  /* 4. the disk has room again: the raise is in force; the disk fills up: the raise is taken back by itself (the next checkpoint probes) */
+  atomic_store(&g_jbo_free, JBO_BIG);
+  CHECK_EQ(store_checkpoint(s), 0);
+  store_stats(s, &st);
+  CHECK_EQ(st.journal_max_bytes, 4 * JBO_MAX);
+  CHECK_EQ(st.journal_bound_bytes, 8 * JBO_MAX);
+  atomic_store(&g_jbo_free, JBO_SMALL);
+  CHECK_EQ(store_checkpoint(s), 0);
+  store_stats(s, &st);
+  CHECK_EQ(st.journal_max_bytes, JBO_MAX);
+  CHECK_EQ(st.journal_boost, 1);                                         /* (still asked for) */
+  store_journal_boost(s, false);
+  store_stats(s, &st);
+  CHECK_EQ(st.journal_boost, 0);
+  CHECK(jbo_verify(s, k));
+  check_consistent(s, "journal boost");
+  CHECK_EQ(store_close(s), 0);
+  store_test_fs_free = NULL;
+  tdir_free(&d);
+}
+
+/* a crash (the process ends with no close) while the fill holds the larger bound: the journal that grew past the normal size is replayed, in full, and every zone is there */
+static void test_journal_boost_crash(void) {
+  printf("[a crash during the bulk fill replays the larger journal and loses nothing]\n");
+  tdir_t d;
+  tdir_new(&d, "jboostc");
+  store_opts_t o;
+  small_opts(&o);
+  o.journal_max_bytes = JBO_MAX;
+  o.checkpoint_interval_ms = UINT32_MAX;
+  o.scrub_interval_s = UINT32_MAX;
+  atomic_store(&g_jbo_free, JBO_BIG);
+  store_test_fs_free = jbo_fs_free;
+  int pp[2];
+  CHECK_EQ(pipe(pp), 0);
+  fflush(stdout);
+  pid_t pid = fork();
+  if (pid == 0) {
+    store_t *x = NULL;
+    if (store_open(d.fd, &o, &x) != 0) _exit(2);
+    if (store_view_add(x, "default") != 0 || store_reserve(x, 3000) != 0 || store_checkpoint(x) != 0) _exit(3);
+    store_stats_t cs;
+    store_stats(x, &cs);
+    const uint64_t base = cs.checkpoints;
+    store_journal_boost(x, true);
+    bool cut = true;
+    const uint32_t k = jbo_fill(x, 0, 3 * JBO_MAX, &cut);
+    store_stats(x, &cs);
+    if (cut || cs.journal_bytes < 3 * JBO_MAX || cs.checkpoints != base) _exit(4);   /* (three times the size at which the normal bound forces a checkpoint, and none was made) */
+    if (store_commit(x) != 0) _exit(5);
+    if (write(pp[1], &k, sizeof(k)) != (ssize_t)sizeof(k)) _exit(6);
+    _exit(0);                                                            /* (no close: the state a crash leaves) */
+  }
+  uint32_t k = 0;
+  CHECK(read(pp[0], &k, sizeof(k)) == (ssize_t)sizeof(k));
+  close(pp[0]);
+  close(pp[1]);
+  int stt = 0;
+  waitpid(pid, &stt, 0);
+  CHECK(WIFEXITED(stt) && WEXITSTATUS(stt) == 0);
+  if (!(WIFEXITED(stt) && WEXITSTATUS(stt) == 0)) printf("  (the child ended with status %d)\n", WIFEXITED(stt) ? WEXITSTATUS(stt) : -1);
+  o.create = false;
+  store_t *s = NULL;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (s) {
+    store_stats_t st;
+    store_stats(s, &st);
+    CHECK(!st.recovery.was_clean);
+    CHECK(!st.recovery.rebuilt);
+    printf("  %u puts, %" PRIu64 " records replayed, the open took %" PRIu64 " us\n", k, st.recovery.records_replayed, st.recovery.open_us);
+    CHECK(st.recovery.records_replayed >= k);                            /* (the journal was not cut: every put since the checkpoint is a record) */
+    CHECK_EQ(st.journal_boost, 0);                                       /* (the flag is the fill's, not the store's: the next process starts at the normal size) */
+    CHECK_EQ(st.journal_max_bytes, JBO_MAX);
+    CHECK(jbo_verify(s, k));
+    check_consistent(s, "journal boost crash");
+    CHECK_EQ(store_close(s), 0);
+  }
+  store_test_fs_free = NULL;
+  tdir_free(&d);
+}
+
 static void test_journal_bound(int mode) {
   printf("[the journal stays below 2 x journal_max_bytes while a checkpoint is slow; a close leaves a fuzzy checkpoint (%s)]\n", mode == STORE_MODE_MAP ? "MAP" : "COPY");
   tdir_t d;
@@ -6965,6 +7166,7 @@ int main(void) {
   if (WANT("nowait")) { test_no_wait_in_lock(STORE_MODE_MAP); test_no_wait_in_lock(STORE_MODE_COPY); test_growth_catchup(); test_retire_after_unlock(); }
   if (WANT("ixwait")) { test_reserve_survives_growth(); test_index_wait(); }
   if (WANT("jbound")) { test_journal_bound(STORE_MODE_MAP); test_journal_bound(STORE_MODE_COPY); }
+  if (WANT("jboost")) { test_journal_boost(); test_journal_boost_crash(); }
   if (WANT("kfz")) test_kill_loop(UNDER_TSAN ? 25 : 50, 3);
   if (WANT("kgrow")) test_kill_loop(UNDER_TSAN ? 20 : 50, 4);
   if (WANT("kjsw")) { test_kill_loop(UNDER_TSAN ? 20 : 50, 5); test_commit_switch(); }

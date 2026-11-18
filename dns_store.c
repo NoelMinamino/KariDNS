@@ -103,7 +103,7 @@
  * Bounded size: a checkpoint is forced when the journal reaches journal_max_bytes (default 100 MiB: a replay of that is about a second
  * warm), so the journal never grows without limit and the replay after a crash is bounded (by that and what is written while one
  * checkpoint flushes: the writer that finds the journal full switches it at once when no other checkpoint runs; and never by more than twice
- * the limit while the callers wait in store_journal_wait()).
+ * the limit while the callers wait in store_journal_wait()).  While a first fill runs the limit is 4 x as much when the free space allows (jmax(), store_journal_boost()).
  *
  * ======================================================================================================================
  * 0.7 WP9 (S6): the cleaner, disk full, the scrub, nx
@@ -431,6 +431,8 @@ struct store {
   int jfd;
   uint64_t joff;                                      /* (the mutex) where the next record goes in the file jfd */
   _Atomic uint64_t jbytes;                            /* the bytes of the journal since the last checkpoint's switch (every file of the chain since: journal_max_bytes is about the replay) */
+  _Atomic bool jboost;                                /* a bulk fill is going on (store_journal_boost()): the bound of the journal is JBOOST x journal_max_bytes while the free space allows (jmax()) */
+  _Atomic uint64_t n_jboost;                          /* the times the bound was asked to be raised (0 -> 1) */
   _Atomic uint64_t lsn, committed_lsn;
   _Atomic bool dir_dirty;
   _Atomic uint64_t last_sync_ms, last_ckpt_ms;
@@ -3520,6 +3522,24 @@ static void space_used(store_t *s, uint64_t n) {
   while (c >= 0 && !atomic_compare_exchange_weak_explicit(&s->avail_est, &c, (uint64_t)c > n ? c - (int64_t)n : 0, memory_order_relaxed, memory_order_relaxed)) {}
 }
 
+/* The size at which a checkpoint is forced (journal_max_bytes), and the base of the bound of the journal (jbound()).  While a bulk fill runs (store_journal_boost(): the manifest pass
+ * of a first fill) it is JBOOST times as much: with the index reserved at its full size (round 10) every checkpoint writes all of it (10M zones: 430 to 600 MB, the hash scatters the
+ * writes over every page), and one every 100 MiB of journal kept the disk busy with checkpoints for the whole pass (round 11: 14 to 17 of them, the journal bound waits of the pass
+ * and a manifest pass of 42 to 45 s in 3 runs of 10).  A fourth of the checkpoints, the replay of a crash during the fill (which starts again anyway) four times as long: 400 MiB, about
+ * 4 s.  Not when the file system could not take it: the journal at the hard bound of the thread that also answers lookups (4 x the raised size, 1.6 GiB at the default) must be no more
+ * than an eighth of what is free (the share at which jr_floor() cuts what the checkpoint may still allocate, and the ENOSPC states of the journal keep their meaning: they look at
+ * every record, not at this bound); the estimate is the checkpoint's probe, so a disk that fills during the fill takes the raise back by itself (a checkpoint cuts the journal at the
+ * normal size then), and an unknown estimate (no statfs) never raises it.  On ZFS statfs counts everything the file system holds, on UFS only what is allocated: the same
+ * estimate as the other space checks. */
+#define JBOOST 4u
+#define JBOOST_SPACE 8u
+static uint64_t jmax(const store_t *s) {
+  const uint64_t m = s->o.journal_max_bytes;
+  if (!atomic_load_explicit(&s->jboost, memory_order_relaxed) || m > UINT64_MAX / (JBOOST_SPACE * 4u * JBOOST)) return m;
+  const int64_t est = atomic_load_explicit(&s->avail_est, memory_order_relaxed);
+  return est >= 0 && (uint64_t)est >= (uint64_t)JBOOST_SPACE * 4u * JBOOST * m ? (uint64_t)JBOOST * m : m;
+}
+
 /* is a commit due? (no lock: atomics) */
 static bool commit_due(const store_t *s, uint64_t now) {
   const uint64_t lsn = atomic_load_explicit(&s->lsn, memory_order_relaxed), done = atomic_load_explicit(&s->committed_lsn, memory_order_relaxed);
@@ -3530,7 +3550,7 @@ static bool commit_due(const store_t *s, uint64_t now) {
 /* is a checkpoint due? */
 static bool ckpt_due(const store_t *s, uint64_t now) {
   const uint64_t lsn = atomic_load_explicit(&s->lsn, memory_order_relaxed);
-  if (atomic_load_explicit(&s->jbytes, memory_order_relaxed) >= s->o.journal_max_bytes) return true;
+  if (atomic_load_explicit(&s->jbytes, memory_order_relaxed) >= jmax(s)) return true;
   if (lsn <= atomic_load_explicit(&s->ckpt_lsn, memory_order_relaxed)) return false;
   if (atomic_load_explicit(&s->ck_want, memory_order_relaxed)) return true;
   return s->o.checkpoint_interval_ms != UINT32_MAX && now - atomic_load_explicit(&s->last_ckpt_ms, memory_order_relaxed) >= s->o.checkpoint_interval_ms;
@@ -3541,7 +3561,7 @@ static bool ckpt_due(const store_t *s, uint64_t now) {
 static int post_write(store_t *s) {
   const uint64_t now = st_now_ms();
   bool kick = commit_due(s, now);
-  if (s->fl_on && s->jbytes >= s->o.journal_max_bytes && ck_try_locked(s)) {
+  if (s->fl_on && s->jbytes >= jmax(s) && ck_try_locked(s)) {
     int r = s->jold < 0 ? ck_begin_locked(s, false) : 1;          /* (the writers cleared the clean flag in wr_lock(); a journal whose sync failed is the flusher's first) */
     if (r == 0) {
       pthread_mutex_lock(&s->bg_mu);
@@ -3618,7 +3638,8 @@ static void bg_due(store_t *s) {
  * slowed down to the disk, which happens only when a checkpoint takes longer than the writing of journal_max_bytes of records (a 10M first fill on ZFS: during the manifest pass,
  * whose journal grows by 7 MB a second against checkpoints of 6 to 17 s), against a journal of gigabytes and minutes of replay.  Counted; a WARNING at most once a minute. */
 static uint64_t jbound(const store_t *s, unsigned factor) {
-  return factor && s->o.journal_max_bytes > UINT64_MAX / factor ? UINT64_MAX : (uint64_t)factor * s->o.journal_max_bytes;
+  const uint64_t m = jmax(s);
+  return factor && m > UINT64_MAX / factor ? UINT64_MAX : (uint64_t)factor * m;
 }
 uint64_t store_journal_wait(store_t *s, unsigned factor) {
   if (!s || factor == 0 || !s->fl_on) return 0;                  /* (without the flusher the writers make the checkpoints themselves: the journal does not run ahead) */
@@ -3650,6 +3671,25 @@ uint64_t store_journal_wait(store_t *s, unsigned factor) {
     st_log(s, 4, "store: the journal reached %u x journal_max_bytes (%" PRIu64 " bytes) before a checkpoint could cut it: a writer waited %" PRIu64 " ms (%" PRIu64 " waits since the open); "
                  "the disk does not keep up with the writes (store.journal.limit_waits, store.checkpoint.max_us)", factor, lim, us / 1000u, n);
   return us ? us : 1;
+}
+
+/* A bulk fill begins (on) or ends (off): see jmax().  Idempotent, no lock: the flag is read by the writers' checks.  The end of the fill: the journal may be past the normal size
+ * (up to JBOOST x it, 2 x that at the bound of the pass), so the checkpoint that cuts it is due now, not at the next write or the next tick: the flusher is woken (ckpt_due() is
+ * true at the normal size again; without a flusher the next writer call or tick makes it).  A crash before that checkpoint ended replays the larger journal (about 1 s per 100 MiB). */
+void store_journal_boost(store_t *s, bool on) {
+  if (!s) return;
+  if (on) {
+    if (atomic_exchange_explicit(&s->jboost, true, memory_order_acq_rel)) return;
+    atomic_fetch_add_explicit(&s->n_jboost, 1, memory_order_relaxed);
+    const uint64_t m = jmax(s);
+    st_log(s, 6, "store: a bulk fill begins: a checkpoint is forced at %" PRIu64 " KiB of journal%s", m >> 10,
+           m > s->o.journal_max_bytes ? "" : " (the free space is too small for a larger bound: it stays at the normal size)");
+    return;
+  }
+  if (!atomic_exchange_explicit(&s->jboost, false, memory_order_acq_rel)) return;
+  const uint64_t j = atomic_load_explicit(&s->jbytes, memory_order_relaxed);
+  st_log(s, 6, "store: the bulk fill is over: a checkpoint is forced at %" PRIu64 " KiB of journal again (the journal holds %" PRIu64 " KiB)", s->o.journal_max_bytes >> 10, j >> 10);
+  if (j >= s->o.journal_max_bytes && s->fl_on) bg_signal(s);
 }
 
 /* The end of a writer call: the mutex is given up; STORE_SYNC_EVERY makes the call durable now (with the mutex released: other writers go on), and without a flusher the due work is done
@@ -4570,7 +4610,7 @@ static int nx_reclaim_locked(store_t *s, bool force, uint64_t *reclaimed) {
     if (batch >= 256 || (batch && i + 1 == n)) {
       r = journal_commit_apply(s);
       batch = 0;
-      if (r == 0 && s->jbytes >= s->o.journal_max_bytes && ck_try_locked(s)) {    /* (the pass keeps the mutex: a checkpoint that runs elsewhere is not waited for, the journal grows meanwhile) */
+      if (r == 0 && s->jbytes >= jmax(s) && ck_try_locked(s)) {    /* (the pass keeps the mutex: a checkpoint that runs elsewhere is not waited for, the journal grows meanwhile) */
         r = ck_full_locked(s, false);
         bg_release(s, true, true);
       }
@@ -6049,7 +6089,9 @@ void store_stats(const store_t *s, store_stats_t *o) {
     o->views[i].image_bytes = VG(s, V_VIEW(i, 3));
   }
   /* 0.7 WP9 */
-  o->journal_max_bytes = s->o.journal_max_bytes;
+  o->journal_max_bytes = jmax(s);
+  o->journal_boost = atomic_load_explicit(&s->jboost, memory_order_relaxed);
+  o->journal_boosts = atomic_load_explicit(&s->n_jboost, memory_order_relaxed);
   uint32_t draining = 0, pinned = 0;
   (void)cl_pick(s, &o->compact_candidates, &o->compact_dead_bytes, &pinned, &draining, false);
   o->seg_draining = draining;

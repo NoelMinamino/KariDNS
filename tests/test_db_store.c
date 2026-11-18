@@ -4279,7 +4279,27 @@ static int run_fixes(const char *dir) {
         store_stats(st, &s1);
         CHECK(s1.zt_capacity >= 1400000 && s1.zt_capacity < 3000000);
         CHECK(s1.ix_slots >= 1400000 * 8 / 3 && s1.ix_slots < 3000000 * 8 / 3);
+        CHECK(s1.journal_boost == 1 && s1.journal_boosts >= 1);          /* (round 12: a pass that reserved is a bulk fill: the journal may grow to a larger size) */
+        const uint64_t boosts = s1.journal_boosts;
         db_recon_abort();
+        store_stats(st, &s1);
+        CHECK(s1.journal_boost == 0 && s1.journal_boosts == boosts);     /* (a pass that was cut off ends it) */
+        db_recon_abort();                                                /* (nothing is active now: no effect) */
+        dbreg_cache_set_limit(1500000ull * 43 * 4);
+        CHECK(db_recon_begin("default", 4000000, false, why, sizeof(why)));
+        store_stats(st, &s1);
+        CHECK(s1.journal_boost == 1 && s1.journal_boosts == boosts + 1);
+        CHECK(db_recon_begin("default", 0, false, why, sizeof(why)));    /* (the next pass drops it: no reserve is needed, the flag is cleared) */
+        store_stats(st, &s1);
+        CHECK(s1.journal_boost == 0);
+        db_recon_abort();
+        CHECK(db_recon_begin("default", 4000000, false, why, sizeof(why)));
+        store_stats(st, &s1);
+        CHECK(s1.journal_boost == 1);
+        db_recon_end_t oe;
+        db_recon_end(false, 0, false, 0, NULL, 0, &oe);                  /* (the end of the entries: the loader did not finish the list, nothing is swept; the flag goes first) */
+        store_stats(st, &s1);
+        CHECK(s1.journal_boost == 0);
         dbreg_cache_set_limit(0);
     }
 

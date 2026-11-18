@@ -3367,7 +3367,10 @@ bool db_recon_begin(const char *view, uint64_t estimate, bool force, char *why, 
   uint64_t cap = (1ull << 25) - 1;
   if (lim && lim / 4 / 43 < cap) cap = lim / 4 / 43;
   const uint64_t want = estimate < cap ? estimate : cap;
-  if (want > have) (void)store_reserve(st, want);
+  const bool bulk = want > have && store_reserve(st, want) == 0;
+  /* (a bulk fill: the checkpoints of the pass write the whole reserved index, so the journal may grow to a larger size before one is forced (round 12).  Ended by db_recon_end() and db_recon_abort();
+   * a pass that this one drops (above) is ended here: the flag is set or cleared by what this pass needs) */
+  store_journal_boost(st, bulk);
   un_mark(view);
   rc_lock();
   bits_free(&RC.seen);
@@ -3429,7 +3432,8 @@ int db_recon_entry(const db_recon_entry_t *e, uint32_t *zid_out) {
 
 void db_recon_abort(void) {
   rc_lock();
-  if (RC.active) {
+  const bool was = RC.active;
+  if (was) {
     syslog(LOG_WARNING, "[Store] the pass of view '%s' was cut off (the loader's stream ended); nothing is swept, the next pass starts again", RC.view);
     RC.active = false;
     bits_free(&RC.seen);
@@ -3437,6 +3441,7 @@ void db_recon_abort(void) {
     atomic_store_explicit(&RC.lk_any, false, memory_order_relaxed);
   }
   rc_unlock();
+  if (was) store_journal_boost(atomic_load_explicit(&G.st, memory_order_acquire), false);     /* (the pass that raised the bound of the journal is over; the lock of the pass is not held) */
 }
 
 /* the zones of the view in the store, a few thousand at a time (the read section does not last for a pass over ten million zones) */
@@ -3448,6 +3453,7 @@ void db_recon_end(bool complete, uint64_t n_skipped, bool cursor_valid, uint64_t
   memset(out, 0, sizeof(*out));
   store_t *st = atomic_load_explicit(&G.st, memory_order_acquire);
   if (!RC.active || !st) return;
+  store_journal_boost(st, false);                           /* (the entries are in: a first fill is over, the journal goes back to its size; the sweep and the cursor follow) */
   const int vid = RC.vid;
   char view[STORE_VIEW_NAME_MAX + 1];
   snprintf(view, sizeof(view), "%s", RC.view);

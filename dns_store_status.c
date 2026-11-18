@@ -701,6 +701,8 @@ static void add_store(list_t *l, const store_t *s, const store_attach_stats_t *a
   U("store.journal.limit_waits", st->journal_limit_waits);
   U("store.journal.limit_wait_us", st->journal_limit_wait_us);
   U("store.journal.limit_wait_max_us", st->journal_limit_wait_max_us);
+  U("store.journal.boost", st->journal_boost);
+  U("store.journal.boosts", st->journal_boosts);
   U("store.index.waits", st->index_waits);
   U("store.index.wait_us", st->index_wait_us);
   U("store.index.wait_max_us", st->index_wait_max_us);
