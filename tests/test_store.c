@@ -7673,7 +7673,7 @@ static void test_bulk_crash(int mode) {
   if (mode == BK_AFTER_END) {
     CHECK(!st.recovery.bulk_recovered);
     CHECK_EQ(store_bulk(s), 0);
-    CHECK(st.recovery.records_replayed >= 50);
+    CHECK(!st.recovery.rebuilt && st.recovery.records_replayed <= 50);     /* (the usual open: the journal is replayed, no rebuild; a checkpoint the flusher made after the end may already hold some of the 50 puts, so not all of them need replaying: the checks below say every one is there) */
     for (uint32_t i = 0; i < 100; i++) CHECK(verify_i(s, 0, i, 2));
     for (uint32_t i = 100; i < 200; i++) CHECK(there_i(s, 0, i, NULL));
     for (uint32_t i = 300; i < 350; i++) CHECK(verify_i(s, 0, i, 4));
