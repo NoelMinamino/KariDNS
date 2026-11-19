@@ -1035,6 +1035,11 @@ static void *race_tick(void *arg) {
   }
   return NULL;
 }
+/* the restore waits (bounded) until the tick thread has seen restore_pending, so that the check below does not depend on thread start timing */
+static void race_hook(zone_db_entry_t *e) {
+  slow_hook(e);
+  for (int i = 0; i < 5000 && atomic_load(&g_race_skips) == 0; i++) usleep(1000);
+}
 static void *race_hooks(void *arg) {
   (void)arg;
   const xfr_store_ops_t *o = atomic_load(&g_xfr_ops);
@@ -1055,7 +1060,7 @@ static int life6a(void) {
 static int life6(void) {
   printf("[life 6: the restore against a transfer and the tick on one entry; the hooks from several threads]\n");
   rcu_aux_thread_pin();
-  atomic_store(&xfr_store_test_restore_hook, slow_hook);
+  atomic_store(&xfr_store_test_restore_hook, race_hook);
   if (life_start(g_store, true) != 0) return 1;
   zone_db_entry_t *a = ent("a.test.");
   pthread_t t, h[3];

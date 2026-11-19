@@ -7051,7 +7051,6 @@ static int rebuild_locked(store_t *s, unsigned how) {
   uint64_t nxlive = 0, live_ix = 0, live_sx = 0, nx_end = nx_used;
   for (uint64_t z = 0; z < hwm; z++) {
     r64_t rt, rc;
-    s->rec.rebuilt_zones++;
     uint8_t st0 = zt_state_fast(s, (uint32_t)z);
     bool ok = false;
     zt_t t;
@@ -7093,6 +7092,7 @@ static int rebuild_locked(store_t *s, unsigned how) {
       if (ok && ix_raw_insert(nix, h, (uint32_t)z) < 0) ok = false;
       if (ok) {
         live_ix++;
+        s->rec.rebuilt_zones++;                      /* (live zones only: not the free cells, not the dropped ones) */
         if (c.source_id != 0) {
           ix_raw_insert(nsx, st_hash_src(s, c.source, t.view, c.source_id), (uint32_t)z);
           live_sx++;

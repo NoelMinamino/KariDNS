@@ -160,7 +160,7 @@ typedef struct store_recovery {
   uint64_t replay_from_lsn;
   uint64_t replay_to_lsn;
   bool     journal_torn;          /* the replay stopped at a torn or CRC-bad record (normal after kill -9 mid-write) */
-  uint64_t rebuilt_zones;         /* zone records seen by the rebuild */
+  uint64_t rebuilt_zones;         /* live zones (KNOWN or STORED) the rebuild kept; free and dropped cells are not counted */
   uint64_t dropped_zones;         /* ... of which dropped (CRC, bounds, duplicate name) */
   uint64_t open_us;               /* time of the whole open */
   uint32_t gen_replays;           /* index generations (OP_GEN) the replay switched to: their files hold what a checkpoint wrote, so the derived tables were rebuilt (0.7, private tables) */

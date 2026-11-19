@@ -1956,7 +1956,9 @@ static int run_mode(const char *mode) {
             CHECK(zref_of("wq3.test.", &z) && z.entry && z.el && zdir_serial(z.el) == 4);
             bool reg = false;
             for (int t = 0; t < 2500 && !reg; t++) {                                   /* (a store thread registers it: the registry has the zone, the attach table has the element) */
-                reg = zref_of("wq3.test.", &z) && z.el && dbreg_lookup_entry("default", "wq3.test.") == z.entry && dbdir()->attach_get(z.zid) == z.el;
+                db_store_counters(&w1);                                                /* (the counters are bumped after the zone is visible: wait for them in the same loop) */
+                reg = zref_of("wq3.test.", &z) && z.el && dbreg_lookup_entry("default", "wq3.test.") == z.entry && dbdir()->attach_get(z.zid) == z.el
+                      && w1.wa_adopted == w0.wa_adopted + 1 && w1.attach_ok == w0.attach_ok + 1;
                 if (!reg) usleep(2000);
             }
             CHECK(reg);

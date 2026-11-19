@@ -1164,6 +1164,7 @@ static void test_superblock_damage(void) {
     CHECK(st.recovery.rebuilt);                                          /* the cells are ahead of the journal: derived tables are rebuilt */
     CHECK_EQ(st.zones_stored, 699);                                      /* the zone of the lost record is not in the rebuilt tables: its cell lies beyond the
                                                                           * high-water mark that the journal gave */
+    CHECK_EQ(st.recovery.rebuilt_zones, st.zones_known + st.zones_stored);   /* (live zones, not the slots up to the high-water mark) */
     if (g_verbose) for (uint32_t i = 0; i < 700; i++) if (find_i(s, 0, i) == STORE_NONE) printf("    missing zone %u\n", i);
     CHECK(verify_i(s, 0, 698, 1));
     CHECK_EQ(find_i(s, 0, 699), STORE_NONE);
@@ -8266,11 +8267,12 @@ static void test_torn_pairs(bool bulk) {
   if (!s) { tdir_free(&d); return; }
   store_stats_t st;
   store_stats(s, &st);
-  printf("  open: rebuilt %d, %" PRIu64 " replayed, %" PRIu64 " zones seen, %" PRIu64 " dropped\n", (int)st.recovery.rebuilt, st.recovery.records_replayed, st.recovery.rebuilt_zones,
+  printf("  open: rebuilt %d, %" PRIu64 " replayed, %" PRIu64 " live zones, %" PRIu64 " dropped\n", (int)st.recovery.rebuilt, st.recovery.records_replayed, st.recovery.rebuilt_zones,
          st.recovery.dropped_zones);
   CHECK(st.recovery.rebuilt);
   CHECK_EQ(st.recovery.records_replayed, 0);
   CHECK_EQ(st.recovery.dropped_zones, 0);
+  CHECK_EQ(st.recovery.rebuilt_zones, TP_ZONES);                        /* (the live zones, not the slots up to the high-water mark) */
   uint32_t there = 0;
   uint8_t sta = 0;
   for (uint32_t i = 0; i < TP_ZONES; i++) there += there_i(s, 0, i, &sta) && sta == STORE_STATE_KNOWN;
