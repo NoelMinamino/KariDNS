@@ -81,7 +81,7 @@ jobs:
             # sanitizer builds, the fuzz builds (fuzz_dag_all: run_dag_fuzzer_test.sh), test_response_cache (run_response_cache_test.sh runs the binary; its own
             # fallback compile line lacks sources the engine needs now and does not link) and the unit test binaries, plain and ASan
             ./configure --march=none --with-db-drivers="sqlite3 postgresql"
-            make -j"$NCPU" all karicheck-codelog test_coverage_sweep_tools-codelog karidns-dbloader karidns-zone karidns-zone-asan zone2sql zone2kdb asan tsan tools-asan fuzz_all fuzz_dag_all asan_test tinydns_test hash_test include_test response_cache_test test_response_cache vulnerability_test bench_serialize fetch_backend fake_dbloader karidns-evict
+            make -j"$NCPU" all karicheck-codelog test_coverage_sweep_tools-codelog karidns-dbloader karidns-zone karidns-zone-asan zone2sql zone2kdb asan tsan tools-asan fuzz_all fuzz_dag_all asan_test tinydns_test hash_test include_test response_cache_test test_response_cache vulnerability_test bench_serialize fetch_backend fake_dbloader karidns-evict test_store_status
             # stdin from /dev/null: no test may block reading the VM session's stdin
             make -j"$NCPU" unit-test-bins unit-test-bins-asan < /dev/null
             echo "::endgroup::"
@@ -314,7 +314,7 @@ jobs:
   # karictl, dag: the files the Makefile links into them, the database code included); a change to a file that only the server links does not start a browser.
   # ---------------------------------------------------------------------------
   webadmin-gui:
-    name: WebAdmin browser tests (FreeBSD ${{ inputs.release }})
+    name: WebAdmin browser tests (FreeBSD 15.1)
     if: inputs.release == '15.1'
     needs: build
     runs-on: ubuntu-latest
