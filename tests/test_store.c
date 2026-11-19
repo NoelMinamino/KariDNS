@@ -7936,6 +7936,101 @@ static void test_bulk_nx_rule(void) {
   tdir_free(&d);
 }
 
+/* A fuzzy checkpoint copies zt and zc in lockstep, pair by pair under the cells' sequence counters (ck_write_cells()): a writer that changes both cells of its zones all the time (a new stamp: zc,
+ * and the CRC in zt) while the checkpoints run leaves no torn pair in the files.  The open that has nothing to replay (a bulk fill cut off; a power loss that took the journal past the last
+ * checkpoint) rebuilds from those files and drops no zone.  Copied one table after the other, the pairs changed between the copy of zt and the copy of zc failed their CRC and were dropped. */
+#define TP_ZONES 128u
+static store_t *g_tp_s;
+static _Atomic bool g_tp_stop;
+static uint32_t g_tp_zid[TP_ZONES];
+static void *tp_writer(void *arg) {
+  (void)arg;
+  for (uint64_t gen = 10; !atomic_load(&g_tp_stop); gen++)
+    for (uint32_t i = 0; i < TP_ZONES && !atomic_load(&g_tp_stop); i++) (void)store_set_stamp(g_tp_s, g_tp_zid[i], gen, gen * 3, 0, 0);
+  return NULL;
+}
+static void test_torn_pairs(bool bulk) {
+  printf("[a fuzzy checkpoint never tears a zt / zc pair: a writer changes both cells all the time, and the rebuild with nothing to replay drops no zone (%s)]\n",
+         bulk ? "a bulk fill cut off" : "a power loss past the last checkpoint");
+  tdir_t d;
+  tdir_new(&d, "pairs");
+  store_opts_t o;
+  bulk_opts(&o);
+  o.no_readahead = true;
+  o.checkpoint_interval_ms = UINT32_MAX;
+  o.journal_max_bytes = 100u << 20;
+  int pp[2];
+  CHECK_EQ(pipe(pp), 0);
+  fflush(stdout);
+  const pid_t pid = fork();
+  if (pid == 0) {
+    store_t *s = NULL;
+    if (store_open(d.fd, &o, &s) != 0 || store_view_add(s, "default") != 0) _exit(10);
+    if (bulk && store_bulk_begin(s) != 0) _exit(11);
+    store_bulk_phase(s, STORE_BULK_BODY);
+    for (uint32_t i = 0; i < TP_ZONES; i++) {
+      if (known_i(s, 0, i, 1) != 0) _exit(12);
+      if ((g_tp_zid[i] = find_i(s, 0, i)) == STORE_NONE) _exit(13);
+    }
+    if (store_checkpoint(s) != 0) _exit(14);
+    g_tp_s = s;
+    atomic_store(&g_tp_stop, false);
+    pthread_t th;
+    if (pthread_create(&th, NULL, tp_writer, NULL) != 0) _exit(15);
+    for (int k = 0; k < 30; k++) {
+      if (store_checkpoint(s) != 0) _exit(16);                          /* (during a fill: a bulk checkpoint; else a fuzzy one) */
+      usleep(2000);
+    }
+    atomic_store(&g_tp_stop, true);
+    pthread_join(th, NULL);
+    if (!bulk && store_commit(s) != 0) _exit(17);
+    const char ok = 1;
+    if (write(pp[1], &ok, 1) != 1) _exit(18);
+    if (bulk) kill(getpid(), SIGKILL);
+    _exit(0);                                                            /* (no close) */
+  }
+  char ok = 0;
+  CHECK(read(pp[0], &ok, 1) == 1 && ok == 1);
+  close(pp[0]);
+  close(pp[1]);
+  int status = 0;
+  CHECK(waitpid(pid, &status, 0) == pid);
+  CHECK(bulk ? (WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL) : (WIFEXITED(status) && WEXITSTATUS(status) == 0));
+  if (!bulk) {                                                           /* (the power loss: no record past the last checkpoint reached the disk) */
+    DIR *dp = opendir(d.path);
+    struct dirent *de;
+    while (dp && (de = readdir(dp)) != NULL) {
+      unsigned g;
+      char tail;
+      if (sscanf(de->d_name, "jrn.%u%c", &g, &tail) != 1) continue;
+      char p[1024];
+      snprintf(p, sizeof(p), "%s/%s", d.path, de->d_name);
+      struct stat sb;
+      if (stat(p, &sb) == 0 && sb.st_size > 64) CHECK_EQ(truncate(p, 64), 0);
+    }
+    if (dp) closedir(dp);
+    o.boot_id = 43;                                                      /* (another boot) */
+  }
+  o.create = false;
+  store_t *s = NULL;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (!s) { tdir_free(&d); return; }
+  store_stats_t st;
+  store_stats(s, &st);
+  printf("  open: rebuilt %d, %" PRIu64 " replayed, %" PRIu64 " zones seen, %" PRIu64 " dropped\n", (int)st.recovery.rebuilt, st.recovery.records_replayed, st.recovery.rebuilt_zones,
+         st.recovery.dropped_zones);
+  CHECK(st.recovery.rebuilt);
+  CHECK_EQ(st.recovery.records_replayed, 0);
+  CHECK_EQ(st.recovery.dropped_zones, 0);
+  uint32_t there = 0;
+  uint8_t sta = 0;
+  for (uint32_t i = 0; i < TP_ZONES; i++) there += there_i(s, 0, i, &sta) && sta == STORE_STATE_KNOWN;
+  CHECK_EQ(there, TP_ZONES);
+  check_consistent(s, "torn pairs");
+  CHECK_EQ(store_close(s), 0);
+  tdir_free(&d);
+}
+
 int main(void) {
   const char *base = getenv("KARIDNS_STORE_TESTDIR");
   snprintf(g_base, sizeof(g_base), "%s/store_test.%d", base && *base ? base : ".", (int)getpid());
@@ -8010,6 +8105,7 @@ int main(void) {
     test_bulk_nx_rule();
     test_bulk_kill_loop(UNDER_TSAN ? 8 : 24);
   }
+  if (WANT("bulk") || WANT("pairs")) { test_torn_pairs(true); test_torn_pairs(false); }
   if (WANT("clk")) {
     int citers = getenv("KARIDNS_STORE_KILLC_ITERS") ? atoi(getenv("KARIDNS_STORE_KILLC_ITERS")) : (UNDER_TSAN ? 25 : store_long() ? 100 : 50);
     test_kill_loop(citers, 1);

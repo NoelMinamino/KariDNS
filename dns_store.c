@@ -50,7 +50,7 @@
  *     counters of the superblock are those of P, and every record after P carries the absolute value of every counter it changes.  Same boot
  *     (kill -9): the page cache holds every page the checkpoints wrote, the replay is exact.  Power loss: pages of records > P that are not in the
  *     durable journal may be on disk (a checkpoint's copy is taken after P); the open rebuilds the derived tables then, as before (a
- *     cell that was in the middle of a write when its page was flushed fails its CRC and is dropped by the rebuild: the zone is fetched again).
+ *     cell whose bytes are damaged fails its CRC and is dropped by the rebuild: the zone is fetched again; a pair is never torn by the copy, ck_write_cells()).
  *     One checkpoint at a time (ck_busy); the ix / sx generations and segments it writes or syncs are kept from being freed by io_hold.  A close
  *     leaves a fuzzy checkpoint between two runs of its write (its clean checkpoint writes everything), and the journal is bounded by
  *     2 x journal_max_bytes: the bulk writer waits between its calls, with no lock held, while the journal is at that bound (store_journal_wait()).
@@ -74,7 +74,8 @@
  *     the process has its own copy); a growth maps anonymous memory; a generation made in this session (a growth of ix / sx, a rebuild) is anonymous memory.
  *   - The writers mark the pages they change (dmap_t, one bit per page, under the mutex).  The begin of a checkpoint (under the mutex) takes the bitmaps of P and gives the writers
  *     empty ones; then, with no lock, each run of marked pages is copied with word loads into a buffer and pwrite()n to the file, the file is extended to the size of P and
- *     synced (ck_write_tab()).  The page cache page that the kernel writes out is never the page a writer stores into.  A checkpoint that fails or is left gives its pages back.
+ *     synced (ck_write_tab(); zt and zc in lockstep, run by run over the same cells, and every cell pair under its sequence counter: ck_write_cells()).  The page cache page that the kernel
+ *     writes out is never the page a writer stores into.  A checkpoint that fails or is left gives its pages back.
  *     The granule is the page: a larger one would write pages still shared with the page cache, and a writer's first store into one (a copy-on-write fault) would wait for it.
  *   - The copy is taken after P while the writers go on: what it holds of records > P is made right by the replay from P, as for the fuzzy flush above; a page that no record
  *     between the last two begins changed was written by the checkpoint before (one at a time) with its value of P.
@@ -170,12 +171,12 @@
  *      of a full disk: the store was empty, nothing is dead.  The readers are unchanged: the tables in memory are the truth.
  *   C  bulk checkpoints (store_bulk_phase(BODY / PASSED): none while a pass runs): a fuzzy checkpoint begun while BULK (ck_begin_locked(), ck.bulk) when the segments doubled since the last one and
  *      grew by at least opts.bulk_ckpt_bytes (4 GiB), or when opts.bulk_ckpt_interval_ms (15 min) passed and they grew (bulk_due()).  Its steps are those of any fuzzy checkpoint: the commit of its
- *      position P syncs the segments marked dirty and the directory (the files of new segments are in it before a superblock names them), zt and zc are copied as of P (and later), nx by the nx rule
+ *      position P syncs the segments marked dirty and the directory (the files of new segments are in it before a superblock names them), zt and zc are copied as of P (and later; pair by pair under the cells' sequence counters, ck_write_cells(), so no pair is torn), nx by the nx rule
  *      (ck_nx_widen()); ix and sx are not written (their pages stay marked; a generation made during the fill is written whole at its end).  Its superblock says SBF_BULK | SBF_BULK_CK: the open
  *      does not read ix / sx from it (adopt_sb()) and rebuilds them from zt.  P names no record: the counters, views and cursors are those of the begin (under the mutex), the tables those of the copy.
  *   K  a crash during the fill (the open finds SBF_BULK without the clean flag): nothing is replayed (journal_skip(): the chain is passed over so that the next journal file is a new one; the records
  *      made after the end of the fill and before its checkpoint was on disk are lost with it); the derived tables are rebuilt with the bulk rules (rebuild_locked(RB_BULK); also after the
- *      superblock of the start: a bulk checkpoint that did not reach its superblock may have written pages of the tables, which no replay makes right): a cell torn by the copy fails its CRC and is dropped; a STORED cell whose image is past the durable end of its segment (the counters of the superblock: the segments were synced to at least
+ *      superblock of the start: a bulk checkpoint that did not reach its superblock may have written pages of the tables, which no replay makes right): a cell that is damaged fails its CRC and is dropped (the copy never tears a pair); a STORED cell whose image is past the durable end of its segment (the counters of the superblock: the segments were synced to at least
  *      there before the tables) becomes KNOWN with its name, source id and stamp, so that it is fetched again rather than lost; a long name is taken only when it is the one whose start the cell holds.
  *      Segment files past the counters are files nobody names (the next creation of the number truncates them).  The caller drops the loader's cursors of its views (a bulk checkpoint may hold a
  *      cursor whose zones a dropped cell had): the next pass lists every zone again.  The open's own checkpoint says BULK again, so the rest of the fill stays unlogged.  The WARNING says when the
@@ -2895,7 +2896,7 @@ static int ck_io_commit(store_t *s, bool full) {
 /* ---- the write of the tables (0.7: the tables in private memory) ----
  * Table i of a checkpoint: 0 zt, 1 zc, 2 nx, 3 / 4 the ix / sx generation of P (s->ck.ix / ck.sx). */
 
-#define ST_CK_RUN (1u << 20)                /* the longest run of pages copied and written at once (the size of ck_buf) */
+#define ST_CK_RUN (1u << 20)                /* the longest run of pages copied and written at once (ck_buf holds two: zt and zc, ck_write_cells()) */
 
 static dmap_t *ck_dmap(store_t *s, int i) {
   switch (i) {
@@ -3011,6 +3012,18 @@ static void ck_pace(store_t *s, uint64_t done, const _Atomic bool *cancel) {
 /* Write the pages of table i that the checkpoint took (no lock: the writers go on).  A run of pages is copied into ck_buf with word loads (the writers store words into those pages
  * meanwhile: a copy may hold the effect of records after P, which the replay from P makes right again, see "The tables in private memory") and written with pwrite(); the page that
  * a writer stores into is never the page the kernel writes out.  Then the file is extended to the size of P and synced.  *done: the bytes written. */
+/* the end of a table's write: the file is extended to the size of P and synced (when anything was written to it) */
+static int ck_tab_end(int fd, uint64_t bytes, bool wrote) {
+  struct stat st;
+  if (fstat(fd, &st) != 0) return -errno;
+  if ((uint64_t)st.st_size < ST_HDR_PAGE + bytes) {
+    int r = st_extend(fd, st.st_size, (off_t)(ST_HDR_PAGE + bytes));
+    if (r < 0) return r;
+    wrote = true;
+  }
+  if (wrote && fdatasync(fd) != 0) return -errno;
+  return 0;
+}
 static int ck_write_tab(store_t *s, int i, int fd, const uint8_t *base, const _Atomic bool *cancel, uint64_t *done) {
   const uint64_t *dirty = s->ck.t[i].dirty, bytes = s->ck.t[i].bytes;
   const bool all = s->ck.t[i].all;
@@ -3047,14 +3060,84 @@ static int ck_write_tab(store_t *s, int i, int fd, const uint8_t *base, const _A
     if (cancel) ck_pace(s, *done, cancel);
     if (cancel && atomic_load_explicit(cancel, memory_order_relaxed)) return -ECANCELED;
   }
-  struct stat st;
-  if (fstat(fd, &st) != 0) return -errno;
-  if ((uint64_t)st.st_size < ST_HDR_PAGE + bytes) {
-    int r = st_extend(fd, st.st_size, (off_t)(ST_HDR_PAGE + bytes));
-    if (r < 0) return r;
-    wrote = true;
+  return ck_tab_end(fd, bytes, wrote);
+}
+
+/* zt and zc in lockstep (0.7, every checkpoint): page n of zt and page n of zc hold the cells of the same zone ids (64 bytes a cell in both, from ST_HDR_PAGE in both files), and a zone's pair is
+ * one record (its CRC covers both cells).  Copied one table after the other, a pair that a writer changed between the two copies reached the disk torn: zt of one version, zc of another, a CRC that
+ * fails, a zone the rebuild drops (a bulk fill cut off after a bulk checkpoint, 678 of 200000 zones; the records past the durable journal after a power loss).  So a run of pages is the run of both
+ * tables over the same cells (the union of the two maps: a page of zt and the same page of zc are marked separately), and in a fuzzy checkpoint every pair is copied as a lock-free reader reads it
+ * (zrec_read_seq()): the sequence counter in word 7 of the zc cell, odd while a writer is in the pair, read before and after the copy of both cells; a pair that was being written or changed under the
+ * copy is copied again (seq_wait(): a spin, a yield, short sleeps; a counter that stays odd for ST_SEQ_GIVEUP_US, which only a crash leaves behind, is copied as it is and the rebuild judges it).
+ * With the writers kept out (cancel NULL) no pair changes and the copy is a plain one.  The writes, the pacing and the cancel points are those of ck_write_tab(), with a half of ck_buf (2 x ST_CK_RUN) for each table. */
+static int ck_write_cells(store_t *s, const _Atomic bool *cancel, uint64_t *done) {
+  const mtab_t *tabs[2] = { &s->zt, &s->zc };
+  uint64_t np[2];
+  for (int i = 0; i < 2; i++) {
+    np[i] = s->ck.t[i].bytes >> s->pgshift;
+    if (!s->ck.t[i].all && np[i] > s->ck.t[i].npages) np[i] = s->ck.t[i].npages;
+    if (!s->ck.t[i].cow) ck_charge(s, s->ck.t[i].grow);
   }
-  if (wrote && fdatasync(fd) != 0) return -errno;
+  const uint64_t npmax = np[0] > np[1] ? np[0] : np[1], run_max = ST_CK_RUN >> s->pgshift, cpp = (uint64_t)s->pagesz / ST_REC;
+  uint8_t *const buf[2] = { s->ck_buf, s->ck_buf + ST_CK_RUN };
+  bool wrote[2] = { false, false };
+#define CK_MARKED(i, p) ((p) < np[(i)] && (s->ck.t[(i)].all || ((s->ck.t[(i)].dirty[(p) >> 6] >> ((p) & 63)) & 1)))
+  const bool any_all = s->ck.t[0].all || s->ck.t[1].all;
+  for (uint64_t p = 0; p < npmax; ) {
+    if (!any_all && (p >= np[0] || !s->ck.t[0].dirty[p >> 6]) && (p >= np[1] || !s->ck.t[1].dirty[p >> 6])) { p = (p | 63) + 1; continue; }     /* (no page of either in this word) */
+    if (!CK_MARKED(0, p) && !CK_MARKED(1, p)) { p++; continue; }
+    const uint64_t start = p;
+    while (p < npmax && p - start < run_max && (CK_MARKED(0, p) || CK_MARKED(1, p))) p++;
+    size_t len[2];
+    for (int i = 0; i < 2; i++) len[i] = start < np[i] ? (size_t)(((p < np[i] ? p : np[i]) - start) << s->pgshift) : 0;
+    const uint64_t z0 = start * cpp, z1 = z0 + (uint64_t)((len[0] < len[1] ? len[0] : len[1]) / ST_REC);    /* (the pairs: the cells both tables hold in the run) */
+    for (uint64_t z = z0; z < z1; z++) {
+      const _Atomic uint64_t *tc = (const _Atomic uint64_t *)(tabs[0]->base + z * ST_REC), *cc = (const _Atomic uint64_t *)(tabs[1]->base + z * ST_REC);
+      uint64_t *dt = (uint64_t *)(buf[0] + (z - z0) * ST_REC), *dc = (uint64_t *)(buf[1] + (z - z0) * ST_REC);
+      seqwait_t sw = { 0, 0 };
+      for (;;) {
+        const uint32_t s1 = (uint32_t)(atomic_load_explicit(&cc[7], memory_order_acquire) >> 32);
+        for (int k = 0; k < 8; k++) dt[k] = atomic_load_explicit(&tc[k], memory_order_relaxed);
+        for (int k = 0; k < 8; k++) dc[k] = atomic_load_explicit(&cc[k], memory_order_relaxed);
+        if (!cancel) break;
+        atomic_thread_fence(memory_order_acquire);
+        const uint32_t s2 = (uint32_t)(atomic_load_explicit(&cc[7], memory_order_relaxed) >> 32);
+        if (!(s1 & 1u) && s1 == s2) break;
+        if (!seq_wait(&sw)) break;
+      }
+    }
+    for (int i = 0; i < 2; i++) {                    /* (the cells of a table past the other's end: a plain copy) */
+      const size_t from = (size_t)((z1 - z0) * ST_REC);
+      const _Atomic uint64_t *src = (const _Atomic uint64_t *)(tabs[i]->base + (start << s->pgshift) + from);
+      uint64_t *dst = (uint64_t *)(buf[i] + from);
+      for (size_t k = 0; from + k * 8 < len[i]; k++) dst[k] = atomic_load_explicit(&src[k], memory_order_relaxed);
+    }
+    /* rule T (N1), as in ck_write_tab(): both copies reach their files only after the kernel holds the journal up to the jr_pub read after them */
+    atomic_thread_fence(memory_order_acquire);
+    const uint64_t X = atomic_load_explicit(&s->jr_pub, memory_order_relaxed);
+    if (atomic_load_explicit(&s->jr_tail, memory_order_acquire) < X && !RULE_T_OFF()) {
+      atomic_fetch_add_explicit(&s->n_ck_twaits, 1, memory_order_relaxed);
+      const int w = jw_wait(s, X, cancel);
+      if (w < 0) return w;
+    }
+    for (int i = 0; i < 2; i++) {
+      if (!len[i]) continue;
+      if (s->ck.t[i].cow) ck_charge(s, len[i]);
+      const int r = FAIL_CKWRITE() ? -EIO : st_pwrite_all(tabs[i]->fd, buf[i], len[i], (off_t)(ST_HDR_PAGE + (start << s->pgshift)));
+      if (r < 0) return r;
+      *done += len[i];
+      wrote[i] = true;
+      CRASH_POINT();
+      st_hook(&store_test_ckpt_hook, 5);
+    }
+    if (cancel) ck_pace(s, *done, cancel);
+    if (cancel && atomic_load_explicit(cancel, memory_order_relaxed)) return -ECANCELED;
+  }
+#undef CK_MARKED
+  for (int i = 0; i < 2; i++) {
+    const int r = ck_tab_end(tabs[i]->fd, s->ck.t[i].bytes, wrote[i]);
+    if (r < 0) return r;
+  }
   return 0;
 }
 /* The nx rule (0.7, the bulk fill; every fuzzy checkpoint): a zt cell that a writer changed after P on a page that was marked at P is copied with its new value, and its long name may be on a page of
@@ -3091,7 +3174,11 @@ static int ck_io_tables(store_t *s, const _Atomic bool *cancel) {
   for (int i = 0; i < 5 && r == 0; i++) {
     if (i == 2 && cancel) r = ck_nx_widen(s);       /* (fuzzy: the nx rule, above; with the writers kept out nothing was marked since P) */
     if (r < 0) break;
-    if (i < 3) {
+    if (i == 1) continue;                             /* (zc: with zt, in lockstep) */
+    if (i == 0) {
+      r = ck_write_cells(s, cancel, &done);
+      if (r == 0) { mtab_note_extended(tabs[0], s->ck.t[0].bytes); mtab_note_extended(tabs[1], s->ck.t[1].bytes); }
+    } else if (i == 2) {
       r = ck_write_tab(s, i, tabs[i]->fd, tabs[i]->base, cancel, &done);
       if (r == 0) mtab_note_extended(tabs[i], s->ck.t[i].bytes);
     } else {
@@ -7578,7 +7665,7 @@ int store_open(int dirfd, const store_opts_t *opts, store_t **out) {
   s->sb_fd[0] = s->sb_fd[1] = -1;
   s->zt.fd = s->zc.fd = s->nx.fd = -1;
   s->sbbuf = calloc(1, sizeof(sb_t));
-  s->ck_buf = malloc(ST_CK_RUN);
+  s->ck_buf = malloc(2 * ST_CK_RUN);                     /* (zt and zc are copied in lockstep: ck_write_cells()) */
   s->jb.p = malloc(4096);
   s->jb.cap = s->jb.p ? 4096 : 0;
   s->jx_cap = JX_CAP;
