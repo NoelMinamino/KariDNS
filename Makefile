@@ -2039,10 +2039,10 @@ dag-asan: $(DAG_ASAN_SRCS)
 	$(CC) $(ASAN_CFLAGS) $(DAG_ASAN_SRCS) -o $@ $(LDFLAGS) -lssl -lcrypto -lz $(IDN_LDFLAGS)
 
 dnsqps-asan: $(DNSQPS_SRCS)
-	$(CC) $(ASAN_CFLAGS) $(DQ_XDP_CFLAGS) $(DNSQPS_SRCS) -o $@ $(LDFLAGS) -lssl -lcrypto -lz $(DQ_XDP_LIBS)
+	$(CC) $(ASAN_CFLAGS) $(BREW_CFLAGS) $(DQ_XDP_CFLAGS) $(DNSQPS_SRCS) -o $@ $(LDFLAGS) -lssl -lcrypto -lz $(DQ_XDP_LIBS)
 
 dnsqps-tsan: $(DNSQPS_SRCS)
-	$(CC) $(TSAN_CFLAGS) $(DQ_XDP_CFLAGS) $(DNSQPS_SRCS) -o $@ $(TSAN_LDFLAGS) -lssl -lcrypto -lz -lpthread -lm $(DQ_XDP_LIBS)
+	$(CC) $(TSAN_CFLAGS) $(BREW_CFLAGS) $(DQ_XDP_CFLAGS) $(DNSQPS_SRCS) -o $@ $(TSAN_LDFLAGS) -lssl -lcrypto -lz -lpthread -lm $(DQ_XDP_LIBS)
 
 KARICTL_ASAN_SRCS = tools/karictl.c dns_mem_advice.c
 karictl-asan: $(KARICTL_ASAN_SRCS)

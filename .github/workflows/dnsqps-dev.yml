@@ -33,6 +33,12 @@ jobs:
           make clean
       - name: dnsqps
         run: sh tests/run_ci_dnsqps.sh
+      - name: ceiling (information only)
+        run: |
+          printf "www.example.test
+" > n.txt
+          nproc || sysctl -n hw.ncpu
+          for io in sendto mmsg; do ./dnsqps -r -z n.txt --null-target -l 4 -T 2 --io $io 2>&1 | grep -E "I/O path:|Queries per second" || true; done
       - name: dnsqps AF_XDP on a veth pair
         if: runner.os == 'Linux'
         run: sudo DNSQPS_TEST_REQUIRE=1 sh tests/run_dnsqps_xdp_test.sh
@@ -83,4 +89,7 @@ jobs:
             DNSQPS=./dnsqps-asan sh tests/run_dnsqps_test.sh
             DNSQPS=./dnsqps-tsan sh tests/run_dnsqps_test.sh
             DNSQPS_TEST_REQUIRE=1 sh tests/run_dnsqps_netmap_test.sh
+            printf "www.example.test
+" > n.txt
+            for io in sendto mmsg; do ./dnsqps -r -z n.txt --null-target -l 4 -T 2 --io $io 2>&1 | grep -E "I/O path:|Queries per second" || true; done
             for t in fuzz_dnsqps_resp fuzz_dnsqps_args; do tests/fuzz/$t -runs=50000 -close_fd_mask=3 tests/fuzz/corpus_$t; done
