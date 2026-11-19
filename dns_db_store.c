@@ -587,6 +587,7 @@ static void set_load(int dirfd) {
   }
   struct stat st;
   if (fstat(SET.fd, &st) != 0) goto io_error;
+  if (st.st_size == 0) (void)fsync(dirfd);                   /* (a file that was just made: its directory entry is durable before the first text is; best effort, the texts are re-sent by the database otherwise) */
   off_t off = 0;
   for (;;) {
     uint32_t h[3];
@@ -640,7 +641,7 @@ static uint32_t dir_settings_id(zone_ext_shared_t *sh) {
       uint32_t h[3] = { DBS_SET_MAGIC, (uint32_t)sh->key_len, set_crc((const uint8_t *)sh->key, sh->key_len) };
       memcpy(buf, h, 12);
       memcpy(buf + 12, sh->key, sh->key_len);
-      if (pwrite(SET.fd, buf, 12 + sh->key_len, SET.end) == (ssize_t)(12 + sh->key_len) && fdatasync(SET.fd) == 0 && set_put_slot(SET.n + 1, sh)) {
+      if (pwrite(SET.fd, buf, 12 + sh->key_len, SET.end) == (ssize_t)(12 + sh->key_len) && fsync(SET.fd) == 0 && set_put_slot(SET.n + 1, sh)) {
         zone_ext_shared_ref(sh);                       /* (the table's reference: the object lives as long as the process) */
         SET.end += (off_t)(12 + sh->key_len);
         SET.n++;
