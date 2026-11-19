@@ -9,6 +9,7 @@ jobs:
   unix:
     name: dnsqps on ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
@@ -39,6 +40,7 @@ jobs:
   windows:
     name: dnsqps on Windows
     runs-on: windows-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: msys2/setup-msys2@v2
@@ -62,6 +64,7 @@ jobs:
   freebsd:
     name: dnsqps on FreeBSD 15.1
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: vmactions/freebsd-vm@v1.4.8

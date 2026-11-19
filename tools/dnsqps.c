@@ -371,6 +371,7 @@ int main(int argc, char **argv) {
     if (dq_qtab_load(&tab, &cfg, err, sizeof err) < 0) return die(err);
     unsigned nthr = cfg.threads ? cfg.threads : (dq_ncpus() < 4 ? dq_ncpus() : 4);
     if (!tab.gen && nthr > tab.n) nthr = (unsigned)tab.n;
+    if (cfg.count && nthr > cfg.count) nthr = (unsigned)cfg.count;   /* every thread has a share of -N (a share of 0 would mean no limit) */
     if (nthr == 0) nthr = 1;
     cfg.threads = nthr;
     unsigned nchan = cfg.sockets;
