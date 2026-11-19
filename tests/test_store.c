@@ -3112,9 +3112,9 @@ static void test_journal_boost(void) {
   store_stats(s, &st);
   CHECK(cut);
   CHECK(st.journal_peak_bytes >= 4 * JBO_MAX && st.journal_peak_bytes <= 8 * JBO_MAX + 4096);
-  for (int w = 0; w < 3000 && st.checkpoints < base + 1; w++) { usleep(1000); store_stats(s, &st); }
+  for (int w = 0; w < 60000 && st.checkpoints < base + 1; w++) { usleep(1000); store_stats(s, &st); }
   CHECK(st.checkpoints >= base + 1);
-  for (int w = 0; w < 20000 && st.journal_bytes >= 3 * JBO_MAX / 2; w++) { usleep(1000); store_stats(s, &st); }   /* (a slow checkpoint (ZFS, ASan) let the writes of step 1 run on past 4 x: the next one cuts them) */
+  CHECK_EQ(store_checkpoint(s), 0);                                      /* (waits for the checkpoint in progress and cuts what the writes of step 1 added meanwhile: a slow one (ZFS, ASan, a loaded host) let them run on past 4 x, and one still running at step 2 held the cut that step 2 waits for) */
   /* 2. the end of the fill: the journal is between the two sizes, the checkpoint that cuts it is made at once (the flusher is woken), the sizes are the normal ones */
   k = jbo_fill(s, k, 3 * JBO_MAX / 2, &cut);
   store_stats(s, &st);
@@ -3130,7 +3130,7 @@ static void test_journal_boost(void) {
   CHECK_EQ(st.journal_boost, 0);
   CHECK_EQ(st.journal_boosts, 1);
   CHECK_EQ(log_count(6, "the bulk fill is over: a checkpoint is forced at 256 KiB of journal again"), 1);
-  for (int w = 0; w < 5000 && (st.checkpoints == c1 || st.journal_bytes >= JBO_MAX); w++) { usleep(1000); store_stats(s, &st); }
+  for (int w = 0; w < 60000 && (st.checkpoints == c1 || st.journal_bytes >= JBO_MAX); w++) { usleep(1000); store_stats(s, &st); }
   printf("  the journal of %u KiB was cut %" PRIu64 " ms after the end of the fill\n", (unsigned)(3 * JBO_MAX / 2 >> 10), now_ms() - t0);
   CHECK(st.checkpoints > c1);
   CHECK(st.journal_bytes < JBO_MAX);
@@ -3290,7 +3290,7 @@ static void test_journal_bound(int mode) {
     if (put_i(s, 0, i, 1, NULL) != 0) { CHECK(!"put 2"); break; }
   atomic_store(&g_jb_entered, false);
   atomic_store(&g_jb_step, 2);
-  for (int w = 0; w < 5000 && !atomic_load(&g_jb_entered); w++) usleep(1000);
+  for (int w = 0; w < 60000 && !atomic_load(&g_jb_entered); w++) usleep(1000);
   CHECK(atomic_load(&g_jb_in));
   const uint32_t n = i;
   log_clear();
@@ -7110,6 +7110,334 @@ static void test_jr_group_torn(void) {
   CHECK(parts > 0 && whole > 0 && none > 0);
 }
 
+/* ---- 0.7 round 15: the blocks of the tables and the next segment are made ahead by threads of their own ---- */
+
+static pthread_t g_ah_main;
+static _Atomic int g_ah_in1, g_ah_in2, g_ah_in3, g_ah_held;                       /* entries of the hook at its sites 1, 2 and 3 */
+static _Atomic int g_ah_slow1, g_ah_slow2;                             /* the thread's hook waits (until released) at site 1 / 2 */
+static _Atomic bool g_ah_release;
+static void ah_hook(store_t *s, int site) {
+  (void)s;
+  if (site == 3) { atomic_fetch_add(&g_ah_in3, 1); return; }          /* (inside the writer mutex: counted, never slow: the fallback is the old behaviour) */
+  if (pthread_equal(pthread_self(), g_ah_main)) return;                /* (the test's own thread: store_reserve()) */
+  atomic_fetch_add(site == 1 ? &g_ah_in1 : &g_ah_in2, 1);
+  if (atomic_load(site == 1 ? &g_ah_slow1 : &g_ah_slow2)) {
+    atomic_fetch_add(&g_ah_held, 1);
+    for (int i = 0; i < 60000 && !atomic_load(&g_ah_release); i++) usleep(1000);        /* (a disk that stalls: until the test lets go, 60 s at most) */
+  }
+}
+static unsigned seg_files(const char *dir, uint32_t *highest) {
+  DIR *dp = opendir(dir);
+  if (!dp) return 0;
+  unsigned n = 0;
+  uint32_t hi = 0;
+  struct dirent *de;
+  while ((de = readdir(dp)) != NULL) {
+    unsigned g;
+    char tail;
+    if (sscanf(de->d_name, "seg.%u%c", &g, &tail) != 1) continue;
+    n++;
+    if (g > hi) hi = g;
+  }
+  closedir(dp);
+  if (highest) *highest = hi;
+  return n;
+}
+#define AH_ZONES 700u
+/* the zone ids the tests above write: version v of zone i % AH_ZONES (a put number k writes zone k % AH_ZONES in version 1 + k / AH_ZONES) */
+static bool ah_verify_all(store_t *s, uint32_t puts) {
+  bool all = true;
+  for (uint32_t i = 0; i < AH_ZONES && i < puts; i++) all = all && verify_i(s, 0, i, 1 + (puts - 1 - ((puts - 1 - i) % AH_ZONES)) / AH_ZONES);
+  return all;
+}
+static bool ah_wait_stat(store_t *s, store_stats_t *st, int ms, bool (*pred)(const store_stats_t *)) {
+  for (int k = 0; k < ms; k++) {
+    store_stats(s, st);
+    if (pred(st)) return true;
+    usleep(1000);
+  }
+  return false;
+}
+static bool ah_p_ready(const store_stats_t *st) { return st->segment_ready == 1; }
+static bool ah_p_alloc(const store_stats_t *st) { return st->ahead_allocs >= 1; }
+static bool ah_p_thread(const store_stats_t *st) { return st->ahead_thread_max_us >= 1000; }
+static bool ah_p_unwritten0(const store_stats_t *st) { return st->ring_unwritten_bytes == 0; }
+static bool ah_p_committed(const store_stats_t *st) { return st->committed_lsn >= st->lsn; }
+
+/* A posix_fallocate() that waits (a disk that stalls: 0.5 to 11 s on UFS) stood in the commit thread, which makes the periodic commits and leads the ring for the deferred records.  The hook holds
+ * the thread of the blocks ahead in the allocation: the commit thread goes on (the periodic commit makes the records durable, the deferred records are written), and the checkpoint and the
+ * writers do not wait for it. */
+static void test_ahead_tables(void) {
+  printf("[the blocks of the tables are allocated by a thread of its own: a slow allocation stalls neither the commits nor the ring]\n");
+  tdir_t d;
+  tdir_new(&d, "ahtab");
+  store_opts_t o;
+  small_opts(&o);
+  o.sync_interval_ms = 5;
+  o.scrub_interval_s = UINT32_MAX;
+  store_t *s = NULL;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (!s) { tdir_free(&d); return; }
+  store_view_add(s, "default");
+  g_ah_main = pthread_self();
+  atomic_store(&g_ah_in1, 0);
+  atomic_store(&g_ah_slow1, 1);
+  atomic_store(&g_ah_release, false);
+  atomic_store(&store_test_ahead_hook, ah_hook);
+  uint32_t k = 0;
+  store_stats_t st;
+  for (; k < 60000 && atomic_load(&g_ah_in1) == 0; k++) {             /* (zones until the thread stands in its allocation) */
+    CHECK_EQ(put_i(s, 0, k, 1, NULL), 0);
+    if ((k & 255) == 255) usleep(2000);
+  }
+  CHECK(atomic_load(&g_ah_in1) > 0);
+  printf("  the thread is in the allocation after %u zones\n", k);
+  /* the periodic commit: no store_commit(), the records become durable in the time of the sync interval */
+  CHECK_EQ(put_i(s, 0, k, 1, NULL), 0);
+  k++;
+  const uint64_t t0 = now_us();
+  CHECK(ah_wait_stat(s, &st, 10000, ah_p_committed));
+  const uint64_t commit_us = now_us() - t0;
+  printf("  the periodic commit took %" PRIu64 " us while the allocation waited\n", commit_us);
+  CHECK(commit_us < 9000000);                                          /* (the hold lasts up to 60 s: a commit that waits for it is far past this; a loaded host and a slow disk are not) */
+  /* the ring: the records of a thread that does not wait for them are written by the background leader (the commit thread) */
+  if (store_defer(s, true) == 0) {
+    CHECK_EQ(put_i(s, 0, k, 1, NULL), 0);
+    k++;
+    const uint64_t t1 = now_us();
+    CHECK(ah_wait_stat(s, &st, 10000, ah_p_unwritten0));
+    printf("  the deferred record was written after %" PRIu64 " us\n", now_us() - t1);
+    CHECK(now_us() - t1 < 9000000);
+    CHECK_EQ(store_settle(s), 0);
+    (void)store_defer(s, false);
+  } else {
+    CHECK(false);                                                      /* (a store with a flusher accepts the deferral) */
+  }
+  store_stats(s, &st);
+  CHECK(st.ahead_busy_kicks > 0);                                      /* (the commit thread asked while the thread stood in its allocation, and went on) */
+  CHECK_EQ(store_checkpoint(s), 0);                                    /* (a checkpoint does not wait for the allocation either: it extends the files itself) */
+  atomic_store(&g_ah_release, true);
+  CHECK(ah_wait_stat(s, &st, 30000, ah_p_alloc));
+  CHECK(ah_wait_stat(s, &st, 30000, ah_p_thread));
+  CHECK(st.ahead_alloc_max_us >= 1000);                                /* (the time of the wait is in the longest allocation) */
+  CHECK(st.ahead_thread_max_us >= 1000);                               /* (the thread's own longest round, with no store_reserve() in it) */
+  CHECK(st.ahead_unallocated_growths >= 1);                            /* (a growth found its blocks not allocated yet: the checkpoint took them) */
+  atomic_store(&g_ah_slow1, 0);
+  for (uint32_t i = 0; i < k; i += 97) CHECK(verify_i(s, 0, i, 1));
+  store_check_report_t rep;
+  CHECK_EQ(store_check(s, &rep), 0);
+  CHECK_EQ(store_close(s), 0);                                         /* (the thread is joined: the hook is gone after it) */
+  atomic_store(&store_test_ahead_hook, NULL);
+  o.create = false;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (s) {
+    for (uint32_t i = 0; i < k; i += 97) CHECK(verify_i(s, 0, i, 1));
+    CHECK_EQ(store_close(s), 0);
+  }
+  tdir_free(&d);
+}
+
+/* The file of the next segment is made by a thread once the open segment is half full; seg_place() takes it.  With the thread held in its file (a slow disk) the segment fills and the writer makes the
+ * file itself (the fallback, counted), without taking the number the thread is making; the writers go on meanwhile: no file is made inside the mutex while a precreated one waits. */
+static void test_ahead_segments(int mode) {
+  printf("[the next segment is made ahead (%s): taken, the fallback when none is ready, a slow disk under the thread]\n", mode == STORE_MODE_MAP ? "MAP" : "COPY");
+  tdir_t d;
+  tdir_new(&d, "ahseg");
+  store_opts_t o;
+  small_opts(&o);
+  o.mode = mode;
+  o.sync_interval_ms = 5;
+  o.scrub_interval_s = UINT32_MAX;
+  store_t *s = NULL;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (!s) { tdir_free(&d); return; }
+  store_view_add(s, "default");
+  g_ah_main = pthread_self();
+  atomic_store(&g_ah_in2, 0);
+  atomic_store(&g_ah_in3, 0);
+  atomic_store(&g_ah_slow2, 0);
+  atomic_store(&g_ah_release, false);
+  atomic_store(&store_test_ahead_hook, ah_hook);
+  uint32_t k = 0;
+  store_stats_t st;
+  store_stats(s, &st);
+  /* 1. the first segment is made inside the mutex (nothing is made ahead of the first); each of the next ones is taken: the puts stop at the half of the open segment, where the thread is asked, until
+   * the file is there (a loaded host may make the thread late: it is waited for, not raced), then go on to the roll */
+  CHECK_EQ(put_i(s, 0, k % AH_ZONES, 1 + k / AH_ZONES, NULL), 0);
+  k++;
+  for (int roll = 0; roll < 5; roll++) {
+    store_stats(s, &st);
+    const uint32_t seg0 = st.seg_count;
+    const uint64_t pre_before = st.segment_precreated;
+    store_seg_info_t si;
+    for (uint32_t n = 0; n < 200000 && (store_seg_info(s, seg0, &si) != 0 || si.used < o.seg_size / 2 + 4096); n++, k++) CHECK_EQ(put_i(s, 0, k % AH_ZONES, 1 + k / AH_ZONES, NULL), 0);
+    CHECK(ah_wait_stat(s, &st, 30000, ah_p_ready));
+    for (uint32_t n = 0; n < 200000 && st.seg_count == seg0; n++, k++) {
+      CHECK_EQ(put_i(s, 0, k % AH_ZONES, 1 + k / AH_ZONES, NULL), 0);
+      if ((k & 15) == 0) store_stats(s, &st);
+    }
+    store_stats(s, &st);
+    CHECK_EQ(st.seg_count, seg0 + 1);
+    CHECK_EQ(st.segment_precreated, pre_before + 1);                                   /* (this one came from ahead) */
+  }
+  store_stats(s, &st);
+  printf("  %u segments: %" PRIu64 " taken from ahead, %" PRIu64 " made inside the mutex (the longest %" PRIu64 " us), the thread's longest file %" PRIu64 " us\n", st.seg_count, st.segment_precreated,
+         st.segment_inline_creates, st.segment_inline_create_max_us, st.segment_precreate_max_us);
+  CHECK_EQ(st.seg_count, 6);
+  CHECK_EQ(st.segment_precreated + st.segment_inline_creates, st.seg_count);          /* (every segment was made one way or the other) */
+  CHECK_EQ((uint64_t)atomic_load(&g_ah_in3), st.segment_inline_creates);               /* (the hook inside the mutex saw each file made there) */
+  CHECK_EQ(st.segment_inline_creates, 1);                                             /* (the first segment: nothing is made ahead of the first) */
+  CHECK_EQ(st.segment_precreated, 5);
+  CHECK_EQ(st.segment_precreate_errors, 0);
+  /* 2. the thread is held in its file: the writers go on, the segment fills, the writer makes the file itself and leaves the number the thread has */
+  atomic_store(&g_ah_held, 0);
+  atomic_store(&g_ah_slow2, 1);
+  for (int w = 0; w < 40000 && atomic_load(&g_ah_held) == 0; w++) {                    /* (the thread is asked at the half of a segment: it stands in the hook, with its number chosen and no file made) */
+    CHECK_EQ(put_i(s, 0, k % AH_ZONES, 1 + k / AH_ZONES, NULL), 0);
+    k++;
+    if ((k & 15) == 0) usleep(300);
+  }
+  CHECK(atomic_load(&g_ah_held) > 0);
+  store_stats(s, &st);
+  const uint64_t pre0 = st.segment_precreated, inl0 = st.segment_inline_creates;
+  const uint32_t segs0 = st.seg_count;
+  CHECK_EQ(st.segment_ready, 0);
+  const uint64_t t0 = now_us();
+  uint32_t during = 0;
+  while (st.seg_count == segs0 && k < 120000) {                                        /* (the writers go on while the thread is held; the segment fills up and rolls) */
+    CHECK_EQ(put_i(s, 0, k % AH_ZONES, 1 + k / AH_ZONES, NULL), 0);
+    k++;
+    during++;
+    if ((k & 15) == 0) store_stats(s, &st);
+  }
+  const uint64_t span_us = now_us() - t0;
+  store_stats(s, &st);
+  printf("  %u puts in %" PRIu64 " us while the thread was held, then the segment rolled: %" PRIu64 " made inside the mutex\n", during, span_us, st.segment_inline_creates - inl0);
+  CHECK(st.seg_count > segs0);
+  CHECK_EQ(st.segment_inline_creates, inl0 + 1);                                       /* (the fallback: none was ready) */
+  CHECK_EQ(st.segment_precreated, pre0);
+  CHECK(span_us < 120000000);
+  CHECK_EQ(st.segment_ready, 0);
+  atomic_store(&g_ah_release, true);
+  CHECK(ah_wait_stat(s, &st, 30000, ah_p_ready));                                       /* (the thread finishes the file it holds) */
+  /* 3. that file has a number the writer skipped: it is taken at the next roll, and the numbers are all different */
+  const uint32_t segs1 = st.seg_count;
+  atomic_store(&g_ah_slow2, 0);
+  const uint64_t pre1 = st.segment_precreated;
+  uint32_t safety = 0;
+  while (st.segment_precreated == pre1 && safety++ < 60000) {
+    CHECK_EQ(put_i(s, 0, k % AH_ZONES, 1 + k / AH_ZONES, NULL), 0);
+    k++;
+    if ((k & 15) == 0) { usleep(200); store_stats(s, &st); }
+  }
+  store_stats(s, &st);
+  CHECK(st.segment_precreated > pre1);
+  CHECK(st.seg_count >= segs1);
+  CHECK(ah_verify_all(s, k));
+  store_check_report_t rep;
+  CHECK_EQ(store_check(s, &rep), 0);
+  uint32_t hi = 0;
+  const unsigned nfiles = seg_files(d.path, &hi);
+  CHECK(nfiles >= st.seg_count - 1);
+  CHECK_EQ(store_close(s), 0);
+  atomic_store(&store_test_ahead_hook, NULL);
+  /* a clean close removes the file that waits: nothing but the segments the store names is left, and a reopen reads all */
+  uint32_t hi2 = 0;
+  const unsigned nfiles2 = seg_files(d.path, &hi2);
+  printf("  files before the close %u (highest %u), after %u (highest %u)\n", nfiles, hi, nfiles2, hi2);
+  o.create = false;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (s) {
+    store_stats(s, &st);
+    CHECK(hi2 <= st.seg_count);
+    CHECK(ah_verify_all(s, k));
+    CHECK_EQ(store_check(s, &rep), 0);
+    CHECK_EQ(store_close(s), 0);
+  }
+  tdir_free(&d);
+}
+
+/* kill -9 while a segment file is made ahead and unused: the file is not named by any counter; the replay never opens it, the next segment of that number truncates it, and a clean close removes
+ * the one that waits.  (The kill loops reach the crash points inside the thread too: every mode has a flusher and rolls its segments of 256 KiB.) */
+static void test_ahead_crash(int mode) {
+  printf("[kill -9 with a segment file made ahead and not used (%s): ignored by the replay, truncated when its number is made]\n", mode == STORE_MODE_MAP ? "MAP" : "COPY");
+  tdir_t d;
+  tdir_new(&d, "ahcr");
+  store_opts_t o;
+  small_opts(&o);
+  o.mode = mode;
+  o.seg_size = 256u << 10;
+  o.sync_interval_ms = 5;
+  o.scrub_interval_s = UINT32_MAX;
+  const pid_t pid = fork();
+  if (pid == 0) {
+    int fd = open(d.path, O_RDONLY | O_DIRECTORY);
+    store_t *s = NULL;
+    if (fd < 0 || store_open(fd, &o, &s) != 0) _exit(10);
+    store_view_add(s, "default");
+    store_stats_t st;
+    uint32_t k = 0;
+    for (;;) {
+      if (put_i(s, 0, k % AH_ZONES, 1 + k / AH_ZONES, NULL) != 0) _exit(11);
+      k++;
+      if ((k & 7) == 0) {
+        if (store_commit(s) != 0) _exit(12);
+        store_stats(s, &st);
+        if (st.seg_count >= 2 && st.segment_ready == 1) kill(getpid(), SIGKILL);     /* (the file of the next segment waits, unused) */
+        usleep(200);
+      }
+      if (k > 200000) _exit(13);
+    }
+  }
+  CHECK(pid > 0);
+  int status = 0;
+  CHECK(waitpid(pid, &status, 0) == pid);
+  CHECK(WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL);
+  uint32_t hi = 0;
+  const unsigned before = seg_files(d.path, &hi);
+  store_t *s = NULL;
+  o.create = false;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (!s) { tdir_free(&d); return; }
+  store_stats_t st;
+  store_stats(s, &st);
+  printf("  after the kill: %u segment files (highest %u), the store names %u\n", before, hi, st.seg_count);
+  CHECK(hi == st.seg_count + 1);                                       /* (the file nobody names) */
+  CHECK(!st.recovery.was_clean);
+  store_check_report_t rep;
+  CHECK_EQ(store_check(s, &rep), 0);
+  uint32_t nz = 0;
+  for (uint32_t i = 0; i < AH_ZONES; i++) {
+    if (find_i(s, 0, i) == STORE_NONE) continue;
+    nz++;
+    CHECK(verify_i(s, 0, i, UINT64_MAX));
+  }
+  CHECK(nz > 0);
+  /* the store goes on: the number of the stale file is made again (by the thread or inside the mutex), the file is truncated, nothing of it is read as data */
+  uint32_t k = 1000000;
+  const uint32_t segs0 = st.seg_count;
+  while (st.seg_count < segs0 + 3 && k < 1000000 + 200000) {
+    CHECK_EQ(put_i(s, 0, k % AH_ZONES, 7 + (k - 1000000) / AH_ZONES, NULL), 0);
+    k++;
+    if ((k & 15) == 0) { usleep(200); store_stats(s, &st); }
+  }
+  CHECK(st.seg_count >= segs0 + 3);
+  for (uint32_t i = 0; i < AH_ZONES; i++) {
+    if (find_i(s, 0, i) != STORE_NONE) CHECK(verify_i(s, 0, i, UINT64_MAX));
+  }
+  CHECK_EQ(store_check(s, &rep), 0);
+  CHECK_EQ(store_close(s), 0);
+  const unsigned after = seg_files(d.path, &hi);
+  CHECK(hi <= st.seg_count + 0u);                                      /* (the file that waited at the close is gone) */
+  printf("  after the close: %u segment files (highest %u), the store names %u\n", after, hi, st.seg_count);
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (s) {
+    CHECK_EQ(store_check(s, &rep), 0);
+    CHECK_EQ(store_close(s), 0);
+  }
+  tdir_free(&d);
+}
+
 int main(void) {
   const char *base = getenv("KARIDNS_STORE_TESTDIR");
   snprintf(g_base, sizeof(g_base), "%s/store_test.%d", base && *base ? base : ".", (int)getpid());
@@ -7172,6 +7500,7 @@ int main(void) {
   if (WANT("jboost")) { test_journal_boost(); test_journal_boost_crash(); }
   if (WANT("kfz")) test_kill_loop(UNDER_TSAN ? 25 : 50, 3);
   if (WANT("kgrow")) test_kill_loop(UNDER_TSAN ? 20 : 50, 4);
+  if (WANT("ahead")) { test_ahead_tables(); test_ahead_segments(STORE_MODE_MAP); test_ahead_segments(STORE_MODE_COPY); test_ahead_crash(STORE_MODE_MAP); test_ahead_crash(STORE_MODE_COPY); }
   if (WANT("kjsw")) { test_kill_loop(UNDER_TSAN ? 20 : 50, 5); test_commit_switch(); }
   if (WANT("kjr")) test_kill_loop(UNDER_TSAN ? 20 : 60, 6);
   if (WANT("jring")) { test_jr_ack(); test_jr_kill_after_return(); test_jr_states(true); test_jr_states(false); test_jr_rule_t(); test_jr_ring(); test_jr_space(); test_jr_multi(); test_jr_edges(); test_jr_estimate(); test_jr_partial(); test_jr_flusher_states(); test_jr_seg_pending(); test_jr_defer_more(); test_jr_group_torn(); }

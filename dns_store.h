@@ -311,6 +311,18 @@ typedef struct store_stats {
   uint64_t journal_commit_switches; /* the journal file switched by a commit (0.7: the writers append to a file that no sync holds) */
   uint64_t image_prewrites;         /* image records store_put() wrote before the writer mutex and the change took (0.7) */
   uint64_t image_prewrite_misses;   /* ... that the change wrote again inside the mutex (the zone, its record or the open segment changed in between) */
+  /* ---- 0.7 round 15: the allocations ahead are not the commit thread's and not the writer mutex's ---- */
+  uint64_t ahead_allocs, ahead_alloc_us, ahead_alloc_max_us;   /* posix_fallocate() calls of the blocks ahead of the tables (the thread of its own; store_reserve() too): their number, total and longest time */
+  uint64_t ahead_thread_max_us;     /* the longest round of the thread of the blocks ahead (what it waited for the disk; the allocation of store_reserve() is not in it) */
+  uint64_t ahead_errors;            /* ... that failed with ENOSPC or EIO (the checkpoint that extends the file meets the same error) */
+  uint64_t ahead_busy_kicks;        /* the commit thread asked while the thread was still in its round before (the work lags behind: before round 15 the commit thread waited here) */
+  uint64_t ahead_unallocated_growths;   /* growths of a table that found its blocks not allocated yet (the checkpoint allocates them) */
+  uint64_t segment_precreated;      /* segments taken from the file made ahead (no file was made inside the writer mutex) */
+  uint64_t segment_inline_creates;  /* segments whose file was made inside the writer mutex (none was ready: the first one, a fill faster than the disk, a failure) */
+  uint64_t segment_precreate_errors; /* files that the thread could not make ahead */
+  uint64_t segment_precreate_us, segment_precreate_max_us;   /* the time the thread took to make the files ahead (outside every lock): total and longest */
+  uint64_t segment_inline_create_max_us;   /* the longest file made inside the writer mutex */
+  uint32_t segment_ready;           /* 1: a file is made ahead and waits */
   /* ---- 0.7: the tables in private memory, written by the checkpoint ---- */
   uint64_t table_private_bytes;     /* pages of zt, zc, nx, ix, sx that the writers changed since the open: private memory of the process (counted in memory-limit) */
   uint64_t checkpoint_table_bytes;  /* bytes of the tables that checkpoints wrote since the open */
@@ -640,6 +652,9 @@ extern _Atomic int64_t store_test_jr_floor;
 extern int (*store_test_append_fault)(uint64_t reclen);
 /* called at the start of every slice of the cleaner (writer mutex held) with the segment it is emptying: a test takes a reference of an image there (store_image_read does not need the mutex) */
 extern void (*store_test_cleaner_step)(store_t *s, uint32_t victim);
+/* 0.7 round 15, the allocations ahead: called with no lock held before the posix_fallocate() of the blocks ahead of the tables (site 1), before the thread of the segment ahead makes its file (2), and
+ * inside the writer mutex before seg_create() makes a segment file (3): a test makes the disk slow there (NULL = off) */
+extern void (*_Atomic store_test_ahead_hook)(store_t *s, int site);
 /* called by the read-ahead thread before every page it reads (NULL = off): a test makes the read-ahead slow, and shows that store_close() waits for it */
 extern void (*store_test_ra_page)(void);
 uint64_t store_test_siphash(unsigned c, unsigned d, const uint8_t key[16], const uint8_t *in, size_t len);

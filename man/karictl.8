@@ -1,4 +1,4 @@
-.TH KARICTL 8 "2026-11-18" "KariDNS" "KariDNS Manual"
+.TH KARICTL 8 "2026-11-19" "KariDNS" "KariDNS Manual"
 .\" Generated from docs/karictl.md by man/md2man.pl (make man): edit the Markdown manual, not this page.
 .SH NAME
 karictl \- Remote Control and Management Utility for KariDNS
@@ -906,6 +906,40 @@ and found no free slot: they waited instead. Should stay 0
 change inside it only records where they are), and those it wrote again inside
 the mutex because the zone, its record or the open segment changed in between. A
 new zone and a full segment are written inside the mutex
+.TP 8
+\fBstore.ahead.allocs\fR, \fB.alloc_us\fR, \fB.alloc_max_us\fR, \fB.thread_max_us\fR, \fB.errors\fR
+0.7: the allocation of the blocks ahead of the tables (\fBzt\fR, \fBzc\fR,
+\fBnx\fR: \fBposix_fallocate()\fR when what is in use nears the end of what is
+mapped, and for \fBstore_reserve()\fR), so that a growth inside the writer mutex
+is a mapping: how many were made, their total and longest time in microseconds
+(every caller, the one of \fBstore_reserve()\fR too), the longest round of the
+thread of its own (\fB.thread_max_us\fR: what the thread waited for the disk,
+without the reserve), and how many failed (a full disk or an I/O error: nothing
+is done then, the checkpoint that extends the file meets the same error). Since
+0.7 the flusher makes them in a thread of its own: a slow disk (up to 11 s were
+seen on UFS) no longer stops the periodic commit and the journal ring's
+background leader
+.TP 8
+\fBstore.ahead.busy_kicks\fR, \fB.unallocated_growths\fR
+0.7: how often the commit thread asked for the blocks ahead while that thread
+was still in its round before (the work lags behind the writers; the commit
+thread went on), and the growths of a table that found its blocks not allocated
+yet (the checkpoint allocates them when it extends the file: a longer checkpoint
+and a later warning about a full disk, never a wrong answer)
+.TP 8
+\fBstore.segment.precreated\fR, \fB.inline_creates\fR, \fB.precreate_ready\fR
+0.7: the file of the next segment (\fBseg.N\fR) is made ahead by a thread of the
+flusher once the open segment is half full, outside every lock, so that the
+writer mutex does not wait for the file system to make a 256 MiB file. How many
+segments were taken from the file made ahead, how many files were made inside
+the writer mutex instead (the first segment, a fill faster than the disk, a
+failure of the thread: the old behaviour), and 1 while a file waits
+.TP 8
+\fBstore.segment.precreate_errors\fR, \fB.precreate_us\fR, \fB.precreate_max_us\fR, \fB.inline_create_max_us\fR
+0.7: files the thread could not make (the writer makes it then and meets the
+error itself), the time the thread took for its files (total and longest, no
+lock held), and the longest file made inside the writer mutex (the part of
+\fBstore.lock.writer_hold_max_us\fR that a segment file made)
 .TP 8
 \fBstore.writes.growths_background\fR
 Of \fBgrowths\fR: the index growths that were built outside the writer mutex (a

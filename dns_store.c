@@ -64,6 +64,8 @@
  *     the one before (st_commit_ex()); a fuzzy checkpoint gets the file its superblock names synced the same way; store_put() writes the image before the mutex (st_prewrite()).
  *     What is left in the mutex: the pwrite() of a record still meets the file system's own back-pressure (UFS runningbufspace, the ZFS write throttle).
  *   - No store into a table meets the write of its page (0.7, the tables in private memory, below).
+ *   - No allocation of the file system is waited for by the commit thread or inside the writer mutex (0.7 round 15): the blocks ahead of the tables are allocated by a thread of its own (fl_tab_main()), and
+ *     the file of the next segment is made by another (seg_pre_make(), with the argument that its directory entry is durable before a record names it), seg_place() only takes it.
  *
  * The tables in private memory (0.7).  With shared mappings of the table files a store into a page of zt / zc / nx / ix / sx (apply_ops(), inside the mutex) waited while the kernel
  * wrote that page out (a checkpoint's msync, the syncer: vm_fault_busy_sleep, holds of up to 2.7 s at 10M zones), and the earlier msync(MS_SYNC) held a table's vnode lock for its
@@ -351,6 +353,15 @@ typedef struct seg {
   _Atomic int refs;
 } seg_t;
 
+/* A helper thread of the flusher (0.7, round 15): it waits on its own mutex and condition, which nobody holds across I/O, so the thread that asks (the commit thread, a writer inside the writer
+ * mutex) never waits for the disk.  kick: work was asked for (coalesced); busy: the thread is in a round now (a kick that finds it set is counted: store.ahead.busy_kicks). */
+typedef struct {
+  pthread_mutex_t mu;
+  pthread_cond_t cv;
+  bool kick, stop, busy;
+} ahead_t;
+enum { PRE_NONE = 0, PRE_BUSY, PRE_READY, PRE_STALE };    /* the segment made ahead (store_t.pre_state); STALE: made for a number that is not the lowest free one any more, the thread removes it */
+
 typedef struct {                                      /* the holds of the writer mutex of 1 ms or more by one function (store.lock.site.*) */
   _Atomic(const char *) site;
   _Atomic uint64_t slow, over10, over100, slow_us, max_us;
@@ -474,6 +485,21 @@ struct store {
   pthread_cond_t bg_cv;
   bool io_busy, ck_busy, ck_handoff, bg_stop, bg_kick, fl_on;
   pthread_t fl_thr, fl_thr2;
+  /* 0.7 round 15: what the commit thread and the writers must not wait for.  ah_tab: the blocks of the next growth of zt, zc and nx (tables_ahead(): a posix_fallocate() waited 0.5 to 11 s on UFS, and the commit
+   * thread, which is also the background leader of the journal ring, stood in it).  ah_seg: the next segment file made ahead of its use (seg_pre_make(): seg_create() inside the writer mutex held it for
+   * 0.4 to 0.9 s).  Both are started and stopped with the flusher (bg_start(), bg_stop_join()). */
+  pthread_t fl_thr3, fl_thr4;
+  ahead_t ah_tab, ah_seg;
+  _Atomic uint64_t n_ah_allocs, n_ah_us, n_ah_max_us, n_ah_errors, n_ah_busy_kicks, n_ah_unahead, n_ah_thread_max_us;   /* store.ahead.*: posix_fallocate() calls of mtab_ahead() (any caller), their total and longest time, those that failed, kicks that found the thread busy, growths that found their blocks not allocated yet */
+  /* The segment made ahead (seg_pre_*): pre_mu protects pre_state (its writes), pre_n and pre_g.  PRE_NONE -> PRE_BUSY (the thread, with the writer mutex held, picks the number: pre_n) -> PRE_READY (the file is made, the descriptor is in pre_g) -> PRE_NONE
+   * (seg_place() took it under the writer mutex), or READY -> STALE (seg_place() found it made for a number that is not the next one) -> NONE (the thread removed the file; a close does the same).  Order: wlock, then pre_mu; nothing is waited for under pre_mu. */
+  pthread_mutex_t pre_mu;
+  _Atomic int pre_state;                              /* (writes under pre_mu; the thread peeks without it) */
+  uint32_t pre_n;
+  seg_t *pre_g;
+  uint32_t pre_asked;                                 /* (the mutex) the segment for which the writer last asked the thread for the next one (once per segment) */
+  uint64_t seg_free_lsn[ST_MAXSEG + 1];               /* (the mutex) the LSN of the record that freed the number of a removed segment (the number is made ahead only once that record is durable) */
+  _Atomic uint64_t n_seg_pre, n_seg_inline, n_seg_pre_err, n_seg_pre_us, n_seg_pre_max_us, n_seg_inline_max_us;   /* store.segment.*: files taken from ahead, files made inside the writer mutex, failures of the thread, its longest creation, the longest creation inside the mutex */
   _Atomic bool ck_want;                               /* a checkpoint is wanted soon (after a growth: the old generation can go when the superblocks name the new one) */
   _Atomic bool ck_cancel;                             /* a clean checkpoint comes (store_checkpoint_clean(), store_close()): the write of a fuzzy checkpoint's tables ends between two runs (ck_write_tab()) */
   _Atomic uint64_t ckpt_max_us, n_ckpt_cancel;        /* the longest checkpoint; fuzzy checkpoints left for a clean one (a stop, a close) */
@@ -624,6 +650,9 @@ void (*store_test_in_stats)(void) = NULL;
 int64_t (*store_test_fs_free)(void) = NULL;
 int (*store_test_append_fault)(uint64_t reclen) = NULL;
 void (*store_test_cleaner_step)(store_t *s, uint32_t victim) = NULL;
+/* the blocks ahead and the segment ahead (0.7 round 15): called with no lock held by mtab_ahead() before its posix_fallocate() (site 1), by the segment thread before it makes the file (2), and by seg_create() inside the writer mutex before it makes one (3); a test makes the disk slow there */
+void (*_Atomic store_test_ahead_hook)(store_t *s, int site);
+#define AHEAD_HOOK(s, site) do { void (*h_)(store_t *, int) = atomic_load_explicit(&store_test_ahead_hook, memory_order_acquire); if (h_) h_((s), (site)); } while (0)
 #define ST_FAULT(op, zid) do { int fe_ = store_test_write_fault ? store_test_write_fault((op), (zid)) : 0; if (fe_) return fe_; } while (0)
 /* ... the same for an entry of a group (store_set_known_n()): the entry fails with the errno, the others go on */
 #define ST_FAULT_RES(op, zid, res) do { int fe_ = store_test_write_fault ? store_test_write_fault((op), (zid)) : 0; if (fe_) (res) = fe_; } while (0)
@@ -645,6 +674,7 @@ static bool st_fail_nth(_Atomic long *n) {
 #define CRASH_POINT() ((void)0)
 #define FAIL_COMMIT() false
 #define FAIL_CKWRITE() false
+#define AHEAD_HOOK(s, site) ((void)0)
 #define ST_FAULT(op, zid) ((void)0)
 #define ST_FAULT_RES(op, zid, res) ((void)0)
 #endif
@@ -1346,6 +1376,7 @@ static int mtab_grow(store_t *s, mtab_t *t, uint64_t need) {
   const uint64_t want = mtab_want(s, t, cur, need), ext = atomic_load_explicit(&t->extended, memory_order_acquire);
   if (ext < want) {                                   /* (the blocks are the flusher's and the checkpoint's to allocate: here only the room is checked; the reserve of the cleaner may be used, as an allocation could) */
     const uint64_t n = want - (ext > cur ? ext : cur);
+    atomic_fetch_add_explicit(&s->n_ah_unahead, 1, memory_order_relaxed);         /* (the thread of the blocks ahead has not got there: the checkpoint allocates them, ck_write_tab()) */
     fs_probe(s);
     const int64_t est = atomic_load_explicit(&s->avail_est, memory_order_relaxed);
     if (est >= 0 && (uint64_t)est < n) return -ENOSPC;
@@ -1371,9 +1402,17 @@ static void mtab_ahead(store_t *s, mtab_t *t, uint64_t used, uint64_t need) {
   if (have >= want) return;
   const uint64_t from = have > cur ? have : cur;
   /* posix_fallocate() only: it never makes a file shorter */
+  const uint64_t t0 = st_now_us();
+  AHEAD_HOOK(s, 1);
   const int r = posix_fallocate(t->fd, (off_t)(ST_HDR_PAGE + from), (off_t)(want - from));
+  const uint64_t us = st_now_us() - t0;
+  atomic_fetch_add_explicit(&s->n_ah_allocs, 1, memory_order_relaxed);
+  atomic_fetch_add_explicit(&s->n_ah_us, us, memory_order_relaxed);
+  uint64_t mx = atomic_load_explicit(&s->n_ah_max_us, memory_order_relaxed);
+  while (us > mx && !atomic_compare_exchange_weak_explicit(&s->n_ah_max_us, &mx, us, memory_order_relaxed, memory_order_relaxed)) {}
   if (r == 0) mtab_note_extended(t, want);
   else if (st_no_fallocate(r)) atomic_store_explicit(&t->no_alloc, true, memory_order_relaxed);
+  else atomic_fetch_add_explicit(&s->n_ah_errors, 1, memory_order_relaxed);        /* (ENOSPC, EIO: nothing is done here, as before: the checkpoint that extends the file meets the same error and the state handling is its, ck_write_tab()) */
 }
 
 /* ---- index generation files (ix, sx) ---- */
@@ -1595,6 +1634,21 @@ static void seg_free(seg_t *g) {
   free(g);
 }
 
+/* the descriptor of an open segment file of `size` bytes (MAP mode: mapped read only, the whole file); NULL when it cannot be mapped (the caller closes fd) */
+static seg_t *seg_wrap(const store_t *s, int fd, uint32_t n, size_t size) {
+  seg_t *g = calloc(1, sizeof(*g));
+  if (!g) return NULL;
+  g->fd = fd;
+  g->num = n;
+  if (s->mode == STORE_MODE_MAP) {
+    g->maplen = size;
+    void *p = g->maplen ? mmap(NULL, g->maplen, PROT_READ, MAP_SHARED | ST_NOCORE | ST_PREFAULT, fd, 0) : MAP_FAILED;
+    if (p == MAP_FAILED) { free(g); return NULL; }
+    g->map = p;
+  }
+  return g;
+}
+
 /* the descriptor of segment n; opens it on first use (the only reader-side mutex: first touch of a segment) */
 static seg_t *seg_get(store_t *s, uint32_t n) {
   if (n == 0 || n > ST_MAXSEG) return NULL;
@@ -1610,17 +1664,8 @@ static seg_t *seg_get(store_t *s, uint32_t n) {
       fhdr_t h;
       struct stat st;
       if (st_pread_all(fd, &h, sizeof(h), 0) == 0 && fhdr_ok(s, &h, FK_SEG, n) && fstat(fd, &st) == 0) {
-        g = calloc(1, sizeof(*g));
-        if (g) {
-          g->fd = fd;
-          g->num = n;
-          if (s->mode == STORE_MODE_MAP) {
-            g->maplen = (size_t)st.st_size;
-            void *p = g->maplen ? mmap(NULL, g->maplen, PROT_READ, MAP_SHARED | ST_NOCORE | ST_PREFAULT, fd, 0) : MAP_FAILED;
-            if (p == MAP_FAILED) { free(g); g = NULL; } else g->map = p;
-          }
-          if (g) atomic_store_explicit(&s->segs[n], g, memory_order_release);
-        }
+        g = seg_wrap(s, fd, n, (size_t)st.st_size);
+        if (g) atomic_store_explicit(&s->segs[n], g, memory_order_release);
       }
       if (!g) close(fd);
     }
@@ -1628,10 +1673,10 @@ static seg_t *seg_get(store_t *s, uint32_t n) {
   pthread_mutex_unlock(&s->seg_mu);
   return g;
 }
-/* writer: create segment n with room for at least `cap` bytes */
-static int seg_create(store_t *s, uint32_t n, uint64_t cap) {
+/* Make the file of segment n with room for at least `cap` bytes (the header; MAP mode: its full size, sparse); the open descriptor, or -errno.  The directory entry is not made durable here: the
+ * caller sets dir_dirty (the next commit syncs the directory before the journal that names the file, commit_sync()). */
+static int seg_file_new(store_t *s, uint32_t n, uint64_t cap) {
   char name[32];
-  s->seg_draining[n] = 0;                              /* (a removal that waited for the journal (3) does not unlink the new file: N8) */
   snprintf(name, sizeof(name), "seg.%u", n);
   int fd = st_openat(s, name, O_RDWR | O_CREAT | O_TRUNC);
   if (fd < 0) return fd;
@@ -1646,10 +1691,22 @@ static int seg_create(store_t *s, uint32_t n, uint64_t cap) {
     if (ftruncate(fd, (off_t)sz) != 0) r = -errno;
   }
   if (r < 0) { close(fd); return r; }
+  return fd;
+}
+/* writer (the mutex held): create segment n with room for at least `cap` bytes, when none was made ahead (seg_pre_take()); the time it takes is inside the mutex: store.segment.inline_creates */
+static int seg_create(store_t *s, uint32_t n, uint64_t cap) {
+  s->seg_draining[n] = 0;                              /* (a removal that waited for the journal (3) does not unlink the new file: N8) */
+  const uint64_t t0 = st_now_us();
+  AHEAD_HOOK(s, 3);
+  const int fd = seg_file_new(s, n, cap);
+  if (fd < 0) return fd;
   s->dir_dirty = true;
   seg_t *old = atomic_load_explicit(&s->segs[n], memory_order_relaxed);
   if (old) { atomic_store_explicit(&s->segs[n], NULL, memory_order_release); retire_add_seg(s, old); }       /* (a reader or a commit may still hold it) */
   close(fd);
+  const uint64_t us = st_now_us() - t0;
+  atomic_fetch_add_explicit(&s->n_seg_inline, 1, memory_order_relaxed);
+  if (us > atomic_load_explicit(&s->n_seg_inline_max_us, memory_order_relaxed)) atomic_store_explicit(&s->n_seg_inline_max_us, us, memory_order_relaxed);       /* (the writer mutex: one writer) */
   return 0;
 }
 
@@ -2403,6 +2460,53 @@ static void bg_signal(store_t *s) {
   s->bg_kick = true;
   pthread_cond_broadcast(&s->bg_cv);
   pthread_mutex_unlock(&s->bg_mu);
+}
+/* ---- the helper threads that do the allocations ahead (ahead_t, see store_t): the thread that asks never waits for the disk ---- */
+static void ahead_init(ahead_t *a) {
+  pthread_condattr_t ca;
+  pthread_mutex_init(&a->mu, NULL);
+  pthread_condattr_init(&ca);
+  pthread_condattr_setclock(&ca, CLOCK_MONOTONIC);
+  pthread_cond_init(&a->cv, &ca);
+  pthread_condattr_destroy(&ca);
+  a->kick = a->stop = a->busy = false;
+}
+static void ahead_destroy(ahead_t *a) {
+  pthread_mutex_destroy(&a->mu);
+  pthread_cond_destroy(&a->cv);
+}
+/* ask for a round (coalesced with one that is waiting); busy_kicks (NULL: not counted) counts the asks that find the thread still in the round before: the work lags behind its askers */
+static void ahead_kick(ahead_t *a, _Atomic uint64_t *busy_kicks) {
+  pthread_mutex_lock(&a->mu);
+  if (a->busy && busy_kicks) atomic_fetch_add_explicit(busy_kicks, 1, memory_order_relaxed);
+  a->kick = true;
+  pthread_cond_signal(&a->cv);
+  pthread_mutex_unlock(&a->mu);
+}
+static void ahead_stop(ahead_t *a) {
+  pthread_mutex_lock(&a->mu);
+  a->stop = true;
+  pthread_cond_signal(&a->cv);
+  pthread_mutex_unlock(&a->mu);
+}
+/* the thread: wait up to `ms` for a kick; false when it has to end.  The round that follows is "busy" until the next call. */
+static bool ahead_wait(ahead_t *a, uint64_t ms, bool *kicked) {
+  pthread_mutex_lock(&a->mu);
+  a->busy = false;
+  if (!a->kick && !a->stop) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    ts.tv_sec += (time_t)(ms / 1000u);
+    ts.tv_nsec += (long)(ms % 1000u) * 1000000L;
+    if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+    (void)pthread_cond_timedwait(&a->cv, &a->mu, &ts);
+  }
+  if (kicked) *kicked = a->kick;
+  a->kick = false;
+  const bool run = !a->stop;
+  a->busy = run;
+  pthread_mutex_unlock(&a->mu);
+  return run;
 }
 static void baton_take(store_t *s) {
   pthread_mutex_lock(&s->bg_mu);
@@ -3718,27 +3822,77 @@ static int wr_unlock_w(store_t *s) {
 
 /* The open segment for a record of rlen bytes: the current one when it has room, else a new one (the lowest free segment number: a segment that was cleaned and removed
  * has "used = 0" and its number is used again).  The counters of a new segment go into the builder.  *cur / *used: where the record goes. */
+/* The segment made ahead, when it can serve this call (the writer mutex held): its number, with its descriptor in *g.  `want` is the number the next segment has: the lowest free one, or the one after the
+ * last (the numbers of cleaned segments are used again, lowest first, as before).  *rsv: the number the thread holds (being made, or made and not usable now), which the scan for a free number must skip.
+ * Usable: it is made, it is the number wanted, and the record fits its size (cap).  A file made for another number (the cleaner freed a lower one since) is given up: the thread removes it and makes the
+ * right one; this call makes its file itself.  The number of a file made ahead is free: nothing but seg_place() gives a free number a record. */
+static uint32_t seg_pre_peek(store_t *s, uint64_t cap, uint32_t want, seg_t **g, uint32_t *rsv) {
+  uint32_t n = 0;
+  bool stale = false;
+  *g = NULL;
+  *rsv = 0;
+  pthread_mutex_lock(&s->pre_mu);
+  if (s->pre_state != PRE_NONE) {
+    *rsv = s->pre_n;
+    if (s->pre_state == PRE_READY && s->pre_n == want && cap <= s->seg_size) {
+      n = want;
+      *g = s->pre_g;
+    } else if (s->pre_state == PRE_READY && s->pre_n != want) {
+      s->pre_state = PRE_STALE;
+      stale = true;
+    }
+  }
+  pthread_mutex_unlock(&s->pre_mu);
+  if (stale) ahead_kick(&s->ah_seg, NULL);
+  return n;
+}
+/* The segment made ahead is used (writer mutex held).  Its descriptor takes the place of the one of an older segment of the same number, as seg_create() does (the file is the new one: it was made empty). */
+static void seg_pre_take(store_t *s, uint32_t n, seg_t *g) {
+  pthread_mutex_lock(&s->pre_mu);
+  s->pre_state = PRE_NONE;
+  s->pre_g = NULL;
+  pthread_mutex_unlock(&s->pre_mu);
+  s->seg_draining[n] = 0;                              /* (as seg_create(): a removal that waited for the journal (3) does not unlink the new file: N8) */
+  pthread_mutex_lock(&s->seg_mu);
+  seg_t *old = atomic_exchange_explicit(&s->segs[n], g, memory_order_acq_rel);
+  pthread_mutex_unlock(&s->seg_mu);
+  if (old) retire_add_seg(s, old);                     /* (a reader or a commit may still hold it) */
+  atomic_fetch_add_explicit(&s->n_seg_pre, 1, memory_order_relaxed);
+}
+/* A new segment is needed.  A segment made ahead by seg_pre_make() is taken when there is one: no file is made inside the mutex.  Else the file is made here, as before (store.segment.inline_creates). */
 static int seg_place(store_t *s, uint64_t rlen, uint32_t *cur_out, uint64_t *used_out) {
   jb_t *j = &s->jb;
   uint32_t cur = (uint32_t)jb_vget(s, j, V_CUR_SEG);
   uint64_t used = cur ? jb_vget(s, j, V_SEG(cur, 0)) : 0;
   if (cur == 0 || used + rlen > s->seg_size) {
-    uint32_t nsegs = (uint32_t)jb_vget(s, j, V_NSEGS), n = 0;
+    uint32_t nsegs = (uint32_t)jb_vget(s, j, V_NSEGS), n = 0, rsv, want = 0;
+    seg_t *pg;
     int r;
-    for (uint32_t i = 1; i <= nsegs && i <= ST_MAXSEG; i++)
-      if (jb_vget(s, j, V_SEG(i, 0)) == 0) { n = i; break; }
-    if (!n) {
-      n = nsegs + 1;
-      if (n > ST_MAXSEG) return -ENOSPC;
-      if ((r = jb_vset(j, V_NSEGS, n)) < 0) return r;
-    }
     uint64_t cap = s->seg_size;
     if (ST_SEGHDR + rlen > cap) cap = ST_SEGHDR + rlen;
-    r = seg_create(s, n, cap);
-    if (r < 0) return r;
+    for (uint32_t i = 1; i <= nsegs && i <= ST_MAXSEG; i++)
+      if (jb_vget(s, j, V_SEG(i, 0)) == 0) { want = i; break; }
+    if (!want) want = nsegs + 1;
+    n = seg_pre_peek(s, cap, want, &pg, &rsv);
+    if (n) {
+      if (n == nsegs + 1 && (r = jb_vset(j, V_NSEGS, n)) < 0) return r;
+      seg_pre_take(s, n, pg);
+    } else {
+      for (uint32_t i = 1; i <= nsegs && i <= ST_MAXSEG; i++)
+        if (i != rsv && jb_vget(s, j, V_SEG(i, 0)) == 0) { n = i; break; }
+      if (!n) {
+        n = nsegs + 1;
+        if (n == rsv) n++;                             /* (the number the thread is making: this one leaves a free number behind, which the next call finds) */
+        if (n > ST_MAXSEG) return -ENOSPC;
+        if ((r = jb_vset(j, V_NSEGS, n)) < 0) return r;
+      }
+      r = seg_create(s, n, cap);
+      if (r < 0) return r;
+    }
     if ((r = jb_vset(j, V_CUR_SEG, n)) < 0 || (r = jb_vset(j, V_SEG(n, 0), ST_SEGHDR)) < 0 || (r = jb_vset(j, V_SEG(n, 1), 0)) < 0) return r;
     cur = n;
     used = ST_SEGHDR;
+    s->pre_asked = 0;
   }
   *cur_out = cur;
   *used_out = used;
@@ -3753,6 +3907,10 @@ static int seg_note_append(store_t *s, uint32_t cur, uint64_t used, uint64_t rle
   s->seg_dirty[cur] = 1;
   *loc = ((uint64_t)cur << ST_LOC_SHIFT) | (used / 64);
   space_used(s, rlen);
+  if (used + rlen >= s->seg_size / 2 && s->pre_asked != cur) {      /* (half full: the next segment's file is made ahead, off the mutex.  Here, not in seg_place(): an image written before the mutex does not pass it) */
+    s->pre_asked = cur;
+    ahead_kick(&s->ah_seg, NULL);
+  }
   int r = jb_vset(j, V_SEG(cur, 0), used + rlen);
   if (r == 0) r = jb_vset(j, V_SEG(cur, 1), jb_vget(s, j, V_SEG(cur, 1)) + rlen);
   return r;
@@ -4489,6 +4647,7 @@ static void seg_unlink_locked(store_t *s, uint32_t n) {
   CRASH_POINT();
   s->seg_draining[n] = 0;
   s->seg_skip_until[n] = 0;
+  s->seg_free_lsn[n] = s->lsn;                          /* (the record that zeroed the counters is at or below it: the number is made ahead only once that is durable, seg_pre_make()) */
   atomic_fetch_add_explicit(&s->c_segs_freed, 1, memory_order_relaxed);
 }
 static void seg_retire_locked(store_t *s, bool wait) {
@@ -6191,6 +6350,20 @@ void store_stats(const store_t *s, store_stats_t *o) {
   o->journal_commit_switches = atomic_load_explicit(&s->n_jswitch, memory_order_relaxed);
   o->image_prewrites = atomic_load_explicit(&s->n_prew, memory_order_relaxed);
   o->image_prewrite_misses = atomic_load_explicit(&s->n_prew_miss, memory_order_relaxed);
+  o->ahead_allocs = atomic_load_explicit(&s->n_ah_allocs, memory_order_relaxed);
+  o->ahead_alloc_us = atomic_load_explicit(&s->n_ah_us, memory_order_relaxed);
+  o->ahead_alloc_max_us = atomic_load_explicit(&s->n_ah_max_us, memory_order_relaxed);
+  o->ahead_thread_max_us = atomic_load_explicit(&s->n_ah_thread_max_us, memory_order_relaxed);
+  o->ahead_errors = atomic_load_explicit(&s->n_ah_errors, memory_order_relaxed);
+  o->ahead_busy_kicks = atomic_load_explicit(&s->n_ah_busy_kicks, memory_order_relaxed);
+  o->ahead_unallocated_growths = atomic_load_explicit(&s->n_ah_unahead, memory_order_relaxed);
+  o->segment_precreated = atomic_load_explicit(&s->n_seg_pre, memory_order_relaxed);
+  o->segment_inline_creates = atomic_load_explicit(&s->n_seg_inline, memory_order_relaxed);
+  o->segment_precreate_errors = atomic_load_explicit(&s->n_seg_pre_err, memory_order_relaxed);
+  o->segment_precreate_us = atomic_load_explicit(&s->n_seg_pre_us, memory_order_relaxed);
+  o->segment_precreate_max_us = atomic_load_explicit(&s->n_seg_pre_max_us, memory_order_relaxed);
+  o->segment_inline_create_max_us = atomic_load_explicit(&s->n_seg_inline_max_us, memory_order_relaxed);
+  o->segment_ready = atomic_load_explicit(&s->pre_state, memory_order_relaxed) == PRE_READY ? 1u : 0u;
   o->table_private_bytes = atomic_load_explicit(&s->priv_bytes, memory_order_relaxed);
   o->checkpoint_table_bytes = atomic_load_explicit(&s->n_ck_bytes, memory_order_relaxed);
   o->checkpoint_table_last_bytes = atomic_load_explicit(&s->ck_last_bytes, memory_order_relaxed);
@@ -6897,12 +7070,122 @@ static void *fl_commit_main(void *arg) {
         (void)jw_wait(s, atomic_load_explicit(&s->jr_pub, memory_order_acquire), &s->bg_stop_a);
       if (commit_due(s, st_now_ms())) r = st_commit(s, atomic_load_explicit(&s->lsn, memory_order_acquire));
     }
-    tables_ahead(s, 0);
+    ahead_kick(&s->ah_tab, &s->n_ah_busy_kicks);          /* (the blocks of the tables: another thread's work, since round 15; this thread never waits for an allocation) */
     pthread_mutex_lock(&s->bg_mu);
     if (r < 0) bg_backoff(s, s->o.sync_interval_ms > 1000u ? s->o.sync_interval_ms : 1000u);
   }
   pthread_mutex_unlock(&s->bg_mu);
   return NULL;
+}
+/* The thread of the blocks ahead (0.7 round 15).  A posix_fallocate() of the table files waited 0.5 to 11.3 s on UFS (the vnode lock that a checkpoint's fdatasync() of the table holds, a slow
+ * disk) and stood in the commit thread, which makes the periodic commits and leads the journal ring for the deferred records.  It is here now, on its own: when it lags nothing waits for it.  The
+ * growth of a table (mtab_grow(), inside the writer mutex) is a mapping and a check of the free space, the blocks are not needed for it; what is not allocated yet the checkpoint allocates when it
+ * extends the file to the size of its position (ck_write_tab(): a delay of the checkpoint, which has its own thread, and the same ENOSPC / EIO handling as for any growth), so a lagging thread costs the
+ * early warning of a full disk and a longer checkpoint, never a wrong answer (store.ahead.unallocated_growths counts the growths that found the blocks missing). */
+static void *fl_tab_main(void *arg) {
+  store_t *s = arg;
+  while (ahead_wait(&s->ah_tab, 1000, NULL)) {
+    const uint64_t t0 = st_now_us();
+    tables_ahead(s, 0);
+    const uint64_t us = st_now_us() - t0;
+    if (us > atomic_load_explicit(&s->n_ah_thread_max_us, memory_order_relaxed)) atomic_store_explicit(&s->n_ah_thread_max_us, us, memory_order_relaxed);        /* (this thread only) */
+  }
+  return NULL;
+}
+/* The thread of the segment ahead (0.7 round 15): when the open segment is half full, the file of the next one is made here, outside the writer mutex (it was made inside it: openat(O_CREAT | O_TRUNC), a
+ * pwrite and an ftruncate to 256 MiB cost 0.36 and 0.87 s there, with the records lock and the lock of the image writers held).  seg_place() takes it: no file is made inside the mutex.  When none is ready
+ * (the first segment, a fill faster than the disk, a failure) seg_place() makes the file itself as before: store.segment.inline_creates.
+ *
+ * Durability (rules F, N4, the same argument as for the journal files made ahead, ck_precreate()): a directory entry is durable before any durable record names it.  The file is made, the header is
+ * written and (MAP mode) the file is given its size here; then dir_dirty is set, and only then the file is published (PRE_READY).  The first record that names the segment (an image appended to it, the
+ * journal record with its counters) is written after seg_place() took it, so after dir_dirty was set.  A commit that makes that journal record durable took dir_dirty under the writer mutex after the
+ * record's LSN: it finds the flag set, or an earlier commit took it, and the commits go one at a time (the baton): that one's fsync() of the directory is over before this one's fdatasync() of the journal
+ * (commit_sync(): segments, directory, journal), and a failed one sets the flag again.  So the directory entry is synced before the journal record that names the file can be durable, as it was when the
+ * file was made inside the mutex; the entry may be durable much earlier, which does no harm.  The segment's bytes are synced by the same commit (seg_dirty, set at the first append) before the directory.
+ *
+ * The number: the lowest free one that seg_place() would take, and only when it is safe to truncate the old file of that number: no removal waits for the journal (seg_draining, N8), and the record that freed it
+ * is durable (seg_free_lsn <= committed_lsn: a power loss must not leave counters that still name a segment whose file was made empty).  Chosen under the writer mutex (no I/O), so that a removal cannot
+ * unlink the new file, which a removal in state (3) would do with the name; the file is made with the mutex released.  Crash: the file is never named by a counter until seg_place() took it, so a replay
+ * never opens it (seg_get() is only called for the numbers the counters name); it stays as an empty file that the next making of that number truncates (seg_file_new()), or that a close removes. */
+static void seg_pre_drop(store_t *s);
+static void seg_pre_make(store_t *s, bool asked) {
+  if (atomic_load_explicit(&s->pre_state, memory_order_relaxed) == PRE_STALE) seg_pre_drop(s);
+  if (atomic_load_explicit(&s->pre_state, memory_order_relaxed) != PRE_NONE) return;
+  uint32_t cur = (uint32_t)VG(s, V_CUR_SEG);
+  if (cur == 0 || (!asked && VG(s, V_SEG(cur, 0)) < s->seg_size / 2)) return;       /* (asked: the writer that crossed the half has not made its counters real yet; a timed round looks at them) */
+  uint32_t n = 0;
+  wr_lock_raw(s);
+  cur = (uint32_t)VG(s, V_CUR_SEG);
+  if (cur != 0 && (asked || VG(s, V_SEG(cur, 0)) >= s->seg_size / 2) && atomic_load_explicit(&s->pre_state, memory_order_relaxed) == PRE_NONE) {
+    const uint32_t nsegs = (uint32_t)VG(s, V_NSEGS);
+    bool found = false;
+    for (uint32_t i = 1; i <= nsegs && i <= ST_MAXSEG; i++) {
+      if (VG(s, V_SEG(i, 0)) != 0) continue;
+      found = true;
+      if (s->seg_draining[i] == 0 && atomic_load_explicit(&s->committed_lsn, memory_order_acquire) >= s->seg_free_lsn[i]) n = i;
+      break;
+    }
+    if (!found && nsegs < ST_MAXSEG) n = nsegs + 1;
+    if (n) {
+      pthread_mutex_lock(&s->pre_mu);
+      atomic_store_explicit(&s->pre_state, PRE_BUSY, memory_order_relaxed);
+      s->pre_n = n;
+      pthread_mutex_unlock(&s->pre_mu);
+    }
+  }
+  wr_unlock_raw(s);
+  if (!n) return;
+  const uint64_t t0 = st_now_us();
+  AHEAD_HOOK(s, 2);
+  seg_t *g = NULL;
+  const int fd = seg_file_new(s, n, s->seg_size);
+  if (fd >= 0) {
+    CRASH_POINT();
+    g = seg_wrap(s, fd, n, (size_t)((s->seg_size + s->pagesz - 1) & ~((uint64_t)s->pagesz - 1)));
+    if (!g) close(fd);
+  }
+  if (!g) {                                            /* (a full disk, an I/O error, no memory: the writer makes the file itself and meets the error with its own state handling) */
+    atomic_fetch_add_explicit(&s->n_seg_pre_err, 1, memory_order_relaxed);
+    pthread_mutex_lock(&s->pre_mu);
+    atomic_store_explicit(&s->pre_state, PRE_NONE, memory_order_relaxed);
+    pthread_mutex_unlock(&s->pre_mu);
+    return;
+  }
+  atomic_store_explicit(&s->dir_dirty, true, memory_order_seq_cst);        /* (before the file is published: see above) */
+  CRASH_POINT();
+  const uint64_t us = st_now_us() - t0;
+  atomic_fetch_add_explicit(&s->n_seg_pre_us, us, memory_order_relaxed);
+  if (us > atomic_load_explicit(&s->n_seg_pre_max_us, memory_order_relaxed)) atomic_store_explicit(&s->n_seg_pre_max_us, us, memory_order_relaxed);       /* (this thread only) */
+  pthread_mutex_lock(&s->pre_mu);
+  s->pre_g = g;
+  atomic_store_explicit(&s->pre_state, PRE_READY, memory_order_release);
+  pthread_mutex_unlock(&s->pre_mu);
+}
+static void *fl_seg_main(void *arg) {
+  store_t *s = arg;
+  bool kicked = false;
+  while (ahead_wait(&s->ah_seg, 1000, &kicked)) seg_pre_make(s, kicked);
+  return NULL;
+}
+/* A segment made ahead and not used is removed (the store closes and the thread is gone, or the thread gives up a file made for a number that is not the next one): its number is free, nothing names the
+ * file.  The number stays the thread's (STALE, not NONE) until the file is gone, so that no writer makes a file of that name meanwhile. */
+static void seg_pre_drop(store_t *s) {
+  pthread_mutex_lock(&s->pre_mu);
+  const int st = atomic_load_explicit(&s->pre_state, memory_order_relaxed);
+  seg_t *const g = s->pre_g;
+  const uint32_t n = s->pre_n;
+  s->pre_g = NULL;
+  pthread_mutex_unlock(&s->pre_mu);
+  if ((st != PRE_READY && st != PRE_STALE) || !g) return;
+  seg_free(g);
+  if (VG(s, V_SEG(n, 0)) == 0) {                       /* (a number that a counter names now is not ours: nothing does, but the file is not removed on a guess) */
+    char name[32];
+    snprintf(name, sizeof(name), "seg.%u", n);
+    (void)unlinkat(s->dirfd, name, 0);
+  }
+  pthread_mutex_lock(&s->pre_mu);
+  atomic_store_explicit(&s->pre_state, PRE_NONE, memory_order_relaxed);
+  pthread_mutex_unlock(&s->pre_mu);
 }
 static void *fl_ckpt_main(void *arg) {
   store_t *s = arg;
@@ -6928,16 +7211,28 @@ static void *fl_ckpt_main(void *arg) {
   pthread_mutex_unlock(&s->bg_mu);
   return NULL;
 }
+#define FL_THREADS 4
+/* stop the first n flusher threads (the checkpoint thread, the commit thread, the thread of the blocks ahead, the thread of the segment ahead) and wait for them */
+static void bg_stop_n(store_t *s, int n) {
+  pthread_t *const thr[FL_THREADS] = { &s->fl_thr, &s->fl_thr2, &s->fl_thr3, &s->fl_thr4 };
+  pthread_mutex_lock(&s->bg_mu);
+  s->bg_stop = true;
+  pthread_cond_broadcast(&s->bg_cv);
+  pthread_mutex_unlock(&s->bg_mu);
+  ahead_stop(&s->ah_tab);
+  ahead_stop(&s->ah_seg);
+  for (int i = 0; i < n; i++) pthread_join(*thr[i], NULL);
+}
 static void bg_start(store_t *s) {
   if (atomic_load_explicit(&store_test_no_flusher, memory_order_relaxed)) return;
-  if (pthread_create(&s->fl_thr, NULL, fl_ckpt_main, s) != 0) return;
-  if (pthread_create(&s->fl_thr2, NULL, fl_commit_main, s) != 0) {
-    pthread_mutex_lock(&s->bg_mu);
-    s->bg_stop = true;
-    pthread_cond_broadcast(&s->bg_cv);
-    pthread_mutex_unlock(&s->bg_mu);
-    pthread_join(s->fl_thr, NULL);
+  static void *(*const mains[FL_THREADS])(void *) = { fl_ckpt_main, fl_commit_main, fl_tab_main, fl_seg_main };
+  pthread_t *const thr[FL_THREADS] = { &s->fl_thr, &s->fl_thr2, &s->fl_thr3, &s->fl_thr4 };
+  int n = 0;
+  while (n < FL_THREADS && pthread_create(thr[n], NULL, mains[n], s) == 0) n++;
+  if (n < FL_THREADS) {                                /* (a thread could not be made: none runs, the writers make the due work) */
+    bg_stop_n(s, n);
     s->bg_stop = false;
+    s->ah_tab.stop = s->ah_seg.stop = false;
     return;
   }
   s->fl_on = true;
@@ -6951,12 +7246,7 @@ static void bg_stop_join(store_t *s) {
   atomic_store_explicit(&s->rg_stop, true, memory_order_relaxed);
   while (atomic_load_explicit(&s->rg_live, memory_order_acquire)) usleep(1000);
   if (!s->fl_on) return;
-  pthread_mutex_lock(&s->bg_mu);
-  s->bg_stop = true;
-  pthread_cond_broadcast(&s->bg_cv);
-  pthread_mutex_unlock(&s->bg_mu);
-  pthread_join(s->fl_thr, NULL);
-  pthread_join(s->fl_thr2, NULL);
+  bg_stop_n(s, FL_THREADS);
   s->fl_on = false;
 }
 
@@ -6984,6 +7274,9 @@ int store_open(int dirfd, const store_opts_t *opts, store_t **out) {
   pthread_mutex_init(&s->bg_mu, NULL);
   pthread_mutex_init(&s->ap_mu, NULL);
   pthread_mutex_init(&s->jw_mu, NULL);
+  pthread_mutex_init(&s->pre_mu, NULL);
+  ahead_init(&s->ah_tab);
+  ahead_init(&s->ah_seg);
   {
     pthread_condattr_t ca;
     pthread_condattr_init(&ca);
@@ -7146,6 +7439,9 @@ fail:
   pthread_cond_destroy(&s->bg_cv);
   pthread_mutex_destroy(&s->jw_mu);
   pthread_cond_destroy(&s->jw_cv);
+  pthread_mutex_destroy(&s->pre_mu);
+  ahead_destroy(&s->ah_tab);
+  ahead_destroy(&s->ah_seg);
   if (s->jr_buf) munmap(s->jr_buf, (size_t)s->jr_cap);
   free(s->sbbuf);
   free(s->jb.p);
@@ -7159,6 +7455,7 @@ int store_close(store_t *s) {
   if (!s) return -EINVAL;
   ra_stop_join(s);
   bg_stop_join(s);
+  seg_pre_drop(s);
   wr_lock_ck(s);
   int r = ck_full_locked(s, true);
   if (r < 0) st_log(s, 3, "store: clean checkpoint at close failed: %d", r);
@@ -7180,6 +7477,9 @@ int store_close(store_t *s) {
   pthread_cond_destroy(&s->bg_cv);
   pthread_mutex_destroy(&s->jw_mu);
   pthread_cond_destroy(&s->jw_cv);
+  pthread_mutex_destroy(&s->pre_mu);
+  ahead_destroy(&s->ah_tab);
+  ahead_destroy(&s->ah_seg);
   if (s->jr_buf) munmap(s->jr_buf, (size_t)s->jr_cap);
   err_ring_close(s);
   for (unsigned k = 0; k < RG_NCH; k++) free(s->rg_ch[k]);
