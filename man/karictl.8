@@ -907,15 +907,18 @@ change inside it only records where they are), and those it wrote again inside
 the mutex because the zone, its record or the open segment changed in between. A
 new zone and a full segment are written inside the mutex
 .TP 8
-\fBstore.ahead.allocs\fR, \fB.alloc_us\fR, \fB.alloc_max_us\fR, \fB.errors\fR
+\fBstore.ahead.allocs\fR, \fB.alloc_us\fR, \fB.alloc_max_us\fR, \fB.thread_max_us\fR, \fB.errors\fR
 0.7: the allocation of the blocks ahead of the tables (\fBzt\fR, \fBzc\fR,
 \fBnx\fR: \fBposix_fallocate()\fR when what is in use nears the end of what is
 mapped, and for \fBstore_reserve()\fR), so that a growth inside the writer mutex
-is a mapping: how many were made, their total and longest time in microseconds,
-and how many failed (a full disk or an I/O error: nothing is done then, the
-checkpoint that extends the file meets the same error). Since 0.7 the flusher
-makes them in a thread of its own: a slow disk (up to 11 s were seen on UFS) no
-longer stops the periodic commit and the journal ring's background leader
+is a mapping: how many were made, their total and longest time in microseconds
+(every caller, the one of \fBstore_reserve()\fR too), the longest round of the
+thread of its own (\fB.thread_max_us\fR: what the thread waited for the disk,
+without the reserve), and how many failed (a full disk or an I/O error: nothing
+is done then, the checkpoint that extends the file meets the same error). Since
+0.7 the flusher makes them in a thread of its own: a slow disk (up to 11 s were
+seen on UFS) no longer stops the periodic commit and the journal ring's
+background leader
 .TP 8
 \fBstore.ahead.busy_kicks\fR, \fB.unallocated_growths\fR
 0.7: how often the commit thread asked for the blocks ahead while that thread
