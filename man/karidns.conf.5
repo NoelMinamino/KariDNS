@@ -5305,31 +5305,31 @@ recommended value when it is above 32 KiB
 \fBkarictl store\fR adds the sum (\fBstore.memory.arc.*\fR; the server cannot
 read the ARC settings in its sandbox, so \fBkarictl\fR does) and \fBkaricheck
 db\fR prints it, with the advice to lower \fBvfs.zfs.arc.max\fR when it is above
-RAM. A \fBfdatasync()\fR on ZFS costs about 3 ms, so the store commits in groups
-(at least every 100 ms), as it does everywhere. \fBA quota needs room.\fR ZFS
-makes every writer wait for a transaction group (seconds) when a dataset's
-\fBquota\fR has little left, and the store's tables are mapped files that are
-rewritten at every checkpoint; on the build host that began at about a fifth of
-the quota (14 MB of 48 MB, 19 MB of 100 MB), well before the quota is
-reached. The store stops storing images when only the reserve (half a segment,
-at most 128 MiB) is free, so with a quota set \fBstore\-segment\-size\fR so that
-the reserve is at least a fifth of the quota (a quota of 100 MB: segments of
-64M), or leave the quota out and watch \fBstore.space.*\fR instead. \fBScrub.\fR
-Every \fBstore\-scrub\-interval\fR the store reads every record, at 16 MiB a
-second at the most: the table record (its CRC), the way the name and source
-indexes lead to the zone, and for a stored zone the whole image: its checksum
-and the structure check that is made at every attach. A zone whose image is bad
-becomes known without an image and is read from the database again (the log says
-which zone; \fBstore.scrub.bad_images\fR); the cleaner does the same for a
-record that fails its checksum when it is to be copied. A zone that is in memory
-with that image (the store is in MAP mode: the zone serves the mapped pages) is
-taken out of memory too, even when it is pinned, so that it is read again and
-does not go on serving damaged pages (when a reader or a transfer holds it, the
-store tries again at the next tick). A table record that is damaged or an index
-entry that does not lead to its zone is repaired at the end of the pass: the
-indexes are built again from the zone table, and a record that cannot be read is
-dropped and comes again with the next pass of the loader. \fBkarictl store scrub
-start\fR starts a pass now, \fBstore scrub stop\fR ends it. \fBError ring.\fR
+RAM. A \fBfsync()\fR on ZFS costs about 3 ms, so the store commits in groups (at
+least every 100 ms), as it does everywhere. \fBA quota needs room.\fR ZFS makes
+every writer wait for a transaction group (seconds) when a dataset's \fBquota\fR
+has little left, and the store's tables are mapped files that are rewritten at
+every checkpoint; on the build host that began at about a fifth of the quota (14
+MB of 48 MB, 19 MB of 100 MB), well before the quota is reached. The store stops
+storing images when only the reserve (half a segment, at most 128 MiB) is free,
+so with a quota set \fBstore\-segment\-size\fR so that the reserve is at least a
+fifth of the quota (a quota of 100 MB: segments of 64M), or leave the quota out
+and watch \fBstore.space.*\fR instead. \fBScrub.\fR Every
+\fBstore\-scrub\-interval\fR the store reads every record, at 16 MiB a second at
+the most: the table record (its CRC), the way the name and source indexes lead
+to the zone, and for a stored zone the whole image: its checksum and the
+structure check that is made at every attach. A zone whose image is bad becomes
+known without an image and is read from the database again (the log says which
+zone; \fBstore.scrub.bad_images\fR); the cleaner does the same for a record that
+fails its checksum when it is to be copied. A zone that is in memory with that
+image (the store is in MAP mode: the zone serves the mapped pages) is taken out
+of memory too, even when it is pinned, so that it is read again and does not go
+on serving damaged pages (when a reader or a transfer holds it, the store tries
+again at the next tick). A table record that is damaged or an index entry that
+does not lead to its zone is repaired at the end of the pass: the indexes are
+built again from the zone table, and a record that cannot be read is dropped and
+comes again with the next pass of the loader. \fBkarictl store scrub start\fR
+starts a pass now, \fBstore scrub stop\fR ends it. \fBError ring.\fR
 \fBerr.ring\fR (14 MB, sparse until used) keeps the last 65,536 texts of zones
 that were refused or failed (which zone id, which version, when, why), written
 in place and wrapped; it is not journaled and holds no heap
