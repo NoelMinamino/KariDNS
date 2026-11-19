@@ -297,6 +297,9 @@ jobs:
               run_dnsqps_test,run_dnsqps_karidns_test,run_dnsqps_netmap_test"
             export DNSQPS_TEST_REQUIRE=1   # tests/run_dnsqps_netmap_test.sh: a SKIP (no /dev/netmap) must fail here
             sh ./tests/run_all_suite.sh -j 4 --test-timeout 1200 --full-log --pg-clusters --tests "$FUNC_TESTS" < /dev/null
+            # the log of a passing test is not printed: show what tests/run_dnsqps_karidns_test.sh checked, and fail when it never reached its PASS line (a SKIP or a short circuit)
+            grep -h -E '^ok: (query file|generated mode|option sets|per-line options)|^PASS: dnsqps against karidns' tests/.test_logs/test_*.log || true
+            grep -q '^PASS: dnsqps against karidns' tests/.test_logs/test_*.log || { echo "::error title=dnsqps::run_dnsqps_karidns_test.sh did not reach its PASS line"; exit 1; }
             echo "::endgroup::"
 
             echo "::group::🔏 [Signer, WebAdmin] karidns-signer and karidns-webadmin: unit tests, SQLite3 and PostgreSQL (root: with a server)"

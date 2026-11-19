@@ -1530,7 +1530,7 @@ coverage-fuzz-run:
 
 coverage-fuzz: coverage-fuzz-build coverage-fuzz-run
 
-COV_BIN_OBJS  = -object=$(TARGET) -object=$(DAG_TARGET) -object=$(KARICTL_TARGET) -object=karicheck
+COV_BIN_OBJS  = -object=$(TARGET) -object=$(DAG_TARGET) -object=$(KARICTL_TARGET) -object=karicheck -object=$(DNSQPS_TARGET) -object=test_dnsqps
 COV_BIN_OBJS += -object=test_cidr -object=test_tinydns_parser -object=test_asan_overflow -object=test_conf_include
 COV_BIN_OBJS += -object=test_dns_diag -object=test_mem_advice -object=test_config_directives -object=test_acl_match -object=test_listen_on -object=test_xfr_opts -object=test_server_stmt -object=test_wire_helpers -object=test_zone_image -object=test_zone_parser_paths -object=test_tinydns_paths
 COV_BIN_OBJS += -object=test_sig0_sign -object=test_snapshot_rebuild -object=test_dnssec_proofs -object=test_dag_format -object=test_dag_iter
