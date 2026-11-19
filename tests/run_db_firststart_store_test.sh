@@ -12,8 +12,9 @@
 #      0.7 fix A: no store I/O is waited for inside the store's writer mutex or the mutex of the writers of the records: the longest hold of each (store.lock.writer_hold_max_us,
 #      store.lock.records_hold_max_us) is at most FIRSTSTART_HOLD_US (default 500000: a generous bound for a loaded VM; at 10M zones the holds were seconds before the fix);
 #   2. kill -9 the server in the middle of a pass (the loader is behind tests/db/slow_manifest.c with -DPACE_US, which sends the pages of the pass one at a time): the server is started again on the same
-#      store, the pass is made again, and the store ends with every zone and a log with no message of a rebuild or a repair of the tables, and the zones answer (that a group record is there whole or not at all
-#      is shown by tests/test_store.c, the kill loop with groups, not here: this only sees that the server comes up and fills the store again);
+#      store, the pass is made again, and the store ends with every zone and a log with no message of a repair of the tables, and the zones answer (that a group record is there whole or not at all
+#      is shown by tests/test_store.c, the kill loop with groups, not here: this only sees that the server comes up and fills the store again).  0.7: the first fill of the empty store is unlogged
+#      (tests/run_db_store_bulk_test.sh): the restart says that the fill was cut off, rebuilds the tables of the start of the fill and goes on;
 #   3. kill -9 the loader in the middle of a pass: the stream ends, the pass that was cut off sweeps nothing, the supervisor starts the loader again, the pass is made again, every zone is in the store.
 # Needs sqlite3, perl, a C compiler (the proxy is built in the test's directory), the binaries; as root the loader and the server run as nobody, otherwise as the user who runs the test.  SKIP without them.
 . "$(dirname "$0")/lib_proc.sh"
@@ -154,7 +155,8 @@ grep -q "the manifest pass is over" "$T/k.log" && fail "the pass had ended befor
 start_server k k2.log
 kari_wait_log "$T/k2.log" "the manifest pass is over" 90 && pass "the pass is made again and ends" || { fail "no second pass"; tail -20 "$T/k2.log"; }
 waitfor 180 all_known "$KZ" && pass "the store has all $KZ zones after the restart" || fail "the store has $(( $(sf store.zones.stored) + $(sf store.zones.known) )) of $KZ zones"
-grep -qE "rebuilt=1|damaged|repaired" "$T/k2.log" && fail "the store was rebuilt or repaired after the kill: $(grep -E 'rebuilt=1|damaged|repaired' "$T/k2.log" | head -2)" || pass "the log of the restart has no message of a rebuild or a repair of the store"
+grep -qE "damaged|repaired" "$T/k2.log" && fail "the store was repaired after the kill: $(grep -E 'damaged|repaired' "$T/k2.log" | head -2)" || pass "the log of the restart has no message of a repair of the store"
+grep -q "a bulk fill was cut off" "$T/k2.log" && pass "the restart says that the unlogged first fill was cut off and goes on (0.7: the store went back to the start of the fill and rebuilt its tables)" || fail "no message of the cut-off bulk fill: $(grep 'recovered' "$T/k2.log" | head -2)"
 OUT=$(dagq "z$((KZ - 3)).test" SOA)
 [ "$(echo "$OUT" | status_of)" = NOERROR ] && pass "a zone near the end of the manifest answers" || fail "z$((KZ - 3)).test: $(echo "$OUT" | status_of)"
 [ "$(sf store.recon.pass.entries)" = "$KZ" ] && pass "the second pass listed $KZ zones" || fail "pass.entries=$(sf store.recon.pass.entries)"

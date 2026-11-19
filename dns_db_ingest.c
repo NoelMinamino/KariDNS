@@ -1616,6 +1616,18 @@ static uint32_t queue_cap(const _Atomic uint32_t *hook, uint32_t max) {
   const uint32_t v = atomic_load_explicit(hook, memory_order_relaxed);
   return v && v < max ? v : max;
 }
+/* 0.7: the scan of the wanted bodies (bg_on of the ingest thread, published) and the times it ended idle */
+static _Atomic bool g_scan_on;
+static _Atomic uint64_t g_scan_idle;
+static void scan_set(ing_t *g, bool on) {
+  g->bg_on = on;
+  atomic_store_explicit(&g_scan_on, on, memory_order_release);
+}
+uint64_t db_ingest_fill_scan(bool *on) {
+  const uint64_t n = atomic_load_explicit(&g_scan_idle, memory_order_acquire);
+  if (on) *on = atomic_load_explicit(&g_scan_on, memory_order_acquire);
+  return n;
+}
 /* 0.7 M3: the zone images (store.fill.*, dns_store_status.h) */
 bool db_ingest_fill_stats(store_fill_t *out) {
   memset(out, 0, sizeof(*out));
@@ -1977,14 +1989,14 @@ static void on_hello(ing_t *g, const kdb_msg_t *m) {
   as_reset();
   g->hello_done = true;
   g->loader_feat = h->features;
-  g->bg_on = false;
+  scan_set(g, false);
   send_config(g, "handshake");
   atomic_store_explicit(&g_lookup_on, g->stream_fd >= 0 && g->store_proto && (h->features & KDB_FEAT_LOOKUP) != 0, memory_order_release);      /* (send_config() may have dropped the stream) */
   atomic_store_explicit(&g_lookup_hold, g->store_proto && (h->features & KDB_FEAT_LOOKUP) != 0, memory_order_release);       /* (a loader that does not look up ends the hold: the queries are refused as before) */
   g->debug_sent = -1;                                  /* 0.7 M2: a new loader learns the level in force after its CONFIG */
   send_debug(g);
   if (g->store_proto) {                                /* 0.7 WP7b: the records the store holds that have no body (an interrupted fill, a changed zone, a secondary zone: they are heap zones) are fetched once now */
-    g->bg_on = true;
+    scan_set(g, true);
     g->bg_zid = 0;
     g->bg_again = false;
     g->bg_fail = 0;
@@ -2577,7 +2589,7 @@ static void on_hot_ack(const kdb_msg_t *m) {
 static void bulk_kick(ing_t *g) {
   if (!g->store_proto) return;
   if (!g->bg_on) {
-    g->bg_on = true;
+    scan_set(g, true);
     g->bg_zid = 0;
     g->bg_fail = 0;
     g->bg_again = false;
@@ -3546,7 +3558,8 @@ static bool bulk_take(ing_t *g, park_fetch_req_t *q, uint32_t *zid, uint32_t *ba
         g->bg_zid = 0;
         g->bg_fail = 0;
       } else {
-        g->bg_on = false;
+        scan_set(g, false);
+        atomic_fetch_add_explicit(&g_scan_idle, 1, memory_order_release);     /* (the end of an unlogged first fill waits for this, db_ingest_fill_scan()) */
         if (!g->bg_idle_logged) {
           g->bg_idle_logged = true;
           logev_post(LOGC_DATABASE, 1, NULL, 0, "[DB] the bodies the reconcile wanted are all asked for");

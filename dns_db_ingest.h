@@ -54,6 +54,9 @@ struct store_fill;
 bool db_ingest_lookup_stats(struct store_lookup *out);
 /* 0.7 M3: the zone images (store.fill.*) */
 bool db_ingest_fill_stats(struct store_fill *out);
+/* 0.7, the end of an unlogged first fill (dns_db_store.c bulk_end_check()): is the scan of the wanted bodies running now (*on), and how many times did it end with nothing more to ask
+ * for (no failure to try again, no second round asked for) since the start (the return value).  Any thread; no lock. */
+uint64_t db_ingest_fill_scan(bool *on);
 /* tests: a smaller bound of the lookup queue and of the wait queue (0: the constants of dns_db_ingest.c) */
 extern _Atomic uint32_t db_ingest_test_lq_max, db_ingest_test_wq_max;
 extern _Atomic bool db_ingest_test_recon_poll_off;     /* tests: recon_poll() leaves the protocol error of the reconcile thread to the stream thread */

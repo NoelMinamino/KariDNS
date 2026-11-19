@@ -64,6 +64,9 @@ static struct {
   unsigned hold_ms, net_ms;
 #endif
   _Atomic int64_t nospc_logged_ms, unstorable_logged;
+  _Atomic int64_t unbulk_logged_ms;                   /* 0.7: the last line about a write put off for the end of an unlogged fill (xs_unbulk()) */
+  _Atomic bool retry_want;                            /* ... a write was put off: the restore thread makes a pass once the end is on disk */
+  _Atomic uint64_t put_off;                           /* the writes put off so */
   /* the start's figures */
   _Atomic uint64_t s_restored, s_expired, s_file, s_none;
   /* counters */
@@ -311,7 +314,28 @@ static int rec_get(store_t *st, uint16_t vid, const xinfo_t *xi, store_zone_t *z
   return r;
 }
 
+/* 0.7: a write of a copy is made durable as any other (the journal).  During an unlogged first fill of the store (store_bulk_begin(), which a configuration with secondaries does not begin) or before
+ * its end is on disk, a copy written would be acknowledged and lost to the last bulk checkpoint on a crash: the write is put off (-EAGAIN), the end of the fill is asked for (the store's checkpoint
+ * thread makes it; this thread does not wait), and the restore thread makes a pass once it is on disk (restore_thread(): the refreshes put off are written then, pass_run()).  The zone in memory
+ * is served all the while; only its copy waits.  One line a minute at most. */
+static int xs_unbulk(store_t *st) {
+  if (!store_bulk_pending(st)) return 0;
+  (void)store_bulk_end(st, 0);
+  atomic_fetch_add_explicit(&X.put_off, 1, memory_order_relaxed);
+  if (!atomic_exchange_explicit(&X.retry_want, true, memory_order_acq_rel)) {       /* (the restore thread looks at it every second from now; X.mu is never held around a store write) */
+    pthread_mutex_lock(&X.mu);
+    pthread_cond_broadcast(&X.cv);
+    pthread_mutex_unlock(&X.mu);
+  }
+  const int64_t now = mono_ms(), last = atomic_load_explicit(&X.unbulk_logged_ms, memory_order_relaxed);
+  if (now - last >= 60000 && atomic_compare_exchange_strong_explicit(&X.unbulk_logged_ms, &(int64_t){ last }, now, memory_order_relaxed, memory_order_relaxed))
+    syslog(LOG_NOTICE, "[Store] the copies of secondary zones are stored once the end of the unlogged fill of the store is on disk (%" PRIu64 " write(s) put off so far); the zones are served meanwhile",
+           atomic_load_explicit(&X.put_off, memory_order_relaxed));
+  return -EAGAIN;
+}
+
 static void rec_delete(store_t *st, uint16_t vid, const char *key, size_t klen, uint32_t zid) {
+  if (xs_unbulk(st) < 0) return;
   if (store_delete_name(st, vid, key, klen) == 0) zs_del(zid);
 }
 
@@ -384,6 +408,10 @@ static void state_of(const xinfo_t *xi, const pin_t *p, time_t attempt_at, xfr_s
 /* the whole image of the active version, with the state (NO_DEGRADE: no room keeps the old copy, M1) */
 static int put_image(store_t *st, uint16_t vid, zone_db_entry_t *e, const xinfo_t *xi, time_t attempt_at) {
   pin_t p;
+  {
+    const int ur = xs_unbulk(st);
+    if (ur < 0) return ur;
+  }
   if (!pin_active(e, &p)) return -ENOENT;
   if (p.last_ok <= 0) p.last_ok = attempt_at;           /* (a version from a file without mtime: the refresh just confirmed it) */
   xfr_state_t s;
@@ -436,6 +464,10 @@ static int put_image(store_t *st, uint16_t vid, zone_db_entry_t *e, const xinfo_
 static int put_state(store_t *st, uint16_t vid, const xinfo_t *xi, uint32_t expect_serial, const xfr_state_t *s) {
   uint8_t dg[STORE_DIGEST_LEN];
   xfr_state_encode(s, dg);
+  {
+    const int ur = xs_unbulk(st);
+    if (ur < 0) return ur;
+  }
   const int r = store_set_digest(st, vid, xi->key, (size_t)xi->klen, expect_serial, 0, dg, STORE_F_XFR, 0);
   if (r == 0) atomic_fetch_add_explicit(&X.state_writes, 1, memory_order_relaxed);
   else if (r == -ESTALE || r == -ENOENT) atomic_fetch_add_explicit(&X.state_stale, 1, memory_order_relaxed);       /* (replaced or gone meanwhile: the next outcome writes again) */
@@ -457,6 +489,15 @@ static void after_refresh_pinned(store_t *st, uint16_t vid16, zone_db_entry_t *e
   const int vid = vid16;
   xinfo_t xi;
   if (!entry_info_now(e, &xi)) return;
+  if (outcome != XFR_OUT_NONE && store_bulk_pending(st)) {              /* (0.7: put off until the end of the unlogged fill is on disk, xs_unbulk(); the restore thread's pass writes it) */
+    zone_x_t *const x = zone_x_need(e);                                  /* (a secondary has its extension from the start; no memory: the write waits for the next refresh) */
+    if (x) {
+      atomic_store_explicit(&x->xfr_store_retry_at, attempt_at, memory_order_relaxed);
+      atomic_store_explicit(&x->xfr_store_retry, outcome, memory_order_release);
+    }
+    (void)xs_unbulk(st);
+    return;
+  }
   store_zone_t z;
   const bool have = rec_get(st, (uint16_t)vid, &xi, &z) == 0;
   bool wrote = false;
@@ -522,6 +563,7 @@ static void after_refresh_pinned(store_t *st, uint16_t vid16, zone_db_entry_t *e
 enum { RS_OFF = 0, RS_NOT_PENDING, RS_NONE, RS_IDENTITY, RS_BAD, RS_FILE_WON, RS_HAS_VERSION, RS_RESTORED, RS_NOINFO, RS_MEMORY };
 
 static void make_known(store_t *st, uint16_t vid, const xinfo_t *xi, const store_zone_t *z) {
+  if (xs_unbulk(st) < 0) return;
   store_meta_t m;
   memset(&m, 0, sizeof(m));
   m.flags = z->flags;
@@ -759,7 +801,7 @@ static uint64_t gc_run(store_t *st, uint16_t vid, const hset_t *cur, const hset_
       const bool sok = xfr_state_decode(z.digest, sizeof(z.digest), &s) == 0;
       if (sok && (s.kind == XFR_K_DB_SLAVE || s.kind == XFR_K_DB_CONSUMER)) continue;      /* (R3: the database secondaries are P3's: never deleted here) */
       if (sok && s.kind == XFR_K_MEMBER && hset_has(exempt, (uint64_t)tag + 1)) continue;   /* (M6: a catalog of that view has not refreshed since the start) */
-      if (store_delete_name(st, vid, z.name, kl) == 0) {
+      if (xs_unbulk(st) == 0 && store_delete_name(st, vid, z.name, kl) == 0) {
         zs_del(zid);
         deleted++;
       }
@@ -777,8 +819,8 @@ static uint64_t pass_run(void) {
   if (!st || vid < 0) return 0;
   zone_db_snapshot_t *snap = acquire_retained_zone_snapshot();
   if (!snap) return 0;
-  zone_db_entry_t **pend = NULL;
-  size_t np = 0, cap = 0;
+  zone_db_entry_t **pend = NULL, **retry = NULL;
+  size_t np = 0, cap = 0, nr = 0, rcap = 0;
   hset_t cur = { 0 }, exempt = { 0 };
   bool cur_ok = true;
   rcu_aux_read_lock();
@@ -803,6 +845,14 @@ static uint64_t pass_run(void) {
         if (xi.kind == XFR_K_CATALOG && !atomic_load_explicit(&zone_xr(e)->xfr_refreshed, memory_order_acquire))
           cur_ok = hset_add(&exempt, (uint64_t)xi.view_tag + 1) && cur_ok;
       }
+      if (atomic_load_explicit(&zone_xr(e)->xfr_store_retry, memory_order_acquire) != 0) {     /* (0.7: a store write that waited for the end of an unlogged fill) */
+        if (nr == rcap) {
+          size_t nc = rcap ? rcap * 2 : 16;
+          zone_db_entry_t **n = realloc(retry, nc * sizeof(*n));
+          if (n) { retry = n; rcap = nc; }
+        }
+        if (nr < rcap) retry[nr++] = e;
+      }
       if (atomic_load_explicit(&e->restore_pending, memory_order_acquire)) {
         if (np == cap) {
           size_t nc = cap ? cap * 2 : 64;
@@ -824,6 +874,13 @@ static uint64_t pass_run(void) {
     if (atomic_load_explicit(&X.st, memory_order_acquire) == NULL) break;
   }
   free(pend);
+  for (size_t i = 0; i < nr; i++) {                   /* (the writes put off for the end of an unlogged fill: made now, as at the end of their refresh; one that is put off again is flagged again) */
+    zone_db_entry_t *e = retry[i];
+    zone_x_t *const x = zone_x(e);
+    const int outcome = x ? atomic_exchange_explicit(&x->xfr_store_retry, 0, memory_order_acq_rel) : 0;
+    if (outcome != 0) after_refresh_pinned(st, (uint16_t)vid, e, outcome, atomic_load_explicit(&x->xfr_store_retry_at, memory_order_relaxed));
+  }
+  free(retry);
   const uint64_t del = gc_run(st, (uint16_t)vid, &cur, &exempt, cur_ok);
   free(cur.h);
   free(exempt.h);
@@ -843,6 +900,19 @@ static void *restore_thread(void *arg) {
 #endif
   pthread_mutex_lock(&X.mu);
   while (!X.stop) {
+    if (X.req_gen == X.done_gen && atomic_load_explicit(&X.retry_want, memory_order_acquire)) {
+      /* (0.7: writes were put off for the end of an unlogged fill: a pass once it is on disk, looked at every second) */
+      if (st && !store_bulk_pending(st)) {
+        atomic_store_explicit(&X.retry_want, false, memory_order_relaxed);
+        X.req_gen++;
+        continue;
+      }
+      struct timespec ts;
+      clock_gettime(CLOCK_REALTIME, &ts);
+      ts.tv_sec += 1;
+      (void)pthread_cond_timedwait(&X.cv, &X.mu, &ts);
+      continue;
+    }
     if (X.req_gen == X.done_gen) {
       pthread_cond_wait(&X.cv, &X.mu);
       continue;

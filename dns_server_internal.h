@@ -505,6 +505,10 @@ struct zone_x_s {
   bool exp_stopped;                             /* the restore installed it expired (it expired while the server was stopped): the tick says so in its `expired` line */
   _Atomic bool xfr_refreshed;
   _Atomic bool xfr_axfr_once;
+  /* 0.7 (the unlogged first fill of the store): the store write of the last refresh was put off while the fill ended (XFR_OUT_* of it, 0: none) and the time of that attempt; the restore
+   * thread's next pass writes it once the end is on disk (dns_xfr_store.c) */
+  _Atomic int xfr_store_retry;
+  _Atomic(time_t) xfr_store_retry_at;
   _Atomic(time_t) last_denial_gap_log;          /* 0.7 (audit): when a missing NSEC / NSEC3 proof of this zone was last logged (dns_query_engine.c note_denial_gap()) */
   time_t last_loaded_mtime;
   off_t last_loaded_size;                       /* with the mtime: a reload re-reads a file only when one of them changed (reload_master_zone()) */

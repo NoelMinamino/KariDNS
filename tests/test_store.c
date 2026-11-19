@@ -7438,6 +7438,848 @@ static void test_ahead_crash(int mode) {
   tdir_free(&d);
 }
 
+/* ================================================================================================================== */
+/* 0.7: the unlogged bulk fill of an empty store ("THE BULK FILL" in dns_store.c)                                       */
+/* ================================================================================================================== */
+
+static int known_i(store_t *s, uint16_t view, uint32_t i, uint64_t ver) {
+  char nm[160];
+  name_of(i, nm, sizeof(nm));
+  store_meta_t m = meta_of(i, ver);
+  return store_set_known(s, view, nm, strlen(nm), &m, NULL);
+}
+/* zone i is there with its name: STORED with an image that checks out (some version), or KNOWN (no image, its source id); *state: which */
+static bool there_i(store_t *s, uint16_t view, uint32_t i, uint8_t *state) {
+  char nm[160];
+  name_of(i, nm, sizeof(nm));
+  store_read_lock();
+  const uint32_t z = store_find(s, view, nm, strlen(nm));
+  store_zone_t zi;
+  const bool ok = z != STORE_NONE && store_zone_get(s, z, &zi) == 0 && strcmp(zi.name, nm) == 0;
+  store_read_unlock();
+  if (!ok) return false;
+  if (state) *state = zi.state;
+  if (zi.state == STORE_STATE_KNOWN) return zi.loc == 0 && zi.img_len == 0 && zi.source_id == (int64_t)i + 1;
+  return verify_i(s, view, i, UINT64_MAX);
+}
+static void bulk_opts(store_opts_t *o) {
+  small_opts(o);
+  o->checkpoint_interval_ms = 200;                     /* (a logged fill would make checkpoints by the interval and by the journal's size) */
+  o->journal_max_bytes = 64u << 10;
+  o->sync_interval_ms = 20;
+  o->scrub_interval_s = UINT32_MAX;
+  o->bulk_ckpt_bytes = UINT64_MAX / 4;                 /* (no bulk checkpoint by the bytes or the time unless the case asks for one) */
+  o->bulk_ckpt_interval_ms = UINT32_MAX;
+}
+static bool wait_stat(store_t *s, uint64_t (*get)(const store_stats_t *), uint64_t want, int ms) {
+  store_stats_t st;
+  for (int w = 0; w < ms; w++) {
+    store_stats(s, &st);
+    if (get(&st) >= want) return true;
+    usleep(1000);
+  }
+  return false;
+}
+static uint64_t get_bulk_ck(const store_stats_t *st) { return st->bulk_checkpoints; }
+
+static void test_bulk_basic(void) {
+  printf("[a bulk fill: no journal record, no commit, no checkpoint by size or interval; bulk checkpoints in the body fill only, by the segment bytes; its end logs again]\n");
+  tdir_t d;
+  tdir_new(&d, "bulk");
+  store_opts_t o;
+  bulk_opts(&o);
+  o.bulk_ckpt_bytes = 256u << 10;
+  o.log = log_cb;
+  log_clear();
+  store_t *s = NULL;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (!s) { tdir_free(&d); return; }
+  CHECK_EQ(store_view_add(s, "default"), 0);
+  store_stats_t st;
+  CHECK_EQ(store_bulk(s), 0);
+  CHECK_EQ(store_bulk(NULL), 0);
+  CHECK_EQ(store_bulk_begin(NULL), -EINVAL);
+  store_bulk_phase(s, STORE_BULK_BODY);                                   /* (no fill: nothing) */
+  CHECK_EQ(store_bulk(s), 0);
+  CHECK_EQ(store_bulk_end(s, STORE_BULK_END_WAIT), 0);                                         /* (no fill: nothing) */
+  CHECK_EQ(store_bulk_begin(s), 0);
+  CHECK_EQ(store_bulk_begin(s), 0);                                       /* (idempotent) */
+  CHECK_EQ(store_bulk(s), 1);
+  store_bulk_phase(s, STORE_BULK_PASS);
+  store_bulk_phase(s, 99);                                                /* (not a phase: nothing) */
+  store_stats(s, &st);
+  CHECK_EQ(st.bulk_active, 1);
+  CHECK_EQ(st.bulk_fills, 1);
+  CHECK(st.bulk_since_unix > 0);
+  CHECK_EQ(st.bulk_next_bytes, 0);                                        /* (a pass runs: no bulk checkpoint) */
+  CHECK_EQ(log_count(6, "an unlogged bulk fill of the empty store begins"), 1);
+  const uint64_t jb0 = st.journal_bytes_written, ck0 = st.checkpoints, cm0 = st.commits, lsn0 = st.lsn;
+  /* 1. the pass: the zones are listed (KNOWN) and some bodies come; nothing is logged, committed or checkpointed although the journal limit and the interval are small */
+  for (uint32_t i = 0; i < 600; i++) CHECK_EQ(known_i(s, 0, i, 1), 0);
+  for (uint32_t i = 0; i < 600; i++) CHECK_EQ(put_i(s, 0, i, 2, NULL), 0);
+  CHECK_EQ(store_commit(s), 0);
+  usleep(500000);
+  store_stats(s, &st);
+  CHECK_EQ(st.journal_bytes_written, jb0);
+  CHECK_EQ(st.lsn, lsn0);
+  CHECK_EQ(st.commits, cm0);
+  CHECK_EQ(st.checkpoints, ck0);
+  CHECK(st.bulk_unlogged_records >= 1200 && st.bulk_unlogged_records <= 1204);                 /* (and the growths of the index: their GEN records) */
+  CHECK_EQ(st.bulk_checkpoints, 0);
+  CHECK(st.seg_used_bytes > (256u << 10));                                /* (past the bytes of a bulk checkpoint: none while the pass runs) */
+  CHECK_EQ(store_compact(s, 0, true, NULL), -EBUSY);
+  CHECK_EQ(store_scrub_run(s, NULL), -EBUSY);
+  CHECK_EQ(store_journal_wait(s, 1), 0);
+  for (uint32_t i = 0; i < 600; i++) CHECK(verify_i(s, 0, i, 2));
+  /* 2. the body fill: a bulk checkpoint at once (the segments are past 256 KiB), the next one at twice the bytes of that one */
+  store_bulk_phase(s, STORE_BULK_PASSED);
+  CHECK_EQ(store_bulk(s), 2);
+  CHECK(wait_stat(s, get_bulk_ck, 1, 10000));
+  store_stats(s, &st);
+  CHECK_EQ(st.bulk_checkpoints, 1);
+  CHECK_EQ(st.checkpoints, ck0 + 1);
+  const uint64_t seg1 = store_test_seg_bytes(s);
+  CHECK(st.bulk_next_bytes >= 2 * seg1 - 4096 && st.bulk_next_bytes >= seg1 + (256u << 10));
+  CHECK(st.journal_bytes_written <= jb0 + 64);                            /* (the header of the journal file the checkpoint switched to) */
+  CHECK_EQ(log_count(6, "bulk checkpoint 1 of the fill"), 1);
+  uint32_t k = 600;
+  for (uint64_t seg = store_test_seg_bytes(s); seg < st.bulk_next_bytes && k < 20000; seg = store_test_seg_bytes(s)) CHECK_EQ(put_i(s, 0, k++, 2, NULL), 0);
+  CHECK(wait_stat(s, get_bulk_ck, 2, 10000));
+  usleep(300000);
+  store_stats(s, &st);
+  CHECK_EQ(st.bulk_checkpoints, 2);                                       /* (no more: the segments have not doubled again) */
+  CHECK_EQ(st.lsn, lsn0);
+  CHECK_EQ(store_bulk_begin(s), 0);                                       /* (a pass of a fill that goes on: it stays, the phase is the pass's) */
+  store_stats(s, &st);
+  CHECK_EQ(st.bulk_next_bytes, 0);
+  CHECK_EQ(st.bulk_fills, 1);
+  store_bulk_phase(s, STORE_BULK_PASSED);
+  check_consistent(s, "bulk fill");
+  /* 3. the end: the writers log again, one checkpoint writes the tables and clears the flag */
+  const uint64_t ck2 = st.checkpoints;
+  CHECK_EQ(store_bulk_end(s, STORE_BULK_END_WAIT), 0);
+  store_stats(s, &st);
+  CHECK_EQ(store_bulk(s), 0);
+  CHECK_EQ(st.bulk_active, 0);
+  CHECK(st.bulk_ended_unix > 0);
+  CHECK_EQ(st.checkpoints, ck2 + 1);
+  CHECK_EQ(log_count(6, "the unlogged bulk fill is over"), 1);
+  CHECK_EQ(store_bulk_end(s, STORE_BULK_END_WAIT), 0);
+  const uint64_t jb1 = st.journal_bytes_written, un = st.bulk_unlogged_records;
+  for (uint32_t i = 0; i < 100; i++) CHECK_EQ(put_i(s, 0, i, 3, NULL), 0);
+  store_stats(s, &st);
+  CHECK(st.journal_bytes_written > jb1 + 100 * 128);
+  CHECK(st.lsn >= lsn0 + 100);
+  CHECK_EQ(st.bulk_unlogged_records, un);
+  CHECK_EQ(store_bulk_begin(s), -EEXIST);                                 /* (the store holds zone records: a fill stays logged) */
+  CHECK_EQ(store_checkpoint_clean(s), 0);
+  CHECK(store_test_files_match(s));                                       /* (the tables and the index generations made during the fill are on disk, whole) */
+  check_consistent(s, "bulk fill ended");
+  CHECK_EQ(store_close(s), 0);
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (s) {
+    store_stats(s, &st);
+    CHECK(st.recovery.was_clean);
+    CHECK(!st.recovery.bulk_resumed);
+    CHECK_EQ(store_bulk(s), 0);
+    for (uint32_t i = 0; i < k; i++) CHECK(verify_i(s, 0, i, i < 100 ? 3 : 2));
+    check_consistent(s, "bulk fill reopened");
+    CHECK_EQ(store_close(s), 0);
+  }
+  tdir_free(&d);
+}
+
+/* the crash cases: a child fills, the parent reopens */
+enum { BK_PREFILL = 0, BK_AFTER_CK, BK_FINAL, BK_AFTER_END, BK_CLEAN_CRASH };
+static store_t *g_bk_s;
+static _Atomic int g_bk_hook_mode;
+static void bk_hook(int step) {
+  const int m = atomic_load(&g_bk_hook_mode);
+  if (m == 1 && step == 2) {                           /* (the bulk checkpoint's position is taken, its copy of the tables not yet: these cells are copied with images past the segments' counters of P) */
+    atomic_store(&g_bk_hook_mode, 0);
+    for (uint32_t i = 100; i < 110; i++) (void)put_i(g_bk_s, 0, i, 3, NULL);
+    for (uint32_t k = 0; k < 20; k++) (void)put_i(g_bk_s, 0, 1004 + 7 * k, 3, NULL);     /* (new zones: their ids are past the high-water mark of P, the rebuild does not look at them) */
+  } else if (m == 2 && step == 3) {                    /* (the final checkpoint wrote its tables, not its superblock) */
+    kill(getpid(), SIGKILL);
+  }
+}
+static void bk_child(const tdir_t *d, const store_opts_t *o, int mode) {
+  store_t *s = NULL;
+  if (store_open(d->fd, o, &s) != 0) _exit(10);
+  g_bk_s = s;
+  if (store_view_add(s, "default") != 0 || store_bulk_begin(s) != 0) _exit(11);
+  store_bulk_phase(s, STORE_BULK_PASS);
+  if (store_set_cursor(s, 0, 7, "id", 2) != 0) _exit(12);
+  for (uint32_t i = 0; i < 200; i++) if (known_i(s, 0, i, 1) != 0) _exit(13);
+  store_bulk_phase(s, STORE_BULK_BODY);
+  for (uint32_t i = 0; i < 100; i++) if (put_i(s, 0, i, 2, NULL) != 0) _exit(14);
+  if (mode == BK_PREFILL) kill(getpid(), SIGKILL);
+  if (mode == BK_CLEAN_CRASH) {
+    if (store_checkpoint_clean(s) != 0) _exit(15);
+    for (uint32_t i = 300; i < 350; i++) if (put_i(s, 0, i, 4, NULL) != 0) _exit(16);
+    kill(getpid(), SIGKILL);
+  }
+  atomic_store(&g_bk_hook_mode, mode == BK_AFTER_CK ? 1 : 0);
+  atomic_store(&store_test_ckpt_hook, bk_hook);
+  if (store_checkpoint(s) != 0) _exit(17);                              /* (during a fill: a bulk checkpoint) */
+  atomic_store(&store_test_ckpt_hook, NULL);
+  store_stats_t st;
+  store_stats(s, &st);
+  if (st.bulk_checkpoints != 1 || atomic_load(&g_bk_hook_mode) != 0) _exit(18);
+  for (uint32_t i = 300; i < 350; i++) if (put_i(s, 0, i, 4, NULL) != 0) _exit(19);
+  if (mode == BK_AFTER_CK) kill(getpid(), SIGKILL);
+  store_bulk_phase(s, STORE_BULK_PASSED);
+  if (mode == BK_FINAL) {
+    atomic_store(&g_bk_hook_mode, 2);
+    atomic_store(&store_test_ckpt_hook, bk_hook);
+    (void)store_bulk_end(s, STORE_BULK_END_WAIT);
+    _exit(20);
+  }
+  if (store_bulk_end(s, STORE_BULK_END_WAIT) != 0) _exit(21);
+  for (uint32_t i = 350; i < 400; i++) if (put_i(s, 0, i, 5, NULL) != 0) _exit(22);
+  if (store_commit(s) != 0) _exit(23);
+  kill(getpid(), SIGKILL);
+}
+static void test_bulk_crash(int mode) {
+  static const char *const what[] = { "before the first bulk checkpoint: back to the start of the fill", "after a bulk checkpoint: rebuilt, images past the segments are KNOWN",
+                                      "during the checkpoint at the end: back to the last bulk checkpoint", "after the end: the usual replay", "after a clean checkpoint of the fill and unlogged changes" };
+  printf("[kill -9 in a bulk fill, %s]\n", what[mode]);
+  tdir_t d;
+  tdir_new(&d, "bulkc");
+  store_opts_t o;
+  bulk_opts(&o);
+  o.no_readahead = true;
+  fflush(stdout);
+  const pid_t pid = fork();
+  if (pid == 0) bk_child(&d, &o, mode);
+  CHECK(pid > 0);
+  int status = 0;
+  CHECK(waitpid(pid, &status, 0) == pid);
+  CHECK(WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL);
+  if (!WIFSIGNALED(status)) printf("  (the child ended with status %d)\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+  o.create = false;
+  o.log = log_cb;
+  log_clear();
+  store_t *s = NULL;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (!s) { tdir_free(&d); return; }
+  store_stats_t st;
+  store_stats(s, &st);
+  CHECK(!st.recovery.was_clean);
+  printf("  open: rebuilt %d, %" PRIu64 " replayed, %" PRIu64 " zones known, %" PRIu64 " stored, %" PRIu64 " made KNOWN, %" PRIu64 " dropped, %" PRIu64 " us\n", (int)st.recovery.rebuilt,
+         st.recovery.records_replayed, st.zones_known, st.zones_stored, st.recovery.bulk_known, st.recovery.dropped_zones, st.recovery.open_us);
+  check_consistent(s, "after the kill");
+  uint8_t sta = 0;
+  if (mode == BK_AFTER_END) {
+    CHECK(!st.recovery.bulk_recovered);
+    CHECK_EQ(store_bulk(s), 0);
+    CHECK(!st.recovery.rebuilt && st.recovery.records_replayed <= 50);     /* (the usual open: the journal is replayed, no rebuild; a checkpoint the flusher made after the end may already hold some of the 50 puts, so not all of them need replaying: the checks below say every one is there) */
+    for (uint32_t i = 0; i < 100; i++) CHECK(verify_i(s, 0, i, 2));
+    for (uint32_t i = 100; i < 200; i++) CHECK(there_i(s, 0, i, NULL));
+    for (uint32_t i = 300; i < 350; i++) CHECK(verify_i(s, 0, i, 4));
+    for (uint32_t i = 350; i < 400; i++) CHECK(verify_i(s, 0, i, 5));
+  } else {
+    CHECK(st.recovery.bulk_recovered && st.recovery.bulk_resumed && st.recovery.rebuilt);
+    CHECK_EQ(st.bulk_recoveries, 1);
+    CHECK_EQ(st.recovery.records_replayed, 0);
+    CHECK_EQ(store_bulk(s), 1);                                           /* (the fill goes on; its pass has to be made again) */
+    CHECK_EQ(log_count(4, "a bulk fill was cut off"), 1);
+    bool valid = false;
+    uint64_t cur = 0;
+    CHECK_EQ(store_get_cursor(s, 0, &valid, &cur, NULL, NULL), 0);
+    if (mode == BK_PREFILL) {
+      CHECK_EQ(st.zones_known + st.zones_stored, 0);                      /* (the start of the fill: the store was empty) */
+      CHECK(!valid);
+    } else {
+      CHECK(valid && cur == 7);                                           /* (the store keeps it; the caller drops it, db_store_start()) */
+      for (uint32_t i = 0; i < 100; i++) CHECK(verify_i(s, 0, i, 2));
+      for (uint32_t i = 110; i < 200; i++) CHECK(there_i(s, 0, i, &sta) && sta == STORE_STATE_KNOWN);
+      uint32_t late = 0, newer = 0, conv = 0;
+      for (uint32_t i = 300; i < 350; i++) late += find_i(s, 0, i) != STORE_NONE;
+      for (uint32_t k = 0; k < 20; k++) newer += find_i(s, 0, 1004 + 7 * k) != STORE_NONE;
+      for (uint32_t i = 100; i < 110; i++) {
+        CHECK(there_i(s, 0, i, &sta));
+        store_read_lock();
+        store_zone_t zi;
+        const uint32_t z = find_i(s, 0, i);
+        if (z != STORE_NONE && store_zone_get(s, z, &zi) == 0 && sta == STORE_STATE_KNOWN && zi.stamp_gen == 3) conv++;     /* (the new stamp, no image) */
+        store_read_unlock();
+      }
+      printf("  replaced after the position of the bulk checkpoint: %u of 10 made KNOWN with their new stamp; new zones then: %u of 20; put after it: %u of 50\n", conv, newer, late);
+      if (mode == BK_AFTER_CK) {
+        CHECK_EQ(conv, 10);                                               /* (their cells are on pages of P: copied, with images past the segments' counters) */
+        CHECK(st.recovery.bulk_known >= 10);
+        CHECK_EQ(newer, 0);                                               /* (past the high-water mark of P) */
+        CHECK_EQ(late, 0);                                                /* (not copied by any checkpoint) */
+      } else if (mode == BK_CLEAN_CRASH) {
+        CHECK_EQ(late, 0);
+        CHECK_EQ(conv, 0);
+      } else {
+        for (uint32_t i = 300; i < 350; i++) if (find_i(s, 0, i) != STORE_NONE) CHECK(there_i(s, 0, i, &sta) && sta == STORE_STATE_KNOWN);
+      }
+    }
+    /* the fill goes on, unlogged, and ends */
+    const uint64_t jb = st.journal_bytes_written;
+    for (uint32_t i = 0; i < 200; i++) CHECK_EQ(put_i(s, 0, i, 6, NULL), 0);
+    store_stats(s, &st);
+    CHECK_EQ(st.journal_bytes_written, jb);
+    CHECK(st.bulk_unlogged_records >= 200);
+    store_bulk_phase(s, STORE_BULK_PASSED);
+    CHECK_EQ(store_bulk_end(s, STORE_BULK_END_WAIT), 0);
+    for (uint32_t i = 0; i < 200; i++) CHECK(verify_i(s, 0, i, 6));
+  }
+  check_consistent(s, "the fill went on");
+  const bool cut = mode != BK_AFTER_END;
+  CHECK_EQ(store_bulk_cut(s), cut);                                       /* (the cursors are to be dropped by the caller ...) */
+  CHECK_EQ(store_close(s), 0);
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (s) {
+    store_stats(s, &st);
+    CHECK(st.recovery.was_clean && !st.recovery.rebuilt);
+    CHECK_EQ(store_bulk(s), 0);
+    CHECK_EQ(store_bulk_cut(s), cut);                                     /* (... also after a stop and a start that did not do it, such as one with no database block) */
+    CHECK_EQ(st.bulk_cut, cut ? 1 : 0);
+    store_bulk_cut_done(s);
+    check_consistent(s, "reopened");
+    CHECK_EQ(store_close(s), 0);
+  }
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (s) {
+    CHECK(!store_bulk_cut(s));                                            /* (done: the marker went with the next checkpoint) */
+    CHECK_EQ(store_close(s), 0);
+  }
+  tdir_free(&d);
+}
+
+/* a clean stop in the middle of a fill: the next open needs no rebuild and goes on with it (unlogged); the end of the pass is kept */
+static void test_bulk_clean_stop(void) {
+  printf("[a clean stop during a bulk fill keeps it: no rebuild at the open, the fill goes on unlogged]\n");
+  tdir_t d;
+  tdir_new(&d, "bulks");
+  store_opts_t o;
+  bulk_opts(&o);
+  store_t *s = NULL;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (!s) { tdir_free(&d); return; }
+  CHECK_EQ(store_view_add(s, "default"), 0);
+  CHECK_EQ(store_bulk_begin(s), 0);
+  for (uint32_t i = 0; i < 300; i++) CHECK_EQ(known_i(s, 0, i, 1), 0);
+  store_bulk_phase(s, STORE_BULK_PASSED);
+  for (uint32_t i = 0; i < 150; i++) CHECK_EQ(put_i(s, 0, i, 2, NULL), 0);
+  CHECK_EQ(store_close(s), 0);
+  o.create = false;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (!s) { tdir_free(&d); return; }
+  store_stats_t st;
+  store_stats(s, &st);
+  CHECK(st.recovery.was_clean && !st.recovery.rebuilt);
+  CHECK(st.recovery.bulk_resumed && !st.recovery.bulk_recovered);
+  CHECK_EQ(st.bulk_resumed, 1);
+  CHECK_EQ(st.bulk_recoveries, 0);
+  CHECK_EQ(store_bulk(s), 2);                                             /* (the pass had ended: the fill only waits for its bodies) */
+  for (uint32_t i = 0; i < 150; i++) CHECK(verify_i(s, 0, i, 2));
+  for (uint32_t i = 150; i < 300; i++) CHECK(there_i(s, 0, i, NULL));
+  const uint64_t jb = st.journal_bytes_written, lsn = st.lsn;
+  for (uint32_t i = 150; i < 300; i++) CHECK_EQ(put_i(s, 0, i, 2, NULL), 0);
+  store_stats(s, &st);
+  CHECK_EQ(st.journal_bytes_written, jb);
+  CHECK_EQ(st.lsn, lsn);
+  CHECK_EQ(store_bulk_end(s, STORE_BULK_END_WAIT), 0);
+  check_consistent(s, "clean stop in a fill");
+  CHECK_EQ(store_close(s), 0);
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (s) {
+    for (uint32_t i = 0; i < 300; i++) CHECK(verify_i(s, 0, i, 2));
+    CHECK_EQ(store_bulk(s), 0);
+    CHECK_EQ(store_close(s), 0);
+  }
+  tdir_free(&d);
+}
+
+/* kill -9 at random crash points of a bulk fill with bulk checkpoints (and its end): every open works, the store is consistent, and every zone it names has its name and its image or none */
+static void test_bulk_kill_loop(int iters) {
+  printf("[kill -9 at random crash points of a bulk fill, %d times]\n", iters);
+  tdir_t d;
+  tdir_new(&d, "bulkk");
+  store_opts_t o;
+  bulk_opts(&o);
+  o.no_readahead = true;
+  o.bulk_ckpt_bytes = 128u << 10;
+  uint64_t seed = 0x5eedull;
+  int kills = 0, ends = 0;
+  for (int it = 0; it < iters; it++) {
+    seed = mix64(seed + (uint64_t)it);
+    const long countdown = 1 + (long)(seed % 6000);
+    fflush(stdout);
+    const pid_t pid = fork();
+    if (pid == 0) {
+      store_t *s = NULL;
+      if (store_open(d.fd, &o, &s) != 0) _exit(10);
+      if (store_view_add(s, "default") != 0) _exit(11);
+      if (store_bulk(s) == 0 && store_bulk_begin(s) != 0) _exit(12);
+      store_bulk_phase(s, STORE_BULK_BODY);
+      store_test_crash_countdown = countdown;
+      for (uint32_t k = 0; k < 4000; k++) {
+        const uint32_t i = (uint32_t)(mix64(seed ^ k) % 1500);
+        const int r = (k % 5 == 4) ? known_i(s, 0, i, 100 + (uint64_t)it) : put_i(s, 0, i, 100 + (uint64_t)it, NULL);
+        if (r != 0) _exit(13);
+        if (k % 300 == 299 && store_checkpoint(s) != 0) _exit(14);
+        if (k == 200 && it % 3 == 2) { store_bulk_phase(s, STORE_BULK_PASSED); if (store_bulk_end(s, STORE_BULK_END_WAIT) != 0) _exit(15); }
+      }
+      store_test_crash_countdown = 0;
+      _exit(0);
+    }
+    int status = 0;
+    CHECK(waitpid(pid, &status, 0) == pid);
+    if (WIFSIGNALED(status)) kills++;
+    else CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    store_t *s = NULL;
+    o.create = false;
+    CHECK_EQ(store_open(d.fd, &o, &s), 0);
+    o.create = true;
+    if (!s) break;
+    store_stats_t st;
+    store_stats(s, &st);
+    check_consistent(s, "bulk kill loop");
+    uint32_t bad = 0;
+    for (uint32_t i = 0; i < 1500; i++)
+      if (find_i(s, 0, i) != STORE_NONE && !there_i(s, 0, i, NULL)) bad++;
+    CHECK_EQ(bad, 0);
+    const bool over = store_bulk(s) == 0;
+    CHECK_EQ(store_close(s), 0);
+    if (over) {                                        /* (the fill ended before the kill, or the kill was after its end: the next round fills a new store) */
+      ends++;
+      tdir_free(&d);
+      tdir_new(&d, "bulkk");
+    }
+  }
+  printf("  %d kills, %d opens found the fill over\n", kills, ends);
+  CHECK(kills > iters / 2);
+  tdir_free(&d);
+}
+
+/* The nx rule for every fuzzy checkpoint (planning "Code check" item 1): a zt cell changed after P on a page marked at P is copied with its new value; its long name went to a page of nx first
+ * marked after P.  After a power loss that took the journal past P, the open rebuilds from the tables: the cell has its name (written by the rule), not bytes that were never written. */
+static void nxh_hook(int step) {
+  if (step == 2 && g_bk_s) {
+    store_t *s = g_bk_s;
+    g_bk_s = NULL;
+    for (uint32_t k = 0; k < 5; k++) (void)known_i(s, 0, 3 + 7 * k, 9);     /* (long names; the cells of zones deleted before P: below its high-water mark, on a page marked at P) */
+  }
+}
+static bool nxh_deleted(uint32_t i) { return i == 0 || i == 1 || i == 2 || i == 4 || i == 5; }
+static void test_bulk_nx_rule(void) {
+  printf("[the nx rule: a fuzzy checkpoint writes the names of the cells it copies; after a power loss the rebuild keeps them]\n");
+  tdir_t d;
+  tdir_new(&d, "bulknx");
+  store_opts_t o;
+  small_opts(&o);
+  o.checkpoint_interval_ms = UINT32_MAX;
+  o.scrub_interval_s = UINT32_MAX;
+  o.no_readahead = true;
+  int pp[2];
+  CHECK_EQ(pipe(pp), 0);
+  fflush(stdout);
+  const pid_t pid = fork();
+  if (pid == 0) {
+    store_t *s = NULL;
+    if (store_open(d.fd, &o, &s) != 0) _exit(10);
+    if (store_view_add(s, "default") != 0) _exit(11);
+    for (uint32_t i = 0; i < 20; i++) if (i % 7 != 3 && put_i(s, 0, i, 1, NULL) != 0) _exit(12);   /* (short names only: nx holds nothing at P) */
+    if (store_checkpoint(s) != 0) _exit(13);
+    for (uint32_t i = 0; i < 20; i++) if (nxh_deleted(i)) { char nm[160]; name_of(i, nm, sizeof(nm)); if (store_delete_name(s, 0, nm, strlen(nm)) != 0) _exit(14); }   /* (free cells; the page of zt is marked at P) */
+    usleep(20000);
+    g_bk_s = s;
+    atomic_store(&store_test_ckpt_hook, nxh_hook);
+    if (store_checkpoint(s) != 0) _exit(15);
+    atomic_store(&store_test_ckpt_hook, NULL);
+    if (store_commit(s) != 0) _exit(16);
+    const char ok = 1;
+    if (write(pp[1], &ok, 1) != 1) _exit(17);
+    _exit(0);                                                            /* (no close) */
+  }
+  char ok = 0;
+  CHECK(read(pp[0], &ok, 1) == 1 && ok == 1);
+  close(pp[0]);
+  close(pp[1]);
+  int status = 0;
+  CHECK(waitpid(pid, &status, 0) == pid);
+  CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+  /* the power loss: no record past the checkpoint reached the disk (every journal file keeps its header only) */
+  DIR *dp = opendir(d.path);
+  struct dirent *de;
+  while (dp && (de = readdir(dp)) != NULL) {
+    unsigned g;
+    char tail;
+    if (sscanf(de->d_name, "jrn.%u%c", &g, &tail) != 1) continue;
+    char p[1024];
+    snprintf(p, sizeof(p), "%s/%s", d.path, de->d_name);
+    struct stat sb;
+    if (stat(p, &sb) == 0 && sb.st_size > 64) CHECK_EQ(truncate(p, 64), 0);
+  }
+  if (dp) closedir(dp);
+  o.create = false;
+  o.boot_id = 43;                                                        /* (another boot) */
+  store_t *s = NULL;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (!s) { tdir_free(&d); return; }
+  store_stats_t st;
+  store_stats(s, &st);
+  CHECK(st.recovery.rebuilt);
+  CHECK_EQ(st.recovery.records_replayed, 0);
+  uint32_t kept = 0;
+  uint8_t sta = 0;
+  for (uint32_t k = 0; k < 5; k++)
+    if (find_i(s, 0, 3 + 7 * k) != STORE_NONE) { kept++; CHECK(there_i(s, 0, 3 + 7 * k, &sta) && sta == STORE_STATE_KNOWN); }
+  printf("  %u of 5 zones whose cells the checkpoint copied after its position kept with their long names, %" PRIu64 " dropped\n", kept, st.recovery.dropped_zones);
+  CHECK_EQ(kept, 5);
+  for (uint32_t i = 0; i < 20; i++) {
+    if (nxh_deleted(i)) CHECK(find_i(s, 0, i) == STORE_NONE);
+    else if (i % 7 != 3) CHECK(verify_i(s, 0, i, 1));
+  }
+  check_consistent(s, "nx rule");
+  for (uint32_t i = 100; i < 140; i++) CHECK_EQ(put_i(s, 0, i, 1, NULL), 0);      /* (new long names go behind the kept ones) */
+  for (uint32_t k = 0; k < 5; k++) CHECK(there_i(s, 0, 3 + 7 * k, NULL));
+  for (uint32_t i = 100; i < 140; i++) CHECK(verify_i(s, 0, i, 1));
+  check_consistent(s, "nx rule, then more names");
+  CHECK_EQ(store_close(s), 0);
+  tdir_free(&d);
+}
+
+/* A fuzzy checkpoint copies zt and zc in lockstep, pair by pair under the cells' sequence counters (ck_write_cells()): a writer that changes both cells of its zones all the time (a new stamp: zc,
+ * and the CRC in zt) while the checkpoints run leaves no torn pair in the files.  The open that has nothing to replay (a bulk fill cut off; a power loss that took the journal past the last
+ * checkpoint) rebuilds from those files and drops no zone.  Copied one table after the other, the pairs changed between the copy of zt and the copy of zc failed their CRC and were dropped. */
+/* The end of a fill whose checkpoint fails (THE BULK FILL, E): the end stays pending, the checkpoint is made again by the due work until it is on disk, and meanwhile no segment is removed (the
+ * on-disk bulk checkpoint still names them) nor cleaned; a kill before the retry opens at the last bulk checkpoint. */
+static void be_fill(store_t *s, uint32_t n) {
+  for (uint32_t i = 0; i < n; i++) CHECK_EQ(put_i(s, 0, i, 1, NULL), 0);
+  for (uint32_t i = 0; i < n; i++) CHECK_EQ(put_i(s, 0, i, 2, NULL), 0);      /* (the first segments are dead now: a removal would be due) */
+}
+static void test_bulk_end_retry(void) {
+  printf("[the end of a bulk fill whose checkpoint fails: pending, tried again, no segment removed before it is on disk; a kill before the retry]\n");
+  tdir_t d;
+  tdir_new(&d, "bulke");
+  store_opts_t o;
+  bulk_opts(&o);
+  o.seg_size = 64u << 10;
+  o.no_readahead = true;
+  atomic_store(&store_test_no_flusher, true);                            /* (the retry is the due work of the calls and the ticks: the test sees each step) */
+  store_t *s = NULL;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (!s) { atomic_store(&store_test_no_flusher, false); tdir_free(&d); return; }
+  CHECK_EQ(store_view_add(s, "default"), 0);
+  CHECK_EQ(store_bulk_begin(s), 0);
+  be_fill(s, 300);
+  CHECK_EQ(store_checkpoint(s), 0);                                       /* (a bulk checkpoint: the cells of the dead segments' zones are on disk with their first images) */
+  store_bulk_phase(s, STORE_BULK_PASSED);
+  store_stats_t st;
+  store_stats(s, &st);
+  const uint64_t freed0 = st.compact_segs_freed, ck0 = st.checkpoints, tb0 = st.checkpoint_table_bytes;
+  const unsigned files0 = seg_files(d.path, NULL);
+  atomic_store(&store_test_bulk_end_ms, 100);                            /* (the first back-off: 100 ms, doubling) */
+  /* 1. no room for what the end writes: nothing is written, the end waits for a back-off */
+  atomic_store(&g_jbo_free, 0);
+  store_test_fs_free = jbo_fs_free;
+  CHECK_EQ(store_bulk_end(s, STORE_BULK_END_WAIT), -ENOSPC);
+  store_stats(s, &st);
+  CHECK_EQ(store_bulk(s), 0);
+  CHECK(store_bulk_pending(s));
+  CHECK_EQ(st.bulk_end_pending, 1);
+  CHECK_EQ(st.checkpoints, ck0);
+  CHECK_EQ(st.checkpoint_table_bytes, tb0);                               /* (not one page) */
+  store_test_fs_free = NULL;
+  store_test_probe(s);
+  /* 2. room, and the write fails: tried again only after the back-off (doubled: 200 ms) */
+  usleep(150000);
+  atomic_store(&store_test_fail_ckwrite, 1);
+  CHECK_EQ(store_tick(s), 0);                                             /* (the back-off of the no-room try is over: this try fails) */
+  CHECK_EQ(atomic_load(&store_test_fail_ckwrite), 0);
+  store_stats(s, &st);
+  CHECK_EQ(st.bulk_end_pending, 1);
+  CHECK_EQ(st.checkpoints, ck0);
+  CHECK_EQ(store_compact(s, 0, true, NULL), -EBUSY);
+  CHECK_EQ(store_scrub_run(s, NULL), -EBUSY);
+  CHECK_EQ(store_bulk_begin(s), -EEXIST);
+  atomic_store(&store_test_fail_ckwrite, 1);
+  CHECK_EQ(store_tick(s), 0);                                             /* (within the back-off: no try; the maintenance of the tick removes nothing) */
+  CHECK_EQ(atomic_load(&store_test_fail_ckwrite), 1);
+  usleep(250000);
+  CHECK_EQ(store_tick(s), 0);                                             /* (after it: the try fails again) */
+  CHECK_EQ(atomic_load(&store_test_fail_ckwrite), 0);
+  store_stats(s, &st);
+  CHECK_EQ(st.bulk_end_pending, 1);
+  CHECK_EQ(st.compact_segs_freed, freed0);
+  CHECK(st.seg_draining > 0);                                             /* (segments with nothing live: a removal would be due, and none was made) */
+  CHECK_EQ(seg_files(d.path, NULL), files0);
+  usleep(450000);                                                         /* (the back-off: 400 ms now) */
+  CHECK_EQ(put_i(s, 0, 0, 3, NULL), 0);                                  /* (a logged write: its due work tries again, and the end is on disk) */
+  store_stats(s, &st);
+  CHECK_EQ(st.bulk_end_pending, 0);
+  CHECK(!store_bulk_pending(s));
+  CHECK(st.checkpoints > ck0);
+  for (int k = 0; k < 4; k++) { CHECK_EQ(store_tick(s), 0); CHECK_EQ(store_checkpoint(s), 0); }
+  store_stats(s, &st);
+  printf("  after the end: %" PRIu64 " segments removed (%u wait)\n", st.compact_segs_freed - freed0, st.seg_draining);
+  CHECK(st.compact_segs_freed > freed0);                                  /* (now the dead segments go) */
+  check_consistent(s, "bulk end retried");
+  CHECK_EQ(store_close(s), 0);
+  /* a kill before the retry: the store opens at the bulk checkpoint, consistent, with every zone */
+  tdir_t d2;
+  tdir_new(&d2, "bulke2");
+  fflush(stdout);
+  const pid_t pid = fork();
+  if (pid == 0) {
+    store_t *x = NULL;
+    if (store_open(d2.fd, &o, &x) != 0 || store_view_add(x, "default") != 0 || store_bulk_begin(x) != 0) _exit(10);
+    for (uint32_t i = 0; i < 300; i++) if (put_i(x, 0, i, 1, NULL) != 0) _exit(11);
+    if (store_checkpoint(x) != 0) _exit(12);
+    for (uint32_t i = 0; i < 300; i++) if (put_i(x, 0, i, 2, NULL) != 0) _exit(13);
+    store_bulk_phase(x, STORE_BULK_PASSED);
+    atomic_store(&store_test_fail_ckwrite, 1);
+    if (store_bulk_end(x, STORE_BULK_END_WAIT) >= 0 || !store_bulk_pending(x)) _exit(14);
+    kill(getpid(), SIGKILL);                                              /* (before any retry) */
+  }
+  int status = 0;
+  CHECK(waitpid(pid, &status, 0) == pid);
+  CHECK(WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL);
+  o.create = false;
+  CHECK_EQ(store_open(d2.fd, &o, &s), 0);
+  if (s) {
+    store_stats(s, &st);
+    printf("  open after the kill: bulk resumed %d, cut %d, rebuilt %d, %" PRIu64 " dropped, %" PRIu64 " made KNOWN\n", (int)st.recovery.bulk_resumed, (int)st.recovery.bulk_recovered,
+           (int)st.recovery.rebuilt, st.recovery.dropped_zones, st.recovery.bulk_known);
+    uint32_t there = 0;
+    for (uint32_t i = 0; i < 300; i++) there += there_i(s, 0, i, NULL);
+    CHECK_EQ(there, 300);
+    check_consistent(s, "kill while the end was pending");
+    CHECK_EQ(store_close(s), 0);
+  }
+  atomic_store(&store_test_no_flusher, false);
+  atomic_store(&store_test_bulk_end_ms, 0);
+  tdir_free(&d2);
+  tdir_free(&d);
+}
+
+/* a store whose zones are all gone (a purge) still holds their segments: a fill of it stays logged (the cleaner must run, and the doubling rule would count the dead bytes) */
+static void test_bulk_dead_store(void) {
+  printf("[a store with no zone record but segments of zones that are gone does not begin an unlogged fill]\n");
+  tdir_t d;
+  tdir_new(&d, "bulkd");
+  store_opts_t o;
+  bulk_opts(&o);
+  store_t *s = NULL;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (!s) { tdir_free(&d); return; }
+  CHECK_EQ(store_view_add(s, "default"), 0);
+  for (uint32_t i = 0; i < 50; i++) CHECK_EQ(put_i(s, 0, i, 1, NULL), 0);
+  for (uint32_t i = 0; i < 50; i++) { char nm[160]; name_of(i, nm, sizeof(nm)); CHECK_EQ(store_delete_name(s, 0, nm, strlen(nm)), 0); }
+  store_stats_t st;
+  store_stats(s, &st);
+  CHECK_EQ(st.zones_known + st.zones_stored, 0);
+  CHECK(st.seg_used_bytes > 0);
+  CHECK_EQ(store_bulk_begin(s), -EEXIST);
+  CHECK_EQ(store_bulk(s), 0);
+  for (uint32_t i = 0; i < 50; i++) CHECK_EQ(put_i(s, 0, i, 2, NULL), 0);
+  store_stats(s, &st);
+  CHECK_EQ(st.bulk_unlogged_records, 0);                                  /* (the refill is logged) */
+  check_consistent(s, "dead store");
+  CHECK_EQ(store_close(s), 0);
+  tdir_free(&d);
+}
+
+/* The rebuild takes a long name from nx only when all of it is a name: a page of nx whose tail did not reach the disk (zeros past the 26 bytes the cell holds) drops the zone, it does not
+ * give it a name with zero bytes */
+static void test_rebuild_torn_name(void) {
+  printf("[the rebuild drops a zone whose long name in nx has a torn tail, and keeps the others]\n");
+  tdir_t d;
+  tdir_new(&d, "tornnm");
+  store_opts_t o;
+  small_opts(&o);
+  o.checkpoint_interval_ms = UINT32_MAX;
+  o.scrub_interval_s = UINT32_MAX;
+  store_t *s = NULL;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (!s) { tdir_free(&d); return; }
+  CHECK_EQ(store_view_add(s, "default"), 0);
+  CHECK_EQ(put_i(s, 0, 3, 1, NULL), 0);                                   /* (the first long name: nx offset 0, about 70 bytes) */
+  CHECK_EQ(put_i(s, 0, 10, 1, NULL), 0);                                  /* (the second one, after it) */
+  CHECK_EQ(put_i(s, 0, 1, 1, NULL), 0);
+  for (uint64_t off = 32; off < 64; off += 8) store_test_poke(s, 2, off, 0);     /* (bytes 32..63 of the first name: zeros, its first 26 bytes stay) */
+  CHECK_EQ(store_checkpoint_clean(s), 0);
+  CHECK_EQ(store_close(s), 0);
+  o.create = false;
+  o.force_rebuild = true;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (!s) { tdir_free(&d); return; }
+  store_stats_t st;
+  store_stats(s, &st);
+  CHECK(st.recovery.rebuilt);
+  CHECK_EQ(st.recovery.dropped_zones, 1);
+  CHECK(find_i(s, 0, 3) == STORE_NONE);
+  CHECK(verify_i(s, 0, 10, 1));
+  CHECK(verify_i(s, 0, 1, 1));
+  uint32_t cur = 0;
+  store_zone_t z;
+  int more;
+  store_read_lock();
+  while ((more = store_iter(s, &cur, &z)) != 0) if (more > 0) CHECK_EQ(strlen(z.name), z.klen);   /* (no zone has a name with a zero byte) */
+  store_read_unlock();
+  check_consistent(s, "torn long name");
+  CHECK_EQ(store_close(s), 0);
+  tdir_free(&d);
+}
+
+/* Every name the writers accept survives a rebuild (the way in and the rebuild agree: only a zero byte is refused, check_name_args()): escapes, \DDD, a label of 63 octets and one longer,
+ * 8-bit bytes, all of them long names in nx */
+static void test_rebuild_names(void) {
+  printf("[every name the writers accept survives a rebuild; a name with a zero byte is refused at the write]\n");
+  static const char *const names[] = {
+    "a\\032b\\.c.long-label-with-escapes-to-pass-34-octets.example.test",
+    "\\255\\000\\001x.long-label-for-ddd-escapes-in-the-name.example.test",
+    "abcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghij123.example.test",
+    "abcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghij.example.test",
+    "\xc3\xa9t\xc3\xa9-an-8-bit-label-long-enough-for-nx.example.test",
+    "trailing-dot-is-kept-as-it-was-written-by-the-writer.example.test.",
+  };
+  const size_t nn = sizeof(names) / sizeof(names[0]);
+  tdir_t d;
+  tdir_new(&d, "rbnames");
+  store_opts_t o;
+  small_opts(&o);
+  o.checkpoint_interval_ms = UINT32_MAX;
+  o.scrub_interval_s = UINT32_MAX;
+  store_t *s = NULL;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (!s) { tdir_free(&d); return; }
+  CHECK_EQ(store_view_add(s, "default"), 0);
+  uint8_t img[200];
+  for (size_t i = 0; i < nn; i++) {
+    store_meta_t m = meta_of((uint32_t)i, 1);
+    memset(img, (int)i + 1, sizeof(img));
+    CHECK_EQ(store_put(s, 0, names[i], strlen(names[i]), &m, img, sizeof(img), NULL), 0);
+  }
+  {
+    static const char zn[] = "with-a-zero\0byte-in-the-middle-of-its-name.example.test";
+    store_meta_t m = meta_of(99, 1);
+    CHECK_EQ(store_put(s, 0, zn, sizeof(zn) - 1, &m, img, sizeof(img), NULL), -EINVAL);
+    CHECK_EQ(store_set_known(s, 0, zn, sizeof(zn) - 1, &m, NULL), -EINVAL);
+    store_stats_t st;
+    store_stats(s, &st);
+    CHECK_EQ(st.names_refused, 2);
+  }
+  CHECK_EQ(store_close(s), 0);
+  o.create = false;
+  o.force_rebuild = true;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (!s) { tdir_free(&d); return; }
+  store_stats_t st;
+  store_stats(s, &st);
+  CHECK(st.recovery.rebuilt);
+  CHECK_EQ(st.recovery.dropped_zones, 0);
+  for (size_t i = 0; i < nn; i++) {
+    store_read_lock();
+    const uint32_t z = store_find(s, 0, names[i], strlen(names[i]));
+    store_zone_t zi;
+    CHECK(z != STORE_NONE && store_zone_get(s, z, &zi) == 0 && zi.klen == strlen(names[i]) && zi.state == STORE_STATE_STORED);
+    store_read_unlock();
+  }
+  check_consistent(s, "names after a rebuild");
+  CHECK_EQ(store_close(s), 0);
+  tdir_free(&d);
+}
+
+#define TP_ZONES 128u
+static store_t *g_tp_s;
+static _Atomic bool g_tp_stop;
+static uint32_t g_tp_zid[TP_ZONES];
+static void *tp_writer(void *arg) {
+  (void)arg;
+  for (uint64_t gen = 10; !atomic_load(&g_tp_stop); gen++)
+    for (uint32_t i = 0; i < TP_ZONES && !atomic_load(&g_tp_stop); i++) (void)store_set_stamp(g_tp_s, g_tp_zid[i], gen, gen * 3, 0, 0);
+  return NULL;
+}
+static void test_torn_pairs(bool bulk) {
+  printf("[a fuzzy checkpoint never tears a zt / zc pair: a writer changes both cells all the time, and the rebuild with nothing to replay drops no zone (%s)]\n",
+         bulk ? "a bulk fill cut off" : "a power loss past the last checkpoint");
+  tdir_t d;
+  tdir_new(&d, "pairs");
+  store_opts_t o;
+  bulk_opts(&o);
+  o.no_readahead = true;
+  o.checkpoint_interval_ms = UINT32_MAX;
+  o.journal_max_bytes = 100u << 20;
+  int pp[2];
+  CHECK_EQ(pipe(pp), 0);
+  fflush(stdout);
+  const pid_t pid = fork();
+  if (pid == 0) {
+    store_t *s = NULL;
+    if (store_open(d.fd, &o, &s) != 0 || store_view_add(s, "default") != 0) _exit(10);
+    if (bulk && store_bulk_begin(s) != 0) _exit(11);
+    store_bulk_phase(s, STORE_BULK_BODY);
+    for (uint32_t i = 0; i < TP_ZONES; i++) {
+      if (known_i(s, 0, i, 1) != 0) _exit(12);
+      if ((g_tp_zid[i] = find_i(s, 0, i)) == STORE_NONE) _exit(13);
+    }
+    if (store_checkpoint(s) != 0) _exit(14);
+    g_tp_s = s;
+    atomic_store(&g_tp_stop, false);
+    pthread_t th;
+    if (pthread_create(&th, NULL, tp_writer, NULL) != 0) _exit(15);
+    for (int k = 0; k < 30; k++) {
+      if (store_checkpoint(s) != 0) _exit(16);                          /* (during a fill: a bulk checkpoint; else a fuzzy one) */
+      usleep(2000);
+    }
+    atomic_store(&g_tp_stop, true);
+    pthread_join(th, NULL);
+    if (!bulk && store_commit(s) != 0) _exit(17);
+    const char ok = 1;
+    if (write(pp[1], &ok, 1) != 1) _exit(18);
+    if (bulk) kill(getpid(), SIGKILL);
+    _exit(0);                                                            /* (no close) */
+  }
+  char ok = 0;
+  CHECK(read(pp[0], &ok, 1) == 1 && ok == 1);
+  close(pp[0]);
+  close(pp[1]);
+  int status = 0;
+  CHECK(waitpid(pid, &status, 0) == pid);
+  CHECK(bulk ? (WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL) : (WIFEXITED(status) && WEXITSTATUS(status) == 0));
+  if (!bulk) {                                                           /* (the power loss: no record past the last checkpoint reached the disk) */
+    DIR *dp = opendir(d.path);
+    struct dirent *de;
+    while (dp && (de = readdir(dp)) != NULL) {
+      unsigned g;
+      char tail;
+      if (sscanf(de->d_name, "jrn.%u%c", &g, &tail) != 1) continue;
+      char p[1024];
+      snprintf(p, sizeof(p), "%s/%s", d.path, de->d_name);
+      struct stat sb;
+      if (stat(p, &sb) == 0 && sb.st_size > 64) CHECK_EQ(truncate(p, 64), 0);
+    }
+    if (dp) closedir(dp);
+    o.boot_id = 43;                                                      /* (another boot) */
+  }
+  o.create = false;
+  store_t *s = NULL;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (!s) { tdir_free(&d); return; }
+  store_stats_t st;
+  store_stats(s, &st);
+  printf("  open: rebuilt %d, %" PRIu64 " replayed, %" PRIu64 " zones seen, %" PRIu64 " dropped\n", (int)st.recovery.rebuilt, st.recovery.records_replayed, st.recovery.rebuilt_zones,
+         st.recovery.dropped_zones);
+  CHECK(st.recovery.rebuilt);
+  CHECK_EQ(st.recovery.records_replayed, 0);
+  CHECK_EQ(st.recovery.dropped_zones, 0);
+  uint32_t there = 0;
+  uint8_t sta = 0;
+  for (uint32_t i = 0; i < TP_ZONES; i++) there += there_i(s, 0, i, &sta) && sta == STORE_STATE_KNOWN;
+  CHECK_EQ(there, TP_ZONES);
+  check_consistent(s, "torn pairs");
+  CHECK_EQ(store_close(s), 0);
+  tdir_free(&d);
+}
+
 int main(void) {
   const char *base = getenv("KARIDNS_STORE_TESTDIR");
   snprintf(g_base, sizeof(g_base), "%s/store_test.%d", base && *base ? base : ".", (int)getpid());
@@ -7505,6 +8347,16 @@ int main(void) {
   if (WANT("kjr")) test_kill_loop(UNDER_TSAN ? 20 : 60, 6);
   if (WANT("jring")) { test_jr_ack(); test_jr_kill_after_return(); test_jr_states(true); test_jr_states(false); test_jr_rule_t(); test_jr_ring(); test_jr_space(); test_jr_multi(); test_jr_edges(); test_jr_estimate(); test_jr_partial(); test_jr_flusher_states(); test_jr_seg_pending(); test_jr_defer_more(); test_jr_group_torn(); }
   if (WANT("priv")) test_private_tables();
+  if (WANT("bulk")) {
+    test_bulk_basic();
+    for (int m = BK_PREFILL; m <= BK_CLEAN_CRASH; m++) test_bulk_crash(m);
+    test_bulk_clean_stop();
+    test_bulk_nx_rule();
+    test_bulk_kill_loop(UNDER_TSAN ? 8 : 24);
+  }
+  if (WANT("bulk")) { test_bulk_end_retry(); test_bulk_dead_store(); }
+  if (WANT("bulk") || WANT("repair")) { test_rebuild_torn_name(); test_rebuild_names(); }
+  if (WANT("bulk") || WANT("pairs")) { test_torn_pairs(true); test_torn_pairs(false); }
   if (WANT("clk")) {
     int citers = getenv("KARIDNS_STORE_KILLC_ITERS") ? atoi(getenv("KARIDNS_STORE_KILLC_ITERS")) : (UNDER_TSAN ? 25 : store_long() ? 100 : 50);
     test_kill_loop(citers, 1);

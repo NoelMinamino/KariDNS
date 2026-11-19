@@ -4097,6 +4097,14 @@ static int run_fixes(const char *dir) {
     (void)serve_fetches(&fetchc, f[0], &e, 1500, -1, -1);
     CHECK(wait_stored(st, NF, 30000));
     CHECK(cursor_is(st, 100));
+    {                                                       /* 0.7: the first fill of the empty store was unlogged (store_bulk_begin() in db_recon_begin()); the ticker ends it once its bodies are in */
+        for (int w = 0; w < 10000 && store_bulk(st) != 0; w++) usleep(1000);
+        store_stats_t ss;
+        store_stats(st, &ss);
+        CHECK_MSG(ss.bulk_fills == 1 && ss.bulk_unlogged_records >= (uint64_t)NF && ss.bulk_active == 0 && ss.bulk_ended_unix > 0 && ss.journal_boost == 0,
+                  "bulk: fills %llu, unlogged %llu, active %u, ended %llu, boost %llu", (unsigned long long)ss.bulk_fills, (unsigned long long)ss.bulk_unlogged_records, ss.bulk_active,
+                  (unsigned long long)ss.bulk_ended_unix, (unsigned long long)ss.journal_boost);
+    }
 
     /* -- 0.7 M3: the bodies of a first fill, which nobody waits for, are stored as the images they are: no entry is made, the registry does not change, and the counters say so.  The first query
      *    (db_store_attach_zone(): what a worker does) attaches the zone from its record. */
@@ -6308,17 +6316,92 @@ static int run_part(const char *cmd) {
     return rc;
 }
 
+/* 0.7, the unlogged first fill cut off by a crash (proto9..proto11): the start drops the loader's cursor of every view the store holds, the configured one and one that is not configured; a
+ * drop that fails keeps the marker (store_bulk_cut()) for the next start, which drops them.  Phase 0: the fill and a bulk checkpoint, then SIGKILL; 1: the start, every set_cursor fails; 2: the start */
+static int bc_fault(const char *op, uint32_t zid) { (void)zid; return strcmp(op, "set_cursor") == 0 ? -EIO : 0; }
+static bool bc_cursor(store_t *st, const char *view, size_t *hl) {
+    const int vid = store_view_id(st, view);
+    bool valid = false;
+    uint64_t cur = 0;
+    uint8_t id[STORE_IDENT_MAX];
+    return vid >= 0 && store_get_cursor(st, (uint16_t)vid, &valid, &cur, id, hl) == 0 && valid;
+}
+static int run_bulkcut(int phase, const char *dir) {
+    printf("[the cursors after a cut-off unlogged fill (phase %d)]\n", phase);
+    if (phase == 0) {                                                    /* (the fill is cut off: a child of this process is killed in it) */
+        fflush(stdout);
+        const pid_t pid = fork();
+        if (pid > 0) {
+            int status = 0;
+            CHECK(waitpid(pid, &status, 0) == pid && WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL);
+            printf("%d checks, %d failed\n", g_checks, g_failed);
+            return g_failed ? 1 : 0;
+        }
+        if (pid < 0) return 1;
+    }
+    char sdir[600];
+    snprintf(sdir, sizeof(sdir), "%s/s", dir);
+    static server_config_t cfg;
+    char conf[2048];
+    snprintf(conf, sizeof(conf),
+             "options { database { driver sqlite3; database-file \"/nonexistent/z.db\"; loader-user \"nobody\"; loader-path \"/bin/true\"; store \"%s\"; store-mode map; "
+             "store-threads 2; }; };\n"
+             "view \"default\" { match-clients { any; }; zone \"static.test\" { type master; }; };\n", sdir);
+    CHECK(parse_named_conf(conf, &cfg) == 0);
+    atomic_store_explicit(&g_config_db.active, &cfg, memory_order_release);
+    rebuild_zone_db_from_config(&cfg, false);
+    char msg[400];
+    CHECK(db_store_frontend_open(&cfg.database, false, (uid_t)-1, (gid_t)-1, msg, sizeof(msg)) && db_store_dir_fd() >= 0);
+    if (phase == 1) store_test_write_fault = bc_fault;
+    CHECK(db_store_start(&cfg) && db_store_enabled());
+    store_test_write_fault = NULL;
+    store_t *st = db_store_handle();
+    CHECK(st != NULL);
+    if (!st) return 1;
+    size_t hl = 0;
+    if (phase == 0) {
+        const int gv = store_view_add(st, "gone");                       /* (a view of an earlier configuration) */
+        CHECK(gv >= 0);
+        const int dv = store_view_id(st, "default");
+        uint8_t id[16];
+        size_t il = 0;
+        bool valid = false;
+        uint64_t cur = 0;
+        CHECK(dv >= 0 && store_get_cursor(st, (uint16_t)dv, &valid, &cur, id, &il) == 0 && il == 8);    /* (the configuration's part only: a first fill) */
+        memcpy(id + 8, "L1", 2);
+        CHECK(store_set_cursor(st, (uint16_t)dv, 5, id, 10) == 0);
+        memcpy(id, "cfg-gone", 8);
+        CHECK(store_set_cursor(st, (uint16_t)gv, 6, id, 10) == 0);
+        CHECK(store_bulk_begin(st) == 0);
+        CHECK(store_checkpoint(st) == 0);                               /* (a bulk checkpoint: the cursors are in its superblock) */
+        fflush(stdout);
+        if (g_failed) return 1;
+        kill(getpid(), SIGKILL);
+    }
+    if (phase == 1) {
+        CHECK(store_bulk_cut(st));                                       /* (the drops failed: the marker stays) */
+        CHECK(bc_cursor(st, "default", &hl) && hl == 10);
+        CHECK(bc_cursor(st, "gone", &hl) && hl == 10);
+    } else {
+        CHECK(!store_bulk_cut(st));
+        CHECK(bc_cursor(st, "default", &hl) && hl == 8);                 /* (dropped: the configuration's part stays) */
+        CHECK(bc_cursor(st, "gone", &hl) && hl == 8);                    /* (a view that is not configured: dropped too) */
+    }
+    printf("%d checks, %d failed\n", g_checks, g_failed);
+    return g_failed ? 1 : 0;
+}
+
 static int proto_main(const char *self) {
     char dir[600];
     const char *tmp = getenv("TMPDIR");
     snprintf(dir, sizeof(dir), "%s/test_db_store_proto.XXXXXX", tmp && *tmp ? tmp : "/tmp");
     if (!mkdtemp(dir)) { perror("mkdtemp"); return 1; }
     int bad = 0;
-    for (int phase = 0; phase < 9; phase++) {
+    for (int phase = 0; phase < 12; phase++) {
         char cmd[900];
         snprintf(cmd, sizeof(cmd), "%s proto%d %s", self, phase, dir);
         if (run_part(cmd) != 0) bad++;
-        if (phase == 0 || phase == 2 || phase == 3 || phase == 5 || phase == 6 || phase == 7) {                   /* (phase 0 is the legacy loader on an empty store, phase 3 the fixes of the review, phase 4 the settings: the next phases start on a new store; phase 5 follows phase 4 on its store) */
+        if (phase == 0 || phase == 2 || phase == 3 || phase == 5 || phase == 6 || phase == 7 || phase == 8) {                   /* (phase 0 is the legacy loader on an empty store, phase 3 the fixes of the review, phase 4 the settings: the next phases start on a new store; phase 5 follows phase 4 on its store) */
             char rm[700];
             snprintf(rm, sizeof(rm), "rm -rf %s/s", dir);
             (void)!system(rm);
@@ -6523,6 +6606,8 @@ int main(int argc, char **argv) {
     if (argc > 2 && strncmp(argv[1], "proto", 5) == 0 && argv[1][5] == '3') return run_fixes(argv[2]);
     if (argc > 2 && strncmp(argv[1], "proto", 5) == 0 && argv[1][5] == '6') return run_stamp_race(argv[2]);
     if (argc > 2 && strncmp(argv[1], "proto", 5) == 0 && argv[1][5] == '7') return run_lookup_body(argv[2]);
+    if (argc > 2 && strncmp(argv[1], "proto", 5) == 0 && argv[1][5] == '1' && argv[1][6] >= '0' && argv[1][6] <= '1') return run_bulkcut(argv[1][6] - '0' + 1, argv[2]);
+    if (argc > 2 && strncmp(argv[1], "proto", 5) == 0 && argv[1][5] == '9') return run_bulkcut(0, argv[2]);
     if (argc > 2 && strncmp(argv[1], "proto", 5) == 0 && argv[1][5] == '8') return run_recon_thread(argv[2]);
     if (argc > 2 && strncmp(argv[1], "proto", 5) == 0 && (argv[1][5] == '4' || argv[1][5] == '5')) return run_settings(argv[1][5] - '0', argv[2]);
     if (argc > 2 && strncmp(argv[1], "proto", 5) == 0 && argv[1][5] >= '0' && argv[1][5] <= '2') return run_proto(argv[1][5] - '0', argv[2]);

@@ -820,7 +820,9 @@ disk keeps up
 \fBstore.journal.boost\fR, \fB.boosts\fR
 0.7: \fB.boost\fR is 1 while a first fill (the manifest pass that had to reserve
 the tables and the index for the zones the loader announces) asks for the larger
-journal, \fB.boosts\fR counts the times it did. Every checkpoint of such a pass
+journal, \fB.boosts\fR counts the times it did. The first fill of an empty store
+keeps no journal at all (\fBstore.bulk.*\fR): the boost is for a pass that
+reserves for a store that holds zones already. Every checkpoint of such a pass
 writes the whole reserved index (10M zones: 430 to 600 MB), so a checkpoint
 every 100 MiB of journal kept the disk busy for the whole pass; while the fill
 runs a checkpoint is forced at 400 MiB instead (a fourth of them), and the bound
@@ -835,6 +837,44 @@ that cuts the journal is begun at once. A clean stop is not affected (its
 checkpoint is clean whatever the journal holds); a crash during the first fill
 replays up to 400 MiB (about 4 s) instead of 100 MiB, a crash after it replays
 what it did before
+.TP 8
+\fBstore.journal.bytes_written\fR
+0.7: the bytes the journal files took since the start (every record and the
+header of every file): what the journal wrote to the device. It stays at the
+headers of a few files while an unlogged first fill runs (\fBstore.bulk.*\fR)
+.TP 8
+\fBstore.bulk.active\fR, \fB.fills\fR, \fB.unlogged_records\fR, \fB.checkpoints\fR, \fB.next_checkpoint_bytes\fR, \fB.since_unix\fR, \fB.ended_unix\fR
+0.7: the first fill of an empty store is unlogged (see "The first fill without a
+journal" under the zone store in karidns.md). \fB.active\fR is 1 while it runs,
+2 once the passes of every view have listed their zones (it ends when the fill
+has nothing more to fetch), 0 otherwise; \fB.fills\fR counts the fills that
+began since the start, \fB.unlogged_records\fR the changes made without a
+journal record; \fB.checkpoints\fR the bulk checkpoints (the durable points of
+the fill: made while the bodies are fetched, when the segments have doubled
+since the last one and grew by 4 GiB or more, or 15 minutes after the last one),
+\fB.next_checkpoint_bytes\fR the size of the segments at which the next one is
+due (0 while a pass runs); when the fill began (or was resumed) and when the
+last one ended
+.TP 8
+\fBstore.bulk.resumed\fR, \fB.recoveries\fR, \fB.recovered_known\fR
+0.7: the start found an unlogged fill going on (1) and went on with it;
+\fB.recoveries\fR is 1 when the server had not stopped cleanly (a crash or kill
+\-9 cut the fill off: nothing was replayed, the store went back to its last bulk
+checkpoint, or to the start of the fill, and rebuilt its tables; the cursors of
+the views were dropped, so the loader lists every zone again),
+\fB.recovered_known\fR the zones whose image was past that checkpoint: kept as
+known zones with their name and stamp, fetched again. A clean stop in the middle
+of a fill needs no rebuild: \fB.resumed\fR is 1 and \fB.recoveries\fR 0
+.TP 8
+\fBstore.bulk.end_pending\fR, \fB.cut\fR
+0.7: \fB.end_pending\fR is 1 from the end of an unlogged fill until the
+checkpoint that clears it on disk is done (the store's checkpoint thread makes
+it, and tries again after a failure with a back-off of 1 s doubling up to 5 min,
+not at all while the free space is below what it writes; the cleaner, the
+removal of segments and the scrub stay off until then, and a crash meanwhile is
+a crash of the fill); \fB.cut\fR is 1 from the start that found a fill cut off
+by a crash until a start with the database has dropped the cursors of the views
+(kept on disk across a start with no database block)
 .TP 8
 \fBstore.checkpoint.count\fR, \fB.last_unix\fR, \fB.last_us\fR, \fB.max_us\fR, \fB.cancelled\fR
 Checkpoints since the open, when the last one ended, how long it took, the
@@ -860,6 +900,11 @@ it: the zones in memory get the limit less this, at least a tenth of the limit
 \fBstore.writes.commits\fR, \fB.puts\fR, \fB.replaces\fR, \fB.deletes\fR, \fB.growths\fR, \fB.errors\fR
 Writer counters since the open (\fBerrors\fR counts a commit or a checkpoint
 that failed in the background too; it is tried again)
+.TP 8
+\fBstore.writes.names_refused\fR
+0.7: writer calls refused because the zone's name holds a zero byte (no writer
+of the server makes such a name; a recovery would take one for a page of the
+long names that did not reach the disk). Should stay 0
 .TP 8
 \fBstore.journal.commit_switches\fR
 0.7: commits that switched the journal to the next file (made ahead): the
