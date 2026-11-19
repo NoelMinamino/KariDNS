@@ -79,5 +79,8 @@ jobs:
             ./test_dnsqps
             ./test_dnsqps-asan
             sh tests/run_dnsqps_test.sh
+            make dnsqps-tsan
+            DNSQPS=./dnsqps-asan sh tests/run_dnsqps_test.sh
+            DNSQPS=./dnsqps-tsan sh tests/run_dnsqps_test.sh
             DNSQPS_TEST_REQUIRE=1 sh tests/run_dnsqps_netmap_test.sh
             for t in fuzz_dnsqps_resp fuzz_dnsqps_args; do tests/fuzz/$t -runs=50000 -close_fd_mask=3 tests/fuzz/corpus_$t; done

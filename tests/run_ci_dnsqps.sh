@@ -26,6 +26,9 @@ if [ "$UNIT" = "1" ]; then
     ./test_dnsqps || { echo "FAIL: test_dnsqps"; exit 1; }
     build test_dnsqps-asan
     ASAN_OPTIONS="detect_leaks=0:abort_on_error=0" UBSAN_OPTIONS="print_stacktrace=1:halt_on_error=1" ./test_dnsqps-asan || { echo "FAIL: test_dnsqps-asan"; exit 1; }
+    # the engine and its threads under ASan/UBSan too: the CLI test against dnsqps-asan
+    build dnsqps-asan
+    ASAN_OPTIONS="detect_leaks=0:abort_on_error=0" UBSAN_OPTIONS="print_stacktrace=1:halt_on_error=1" DNSQPS=./dnsqps-asan sh tests/run_dnsqps_test.sh || { echo "FAIL: run_dnsqps_test.sh under ASan"; exit 1; }
 fi
 [ -x ./dnsqps.exe ] && export DNSQPS=./dnsqps.exe
 sh tests/run_dnsqps_test.sh || exit 1
