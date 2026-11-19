@@ -153,6 +153,55 @@
  * its build outside the mutex ended is grown inside it (as before 0.7 fix A); store_repair() and the nx pass block the writer (rarely: only
  * when more than half of nx is dead).
  *
+ * ======================================================================================================================
+ * THE BULK FILL (0.7, planing_0.7.x_first_fill_writes.md)
+ * ======================================================================================================================
+ *
+ * The first fill of an empty store is read from the database, which stays the source of every zone: a fill that a crash cuts off can be read again.  Its journal (5 GB at 10M zones), the
+ * checkpoints that cut it (every 100 MiB, each rewriting the reserved index) and the fsyncs of its commits (on ZFS each one writes its data twice, through the ZIL) were most of what the fill wrote
+ * to the device; only the images must reach it.  So the fill of a store that holds no zone record is unlogged:
+ *   B  begin (store_bulk_begin(), db_recon_begin() when it reserves for a store with no zone record): a checkpoint with the writers kept out makes a superblock with SBF_BULK durable, then the flag is
+ *      set in memory (it is set before the checkpoint, under the writer mutex: no writer runs until that superblock is on disk).  The reserve of the tables and the index comes after it, so its
+ *      generation is not written by this checkpoint.  This superblock is "the start of the fill": exact, with its ix / sx.
+ *   U  while BULK: every writer (the reconcile, the ingest of bodies, a secondary's transfer, store_repair(), a growth's publish) plans and applies its ops and marks its pages as before, but
+ *      journal_reserve_locked() writes no record and gives no LSN.  So nothing is committed (committed_lsn stays at the LSN of the begin), no journal file is switched by a commit, the journal does not
+ *      grow (no checkpoint by its size, store_journal_wait() never waits) and checkpoint_interval_ms is not looked at (ckpt_due()).  The segments are appended as before; they are synced by the
+ *      checkpoints.  The cleaner, the removal of empty segments, the nx pass and the scrub do not run (maintenance(); store_compact() and store_scrub_run() say -EBUSY), nor the emergency cleaning
+ *      of a full disk: the store was empty, nothing is dead.  The readers are unchanged: the tables in memory are the truth.
+ *   C  bulk checkpoints (store_bulk_phase(BODY / PASSED): none while a pass runs): a fuzzy checkpoint begun while BULK (ck_begin_locked(), ck.bulk) when the segments doubled since the last one and
+ *      grew by at least opts.bulk_ckpt_bytes (4 GiB), or when opts.bulk_ckpt_interval_ms (15 min) passed and they grew (bulk_due()).  Its steps are those of any fuzzy checkpoint: the commit of its
+ *      position P syncs the segments marked dirty and the directory (the files of new segments are in it before a superblock names them), zt and zc are copied as of P (and later), nx by the nx rule
+ *      (ck_nx_widen()); ix and sx are not written (their pages stay marked; a generation made during the fill is written whole at its end).  Its superblock says SBF_BULK | SBF_BULK_CK: the open
+ *      does not read ix / sx from it (adopt_sb()) and rebuilds them from zt.  P names no record: the counters, views and cursors are those of the begin (under the mutex), the tables those of the copy.
+ *   K  a crash during the fill (the open finds SBF_BULK without the clean flag): nothing is replayed (journal_skip(): the chain is passed over so that the next journal file is a new one; the records
+ *      made after the end of the fill and before its checkpoint was on disk are lost with it); the derived tables are rebuilt with the bulk rules (rebuild_locked(RB_BULK); also after the
+ *      superblock of the start: a bulk checkpoint that did not reach its superblock may have written pages of the tables, which no replay makes right): a cell torn by the copy fails its CRC and is dropped; a STORED cell whose image is past the durable end of its segment (the counters of the superblock: the segments were synced to at least
+ *      there before the tables) becomes KNOWN with its name, source id and stamp, so that it is fetched again rather than lost; a long name is taken only when it is the one whose start the cell holds.
+ *      Segment files past the counters are files nobody names (the next creation of the number truncates them).  The caller drops the loader's cursors of its views (a bulk checkpoint may hold a
+ *      cursor whose zones a dropped cell had): the next pass lists every zone again.  The open's own checkpoint says BULK again, so the rest of the fill stays unlogged.  The WARNING says when the
+ *      store is back to and how many zones it holds.
+ *   S  a clean stop (store_close(), store_checkpoint_clean()) during the fill writes a full clean checkpoint that keeps SBF_BULK (and SBF_BULK_PASSED): the state is exact, the next open needs no
+ *      rebuild and goes on with the fill.  The first writer after a clean checkpoint clears the flag on disk before its first unlogged change (wr_lock()), as for a logged one: a clean flag after
+ *      which an unlogged change was made would make the open trust tables that do not hold it.
+ *   E  the end (store_bulk_end(), the caller's ticker: the first tick after a complete pass at which the fill is over, db_store_filling(), seen twice: bulk_end_check()): the flag goes under the writer mutex, so every later
+ *      record is logged with an LSN after P; then one ordinary fuzzy checkpoint at P: every unlogged change is before P and its copy is taken after it, which is the rule of every fuzzy checkpoint
+ *      (records after P are replayed onto it); it writes every page marked since the last full write, ix / sx included (taken from the writers' maps, which no bulk checkpoint took), and its
+ *      superblock has no SBF_BULK.  Until it is on disk a crash is a crash of the fill (K); a checkpoint that fails gives its pages back and the next one (by the journal's size or the interval) ends it.
+ * What relied on the journal, and what the fill does there:
+ *   - OP_GEN (a growth of ix / sx): written unlogged; the generations are not durable during the fill (C), the superblock of the next bulk checkpoint marks them for the rebuild.
+ *   - OP_SRC (the loader's cursors): applied in memory, durable in the superblock of the next checkpoint (as of its begin, with the tables copied after it), dropped by the caller after a crash (K).
+ *   - OP_REBUILD (store_repair()'s marker): unlogged; the repair ends with a checkpoint with the writers kept out, which is exact; a crash before it goes back to the last checkpoint (K).
+ *   - the clean flag on disk and unclean_now_locked(): as before (S); the superblock it writes keeps SBF_BULK (it follows a full checkpoint: ix / sx are valid).
+ *   - jr_floor() and the space guard: no room for the journal is needed (jr_space_locked() is not asked); the appends keep their check (the reserve and the floor of a running checkpoint).
+ *   - degradation on ENOSPC: the same rules (put_stored_locked(): the zone is KNOWN), without the emergency cleaning.
+ *   - the replay at open: none after a cut-off fill (K), the usual one after a clean stop during it (the journal holds nothing after a clean checkpoint).
+ *   - the segment made ahead (rule F / N4 of seg_pre_make()): no journal record names a segment during the fill; the directory entry is synced by the commit of the checkpoint whose superblock
+ *     first counts the segment.  seg_free_lsn <= committed_lsn: the cleaner does not free numbers during the fill, and the numbers freed before it were durable at its begin (B is a checkpoint).
+ *   - retire_run(): by io_hold and the grace period, not by the journal: unchanged.
+ *   - the cleaner's (b) ("a checkpoint after the last record of the move is on disk"): LSNs do not move during the fill, so it would hold at once; the cleaner does not run (U).
+ *   - store_journal_boost() is the fallback for a pass over a store that is not empty: the caller does not raise it for a bulk fill (it has no journal).
+ *   - the nx rule (ck_nx_widen()) is kept by every fuzzy checkpoint, not only by bulk ones: after a power loss the cells past the durable journal are rebuilt from the tables too (rebuild_locked(RB_OPEN)).
+ *
  * Journal ops (typed, each a TLV {u16 type, u16 0, u32 payload length}):
  *   ZREC zid + zt[64] + zc[64] | NX offset + bytes | IX / SX count x {slot, value} | V count x {field id, value}
  *   VIEW id + name | SRC source + cursor + identity | GEN which, generation, slots | NXMOVE zid, new offset, name bytes, zt[64], zc[64]
@@ -293,6 +342,11 @@ typedef union {
 } sb_t;
 _Static_assert(sizeof(sb_t) == ST_SB_SIZE, "superblock size");
 #define SBF_CLEAN 1u
+#define SBF_BULK 2u                       /* a bulk fill is going on: the journal holds nothing of it (THE BULK FILL) */
+#define SBF_BULK_CK 4u                    /* a bulk checkpoint: a fuzzy copy without a journal and without ix / sx: the open rebuilds the derived tables */
+#define SBF_BULK_PASSED 8u                /* a pass of the bulk fill ended complete (store_bulk_phase()) */
+#define ST_BULK_BYTES (4ull << 30)        /* the segments grew by at least this much since the last bulk checkpoint (and doubled) */
+#define ST_BULK_IVL_MS 900000u            /* ... or this long passed since it */
 
 /* 64 B cells as eight host (little endian) words */
 typedef struct { uint64_t w[8]; } r64_t;
@@ -444,6 +498,13 @@ struct store {
   _Atomic uint64_t jbytes;                            /* the bytes of the journal since the last checkpoint's switch (every file of the chain since: journal_max_bytes is about the replay) */
   _Atomic bool jboost;                                /* a bulk fill is going on (store_journal_boost()): the bound of the journal is JBOOST x journal_max_bytes while the free space allows (jmax()) */
   _Atomic uint64_t n_jboost;                          /* the times the bound was asked to be raised (0 -> 1) */
+  /* ---- 0.7: the unlogged bulk fill (THE BULK FILL at the top; written under the writer mutex, read by the flusher) ---- */
+  _Atomic bool bulk;                                  /* the writers append no journal record (store_bulk_begin() .. store_bulk_end()) */
+  _Atomic bool bulk_body;                             /* no pass runs: bulk checkpoints may be made (bulk_due()) */
+  _Atomic bool bulk_passed;                           /* a pass of the fill ended complete (SBF_BULK_PASSED) */
+  _Atomic uint64_t bulk_base;                         /* the segment bytes at the begin of the last bulk checkpoint (or of the fill) */
+  _Atomic uint64_t bulk_last_ms;                      /* ... and its time */
+  _Atomic uint64_t n_bulk_fills, n_bulk_ckpts, n_bulk_unlogged, bulk_since, bulk_ended;
   _Atomic uint64_t lsn, committed_lsn;
   _Atomic bool dir_dirty;
   _Atomic uint64_t last_sync_ms, last_ckpt_ms;
@@ -521,6 +582,8 @@ struct store {
     uint64_t lsn, t0, tw0;                            /* tw0: when the write of the tables began (ck_pace()) */
     uint64_t epos;                                    /* the ring position after its switch: the old file's records and the new file's header are below it (rule F) */
     bool clean, dir;
+    bool bulk;                                        /* a bulk checkpoint: no ix / sx, the superblock says SBF_BULK_CK */
+    uint64_t bulk_seg;                                /* ... the segment bytes at its begin */
     int oldfd, newfd;
     uint32_t gen;                                     /* the journal file the superblock names (newfd until a commit switches the journal on) */
     ixgen_t *ix, *sx;
@@ -2348,6 +2411,14 @@ static int journal_reserve_locked(store_t *s) {
     bg_release(s, true, true);
     if (r < 0) return r;
   }
+  if (atomic_load_explicit(&s->bulk, memory_order_relaxed)) {
+    /* a bulk fill (THE BULK FILL): the record is not written.  The ops are applied as they are (the caller does it), the pages are marked; no LSN is given (nothing is replayed after a
+     * crash: the open goes back to the last bulk checkpoint and rebuilds), so commits, the journal's size and rule T have nothing to do with it */
+    atomic_fetch_add_explicit(&s->n_bulk_unlogged, 1, memory_order_relaxed);
+    atomic_thread_fence(memory_order_release);
+    CRASH_POINT();
+    return 0;
+  }
   if ((r = jr_space_locked(s, j->len)) < 0) return r;
   if ((r = jr_room_locked(s, j->len, 0)) < 0) {                                       /* (nothing was taken: the estimate gets the bytes back) */
     int64_t c = atomic_load_explicit(&s->avail_est, memory_order_relaxed);
@@ -2654,7 +2725,8 @@ static int st_commit(store_t *s, uint64_t target) { return st_commit_ex(s, targe
 
 static const char *const st_sb_names[2] = { "super.a", "super.b" };
 
-static void sb_fill(store_t *s, sb_t *b, bool clean, uint64_t seq, uint32_t jrn_gen) {
+/* (bulk_ck: a bulk checkpoint's superblock: its ix / sx are not written; the flags of the bulk fill come from the store) */
+static void sb_fill(store_t *s, sb_t *b, bool clean, uint64_t seq, uint32_t jrn_gen, bool bulk_ck) {
   memset(b, 0, sizeof(*b));
   memcpy(b->f.magic, "KARISTOR", 8);
   b->f.version = STORE_FORMAT_VERSION;
@@ -2664,6 +2736,8 @@ static void sb_fill(store_t *s, sb_t *b, bool clean, uint64_t seq, uint32_t jrn_
   b->f.hk0 = s->hk0;
   b->f.hk1 = s->hk1;
   b->f.flags = clean ? SBF_CLEAN : 0;
+  if (atomic_load_explicit(&s->bulk, memory_order_relaxed))
+    b->f.flags |= SBF_BULK | (bulk_ck ? SBF_BULK_CK : 0) | (atomic_load_explicit(&s->bulk_passed, memory_order_relaxed) ? SBF_BULK_PASSED : 0);
   b->f.boot_id = s->boot_id;
   b->f.ckpt_lsn = s->lsn;
   b->f.ckpt_time = (uint64_t)time(NULL);
@@ -2730,7 +2804,7 @@ static int sb_store(store_t *s) {
   return 0;
 }
 static int sb_write(store_t *s, bool clean, uint32_t jrn_gen) {
-  sb_fill(s, s->sbbuf, clean, s->sb_seq + 1, jrn_gen);
+  sb_fill(s, s->sbbuf, clean, s->sb_seq + 1, jrn_gen, false);
   return sb_store(s);
 }
 
@@ -2768,10 +2842,15 @@ static int ck_take_locked(store_t *s);
 static void ck_merge_locked(store_t *s);
 static void ck_drop_taken(store_t *s);
 static void ck_alloc_plan_locked(store_t *s);
-static int ck_begin_locked(store_t *s, bool clean) {
+static uint64_t st_seg_bytes(const store_t *s);
+/* fuzzy: the writers go on while it writes (not ck_full_locked()); one begun during a bulk fill is a bulk checkpoint: ix / sx are not taken (their pages stay marked for the checkpoint that
+ * ends the fill, a generation made during the fill is written whole by it) and its superblock says SBF_BULK_CK */
+static int ck_begin_locked(store_t *s, bool clean, bool fuzzy) {
   const uint64_t P = s->lsn;
-  s->ck.ix = atomic_load_explicit(&s->ix, memory_order_relaxed);
-  s->ck.sx = atomic_load_explicit(&s->sx, memory_order_relaxed);
+  s->ck.bulk = fuzzy && atomic_load_explicit(&s->bulk, memory_order_relaxed);
+  s->ck.bulk_seg = s->ck.bulk ? st_seg_bytes(s) : 0;
+  s->ck.ix = s->ck.bulk ? NULL : atomic_load_explicit(&s->ix, memory_order_relaxed);
+  s->ck.sx = s->ck.bulk ? NULL : atomic_load_explicit(&s->sx, memory_order_relaxed);
   int r = ck_take_locked(s);                         /* (the pages the writers changed up to P) */
   if (r < 0) return r;
   int oldfd = -1;
@@ -2781,7 +2860,7 @@ static int ck_begin_locked(store_t *s, bool clean) {
   s->ck.epos = s->jr_head;                          /* (rule F: the records <= P and the new file's header are below it; ck_io_commit() waits for it) */
   ck_alloc_plan_locked(s);
   atomic_store_explicit(&s->ck_want, false, memory_order_relaxed);
-  sb_fill(s, s->sbbuf, clean, s->sb_seq + 1, s->jrn_gen);
+  sb_fill(s, s->sbbuf, clean, s->sb_seq + 1, s->jrn_gen, s->ck.bulk);
   s->ck.nseg = commit_capture_locked(s, s->ck.seg, &s->ck.dir);           /* (io_hold + 1) */
   s->ck.lsn = P;
   s->ck.t0 = st_now_us();
@@ -2978,6 +3057,31 @@ static int ck_write_tab(store_t *s, int i, int fd, const uint8_t *base, const _A
   if (wrote && fdatasync(fd) != 0) return -errno;
   return 0;
 }
+/* The nx rule (0.7, the bulk fill; every fuzzy checkpoint): a zt cell that a writer changed after P on a page that was marked at P is copied with its new value, and its long name may be on a page of
+ * nx that was first marked after P (the writers' new map): without this the cell would reach the disk and its name would not, and a rebuild with no journal to replay (a bulk fill, the records past the
+ * durable journal after a power loss) would have a cell without its name.  So nx is written after zt and zc, up to its size now and from the pages of P and the ones marked since (taken under the writer
+ * mutex: or'ed into the checkpoint's map, the writers' map keeps its bits for the next checkpoint).  A name is appended before its cell (the apply order, zrec_write_nx()), so every name a copied cell
+ * needs was there before this; nx is only appended to (the nx pass, which moves names down, does not run during a bulk fill), so a page written twice is the same bytes.  -ENOMEM: the checkpoint fails. */
+static int ck_nx_widen(store_t *s) {
+  wr_lock_raw(s);
+  const dmap_t *d = &s->nx.d;
+  const uint64_t onp = s->ck.t[2].npages, np = d->npages, ow = (onp + 63) / 64, nw = (np + 63) / 64;
+  uint64_t *m = s->ck.t[2].dirty;
+  if (nw > ow) {
+    if (!(m = calloc(nw, sizeof(uint64_t)))) { wr_unlock_raw(s); return -ENOMEM; }
+    if (ow) memcpy(m, s->ck.t[2].dirty, (size_t)ow * sizeof(uint64_t));
+    free(s->ck.t[2].dirty);
+    s->ck.t[2].dirty = m;
+  }
+  if (np > onp) s->ck.t[2].npages = np;
+  for (uint64_t w = 0; w < nw; w++) m[w] |= d->dirty[w];
+  const uint64_t bytes = atomic_load_explicit(&s->nx.mapped, memory_order_relaxed), held = atomic_load_explicit(&s->nx.extended, memory_order_relaxed);
+  if (bytes > s->ck.t[2].bytes) s->ck.t[2].bytes = bytes;
+  s->ck.t[2].grow = s->ck.t[2].bytes > held ? s->ck.t[2].bytes - held : 0;
+  wr_unlock_raw(s);
+  return 0;
+}
+
 /* the write of the tables and the index generations of P (no lock).  cancel: the fuzzy checkpoint's (a close leaves it, see bg_stop_join()); NULL for one with the writers kept out */
 static int ck_io_tables(store_t *s, const _Atomic bool *cancel) {
   mtab_t *tabs[3] = { &s->zt, &s->zc, &s->nx };
@@ -2985,6 +3089,8 @@ static int ck_io_tables(store_t *s, const _Atomic bool *cancel) {
   s->ck.tw0 = st_now_us();
   int r = 0;
   for (int i = 0; i < 5 && r == 0; i++) {
+    if (i == 2 && cancel) r = ck_nx_widen(s);       /* (fuzzy: the nx rule, above; with the writers kept out nothing was marked since P) */
+    if (r < 0) break;
     if (i < 3) {
       r = ck_write_tab(s, i, tabs[i]->fd, tabs[i]->base, cancel, &done);
       if (r == 0) mtab_note_extended(tabs[i], s->ck.t[i].bytes);
@@ -3024,6 +3130,13 @@ static void ck_finish(store_t *s) {
   atomic_store_explicit(&s->clean_on_disk, s->ck.clean, memory_order_relaxed);
   atomic_store_explicit(&s->ckpt_lsn, s->ck.lsn, memory_order_release);
   atomic_fetch_add_explicit(&s->n_checkpoints, 1, memory_order_relaxed);
+  if (s->ck.bulk) {                                   /* (the next one is due by the bytes appended since its begin, or by the time) */
+    atomic_store_explicit(&s->bulk_base, s->ck.bulk_seg, memory_order_relaxed);
+    atomic_store_explicit(&s->bulk_last_ms, st_now_ms(), memory_order_relaxed);
+    atomic_fetch_add_explicit(&s->n_bulk_ckpts, 1, memory_order_relaxed);
+    st_log(s, 6, "store: bulk checkpoint %" PRIu64 " of the fill: %" PRIu64 " MiB of segments, %" PRIu64 " zones stored, %" PRIu64 " known (the fill goes back to here after a crash)",
+           atomic_load_explicit(&s->n_bulk_ckpts, memory_order_relaxed), s->ck.bulk_seg >> 20, s->sbbuf->f.v[V_STORED], s->sbbuf->f.v[V_KNOWN]);
+  }
   unlink_old_gens(s);
 }
 
@@ -3091,7 +3204,7 @@ static int unclean_now_locked(store_t *s) {
 static int ck_full_locked(store_t *s, bool clean) {
   int r = jw_drain_locked(s);                         /* (the ring first: in the states that write nothing this fails, and no table page is written: N1) */
   if (r == 0) r = jold_sync(s);
-  if (r == 0) r = ck_begin_locked(s, clean);
+  if (r == 0) r = ck_begin_locked(s, clean, false);
   if (r < 0) { atomic_store_explicit(&s->ck_left, 0, memory_order_relaxed); return r; }
   r = ck_io_commit(s, true);
   if (r == 0) { CRASH_POINT(); r = ck_io_tables(s, NULL); }
@@ -3145,6 +3258,7 @@ static bool ck_acquire_fl(store_t *s) {
   return ok;
 }
 
+static bool bulk_due(const store_t *s, uint64_t now);
 /* A checkpoint from a thread that holds no lock (the flusher, store_checkpoint()): the flags, the begin under the writer mutex, the rest without it.  force: also when nothing was
  * written since the last one.  fl: the flusher's checkpoint thread (it gives way to a checkpoint handed to it, and returns 1).  0, or -errno. */
 static int st_ckpt(store_t *s, bool force, bool fl) {
@@ -3154,9 +3268,9 @@ static int st_ckpt(store_t *s, bool force, bool fl) {
   r = jold_sync(s);                                   /* (a journal whose sync failed: synced first, with no lock held) */
   if (r == 0) {
     wr_lock_raw(s);
-    const bool need = force || s->lsn > s->ckpt_lsn;
+    const bool need = force || s->lsn > s->ckpt_lsn || bulk_due(s, st_now_ms());     /* (a bulk fill moves no LSN) */
     r = need ? unclean_now_locked(s) : 1;           /* (writers go on while this checkpoint flushes: a clean flag on disk goes first) */
-    if (r == 0) r = ck_begin_locked(s, false);
+    if (r == 0) r = ck_begin_locked(s, false, true);
     wr_unlock_raw(s);
   }
   if (r != 0) {
@@ -3651,8 +3765,34 @@ static bool commit_due(const store_t *s, uint64_t now) {
   if (s->o.sync_policy == STORE_SYNC_EVERY) return true;               /* (what the writers' calls left: the cleaner, the scrub, a call that failed) */
   return s->o.sync_policy == STORE_SYNC_BATCH && now - atomic_load_explicit(&s->last_sync_ms, memory_order_relaxed) >= s->o.sync_interval_ms;
 }
+/* the bytes of every segment (the sum of their used counters; no lock: relaxed loads of the counters, a figure for the cadence of the bulk checkpoints) */
+static uint64_t st_seg_bytes(const store_t *s) {
+  uint32_t nsegs = (uint32_t)VG(s, V_NSEGS);
+  if (nsegs > ST_MAXSEG) nsegs = ST_MAXSEG;
+  uint64_t b = 0;
+  for (uint32_t n = 1; n <= nsegs; n++) b += VG(s, V_SEG(n, 0));
+  return b;
+}
+#ifdef KARIDNS_UNIT_TEST
+uint64_t store_test_seg_bytes(store_t *s) { return st_seg_bytes(s); }
+#endif
+/* the segment bytes at which the next bulk checkpoint is due: twice the bytes of the last one, and at least opts.bulk_ckpt_bytes more */
+static uint64_t bulk_next_bytes(const store_t *s) {
+  const uint64_t base = atomic_load_explicit(&s->bulk_base, memory_order_relaxed), minb = s->o.bulk_ckpt_bytes ? s->o.bulk_ckpt_bytes : ST_BULK_BYTES;
+  const uint64_t a = base > UINT64_MAX / 2 ? UINT64_MAX : 2 * base, b = base > UINT64_MAX - minb ? UINT64_MAX : base + minb;
+  return a > b ? a : b;
+}
+/* Is a bulk checkpoint due?  (THE BULK FILL: none while a pass runs; in the body fill when the segments reached bulk_next_bytes(), or when opts.bulk_ckpt_interval_ms passed since the last one and the
+ * segments grew; no lock) */
+static bool bulk_due(const store_t *s, uint64_t now) {
+  if (!atomic_load_explicit(&s->bulk, memory_order_relaxed) || !atomic_load_explicit(&s->bulk_body, memory_order_relaxed)) return false;
+  const uint64_t seg = st_seg_bytes(s), ivl = s->o.bulk_ckpt_interval_ms ? s->o.bulk_ckpt_interval_ms : ST_BULK_IVL_MS;
+  if (seg <= atomic_load_explicit(&s->bulk_base, memory_order_relaxed)) return false;
+  return seg >= bulk_next_bytes(s) || now - atomic_load_explicit(&s->bulk_last_ms, memory_order_relaxed) >= ivl;
+}
 /* is a checkpoint due? */
 static bool ckpt_due(const store_t *s, uint64_t now) {
+  if (atomic_load_explicit(&s->bulk, memory_order_relaxed)) return bulk_due(s, now);     /* (a bulk fill: not by the journal, which holds nothing, nor by checkpoint_interval_ms) */
   const uint64_t lsn = atomic_load_explicit(&s->lsn, memory_order_relaxed);
   if (atomic_load_explicit(&s->jbytes, memory_order_relaxed) >= jmax(s)) return true;
   if (lsn <= atomic_load_explicit(&s->ckpt_lsn, memory_order_relaxed)) return false;
@@ -3666,7 +3806,7 @@ static int post_write(store_t *s) {
   const uint64_t now = st_now_ms();
   bool kick = commit_due(s, now);
   if (s->fl_on && s->jbytes >= jmax(s) && ck_try_locked(s)) {
-    int r = s->jold < 0 ? ck_begin_locked(s, false) : 1;          /* (the writers cleared the clean flag in wr_lock(); a journal whose sync failed is the flusher's first) */
+    int r = s->jold < 0 ? ck_begin_locked(s, false, true) : 1;          /* (the writers cleared the clean flag in wr_lock(); a journal whose sync failed is the flusher's first) */
     if (r == 0) {
       pthread_mutex_lock(&s->bg_mu);
       s->ck_handoff = true;
@@ -3794,6 +3934,76 @@ void store_journal_boost(store_t *s, bool on) {
   const uint64_t j = atomic_load_explicit(&s->jbytes, memory_order_relaxed);
   st_log(s, 6, "store: the bulk fill is over: a checkpoint is forced at %" PRIu64 " KiB of journal again (the journal holds %" PRIu64 " KiB)", s->o.journal_max_bytes >> 10, j >> 10);
   if (j >= s->o.journal_max_bytes && s->fl_on) bg_signal(s);
+}
+
+/* ---- 0.7: the unlogged bulk fill (THE BULK FILL at the top) ---- */
+
+/* The fill of an empty store begins: the superblock that says BULK is made durable by a checkpoint with the writers kept out (cheap: the store is empty; the reserve of the tables and the index
+ * comes after it, so that this checkpoint does not write the reserved index), and only then the writers stop logging. */
+int store_bulk_begin(store_t *s) {
+  if (!s) return -EINVAL;
+  wr_lock_ck(s);
+  int r = 0;
+  if (atomic_load_explicit(&s->bulk, memory_order_relaxed)) {
+    atomic_store_explicit(&s->bulk_body, false, memory_order_relaxed);     /* (going on: a pass begins) */
+  } else if (VG(s, V_KNOWN) + VG(s, V_STORED) != 0) {
+    r = -EEXIST;
+  } else {
+    atomic_store_explicit(&s->bulk, true, memory_order_relaxed);          /* (the superblock of the checkpoint below says BULK; no writer runs before it is on disk) */
+    atomic_store_explicit(&s->bulk_body, false, memory_order_relaxed);
+    atomic_store_explicit(&s->bulk_passed, false, memory_order_relaxed);
+    r = ck_full_locked(s, false);
+    if (r < 0) {
+      atomic_store_explicit(&s->bulk, false, memory_order_relaxed);
+      note_error(s, r);
+    } else {
+      atomic_store_explicit(&s->bulk_base, st_seg_bytes(s), memory_order_relaxed);
+      atomic_store_explicit(&s->bulk_last_ms, st_now_ms(), memory_order_relaxed);
+      atomic_store_explicit(&s->bulk_since, (uint64_t)time(NULL), memory_order_relaxed);
+      atomic_fetch_add_explicit(&s->n_bulk_fills, 1, memory_order_relaxed);
+      st_log(s, 6, "store: an unlogged bulk fill of the empty store begins: the writers keep no journal until it is over (a crash goes back to the last bulk checkpoint, and the zones after it are read again)");
+    }
+  }
+  (void)wr_unlock_ck(s);
+  return r;
+}
+
+void store_bulk_phase(store_t *s, int phase) {
+  if (!s || (phase != STORE_BULK_PASS && phase != STORE_BULK_BODY && phase != STORE_BULK_PASSED)) return;
+  wr_lock_raw(s);
+  if (atomic_load_explicit(&s->bulk, memory_order_relaxed)) {
+    atomic_store_explicit(&s->bulk_body, phase != STORE_BULK_PASS, memory_order_relaxed);
+    atomic_store_explicit(&s->bulk_passed, phase == STORE_BULK_PASSED, memory_order_relaxed);     /* (a pass that begins, or that was cut off or failed: the fill needs one more that ends complete) */
+  }
+  wr_unlock_raw(s);
+  if (phase != STORE_BULK_PASS && s->fl_on) bg_signal(s);              /* (a bulk checkpoint may be due now: the pass took long) */
+}
+
+int store_bulk(const store_t *s) {
+  if (!s || !atomic_load_explicit(&s->bulk, memory_order_relaxed)) return 0;
+  return atomic_load_explicit(&s->bulk_passed, memory_order_relaxed) ? 2 : 1;
+}
+
+/* The fill is over: the records the writers make from now on are logged (their LSNs follow the last checkpoint's), and a fuzzy checkpoint at the position of now writes the tables (every page
+ * marked since the last full write, ix / sx included: a generation made during the fill whole) and a superblock without BULK.  Until it is on disk, a crash goes back to the last bulk checkpoint. */
+int store_bulk_end(store_t *s) {
+  if (!s) return -EINVAL;
+  wr_lock_raw(s);
+  const bool was = atomic_load_explicit(&s->bulk, memory_order_relaxed);
+  if (was) {
+    atomic_store_explicit(&s->bulk, false, memory_order_relaxed);
+    atomic_store_explicit(&s->bulk_body, false, memory_order_relaxed);
+    atomic_store_explicit(&s->bulk_passed, false, memory_order_relaxed);
+    atomic_store_explicit(&s->bulk_ended, (uint64_t)time(NULL), memory_order_relaxed);
+  }
+  wr_unlock_raw(s);
+  if (!was) return 0;
+  st_log(s, 6, "store: the unlogged bulk fill is over (%" PRIu64 " unlogged records, %" PRIu64 " bulk checkpoints): the writers keep the journal again; the checkpoint that ends it writes every table",
+         atomic_load_explicit(&s->n_bulk_unlogged, memory_order_relaxed), atomic_load_explicit(&s->n_bulk_ckpts, memory_order_relaxed));
+  const int r = st_ckpt(s, true, false);
+  ck_after(s);
+  if (r < 0) st_log(s, 3, "store: the checkpoint at the end of the bulk fill failed (%d): until one is on disk a crash goes back to the last bulk checkpoint", r);
+  return r;
 }
 
 /* The end of a writer call: the mutex is given up; STORE_SYNC_EVERY makes the call durable now (with the mutex released: other writers go on), and without a flusher the due work is done
@@ -4828,7 +5038,7 @@ static int put_stored_locked(store_t *s, uint16_t view, const char *name, size_t
   if (!is_nospc(r)) return r;
   note_error(s, r);
   uint64_t now = st_now_ms();
-  if (now >= s->emerg_block_until) {                    /* (when the last cleaning found nothing to free, it is not repeated for every zone: once a second) */
+  if (now >= s->emerg_block_until && !atomic_load_explicit(&s->bulk, memory_order_relaxed)) {   /* (when the last cleaning found nothing to free, it is not repeated for every zone: once a second; none during a bulk fill: no cleaner) */
     if (emergency_free_locked(s) == 0) s->emerg_block_until = now + 1000;
     r = put_locked(s, view, name, len, meta, image, ilen, STORE_STATE_STORED, zid, NULL);
     if (!is_nospc(r)) return r;
@@ -5504,6 +5714,7 @@ void store_scrub_stop(store_t *s) {
 int store_scrub_run(store_t *s, store_scrub_report_t *rep) {
   if (!s) return -EINVAL;
   if (rep) memset(rep, 0, sizeof(*rep));
+  if (atomic_load_explicit(&s->bulk, memory_order_relaxed)) return -EBUSY;      /* (no scrub during a bulk fill: its repair would be a full checkpoint for every damaged cell it finds in a fill) */
   pthread_mutex_lock(&s->sc_mu);
   if (!s->sc_running) scrub_begin_pass(s);
   while (s->sc_running && !scrub_work(s, UINT64_MAX, 1000000)) {}
@@ -5570,6 +5781,7 @@ static int wr_lock_ck_w_at(store_t *s, const char *site) {
 int store_compact(store_t *s, uint64_t max_bytes, bool finish, store_compact_report_t *rep) {
   if (!s) return -EINVAL;
   if (rep) memset(rep, 0, sizeof(*rep));
+  if (atomic_load_explicit(&s->bulk, memory_order_relaxed)) return -EBUSY;      /* (no cleaner during a bulk fill: THE BULK FILL) */
   const uint64_t freed0 = atomic_load_explicit(&s->c_segs_freed, memory_order_relaxed);
   int r = cleaner_work(s, max_bytes ? max_bytes : UINT64_MAX, st_now_ms() + 3600000u, rep, false);
   int lr = finish ? wr_lock_ck_w(s) : wr_lock(s);
@@ -5597,6 +5809,10 @@ int store_compact(store_t *s, uint64_t max_bytes, bool finish, store_compact_rep
 
 /* What the tick does besides the commit and the checkpoint: the cleaner, the removal of empty segments, the nx pass, the free space, the scrub.  Never inside a read section. */
 static void maintenance(store_t *s) {
+  if (atomic_load_explicit(&s->bulk, memory_order_relaxed)) {         /* (a bulk fill: the cleaner, the removals, the nx pass and the scrub wait for its end, THE BULK FILL) */
+    bad_drain(s);
+    return;
+  }
   uint64_t now = st_now_ms();
   const bool forced = atomic_load_explicit(&s->c_forced, memory_order_relaxed);
   const uint64_t rate = s->o.compact_rate ? s->o.compact_rate : (16ull << 20);
@@ -6335,6 +6551,16 @@ void store_stats(const store_t *s, store_stats_t *o) {
   o->space_reprobe_in_lock = atomic_load_explicit(&s->n_reprobe_lock, memory_order_relaxed);
   o->defer_busy = atomic_load_explicit(&s->n_df_busy, memory_order_relaxed);
   for (unsigned k = 0; k < STORE_FINE_BUCKETS; k++) o->lock_hold_fine[k] = atomic_load_explicit(&s->wl_fine[k], memory_order_relaxed);
+  o->journal_bytes_written = o->leader_bytes;
+  o->bulk_active = (uint32_t)store_bulk(s);
+  o->bulk_fills = atomic_load_explicit(&s->n_bulk_fills, memory_order_relaxed);
+  o->bulk_resumed = s->rec.bulk_resumed ? 1 : 0;
+  o->bulk_recoveries = s->rec.bulk_recovered ? 1 : 0;
+  o->bulk_checkpoints = atomic_load_explicit(&s->n_bulk_ckpts, memory_order_relaxed);
+  o->bulk_unlogged_records = atomic_load_explicit(&s->n_bulk_unlogged, memory_order_relaxed);
+  o->bulk_since_unix = o->bulk_active ? atomic_load_explicit(&s->bulk_since, memory_order_relaxed) : 0;
+  o->bulk_ended_unix = atomic_load_explicit(&s->bulk_ended, memory_order_relaxed);
+  o->bulk_next_bytes = o->bulk_active && atomic_load_explicit(&s->bulk_body, memory_order_relaxed) ? bulk_next_bytes(s) : 0;
   o->flusher = s->fl_on;
   o->checkpoint_max_us = atomic_load_explicit(&s->ckpt_max_us, memory_order_relaxed);
   o->checkpoints_cancelled = atomic_load_explicit(&s->n_ckpt_cancel, memory_order_relaxed);
@@ -6601,10 +6827,19 @@ int store_check(store_t *s, store_check_report_t *rep) {
 /* the counters are recomputed into a private array and stored at the end, so that readers (and a concurrent store_stats) never see a half-done recount */
 #define NG(i)    (nv[(i)])
 #define NS(i, x) (nv[(i)] = (x))
-static int rebuild_locked(store_t *s) {
+/* how: RB_OPEN (at the open: a long name may lie past the counter of nx, in bytes a checkpoint wrote by the nx rule, ck_nx_widen(); it is taken when it is the name the cell holds the start of),
+ * RB_BULK (after a bulk fill was cut off: a STORED cell whose image is past the durable end of its segment, the counters of the superblock, becomes KNOWN with its name, source id and stamp, instead
+ * of being dropped: the loader's cursor may already be past it) */
+#define RB_OPEN 1u
+#define RB_BULK 2u
+static int rebuild_locked(store_t *s, unsigned how) {
   uint64_t *nv = malloc(ST_NV * sizeof(*nv));
   if (!nv) return -ENOMEM;
   for (uint32_t i = 0; i < ST_NV; i++) nv[i] = VG(s, i);
+  if (how & RB_OPEN) {                                /* (no reader yet: the names that the files hold up to the size of nx are readable for the pass) */
+    const uint64_t m = atomic_load_explicit(&s->nx.mapped, memory_order_relaxed);
+    if (m > atomic_load_explicit(&s->nx_avail, memory_order_relaxed)) atomic_store_explicit(&s->nx_avail, m, memory_order_release);
+  }
   uint64_t hwm = NG(V_HWM), cap = st_zt_cap(s);
   if (hwm > cap) hwm = cap;
   uint32_t nviews = atomic_load_explicit(&s->nviews, memory_order_relaxed);
@@ -6624,7 +6859,7 @@ static int rebuild_locked(store_t *s) {
   NS(V_NX_USED, nx_used);
   NS(V_HWM, hwm);
   for (uint32_t n = 1; n <= nsegs && n <= ST_MAXSEG; n++) NS(V_SEG(n, 0), seg_used[n]);
-  uint64_t nxlive = 0, live_ix = 0, live_sx = 0;
+  uint64_t nxlive = 0, live_ix = 0, live_sx = 0, nx_end = nx_used;
   for (uint64_t z = 0; z < hwm; z++) {
     r64_t rt, rc;
     s->rec.rebuilt_zones++;
@@ -6640,10 +6875,22 @@ static int rebuild_locked(store_t *s) {
       zt_unpack(&rt, &t);
       zc_unpack(&rc, &c);
       ok = (t.state == STORE_STATE_KNOWN || t.state == STORE_STATE_STORED) && t.view < nviews && zt_fullname(s, &t, fn);
+      if (ok && t.klen > ST_NAME_INL) ok = memcmp(fn, t.name + 8, ST_NAME_INL - 8) == 0;       /* (a long name is the one whose start the cell holds: bytes of nx that were never written are not a name) */
       if (ok && t.state == STORE_STATE_STORED) {
         uint32_t sn = (uint32_t)(t.loc >> ST_LOC_SHIFT);
         uint64_t off = (t.loc & ST_LOC_MASK) * 64, rl = st_reclen(t.klen, t.img_len);
-        ok = sn >= 1 && sn <= nsegs && sn <= ST_MAXSEG && off >= ST_SEGHDR && off + rl <= NG(V_SEG(sn, 0));
+        const bool placed = sn >= 1 && sn <= ST_MAXSEG && off >= ST_SEGHDR;
+        ok = placed && sn <= nsegs && off + rl <= NG(V_SEG(sn, 0));
+        if (!ok && placed && (how & RB_BULK)) {      /* (past the durable end of its segment: the zone is KNOWN, fetched again; THE BULK FILL, rule K) */
+          t.state = STORE_STATE_KNOWN;
+          t.loc = 0;
+          t.img_len = 0;
+          zt_pack(&t, &rt);
+          zrec_seal(&rt, &rc);
+          zrec_write(s, (uint32_t)z, &rt, &rc);
+          s->rec.bulk_known++;
+          ok = true;
+        }
       } else if (ok) {
         ok = t.loc == 0 && t.img_len == 0;
       }
@@ -6661,7 +6908,12 @@ static int rebuild_locked(store_t *s) {
           ix_raw_insert(nsx, st_hash_src(s, c.source, t.view, c.source_id), (uint32_t)z);
           live_sx++;
         }
-        if (t.klen > ST_NAME_INL) nxlive += t.klen;
+        if (t.klen > ST_NAME_INL) {
+          uint64_t no;
+          memcpy(&no, t.name, 8);
+          nxlive += t.klen;
+          if (no + t.klen > nx_end) nx_end = no + t.klen;      /* (a name past the counter, RB_OPEN: nx ends after it, the next name goes behind it) */
+        }
         if (t.state == STORE_STATE_KNOWN) { NS(V_KNOWN, NG(V_KNOWN) + 1); NS(V_VIEW(t.view, 0), NG(V_VIEW(t.view, 0)) + 1); }
         else {
           uint64_t rl = st_reclen(t.klen, t.img_len);
@@ -6715,11 +6967,13 @@ static int rebuild_locked(store_t *s) {
   NS(V_IX_LIVE, live_ix);
   NS(V_SX_USED, live_sx);
   NS(V_SX_LIVE, live_sx);
-  NS(V_NX_DEAD, nx_used >= nxlive ? nx_used - nxlive : 0);
+  NS(V_NX_USED, nx_end);
+  NS(V_NX_DEAD, nx_end >= nxlive ? nx_end - nxlive : 0);
   /* the segment counters of segments no record uses stay 0 live; V_SEG(n, 0) were restored above */
   /* (the new generations are anonymous memory: the checkpoint that follows the rebuild writes them whole, ck_write_tab()) */
   for (uint32_t i = 0; i < ST_NV; i++) VS(s, i, nv[i]);
   free(nv);
+  if ((how & RB_OPEN) || nx_end > atomic_load_explicit(&s->nx_avail, memory_order_relaxed)) atomic_store_explicit(&s->nx_avail, nx_end, memory_order_release);
   index_publish(s, 0, nix);
   index_publish(s, 1, nsx);
   s->free_epoch = rcu_writer_advance_epoch();         /* (cells that were dropped are reused after the readers of the old tables are gone) */
@@ -6738,7 +6992,7 @@ int store_repair(store_t *s) {
    * that a crash (or a failed checkpoint and a later crash) in between makes the open rebuild again instead of trusting half of it */
   jb_reset(&s->jb);
   r = jb_op(&s->jb, OP_REBUILD, 8) ? journal_append(s) : -ENOMEM;
-  if (r == 0) r = rebuild_locked(s);
+  if (r == 0) r = rebuild_locked(s, 0);
   if (r == 0) r = ck_full_locked(s, false);
   if (r < 0) note_error(s, r);
   wr_unlock_ck(s);
@@ -6796,8 +7050,13 @@ static int adopt_sb(store_t *s, const sb_t *b) {
   for (uint32_t n = 1; n <= b->f.v[V_NSEGS]; n++)
     if (b->f.v[V_SEG(n, 0)] != 0 && b->f.v[V_SEG(n, 0)] < ST_SEGHDR) { r = -EBADMSG; goto fail; }       /* (0 = a segment that was cleaned and removed: its number is free) */
   ixgen_t *ix = NULL, *sx = NULL;
-  if ((r = ixgen_open(s, FK_IX, b->f.ix_gen, b->f.ix_slots, &ix)) < 0) goto fail;
-  if ((r = ixgen_open(s, FK_SX, b->f.sx_gen, b->f.sx_slots, &sx)) < 0) { ixgen_free(ix); goto fail; }
+  if (b->f.flags & SBF_BULK_CK) {
+    /* a bulk checkpoint wrote no ix / sx (their files may hold nothing, or be gone after a power loss): the open rebuilds them from zt (store_open()); the generation numbers are kept for the
+     * numbering of the new ones */
+  } else {
+    if ((r = ixgen_open(s, FK_IX, b->f.ix_gen, b->f.ix_slots, &ix)) < 0) goto fail;
+    if ((r = ixgen_open(s, FK_SX, b->f.sx_gen, b->f.sx_slots, &sx)) < 0) { ixgen_free(ix); goto fail; }
+  }
   atomic_store(&s->ix, ix);
   atomic_store(&s->sx, sx);
   s->ix_gen = b->f.ix_gen;
@@ -6885,6 +7144,27 @@ static int journal_replay(store_t *s, uint32_t first_gen, bool *anomaly) {
   s->lsn = expected - 1;
   s->jrn_gen = last_gen;      /* the new journal will be last_gen + 1 */
   return 0;
+}
+
+/* A bulk fill that was cut off (THE BULK FILL, K): nothing of the journal is applied (it holds no record of the fill; the records of its end, after its last checkpoint began, are
+ * lost with the fill, whose cursors the caller drops), but the files of the chain are skipped, so that the next journal file is a new one */
+static void journal_skip(store_t *s, uint32_t first_gen) {
+  uint32_t last_gen = first_gen;
+  for (uint32_t gen = first_gen;; gen++) {
+    char name[32];
+    st_name_ix(name, sizeof(name), "jrn", gen);
+    const int fd = st_openat(s, name, O_RDONLY);
+    if (fd < 0) break;
+    fhdr_t h;
+    const bool ok = st_pread_all(fd, &h, sizeof(h), 0) == 0 && fhdr_ok(s, &h, FK_JRN, gen);
+    close(fd);
+    if (!ok) break;
+    last_gen = gen;
+    s->rec.journals_read++;
+  }
+  s->rec.replay_from_lsn = s->ckpt_lsn + 1;
+  s->rec.replay_to_lsn = s->ckpt_lsn;
+  s->jrn_gen = last_gen;
 }
 
 static int create_store(store_t *s) {
@@ -7374,7 +7654,10 @@ int store_open(int dirfd, const store_opts_t *opts, store_t **out) {
     uint64_t was_boot = cand[used]->f.boot_id;
     bool unclean = !s->rec.was_clean;
     bool anomaly = false;
-    r = journal_replay(s, cand[used]->f.jrn_gen, &anomaly);
+    const uint32_t sbfl = cand[used]->f.flags;
+    const bool sb_bulk = (sbfl & SBF_BULK) != 0, sb_bulk_ck = (sbfl & SBF_BULK_CK) != 0, cut = sb_bulk && unclean;
+    if (cut) journal_skip(s, cand[used]->f.jrn_gen);    /* (THE BULK FILL, K: a fill that was cut off is not replayed) */
+    else r = journal_replay(s, cand[used]->f.jrn_gen, &anomaly);
     if (r < 0) goto fail;
     /* the numbers of new generation files start above every one that a superblock or the journal named */
     s->ix_gen_next = s->ix_gen > s->slot_ix[0] ? s->ix_gen : s->slot_ix[0];
@@ -7385,12 +7668,29 @@ int store_open(int dirfd, const store_opts_t *opts, store_t **out) {
     s->sx_gen_next++;
     /* same boot after an unclean stop: the page cache kept every cell and the replay is exact; another or an unknown boot (power
      * loss, OS crash): cells may be ahead of the journal, so the derived tables are rebuilt */
-    bool rebuild = s->o.force_rebuild || anomaly || (unclean && (s->boot_id == 0 || was_boot == 0 || was_boot != s->boot_id));
+    bool rebuild = s->o.force_rebuild || anomaly || sb_bulk_ck || cut || (unclean && (s->boot_id == 0 || was_boot == 0 || was_boot != s->boot_id));
     if (rebuild) {
       wr_lock_raw(s);
-      r = rebuild_locked(s);
+      r = rebuild_locked(s, RB_OPEN | (cut ? RB_BULK : 0u));
       wr_unlock_raw(s);
       if (r < 0) goto fail;
+    }
+    if (sb_bulk) {                                    /* (the fill goes on: the open's checkpoint below says BULK, and the writers log nothing from the start) */
+      atomic_store_explicit(&s->bulk, true, memory_order_relaxed);
+      atomic_store_explicit(&s->bulk_body, true, memory_order_relaxed);
+      atomic_store_explicit(&s->bulk_passed, !cut && (sbfl & SBF_BULK_PASSED) != 0, memory_order_relaxed);
+      atomic_store_explicit(&s->bulk_since, (uint64_t)time(NULL), memory_order_relaxed);
+      s->rec.bulk_resumed = true;
+      s->rec.bulk_recovered = cut;
+    }
+    if (cut) {
+      char when[40] = "?";
+      const time_t ct = (time_t)cand[used]->f.ckpt_time;
+      struct tm tmv;
+      if (gmtime_r(&ct, &tmv)) strftime(when, sizeof(when), "%Y-%m-%d %H:%M:%S UTC", &tmv);
+      st_log(s, 4, "store: a bulk fill was cut off: the store is back at %s (%s), %" PRIu64 " zones stored, %" PRIu64 " known (%" PRIu64 " of them had an image past the durable end of their segment), "
+                   "%" PRIu64 " dropped; nothing was replayed, the zones after it are read from the database again; the fill goes on", when,
+             sb_bulk_ck ? "its last bulk checkpoint" : "the start of the fill", VG(s, V_STORED), VG(s, V_KNOWN), s->rec.bulk_known, s->rec.dropped_zones);
     }
   }
   free(cand[0]);
@@ -7405,6 +7705,8 @@ int store_open(int dirfd, const store_opts_t *opts, store_t **out) {
   s->clean_on_disk = false;
   s->last_sync_ms = st_now_ms();
   s->last_ckpt_ms = st_now_ms();
+  atomic_store_explicit(&s->bulk_base, st_seg_bytes(s), memory_order_relaxed);          /* (a fill that goes on: its next bulk checkpoint counts from here) */
+  atomic_store_explicit(&s->bulk_last_ms, st_now_ms(), memory_order_relaxed);
   if (!atomic_load_explicit(&s->sc_last_done, memory_order_relaxed)) atomic_store_explicit(&s->sc_last_done, (uint64_t)time(NULL), memory_order_relaxed);      /* (a store from before the scrub: its first pass is one interval from now) */
   fs_open_checks(s);
   err_ring_open(s);

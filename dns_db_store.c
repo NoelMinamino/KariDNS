@@ -1614,6 +1614,37 @@ static void tables_charge(uint64_t priv, int64_t now_ms, int64_t *warned_ms) {
          "by the size of the tables (about 200 bytes a zone) (store.tables.private_bytes)", priv >> 20, lim >> 20, (priv + lim / 10 < lim ? lim - priv : lim / 10) >> 20);
 }
 
+/* 0.7, the unlogged bulk fill (store_bulk_begin()): it ends at the first tick after a complete pass at which the fill is over (db_store_filling(): no pass runs and no body of the fill is in flight,
+ * or no zone waits for its body), seen at two ticks in a row (the fetches of the bodies come in rounds); when no fetch of a body was made since the pass ended (a restart after a clean stop: the
+ * loader may not be connected yet), only after a minute of that, or when no zone waits.  Ticker thread only (no lock held) */
+static void bulk_end_check(store_t *st) {
+  static bool armed;
+  static uint64_t fetched0;
+  static unsigned quiet;
+  if (store_bulk(st) != 2) {
+    armed = false;
+    return;
+  }
+  db_recon_status_t r;
+  db_recon_status(&r);
+  const uint64_t f = r.fetched + r.fetch_failed;
+  if (!armed) {
+    armed = true;
+    fetched0 = f;
+    quiet = 0;
+  }
+  if (r.active || (r.known_now > 0 && r.in_flight > 0)) {
+    quiet = 0;
+    return;
+  }
+  quiet++;
+  if (r.known_now == 0 || (f > fetched0 && quiet >= 2) || quiet >= 60) {
+    syslog(LOG_INFO, "[Store] the first fill is over (%llu zone(s) still without a body): the store keeps its journal again", (unsigned long long)r.known_now);
+    (void)store_bulk_end(st);
+    armed = false;
+  }
+}
+
 /* the time of the store: group commit and checkpoint, once a second */
 static void *ticker_thread(void *arg) {
   (void)arg;
@@ -1630,6 +1661,7 @@ static void *ticker_thread(void *arg) {
     if (st) {
       pthread_mutex_unlock(&G.wlock);
       (void)store_tick(st);
+      bulk_end_check(st);
       store_stats_t ss;
       store_stats(st, &ss);
       tables_charge(ss.table_private_bytes + ss.ring_bytes, mono_ns() / 1000000, &warned_ms);      /* (0.7: the journal ring is the store's memory too, D4) */
@@ -3367,10 +3399,19 @@ bool db_recon_begin(const char *view, uint64_t estimate, bool force, char *why, 
   uint64_t cap = (1ull << 25) - 1;
   if (lim && lim / 4 / 43 < cap) cap = lim / 4 / 43;
   const uint64_t want = estimate < cap ? estimate : cap;
+  /* (0.7, the unlogged bulk fill: the first fill of a store that holds no zone record in any view keeps no journal (store_bulk_begin(), "THE BULK FILL" in dns_store.c); it begins before the
+   * reserve, so that the checkpoint that makes it durable does not write the reserved index.  A fill that goes on (a pass that failed or was cut off, a restart in the middle of it) stays one) */
+  bool unlogged = store_bulk(st) != 0;
+  if (!unlogged && want > have && have == 0) unlogged = store_bulk_begin(st) == 0;
+  if (unlogged) store_bulk_phase(st, STORE_BULK_PASS);
   const bool bulk = want > have && store_reserve(st, want) == 0;
-  /* (a bulk fill: the checkpoints of the pass write the whole reserved index, so the journal may grow to a larger size before one is forced (round 12).  Ended by db_recon_end() and db_recon_abort();
-   * a pass that this one drops (above) is ended here: the flag is set or cleared by what this pass needs) */
-  store_journal_boost(st, bulk);
+  if (unlogged && want > have && have == 0 && !bulk) {      /* (no reserve: the fill is not a bulk fill, as before) */
+    (void)store_bulk_end(st);
+    unlogged = false;
+  }
+  /* (a bulk fill of a store that is not empty: the checkpoints of the pass write the whole reserved index, so the journal may grow to a larger size before one is forced (round 12).  Ended by
+   * db_recon_end() and db_recon_abort(); a pass that this one drops (above) is ended here: the flag is set or cleared by what this pass needs.  An unlogged fill has no journal to raise) */
+  store_journal_boost(st, bulk && !unlogged);
   un_mark(view);
   rc_lock();
   bits_free(&RC.seen);
@@ -3441,7 +3482,11 @@ void db_recon_abort(void) {
     atomic_store_explicit(&RC.lk_any, false, memory_order_relaxed);
   }
   rc_unlock();
-  if (was) store_journal_boost(atomic_load_explicit(&G.st, memory_order_acquire), false);     /* (the pass that raised the bound of the journal is over; the lock of the pass is not held) */
+  if (was) {
+    store_t *st = atomic_load_explicit(&G.st, memory_order_acquire);
+    store_journal_boost(st, false);                         /* (the pass that raised the bound of the journal is over; the lock of the pass is not held) */
+    store_bulk_phase(st, STORE_BULK_BODY);                  /* (an unlogged fill goes on: its next pass has to end complete before it can end) */
+  }
 }
 
 /* the zones of the view in the store, a few thousand at a time (the read section does not last for a pass over ten million zones) */
@@ -3581,6 +3626,7 @@ void db_recon_end(bool complete, uint64_t n_skipped, bool cursor_valid, uint64_t
   }
   if (cursor_valid && !out->failed) db_recon_cursor_put(view, cursor, ident, ident_len);
 done:
+  store_bulk_phase(st, complete && !out->failed ? STORE_BULK_PASSED : STORE_BULK_BODY);   /* (an unlogged fill: it ends when its bodies are in, bulk_end_check(); a pass that failed keeps it for the next one) */
   rc_lock();
   RC.active = false;
   RC.s.duration_ms = out->duration_ms;
@@ -3813,6 +3859,10 @@ static store_t *core_start(const server_config_t *cfg, bool *created_out) {
     /* TEST ONLY (karidns-evict, make evict; never a production build): another boot after an unclean stop, the rebuild of the derived tables (tests/run_secondary_store_test.sh) */
     const char *bid = getenv("KARIDNS_TEST_STORE_BOOT_ID");
     if (bid && *bid) o.boot_id = strtoull(bid, NULL, 10);
+    /* ... and the cadence of the bulk checkpoints of a first fill (tests/run_db_store_bulk_test.sh: a fill of a few hundred MB makes several) */
+    const char *bb = getenv("KARIDNS_TEST_STORE_BULK_BYTES"), *bm = getenv("KARIDNS_TEST_STORE_BULK_MS");
+    if (bb && *bb) o.bulk_ckpt_bytes = strtoull(bb, NULL, 10);
+    if (bm && *bm) o.bulk_ckpt_interval_ms = (uint32_t)strtoul(bm, NULL, 10);
   }
 #endif
   store_t *st = NULL;
@@ -3868,8 +3918,18 @@ bool db_store_start(const server_config_t *cfg) {
   if (!st || !cfg->database.enabled) {
     if (st) {
       syslog(LOG_NOTICE, "[Store] the zone store is on for the copies of the secondary zones (no database block)%s", created ? ": created (first use)" : "");
+      if (store_bulk(st)) (void)store_bulk_end(st);         /* (0.7: a first fill that a stop cut off, with no database left to finish it: the store keeps its journal again) */
     }
     return true;
+  }
+  bool bulk_cut = false;                                     /* (0.7: the open found an unlogged first fill that a crash cut off: the cursors of the views are dropped below) */
+  {
+    store_stats_t *ss = malloc(sizeof(*ss));
+    if (ss) {
+      store_stats(st, ss);
+      bulk_cut = ss->recovery.bulk_recovered;
+      free(ss);
+    }
   }
   const database_config_t *db = &cfg->database;
   if (!G.wthr_started) return false;                         /* (the ticker keeps the store's time for the database zones: a start without it is refused, as before) */
@@ -3897,6 +3957,11 @@ bool db_store_start(const server_config_t *cfg) {
       purge_view(st, vid);
       (void)store_set_cursor(st, (uint16_t)vid, 0, want, DBS_CFGID);
       if (vid < 32) atomic_fetch_or(&G.dir_pending, 1u << vid);          /* (the store has no list of this view's zones: a first fill; a pass has to make it) */
+    } else if (bulk_cut) {
+      /* the store went back to the last bulk checkpoint of a first fill: its cursor may already be past zones that the rebuild had to drop, so it is dropped (the configuration's part
+       * stays, as for a held view): the loader lists every zone again, and until that pass is over a zone the store does not name is looked up by name (THE BULK FILL in dns_store.c) */
+      (void)store_set_cursor(st, (uint16_t)vid, 0, have, DBS_CFGID);
+      if (vid < 32) atomic_fetch_or(&G.dir_pending, 1u << vid);
     }
   }
   for (int vid = 0; vid < STORE_MAX_VIEWS; vid++)

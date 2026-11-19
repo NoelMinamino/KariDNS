@@ -703,6 +703,17 @@ static void add_store(list_t *l, const store_t *s, const store_attach_stats_t *a
   U("store.journal.limit_wait_max_us", st->journal_limit_wait_max_us);
   U("store.journal.boost", st->journal_boost);
   U("store.journal.boosts", st->journal_boosts);
+  U("store.journal.bytes_written", st->journal_bytes_written);
+  U("store.bulk.active", st->bulk_active);                                       /* 0.7: the unlogged bulk fill of an empty store */
+  U("store.bulk.fills", st->bulk_fills);
+  U("store.bulk.resumed", st->bulk_resumed);
+  U("store.bulk.recoveries", st->bulk_recoveries);
+  U("store.bulk.recovered_known", st->recovery.bulk_known);
+  U("store.bulk.checkpoints", st->bulk_checkpoints);
+  U("store.bulk.unlogged_records", st->bulk_unlogged_records);
+  U("store.bulk.since_unix", st->bulk_since_unix);
+  U("store.bulk.ended_unix", st->bulk_ended_unix);
+  U("store.bulk.next_checkpoint_bytes", st->bulk_next_bytes);
   U("store.index.waits", st->index_waits);
   U("store.index.wait_us", st->index_wait_us);
   U("store.index.wait_max_us", st->index_wait_max_us);
