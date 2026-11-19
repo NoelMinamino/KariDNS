@@ -47,7 +47,7 @@ KARICHECK="$ROOT/karicheck"
 DAG="$ROOT/dag"
 KARICTL="$ROOT/karictl"
 
-W="$(mktemp -d /tmp/secstore.XXXXXX)"
+W="$(mktemp -d "${TMPDIR:-/tmp}/secstore.XXXXXX")"
 chmod 755 "$W"
 PPORT=$(kari_port 0 $((25000 + $$ % 5000)))
 SPORT=$((PPORT + 1))
@@ -157,7 +157,18 @@ start_primary() {
     PPID_=$!
     kari_wait_answer "$DAG" "$PPORT" sec.test. 15 || { cat "$W/p.log"; fail "the primary did not start"; }
 }
-stop_primary() { [ -n "$PPID_" ] && kari_kill_tree "$PPID_"; PPID_=""; sleep 0.3; }
+# wait_gone PID CONF: PID is reaped and no process of CONF is left (the next start must not meet the old control socket); fails after 10 s
+wait_gone() {
+    [ -z "$1" ] || wait "$1" 2>/dev/null || true
+    _wg=0
+    while [ -n "$(kari_conf_pids "$2")" ]; do
+        _wg=$((_wg + 1))
+        [ "$_wg" -lt 100 ] || fail "a process of $2 did not exit"
+        sleep 0.1
+    done
+    return 0
+}
+stop_primary() { _sp=$PPID_; [ -n "$PPID_" ] && kari_kill_tree "$PPID_"; PPID_=""; kari_kill_conf "$W/primary.conf"; wait_gone "$_sp" "$W/primary.conf"; }
 # start_secondary [env...]: the log of this run is $W/s.log (the one before is appended to $W/s.all)
 start_secondary() {
     [ -f "$W/s.log" ] && cat "$W/s.log" >> "$W/s.all"
@@ -171,7 +182,7 @@ start_secondary() {
         sleep 0.1
     done
 }
-stop_secondary() { [ -n "$SPID" ] && kari_kill_tree "$SPID"; SPID=""; kari_kill_conf "$W/secondary.conf"; sleep 0.3; }
+stop_secondary() { _ss=$SPID; [ -n "$SPID" ] && kari_kill_tree "$SPID"; SPID=""; kari_kill_conf "$W/secondary.conf"; wait_gone "$_ss" "$W/secondary.conf"; }
 
 q() { # name type [dag options]
     _n=$1; _t=$2; shift 2
@@ -401,6 +412,7 @@ stop_primary
 start_secondary
 [ "$(serial_of d7.test)" = 50 ] || fail "7: the old file with the higher serial won against the newer copy (serial $(serial_of d7.test))"
 stop_secondary
+sleep 2                                                                                  # (the file's time is compared with the copy's in whole seconds: the stops no longer sleep, so the file must come at least a second later)
 sed 's/ 50 2 1 20 60/ 101 2 1 20 60/' "$W/p/d7.test.zone" > "$W/s/d7.test.zone"        # a newer file with a greater serial
 start_secondary
 [ "$(serial_of d7.test)" = 101 ] || fail "7: a newer file with a greater serial did not win"
