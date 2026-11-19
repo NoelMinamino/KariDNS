@@ -820,7 +820,9 @@ disk keeps up
 \fBstore.journal.boost\fR, \fB.boosts\fR
 0.7: \fB.boost\fR is 1 while a first fill (the manifest pass that had to reserve
 the tables and the index for the zones the loader announces) asks for the larger
-journal, \fB.boosts\fR counts the times it did. Every checkpoint of such a pass
+journal, \fB.boosts\fR counts the times it did. The first fill of an empty store
+keeps no journal at all (\fBstore.bulk.*\fR): the boost is for a pass that
+reserves for a store that holds zones already. Every checkpoint of such a pass
 writes the whole reserved index (10M zones: 430 to 600 MB), so a checkpoint
 every 100 MiB of journal kept the disk busy for the whole pass; while the fill
 runs a checkpoint is forced at 400 MiB instead (a fourth of them), and the bound
@@ -835,6 +837,34 @@ that cuts the journal is begun at once. A clean stop is not affected (its
 checkpoint is clean whatever the journal holds); a crash during the first fill
 replays up to 400 MiB (about 4 s) instead of 100 MiB, a crash after it replays
 what it did before
+.TP 8
+\fBstore.journal.bytes_written\fR
+0.7: the bytes the journal files took since the start (every record and the
+header of every file): what the journal wrote to the device. It stays at the
+headers of a few files while an unlogged first fill runs (\fBstore.bulk.*\fR)
+.TP 8
+\fBstore.bulk.active\fR, \fB.fills\fR, \fB.unlogged_records\fR, \fB.checkpoints\fR, \fB.next_checkpoint_bytes\fR, \fB.since_unix\fR, \fB.ended_unix\fR
+0.7: the first fill of an empty store is unlogged (see "The first fill without a
+journal" under the zone store in karidns.md). \fB.active\fR is 1 while it runs,
+2 once a pass of it has listed every zone (it ends when the bodies are in), 0
+otherwise; \fB.fills\fR counts the fills that began since the start,
+\fB.unlogged_records\fR the changes made without a journal record;
+\fB.checkpoints\fR the bulk checkpoints (the durable points of the fill: made
+while the bodies are fetched, when the segments have doubled since the last one
+and grew by 4 GiB or more, or 15 minutes after the last one),
+\fB.next_checkpoint_bytes\fR the size of the segments at which the next one is
+due (0 while a pass runs); when the fill began (or was resumed) and when the
+last one ended
+.TP 8
+\fBstore.bulk.resumed\fR, \fB.recoveries\fR, \fB.recovered_known\fR
+0.7: the start found an unlogged fill going on (1) and went on with it;
+\fB.recoveries\fR is 1 when the server had not stopped cleanly (a crash or kill
+\-9 cut the fill off: nothing was replayed, the store went back to its last bulk
+checkpoint, or to the start of the fill, and rebuilt its tables; the cursors of
+the views were dropped, so the loader lists every zone again),
+\fB.recovered_known\fR the zones whose image was past that checkpoint: kept as
+known zones with their name and stamp, fetched again. A clean stop in the middle
+of a fill needs no rebuild: \fB.resumed\fR is 1 and \fB.recoveries\fR 0
 .TP 8
 \fBstore.checkpoint.count\fR, \fB.last_unix\fR, \fB.last_us\fR, \fB.max_us\fR, \fB.cancelled\fR
 Checkpoints since the open, when the last one ended, how long it took, the
