@@ -731,6 +731,7 @@ static void add_store(list_t *l, const store_t *s, const store_attach_stats_t *a
   U("store.ahead.allocs", st->ahead_allocs);
   U("store.ahead.alloc_us", st->ahead_alloc_us);
   U("store.ahead.alloc_max_us", st->ahead_alloc_max_us);
+  U("store.ahead.thread_max_us", st->ahead_thread_max_us);
   U("store.ahead.errors", st->ahead_errors);
   U("store.ahead.busy_kicks", st->ahead_busy_kicks);
   U("store.ahead.unallocated_growths", st->ahead_unallocated_growths);

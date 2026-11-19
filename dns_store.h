@@ -313,6 +313,7 @@ typedef struct store_stats {
   uint64_t image_prewrite_misses;   /* ... that the change wrote again inside the mutex (the zone, its record or the open segment changed in between) */
   /* ---- 0.7 round 15: the allocations ahead are not the commit thread's and not the writer mutex's ---- */
   uint64_t ahead_allocs, ahead_alloc_us, ahead_alloc_max_us;   /* posix_fallocate() calls of the blocks ahead of the tables (the thread of its own; store_reserve() too): their number, total and longest time */
+  uint64_t ahead_thread_max_us;     /* the longest round of the thread of the blocks ahead (what it waited for the disk; the allocation of store_reserve() is not in it) */
   uint64_t ahead_errors;            /* ... that failed with ENOSPC or EIO (the checkpoint that extends the file meets the same error) */
   uint64_t ahead_busy_kicks;        /* the commit thread asked while the thread was still in its round before (the work lags behind: before round 15 the commit thread waited here) */
   uint64_t ahead_unallocated_growths;   /* growths of a table that found its blocks not allocated yet (the checkpoint allocates them) */

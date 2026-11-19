@@ -188,7 +188,7 @@ static const char *REQUIRED[] = {
   "store.index.waits", "store.index.wait_us", "store.index.wait_max_us", "store.index.wait_giveups",                         /* (0.7 round 10: the wait for the build of the next index) */
   "store.journal.boost", "store.journal.boosts",                                                                                     /* (0.7 round 12: the larger bound of a bulk fill) */
   "store.checkpoint.max_us", "store.checkpoint.cancelled",                                                                                  /* (0.7: the journal bound) */
-  "store.ahead.allocs", "store.ahead.alloc_us", "store.ahead.alloc_max_us", "store.ahead.errors", "store.ahead.busy_kicks", "store.ahead.unallocated_growths",     /* (0.7 round 15: the blocks and the segment made ahead) */
+  "store.ahead.allocs", "store.ahead.alloc_us", "store.ahead.alloc_max_us", "store.ahead.thread_max_us", "store.ahead.errors", "store.ahead.busy_kicks", "store.ahead.unallocated_growths",     /* (0.7 round 15: the blocks and the segment made ahead) */
   "store.segment.precreated", "store.segment.inline_creates", "store.segment.precreate_errors", "store.segment.precreate_us", "store.segment.precreate_max_us",
   "store.segment.inline_create_max_us", "store.segment.precreate_ready",
   "store.cache.kind", "store.attach.count", "store.attach.failed", "store.attach.fail.checksum", "store.attach.fail.record",

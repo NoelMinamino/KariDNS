@@ -490,7 +490,7 @@ struct store {
    * 0.4 to 0.9 s).  Both are started and stopped with the flusher (bg_start(), bg_stop_join()). */
   pthread_t fl_thr3, fl_thr4;
   ahead_t ah_tab, ah_seg;
-  _Atomic uint64_t n_ah_allocs, n_ah_us, n_ah_max_us, n_ah_errors, n_ah_busy_kicks, n_ah_unahead;   /* store.ahead.*: posix_fallocate() calls of mtab_ahead() (any caller), their total and longest time, those that failed, kicks that found the thread busy, growths that found their blocks not allocated yet */
+  _Atomic uint64_t n_ah_allocs, n_ah_us, n_ah_max_us, n_ah_errors, n_ah_busy_kicks, n_ah_unahead, n_ah_thread_max_us;   /* store.ahead.*: posix_fallocate() calls of mtab_ahead() (any caller), their total and longest time, those that failed, kicks that found the thread busy, growths that found their blocks not allocated yet */
   /* The segment made ahead (seg_pre_*): pre_mu protects pre_state (its writes), pre_n and pre_g.  PRE_NONE -> PRE_BUSY (the thread, with the writer mutex held, picks the number: pre_n) -> PRE_READY (the file is made, the descriptor is in pre_g) -> PRE_NONE
    * (seg_place() took it under the writer mutex), or READY -> STALE (seg_place() found it made for a number that is not the next one) -> NONE (the thread removed the file; a close does the same).  Order: wlock, then pre_mu; nothing is waited for under pre_mu. */
   pthread_mutex_t pre_mu;
@@ -6353,6 +6353,7 @@ void store_stats(const store_t *s, store_stats_t *o) {
   o->ahead_allocs = atomic_load_explicit(&s->n_ah_allocs, memory_order_relaxed);
   o->ahead_alloc_us = atomic_load_explicit(&s->n_ah_us, memory_order_relaxed);
   o->ahead_alloc_max_us = atomic_load_explicit(&s->n_ah_max_us, memory_order_relaxed);
+  o->ahead_thread_max_us = atomic_load_explicit(&s->n_ah_thread_max_us, memory_order_relaxed);
   o->ahead_errors = atomic_load_explicit(&s->n_ah_errors, memory_order_relaxed);
   o->ahead_busy_kicks = atomic_load_explicit(&s->n_ah_busy_kicks, memory_order_relaxed);
   o->ahead_unallocated_growths = atomic_load_explicit(&s->n_ah_unahead, memory_order_relaxed);
@@ -7083,7 +7084,12 @@ static void *fl_commit_main(void *arg) {
  * early warning of a full disk and a longer checkpoint, never a wrong answer (store.ahead.unallocated_growths counts the growths that found the blocks missing). */
 static void *fl_tab_main(void *arg) {
   store_t *s = arg;
-  while (ahead_wait(&s->ah_tab, 1000, NULL)) tables_ahead(s, 0);
+  while (ahead_wait(&s->ah_tab, 1000, NULL)) {
+    const uint64_t t0 = st_now_us();
+    tables_ahead(s, 0);
+    const uint64_t us = st_now_us() - t0;
+    if (us > atomic_load_explicit(&s->n_ah_thread_max_us, memory_order_relaxed)) atomic_store_explicit(&s->n_ah_thread_max_us, us, memory_order_relaxed);        /* (this thread only) */
+  }
   return NULL;
 }
 /* The thread of the segment ahead (0.7 round 15): when the open segment is half full, the file of the next one is made here, outside the writer mutex (it was made inside it: openat(O_CREAT | O_TRUNC), a
