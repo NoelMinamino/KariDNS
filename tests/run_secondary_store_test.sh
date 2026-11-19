@@ -412,6 +412,7 @@ stop_primary
 start_secondary
 [ "$(serial_of d7.test)" = 50 ] || fail "7: the old file with the higher serial won against the newer copy (serial $(serial_of d7.test))"
 stop_secondary
+sleep 2                                                                                  # (the file's time is compared with the copy's in whole seconds: the stops no longer sleep, so the file must come at least a second later)
 sed 's/ 50 2 1 20 60/ 101 2 1 20 60/' "$W/p/d7.test.zone" > "$W/s/d7.test.zone"        # a newer file with a greater serial
 start_secondary
 [ "$(serial_of d7.test)" = 101 ] || fail "7: a newer file with a greater serial did not win"
