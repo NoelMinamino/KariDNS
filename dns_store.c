@@ -27,11 +27,16 @@
  * cursor, which is made durable only after the entries it covers, has not passed them.  The entries of a group are planned against the state before the group (no cell is written until the record is
  * in the kernel), so a group never holds two entries that touch one name or one source id, and the slots an entry has claimed in the index are skipped by the entries after it (see kn_chunk_t).
  *
- * Durability / group commit.  fdatasync is not issued per call: store_commit() (a batch end), the policy
+ * Durability / group commit.  fsync is not issued per call: store_commit() (a batch end), the policy
  * (sync_interval_ms, default 100 ms), a checkpoint and close do
- *     fdatasync(segments written since the last commit)   -- an image is durable before ...
- *     fdatasync(journal)                                  -- ... the record that points at it
+ *     fsync(segments written since the last commit)   -- an image is durable before ...
+ *     fsync(journal)                                  -- ... the record that points at it
  * so after power loss the journal prefix that was synced is complete and only points at durable images.
+ *
+ * fsync(), never fdatasync() (0.7, measured on FreeBSD 15.1 UFS with soft updates, in a bhyve guest with the power cut by bhyvectl --destroy): fdatasync() of a file that grew by an append,
+ * or of a new file whose only write was its first, is not durable there, fsync() is (planning: 2026-11-19_first_fill_ab/vps, fdtest).  With fdatasync the superblocks of a store that was cut
+ * within 30 s of its first start were 0 bytes (the whole store lost), the tail of the journal was lost, and thousands of changed zones were damaged.  fsync() costs the same on ZFS (the ZIL
+ * is written for both).  A new file is durable only with its directory entry: the directory is fsynced after files are created (dir_dirty, create_store(), a checkpoint).
  *
  * No I/O wait inside the writer mutex (0.7 fix A).  At 10M zones a checkpoint's msync of the tables took 1.5 to 25 s and a growth of the index
  * 6 s, all of it inside the writer mutex, and the threads that wait for the mutex hold the record mutex of the Backend meanwhile.  Now:
@@ -83,9 +88,9 @@
  *   - The private pages (dmap_t.priv: written since the open) are memory the kernel cannot drop: store.tables.private_bytes, counted in memory-limit by the Backend.
  *
  * Checkpoint (store_checkpoint(), by the journal size limit, by checkpoint_interval_ms, at close, after recovery).
- *     switch to the next journal file; commit up to P; write + fdatasync the changed pages of every table; fdatasync the new journal and the directory;
+ *     switch to the next journal file; commit up to P; write + fsync the changed pages of every table; fsync the new journal and the directory;
  *     write the *other* superblock copy (seq+1, checkpoint LSN = P, names the new journal gen and the ix / sx generations of P, counters,
- *     views, cursors, CRC-32C); fdatasync it; delete journals / generations that neither superblock copy names any more.  The older copy plus
+ *     views, cursors, CRC-32C); fsync it; delete journals / generations that neither superblock copy names any more.  The older copy plus
  *     the journals it names stays valid, so a damaged newer copy costs nothing: the open uses the older one and replays the longer journal
  *     chain.  Growth of ix / sx (a new generation file) is bridged by an OP_GEN record in the journal chain: a replay from a checkpoint before
  *     it applies the records before it to the old generation and switches to the new one; since the tables are private memory (0.7) that file may
@@ -114,7 +119,7 @@
  *
  * The cleaner (design 3.2).  A segment whose records are mostly dead (replaced or deleted zones) is cleaned: its live records are copied,
  * byte for byte, to the open segment and each zone's zt cell gets the new location.  One move = one journal record (the appended bytes
- * are written and, at the commit, fdatasynced before the record is; the record carries the whole new cell and the counters), so after
+ * are written and, at the commit, fsynced before the record is; the record carries the whole new cell and the counters), so after
  * kill -9 or a power loss a zone's record is either at the old or at the new place, never missing and never in two places that the
  * zone's cell names.  The old segment is removed only when
  *     (a) it has no live record left (the counters say so), and it is not the open segment,
@@ -718,6 +723,7 @@ _Atomic long store_test_crash_countdown = 0;
 void (*store_test_before_counters)(store_t *s) = NULL;
 _Atomic long store_test_fail_commit = 0;
 _Atomic long store_test_fail_ckwrite = 0;
+_Atomic long store_test_fail_map = 0;      /* the n-th reservation of address space of a table fails with ENOMEM (a limit of address space, ulimit -v) */
 /* a writer function of the store (its name: "put", "set_known", "delete", "set_flags", "set_stamp", "set_cursor") fails before it changes anything with the errno this returns (0: no failure) */
 int (*store_test_write_fault)(const char *op, uint32_t zid) = NULL;
 void (*store_test_in_stats)(void) = NULL;
@@ -744,10 +750,12 @@ static bool st_fail_nth(_Atomic long *n) {
 #define CRASH_POINT() st_crash_point()
 #define FAIL_COMMIT() st_fail_nth(&store_test_fail_commit)
 #define FAIL_CKWRITE() st_fail_nth(&store_test_fail_ckwrite)
+#define FAIL_MAP() st_fail_nth(&store_test_fail_map)
 #else
 #define CRASH_POINT() ((void)0)
 #define FAIL_COMMIT() false
 #define FAIL_CKWRITE() false
+#define FAIL_MAP() false
 #define AHEAD_HOOK(s, site) ((void)0)
 #define ST_FAULT(op, zid) ((void)0)
 #define ST_FAULT_RES(op, zid, res) ((void)0)
@@ -1409,7 +1417,7 @@ static int mtab_open(store_t *s, mtab_t *t, const char *name, uint32_t kind, uin
   if (st.st_size < (off_t)ST_HDR_PAGE) return -EBADMSG;
   uint64_t data = ((uint64_t)st.st_size - ST_HDR_PAGE) & ~((uint64_t)s->pagesz - 1);
   if (data > reserve) return -EFBIG;
-  void *base = mmap(NULL, reserve, PROT_NONE, MAP_ANON | MAP_PRIVATE, -1, 0);
+  void *base = FAIL_MAP() ? (errno = ENOMEM, MAP_FAILED) : mmap(NULL, reserve, PROT_NONE, MAP_ANON | MAP_PRIVATE, -1, 0);
   if (base == MAP_FAILED) return -errno;
   t->base = base;
   t->reserve = reserve;
@@ -1446,7 +1454,7 @@ static bool st_no_fallocate(int r) { return r == EINVAL || r == EOPNOTSUPP || r 
 static void fs_probe(store_t *s);
 static void space_used(store_t *s, uint64_t n);
 /* grow the data area to at least `need` bytes (never shrinks); the address of existing data does not change.  The new pages are anonymous memory, and no operation on the file is made
- * here (inside the writer mutex): UFS's posix_fallocate() syncs the file's vnode and waits for the lock that a checkpoint's fdatasync() of the table holds (holds of seconds).  The
+ * here (inside the writer mutex): UFS's posix_fallocate() syncs the file's vnode and waits for the lock that a checkpoint's fsync() of the table holds (holds of seconds).  The
  * room is checked against the free space (fs_probe(): a full disk is -ENOSPC now, not a checkpoint that cannot write); the flusher allocates the blocks ahead
  * (mtab_ahead()) and the checkpoint extends the file to the size of its position (ck_write_tab()). */
 static int mtab_grow(store_t *s, mtab_t *t, uint64_t need) {
@@ -2651,14 +2659,14 @@ static void commit_unmark(store_t *s, seg_t *const *seg, uint32_t nseg, bool dir
 static int commit_sync(store_t *s, uint64_t target, seg_t *const *seg, uint32_t nseg, bool dir, int fd) {
   int r = FAIL_COMMIT() ? -EIO : 0;
   for (uint32_t k = 0; k < nseg && r == 0; k++)
-    if (fdatasync(seg[k]->fd) != 0) r = -errno;
+    if (fsync(seg[k]->fd) != 0) r = -errno;
   CRASH_POINT();
   if (r == 0 && dir && fsync(s->dirfd) != 0 && errno != EINVAL && errno != ENOTSUP) r = -errno;
   if (r == 0 && s->jold >= 0) {                      /* (rule F: the callers waited for a position past jold_end) */
-    if (fdatasync(s->jold) != 0) r = -errno;
+    if (fsync(s->jold) != 0) r = -errno;
     else { close(s->jold); s->jold = -1; }
   }
-  if (r == 0 && fd >= 0 && fdatasync(fd) != 0) r = -errno;
+  if (r == 0 && fd >= 0 && fsync(fd) != 0) r = -errno;
   if (r < 0) {
     commit_unmark(s, seg, nseg, dir);
     return r;
@@ -2676,7 +2684,7 @@ static void ck_precreate(store_t *s);
 static int jold_sync(store_t *s) {
   if (s->jold < 0) return 0;
   int r = jw_wait(s, s->jold_end, NULL);
-  if (r == 0 && fdatasync(s->jold) != 0) r = -errno;
+  if (r == 0 && fsync(s->jold) != 0) r = -errno;
   if (r == 0) { close(s->jold); s->jold = -1; }
   return r;
 }
@@ -2812,7 +2820,7 @@ static int sb_read(store_t *s, int slot, sb_t *b) {
 static int sb_store(store_t *s) {
   const int slot = s->sb_next;
   int r = st_pwrite_all(s->sb_fd[slot], s->sbbuf, ST_SB_SIZE, 0);
-  if (r == 0 && fdatasync(s->sb_fd[slot]) != 0) r = -errno;
+  if (r == 0 && fsync(s->sb_fd[slot]) != 0) r = -errno;
   if (r < 0) return r;
   s->sb_seq = s->sbbuf->f.seq;
   s->slot_jrn[slot] = s->sbbuf->f.jrn_gen;
@@ -2903,7 +2911,7 @@ static int ck_io_commit(store_t *s, bool full) {
   }
   /* with the writers kept out (full): the file the superblock names (its header) and its directory entry are durable now; a fuzzy checkpoint leaves that to ck_io_super() */
   if (r == 0 && full) {
-    if (fdatasync(s->ck.newfd) != 0) r = -errno;
+    if (fsync(s->ck.newfd) != 0) r = -errno;
     else if (fsync(s->dirfd) != 0 && errno != EINVAL && errno != ENOTSUP) r = -errno;
     else if (s->ck.gen > s->jrn_synced) s->jrn_synced = s->ck.gen;
   }
@@ -3038,7 +3046,7 @@ static int ck_tab_end(int fd, uint64_t bytes, bool wrote) {
     if (r < 0) return r;
     wrote = true;
   }
-  if (wrote && fdatasync(fd) != 0) return -errno;
+  if (wrote && fsync(fd) != 0) return -errno;
   return 0;
 }
 static int ck_write_tab(store_t *s, int i, int fd, const uint8_t *base, const _Atomic bool *cancel, uint64_t *done) {
@@ -4378,7 +4386,7 @@ static int seg_append(store_t *s, uint32_t zid, uint16_t view, const uint8_t *fn
 }
 
 /* ---- 0.7: the image of a store_put() is written before the writer mutex ----
- * Inside the mutex the pwritev() of the image waited for the vnode lock that a commit's fdatasync() of the open segment holds (UFS; 0.2 to 0.5 s at 10M zones under load), and every writer
+ * Inside the mutex the pwritev() of the image waited for the vnode lock that a commit's fsync() of the open segment holds (UFS; 0.2 to 0.5 s at 10M zones under load), and every writer
  * waited behind it.  Now store_put() serialises the writers of images (ap_mu: store_put() and the cleaner, the only ones that append to a segment), takes the writer mutex for a moment to
  * read where the record goes (the zone's id and its record before, the open segment and its end), writes the record there with the mutex released, marks the segment dirty, and then
  * makes the change inside the mutex as before, with the record already in place.  The order is kept: the image is in the kernel before the journal record that points at it (kill -9),
@@ -7217,6 +7225,8 @@ static void files_close(store_t *s) {
 }
 
 /* Adopt the state of superblock copy b: open and check the table files.  On failure the files are closed again. */
+/* a failure that says nothing about the files: the open fails with it and nothing is moved aside (only -EBADMSG, damage or another format, is) */
+static bool st_resource_err(int r) { return r == -ENOMEM || r == -EAGAIN || r == -EMFILE || r == -ENFILE || r == -ENOBUFS; }
 static int adopt_sb(store_t *s, const sb_t *b) {
   memcpy(s->uuid, b->f.uuid, 16);
   s->hk0 = b->f.hk0;
@@ -7391,9 +7401,17 @@ static int create_store(store_t *s) {
   int oldfd = -1;
   r = journal_switch_locked(s, 1, &oldfd, true);      /* (jrn_gen 0: the journal file 1, records from LSN 1) */
   if (r == 0) r = jw_wait(s, s->jr_head, NULL);          /* (its header is in the ring: written before the sync) */
-  if (r == 0 && fdatasync(s->jfd) != 0) r = -errno;
+  if (r == 0 && fsync(s->jfd) != 0) r = -errno;
+  /* the table files (header page, size) and the directory entries of every file made so far are durable before a superblock names them: a checkpoint that finds nothing dirty syncs no table (0.7, UFS) */
+  if (r == 0 && fsync(s->zt.fd) != 0) r = -errno;
+  if (r == 0 && fsync(s->zc.fd) != 0) r = -errno;
+  if (r == 0 && fsync(s->nx.fd) != 0) r = -errno;
+  if (r == 0 && fsync(ix->fd) != 0) r = -errno;
+  if (r == 0 && fsync(sx->fd) != 0) r = -errno;
+  if (r == 0 && fsync(s->dirfd) != 0 && errno != EINVAL && errno != ENOTSUP) r = -errno;
   if (r == 0) r = sb_write(s, false, 1);
   if (r == 0) r = sb_write(s, false, 1);
+  if (r == 0 && fsync(s->dirfd) != 0 && errno != EINVAL && errno != ENOTSUP) r = -errno;      /* (the superblock files were made, empty, by store_open()) */
   return r;
 }
 
@@ -7546,7 +7564,7 @@ static void *fl_commit_main(void *arg) {
   pthread_mutex_unlock(&s->bg_mu);
   return NULL;
 }
-/* The thread of the blocks ahead (0.7 round 15).  A posix_fallocate() of the table files waited 0.5 to 11.3 s on UFS (the vnode lock that a checkpoint's fdatasync() of the table holds, a slow
+/* The thread of the blocks ahead (0.7 round 15).  A posix_fallocate() of the table files waited 0.5 to 11.3 s on UFS (the vnode lock that a checkpoint's fsync() of the table holds, a slow
  * disk) and stood in the commit thread, which makes the periodic commits and leads the journal ring for the deferred records.  It is here now, on its own: when it lags nothing waits for it.  The
  * growth of a table (mtab_grow(), inside the writer mutex) is a mapping and a check of the free space, the blocks are not needed for it; what is not allocated yet the checkpoint allocates when it
  * extends the file to the size of its position (ck_write_tab(): a delay of the checkpoint, which has its own thread, and the same ENOSPC / EIO handling as for any growth), so a lagging thread costs the
@@ -7568,7 +7586,7 @@ static void *fl_tab_main(void *arg) {
  * Durability (rules F, N4, the same argument as for the journal files made ahead, ck_precreate()): a directory entry is durable before any durable record names it.  The file is made, the header is
  * written and (MAP mode) the file is given its size here; then dir_dirty is set, and only then the file is published (PRE_READY).  The first record that names the segment (an image appended to it, the
  * journal record with its counters) is written after seg_place() took it, so after dir_dirty was set.  A commit that makes that journal record durable took dir_dirty under the writer mutex after the
- * record's LSN: it finds the flag set, or an earlier commit took it, and the commits go one at a time (the baton): that one's fsync() of the directory is over before this one's fdatasync() of the journal
+ * record's LSN: it finds the flag set, or an earlier commit took it, and the commits go one at a time (the baton): that one's fsync() of the directory is over before this one's fsync() of the journal
  * (commit_sync(): segments, directory, journal), and a failed one sets the flag again.  So the directory entry is synced before the journal record that names the file can be durable, as it was when the
  * file was made inside the mutex; the entry may be durable much earlier, which does no harm.  The segment's bytes are synced by the same commit (seg_dirty, set at the first append) before the directory.
  *
@@ -7820,8 +7838,13 @@ int store_open(int dirfd, const store_opts_t *opts, store_t **out) {
       if (rc[i] != 0) continue;
       r = adopt_sb(s, cand[i]);
       if (r == 0) used = i;
+      else if (st_resource_err(r)) break;      /* (no address space, memory or descriptors: the other copy would fail the same way, and the store is not damaged) */
     }
     if (used < 0) {
+      if (st_resource_err(r)) {                /* (0.7: with ulimit -v the reservations of the tables failed and the open moved a valid store aside) */
+        st_log(s, 3, "store: cannot open the store, the directory is left as it is: %s", strerror(-r));
+        goto fail;
+      }
       st_log(s, 3, "store: no usable superblock copy (%d, %d)", rc[0], rc[1]);
       r = -EBADMSG;
       goto fail;

@@ -8282,6 +8282,59 @@ static void test_torn_pairs(bool bulk) {
   tdir_free(&d);
 }
 
+/* 0.7: no address space for the reservations of the tables (ulimit -v: mmap fails with ENOMEM) is not damage: the open fails with ENOMEM, nothing is moved aside, and the open after it finds the store */
+static int dir_count(const tdir_t *d) {
+  int n = 0;
+  DIR *dp = opendir(d->path);
+  if (!dp) return -1;
+  while (readdir(dp)) n++;
+  closedir(dp);
+  return n;
+}
+static void test_open_enomem(void) {
+  printf("[an ENOMEM of the reservations of the tables does not move the store aside]\n");
+  tdir_t d;
+  tdir_new(&d, "enomem");
+  store_opts_t o;
+  small_opts(&o);
+  store_t *s = NULL;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (!s) { tdir_free(&d); return; }
+  CHECK_EQ(store_view_add(s, "default"), 0);
+  for (uint32_t i = 1; i <= 20; i++) CHECK_EQ(put_i(s, 0, i, 1, NULL), 0);
+  CHECK_EQ(store_close(s), 0);
+  const int before = dir_count(&d);
+  struct stat sa, sb;
+  char pa[700], pb[700];
+  fpath(&d, "super.a", pa, sizeof(pa));
+  fpath(&d, "super.b", pb, sizeof(pb));
+  CHECK_EQ(stat(pa, &sa), 0);
+  CHECK_EQ(stat(pb, &sb), 0);
+  for (long n = 1; n <= 3; n++) {                                         /* (the reservation of zt, of zc, of nx) */
+    atomic_store(&store_test_fail_map, n);
+    s = NULL;
+    o.create = true;
+    CHECK_EQ(store_open(d.fd, &o, &s), -ENOMEM);
+    CHECK(s == NULL);
+    atomic_store(&store_test_fail_map, 0);
+    CHECK_EQ(dir_count(&d), before);                                      /* (no quarantine directory, no file gone) */
+    struct stat a2, b2;
+    CHECK_EQ(stat(pa, &a2), 0);
+    CHECK_EQ(stat(pb, &b2), 0);
+    CHECK_EQ(a2.st_size, sa.st_size);
+    CHECK_EQ(b2.st_size, sb.st_size);
+  }
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (s) {
+    store_stats_t st;
+    store_stats(s, &st);
+    CHECK(!st.recovery.created);
+    for (uint32_t i = 1; i <= 20; i++) CHECK(verify_i(s, 0, i, 1));
+    CHECK_EQ(store_close(s), 0);
+  }
+  tdir_free(&d);
+}
+
 int main(void) {
   const char *base = getenv("KARIDNS_STORE_TESTDIR");
   snprintf(g_base, sizeof(g_base), "%s/store_test.%d", base && *base ? base : ".", (int)getpid());
@@ -8358,6 +8411,7 @@ int main(void) {
   }
   if (WANT("bulk")) { test_bulk_end_retry(); test_bulk_dead_store(); }
   if (WANT("bulk") || WANT("repair")) { test_rebuild_torn_name(); test_rebuild_names(); }
+  if (WANT("repair") || WANT("enomem")) test_open_enomem();
   if (WANT("bulk") || WANT("pairs")) { test_torn_pairs(true); test_torn_pairs(false); }
   if (WANT("clk")) {
     int citers = getenv("KARIDNS_STORE_KILLC_ITERS") ? atoi(getenv("KARIDNS_STORE_KILLC_ITERS")) : (UNDER_TSAN ? 25 : store_long() ? 100 : 50);

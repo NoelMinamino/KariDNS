@@ -16,7 +16,7 @@
  * What a caller has to know:
  *
  *  Threads.  One writer thread at a time (every writer function takes the store's writer mutex, so a second thread is safe but
- *  serialised); any number of lock-free readers.  No writer call waits for the disk inside the mutex (0.7 fix A): the fdatasync of the
+ *  serialised); any number of lock-free readers.  No writer call waits for the disk inside the mutex (0.7 fix A): the fsync of the
  *  journal and the segments (the commit), the msync of the tables (the checkpoint) and the build of a bigger index run outside it, on the
  *  store's flusher thread and on a thread of its own for a growth (both started by the store; see the comment at the top of dns_store.c).  Reader functions (store_find, store_find_source, store_zone_get,
  *  store_image_read, store_iter) must be called inside an RCU read section of the project's epoch RCU (dns_epoch_rcu.h):
@@ -40,7 +40,7 @@
  *  over a delete can tell that it was reused.
  *
  *  Capsicum.  Everything is done through the directory fd: openat (O_CREAT, O_TRUNC; O_RESOLVE_BENEATH when available), pread, pwrite,
- *  pwritev, mmap (rw shared for the tables, ro for segments), msync, madvise, mincore, fsync, fdatasync, ftruncate, posix_fallocate, fstat, fstatfs,
+ *  pwritev, mmap (rw shared for the tables, ro for segments), msync, madvise, mincore, fsync, fsync, ftruncate, posix_fallocate, fstat, fstatfs,
  *  unlinkat (the cleaner removes segments, the open removes old generations); renameat and mkdirat (and readdir) only in store_quarantine(), which the Frontend runs before it hands the fd over.
  *  The store starts a detached thread for the zt read-ahead after the open, the flusher thread (commits and checkpoints) and, while an index
  *  grows, a detached thread that builds the bigger index; store_close() waits for all of them.
@@ -87,7 +87,7 @@ enum { STORE_STATE_FREE = 0, STORE_STATE_KNOWN = 1, STORE_STATE_STORED = 2 };
 enum { STORE_MODE_AUTO = 0, STORE_MODE_MAP = 1, STORE_MODE_COPY = 2 };
 /* journal sync policy */
 enum {
-  STORE_SYNC_BATCH = 0,   /* default: fdatasync at store_commit() and at least every sync_interval_ms */
+  STORE_SYNC_BATCH = 0,   /* default: fsync at store_commit() and at least every sync_interval_ms */
   STORE_SYNC_EVERY = 1,   /* every writer call is committed before it returns */
   STORE_SYNC_NONE  = 2    /* only checkpoints and close sync (bulk loads, tests) */
 };
@@ -505,7 +505,7 @@ int  store_set_cursor(store_t *s, uint16_t source, uint64_t cursor, const void *
 int  store_get_cursor(store_t *s, uint16_t source, bool *valid, uint64_t *cursor, void *ident, size_t *ident_len);
 /* announce the number of zones of a first fill: sizes zt / zc / ix / sx once (a checkpoint barrier) */
 int  store_reserve(store_t *s, uint64_t zones);
-/* group commit point: fdatasync the segments written and the journal.  After it every writer call made before is durable.  It waits for the disk without the writer mutex
+/* group commit point: fsync the segments written and the journal.  After it every writer call made before is durable.  It waits for the disk without the writer mutex
  * (writers go on meanwhile); concurrent callers share one sync. */
 int  store_commit(store_t *s);
 /* 0.7: the bound of the journal.  A writer that holds no lock of its own (the caller's locks: a thread that waits for one of them would wait with it) calls this between its writes:
@@ -654,10 +654,11 @@ extern void (*store_test_before_counters)(store_t *s);
 extern _Atomic long store_test_rg_tail;
 /* the longest wait of store_index_wait() in milliseconds (-1: the built-in 30000) */
 extern _Atomic long store_test_rg_wait_ms;
-/* a commit fails with -EIO at the n-th one (0 = off): a failed fdatasync */
+/* a commit fails with -EIO at the n-th one (0 = off): a failed fsync */
 extern _Atomic long store_test_fail_commit;
 /* the n-th write of a run of table pages by a checkpoint fails with -EIO (0 = off) */
 extern _Atomic long store_test_fail_ckwrite;
+extern _Atomic long store_test_fail_map;
 /* the bytes of the table files (zt, zc, nx, the current ix and sx) equal the memory of the store: true after a checkpoint with the writers kept out (store_checkpoint_clean()) */
 bool store_test_files_match(store_t *s);
 /* a hold of the writer mutex by the function `site` that lasted `us` microseconds (its start is set back): the counters of the holds as for a real one */
