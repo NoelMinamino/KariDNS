@@ -138,7 +138,12 @@ static int xdp_open(dq_io_t **out, const dq_cfg_t *c, dq_target_t *tg, unsigned 
     sc.tx_size = XSK_RING_PROD__DEFAULT_NUM_DESCS;
     sc.xdp_flags = !strcmp(c->xdp_mode, "skb") ? XDP_FLAGS_SKB_MODE : !strcmp(c->xdp_mode, "drv") ? XDP_FLAGS_DRV_MODE : 0;
     sc.bind_flags = XDP_USE_NEED_WAKEUP;
-    r = xsk_socket__create(&x->xsk, tg->ifname, c->queue + worker, x->umem, &x->rx, &x->tx, &sc);
+    /* the queue of a socket that was just closed (the run before) is released a moment later: EBUSY is retried for about a second */
+    for (int tries = 0;; tries++) {
+        r = xsk_socket__create(&x->xsk, tg->ifname, c->queue + worker, x->umem, &x->rx, &x->tx, &sc);
+        if (r != -EBUSY || tries >= 20) break;
+        dq_sleep_us(50000);
+    }
     if (r) {
         x->xsk = NULL;
         snprintf(err, errlen, "xsk_socket__create on %.40s queue %u: %s (needs root or CAP_NET_RAW + CAP_BPF; the interface must exist and have that queue)",
