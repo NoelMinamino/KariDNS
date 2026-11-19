@@ -1,6 +1,7 @@
 /* dnsqps: the parser of an answer.  The bytes come from the network: every offset is checked against the length before it is read (RFC 1035 4.1,
  * names end at a root label or a compression pointer, which is not followed: the walk only needs the length of a name). */
 #include "dnsqps.h"
+#include <string.h>
 
 /* the offset after the name at off, 0 when it runs past the end or uses a reserved label type */
 static size_t skip_name(const uint8_t *p, size_t n, size_t off) {

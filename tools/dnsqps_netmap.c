@@ -154,8 +154,7 @@ int dq_netmap_reflect(const dq_cfg_t *c, const atomic_bool *stop, char *err, siz
     struct nm_desc *d = nm_open(name, NULL, 0, NULL);
     if (!d) { snprintf(err, errlen, "nm_open(%.60s) failed: %s", name, strerror(errno)); return -1; }
     uint8_t out[2048];
-    fprintf(stderr, "dnsqps: reflecting on %s port %d (netmap %s)
-", host, port, name);
+    fprintf(stderr, "dnsqps: reflecting on %s port %d (netmap %s)\n", host, port, name);
     while (!atomic_load_explicit(stop, memory_order_relaxed)) {
         struct pollfd pf = { NETMAP_FD(d), POLLIN, 0 };
         poll(&pf, 1, 100);
