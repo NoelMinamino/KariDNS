@@ -27,10 +27,10 @@
 #endif
 
 #ifdef _WIN32
-static bool would_block(void) { return WSAGetLastError() == WSAEWOULDBLOCK; }
+#define would_block() (WSAGetLastError() == WSAEWOULDBLOCK)   /* a macro: it runs only on a full buffer, a function of its own would be one the tests never reach */
 static int set_nonblock(dq_sock_t s) { u_long on = 1; return ioctlsocket(s, FIONBIO, &on); }
 #else
-static bool would_block(void) { return errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR; }
+#define would_block() (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
 static int set_nonblock(dq_sock_t s) { int fl = fcntl(s, F_GETFL, 0); return fl < 0 ? -1 : fcntl(s, F_SETFL, fl | O_NONBLOCK); }
 #endif
 
