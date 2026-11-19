@@ -1,0 +1,80 @@
+name: dnsqps dev (temporary)
+
+on:
+  push:
+    branches:
+      - 'feature/dnsqps-07'
+
+jobs:
+  unix:
+    name: dnsqps on ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: Linux
+          - os: macos-15
+            name: macOS
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: sh .github/scripts/apt-install.sh libssl-dev zlib1g-dev libidn2-dev libxdp-dev libbpf-dev
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install openssl@3 zlib libidn2
+      - name: Build dag (configure)
+        run: |
+          ./configure --with-db-drivers=none
+          make clean
+      - name: dnsqps
+        run: sh tests/run_ci_dnsqps.sh
+      - name: dnsqps AF_XDP on a veth pair
+        if: runner.os == 'Linux'
+        run: sudo DNSQPS_TEST_REQUIRE=1 sh tests/run_dnsqps_xdp_test.sh
+
+  windows:
+    name: dnsqps on Windows
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-openssl
+            mingw-w64-x86_64-zlib
+            mingw-w64-x86_64-libidn2
+            make
+            perl
+      - name: dnsqps.exe
+        shell: msys2 {0}
+        run: |
+          ./configure --with-db-drivers=none
+          make clean
+          sh tests/run_ci_dnsqps.sh --no-unit
+
+  freebsd:
+    name: dnsqps on FreeBSD 15.1
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: vmactions/freebsd-vm@v1.4.8
+        with:
+          release: '15.1'
+          run: |
+            set -e
+            pkg install -y perl5
+            ./configure --with-db-drivers=none
+            make -j2 dnsqps test_dnsqps dnsqps-asan test_dnsqps-asan fuzz_dnsqps_resp fuzz_dnsqps_args 2>&1 | tee dq_build.log
+            ! grep -E 'dnsqps[a-z_]*\.c:[0-9]+:[0-9]+: warning' dq_build.log
+            ./test_dnsqps
+            ./test_dnsqps-asan
+            sh tests/run_dnsqps_test.sh
+            DNSQPS_TEST_REQUIRE=1 sh tests/run_dnsqps_netmap_test.sh
+            for t in fuzz_dnsqps_resp fuzz_dnsqps_args; do tests/fuzz/$t -runs=50000 -close_fd_mask=3 tests/fuzz/corpus_$t; done
