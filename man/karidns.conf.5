@@ -5207,71 +5207,80 @@ crash between a growth of an index and the next checkpoint (the new \fBix.N\fR /
 \fBzt.1\fR, a few seconds at 10 million zones. The files stay in the format of
 earlier versions; go back to an earlier version only after a clean stop. \fBThe
 first fill without a journal (0.7).\fR The first fill of an empty store (the
-first pass finds no zone record in any view and reserves the tables for the
-zones the loader announces) keeps no journal: the database holds every zone, so
-a fill that a crash cuts off can be read again. Before the first change the
-store makes a superblock durable that says so; from then on the writers (the
-pass, the bodies, a secondary's copy, a dynamic update kept in the store) change
-the tables as before but write no journal record, nothing is synced by a commit,
-and no checkpoint is made by the size of the journal or by its interval; the
-cleaner and the scrub wait for the end of the fill (\fBkarictl store compact\fR
-and \fBstore scrub\fR say it is busy). While the bodies are fetched the store
-makes \fIbulk checkpoints\fR, its durable points: the segments are synced, the
-changed pages of the zone table and the long names are written (not the indexes,
-which a recovery rebuilds), each time the segments have doubled since the last
-one and grew by 4 GiB or more, and 15 minutes after the last one at the latest
-(none during the pass). The fill ends by itself when the pass has ended complete
-and no body of the fill is on its way (a pass that failed or was cut off keeps
-it for the next pass): from then on every change is logged again, and one
-checkpoint writes every table, the indexes included. What it saves: a logged
-fill of 10 million zones on ZFS wrote about 25 GB to the device for 3.5 GB of
-images (lz4), most of it the journal, the checkpoints of the pass and the fsyncs
-of the commits, which ZFS writes twice (through the ZIL); the unlogged fill
-writes the images, 2 or 3 bulk checkpoints and the last one. The cost: \fBa
-crash during the first fill goes back to the last bulk checkpoint\fR (or to the
-empty store, before the first one): nothing is replayed, the tables are rebuilt
-from the zone table (seconds at 10 million zones), a zone whose image is past
-that checkpoint is kept as a known zone and fetched again, the cursors of the
-views are dropped and the loader lists every zone again, and a WARNING says to
-what point the store went back; the zones after it are read from the database
-again, and the server answers meanwhile as for any zone that is not in the
-store. A secondary's copy stored during the fill is lost to the same point (it
-is transferred again at the start). A clean stop in the middle of the fill keeps
-it: the next start needs no rebuild and the rest of the fill is unlogged as
-well. A pass over a store that holds zones already is logged as before, with the
-larger journal of \fBstore.journal.boost\fR. \fBkarictl store\fR shows it as
-\fBstore.bulk.*\fR and \fBstore.journal.bytes_written\fR. \fBThe ARC and a
-restart with many zones (COPY mode).\fR A restart is fast when the records of
-the zones the queries want are in the ARC, and slow when they are not: every
-zone that is not in the ARC costs the read of a whole record of the dataset (16
-KiB with the recommended \fBrecordsize\fR, however small the image is), and the
-zones that are asked for lie in every segment (images are appended in the order
-the zones came). Measured on the build host (8 vCPUs, 10 GB,
-\fBrecordsize=16K\fR, \fBcompression=lz4\fR, \fBvfs.zfs.arc.max\fR 3 GB) with 10
-million zones (12.4 GB of images, 3.5 GB on disk) and 600,000 distinct zones
-asked for, a Zipf load of 400,000 queries a second from the first second of the
-restart: more than half of the records of the store hold at least one of the
-zones that are asked for (about 13 images a record), so the working set is about
-2 GB on disk, more than half of the store, wherever the hot zones are. With the
-ARC warm (the service restarted) 95 % of the steady rate was reached in 5 to 7
-s; with the ARC cold (after a reboot, or after another store has used it) the
-rate stays at 55 to 65 % for 30 s or more, until the 330,000 records have been
-read. That is a limit of the CPU, not of the pool: the pool reads 68,000 random
-records a second at 32 in flight and over 100,000 sequentially, but with the
-queries taking the CPU the restart read 9,000 to 14,000 records a second, each
-costing about 85 microseconds of the pool's read threads (decompression,
-checksum), and threads that read the records ahead (of single zones, or of the
-stretches of the segments the list needs) did not make it faster; putting the
-list in the order of the images' offsets, a window at a time, gained about a
-tenth of the rate while the ARC was cold and cost about as much with the ARC
-warm (the hottest zones of a window then wait for the others), so it is not
-done. So size the ARC for the restart: \fBvfs.zfs.arc.max\fR should hold the
-working set (at least the part of the store that the queries touch, in doubt the
-whole store as \fBzfs list\fR shows it in \fBused\fR, not as
-\fBstore.space.store_bytes\fR shows it, which is the size before compression)
-plus the host's other needs, and do not share a small ARC between the stores of
-several servers; a record size of 8K halves what each miss reads, at the price
-of the compression ratio and of more records to
+first pass finds no zone record in any view and no bytes in the segments, and
+reserves the tables for the zones the loader announces) keeps no journal: the
+database holds every zone, so a fill that a crash cuts off can be read again. A
+configuration with secondary zones whose copies the store keeps fills with the
+journal, as before: their copies must be durable when they are
+acknowledged. Before the first change the store makes a superblock durable that
+says so; from then on the writers (the pass, the bodies) change the tables as
+before but write no journal record, nothing is synced by a commit, and no
+checkpoint is made by the size of the journal or by its interval; the cleaner,
+the removal of empty segments and the scrub wait until the end of the fill is on
+disk (\fBkarictl store compact\fR and \fBstore scrub\fR say it is busy). A
+secondary's copy that is to be stored meanwhile (a secondary added by a
+reconfiguration) ends the fill first and waits for that end to be on disk. While
+the bodies are fetched the store makes \fIbulk checkpoints\fR, its durable
+points: the segments are synced, the changed pages of the zone table and the
+long names are written (not the indexes, which a recovery rebuilds), each time
+the segments have doubled since the last one and grew by 4 GiB or more, and 15
+minutes after the last one at the latest (none during the pass). The fill ends
+by itself when every view has had its pass end complete (a pass that failed or
+was cut off keeps it for the next pass), no body of the fill is on its way and
+the fill has nothing more to fetch (the zones left without a body are the ones
+it does not fetch: refused, or not kept in the store): from then on every change
+is logged again, and one checkpoint, on the store's checkpoint thread, writes
+every table, the indexes included; until it is on disk
+(\fBstore.bulk.end_pending\fR) it is tried again after a failure, and a crash
+meanwhile is a crash of the fill. What it saves: a logged fill of 10 million
+zones on ZFS wrote about 25 GB to the device for 3.5 GB of images (lz4), most of
+it the journal, the checkpoints of the pass and the fsyncs of the commits, which
+ZFS writes twice (through the ZIL); the unlogged fill writes the images, 2 or 3
+bulk checkpoints and the last one. The cost: \fBa crash during the first fill
+goes back to the last bulk checkpoint\fR (or to the empty store, before the
+first one): nothing is replayed, the tables are rebuilt from the zone table
+(seconds at 10 million zones), a zone whose image is past that checkpoint is
+kept as a known zone and fetched again, the cursors of the views are dropped and
+the loader lists every zone again (also at a later start if the next one has no
+database block: \fBstore.bulk.cut\fR), and a WARNING says to what point the
+store went back; the zones after it are read from the database again, and the
+server answers meanwhile as for any zone that is not in the store. Changes made
+after the end of the fill and before its checkpoint is on disk go back with
+it. A clean stop in the middle of the fill keeps it: the next start needs no
+rebuild and the rest of the fill is unlogged as well. A pass over a store that
+holds zones already is logged as before, with the larger journal of
+\fBstore.journal.boost\fR. \fBkarictl store\fR shows it as \fBstore.bulk.*\fR
+and \fBstore.journal.bytes_written\fR. \fBThe ARC and a restart with many zones
+(COPY mode).\fR A restart is fast when the records of the zones the queries want
+are in the ARC, and slow when they are not: every zone that is not in the ARC
+costs the read of a whole record of the dataset (16 KiB with the recommended
+\fBrecordsize\fR, however small the image is), and the zones that are asked for
+lie in every segment (images are appended in the order the zones came). Measured
+on the build host (8 vCPUs, 10 GB, \fBrecordsize=16K\fR, \fBcompression=lz4\fR,
+\fBvfs.zfs.arc.max\fR 3 GB) with 10 million zones (12.4 GB of images, 3.5 GB on
+disk) and 600,000 distinct zones asked for, a Zipf load of 400,000 queries a
+second from the first second of the restart: more than half of the records of
+the store hold at least one of the zones that are asked for (about 13 images a
+record), so the working set is about 2 GB on disk, more than half of the store,
+wherever the hot zones are. With the ARC warm (the service restarted) 95 % of
+the steady rate was reached in 5 to 7 s; with the ARC cold (after a reboot, or
+after another store has used it) the rate stays at 55 to 65 % for 30 s or more,
+until the 330,000 records have been read. That is a limit of the CPU, not of the
+pool: the pool reads 68,000 random records a second at 32 in flight and over
+100,000 sequentially, but with the queries taking the CPU the restart read 9,000
+to 14,000 records a second, each costing about 85 microseconds of the pool's
+read threads (decompression, checksum), and threads that read the records ahead
+(of single zones, or of the stretches of the segments the list needs) did not
+make it faster; putting the list in the order of the images' offsets, a window
+at a time, gained about a tenth of the rate while the ARC was cold and cost
+about as much with the ARC warm (the hottest zones of a window then wait for the
+others), so it is not done. So size the ARC for the restart:
+\fBvfs.zfs.arc.max\fR should hold the working set (at least the part of the
+store that the queries touch, in doubt the whole store as \fBzfs list\fR shows
+it in \fBused\fR, not as \fBstore.space.store_bytes\fR shows it, which is the
+size before compression) plus the host's other needs, and do not share a small
+ARC between the stores of several servers; a record size of 8K halves what each
+miss reads, at the price of the compression ratio and of more records to
 keep. \fBstore.hot.attached_per_s\fR and the ARC counters
 (\fBkstat.zfs.misc.arcstats.demand_data_misses\fR before and after a restart)
 tell which of the two a restart was.

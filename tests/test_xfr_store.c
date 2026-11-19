@@ -894,6 +894,43 @@ static zone_db_entry_t *entv(const char *view, const char *zone) {
   if (s) release_zone_snapshot(s);
   return e;
 }
+/* life 8 (0.7, the unlogged first fill of a store): a configuration whose secondaries keep their copies in the store begins none (a pass stays logged); and a fill that runs anyway (begun here by
+ * hand, as for a store without secondaries) is ended by the first copy written, which waits for the end to be on disk and is then logged */
+static int life8(void) {
+  printf("[life 8: no unlogged fill with secondaries; a copy written during one ends it first]\n");
+  rcu_aux_thread_pin();
+  const time_t now = time(NULL);
+  if (life_start(g_store, true) != 0) return 1;
+  xfr_store_wait_start(5000);
+  wait_pass();
+  store_t *st = db_store_handle();
+  CHECK(st != NULL && xfr_store_active());
+  if (!st) return 1;
+  char why[200];
+  CHECK(db_recon_begin("v1", 1000, false, why, sizeof(why)));             /* (an empty store and a pass that reserves: with no secondary it would be unlogged) */
+  CHECK_EQ(store_bulk(st), 0);
+  store_stats_t ss;
+  store_stats(st, &ss);
+  CHECK_EQ(ss.bulk_fills, 0);
+  db_recon_abort();
+  CHECK_EQ(store_bulk_begin(st), 0);
+  CHECK_EQ(store_bulk(st), 1);
+  zone_db_entry_t *a = ent("a.test.");
+  CHECK(a != NULL);
+  if (!a) return 1;
+  install(a, 10, XFR_ORIGIN_XFR, now - 10, 0);
+  refresh_end(a, XFR_OUT_TRANSFERRED, now - 11);
+  store_stats(st, &ss);
+  CHECK_EQ(store_bulk(st), 0);
+  CHECK(!store_bulk_pending(st));
+  CHECK_EQ(ss.bulk_end_pending, 0);
+  CHECK_EQ(ss.bulk_unlogged_records, 0);                                  /* (the copy was not written unlogged) */
+  store_zone_t z;
+  CHECK(rec("a.test.", XFR_K_CONFIG, &z) && z.state == STORE_STATE_STORED && z.serial == 10);
+  CHECK_EQ(ctr().puts, 1);
+  return 0;
+}
+
 static int life7(void) {
   printf("[life 7: two views whose names have one store tag]\n");
   rcu_aux_thread_pin();
@@ -1072,6 +1109,9 @@ int main(void) {
   run_child(life6);
   snprintf(g_store, sizeof(g_store), "zone-store \"%s/store7\";", g_dir);
   run_child(life7);
+  snprintf(g_store, sizeof(g_store), "zone-store \"%s/store8\";", g_dir);
+  snprintf(g_sdir, sizeof(g_sdir), "%s/store8", g_dir);
+  run_child(life8);
   char cmd[600];
   snprintf(cmd, sizeof(cmd), "rm -rf '%s'", g_dir);
   if (system(cmd) != 0) printf("  (could not remove %s)\n", g_dir);

@@ -114,6 +114,8 @@ watch_fill && pass "the fill ended by itself (store.bulk.active=0)" || fail "the
 [ "$SEEN" = 1 ] && pass "the fill was a bulk fill (store.bulk.active was set)" || fail "store.bulk.active was never set"
 [ "$JW" -le "$JMAX" ] 2>/dev/null && pass "while it ran the journal took $JW bytes (the headers of its files; at most $JMAX)" || fail "the journal took $JW bytes during the fill (more than $JMAX)"
 stored_all && pass "the store holds all $NZ zones" || fail "the store holds $(sf store.zones.stored) of $NZ (known $(sf store.zones.known))"
+end_done() { [ "$(sf store.bulk.end_pending)" = 0 ]; }
+waitfor 120 end_done && pass "the end of the fill is on disk (store.bulk.end_pending=0, made by the checkpoint thread)" || fail "store.bulk.end_pending=$(sf store.bulk.end_pending)"
 UR=$(n0 store.bulk.unlogged_records); BC=$(n0 store.bulk.checkpoints)
 [ "$(sf store.bulk.fills)" = 1 ] && [ "$UR" -ge "$NZ" ] 2>/dev/null && pass "one bulk fill: $UR records unlogged" || fail "bulk.fills=$(sf store.bulk.fills) unlogged_records=$UR"
 [ "$BC" -ge 1 ] 2>/dev/null && pass "the body fill made $BC bulk checkpoint(s) (segments $(sf store.segments.used_bytes) bytes, one at least every $CKB bytes doubled)" || fail "no bulk checkpoint: segments $(sf store.segments.used_bytes)"

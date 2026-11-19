@@ -311,7 +311,18 @@ static int rec_get(store_t *st, uint16_t vid, const xinfo_t *xi, store_zone_t *z
   return r;
 }
 
+/* 0.7: a write of a copy is made durable as any other (the journal): an unlogged first fill of the store (store_bulk_begin(), which a configuration with secondaries does not begin) is ended before
+ * it, and its end waited for (a checkpoint, made by this thread).  A copy written during the fill would be acknowledged and lost to the last bulk checkpoint on a crash.  < 0: the end is not on disk
+ * (the error of its checkpoint, which is tried again): the caller writes nothing now, the next refresh or pass does */
+static int xs_unbulk(store_t *st) {
+  if (!store_bulk_pending(st)) return 0;
+  const int r = store_bulk_end(st, STORE_BULK_END_WAIT);
+  if (r < 0) syslog(LOG_WARNING, "[Store] the copy of a secondary zone is not stored now: the end of the unlogged fill of the store could not be made durable (%s); it is tried again", strerror(-r));
+  return r;
+}
+
 static void rec_delete(store_t *st, uint16_t vid, const char *key, size_t klen, uint32_t zid) {
+  if (xs_unbulk(st) < 0) return;
   if (store_delete_name(st, vid, key, klen) == 0) zs_del(zid);
 }
 
@@ -384,6 +395,10 @@ static void state_of(const xinfo_t *xi, const pin_t *p, time_t attempt_at, xfr_s
 /* the whole image of the active version, with the state (NO_DEGRADE: no room keeps the old copy, M1) */
 static int put_image(store_t *st, uint16_t vid, zone_db_entry_t *e, const xinfo_t *xi, time_t attempt_at) {
   pin_t p;
+  {
+    const int ur = xs_unbulk(st);
+    if (ur < 0) return ur;
+  }
   if (!pin_active(e, &p)) return -ENOENT;
   if (p.last_ok <= 0) p.last_ok = attempt_at;           /* (a version from a file without mtime: the refresh just confirmed it) */
   xfr_state_t s;
@@ -436,6 +451,10 @@ static int put_image(store_t *st, uint16_t vid, zone_db_entry_t *e, const xinfo_
 static int put_state(store_t *st, uint16_t vid, const xinfo_t *xi, uint32_t expect_serial, const xfr_state_t *s) {
   uint8_t dg[STORE_DIGEST_LEN];
   xfr_state_encode(s, dg);
+  {
+    const int ur = xs_unbulk(st);
+    if (ur < 0) return ur;
+  }
   const int r = store_set_digest(st, vid, xi->key, (size_t)xi->klen, expect_serial, 0, dg, STORE_F_XFR, 0);
   if (r == 0) atomic_fetch_add_explicit(&X.state_writes, 1, memory_order_relaxed);
   else if (r == -ESTALE || r == -ENOENT) atomic_fetch_add_explicit(&X.state_stale, 1, memory_order_relaxed);       /* (replaced or gone meanwhile: the next outcome writes again) */
@@ -522,6 +541,7 @@ static void after_refresh_pinned(store_t *st, uint16_t vid16, zone_db_entry_t *e
 enum { RS_OFF = 0, RS_NOT_PENDING, RS_NONE, RS_IDENTITY, RS_BAD, RS_FILE_WON, RS_HAS_VERSION, RS_RESTORED, RS_NOINFO, RS_MEMORY };
 
 static void make_known(store_t *st, uint16_t vid, const xinfo_t *xi, const store_zone_t *z) {
+  if (xs_unbulk(st) < 0) return;
   store_meta_t m;
   memset(&m, 0, sizeof(m));
   m.flags = z->flags;
@@ -759,7 +779,7 @@ static uint64_t gc_run(store_t *st, uint16_t vid, const hset_t *cur, const hset_
       const bool sok = xfr_state_decode(z.digest, sizeof(z.digest), &s) == 0;
       if (sok && (s.kind == XFR_K_DB_SLAVE || s.kind == XFR_K_DB_CONSUMER)) continue;      /* (R3: the database secondaries are P3's: never deleted here) */
       if (sok && s.kind == XFR_K_MEMBER && hset_has(exempt, (uint64_t)tag + 1)) continue;   /* (M6: a catalog of that view has not refreshed since the start) */
-      if (store_delete_name(st, vid, z.name, kl) == 0) {
+      if (xs_unbulk(st) == 0 && store_delete_name(st, vid, z.name, kl) == 0) {
         zs_del(zid);
         deleted++;
       }

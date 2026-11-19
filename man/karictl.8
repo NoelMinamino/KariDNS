@@ -846,12 +846,12 @@ headers of a few files while an unlogged first fill runs (\fBstore.bulk.*\fR)
 \fBstore.bulk.active\fR, \fB.fills\fR, \fB.unlogged_records\fR, \fB.checkpoints\fR, \fB.next_checkpoint_bytes\fR, \fB.since_unix\fR, \fB.ended_unix\fR
 0.7: the first fill of an empty store is unlogged (see "The first fill without a
 journal" under the zone store in karidns.md). \fB.active\fR is 1 while it runs,
-2 once a pass of it has listed every zone (it ends when the bodies are in), 0
-otherwise; \fB.fills\fR counts the fills that began since the start,
-\fB.unlogged_records\fR the changes made without a journal record;
-\fB.checkpoints\fR the bulk checkpoints (the durable points of the fill: made
-while the bodies are fetched, when the segments have doubled since the last one
-and grew by 4 GiB or more, or 15 minutes after the last one),
+2 once the passes of every view have listed their zones (it ends when the fill
+has nothing more to fetch), 0 otherwise; \fB.fills\fR counts the fills that
+began since the start, \fB.unlogged_records\fR the changes made without a
+journal record; \fB.checkpoints\fR the bulk checkpoints (the durable points of
+the fill: made while the bodies are fetched, when the segments have doubled
+since the last one and grew by 4 GiB or more, or 15 minutes after the last one),
 \fB.next_checkpoint_bytes\fR the size of the segments at which the next one is
 due (0 while a pass runs); when the fill began (or was resumed) and when the
 last one ended
@@ -865,6 +865,15 @@ the views were dropped, so the loader lists every zone again),
 \fB.recovered_known\fR the zones whose image was past that checkpoint: kept as
 known zones with their name and stamp, fetched again. A clean stop in the middle
 of a fill needs no rebuild: \fB.resumed\fR is 1 and \fB.recoveries\fR 0
+.TP 8
+\fBstore.bulk.end_pending\fR, \fB.cut\fR
+0.7: \fB.end_pending\fR is 1 from the end of an unlogged fill until the
+checkpoint that clears it on disk is done (the store's checkpoint thread makes
+it, and tries again after a failure; the cleaner, the removal of segments and
+the scrub stay off until then, and a crash meanwhile is a crash of the fill);
+\fB.cut\fR is 1 from the start that found a fill cut off by a crash until a
+start with the database has dropped the cursors of the views (kept on disk
+across a start with no database block)
 .TP 8
 \fBstore.checkpoint.count\fR, \fB.last_unix\fR, \fB.last_us\fR, \fB.max_us\fR, \fB.cancelled\fR
 Checkpoints since the open, when the last one ended, how long it took, the

@@ -362,6 +362,8 @@ typedef struct store_stats {
   uint64_t bulk_since_unix;         /* when the fill began or was resumed (0: none) */
   uint64_t bulk_ended_unix;         /* when the last one ended (store_bulk_end(); 0: none in this session) */
   uint64_t bulk_next_bytes;         /* the segment bytes at which the next bulk checkpoint is due (0: none is due by bytes, a pass runs) */
+  uint32_t bulk_end_pending;        /* 1: the fill is over and the checkpoint that clears the flag on disk is not done yet (it is tried again) */
+  uint32_t bulk_cut;                /* 1: a fill was cut off and the cursors of the views were not dropped yet (store_bulk_cut()) */
 } store_stats_t;
 
 /* What one store_compact() did. */
@@ -520,20 +522,30 @@ uint64_t store_index_wait(store_t *s);
  * The caller ends it on every path that ends the fill (the end of the pass, a pass cut off, a pass dropped by the next one).  Counters: journal_boost (set now), journal_boosts (times asked for),
  * journal_max_bytes (the size in force). */
 void store_journal_boost(store_t *s, bool on);
-/* 0.7, the unlogged bulk fill ("THE BULK FILL" in dns_store.c).  store_bulk_begin(): the first fill of a store that holds no zone record begins: a superblock that says so is made durable (a
- * checkpoint with the writers kept out), and from then on every writer applies its changes without a journal record, no commit syncs anything and no checkpoint is made by the journal's size
- * or by checkpoint_interval_ms; the cleaner and the scrub do not run.  0, -EEXIST (the store holds zone records: the fill stays logged), or the error of the checkpoint.  Idempotent.
+/* 0.7, the unlogged bulk fill ("THE BULK FILL" in dns_store.c).  store_bulk_begin(): the first fill of a store that holds no zone record and no segment bytes begins: a superblock that says so is
+ * made durable (a checkpoint with the writers kept out), and from then on every writer applies its changes without a journal record, no commit syncs anything and no checkpoint is made by the
+ * journal's size or by checkpoint_interval_ms; the cleaner and the scrub do not run.  0, -EEXIST (the store holds zone records or segment bytes: the fill stays logged), or the error of the
+ * checkpoint.  Idempotent.
  * store_bulk_phase(): what the fill does now: STORE_BULK_PASS (a pass lists the zones: no bulk checkpoint), STORE_BULK_BODY (no pass runs: the bodies are fetched; bulk checkpoints are made by
- * the segment bytes and the time, opts.bulk_ckpt_*), STORE_BULK_PASSED (the same, and a pass of the fill ended complete: kept in the superblock).  No effect when no bulk fill runs.
- * store_bulk_end(): the fill is over: the writers log again, and a checkpoint (the writers go on) writes every table whole and clears the flag on disk; its result.  Until that superblock is on
- * disk a crash goes back to the last bulk checkpoint, as during the fill.  A clean stop keeps the fill: the next open goes on with it (no rebuild).  store_bulk(): 0 (none), 1, 2 (PASSED). */
+ * the segment bytes and the time, opts.bulk_ckpt_*), STORE_BULK_PASSED (the same, and the passes of the fill ended complete: kept in the superblock).  No effect when no bulk fill runs.
+ * store_bulk_end(): the fill is over: the writers log again, and the end is pending until a checkpoint (the writers go on) has written every table whole and a superblock without the flag; the
+ * checkpoint thread makes it and tries it again after a failure.  STORE_BULK_END_WAIT: the caller makes it now and gets its result (0: on disk); STORE_BULK_END_IF_PASSED: only while the fill is
+ * in STORE_BULK_PASSED (a pass that began meanwhile keeps it).  While the end is pending the cleaner, the removal of segments and the scrub stay off, and a crash goes back to the last bulk
+ * checkpoint as during the fill.  A clean stop keeps the fill: the next open goes on with it (no rebuild).  store_bulk(): 0 (none), 1, 2 (PASSED); store_bulk_pending(): the fill runs, or its
+ * end is not on disk yet.  store_bulk_cut(): an open found a fill that a crash cut off and the caller has not dropped the cursors of its views since (kept in the superblock until
+ * store_bulk_cut_done()). */
 #define STORE_BULK_PASS   1
 #define STORE_BULK_BODY   2
 #define STORE_BULK_PASSED 3
+#define STORE_BULK_END_WAIT      1u
+#define STORE_BULK_END_IF_PASSED 2u
 int  store_bulk_begin(store_t *s);
 void store_bulk_phase(store_t *s, int phase);
-int  store_bulk_end(store_t *s);
+int  store_bulk_end(store_t *s, unsigned how);
 int  store_bulk(const store_t *s);
+bool store_bulk_pending(const store_t *s);
+bool store_bulk_cut(const store_t *s);
+void store_bulk_cut_done(store_t *s);
 /* the time-driven part: the commit and the checkpoint that are due (the flusher thread makes them by itself; without it the tick does), and (0.7 WP9) the work of the
  * background: the cleaner (at opts.compact_rate), the removal of the segments it emptied, the nx pass, the free-space check, the scrub (at opts.scrub_rate).  Call about once per
  * second from the store's thread, which is not inside a read section; a call takes up to about 300 ms when there is work. */
