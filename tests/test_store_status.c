@@ -185,6 +185,8 @@ static const char *REQUIRED[] = {
   "store.journal.lsn", "store.checkpoint.count", "store.writes.puts", "store.writes.errors", "store.recovery.created", "store.recovery.open_us",
   "store.writes.growths_background", "store.flusher", "store.lock.writer_holds", "store.lock.writer_holds_slow", "store.lock.writer_hold_max_us", "store.lock.writer_hold_max_site",     /* (0.7 fix A; the site: 0.7 leftovers) */
   "store.journal.bound_bytes", "store.journal.peak_bytes", "store.journal.limit_waits", "store.journal.limit_wait_us", "store.journal.limit_wait_max_us",
+  "store.index.waits", "store.index.wait_us", "store.index.wait_max_us", "store.index.wait_giveups",                         /* (0.7 round 10: the wait for the build of the next index) */
+  "store.journal.boost", "store.journal.boosts",                                                                                     /* (0.7 round 12: the larger bound of a bulk fill) */
   "store.checkpoint.max_us", "store.checkpoint.cancelled",                                                                                  /* (0.7: the journal bound) */
   "store.cache.kind", "store.attach.count", "store.attach.failed", "store.attach.fail.checksum", "store.attach.fail.record",
   "store.attach.fail.invalid", "store.attach.fail.io", "store.attach.fail.memory", "store.attach.fail.other", "store.attach.p50_us",
@@ -558,6 +560,8 @@ static void test_store(int mode, const char *base) {
   CHECK_EQ(kv_num("store.space.degraded_puts"), 0);
   CHECK_EQ(kv_num("store.scrub.passes"), 0);
   CHECK_EQ(kv_num("store.journal.max_bytes"), 100u << 20);
+  CHECK_EQ(kv_num("store.journal.boost"), 0);
+  CHECK_EQ(kv_num("store.journal.boosts"), 0);
   CHECK(kv_num("store.space.reserve_bytes") >= (256u << 10));
   CHECK(kv_num("store.space.fs_total_bytes") > 0);       /* (the free space was read at the open) */
   CHECK(kv_num("store.space.store_bytes") > 0);

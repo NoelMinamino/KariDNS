@@ -3759,10 +3759,12 @@ directory): directory mode 0700 ... \fRstore none;\fB in the database block
 turns it off\fR). Disk use: the compact image of every installed zone (about a
 kilobyte for a small zone, about as much as the zones take in memory), 64 bytes
 + 64 bytes of tables for each zone, the index files (about 24 bytes a zone) and
-a journal of at most 100 MiB; \fBkarictl store\fR shows the
-figures. \fBkaricheck conf\fR reports a directory whose parent does not exist,
-and one that the start would refuse for its owner or mode (not root or the user
-of \fBoptions { user }\fR, writable by group or others).
+a journal of at most 100 MiB (400 MiB while the first fill of a large database
+runs and the file system has 12.5 GiB or more free: \fBstore.journal.boost\fR in
+\fBkarictl.md\fR); \fBkarictl store\fR shows the figures. \fBkaricheck conf\fR
+reports a directory whose parent does not exist, and one that the start would
+refuse for its owner or mode (not root or the user of \fBoptions { user }\fR,
+writable by group or others).
 .TP 8
 \fBstore\-mode auto|map|copy;\fR
 \fIDefault:\fR \fBauto\fR

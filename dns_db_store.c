@@ -406,6 +406,7 @@ void (*db_store_test_commit_hook)(int where, const char *zone);
 #endif
 store_t *db_store_handle(void) { return atomic_load_explicit(&G.st, memory_order_acquire); }
 uint64_t db_store_journal_wait(unsigned factor) { return store_journal_wait(atomic_load_explicit(&G.st, memory_order_acquire), factor); }
+uint64_t db_store_index_wait(void) { return store_index_wait(atomic_load_explicit(&G.st, memory_order_acquire)); }
 
 /* the zones the list has attached in a second, from its start until now (until its end, when it has ended) */
 static uint64_t hot_rate(uint64_t attached) {
@@ -3358,10 +3359,18 @@ bool db_recon_begin(const char *view, uint64_t estimate, bool force, char *why, 
     have = ss->zt_records;
     free(ss);
   }
-  /* (a first fill: the tables are made big enough in one step; the estimate is the loader's claim, and a hostile loader must not make the Backend reserve sixteen million records on disk for a handful of zones: the
-   * reserve is at most twice what the store holds plus a million, and the tables grow by themselves beyond that) */
-  const uint64_t cap = 2 * have + 1000000ull, want = estimate < cap ? estimate : cap;
-  if (want > have) (void)store_reserve(st, want);
+  /* (a first fill: the tables and the indexes are made big enough in one step, so that a 10M-zone fill does not grow them (and does not hold the writer mutex for the pass of a growth: round 9);
+   * the estimate is the loader's claim, and a hostile loader must not make the Backend reserve gigabytes for a handful of zones.  So it is bounded by what the store can hold (the address
+   * space of zt / zc: 1 << 25 records) and by what memory-limit can give the two indexes: 8 bytes a slot, 8/3 slots a zone, in ix and in sx = 43 bytes a zone, a quarter of memory-limit
+   * at the most (10M zones: 430 MB, 11 percent of 3840M).  Beyond that the tables grow by themselves, with the pass waiting for the build, store_index_wait()) */
+  const uint64_t lim = dbreg_cache_limit();
+  uint64_t cap = (1ull << 25) - 1;
+  if (lim && lim / 4 / 43 < cap) cap = lim / 4 / 43;
+  const uint64_t want = estimate < cap ? estimate : cap;
+  const bool bulk = want > have && store_reserve(st, want) == 0;
+  /* (a bulk fill: the checkpoints of the pass write the whole reserved index, so the journal may grow to a larger size before one is forced (round 12).  Ended by db_recon_end() and db_recon_abort();
+   * a pass that this one drops (above) is ended here: the flag is set or cleared by what this pass needs) */
+  store_journal_boost(st, bulk);
   un_mark(view);
   rc_lock();
   bits_free(&RC.seen);
@@ -3423,7 +3432,8 @@ int db_recon_entry(const db_recon_entry_t *e, uint32_t *zid_out) {
 
 void db_recon_abort(void) {
   rc_lock();
-  if (RC.active) {
+  const bool was = RC.active;
+  if (was) {
     syslog(LOG_WARNING, "[Store] the pass of view '%s' was cut off (the loader's stream ended); nothing is swept, the next pass starts again", RC.view);
     RC.active = false;
     bits_free(&RC.seen);
@@ -3431,6 +3441,7 @@ void db_recon_abort(void) {
     atomic_store_explicit(&RC.lk_any, false, memory_order_relaxed);
   }
   rc_unlock();
+  if (was) store_journal_boost(atomic_load_explicit(&G.st, memory_order_acquire), false);     /* (the pass that raised the bound of the journal is over; the lock of the pass is not held) */
 }
 
 /* the zones of the view in the store, a few thousand at a time (the read section does not last for a pass over ten million zones) */
@@ -3442,6 +3453,7 @@ void db_recon_end(bool complete, uint64_t n_skipped, bool cursor_valid, uint64_t
   memset(out, 0, sizeof(*out));
   store_t *st = atomic_load_explicit(&G.st, memory_order_acquire);
   if (!RC.active || !st) return;
+  store_journal_boost(st, false);                           /* (the entries are in: a first fill is over, the journal goes back to its size; the sweep and the cursor follow) */
   const int vid = RC.vid;
   char view[STORE_VIEW_NAME_MAX + 1];
   snprintf(view, sizeof(view), "%s", RC.view);

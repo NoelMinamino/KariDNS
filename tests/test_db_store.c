@@ -4268,14 +4268,39 @@ static int run_fixes(const char *dir) {
         (void)serve_fetches(&fetchc, f[0], &e, 1500, -1, -1);
     }
 
-    /* -- L11: a loader that claims four million zones makes the store reserve what it can hold plus a million, not four million records */
+    /* -- L11: the loader's estimate is a claim.  A first fill reserves what the loader announces (round 10: the whole estimate, so that a fill of 10M zones grows the index no more than once), up to what
+     *    memory-limit can give the two indexes (a quarter of it at 43 bytes a zone) and the address space of the tables; a loader that claims four million zones with a limit that holds 1.5 million
+     *    makes the store reserve about that, not four million records */
     {
         char why[200];
         store_stats_t s1;
+        dbreg_cache_set_limit(1500000ull * 43 * 4);
         CHECK(db_recon_begin("default", 4000000, false, why, sizeof(why)));
         store_stats(st, &s1);
-        CHECK(s1.zt_capacity < 3000000);
+        CHECK(s1.zt_capacity >= 1400000 && s1.zt_capacity < 3000000);
+        CHECK(s1.ix_slots >= 1400000 * 8 / 3 && s1.ix_slots < 3000000 * 8 / 3);
+        CHECK(s1.journal_boost == 1 && s1.journal_boosts >= 1);          /* (round 12: a pass that reserved is a bulk fill: the journal may grow to a larger size) */
+        const uint64_t boosts = s1.journal_boosts;
         db_recon_abort();
+        store_stats(st, &s1);
+        CHECK(s1.journal_boost == 0 && s1.journal_boosts == boosts);     /* (a pass that was cut off ends it) */
+        db_recon_abort();                                                /* (nothing is active now: no effect) */
+        dbreg_cache_set_limit(1500000ull * 43 * 4);
+        CHECK(db_recon_begin("default", 4000000, false, why, sizeof(why)));
+        store_stats(st, &s1);
+        CHECK(s1.journal_boost == 1 && s1.journal_boosts == boosts + 1);
+        CHECK(db_recon_begin("default", 0, false, why, sizeof(why)));    /* (the next pass drops it: no reserve is needed, the flag is cleared) */
+        store_stats(st, &s1);
+        CHECK(s1.journal_boost == 0);
+        db_recon_abort();
+        CHECK(db_recon_begin("default", 4000000, false, why, sizeof(why)));
+        store_stats(st, &s1);
+        CHECK(s1.journal_boost == 1);
+        db_recon_end_t oe;
+        db_recon_end(false, 0, false, 0, NULL, 0, &oe);                  /* (the end of the entries: the loader did not finish the list, nothing is swept; the flag goes first) */
+        store_stats(st, &s1);
+        CHECK(s1.journal_boost == 0);
+        dbreg_cache_set_limit(0);
     }
 
     /* -- L7: the guard holds a pass that lists 100 of the zones; the hold is in the store (the cursor of the view is not valid), and nothing is deleted.  (Before: the old cursor stayed, and a restart read

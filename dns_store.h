@@ -255,7 +255,7 @@ typedef struct store_stats {
   uint32_t nviews;
   store_view_stats_t views[STORE_MAX_VIEWS];
   /* ---- 0.7 WP9 ---- */
-  uint64_t journal_max_bytes;     /* the size at which a checkpoint is forced */
+  uint64_t journal_max_bytes;     /* the size at which a checkpoint is forced (in force now: 4 x the option during a bulk fill, store_journal_boost()) */
   uint32_t seg_free_numbers;      /* numbers of segments that were cleaned and removed (they are used again) */
   uint32_t seg_draining;          /* segments with no live record that wait for a checkpoint, a grace period, the end of the references */
   uint32_t seg_pinned;            /* segments that an attached zone's image (MAP mode) points into: not cleaned, not removed */
@@ -300,9 +300,14 @@ typedef struct store_stats {
   uint64_t checkpoint_max_us;     /* the longest checkpoint since the open */
   uint64_t checkpoints_cancelled; /* fuzzy checkpoints that a close left (its clean checkpoint flushed everything instead) */
   uint64_t journal_peak_bytes;    /* the largest size a journal file reached since the open */
-  uint64_t journal_bound_bytes;   /* the bound: 2 x journal_max_bytes (the writers wait at it for the checkpoint in progress) */
+  uint64_t journal_bound_bytes;   /* the bound: 2 x journal_max_bytes in force (the writers wait at it for the checkpoint in progress) */
   uint64_t journal_limit_waits;   /* writer calls that waited at their end for a checkpoint because the journal was at the bound */
   uint64_t journal_limit_wait_us, journal_limit_wait_max_us;   /* the total and the longest of those waits */
+  uint64_t journal_boost;           /* 1 while a bulk fill asks for the larger bound (store_journal_boost(); journal_max_bytes says whether it is in force: the free space may be too small) */
+  uint64_t journal_boosts;          /* the times it was asked for */
+  uint64_t index_waits;             /* store_index_wait() calls that waited for the build of the next index (0.7 round 10) */
+  uint64_t index_wait_us, index_wait_max_us;   /* the total and the longest of those waits */
+  uint64_t index_wait_giveups;      /* waits that ended at their bound with the build still running (the growth inside the writer mutex is the last resort) */
   uint64_t journal_commit_switches; /* the journal file switched by a commit (0.7: the writers append to a file that no sync holds) */
   uint64_t image_prewrites;         /* image records store_put() wrote before the writer mutex and the change took (0.7) */
   uint64_t image_prewrite_misses;   /* ... that the change wrote again inside the mutex (the zone, its record or the open segment changed in between) */
@@ -475,6 +480,16 @@ int  store_commit(store_t *s);
  * the microseconds it waited (0: no wait).  The bulk writer (the reconcile thread of a pass) uses 2, the thread that also answers lookups 4: the journal stays below 2 x
  * journal_max_bytes while the disk keeps up with the checkpoints, and below 4 x in any case (store.journal.limit_waits counts the waits).  The store's own calls never wait for it. */
 uint64_t store_journal_wait(store_t *s, unsigned factor);
+/* 0.7: the bulk producer of new zones (the reconcile thread of a pass), holding no lock, calls this between its groups: while a build of the next index generation runs (it begins at
+ * 3/8 of the index) and the index is past 7/16, it waits for the build to end instead of filling the old index to one half, where the growth would be made inside the writer mutex (the
+ * build dropped, every zone put in again: seconds at millions of zones).  Bounded (30 s): a build that does not end is given up on once, with a WARNING, and the pass goes on.  Returns
+ * the microseconds waited (0: no wait).  A transfer, a dynamic update and the thread that answers lookups do not call it: their zones come slowly, and they must not wait. */
+uint64_t store_index_wait(store_t *s);
+/* 0.7 round 12: a bulk fill (the manifest pass that reserved the index, db_recon_begin()) raises the size at which a checkpoint is forced, and with it the bound of the journal, to 4 x journal_max_bytes
+ * while the free space allows (an eighth of it must cover the journal at the hard bound); `on` false ends it and wakes the flusher: the checkpoint that cuts the journal is due at once.  Idempotent.
+ * The caller ends it on every path that ends the fill (the end of the pass, a pass cut off, a pass dropped by the next one).  Counters: journal_boost (set now), journal_boosts (times asked for),
+ * journal_max_bytes (the size in force). */
+void store_journal_boost(store_t *s, bool on);
 /* the time-driven part: the commit and the checkpoint that are due (the flusher thread makes them by itself; without it the tick does), and (0.7 WP9) the work of the
  * background: the cleaner (at opts.compact_rate), the removal of the segments it emptied, the nx pass, the free-space check, the scrub (at opts.scrub_rate).  Call about once per
  * second from the store's thread, which is not inside a read section; a call takes up to about 300 ms when there is work. */
@@ -580,6 +595,8 @@ extern _Atomic long store_test_crash_countdown;
 extern void (*store_test_before_counters)(store_t *s);
 /* the logged index changes a growth's build makes inside the writer mutex at most (-1: the built-in 4096); the rest it makes in rounds with no lock */
 extern _Atomic long store_test_rg_tail;
+/* the longest wait of store_index_wait() in milliseconds (-1: the built-in 30000) */
+extern _Atomic long store_test_rg_wait_ms;
 /* a commit fails with -EIO at the n-th one (0 = off): a failed fdatasync */
 extern _Atomic long store_test_fail_commit;
 /* the n-th write of a run of table pages by a checkpoint fails with -EIO (0 = off) */
