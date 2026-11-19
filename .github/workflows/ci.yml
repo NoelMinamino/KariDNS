@@ -63,7 +63,7 @@ jobs:
       - name: Install dependencies (Linux)
         if: runner.os == 'Linux'
         run: |
-          sh .github/scripts/apt-install.sh libssl-dev zlib1g-dev libidn2-dev libxdp-dev libbpf-dev   # survives a mirror the runner cannot reach
+          sh .github/scripts/apt-install.sh libssl-dev zlib1g-dev libidn2-dev   # survives a mirror the runner cannot reach
 
       - name: Install dependencies (macOS)
         if: runner.os == 'macOS'
@@ -245,7 +245,7 @@ jobs:
       - name: Install dependencies (Linux)
         if: runner.os == 'Linux'
         run: |
-          sh .github/scripts/apt-install.sh libssl-dev zlib1g-dev libidn2-dev   # survives a mirror the runner cannot reach
+          sh .github/scripts/apt-install.sh libssl-dev zlib1g-dev libidn2-dev libxdp-dev libbpf-dev   # survives a mirror the runner cannot reach
 
       - name: Install dependencies (macOS)
         if: runner.os == 'macOS'
