@@ -5219,7 +5219,8 @@ checkpoint is made by the size of the journal or by its interval; the cleaner,
 the removal of empty segments and the scrub wait until the end of the fill is on
 disk (\fBkarictl store compact\fR and \fBstore scrub\fR say it is busy). A
 secondary's copy that is to be stored meanwhile (a secondary added by a
-reconfiguration) ends the fill first and waits for that end to be on disk. While
+reconfiguration) asks for the end of the fill and is stored once that end is on
+disk (the zone is served from memory meanwhile, without a new transfer). While
 the bodies are fetched the store makes \fIbulk checkpoints\fR, its durable
 points: the segments are synced, the changed pages of the zone table and the
 long names are written (not the indexes, which a recovery rebuilds), each time
@@ -5231,24 +5232,26 @@ the fill has nothing more to fetch (the zones left without a body are the ones
 it does not fetch: refused, or not kept in the store): from then on every change
 is logged again, and one checkpoint, on the store's checkpoint thread, writes
 every table, the indexes included; until it is on disk
-(\fBstore.bulk.end_pending\fR) it is tried again after a failure, and a crash
-meanwhile is a crash of the fill. What it saves: a logged fill of 10 million
-zones on ZFS wrote about 25 GB to the device for 3.5 GB of images (lz4), most of
-it the journal, the checkpoints of the pass and the fsyncs of the commits, which
-ZFS writes twice (through the ZIL); the unlogged fill writes the images, 2 or 3
-bulk checkpoints and the last one. The cost: \fBa crash during the first fill
-goes back to the last bulk checkpoint\fR (or to the empty store, before the
-first one): nothing is replayed, the tables are rebuilt from the zone table
-(seconds at 10 million zones), a zone whose image is past that checkpoint is
-kept as a known zone and fetched again, the cursors of the views are dropped and
-the loader lists every zone again (also at a later start if the next one has no
-database block: \fBstore.bulk.cut\fR), and a WARNING says to what point the
-store went back; the zones after it are read from the database again, and the
-server answers meanwhile as for any zone that is not in the store. Changes made
-after the end of the fill and before its checkpoint is on disk go back with
-it. A clean stop in the middle of the fill keeps it: the next start needs no
-rebuild and the rest of the fill is unlogged as well. A pass over a store that
-holds zones already is logged as before, with the larger journal of
+(\fBstore.bulk.end_pending\fR) it is tried again after a failure, with a
+back-off of 1 s that doubles up to 5 minutes, and it is not tried at all while
+the free space is below what it would write; a crash meanwhile is a crash of the
+fill. What it saves: a logged fill of 10 million zones on ZFS wrote about 25 GB
+to the device for 3.5 GB of images (lz4), most of it the journal, the
+checkpoints of the pass and the fsyncs of the commits, which ZFS writes twice
+(through the ZIL); the unlogged fill writes the images, 2 or 3 bulk checkpoints
+and the last one. The cost: \fBa crash during the first fill goes back to the
+last bulk checkpoint\fR (or to the empty store, before the first one): nothing
+is replayed, the tables are rebuilt from the zone table (seconds at 10 million
+zones), a zone whose image is past that checkpoint is kept as a known zone and
+fetched again, the cursors of the views are dropped and the loader lists every
+zone again (also at a later start if the next one has no database block:
+\fBstore.bulk.cut\fR), and a WARNING says to what point the store went back; the
+zones after it are read from the database again, and the server answers
+meanwhile as for any zone that is not in the store. Changes made after the end
+of the fill and before its checkpoint is on disk go back with it. A clean stop
+in the middle of the fill keeps it: the next start needs no rebuild and the rest
+of the fill is unlogged as well. A pass over a store that holds zones already is
+logged as before, with the larger journal of
 \fBstore.journal.boost\fR. \fBkarictl store\fR shows it as \fBstore.bulk.*\fR
 and \fBstore.journal.bytes_written\fR. \fBThe ARC and a restart with many zones
 (COPY mode).\fR A restart is fast when the records of the zones the queries want

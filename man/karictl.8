@@ -869,11 +869,12 @@ of a fill needs no rebuild: \fB.resumed\fR is 1 and \fB.recoveries\fR 0
 \fBstore.bulk.end_pending\fR, \fB.cut\fR
 0.7: \fB.end_pending\fR is 1 from the end of an unlogged fill until the
 checkpoint that clears it on disk is done (the store's checkpoint thread makes
-it, and tries again after a failure; the cleaner, the removal of segments and
-the scrub stay off until then, and a crash meanwhile is a crash of the fill);
-\fB.cut\fR is 1 from the start that found a fill cut off by a crash until a
-start with the database has dropped the cursors of the views (kept on disk
-across a start with no database block)
+it, and tries again after a failure with a back-off of 1 s doubling up to 5 min,
+not at all while the free space is below what it writes; the cleaner, the
+removal of segments and the scrub stay off until then, and a crash meanwhile is
+a crash of the fill); \fB.cut\fR is 1 from the start that found a fill cut off
+by a crash until a start with the database has dropped the cursors of the views
+(kept on disk across a start with no database block)
 .TP 8
 \fBstore.checkpoint.count\fR, \fB.last_unix\fR, \fB.last_us\fR, \fB.max_us\fR, \fB.cancelled\fR
 Checkpoints since the open, when the last one ended, how long it took, the
@@ -899,6 +900,11 @@ it: the zones in memory get the limit less this, at least a tenth of the limit
 \fBstore.writes.commits\fR, \fB.puts\fR, \fB.replaces\fR, \fB.deletes\fR, \fB.growths\fR, \fB.errors\fR
 Writer counters since the open (\fBerrors\fR counts a commit or a checkpoint
 that failed in the background too; it is tried again)
+.TP 8
+\fBstore.writes.names_refused\fR
+0.7: writer calls refused because the zone's name holds a zero byte (no writer
+of the server makes such a name; a recovery would take one for a page of the
+long names that did not reach the disk). Should stay 0
 .TP 8
 \fBstore.journal.commit_switches\fR
 0.7: commits that switched the journal to the next file (made ahead): the

@@ -7974,25 +7974,44 @@ static void test_bulk_end_retry(void) {
   store_bulk_phase(s, STORE_BULK_PASSED);
   store_stats_t st;
   store_stats(s, &st);
-  const uint64_t freed0 = st.compact_segs_freed, ck0 = st.checkpoints;
+  const uint64_t freed0 = st.compact_segs_freed, ck0 = st.checkpoints, tb0 = st.checkpoint_table_bytes;
   const unsigned files0 = seg_files(d.path, NULL);
-  atomic_store(&store_test_fail_ckwrite, 1);
-  CHECK(store_bulk_end(s, STORE_BULK_END_WAIT) < 0);                     /* (the write of the tables fails) */
+  atomic_store(&store_test_bulk_end_ms, 100);                            /* (the first back-off: 100 ms, doubling) */
+  /* 1. no room for what the end writes: nothing is written, the end waits for a back-off */
+  atomic_store(&g_jbo_free, 0);
+  store_test_fs_free = jbo_fs_free;
+  CHECK_EQ(store_bulk_end(s, STORE_BULK_END_WAIT), -ENOSPC);
   store_stats(s, &st);
   CHECK_EQ(store_bulk(s), 0);
   CHECK(store_bulk_pending(s));
+  CHECK_EQ(st.bulk_end_pending, 1);
+  CHECK_EQ(st.checkpoints, ck0);
+  CHECK_EQ(st.checkpoint_table_bytes, tb0);                               /* (not one page) */
+  store_test_fs_free = NULL;
+  store_test_probe(s);
+  /* 2. room, and the write fails: tried again only after the back-off (doubled: 200 ms) */
+  usleep(150000);
+  atomic_store(&store_test_fail_ckwrite, 1);
+  CHECK_EQ(store_tick(s), 0);                                             /* (the back-off of the no-room try is over: this try fails) */
+  CHECK_EQ(atomic_load(&store_test_fail_ckwrite), 0);
+  store_stats(s, &st);
   CHECK_EQ(st.bulk_end_pending, 1);
   CHECK_EQ(st.checkpoints, ck0);
   CHECK_EQ(store_compact(s, 0, true, NULL), -EBUSY);
   CHECK_EQ(store_scrub_run(s, NULL), -EBUSY);
   CHECK_EQ(store_bulk_begin(s), -EEXIST);
   atomic_store(&store_test_fail_ckwrite, 1);
-  CHECK_EQ(store_tick(s), 0);                                             /* (the retry fails again; the maintenance of the tick removes nothing) */
+  CHECK_EQ(store_tick(s), 0);                                             /* (within the back-off: no try; the maintenance of the tick removes nothing) */
+  CHECK_EQ(atomic_load(&store_test_fail_ckwrite), 1);
+  usleep(250000);
+  CHECK_EQ(store_tick(s), 0);                                             /* (after it: the try fails again) */
+  CHECK_EQ(atomic_load(&store_test_fail_ckwrite), 0);
   store_stats(s, &st);
   CHECK_EQ(st.bulk_end_pending, 1);
   CHECK_EQ(st.compact_segs_freed, freed0);
   CHECK(st.seg_draining > 0);                                             /* (segments with nothing live: a removal would be due, and none was made) */
   CHECK_EQ(seg_files(d.path, NULL), files0);
+  usleep(450000);                                                         /* (the back-off: 400 ms now) */
   CHECK_EQ(put_i(s, 0, 0, 3, NULL), 0);                                  /* (a logged write: its due work tries again, and the end is on disk) */
   store_stats(s, &st);
   CHECK_EQ(st.bulk_end_pending, 0);
@@ -8036,6 +8055,7 @@ static void test_bulk_end_retry(void) {
     CHECK_EQ(store_close(s), 0);
   }
   atomic_store(&store_test_no_flusher, false);
+  atomic_store(&store_test_bulk_end_ms, 0);
   tdir_free(&d2);
   tdir_free(&d);
 }
@@ -8105,6 +8125,65 @@ static void test_rebuild_torn_name(void) {
   while ((more = store_iter(s, &cur, &z)) != 0) if (more > 0) CHECK_EQ(strlen(z.name), z.klen);   /* (no zone has a name with a zero byte) */
   store_read_unlock();
   check_consistent(s, "torn long name");
+  CHECK_EQ(store_close(s), 0);
+  tdir_free(&d);
+}
+
+/* Every name the writers accept survives a rebuild (the way in and the rebuild agree: only a zero byte is refused, check_name_args()): escapes, \DDD, a label of 63 octets and one longer,
+ * 8-bit bytes, all of them long names in nx */
+static void test_rebuild_names(void) {
+  printf("[every name the writers accept survives a rebuild; a name with a zero byte is refused at the write]\n");
+  static const char *const names[] = {
+    "a\\032b\\.c.long-label-with-escapes-to-pass-34-octets.example.test",
+    "\\255\\000\\001x.long-label-for-ddd-escapes-in-the-name.example.test",
+    "abcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghij123.example.test",
+    "abcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghij.example.test",
+    "\xc3\xa9t\xc3\xa9-an-8-bit-label-long-enough-for-nx.example.test",
+    "trailing-dot-is-kept-as-it-was-written-by-the-writer.example.test.",
+  };
+  const size_t nn = sizeof(names) / sizeof(names[0]);
+  tdir_t d;
+  tdir_new(&d, "rbnames");
+  store_opts_t o;
+  small_opts(&o);
+  o.checkpoint_interval_ms = UINT32_MAX;
+  o.scrub_interval_s = UINT32_MAX;
+  store_t *s = NULL;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (!s) { tdir_free(&d); return; }
+  CHECK_EQ(store_view_add(s, "default"), 0);
+  uint8_t img[200];
+  for (size_t i = 0; i < nn; i++) {
+    store_meta_t m = meta_of((uint32_t)i, 1);
+    memset(img, (int)i + 1, sizeof(img));
+    CHECK_EQ(store_put(s, 0, names[i], strlen(names[i]), &m, img, sizeof(img), NULL), 0);
+  }
+  {
+    static const char zn[] = "with-a-zero\0byte-in-the-middle-of-its-name.example.test";
+    store_meta_t m = meta_of(99, 1);
+    CHECK_EQ(store_put(s, 0, zn, sizeof(zn) - 1, &m, img, sizeof(img), NULL), -EINVAL);
+    CHECK_EQ(store_set_known(s, 0, zn, sizeof(zn) - 1, &m, NULL), -EINVAL);
+    store_stats_t st;
+    store_stats(s, &st);
+    CHECK_EQ(st.names_refused, 2);
+  }
+  CHECK_EQ(store_close(s), 0);
+  o.create = false;
+  o.force_rebuild = true;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (!s) { tdir_free(&d); return; }
+  store_stats_t st;
+  store_stats(s, &st);
+  CHECK(st.recovery.rebuilt);
+  CHECK_EQ(st.recovery.dropped_zones, 0);
+  for (size_t i = 0; i < nn; i++) {
+    store_read_lock();
+    const uint32_t z = store_find(s, 0, names[i], strlen(names[i]));
+    store_zone_t zi;
+    CHECK(z != STORE_NONE && store_zone_get(s, z, &zi) == 0 && zi.klen == strlen(names[i]) && zi.state == STORE_STATE_STORED);
+    store_read_unlock();
+  }
+  check_consistent(s, "names after a rebuild");
   CHECK_EQ(store_close(s), 0);
   tdir_free(&d);
 }
@@ -8276,7 +8355,7 @@ int main(void) {
     test_bulk_kill_loop(UNDER_TSAN ? 8 : 24);
   }
   if (WANT("bulk")) { test_bulk_end_retry(); test_bulk_dead_store(); }
-  if (WANT("bulk") || WANT("repair")) test_rebuild_torn_name();
+  if (WANT("bulk") || WANT("repair")) { test_rebuild_torn_name(); test_rebuild_names(); }
   if (WANT("bulk") || WANT("pairs")) { test_torn_pairs(true); test_torn_pairs(false); }
   if (WANT("clk")) {
     int citers = getenv("KARIDNS_STORE_KILLC_ITERS") ? atoi(getenv("KARIDNS_STORE_KILLC_ITERS")) : (UNDER_TSAN ? 25 : store_long() ? 100 : 50);

@@ -364,6 +364,7 @@ typedef struct store_stats {
   uint64_t bulk_next_bytes;         /* the segment bytes at which the next bulk checkpoint is due (0: none is due by bytes, a pass runs) */
   uint32_t bulk_end_pending;        /* 1: the fill is over and the checkpoint that clears the flag on disk is not done yet (it is tried again) */
   uint32_t bulk_cut;                /* 1: a fill was cut off and the cursors of the views were not dropped yet (store_bulk_cut()) */
+  uint64_t names_refused;           /* writer calls refused because the name holds a zero byte (no writer of the server makes one; the rebuild would take it for a lost page of nx) */
 } store_stats_t;
 
 /* What one store_compact() did. */
@@ -707,6 +708,8 @@ uint64_t store_test_sum64(const void *p, size_t n);
 /* path of a store file (for damage tests), written into buf */
 /* 0.7, the bulk fill: the segment bytes the bulk checkpoints count (the sum of the segments' used bytes) */
 uint64_t store_test_seg_bytes(store_t *s);
+/* the first back-off of the checkpoint that ends a bulk fill after a failure (0: 1 s; it doubles up to 5 min) */
+extern _Atomic uint32_t store_test_bulk_end_ms;
 #endif
 
 #endif /* DNS_STORE_H */

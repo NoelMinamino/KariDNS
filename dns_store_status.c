@@ -716,6 +716,7 @@ static void add_store(list_t *l, const store_t *s, const store_attach_stats_t *a
   U("store.bulk.next_checkpoint_bytes", st->bulk_next_bytes);
   U("store.bulk.end_pending", st->bulk_end_pending);
   U("store.bulk.cut", st->bulk_cut);
+  U("store.writes.names_refused", st->names_refused);
   U("store.index.waits", st->index_waits);
   U("store.index.wait_us", st->index_wait_us);
   U("store.index.wait_max_us", st->index_wait_max_us);

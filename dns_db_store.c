@@ -3967,14 +3967,30 @@ bool db_store_start(const server_config_t *cfg) {
       purge_view(st, vid);
       (void)store_set_cursor(st, (uint16_t)vid, 0, want, DBS_CFGID);
       if (vid < 32) atomic_fetch_or(&G.dir_pending, 1u << vid);          /* (the store has no list of this view's zones: a first fill; a pass has to make it) */
-    } else if (bulk_cut) {
-      /* the store went back to the last bulk checkpoint of a first fill: its cursor may already be past zones that the rebuild had to drop, so it is dropped (the configuration's part
-       * stays, as for a held view): the loader lists every zone again, and until that pass is over a zone the store does not name is looked up by name (THE BULK FILL in dns_store.c) */
-      (void)store_set_cursor(st, (uint16_t)vid, 0, have, DBS_CFGID);
-      if (vid < 32) atomic_fetch_or(&G.dir_pending, 1u << vid);
+    } else if (bulk_cut && vid < 32) {
+      atomic_fetch_or(&G.dir_pending, 1u << vid);          /* (its cursor is dropped below: until the pass is over a zone the store does not name is looked up by name) */
     }
   }
-  if (bulk_cut) store_bulk_cut_done(st);                     /* (the cursors are dropped: the marker goes with the next checkpoint, which holds the dropped cursors) */
+  if (bulk_cut) {
+    /* The store went back to the last bulk checkpoint of a first fill: a cursor may already be past zones that the rebuild had to drop, so the cursor of every view the store holds is
+     * dropped, the configured ones and the others (a view that comes back later must not trust it either); the configuration's part stays, as for a held view, and the loader lists every zone
+     * again (THE BULK FILL in dns_store.c).  The marker goes only when every drop was recorded: a drop that failed is made again at the next start. */
+    bool dropped = true;
+    for (uint32_t vid = 0; vid < STORE_MAX_VIEWS && store_view_name(st, (int)vid); vid++) {
+      if ((int)vid == xvid) continue;
+      uint8_t have[STORE_IDENT_MAX];
+      size_t hl = 0;
+      bool valid = false;
+      uint64_t cursor = 0;
+      if (store_get_cursor(st, (uint16_t)vid, &valid, &cursor, have, &hl) != 0 || !valid || hl <= DBS_CFGID) continue;      /* (no cursor of the loader in it) */
+      const int cr = store_set_cursor(st, (uint16_t)vid, 0, have, DBS_CFGID);
+      if (cr < 0) {
+        dropped = false;
+        syslog(LOG_ERR, "[Store] view '%s': its cursor could not be dropped after the first fill was cut off (%s); the next start drops it", store_view_name(st, (int)vid), strerror(-cr));
+      }
+    }
+    if (dropped) store_bulk_cut_done(st);                    /* (the marker goes with the next checkpoint, which holds the dropped cursors) */
+  }
   for (int vid = 0; vid < STORE_MAX_VIEWS; vid++)
     if (vid != xvid) dmax_refresh(st, vid);                  /* (2.2: the reserved view is no directory of the query path) */
   atomic_fetch_add(&G.view_gen, 1);

@@ -897,7 +897,7 @@ static zone_db_entry_t *entv(const char *view, const char *zone) {
 /* life 8 (0.7, the unlogged first fill of a store): a configuration whose secondaries keep their copies in the store begins none (a pass stays logged); and a fill that runs anyway (begun here by
  * hand, as for a store without secondaries) is ended by the first copy written, which waits for the end to be on disk and is then logged */
 static int life8(void) {
-  printf("[life 8: no unlogged fill with secondaries; a copy written during one ends it first]\n");
+  printf("[life 8: no unlogged fill with secondaries; a copy written during one is put off and stored once its end is on disk]\n");
   rcu_aux_thread_pin();
   const time_t now = time(NULL);
   if (life_start(g_store, true) != 0) return 1;
@@ -919,14 +919,24 @@ static int life8(void) {
   CHECK(a != NULL);
   if (!a) return 1;
   install(a, 10, XFR_ORIGIN_XFR, now - 10, 0);
-  refresh_end(a, XFR_OUT_TRANSFERRED, now - 11);
-  store_stats(st, &ss);
+  const int64_t t0 = (int64_t)time(NULL);
+  refresh_end(a, XFR_OUT_TRANSFERRED, now - 11);                          /* (the write is put off and the end of the fill asked for; the refresh does not wait for it) */
+  store_zone_t z;
+  CHECK(!rec("a.test.", XFR_K_CONFIG, &z));
+  CHECK_EQ(ctr().puts, 0);
   CHECK_EQ(store_bulk(st), 0);
+  /* the end is made by the store's checkpoint thread, then the restore thread's pass writes the copy: no new transfer */
+  bool stored = false;
+  for (int w = 0; w < 1500 && !stored; w++) {
+    stored = rec("a.test.", XFR_K_CONFIG, &z) && z.state == STORE_STATE_STORED && z.serial == 10;
+    if (!stored) usleep(10000);
+  }
+  CHECK(stored);
+  printf("  the copy was stored %lld s after the transfer, once the end of the fill was on disk\n", (long long)((int64_t)time(NULL) - t0));
+  store_stats(st, &ss);
   CHECK(!store_bulk_pending(st));
   CHECK_EQ(ss.bulk_end_pending, 0);
   CHECK_EQ(ss.bulk_unlogged_records, 0);                                  /* (the copy was not written unlogged) */
-  store_zone_t z;
-  CHECK(rec("a.test.", XFR_K_CONFIG, &z) && z.state == STORE_STATE_STORED && z.serial == 10);
   CHECK_EQ(ctr().puts, 1);
   return 0;
 }
