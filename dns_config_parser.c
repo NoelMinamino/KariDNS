@@ -6658,6 +6658,11 @@ static int parse_database_option(token_ctx_t *ctx, database_config_t *db, const 
   }
   if (strcmp(key, "store-segment-size") == 0)         /* 0.7 S6: the size of a segment file of the store (K, M, G); the cleaner removes whole segments */
     return db_take_uint(ctx, key, true, KARIDNS_DB_STORE_SEGMENT_MIN, KARIDNS_DB_STORE_SEGMENT_MAX, &db->store_segment_size);
+  if (strcmp(key, "store-max-zones") == 0) {          /* 0.7: the zones the tables of the store reserve address space for (default: by the RAM; the tables cannot grow past it until the next start) */
+    if (db_take_uint(ctx, key, false, KARIDNS_DB_STORE_MAX_ZONES_MIN, KARIDNS_DB_STORE_MAX_ZONES_MAX, &u) != 0) return -1;
+    db->store_max_zones = (uint32_t)u;
+    return 0;
+  }
   if (strcmp(key, "store-scrub-interval") == 0) {      /* 0.7 S6: seconds between two scrubs of the store (every record is read and checked, slowly); `off` = never */
     if (db_take_uint_word(ctx, key, false, KARIDNS_DB_STORE_SCRUB_MIN, KARIDNS_DB_STORE_SCRUB_MAX, "off", UINT32_MAX, &u) != 0) return -1;
     db->store_scrub_interval = (uint32_t)u;

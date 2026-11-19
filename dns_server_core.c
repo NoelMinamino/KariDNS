@@ -4177,6 +4177,7 @@ static void collect_restart_only_changes(const server_config_t *o, const server_
     if (o->database.store_scrub_interval != n->database.store_scrub_interval) append_list_item(buf, sz, "database store-scrub-interval");
     if (o->database.store_segment_size != n->database.store_segment_size) append_list_item(buf, sz, "database store-segment-size");
     if (o->database.store_threads != n->database.store_threads) append_list_item(buf, sz, "database store-threads");
+    if (o->database.store_max_zones != n->database.store_max_zones) append_list_item(buf, sz, "database store-max-zones");
     if (o->database.store_hot_list != n->database.store_hot_list) append_list_item(buf, sz, "database store-hot-list");
   }
 }

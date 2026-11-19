@@ -108,8 +108,9 @@ typedef struct store store_t;
 typedef struct store_opts {
   int      mode;                  /* STORE_MODE_AUTO (fstatfs f_fstypename "zfs" -> COPY, else MAP), MAP or COPY */
   bool     create;                /* create the store when the directory holds none */
-  uint32_t max_zones;             /* address space reserved for zt / zc (records); 0 = 1<<25.  Not a limit of the files. */
-  uint64_t nx_max;                /* address space reserved for nx (bytes); 0 = 1 GiB */
+  uint32_t max_zones;             /* address space reserved for zt / zc (records) = the most zones the store holds until the next start (`store-max-zones`); 0 = by the RAM (store_reserve_zones()).  Not a limit of the files: a start reserves at least twice what they hold. */
+  uint64_t nx_max;                /* address space reserved for nx (bytes); 0 = 32 bytes for every zone of max_zones */
+  uint64_t physmem;               /* the RAM in bytes that max_zones = 0 is derived from; 0 = hw.physmem (tests) */
   uint64_t seg_size;              /* nominal segment size (bytes); 0 = 256 MiB; the minimum is 64 KiB (tests) */
   uint64_t expected_zones;        /* pre-size the tables (first fill); 0 = grow on demand */
   int      sync_policy;           /* STORE_SYNC_* */
@@ -145,6 +146,9 @@ typedef struct store_opts {
   uint64_t bulk_ckpt_bytes;
   uint32_t bulk_ckpt_interval_ms;
 } store_opts_t;
+
+/* The zones the tables are reserved room for: `opt` (store-max-zones) when not 0, else the RAM (physmem / 256 bytes, a power of two, 1M .. 2^25; physmem 0 = unknown: 2^25). */
+uint32_t store_reserve_zones(uint64_t physmem, uint32_t opt);
 
 /* defaults of every field above (mode AUTO, create false, ...) */
 void store_opts_default(store_opts_t *o);
@@ -365,6 +369,11 @@ typedef struct store_stats {
   uint32_t bulk_end_pending;        /* 1: the fill is over and the checkpoint that clears the flag on disk is not done yet (it is tried again) */
   uint32_t bulk_cut;                /* 1: a fill was cut off and the cursors of the views were not dropped yet (store_bulk_cut()) */
   uint64_t names_refused;           /* writer calls refused because the name holds a zero byte (no writer of the server makes one; the rebuild would take it for a lost page of nx) */
+  uint64_t reserve_zones;           /* 0.7: the zones the tables are reserved room for (until the next start) */
+  uint64_t reserve_nx_bytes;        /* ... and the bytes of the table of the long names */
+  uint64_t reserve_zones_used;      /* the zones the table holds (the high-water mark of the ids) */
+  uint64_t reserve_nx_used;         /* the bytes of long names in nx */
+  uint64_t reserve_refused;         /* writes refused because a table was at its reservation: the zone is served from the database (a secondary's copy: not stored); `store-max-zones` raises it at the next start */
 } store_stats_t;
 
 /* What one store_compact() did. */

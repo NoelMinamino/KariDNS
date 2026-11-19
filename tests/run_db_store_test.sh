@@ -620,6 +620,10 @@ conf a "store-scrub-interval 5;"
 cp "$T/a.conf" "$T/k.conf"; kc; [ $? != 0 ] && pass "store-scrub-interval 5 (below a minute) is an error" || fail "karicheck accepted store-scrub-interval 5"
 conf a "store-segment-size 4k;"
 cp "$T/a.conf" "$T/k.conf"; kc; [ $? != 0 ] && pass "store-segment-size 4k (below 1m) is an error" || fail "karicheck accepted store-segment-size 4k"
+conf a "store \"$T/store\"; store-max-zones 100000000;"
+cp "$T/a.conf" "$T/k.conf"; kc; grep -E "ERROR|error" "$T/kc.out" | grep -qi "store" && fail "karicheck refused store-max-zones 100000000: $(grep -i store "$T/kc.out")" || pass "store-max-zones 100000000 is accepted"
+conf a "store-max-zones 100;"
+cp "$T/a.conf" "$T/k.conf"; kc; [ $? != 0 ] && pass "store-max-zones 100 (below 1024) is an error" || fail "karicheck accepted store-max-zones 100"
 if [ "$(id -u)" = 0 ]; then
     # the owner and mode rules of the start (L8): the same refusals as the server's
     mkdir -p "$T/wdir" && chmod 0777 "$T/wdir"
