@@ -3074,9 +3074,10 @@ static void test_journal_boost(void) {
   log_clear();
   atomic_store(&g_jbo_free, JBO_BIG);
   store_test_fs_free = jbo_fs_free;
+  atomic_store(&store_test_jr_floor, (int64_t)(8ll << 20));                /* (the floor of a UFS store: a copy-on-write file system adds 16 MiB, more than "small" leaves) */
   store_t *s = NULL;
   CHECK_EQ(store_open(d.fd, &o, &s), 0);
-  if (!s) { store_test_fs_free = NULL; tdir_free(&d); return; }
+  if (!s) { store_test_fs_free = NULL; atomic_store(&store_test_jr_floor, -1); tdir_free(&d); return; }
   CHECK_EQ(store_view_add(s, "default"), 0);
   CHECK_EQ(store_reserve(s, 3000), 0);                                   /* (no growth of the index during the test: a growth asks for a checkpoint) */
   CHECK_EQ(store_checkpoint(s), 0);
@@ -3113,6 +3114,7 @@ static void test_journal_boost(void) {
   CHECK(st.journal_peak_bytes >= 4 * JBO_MAX && st.journal_peak_bytes <= 8 * JBO_MAX + 4096);
   for (int w = 0; w < 3000 && st.checkpoints < base + 1; w++) { usleep(1000); store_stats(s, &st); }
   CHECK(st.checkpoints >= base + 1);
+  for (int w = 0; w < 20000 && st.journal_bytes >= 3 * JBO_MAX / 2; w++) { usleep(1000); store_stats(s, &st); }   /* (a slow checkpoint (ZFS, ASan) let the writes of step 1 run on past 4 x: the next one cuts them) */
   /* 2. the end of the fill: the journal is between the two sizes, the checkpoint that cuts it is made at once (the flusher is woken), the sizes are the normal ones */
   k = jbo_fill(s, k, 3 * JBO_MAX / 2, &cut);
   store_stats(s, &st);
@@ -3164,6 +3166,7 @@ static void test_journal_boost(void) {
   check_consistent(s, "journal boost");
   CHECK_EQ(store_close(s), 0);
   store_test_fs_free = NULL;
+  atomic_store(&store_test_jr_floor, -1);
   tdir_free(&d);
 }
 
