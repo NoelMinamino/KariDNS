@@ -190,7 +190,7 @@
  *      goes under the writer mutex and bulk_end_pending is set, so every later
  *      record is logged with an LSN after P; then one ordinary fuzzy checkpoint at P: every unlogged change is before P and its copy is taken after it, which is the rule of every fuzzy checkpoint
  *      (records after P are replayed onto it); it writes every page marked since the last full write, ix / sx included (taken from the writers' maps, which no bulk checkpoint took), and its
- *      superblock has no SBF_BULK (ck_finish() clears bulk_end_pending).  The checkpoint thread makes it (ckpt_due() is true while the end is pending, after a failure or with no room for it once its back-off is over, 1 s doubling up to 5 min: bulk_end_backoff(); the
+ *      superblock has no SBF_BULK (ck_finish() clears bulk_end_pending).  The checkpoint thread makes it (ckpt_due() is true while the end is pending, after a failure or with no room for it once its back-off is over, 1 s doubling up to 5 min, in st_ckpt(); the
  *      caller's thread does not wait for it).  Until it is on disk a crash is a crash of the fill (K): the commits acknowledged since the end are lost with it, the cost of decision 1 of the plan.
  * What relied on the journal, and what the fill does there:
  *   - OP_GEN (a growth of ix / sx): written unlogged; the generations are not durable during the fill (C), the superblock of the next bulk checkpoint marks them for the rebuild.
@@ -512,7 +512,7 @@ struct store {
   _Atomic uint64_t bulk_last_ms;                      /* ... and its time */
   _Atomic bool bulk_end_pending;                      /* the fill is over and no superblock without SBF_BULK is on disk yet (cleared by ck_finish()) */
   _Atomic bool bulk_cut;                              /* SBF_BULK_CUT */
-  _Atomic uint64_t bulk_end_backoff_ms, bulk_end_next_ms;   /* the back-off of the checkpoint that ends a fill (bulk_end_backoff()): 0 = none, try now */
+  _Atomic uint64_t bulk_end_backoff_ms, bulk_end_next_ms;   /* the back-off of the checkpoint that ends a fill (st_ckpt()): 0 = none, try now */
   _Atomic int bulk_end_state;                         /* ... 0 trying, 1 it failed, 2 no room (the log line is said at a change) */
   _Atomic uint64_t n_bulk_fills, n_bulk_ckpts, n_bulk_unlogged, bulk_since, bulk_ended;
   _Atomic uint64_t lsn, committed_lsn;
@@ -3381,20 +3381,6 @@ _Atomic uint32_t store_test_bulk_end_ms = 0;
 #define BULK_END_BASE_MS() 1000u
 #endif
 static uint64_t st_avail(const store_t *s);
-static void bulk_end_backoff(store_t *s, int r, bool room, uint64_t need) {
-  if (!atomic_load_explicit(&s->bulk_end_pending, memory_order_relaxed)) return;
-  uint64_t b = atomic_load_explicit(&s->bulk_end_backoff_ms, memory_order_relaxed);
-  b = b == 0 ? BULK_END_BASE_MS() : b >= ST_BULK_END_MAX_MS / 2 ? ST_BULK_END_MAX_MS : 2 * b;
-  atomic_store_explicit(&s->bulk_end_backoff_ms, b, memory_order_relaxed);
-  atomic_store_explicit(&s->bulk_end_next_ms, st_now_ms() + b, memory_order_relaxed);
-  const int st = room ? 2 : 1;
-  if (atomic_exchange_explicit(&s->bulk_end_state, st, memory_order_relaxed) == st) return;
-  if (room)
-    st_log(s, 4, "store: the checkpoint that ends the bulk fill needs about %" PRIu64 " bytes and %" PRIu64 " are free: it is not tried until there is room (looked at again with a back-off up "
-                 "to 5 min); until it is on disk a crash goes back to the last bulk checkpoint", need, st_avail(s));
-  else
-    st_log(s, 3, "store: the checkpoint that ends the bulk fill failed (%d): it is tried again with a back-off up to 5 min; until it is on disk a crash goes back to the last bulk checkpoint", r);
-}
 static int st_ckpt(store_t *s, bool force, bool fl) {
   if (!fl) ck_acquire(s);
   else if (!ck_acquire_fl(s)) return 1;
@@ -3426,16 +3412,27 @@ static int st_ckpt(store_t *s, bool force, bool fl) {
     }
     wr_unlock_raw(s);
   }
-  if (r != 0) {
+  if (r == 0) r = ck_run(s);
+  else {
     bg_release(s, true, true);
-    if (r < 0) {
-      note_error(s, r);
-      if (end) bulk_end_backoff(s, r, room, need_b);
-    }
-    return r < 0 ? r : 0;
+    if (r > 0) return 0;
+    note_error(s, r);
   }
-  r = ck_run(s);
-  if (r < 0 && end) bulk_end_backoff(s, r, false, 0);
+  if (r < 0 && end && atomic_load_explicit(&s->bulk_end_pending, memory_order_relaxed)) {
+    /* the end of a bulk fill failed, or was not tried (no room): its back-off (inline, so that no function of its own runs only on a failure) */
+    uint64_t b = atomic_load_explicit(&s->bulk_end_backoff_ms, memory_order_relaxed);
+    b = b == 0 ? BULK_END_BASE_MS() : b >= ST_BULK_END_MAX_MS / 2 ? ST_BULK_END_MAX_MS : 2 * b;
+    atomic_store_explicit(&s->bulk_end_backoff_ms, b, memory_order_relaxed);
+    atomic_store_explicit(&s->bulk_end_next_ms, st_now_ms() + b, memory_order_relaxed);
+    const int bst = room ? 2 : 1;
+    if (atomic_exchange_explicit(&s->bulk_end_state, bst, memory_order_relaxed) != bst) {
+      if (room)
+        st_log(s, 4, "store: the checkpoint that ends the bulk fill needs about %" PRIu64 " bytes and %" PRIu64 " are free: it is not tried until there is room (looked at again with a back-off up "
+                     "to 5 min); until it is on disk a crash goes back to the last bulk checkpoint", need_b, st_avail(s));
+      else
+        st_log(s, 3, "store: the checkpoint that ends the bulk fill failed (%d): it is tried again with a back-off up to 5 min; until it is on disk a crash goes back to the last bulk checkpoint", r);
+    }
+  }
   return r;
 }
 /* what a checkpoint leaves to the writer mutex: the retired generations and segments, the free space and the warnings */
@@ -3951,7 +3948,7 @@ static bool bulk_due(const store_t *s, uint64_t now) {
 /* is a checkpoint due? */
 static bool ckpt_due(const store_t *s, uint64_t now) {
   if (atomic_load_explicit(&s->bulk, memory_order_relaxed)) return bulk_due(s, now);     /* (a bulk fill: not by the journal, which holds nothing, nor by checkpoint_interval_ms) */
-  if (atomic_load_explicit(&s->bulk_end_pending, memory_order_relaxed)) return now >= atomic_load_explicit(&s->bulk_end_next_ms, memory_order_relaxed);      /* (its end, until a superblock without SBF_BULK is on disk; after a failure, or with no room, once its back-off is over: bulk_end_backoff()) */
+  if (atomic_load_explicit(&s->bulk_end_pending, memory_order_relaxed)) return now >= atomic_load_explicit(&s->bulk_end_next_ms, memory_order_relaxed);      /* (its end, until a superblock without SBF_BULK is on disk; after a failure, or with no room, once its back-off is over, st_ckpt()) */
   const uint64_t lsn = atomic_load_explicit(&s->lsn, memory_order_relaxed);
   if (atomic_load_explicit(&s->jbytes, memory_order_relaxed) >= jmax(s)) return true;
   if (lsn <= atomic_load_explicit(&s->ckpt_lsn, memory_order_relaxed)) return false;
