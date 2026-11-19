@@ -4097,6 +4097,14 @@ static int run_fixes(const char *dir) {
     (void)serve_fetches(&fetchc, f[0], &e, 1500, -1, -1);
     CHECK(wait_stored(st, NF, 30000));
     CHECK(cursor_is(st, 100));
+    {                                                       /* 0.7: the first fill of the empty store was unlogged (store_bulk_begin() in db_recon_begin()); the ticker ends it once its bodies are in */
+        for (int w = 0; w < 10000 && store_bulk(st) != 0; w++) usleep(1000);
+        store_stats_t ss;
+        store_stats(st, &ss);
+        CHECK_MSG(ss.bulk_fills == 1 && ss.bulk_unlogged_records >= (uint64_t)NF && ss.bulk_active == 0 && ss.bulk_ended_unix > 0 && ss.journal_boost == 0,
+                  "bulk: fills %llu, unlogged %llu, active %u, ended %llu, boost %llu", (unsigned long long)ss.bulk_fills, (unsigned long long)ss.bulk_unlogged_records, ss.bulk_active,
+                  (unsigned long long)ss.bulk_ended_unix, (unsigned long long)ss.journal_boost);
+    }
 
     /* -- 0.7 M3: the bodies of a first fill, which nobody waits for, are stored as the images they are: no entry is made, the registry does not change, and the counters say so.  The first query
      *    (db_store_attach_zone(): what a worker does) attaches the zone from its record. */
