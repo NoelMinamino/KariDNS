@@ -66,9 +66,10 @@ check('/version names the tools', /karidns-zone/.test(version.body.tools['karidn
 const noCode = await call('POST', '/auth/login', { body: { user: 'admin', password: process.env.IT_ADMIN_PASSWORD } });
 eq('a login now needs the code', type(noCode), 'totp-required');
 await sleep(1100);
-const twice = await login('admin', process.env.IT_ADMIN_PASSWORD, { totp: code(secret, 1) });
+const once = code(secret, 1);   // (one value for both logins: a 30 s step may end between them, and a new code is a different code)
+const twice = await login('admin', process.env.IT_ADMIN_PASSWORD, { totp: once });
 eq('a login with the code works', twice.status, 200);
-eq('the same code is not taken twice', type((await call('POST', '/auth/login', { body: { user: 'admin', password: process.env.IT_ADMIN_PASSWORD, totp: code(secret, 1) } }))), 'invalid-credentials');
+eq('the same code is not taken twice', type((await call('POST', '/auth/login', { body: { user: 'admin', password: process.env.IT_ADMIN_PASSWORD, totp: once } }))), 'invalid-credentials');
 
 // ---------------------------------------------------------------------------------------------------------------------------------- users, policies, grants
 console.log('-- users, groups, policies, grants');
