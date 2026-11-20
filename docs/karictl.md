@@ -321,6 +321,8 @@ Commands that take a zone name accept an optional view name as the next argument
   | `store.zone.serial`, `.flags`, `.source`, `.source_id`, `.stamp_gen`, `.stamp_time`, `.settings` | SOA serial of the stored version, flag bits, source number and the zone's id in that database, version stamp, settings id |
   | `store.zone.image_bytes`, `.segment`, `.offset`, `.digest` | Size of the image, where it lies (segment and byte offset; not for a known zone), digest of the zone content (hex) |
   | `store.zone.attached` | 1 when the zone is attached now (where the server can tell) |
+  | `store.zone.elem`, `.resident`, `.staged`, `.elem_state` | 0.7, for a zone that does not answer: the attach table has an element for the zone, the element has its data, a worker's attach of it is in the staging table and not registered yet, the element's state (`resident`, `loading`, `error`, `absent`; `none` without an element). Read only |
+  | `store.zone.att_claim`, `.att_claim_req`, `.att_claim_workers`, `.fetch_claim` | 0.7: a claim for the attach of the zone is held (the workers that waited for a store thread joined it), its request is in a ring, the workers that wait (a bit set: bit n is worker n, bit 15 every worker from 15 up), and the claim for the fetch of the zone from the database is held. A claim that stays held while nothing is attached or fetched is a request that was lost |
 
   A bad argument, a zone that is not in the store (`ERROR zone not found`), a name in several views without a view, or `zone` without a store are answered `ERROR ...` (exit status 3).
 

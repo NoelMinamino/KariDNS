@@ -22,7 +22,13 @@ for (my $i = $#order; $i > 0; $i--) {
     @order[$i, $j] = @order[$j, $i];
 }
 socket(my $s, PF_INET, SOCK_DGRAM, 0) or die "socket: $!";
-setsockopt($s, SOL_SOCKET, SO_RCVBUF, 8 * 1024 * 1024);
+# The receive buffer: 8 MiB is more than kern.ipc.maxsockbuf allows (8388608: the kernel takes 8/9 of it, ENOBUFS above that) and the refusal left the 42080 bytes of net.inet.udp.recvspace, which holds a few hundred answers: the
+# answers of a wave of resends that this client sends without reading were dropped by the kernel of the client, and no counter of the server saw it.  So the sizes are tried from the top down, and the one that was taken is printed (rcvbuf=).
+my $rcvbuf = 0;
+for my $sz (8 * 1024 * 1024, 7 * 1024 * 1024, 4 * 1024 * 1024, 2 * 1024 * 1024, 1024 * 1024, 256 * 1024) {
+    if (setsockopt($s, SOL_SOCKET, SO_RCVBUF, $sz)) { $rcvbuf = unpack("i", getsockopt($s, SOL_SOCKET, SO_RCVBUF)); last; }
+}
+$rcvbuf ||= unpack("i", getsockopt($s, SOL_SOCKET, SO_RCVBUF));
 setsockopt($s, SOL_SOCKET, SO_SNDBUF, 4 * 1024 * 1024);
 my $dest = sockaddr_in($port, inet_aton("127.0.0.1"));
 my $flags = fcntl($s, 3, 0);                       # F_GETFL
@@ -35,7 +41,8 @@ sub pkt {
     return pack("nnnnnn", $id, 0x0100, 1, 0, 0, 0) . $q . pack("nn", 1, 1);
 }
 my %pending;                                       # "zN" => [N, the time it was sent]
-my ($sent, $ans, $ok, $sf, $oth, $resent) = (0, 0, 0, 0, 0, 0);
+my ($sent, $ans, $ok, $sf, $oth, $resent, $late) = (0, 0, 0, 0, 0, 0, 0);
+my %nsent;                                         # "zN" => how many times the query was sent (the lost ones are printed with it)
 my $t0 = time;
 my $deadline;
 my $buf;
@@ -53,7 +60,7 @@ sub drain {
             $off += 1 + $l;
         }
         my $key = $labels[1] // next;              # www.zN.test: the second label
-        next unless delete $pending{$key};
+        if (!delete $pending{$key}) { $late++; next; }        # (an answer to a query that was answered already: a resend's second answer)
         $ans++;
         my $rc = $fl & 15;
         if ($rc == 0 && $an > 0) { $ok++ } elsif ($rc == 2) { $sf++ } else { $oth++ }
@@ -69,6 +76,7 @@ while ($idx < @order || %pending) {
     while ($idx < @order && keys(%pending) < $window) {
         my $i = $order[$idx++];
         $pending{"z$i"} = [$i, time];
+        $nsent{"z$i"} = 1;
         send($s, pkt($i, $sent & 0xffff), 0, $dest) or do { delete $pending{"z$i"}; };
         $sent++;
         $moved++;
@@ -81,11 +89,14 @@ while ($idx < @order || %pending) {
         $lastresend = time;
         for my $k (keys %pending) {
             my $p = $pending{$k};
+            next unless defined $p;                          # (answered by a drain() of this very wave)
             next if time - $p->[1] < 2;
             $p->[1] = time;
             send($s, pkt($p->[0], $sent & 0xffff), 0, $dest);
             $sent++;
             $resent++;
+            $nsent{$k}++;
+            drain() if ($resent & 31) == 0;                 # (the answers are read while a wave goes out, not after it)
             $moved++;
         }
     }
@@ -99,5 +110,9 @@ while ($idx < @order || %pending) {
 drain();
 my $secs = time - $t0;
 my $lost = keys %pending;
-printf("sent=%d resent=%d answered=%d noerror=%d servfail=%d other=%d lost=%d secs=%.2f rate=%d\n", $sent, $resent, $ans, $ok, $sf, $oth, $lost, $secs, $secs > 0 ? $sent / $secs : 0);
+if ($lost) {                                       # the first 10 names and how often each was sent: the test asks the server about them
+    my @l = sort { $a cmp $b } keys %pending;
+    print STDERR "LOST: ", join(" ", map { "$_(x$nsent{$_})" } @l[0 .. ($#l < 9 ? $#l : 9)]), (@l > 10 ? " ... (" . @l . " in all)" : ""), "\n";
+}
+printf("sent=%d resent=%d answered=%d noerror=%d servfail=%d other=%d lost=%d secs=%.2f rate=%d late=%d rcvbuf=%d\n", $sent, $resent, $ans, $ok, $sf, $oth, $lost, $secs, $secs > 0 ? $sent / $secs : 0, $late, $rcvbuf);
 exit($ok == $n ? 0 : 1);

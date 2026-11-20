@@ -97,11 +97,22 @@ park_drops() { echo "store.park.drop room=$(sf store.park.drop.room) timeout=$(s
 waitfor() { w=$1; shift; i=0; while [ $i -lt $((w * 10)) ]; do "$@" && return 0; sleep 0.1; i=$((i + 1)); done; return 1; }
 stored_all() { [ "$(sf store.zones.stored)" -ge "$NZ" ] 2>/dev/null; }
 hot_ended() { s=$(sf store.hot.state); [ "$s" = done ] || [ "$s" = high-mark ]; }
+# burst_diag: a burst lost queries.  What the client printed (the lost names and how often each was sent), what the host's UDP sockets dropped during the burst, what the server says about the first lost zones, and the
+# counters between the routers and the workers.
+burst_diag() {
+    [ -s "$T/burst.err" ] && sed 's/^/  /' "$T/burst.err" | cut -c1-700
+    echo "  [udp diag] netstat -s -p udp, what changed during the burst:"
+    kari_udp_delta "$T/udp.snap"
+    kari_lost_diag "$KA" "$PA" $(sed -n 's/^LOST: //p' "$T/burst.err" | tr ' ' '\n' | sed -n 's/^\(z[0-9][0-9]*\)(x.*/\1.test/p')
+    echo "  [store diag] $($KA store -k 2>/dev/null | grep -E '^store\.(attach\.(count|failed|busy|stale|resident|missing|fallback|worker)|cold\.|park\.|lookup\.)' | grep -v '=0$' | tr '\n' ' ')"
+    kari_ipc_diag "$KA" "$T/a.log"
+}
 burst_check() {   # burst_check LABEL SEED: a burst of one query for every zone, every one must be NOERROR
-    OUT=$(perl tests/db/udp_cold_burst.pl "$PA" "$NZ" "$2" "$WINDOW" "$WAIT")
+    kari_udp_snap "$T/udp.snap"
+    OUT=$(perl tests/db/udp_cold_burst.pl "$PA" "$NZ" "$2" "$WINDOW" "$WAIT" 2> "$T/burst.err")
     echo "  $OUT"
     bv() { echo "$OUT" | sed -n "s/.* $1=\([0-9.]*\).*/\1/p" | head -1; }
-    [ "$(bv noerror)" = "$NZ" ] && [ "$(bv servfail)" = 0 ] && [ "$(bv lost)" = 0 ] && pass "$1: all $NZ queries answered with NOERROR (0 SERVFAIL, 0 lost)" || fail "$1: $OUT"; echo "  $(park_drops)"; [ "$(bv noerror)" = "$NZ" ] && [ "$(bv lost)" = 0 ] || kari_ipc_diag "$KA" "$T/a.log"
+    [ "$(bv noerror)" = "$NZ" ] && [ "$(bv servfail)" = 0 ] && [ "$(bv lost)" = 0 ] && pass "$1: all $NZ queries answered with NOERROR (0 SERVFAIL, 0 lost)" || fail "$1: $OUT"; echo "  $(park_drops)"; [ "$(bv noerror)" = "$NZ" ] && [ "$(bv lost)" = 0 ] || burst_diag
     SR0=$(server_refusals)
     case "$SR0" in
     "park_full=0 park_timeout=0 queue_full=0 queue_dropped=0 table_full=0") pass "$1: the server refused no stored zone on its own account ($SR0)" ;;

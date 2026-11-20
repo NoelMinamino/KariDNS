@@ -3908,7 +3908,7 @@ static int run_proto(int phase, const char *dir) {
     {
         /* the report of one zone asks the server whether it is in memory (store.zone.attached), and the scan of the wanted bodies is put back for a zone whose body could not be fetched */
         static char zr[STORE_STATUS_OUT_MAX];
-        CHECK(store_status_format(zr, sizeof(zr), STORE_FMT_KV, "m0600.test") > 0 && strstr(zr, "store.zone.attached=") != NULL);
+        CHECK(store_status_format(zr, sizeof(zr), STORE_FMT_KV, "m0600.test") > 0 && strstr(zr, "store.zone.attached=") != NULL && strstr(zr, "store.zone.resident=") != NULL && strstr(zr, "store.zone.att_claim=") != NULL && strstr(zr, "store.zone.fetch_claim=") != NULL);
         db_recon_status_t fs;
         db_recon_status(&fs);
         CHECK(db_store_filling() == (fs.known_now > 0 && (fs.active || fs.in_flight > 0)));      /* (a first fill: zones without an image and a pass or the fetch of their bodies running) */

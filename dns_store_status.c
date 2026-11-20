@@ -157,6 +157,8 @@ static bool (*_Atomic g_fill_fn)(store_fill_t *);
 void store_status_bind(store_t *s) { atomic_store_explicit(&g_store, s, memory_order_release); }
 void store_status_set_memory_fn(bool (*fn)(ma_est_t *out)) { atomic_store_explicit(&g_mem_fn, fn, memory_order_release); }
 void store_status_set_attached_fn(bool (*fn)(uint32_t zid)) { atomic_store_explicit(&g_att_fn, fn, memory_order_release); }
+static _Atomic(void (*)(uint16_t, uint32_t, const char *, const char *, store_zdetail_t *)) g_zd_fn;
+void store_status_set_zdetail_fn(void (*fn)(uint16_t sview, uint32_t zid, const char *view, const char *name, store_zdetail_t *out)) { atomic_store_explicit(&g_zd_fn, fn, memory_order_release); }
 void store_status_set_attached_count_fn(uint64_t (*fn)(void)) { atomic_store_explicit(&g_att_count_fn, fn, memory_order_release); }
 void store_status_set_extra_fn(bool (*fn)(store_extra_t *out)) { atomic_store_explicit(&g_extra_fn, fn, memory_order_release); }
 void store_status_set_recon_fn(bool (*fn)(store_recon_t *out)) { atomic_store_explicit(&g_recon_fn, fn, memory_order_release); }
@@ -940,6 +942,21 @@ static int add_zone(list_t *l, const store_t *s, const char *spec, char *err, si
   add_s(l, "store.zone.digest", buf);
   bool (*af)(uint32_t) = atomic_load_explicit(&g_att_fn, memory_order_acquire);
   if (af) U("store.zone.attached", af(zz.zid) ? 1 : 0);
+  void (*zf)(uint16_t, uint32_t, const char *, const char *, store_zdetail_t *) = atomic_load_explicit(&g_zd_fn, memory_order_acquire);
+  if (zf) {
+    store_zdetail_t d;
+    memset(&d, 0, sizeof(d));
+    d.elem_state = -1;
+    zf(hv, zz.zid, vn ? vn : "", zz.name, &d);
+    U("store.zone.elem", d.elem ? 1 : 0);
+    U("store.zone.resident", d.resident ? 1 : 0);
+    U("store.zone.staged", d.staged ? 1 : 0);
+    add_s(l, "store.zone.elem_state", d.elem_state == 1 ? "resident" : d.elem_state == 2 ? "loading" : d.elem_state == 3 ? "error" : d.elem_state == 0 ? "absent" : "none");
+    U("store.zone.att_claim", d.att_claim ? 1 : 0);
+    U("store.zone.att_claim_req", d.att_req ? 1 : 0);
+    U("store.zone.att_claim_workers", d.att_set);
+    U("store.zone.fetch_claim", d.fetch_claim ? 1 : 0);
+  }
   return 0;
 }
 

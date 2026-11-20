@@ -178,6 +178,18 @@ void store_status_bind(store_t *s);
 void store_status_set_memory_fn(bool (*fn)(ma_est_t *out));
 /* optional: is the zone with this zid attached right now?  Adds store.zone.attached to `zone <name>` and is not needed for the counts */
 void store_status_set_attached_fn(bool (*fn)(uint32_t zid));
+/* optional, a diagnostic for a zone that does not answer (`karictl store zone`): where the zone is on the way to memory.  The server fills what it can tell; nothing is changed by it. */
+typedef struct {
+  bool elem;                    /* the attach table has an element for the zone id */
+  bool resident;                /* ... and the element has its data (the entry) */
+  bool staged;                  /* a worker's attach is in the staging table, not registered yet */
+  int elem_state;               /* ZDIR_ST_* of the element, -1 without one */
+  bool att_claim;               /* a claim for the attach of the zone is held (the workers wait for a store thread) */
+  bool att_req;                 /* ... and its request is in a ring */
+  uint32_t att_set;             /* ... the workers (bit set) that wait */
+  bool fetch_claim;             /* the claim for the fetch of the zone from the database is held */
+} store_zdetail_t;
+void store_status_set_zdetail_fn(void (*fn)(uint16_t sview, uint32_t zid, const char *view, const char *name, store_zdetail_t *out));
 /* the number of zones in memory (the attach table): `store.zones.attached`; without it the figure is attaches minus detaches */
 void store_status_set_attached_count_fn(uint64_t (*fn)(void));
 

@@ -176,6 +176,16 @@ static bool mem_fn(ma_est_t *e) {
   return true;
 }
 static bool att_fn(uint32_t zid) { return zid == 0; }
+static void zd_fn(uint16_t sview, uint32_t zid, const char *view, const char *name, store_zdetail_t *o) {
+  (void)sview;
+  (void)view;
+  (void)name;
+  o->elem = o->resident = zid == 0;
+  o->elem_state = zid == 0 ? 1 : -1;
+  o->att_claim = o->att_req = zid != 0;
+  o->att_set = 5;
+  o->fetch_claim = true;
+}
 
 static const char *REQUIRED[] = {
   "schema", "store.time.mono_ms", "store.time.unix", "store.state", "store.state_bits", "store.format", "store.mode", "store.fstype",
@@ -500,6 +510,7 @@ static void test_store(int mode, const char *base) {
   g_mem_ok = true;
   store_status_set_memory_fn(mem_fn);
   store_status_set_attached_fn(att_fn);
+  store_status_set_zdetail_fn(zd_fn);
   store_status_note_attach(1500, 0);
   store_status_note_attach(900000, 0);
   store_status_note_attach(0, STORE_ATT_ERR_CHECKSUM);
@@ -678,6 +689,13 @@ static void test_store(int mode, const char *base) {
   CHECK_EQ(kv_num("store.zone.serial"), 13);
   CHECK(strcmp(kv_str("store.zone.view"), "external") == 0);
   CHECK_EQ(kv_num("store.zone.attached"), kv_num("store.zone.zid") == 0 ? 1 : 0);
+  /* where the zone is on its way to memory (store.zone.elem ... fetch_claim): what the server's hook says */
+  CHECK_EQ(kv_num("store.zone.resident"), kv_num("store.zone.zid") == 0 ? 1 : 0);
+  CHECK_EQ(kv_num("store.zone.att_claim"), kv_num("store.zone.zid") == 0 ? 0 : 1);
+  CHECK_EQ(kv_num("store.zone.att_claim_workers"), 5);
+  CHECK_EQ(kv_num("store.zone.fetch_claim"), 1);
+  CHECK(strcmp(kv_str("store.zone.elem_state"), kv_num("store.zone.zid") == 0 ? "resident" : "none") == 0);
+  CHECK(kv_get("store.zone.staged") != NULL && kv_get("store.zone.elem") != NULL && kv_get("store.zone.att_claim_req") != NULL);
   store_status_format(js, STORE_STATUS_OUT_MAX, STORE_FMT_JSON, "known.test");
   CHECK(parse_json(js) && strcmp(kv_str("store.zone.state"), "known") == 0 && kv_get("store.zone.segment") == NULL);
   store_status_format(js, STORE_STATUS_OUT_MAX, STORE_FMT_TEXT, "example.com");

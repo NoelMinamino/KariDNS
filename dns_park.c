@@ -1027,6 +1027,22 @@ uint32_t park_att_take_tag(uint16_t sview, uint32_t zid, uint64_t *tag) {
   return PARK_ATT_ALL;                                   /* no claim (a request without one, or a duplicate that came after the first was done): whoever waits is woken */
 }
 
+/* A read of the claim of a zone for a diagnostic (karictl store zone): is one held, which workers wait, is its request in a ring.  Changes nothing. */
+bool park_att_peek(uint16_t sview, uint32_t zid, uint32_t *set, bool *req) {
+  const uint64_t id = ACL_ID(sview, zid);
+  for (unsigned j = 0; j < ACL_WIN; j++) {
+    const uint64_t v = atomic_load_explicit(&g_aclaim[acl_slot(id, j)], memory_order_acquire);
+    if (v != 0 && (v & ACL_IDMASK) == id) {
+      *set = acl_to_set(v);
+      *req = (v & ACL_REQ) != 0;
+      return true;
+    }
+  }
+  *set = 0;
+  *req = false;
+  return false;
+}
+
 uint32_t park_att_take(uint16_t sview, uint32_t zid) {
   uint64_t tag;
   return park_att_take_tag(sview, zid, &tag);

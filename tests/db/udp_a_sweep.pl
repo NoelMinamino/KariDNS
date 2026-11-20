@@ -11,6 +11,7 @@ open(my $fh, '<', $file) or die "$file: $!\n";
 my $s = IO::Socket::INET->new(PeerAddr => $host, PeerPort => $port, Proto => 'udp') or die "udp: $!\n";
 my $sel = IO::Select->new($s);
 my ($sent, $answered, $noerror) = (0, 0, 0);
+my @lost;                                                # the names that got no answer in time (printed to standard error: the test asks the server about them)
 my $id = 1;
 while (my $name = <$fh>) {
     chomp $name;
@@ -20,11 +21,15 @@ while (my $name = <$fh>) {
     syswrite($s, $q);
     $sent++;
     my $r;
+    my $got = 0;
     while ($sel->can_read(10) && sysread($s, $r, 4096)) {
         next if unpack('n', $r) != $id;                  # (an answer to an earlier question that came late)
         $answered++;
+        $got = 1;
         $noerror++ if (unpack('n', substr($r, 2, 2)) & 15) == 0;
         last;
     }
+    push @lost, $name unless $got;
 }
+print STDERR "LOST: ", join(" ", @lost[0 .. ($#lost < 9 ? $#lost : 9)]), (@lost > 10 ? " ... (" . @lost . " in all)" : ""), "\n" if @lost;
 print "sent=$sent answered=$answered noerror=$noerror\n";

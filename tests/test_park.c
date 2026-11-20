@@ -1157,6 +1157,14 @@ static void test_attach_ring(void) {
   CHECK(park_att_claim(2, 100, 7) == 1);                                                       /* (a new claim after the take) */
   CHECK(park_att_leave(2, 100, 7) && park_att_take(2, 100) == PARK_ATT_ALL);                  /* (the last worker leaves: the claim goes) */
   CHECK(park_att_claim(2, 101, 5) == 2 && park_att_leave(2, 101, 0) && park_att_take(2, 101) == (1u << 5));
+  {                                                                                            /* the read of a claim for a diagnostic: nothing changes */
+    uint32_t pset = 99;
+    bool preq = true;
+    CHECK(!park_att_peek(2, 555, &pset, &preq) && pset == 0 && !preq);
+    CHECK(park_att_claim(2, 555, 4) == 1 && park_att_peek(2, 555, &pset, &preq) && pset == (1u << 4) && !preq);
+    park_att_requested(2, 555);
+    CHECK(park_att_peek(2, 555, &pset, &preq) && preq && park_att_take(2, 555) == (1u << 4) && !park_att_peek(2, 555, &pset, &preq));
+  }
   CHECK(park_att_claim(3, 100, 20) == 2 && (park_att_take(3, 100) & 0xFFFF8000u) == 0xFFFF8000u);   /* (workers above 14 share a bit: every worker from 15 up is woken) */
   (void)park_att_take(3, 100);
   /* the zone id 0 of the view 0 is a zone like any other (the claim is the exact zone, never 0) */
