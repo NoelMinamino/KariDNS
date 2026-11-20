@@ -7910,8 +7910,7 @@ static void test_bulk_nx_rule(void) {
   int status = 0;
   CHECK(waitpid(pid, &status, 0) == pid);
   CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
-  if (!(WIFEXITED(status) && WEXITSTATUS(status) == 0)) printf("  (the child ended with status %d, signal %d)
-", WIFEXITED(status) ? WEXITSTATUS(status) : -1, WIFSIGNALED(status) ? WTERMSIG(status) : 0);
+  if (!(WIFEXITED(status) && WEXITSTATUS(status) == 0)) printf("  (the child ended with status %d, signal %d)\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1, WIFSIGNALED(status) ? WTERMSIG(status) : 0);
   /* the power loss: no record past the checkpoint reached the disk (every journal file keeps its header only) */
   DIR *dp = opendir(d.path);
   struct dirent *de;
@@ -8252,8 +8251,7 @@ static void test_torn_pairs(bool bulk) {
   int status = 0;
   CHECK(waitpid(pid, &status, 0) == pid);
   CHECK(bulk ? (WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL) : (WIFEXITED(status) && WEXITSTATUS(status) == 0));
-  if (!(bulk ? (WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL) : (WIFEXITED(status) && WEXITSTATUS(status) == 0))) printf("  (the child ended with status %d, signal %d)
-", WIFEXITED(status) ? WEXITSTATUS(status) : -1, WIFSIGNALED(status) ? WTERMSIG(status) : 0);
+  if (!(bulk ? (WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL) : (WIFEXITED(status) && WEXITSTATUS(status) == 0))) printf("  (the child ended with status %d, signal %d)\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1, WIFSIGNALED(status) ? WTERMSIG(status) : 0);
   if (!bulk) {                                                           /* (the power loss: no record past the last checkpoint reached the disk) */
     DIR *dp = opendir(d.path);
     struct dirent *de;
