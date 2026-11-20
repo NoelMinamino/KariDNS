@@ -234,3 +234,10 @@ store_prefill() {
     while [ $_sp_i -lt 1800 ] && ! grep -q "\[DB\] initial load complete" "$T/srv.log" 2>/dev/null; do sleep 0.1; _sp_i=$((_sp_i + 1)); done
     return 0
 }
+
+# kari_lab_zones : the zone files of tests/zones/ that are part of the repository (tests/zones/LAB_ZONES), one path relative to the source root per line.  Tests that run
+# side by side (tests/run_all_suite.sh -j) write temporary zone files of their own into tests/zones/ while they run (ttl_clamp_test.zone, ...), so a glob of
+# tests/zones/*.zone sees files come and go: a test that takes "every lab zone" (run_db_dump_test.sh: reference stream and database must hold the same zones) lists them here.
+kari_lab_zones() {
+    sed 's#^#tests/zones/#' "${ROOT:-.}/tests/zones/LAB_ZONES"
+}
