@@ -59,7 +59,8 @@ function sql(text) {
 
 // ---- the DNS server
 const dagArgs = (name, t) => ['@127.0.0.1', '-p', PORT, name, t, '+nohexdump', '+time=3', '+tries=3'];
-const answer = (name, t = 'A') => spawnSync(DAG, [...dagArgs(name, t), '+short'], { encoding: 'utf8' }).stdout.trim().split('\n').filter(Boolean).sort().join(',');
+// (with +tries=3, a try that timed out prints ";; communications error ..." to stdout as dig does: not part of the answer)
+const answer = (name, t = 'A') => spawnSync(DAG, [...dagArgs(name, t), '+short'], { encoding: 'utf8' }).stdout.trim().split('\n').filter((l) => l && !l.startsWith(';;')).sort().join(',');
 async function waitAnswer(what, name, want, secs = 15, t = 'A') {
   const end = Date.now() + secs * 1000;
   let got;

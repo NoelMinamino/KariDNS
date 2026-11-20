@@ -170,13 +170,17 @@ STATIC_TEST int usable_cpu_count(void) {
   return cpus;
 }
 
-/* The thread counts for `cpus` usable CPUs: 1-2 CPUs: 1 router + 1 worker; 3: 1 + 2; 4 or more: 2 routers + the rest as workers.  Then the clamps
- * (MAX_FRONTEND_ROUTERS, MAX_WORKERS), then options { router-threads; worker-threads; } (already in range; 0 = not written) replace each count. */
+/* The thread counts for `cpus` usable CPUs: 1-3 CPUs: 1 router (1 worker on 1-2 CPUs, 2 on 3); 4 or more: half the CPUs as routers (4: 2 + 2, 8: 4 + 4,
+ * 16: 8 + 8) and the rest as workers.  A router costs about as much CPU per query as a worker (4.2 us and 4.4 us measured, B3 phase 0: 2 routers and
+ * 6 workers topped out at 550k qps with the routers at 90 % of a CPU each, 4 and 4 passed 600k), so the split follows 1:1.  Then the clamps
+ * (MAX_FRONTEND_ROUTERS, MAX_WORKERS), then options { router-threads; worker-threads; } (already in range; 0 = not written) replace each count;
+ * the default of the one that is not written does not depend on the one that is. */
 STATIC_TEST void plan_threads(int cpus, uint32_t opt_routers, uint32_t opt_workers, int *routers, int *workers) {
   if (cpus < 1) cpus = 1;
-  *routers = cpus <= 3 ? 1 : 2;
-  *workers = cpus <= 3 ? (cpus >= 3 ? 2 : 1) : cpus - 2;
+  *routers = cpus <= 3 ? 1 : cpus / 2;
   if (*routers > MAX_FRONTEND_ROUTERS) *routers = MAX_FRONTEND_ROUTERS;
+  *workers = cpus - *routers;
+  if (*workers < 1) *workers = 1;
   if (*workers > MAX_WORKERS) *workers = MAX_WORKERS;
   if (opt_routers) *routers = (int)opt_routers;
   if (opt_workers) *workers = (int)opt_workers;
@@ -2035,6 +2039,16 @@ void ipcd_add(ipcd_t c, uint64_t n) {
   if (n) atomic_fetch_add_explicit(&g_ipcd_self->c[c], n, memory_order_relaxed);
 }
 
+/* A router counts the queries it passes on in its own slot (one writer: a plain load and store, no locked add); the Backend reads them for ipcstats */
+void ipcd_routed_add(uint64_t n) {
+  if (n) atomic_store_explicit(&g_ipcd_self->routed, atomic_load_explicit(&g_ipcd_self->routed, memory_order_relaxed) + n, memory_order_relaxed);
+}
+
+uint64_t ipcd_routed(int slot) {
+  if (!g_ipcd_slots) return slot == 0 ? atomic_load_explicit(&g_ipcd_fallback.routed, memory_order_relaxed) : 0;   /* (no shared area: one private slot) */
+  return (slot >= 0 && slot < IPCD_SLOTS) ? atomic_load_explicit(&g_ipcd_slots[slot].routed, memory_order_relaxed) : 0;
+}
+
 uint64_t ipcd_total(ipcd_t c) {
   uint64_t t = 0;
   if (!g_ipcd_slots) return atomic_load_explicit(&g_ipcd_fallback.c[c], memory_order_relaxed);
@@ -2056,6 +2070,12 @@ size_t ipcd_format(char *buf, size_t cap) {
   }
   int w = snprintf(buf + len, cap - len, "ipc.dropped.total=%llu\n", (unsigned long long)dropped);
   if (w > 0 && (size_t)w < cap - len) len += (size_t)w;
+  /* the queries each router read and handed to the workers (B3: with several routers, SO_REUSEPORT_LB shares the clients' ports out; a router at 0 is idle) */
+  for (int r = 0; r < g_num_frontend_routers && r < KARIDNS_ROUTER_THREADS_MAX; r++) {
+    w = snprintf(buf + len, cap - len, "ipcrouter.%d.queries=%llu\n", r, (unsigned long long)ipcd_routed(r));
+    if (w < 0 || (size_t)w >= cap - len) return len;
+    len += (size_t)w;
+  }
   /* the sizes of the socket buffers in force (smallest of each kind; asked = the largest request): ipcbuf.<kind>.<direction>.asked / .got, 0 = not set */
   static const char *const kinds[2] = { "queue", "udp" };
   static const char *const dirs[2] = { "rcv", "snd" };
@@ -3429,6 +3449,8 @@ worker_startup_success:;
             sendmmsg_skip_failed(active_fd, batch->tx_msgs, pass.n_tx, "Backend->Frontend IPC", true, IPCD_WREP_FULL);
             pass.n_tx = 0;
           }
+          if (udp_batch_drained(n_recv))
+            break;   // the queue was emptied by this batch (EV_CLEAR: a message that comes later raises the event again), as in the router
         }
       } else if (ev_list[i].udata == (void *)2) {
         // TCP
@@ -6664,7 +6686,26 @@ void setup_udp_socket_buffers(int fd, int desired_rcv, int desired_snd) {
   if (desired_snd > 0) udp_sockbuf_one(fd, SO_SNDBUF, desired_snd, "SO_SNDBUF", "udp-sndbuf-size");
 }
 
-int open_router_udp_sockets(server_config_t *cfg, int out_fds[MAX_BIND_ADDRS], bool out_is_wildcard[MAX_BIND_ADDRS]) {
+/* The family and the address of a bound socket's sockaddr as the destination of its queries (see router_src_t); false (out->valid unset) for another family. */
+bool router_src_from_sockaddr(const struct sockaddr_storage *ss, router_src_t *out) {
+  memset(out, 0, sizeof(*out));
+  if (ss->ss_family == AF_INET) {
+    out->addr.sin.sin_family = AF_INET;
+    out->addr.sin.sin_addr = ((const struct sockaddr_in *)ss)->sin_addr;
+  } else if (ss->ss_family == AF_INET6) {
+    out->addr.sin6.sin6_family = AF_INET6;
+    out->addr.sin6.sin6_addr = ((const struct sockaddr_in6 *)ss)->sin6_addr;
+  } else {
+    return false;
+  }
+  out->valid = true;
+  return true;
+}
+
+/* Opens the router UDP sockets.  A wildcard socket asks the kernel for the destination of every query (IP_RECVDSTADDR / IPV6_RECVPKTINFO: the reply must leave
+ * from that address); a socket bound to one address does not: out_src[i] keeps the address it was bound to (B3 phase 1: less work in the kernel and in the
+ * router for every query).  The sockets that only send NOTIFY (an ephemeral port, no query ever comes in) have neither. */
+int open_router_udp_sockets(server_config_t *cfg, int out_fds[MAX_BIND_ADDRS], bool out_is_wildcard[MAX_BIND_ADDRS], router_src_t out_src[MAX_BIND_ADDRS]) {
   int num_fds = 0;
   int opt = 1;
   int rcvbuf_size = cfg->udp_recvbuf_size > 0 ? cfg->udp_recvbuf_size : 4 * 1024 * 1024;
@@ -6691,14 +6732,14 @@ int open_router_udp_sockets(server_config_t *cfg, int out_fds[MAX_BIND_ADDRS], b
     int opt_reuse = 1;
     setsockopt(udp_fd, SOL_SOCKET, SO_REUSEPORT, &opt_reuse, sizeof(opt_reuse));
 #endif
-    if (la->family == AF_INET) {
+    if (is_wildcard && la->family == AF_INET) {
       int opt_dst = 1;
 #ifdef IP_RECVDSTADDR
       setsockopt(udp_fd, IPPROTO_IP, IP_RECVDSTADDR, &opt_dst, sizeof(opt_dst));
 #elif defined(IP_PKTINFO)
       setsockopt(udp_fd, IPPROTO_IP, IP_PKTINFO, &opt_dst, sizeof(opt_dst));
 #endif
-    } else {
+    } else if (is_wildcard) {
       int opt_pktinfo = 1;
 #ifdef IPV6_RECVPKTINFO
       setsockopt(udp_fd, IPPROTO_IPV6, IPV6_RECVPKTINFO, &opt_pktinfo, sizeof(opt_pktinfo));
@@ -6710,6 +6751,8 @@ int open_router_udp_sockets(server_config_t *cfg, int out_fds[MAX_BIND_ADDRS], b
       logev_post(LOGC_NETWORK, 1, NULL, 0, "[Network] UDP listener %s#%d (socket %d)%s", la->text, (int)la->port, udp_fd,
                  is_wildcard ? ": a wildcard address, the reply's source is taken from the destination of the query" : "");
       out_is_wildcard[num_fds] = is_wildcard;
+      memset(&out_src[num_fds], 0, sizeof(out_src[num_fds]));
+      if (!is_wildcard) (void)router_src_from_sockaddr(&addr, &out_src[num_fds]);
       out_fds[num_fds++] = udp_fd;
     } else {
       int bind_errno = errno;
@@ -6764,6 +6807,7 @@ int open_router_udp_sockets(server_config_t *cfg, int out_fds[MAX_BIND_ADDRS], b
       }
       if (bind(udp_fd, (struct sockaddr *)&bs, bl) == 0) {
         out_is_wildcard[num_fds] = false;
+        memset(&out_src[num_fds], 0, sizeof(out_src[num_fds]));
         out_fds[num_fds++] = udp_fd;
       } else {
         // start-up already bound this address once (preflight_xfr_sources()), so this is rare; the NOTIFY then leaves from the system's choice
@@ -6812,7 +6856,8 @@ STATIC_TEST void run_frontend_router(pid_t backend_pid, int router_id) {
   // 特権破棄前に、外部UDPソケットをSO_REUSEPORT_LBでオープン・バインド (指示1: インデックス整合性の完全統一)
   int local_udp_fds[MAX_BIND_ADDRS];
   bool local_udp_is_wildcard[MAX_BIND_ADDRS];
-  int local_num_udp_fds = open_router_udp_sockets(cfg, local_udp_fds, local_udp_is_wildcard);
+  router_src_t local_udp_src[MAX_BIND_ADDRS];
+  int local_num_udp_fds = open_router_udp_sockets(cfg, local_udp_fds, local_udp_is_wildcard, local_udp_src);
 
   // 特権破棄 (setgid / setuid)。非root起動で user/group が実行ユーザー自身を
   // 指している場合は降格不要としてそのまま続行する (resolve_run_identity 参照)。
@@ -6973,13 +7018,16 @@ STATIC_TEST void run_frontend_router(pid_t backend_pid, int router_id) {
       if (ud < MAX_BIND_ADDRS) {
         // (1) UDP Inbound -> IPC to Backend Worker (recvmmsg / sendmmsg バッチ化)
         int fd = local_udp_fds[ud];
+        /* only a wildcard socket is given room for the destination cmsg (open_router_udp_sockets() asked for it there only) */
+        const bool want_dst = local_udp_is_wildcard[ud];
+        const router_src_t *const bound_src = &local_udp_src[ud];
         while (1) {
           for (int k = 0; k < UDP_BATCH_SIZE; k++) {
             udp_ipc_t *msg = (udp_ipc_t *)fctx->rx_buffers[k];
             fctx->rx_iov[k].iov_len = BUFFER_SIZE;
             fctx->rx_msgs[k].msg_hdr.msg_namelen = sizeof(msg->client_addr);
-            fctx->rx_msgs[k].msg_hdr.msg_control = fctx->rx_cbuf[k].buf;
-            fctx->rx_msgs[k].msg_hdr.msg_controllen = sizeof(fctx->rx_cbuf[k].buf);
+            fctx->rx_msgs[k].msg_hdr.msg_control = want_dst ? fctx->rx_cbuf[k].buf : NULL;
+            fctx->rx_msgs[k].msg_hdr.msg_controllen = want_dst ? sizeof(fctx->rx_cbuf[k].buf) : 0;
           }
           int n_recv = recvmmsg(fd, fctx->rx_msgs, UDP_BATCH_SIZE, MSG_DONTWAIT, NULL);
           if (n_recv <= 0)
@@ -7004,7 +7052,11 @@ STATIC_TEST void run_frontend_router(pid_t backend_pid, int router_id) {
               memset(&msg->source_addr, 0, sizeof(msg->source_addr));
               msg->payload_len = (uint16_t)len;
 
-              for (struct cmsghdr *cmsg = CMSG_FIRSTHDR(&fctx->rx_msgs[k].msg_hdr);
+              if (!want_dst && bound_src->valid) {
+                msg->has_source_addr = true;     /* the address the socket is bound to: where the query came in */
+                msg->source_addr = bound_src->addr;
+              }
+              for (struct cmsghdr *cmsg = want_dst ? CMSG_FIRSTHDR(&fctx->rx_msgs[k].msg_hdr) : NULL;
                    cmsg != NULL;
                    cmsg = CMSG_NXTHDR(&fctx->rx_msgs[k].msg_hdr, cmsg)) {
 #ifdef IP_RECVDSTADDR
@@ -7043,8 +7095,12 @@ STATIC_TEST void run_frontend_router(pid_t backend_pid, int router_id) {
               tx_count++;
             }
           }
-          if (tx_count > 0 && g_num_workers > 0)
+          if (tx_count > 0 && g_num_workers > 0) {
+            ipcd_routed_add((uint64_t)tx_count);
             ipc_send_spill(g_ipc_fds[router_id], g_num_workers, &rr, fctx->ipc_tx_msgs, tx_count);   /* (a worker whose queue is full: its part goes to the next worker) */
+          }
+          if (udp_batch_drained(n_recv))
+            break;   // the queue was emptied by this batch (EV_CLEAR: a datagram that comes later raises the event again)
         }
       } else if (ud == 999 && router_id == 0) {
         // (2) Notify Outbound -> Pre-opened UDP Sockets (Capsicum safe)
@@ -7324,6 +7380,8 @@ STATIC_TEST void run_frontend_router(pid_t backend_pid, int router_id) {
             sendmmsg_skip_failed(local_udp_fds[cur_sock_idx], fctx->cli_tx_msgs, tx_count, "Frontend UDP", false, IPCD_RCLI_FULL);
             tx_count = 0;
           }
+          if (udp_batch_drained(n_recv))
+            break;   // (as for the UDP sockets above)
         }
       }
     }

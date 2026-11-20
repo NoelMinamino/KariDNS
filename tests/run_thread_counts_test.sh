@@ -6,7 +6,8 @@
 # and options { router-threads; worker-threads; } replace them.
 #  1. `cpuset -l <first CPU>`: 1 router and 1 worker, "(1 CPUs usable of N)" in the start-up line, `karictl status` shows 1 worker thread
 #     and the machine's CPUs (unchanged `CPUs found`)
-#  2. no CPU set of its own: the counts of the CPUs this shell may use (2 routers and CPUs-2 workers from 4 CPUs on), the same line
+#  2. no CPU set of its own: the counts of the CPUs this shell may use (B3 phase 1: 1 router up to 3 CPUs, from 4 on half the CPUs as routers, at
+#     most 8, and the rest as workers), the same line; then CPU sets of 4, 8 and 16 CPUs (as far as the shell has them)
 #  3. router-threads / worker-threads: the counts and "set by ..." in the line, under a CPU set; the one that is not written stays automatic
 #  4. a reload that changes them: "OK (restart needed for: router-threads, worker-threads)" and the counts of the start stay
 #  5. karicheck conf: a valid file passes, a value out of range is an error with file:line; the server refuses to start with it
@@ -52,7 +53,7 @@ fi
 
 NCPU=$(sysctl -n hw.ncpu)
 # the CPUs this shell may use (a CI runner may be under a CPU set itself): the first one, and how many
-MASK=$(cpuset -g 2>/dev/null | sed -n 's/^pid [0-9]* mask: *//p' | head -1)
+MASK=$(cpuset -g 2>/dev/null | sed -n 's/^pid [-0-9]* mask: *//p' | head -1)   # ("pid -1 mask: ..." on FreeBSD 15: the calling process)
 FIRST=$(printf '%s' "$MASK" | cut -d, -f1)
 [ -n "$FIRST" ] || FIRST=0
 HAVE=$(printf '%s' "$MASK" | tr ',' '\n' | grep -c .)
@@ -99,6 +100,18 @@ expect_line() {
     l=$(line)
     case "$l" in "$2"*) pass "$1: $l";; *) fail "$1: '$l' (want '$2...')";; esac
 }
+# plan_expect CPUS: R and W the default plan gives (dns_server_core.c plan_threads())
+plan_expect() {
+    if [ "$1" -le 3 ]; then
+        R=1
+        if [ "$1" -ge 3 ]; then W=2; else W=1; fi
+    else
+        R=$(($1 / 2)); [ "$R" -gt 8 ] && R=8
+        W=$(($1 - R))
+    fi
+    [ "$W" -gt 128 ] && W=128
+    return 0
+}
 # the worker threads the Backend reports (`karictl status`)
 status_workers() { ctl status | sed -n 's/^worker threads: //p'; }
 
@@ -112,16 +125,20 @@ start_server cpuset -l "$FIRST" && {
 
 echo "=== 2. the CPUs this shell may use ($HAVE of $NCPU) ==="
 start_server env && {
-    if [ "$HAVE" -le 3 ]; then
-        R=1
-        if [ "$HAVE" -ge 3 ]; then W=2; else W=1; fi
-    else
-        R=2; W=$((HAVE - 2))
-    fi
-    [ "$W" -gt 128 ] && W=128
+    plan_expect "$HAVE"
     expect_line "the CPUs of the shell" "$R routers, $W workers ($HAVE CPUs usable of $NCPU)"
     [ "$(status_workers)" = "$W" ] && pass "status: $W worker threads" || fail "status worker threads: $(status_workers) (want $W)"
 }
+# a CPU set of the first N CPUs of the shell's mask: the plan for N CPUs
+for N in 4 8 16; do
+    [ "$HAVE" -ge "$N" ] || { echo "  (skipped: $N CPUs, this shell has $HAVE)"; continue; }
+    LIST=$(printf '%s' "$MASK" | tr -d ' ' | tr ',' '\n' | head -n "$N" | tr '\n' ',' | sed 's/,$//')
+    start_server cpuset -l "$LIST" && {
+        plan_expect "$N"
+        expect_line "a CPU set of $N CPUs" "$R routers, $W workers ($N CPUs usable of $NCPU)"
+        [ "$(status_workers)" = "$W" ] && pass "status: $W worker threads" || fail "status worker threads: $(status_workers) (want $W)"
+    }
+done
 
 echo "=== 3. router-threads / worker-threads ==="
 write_conf "router-threads 3; worker-threads 5;"
@@ -148,7 +165,10 @@ echo "=== 5. karicheck conf ==="
 write_conf "router-threads 1; worker-threads 128;"
 "$KARICHECK" conf "$TMP_DIR/karidns.conf" > "$TMP_DIR/kc.out" 2>&1; rc=$?
 [ "$rc" -eq 0 ] && pass "valid values pass" || { fail "karicheck rc=$rc"; cat "$TMP_DIR/kc.out"; }
-for bad in "router-threads 5;" "router-threads 0;" "worker-threads 129;" "worker-threads many;"; do
+write_conf "router-threads 8;"
+"$KARICHECK" conf "$TMP_DIR/karidns.conf" > "$TMP_DIR/kc.out" 2>&1; rc=$?
+[ "$rc" -eq 0 ] && pass "router-threads 8 (the most) passes" || { fail "karicheck rc=$rc"; cat "$TMP_DIR/kc.out"; }
+for bad in "router-threads 9;" "router-threads 0;" "worker-threads 129;" "worker-threads many;"; do
     write_conf "
 $bad"
     out=$("$KARICHECK" conf "$TMP_DIR/karidns.conf" 2>&1); rc=$?

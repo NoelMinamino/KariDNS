@@ -833,15 +833,20 @@ BLOCKS).
 \fBrouter\-threads <n>;\fR \fBworker\-threads <n>;\fR
 \fIDefault:\fR by the CPUs the server may run on
 .br
-\fIDescription:\fR The number of Frontend router processes (1..4) and of Backend
+\fIDescription:\fR The number of Frontend router processes (1..8) and of Backend
 worker threads (1..128). Not written: 1 router and 1 worker on up to 2 CPUs, 1
-and 2 on 3 CPUs, otherwise 2 routers and the CPUs minus 2 workers, where the
-CPUs are those of the server's CPU set (see the architecture section). Each is
-read on its own, so writing one leaves the other automatic; a second statement
-replaces the first. A value outside the range is a configuration error
-(\fBkaricheck conf\fR shows it with the file and line). Changing either needs a
-restart: a reload that changes it logs a warning, answers \fBOK reloaded
-(restart needed for: router\-threads)\fR and keeps the counts of the start.
+and 2 on 3 CPUs, otherwise half the CPUs as routers (at most 8) and the CPUs
+that are left as workers (4 CPUs: 2 + 2, 8: 4 + 4, 16: 8 + 8), where the CPUs
+are those of the server's CPU set (see the architecture section). A router is a
+process with its own UDP sockets (the kernel spreads the clients over them by
+their address and port, so a few clients that send from one port reach one
+router) and its own queues to every worker: more routers than CPUs only add
+context switches. Each is read on its own, so writing one leaves the other
+automatic; a second statement replaces the first. A value outside the range is a
+configuration error (\fBkaricheck conf\fR shows it with the file and
+line). Changing either needs a restart: a reload that changes it logs a warning,
+answers \fBOK reloaded (restart needed for: router\-threads)\fR and keeps the
+counts of the start.
 .TP 8
 \fBresponse\-cache\-size <size>;\fR
 \fIDefault:\fR \fB32M\fR
@@ -6352,11 +6357,13 @@ BIND).
 \fB\fBallow\-query\-on\fB\fR is checked against the address the query came to,
 with the same effect. On TCP it is the local address of the connection
 (\fBgetsockname\fR), on UDP the destination address of the datagram (the
-Frontend reads \fBIP_RECVDSTADDR\fR / \fBIPV6_PKTINFO\fR from every UDP socket,
-wildcard or not, and passes it to the Backend with the packet). If the address
-is unknown the only element that can match is \fBany\fR. The answer is refused
-when either \fBallow\-query\fR or \fBallow\-query\-on\fR does not allow the
-query.
+Frontend passes it to the Backend with the packet: for a wildcard socket it
+reads \fBIP_RECVDSTADDR\fR / \fBIPV6_PKTINFO\fR of the datagram; a socket bound
+to one address always receives its queries at that address, so the Frontend
+takes the address from the \fBbind()\fR at start-up and does not ask the kernel
+for every datagram). If the address is unknown the only element that can match
+is \fBany\fR. The answer is refused when either \fBallow\-query\fR or
+\fBallow\-query\-on\fR does not allow the query.
 .IP \(bu 2
 \fB\fBallow\-transfer\fB\fR may be written in \fBoptions\fR and \fBview\fR;
 \fBkey\fR elements, \fB!\fR, nested lists and named lists work as above. See

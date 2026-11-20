@@ -578,6 +578,15 @@ was left to copy the query
 \fBipc.dropped.total\fR
 the sum of all of them but \fBspilled\fR
 .PP
+After the totals come the queries that each Frontend router read from its UDP
+sockets and handed to the workers, as lines \fBipcrouter.<n>.queries=<number>\fR
+(one per router, from 0; a query that every worker's queue refused is counted
+here and, as a loss, in \fBipc.router.worker.dropped_full\fR). They are not
+losses and are not in \fBipc.dropped.total\fR. The kernel hands a client's
+queries to a router by the client's address and port, so a router that stays at
+0 while the others count is one that no client reached: a few clients that all
+send from one source port reach one router, however many routers there are.
+.PP
 After the counters come the sizes of the socket buffers in force, as lines
 \fBipcbuf.<kind>.<direction>.asked=<bytes>\fR and \fB.got=<bytes>\fR:
 \fBqueue\fR is the queues between the routers and the workers, \fBudp\fR the UDP
