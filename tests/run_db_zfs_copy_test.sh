@@ -93,6 +93,7 @@ sf() { $KA store -k 2>/dev/null | sed -n "s/^$1=//p" | head -1; }
 fqv() { $KA dbstatus 2>/dev/null | grep '^fetchq:' | tr ' ' '\n' | sed -n "s/^$1=//p" | head -1; }
 server_refusals() { echo "park_full=$(fqv park_full) park_timeout=$(fqv park_timeout) queue_full=$(fqv queue_full) queue_dropped=$(fqv queue_dropped) table_full=$(fqv table_full)"; }
 fetches() { $KA dbstatus 2>/dev/null | grep '^fetch:' | head -1 | sed -n 's/.* issued=\([0-9]*\).*/\1/p'; }
+park_drops() { echo "store.park.drop room=$(sf store.park.drop.room) timeout=$(sf store.park.drop.timeout) queue=$(sf store.park.drop.queue)"; }
 waitfor() { w=$1; shift; i=0; while [ $i -lt $((w * 10)) ]; do "$@" && return 0; sleep 0.1; i=$((i + 1)); done; return 1; }
 stored_all() { [ "$(sf store.zones.stored)" -ge "$NZ" ] 2>/dev/null; }
 hot_ended() { s=$(sf store.hot.state); [ "$s" = done ] || [ "$s" = high-mark ]; }
@@ -100,7 +101,7 @@ burst_check() {   # burst_check LABEL SEED: a burst of one query for every zone,
     OUT=$(perl tests/db/udp_cold_burst.pl "$PA" "$NZ" "$2" "$WINDOW" "$WAIT")
     echo "  $OUT"
     bv() { echo "$OUT" | sed -n "s/.* $1=\([0-9.]*\).*/\1/p" | head -1; }
-    [ "$(bv noerror)" = "$NZ" ] && [ "$(bv servfail)" = 0 ] && [ "$(bv lost)" = 0 ] && pass "$1: all $NZ queries answered with NOERROR (0 SERVFAIL, 0 lost)" || fail "$1: $OUT"
+    [ "$(bv noerror)" = "$NZ" ] && [ "$(bv servfail)" = 0 ] && [ "$(bv lost)" = 0 ] && pass "$1: all $NZ queries answered with NOERROR (0 SERVFAIL, 0 lost)" || fail "$1: $OUT"; echo "  $(park_drops)"
     SR0=$(server_refusals)
     case "$SR0" in
     "park_full=0 park_timeout=0 queue_full=0 queue_dropped=0 table_full=0") pass "$1: the server refused no stored zone on its own account ($SR0)" ;;

@@ -123,6 +123,7 @@ sf() {   # sf KEY: a value of `karictl store -k` on the server under test
     $KA store -k 2>/dev/null | sed -n "s/^$1=//p" | head -1
 }
 fetches() { $KA dbstatus 2>/dev/null | grep '^fetch:' | head -1 | sed -n 's/.* issued=\([0-9]*\).*/\1/p'; }
+park_drops() { echo "store.park.drop room=$(sf store.park.drop.room) timeout=$(sf store.park.drop.timeout) queue=$(sf store.park.drop.queue)"; }
 zname() { printf 'z%04d.test' "$1"; }
 waitfor() {   # waitfor SECONDS COMMAND...
     w=$1; shift
@@ -150,6 +151,7 @@ pass_all() {
     done
     PASS_N=$n
     PASS_BAD=$bad
+    [ "$bad" = 0 ] || echo "  $bad queries not answered right: $(park_drops)"
 }
 # the answers of the subset on a port, normalised, into FILE
 subset_answers() {   # subset_answers PORT FILE
@@ -216,7 +218,7 @@ ST_ATT=$(sf store.zones.attached)
 echo "  answers on the subset: the server with the store against the reference"
 subset_answers "$PB" "$T/ref.ans"
 subset_answers "$PA" "$T/a1.ans"
-if cmp -s "$T/ref.ans" "$T/a1.ans" && [ -s "$T/ref.ans" ]; then pass "the answers are the reference's ($(grep -c '^##' "$T/ref.ans") queries, $(wc -l < "$T/ref.ans" | tr -d ' ') lines)"; else fail "the answers differ from the reference"; diff "$T/ref.ans" "$T/a1.ans" | head -10; fi
+if cmp -s "$T/ref.ans" "$T/a1.ans" && [ -s "$T/ref.ans" ]; then pass "the answers are the reference's ($(grep -c '^##' "$T/ref.ans") queries, $(wc -l < "$T/ref.ans" | tr -d ' ') lines)"; else fail "the answers differ from the reference"; diff -u "$T/ref.ans" "$T/a1.ans" | head -60; fi
 waitfor 30 stored_all >/dev/null
 
 echo "== kill -9, a restart on the same store, the loader stopped: answered from the store alone"
@@ -232,7 +234,7 @@ pass_all 1 "$NZ" 1
 [ "$(fetches)" = 0 ] && pass "no zone was read from the loader (fetch issued=0)" || fail "fetch issued=$(fetches) after the restart"
 [ "$(sf store.attach.count)" -gt 0 ] 2>/dev/null && pass "the zones were attached from the store ($(sf store.attach.count))" || fail "no attach after the restart: $($KA store | head -20)"
 subset_answers "$PA" "$T/a2.ans"
-if cmp -s "$T/ref.ans" "$T/a2.ans"; then pass "the answers after the restart are the reference's"; else fail "the answers after the restart differ"; diff "$T/ref.ans" "$T/a2.ans" | head -10; fi
+if cmp -s "$T/ref.ans" "$T/a2.ans"; then pass "the answers after the restart are the reference's"; else fail "the answers after the restart differ"; diff -u "$T/ref.ans" "$T/a2.ans" | head -60; echo "  $(park_drops)"; $KA store -k 2>/dev/null | grep -E "^store.(attach|cold|park|wa)" | head -40; fi
 [ -n "$LPID" ] && kill -CONT "$LPID" 2>/dev/null
 
 echo "== a damaged record: that zone is read from the database, the others still attach"
