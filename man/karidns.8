@@ -1,4 +1,4 @@
-.TH KARIDNS 8 "2026-11-18" "KariDNS" "KariDNS Manual"
+.TH KARIDNS 8 "2026-11-20" "KariDNS" "KariDNS Manual"
 .\" Generated from docs/karidns.md by man/md2man.pl (make man): edit the Markdown manual, not this page.
 .SH NAME
 karidns \- Authoritative DNS Server Daemon for FreeBSD
@@ -29,14 +29,28 @@ backend.
 .IP \(bu 2
 \fBFrontend Router Processes\fR: Bind the privileged network sockets (UDP/TCP
 port 53) and dispatch network traffic to the backend workers. One router is
-started on hosts with up to 3 CPU cores, two on larger hosts.
+started when the server may run on up to 3 CPUs, two when it may run on more
+(\fBrouter\-threads\fR sets the number).
 .IP \(bu 2
 \fBBackend Process\fR: Operates in FreeBSD Capsicum capability mode
 (\fBcap_enter(2)\fR). DNS packet parsing and response generation are performed
-by the worker threads (one or two on hosts with up to 3 cores, otherwise the
-number of cores minus two) without direct filesystem access or socket creation
-permissions. Configuration and zone files are accessed via pre-opened directory
-descriptors (\fBopenat(2)\fR / \fBrenameat(2)\fR).
+by the worker threads (one or two when the server may run on up to 3 CPUs,
+otherwise the number of CPUs minus two; \fBworker\-threads\fR sets the number)
+without direct filesystem access or socket creation permissions. Configuration
+and zone files are accessed via pre-opened directory descriptors
+(\fBopenat(2)\fR / \fBrenameat(2)\fR).
+.IP \(bu 2
+\fBHow many threads (0.7)\fR: the counts follow the CPUs the server may run on
+(its CPU set, see \fBcpuset(1)\fR and the CPU limit of a jail), not the CPUs of
+the machine: under \fBcpuset \-l 0\fR on an 8-CPU host the server starts 1
+router and 1 worker, where the machine's 8 CPUs used to give 2 routers and 6
+workers (that was measured at half the throughput on one CPU: about 3 context
+switches per query). The decision is logged once at start (\fB[Startup] 2
+routers, 6 workers (8 CPUs usable of 8)\fR, with \fB; set by router\-threads and
+worker\-threads\fR when the options set it); \fBkarictl status\fR shows the
+machine's CPUs (\fBCPUs found\fR) and the workers started (\fBworker
+threads\fR). A CPU set that is changed while the server runs is not noticed:
+restart the server.
 .IP \(bu 2
 \fBCPUs\fR: the routers and the worker threads are not pinned to CPUs (since
 0.6.1), so the scheduler can move a thread that another busy thread displaces;

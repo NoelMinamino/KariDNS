@@ -4575,6 +4575,40 @@ static void test_crypto_prewarm_survives_capability_mode(void) {
 #endif
 }
 
+/* 0.7: the thread counts follow the CPUs the process may run on; router-threads / worker-threads replace them; a changed option needs a restart */
+static void test_plan_threads_and_cpus(void) {
+    printf("[TEST] Server Core: plan_threads() / usable_cpu_count() / restart-only router-threads, worker-threads...\n");
+    static const struct { int cpus; unsigned ro, wo; int r, w; } c[] = {
+        { 1, 0, 0, 1, 1 }, { 2, 0, 0, 1, 1 }, { 3, 0, 0, 1, 2 }, { 4, 0, 0, 2, 2 }, { 8, 0, 0, 2, 6 }, { 64, 0, 0, 2, 62 },
+        { 200, 0, 0, 2, 128 },                 /* clamped to MAX_WORKERS */
+        { 0, 0, 0, 1, 1 }, { -5, 0, 0, 1, 1 },  /* never below 1 */
+        { 8, 4, 0, 4, 6 }, { 8, 0, 3, 2, 3 }, { 1, 2, 7, 2, 7 }, { 200, 1, 128, 1, 128 },
+    };
+    for (size_t i = 0; i < sizeof(c) / sizeof(c[0]); i++) {
+        int r = -1, w = -1;
+        plan_threads(c[i].cpus, c[i].ro, c[i].wo, &r, &w);
+        if (r != c[i].r || w != c[i].w) printf("  case %zu: %d CPUs -> %d+%d, expected %d+%d\n", i, c[i].cpus, r, w, c[i].r, c[i].w);
+        assert(r == c[i].r && w == c[i].w);
+    }
+    long machine = sysconf(_SC_NPROCESSORS_ONLN);
+    int u = usable_cpu_count();
+    assert(u >= 1 && (machine < 1 || u <= machine));   /* the mask is a subset of the machine's CPUs */
+
+    server_config_t a, b;
+    memset(&a, 0, sizeof(a));
+    memset(&b, 0, sizeof(b));
+    char buf[256] = "";
+    collect_restart_only_changes(&a, &b, buf, sizeof(buf));
+    assert(strstr(buf, "router-threads") == NULL && strstr(buf, "worker-threads") == NULL);
+    b.router_threads = 2;
+    collect_restart_only_changes(&a, &b, buf, sizeof(buf));
+    assert(strstr(buf, "router-threads") != NULL && strstr(buf, "worker-threads") == NULL);
+    b.worker_threads = 5;
+    buf[0] = '\0';
+    collect_restart_only_changes(&a, &b, buf, sizeof(buf));
+    assert(strstr(buf, "router-threads") != NULL && strstr(buf, "worker-threads") != NULL);
+}
+
 /* 0.7: how long an explicit reload waits for the readers of the configuration before: the longest program-timeout or forward-timeout of the
  * configuration plus 500 ms, at least 1 s, at most 5 s */
 static void test_reload_readers_wait_ms(void) {
@@ -8117,6 +8151,7 @@ int main(void) {
     test_meta_types_and_utils_helpers();
     test_setup_ipc_tables_and_reload_error_paths();
     test_perform_config_reload_valid_and_diff();
+    test_plan_threads_and_cpus();
     test_reload_readers_wait_ms();
     test_active_broker_connect_loop();
     test_broker_connect_reply_handling();

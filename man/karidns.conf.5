@@ -175,13 +175,14 @@ configuration.
 Settings that are fixed when the server starts (\fBport\fR, \fBbind\-address\fR,
 \fBlisten\-on\fR, \fBlisten\-on\-v6\fR, \fBuser\fR, \fBgroup\fR,
 \fBpid\-file\fR, \fBudp\-recvbuf\-size\fR, \fBudp\-sndbuf\-size\fR,
-\fBtcp\-window\fR, the \fBcontrol\-channel\fR socket path, \fBdnstap\fR, a log
-file in a directory that was not open at start-up (see \fBlogging\fR), and the
-interface snapshot that \fBlocalhost\fR / \fBlocalnets\fR in address match lists
-are evaluated against) need a restart; a reload (\fBSIGHUP\fR, \fBkarictl
-reload\fR / \fBreconfig\fR) applies everything else. When a reload changes one
-of them, the server logs a warning that names it, and \fBkarictl\fR shows it as
-\fBOK (restart needed for: ...)\fR.
+\fBtcp\-window\fR, \fBrouter\-threads\fR, \fBworker\-threads\fR, the
+\fBcontrol\-channel\fR socket path, \fBdnstap\fR, a log file in a directory that
+was not open at start-up (see \fBlogging\fR), and the interface snapshot that
+\fBlocalhost\fR / \fBlocalnets\fR in address match lists are evaluated against)
+need a restart; a reload (\fBSIGHUP\fR, \fBkarictl reload\fR / \fBreconfig\fR)
+applies everything else. When a reload changes one of them, the server logs a
+warning that names it, and \fBkarictl\fR shows it as \fBOK (restart needed
+for: ...)\fR.
 .IP \(bu 2
 A reload that cannot be applied (the file cannot be read, a configuration error,
 a log file that cannot be opened) keeps the running configuration. A reload
@@ -807,6 +808,19 @@ BLOCKS).
 \fIDefault:\fR \fBno\fR
 .br
 \fIDescription:\fR Must be \fByes\fR for \fBtype program\fR zones to be loaded.
+.TP 8
+\fBrouter\-threads <n>;\fR \fBworker\-threads <n>;\fR
+\fIDefault:\fR by the CPUs the server may run on
+.br
+\fIDescription:\fR The number of Frontend router processes (1..4) and of Backend
+worker threads (1..128). Not written: 1 router and 1 worker on up to 2 CPUs, 1
+and 2 on 3 CPUs, otherwise 2 routers and the CPUs minus 2 workers, where the
+CPUs are those of the server's CPU set (see the architecture section). Each is
+read on its own, so writing one leaves the other automatic; a second statement
+replaces the first. A value outside the range is a configuration error
+(\fBkaricheck conf\fR shows it with the file and line). Changing either needs a
+restart: a reload that changes it logs a warning, answers \fBOK reloaded
+(restart needed for: router\-threads)\fR and keeps the counts of the start.
 .TP 8
 \fBresponse\-cache\-size <size>;\fR
 \fIDefault:\fR \fB32M\fR

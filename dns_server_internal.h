@@ -1908,6 +1908,9 @@ config_reload_result_t reload_all_zones(void);
 config_reload_result_t perform_config_reload(void);
 config_reload_result_t perform_config_reload_ext(bool skip_unchanged);
 int reload_readers_wait_ms(const server_config_t *cfg);   /* 0.7: how long an explicit reload waits for the readers of the configuration before */
+int usable_cpu_count(void);   /* 0.7: the CPUs the process may run on (its affinity mask) */
+void plan_threads(int cpus, uint32_t opt_routers, uint32_t opt_workers, int *routers, int *workers);   /* 0.7: routers and workers for the CPUs and router-threads / worker-threads */
+void collect_restart_only_changes(const server_config_t *o, const server_config_t *n, char *buf, size_t sz);
 int reload_previous_readers_wait_ms(void);              /* (the larger of the active and the standby configuration's, while the standby is not reaped) */
 void escape_qname_for_log(const char *src, char *dst, size_t dst_size);
 void write_query_log(worker_ctx_t *ctx, const void *client_addr, socklen_t addr_len,

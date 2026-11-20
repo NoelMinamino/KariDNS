@@ -12,7 +12,7 @@ KariDNS is an authoritative DNS server designed for FreeBSD, developed in collab
 ## Architecture & Design
 
 - **Privilege-Separated Processes & Capsicum Sandboxing:**
-  - **Frontend:** Binds privileged ports (UDP/TCP 53) and manages network sockets (one or two frontend router processes, depending on the number of CPU cores).
+  - **Frontend:** Binds privileged ports (UDP/TCP 53) and manages network sockets (one or two frontend router processes, depending on the number of CPUs the server may run on; `router-threads` / `worker-threads` set them).
   - **Backend:** Enters Capsicum capability mode (`cap_enter()`) to parse DNS queries and generate responses without direct filesystem or network socket creation privileges. Zone and configuration files are reloaded using pre-opened directory descriptors (`openat`/`renameat`).
   - A supervisor process starts and monitors the others, and a small connect broker opens the outbound connections the sandboxed backend needs (zone transfers from a primary, forward zones, dnstap reconnection).
 - **Memory Arenas:**
