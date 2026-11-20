@@ -239,7 +239,7 @@ EOF
     LP=$(pgrep -P "$PID4" -f 'karidns-dbloader -s 3' | head -1)
     if [ -n "$LP" ]; then
         kill -KILL "$LP"
-        sleep 3
+        i=0; while [ "$i" -lt 150 ]; do LP2=$(pgrep -P "$PID4" -f 'karidns-dbloader -s 3' | head -1); [ -n "$LP2" ] && [ "$LP2" != "$LP" ] && break; sleep 0.2; i=$((i + 1)); done
         LP2=$(pgrep -P "$PID4" -f 'karidns-dbloader -s 3' | head -1)
         if [ -n "$LP2" ] && [ "$LP2" != "$LP" ]; then pass "the loader was restarted from the relative loader-path"; else fail "the loader did not come back after a kill"; fi
     else

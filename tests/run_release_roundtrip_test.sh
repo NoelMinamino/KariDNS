@@ -367,7 +367,7 @@ EOF
 }
 
 logs_clean() {
-    [ -n "$WEB" ] && { kill -TERM "$WEB" 2>/dev/null; i=0; while [ $i -lt 100 ] && kill -0 "$WEB" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done; kill -0 "$WEB" 2>/dev/null && { bad "the API did not stop after SIGTERM"; kill -KILL "$WEB" 2>/dev/null; } || ok "the API stops on SIGTERM"; WEB=""; }
+    [ -n "$WEB" ] && { kill -TERM "$WEB" 2>/dev/null; i=0; while [ $i -lt 100 ] && kill -0 "$WEB" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done; kill -0 "$WEB" 2>/dev/null && { bad "the API did not stop after SIGTERM" "$(kari_log_tail "$P/server.log")"; kill -KILL "$WEB" 2>/dev/null; } || ok "the API stops on SIGTERM"; WEB=""; }
     grep -q "(a bug)" "$P/server.log" && bad "row level security refused what the API had allowed" "$(grep '(a bug)' "$P/server.log" | head -3)" || ok "the API never logged a disagreement with the database"
     grep -Eq '^[^ ]+ error ' "$P/server.log" && bad "the API logged an error" "$(grep ' error ' "$P/server.log" | head -3)" || ok "the API logged no error"
     [ -f "$P/karidns.log" ] && { grep -q "ERROR\|assertion\|Assertion" "$P/karidns.log" && bad "karidns logged an error" "$(grep 'ERROR\|ssertion' "$P/karidns.log" | head -3)" || ok "karidns logged no error"; }

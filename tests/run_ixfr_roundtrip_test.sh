@@ -29,7 +29,7 @@ cp "$ZONE_FILE" "${ZONE_FILE}.orig"
 echo "[*] Starting KariDNS..."
 $BIN -f "$CONF_FILE" > server_ixfr.log 2>&1 &
 SERVER_PID=$!
-sleep 2
+kari_wait_answer "$DAG" 10053 example.com 20 || true
 
 cleanup() {
     set +e  # trap handler: with set -e a failing command here would become the exit status of the test (FreeBSD sh)

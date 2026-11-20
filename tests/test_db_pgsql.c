@@ -30,6 +30,8 @@
 #include <stdbool.h>
 #include <unistd.h>
 #include <poll.h>
+#include <signal.h>
+#include <errno.h>
 #include <dirent.h>
 #include <sys/stat.h>
 
@@ -1052,6 +1054,22 @@ static void wait_cluster_quiet(void) {
     printf("  note: other transactions stayed open in the cluster for 30 s\n");
 }
 
+/* pg_terminate_backend() only signals the backend; it is gone (and its socket closed) a moment later.  Wait, up to 5 s, until pg_stat_activity no longer lists it, then (a server on this host)
+ * until the process has exited: it leaves the activity list before it closes the socket, and the client sees the end of the connection only then.  Then ask the client side. */
+static void wait_backend_gone(const char *pid) {
+    char sql[160], v[16] = "";
+    snprintf(sql, sizeof(sql), "SELECT count(*) FROM pg_stat_activity WHERE pid = %s", pid);
+    bool listed = true;
+    for (int i = 0; i < 500 && listed; i++) {
+        qv(g_admin, sql, v, sizeof(v));
+        listed = strcmp(v, "0") != 0;
+        if (listed) usleep(10000);
+    }
+    CHECK_MSG(!listed, "the terminated backend %s is gone (pg_stat_activity count %s)", pid, v);
+    const pid_t bp = (pid_t)atol(pid);
+    for (int i = 0; i < 500 && bp > 1 && !(kill(bp, 0) != 0 && errno == ESRCH); i++) usleep(10000);     /* (a server on another host: the pid is no process here, and the loop ends at once) */
+}
+
 static void test_changes(void) {
     printf("change log\n");
     PGconn *t1 = connect_db(g_db), *t2 = connect_db(g_db), *t3 = connect_db(g_db);
@@ -1225,7 +1243,7 @@ static void test_notify(void) {
     /* a notification that arrived while the connection ran a query (changes_max) is seen by the next poll_version */
     uint64_t m;
     Q("INSERT INTO records (domain_id, name, type, content, ttl) VALUES (2, 'n2.b.test', 'A', '192.0.2.12', 60)");
-    usleep(200000);
+    CHECK_MSG(poll(&pf, 1, 5000) == 1, "the notification of the second insert reaches the socket");   /* (it arrived while the connection was idle in the query above; wait for the socket, not a fixed time) */
     CHECK(D->begin_snapshot(c) == -1 || true);
     if (c->in_snapshot) D->end_snapshot(c);
     CHECK(D->changes_max(c, &m) == 0);
@@ -1269,7 +1287,7 @@ static void test_notify(void) {
         qv(g_admin, q2, pidv, sizeof(pidv));
         snprintf(q2, sizeof(q2), "SELECT pg_terminate_backend(%s)", pidv);
         if (pidv[0]) Q(q2);
-        usleep(300000);
+        if (pidv[0]) wait_backend_gone(pidv);
         CHECK(D->poll_version(c3, &p1, &r3) == DB_ERR_RETRY);
     }
     if (c3) D->close(c3);
@@ -1282,7 +1300,7 @@ static void test_notify(void) {
     CHECK(pid[0] != '\0');
     snprintf(sql, sizeof(sql), "SELECT pg_terminate_backend(%s)", pid);
     Q(sql);
-    usleep(300000);
+    wait_backend_gone(pid);
     int rc = D->poll_version(c, &v2, &repl);
     int rc2 = D->drain_notifications(c, &changed);
     CHECK_MSG(rc == DB_ERR_RETRY || rc2 == DB_ERR_RETRY, "terminated connection: %d %d (%s)", rc, rc2, D->errmsg(c));
@@ -1731,7 +1749,7 @@ static void test_status(void) {
     qv(c->pg, "SELECT pg_backend_pid()", pid, sizeof(pid));
     snprintf(sql, sizeof(sql), "SELECT pg_terminate_backend(%s)", pid);
     Q(sql);
-    usleep(300000);
+    wait_backend_gone(pid);
     CHECK(D->report_status(c, &s1) == DB_ERR_RETRY);
     CHECK_HAS(D->errmsg(c), "retry later");
     D->close(c);

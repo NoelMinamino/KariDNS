@@ -200,7 +200,7 @@ if [ -n "$SG" ]; then
 fi
 kill -TERM "$WEB" 2>/dev/null
 i=0; while [ $i -lt 100 ] && kill -0 "$WEB" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
-if kill -0 "$WEB" 2>/dev/null; then bad "the API did not stop after SIGTERM"; kill -KILL "$WEB" 2>/dev/null; else wait "$WEB" 2>/dev/null; [ $? = 0 ] && ok "the API stops on SIGTERM with status 0" || bad "the API stopped with a status"; fi
+if kill -0 "$WEB" 2>/dev/null; then bad "the API did not stop after SIGTERM" "$(kari_log_tail "$T/server.log")"; kill -KILL "$WEB" 2>/dev/null; else wait "$WEB" 2>/dev/null; [ $? = 0 ] && ok "the API stops on SIGTERM with status 0" || bad "the API stopped with a status"; fi
 WEB=""
 grep -q "(a bug)" "$T/server.log" && bad "row level security refused what the API had allowed" "$(grep '(a bug)' "$T/server.log" | head -3)" || ok "the API never logged a disagreement with the database"
 grep -Eq '^[^ ]+ error ' "$T/server.log" && bad "the API logged an error" "$(grep ' error ' "$T/server.log" | head -3)" || ok "the API logged no error"

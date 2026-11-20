@@ -428,7 +428,7 @@ static xfr_store_counters_t ctr(void) {
 
 static void wait_pass(void) {
   for (int i = 0; i < 500 && atomic_load(&g_xfr_pending) > 0; i++) usleep(10000);
-  usleep(50000);                                                          /* (the GC of the pass runs after the restores) */
+  xfr_store_wait_start(5000);                                             /* (the GC of the pass runs after the restores, before the pass is done: wait for every asked pass, not for a fixed time) */
 }
 
 /* the catalog delta of the transfer of cat.test: its members (domain, unique-id) */

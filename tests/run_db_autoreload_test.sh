@@ -369,7 +369,7 @@ kill -0 "$SRV" 2>/dev/null && pass "the server is up" || fail "the server died"
 grep -q "AddressSanitizer\|runtime error:\|ThreadSanitizer" "$LOG" && fail "sanitizer report in the server log" || true
 stop_server
 SRV=""
-sleep 0.5
+kari_wait_no_proc "karidns.*$T" 15 || true
 LEFT=$(pgrep -f "karidns.*$T" | tr '\n' ' ')
 [ -z "$LEFT" ] && pass "no process of this server is left" || fail "left over: $LEFT"
 
