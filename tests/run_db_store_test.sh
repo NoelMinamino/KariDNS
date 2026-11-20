@@ -151,7 +151,7 @@ pass_all() {
     done
     PASS_N=$n
     PASS_BAD=$bad
-    [ "$bad" = 0 ] || echo "  $bad queries not answered right: $(park_drops)"
+    if [ "$bad" != 0 ]; then echo "  $bad queries not answered right: $(park_drops)"; kari_ipc_diag "$KA" "$T/a.log"; fi
 }
 # the answers of the subset on a port, normalised, into FILE
 subset_answers() {   # subset_answers PORT FILE
@@ -210,7 +210,7 @@ A1=$(sf store.attach.count); A1=${A1:-0}
 ST_ALL=$($KA stats 2>/dev/null)
 ST_Q=$(printf '%s\n' "$ST_ALL" | sed -n 's/^karidns_queries_total{proto="udp"} \([0-9]*\)$/\1/p'); ST_T=$(printf '%s\n' "$ST_ALL" | sed -n 's/^karidns_queries_total{proto="tcp"} \([0-9]*\)$/\1/p')
 ST_SUM=$(( ${ST_Q:-0} + ${ST_T:-0} ))
-[ "$ST_SUM" -ge $(( P1 + P2 )) ] 2>/dev/null && pass "the totals of karictl stats kept every query of the two passes ($ST_SUM of $((P1 + P2)); only $(sf store.zones.attached) zones are in memory)" || fail "karictl stats counts $ST_SUM queries, the passes sent $((P1 + P2)): the counters of the zones that left memory are lost"
+[ "$ST_SUM" -ge $(( P1 + P2 )) ] 2>/dev/null && pass "the totals of karictl stats kept every query of the two passes ($ST_SUM of $((P1 + P2)); only $(sf store.zones.attached) zones are in memory)" || fail "karictl stats counts $ST_SUM queries, the passes sent $((P1 + P2)): the counters of the zones that left memory are lost"; [ "$ST_SUM" -ge $(( P1 + P2 )) ] 2>/dev/null || kari_ipc_diag "$KA" "$T/a.log"
 ST_ROWS=$(printf '%s\n' "$ST_ALL" | grep -c '^karidns_zone_queries_total{.*proto="udp"')
 ST_ATT=$(sf store.zones.attached)
 [ "$ST_ROWS" -gt "$ST_ATT" ] 2>/dev/null && [ "$ST_ROWS" -le $(( ST_ATT + 128 )) ] 2>/dev/null && pass "karictl stats lists the zones in memory ($ST_ATT) and, after them, the busiest zones that left it ($((ST_ROWS - ST_ATT)) of at most 128)" || fail "karictl stats lists $ST_ROWS zones with $ST_ATT in memory"

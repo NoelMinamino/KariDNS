@@ -350,6 +350,7 @@ static void karictl_usage(FILE *fp, const char *argv0) {
         "                              --zones is a glob (example.*), --limit stops after N zones and prints the cursor to\n"
         "                              go on with (--after).  -f here is the format; before the command it is the\n"
         "                              configuration file\n"
+        "  ipcstats                    the queries and replies lost between the Frontend routers and the Backend workers, as ipc.<name>=<n> lines\n"
         "  dbstatus [zone [view]]      the database loader, the last batch, the zones of the database\n"
         "  store [-j | -k] [zone <name> [view]]\n"
         "                              the zone store (database zones kept on disk): state, zones, attaches, cold queries, cache,\n"
@@ -611,6 +612,47 @@ static int ctl_fetch_struct(const char *conf_path, const char *cli_sock, const c
     return ret;
 }
 
+/* 0.7: the queries and replies lost between the routers and the workers (`ipcstats`: "ipc.<name>=<n>" lines of text, so that a server of another version
+ * only has more or fewer of them).  Best effort for `stats` and `status`: a server that does not know the command answers ERROR, and nothing is shown. */
+#define IPC_CTR_MAX 32
+typedef struct { char name[48]; unsigned long long v; } ipc_ctr_t;
+
+/* Parses the reply text into c[]; returns how many counters (0 for an ERROR reply or no reply). */
+static int ipc_parse(const char *text, ipc_ctr_t *c, int cap) {
+    int n = 0;
+    if (strncmp(text, "ipc.", 4) != 0) return 0;
+    for (const char *p = text; *p && n < cap; ) {
+        const char *eq = strchr(p, '='), *nl = strchr(p, '\n');
+        if (!nl) break;
+        if (eq && eq < nl && strncmp(p, "ipc.", 4) == 0 && (size_t)(eq - p - 4) < sizeof(c[n].name)) {
+            memcpy(c[n].name, p + 4, (size_t)(eq - p - 4));
+            c[n].name[eq - p - 4] = '\0';
+            c[n].v = strtoull(eq + 1, NULL, 10);
+            n++;
+        }
+        p = nl + 1;
+    }
+    return n;
+}
+
+static int ipc_fetch(const char *conf_path, const char *cli_sock, ipc_ctr_t *c, int cap) {
+    int rc = 0;
+    int sock = karictl_open_session(conf_path, cli_sock, &rc);
+    if (sock < 0) return 0;
+    static const char cmd[] = "ipcstats\n";
+    send(sock, cmd, sizeof(cmd) - 1, 0);
+    char text[2048];
+    size_t got = 0;
+    while (got < sizeof(text) - 1) {
+        ssize_t r = ctl_recv(sock, text + got, sizeof(text) - 1 - got);
+        if (r <= 0) break;
+        got += (size_t)r;
+    }
+    text[got] = '\0';
+    close(sock);
+    return ipc_parse(text, c, cap);
+}
+
 static const char *stats_rcode_name(int r) {
     static const char *const n[16] = { "NOERROR", "FORMERR", "SERVFAIL", "NXDOMAIN", "NOTIMP", "REFUSED", "YXDOMAIN", "YXRRSET",
                                        "NXRRSET", "NOTAUTH", "NOTZONE", "DSOTYPENI", "RCODE12", "RCODE13", "RCODE14", "RCODE15" };
@@ -646,7 +688,7 @@ static void prom_family(const char *name, const char *type, const char *help) {
     printf("# HELP %s %s\n# TYPE %s %s\n", name, help, name, type);
 }
 
-static void prom_server(const karidns_status_t *st, const karidns_stats_total_t *t) {
+static void prom_server(const karidns_status_t *st, const karidns_stats_total_t *t, const ipc_ctr_t *ipc, int nipc) {
     uint64_t unzoned = 0;
     for (int r = 0; r < KARIDNS_STATS_RCODES; r++) unzoned += t->unzoned_responses[r];
     prom_family("karidns_build_info", "gauge", "The running KariDNS version (value 1).");
@@ -735,6 +777,10 @@ static void prom_server(const karidns_status_t *st, const karidns_stats_total_t 
     printf("karidns_wirecache_total{result=\"miss\"} %llu\n", ULL(t->wirecache_misses));
     prom_family("karidns_reload_failures_total", "counter", "Configuration reloads that failed or left zones unloaded.");
     printf("karidns_reload_failures_total %llu\n", ULL(t->reload_failures));
+    if (nipc > 0) {
+        prom_family("karidns_ipc_events_total", "counter", "Queries and replies handled or lost between the Frontend routers and the Backend workers (worker.spilled: taken by another worker because the first one's queue was full; the others with dropped or a bad message are losses, see karictl ipcstats).");
+        for (int i = 0; i < nipc; i++) { printf("karidns_ipc_events_total{event="); prom_lv(ipc[i].name); printf("} %llu\n", ipc[i].v); }
+    }
     prom_family("karidns_alerts_active", "gauge", "Threshold alerts (options and zone alerts blocks) that are raised now.");
     printf("karidns_alerts_active %llu\n", ULL(t->alerts_active));
     prom_family("karidns_alerts_zones", "gauge", "Zones with an alerts block that the last check looked at.");
@@ -745,7 +791,7 @@ static void prom_server(const karidns_status_t *st, const karidns_stats_total_t 
     printf("karidns_alerts_build_seconds %.6f\n", (double)t->alerts_build_us / 1e6);
 }
 
-static void json_server(const karidns_status_t *st, const karidns_stats_total_t *t) {
+static void json_server(const karidns_status_t *st, const karidns_stats_total_t *t, const ipc_ctr_t *ipc, int nipc) {
     printf("\"server\":{\"version\":"); json_str(st->version);
     printf(",\"boot_time\":%lld,\"last_configured_time\":%lld,\"zones\":%d,\"worker_threads\":%d,\"transfers_running\":%d,"
            "\"tcp_clients\":%d,\"tcp_clients_high_water\":%d",
@@ -776,6 +822,11 @@ static void json_server(const karidns_status_t *st, const karidns_stats_total_t 
     printf(",\"dnstap_truncated\":%llu,\"dnstap_dropped\":{\"queue_full\":%llu,\"not_connected\":%llu},\"dnstap_connected\":%s,\"dnstap_reconnects\":%llu",
            ULL(st->dnstap_truncated), ULL(st->dnstap_dropped_queue_full), ULL(st->dnstap_dropped_not_connected),
            st->dnstap_link == KARIDNS_DNSTAP_LINK_UP ? "true" : "false", ULL(st->dnstap_reconnects));
+    if (nipc > 0) {
+        printf(",\"ipc\":{");
+        for (int i = 0; i < nipc; i++) { printf("%s", i ? "," : ""); json_str(ipc[i].name); printf(":%llu", ipc[i].v); }
+        printf("}");
+    }
     printf(",\"notify\":{\"sent\":%llu,\"acknowledged\":%llu}", ULL(t->notify_sent), ULL(t->notify_ack));
     printf(",\"transfers_in\":{\"axfr\":%llu,\"ixfr\":%llu,\"failures\":%llu}", ULL(t->axfr_success), ULL(t->ixfr_success), ULL(t->xfer_failed));
     printf(",\"wirecache\":{\"hit\":%llu,\"miss\":%llu},\"reload_failures\":%llu,\"alerts_active\":%llu,\"alerts_zones\":%llu,"
@@ -1041,6 +1092,8 @@ static int karictl_stats(const char *conf_path, const char *cli_sock, const stat
     if (rc == 0) rc = ctl_fetch_struct(conf_path, cli_sock, "stats", &tot, sizeof(tot));
     if (rc != 0) return rc;
     st.version[sizeof(st.version) - 1] = '\0';
+    ipc_ctr_t ipc[IPC_CTR_MAX];
+    const int nipc = ipc_fetch(conf_path, cli_sock, ipc, IPC_CTR_MAX);
 
     const bool full = !o->zone && !o->pattern && !o->after && o->limit == 0;   /* every zone: the views can be summed */
     stats_view_t views[STATS_VIEWS_MAX];
@@ -1058,7 +1111,7 @@ static int karictl_stats(const char *conf_path, const char *cli_sock, const stat
         nviews = 0;
         views_overflow = false;
         zbuf_free(&zb);
-        if (o->json) { printf("{"); json_server(&st, &tot); printf(",\"zones\":["); }
+        if (o->json) { printf("{"); json_server(&st, &tot, ipc, nipc); printf(",\"zones\":["); }
         unsigned long sent = 0;
         bool first_zone = true;
         char cursor[KARIDNS_OBSPAGE_CURSOR_MAX + 8] = "", next[KARIDNS_OBSPAGE_CURSOR_MAX + 8] = "";
@@ -1120,7 +1173,7 @@ static int karictl_stats(const char *conf_path, const char *cli_sock, const stat
                 if (truncated) { printf(",\"more\":true,\"after\":"); json_str(cursor); }
                 printf("}\n");
             } else {
-                prom_server(&st, &tot);
+                prom_server(&st, &tot, ipc, nipc);
                 prom_zones(&zb);
                 if (full && !views_overflow) prom_views(views, nviews);
                 if (truncated) printf("# more zones: karictl stats --after %s\n", cursor);
@@ -1373,6 +1426,12 @@ int main(int argc, char **argv) {
             printf("dnstap connected: %s\n", st.dnstap_link == KARIDNS_DNSTAP_LINK_UP ? "yes"
                                              : st.dnstap_link == KARIDNS_DNSTAP_LINK_DOWN ? "no" : "no (not configured)");
             printf("dnstap reconnects: %llu\n", (unsigned long long)st.dnstap_reconnects);
+            {   /* 0.7: queries and replies lost between the routers and the workers (ipcstats has each place) */
+                ipc_ctr_t ipc[IPC_CTR_MAX];
+                const int nipc = ipc_fetch(conf_path, cli_sock_path, ipc, IPC_CTR_MAX);
+                for (int i = 0; i < nipc; i++)
+                    if (strcmp(ipc[i].name, "dropped.total") == 0) printf("IPC dropped (router/worker queues, see karictl ipcstats): %llu\n", ipc[i].v);
+            }
             printf("-----------------------------------\n");
         } else {
             /* D-13: ERROR 応答や長さの合わない応答は失敗 (終了コード 3) */
@@ -1383,6 +1442,21 @@ int main(int argc, char **argv) {
             else
                 fprintf(stderr, "Invalid status response (%zu bytes, expected %zu; karictl and karidns versions differ?)\n",
                         total, expected_len);
+            close(sock);
+            return 3;
+        }
+    } else if (strcmp(argv[optind], "ipcstats") == 0) {
+        /* the lines "ipc.<name>=<n>" of the server, as they are (the server closes the connection after the reply) */
+        char ibuf[2048];
+        size_t total = 0;
+        while (total < sizeof(ibuf) - 1) {
+            r = ctl_recv(sock, ibuf + total, sizeof(ibuf) - 1 - total);
+            if (r <= 0) break;
+            total += (size_t)r;
+        }
+        ibuf[total] = '\0';
+        printf("%s", ibuf);
+        if (total == 0 || strncmp(ibuf, "ERROR", 5) == 0) {
             close(sock);
             return 3;
         }

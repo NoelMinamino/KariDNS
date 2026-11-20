@@ -1887,6 +1887,38 @@ typedef struct {
   char restart_needed[192]; /* O-09: 変わったが再起動まで反映されない設定 ("port, bind-address") */
 } config_reload_result_t;
 
+/* ---- 0.7: the queries and replies that are lost between the Frontend routers and the Backend workers (dns_server_core.c) ----
+ * Every place where one of them is dropped counts it (ipcd_add()), so that "sent = answered + counted drops" holds and a query that was lost
+ * is never lost without a trace.  The routers are processes of their own: the counters are in an anonymous shared mapping made before the
+ * fork, one slot per router and one for the Backend, relaxed atomic adds, no lock.  `karictl ipcstats` (and `karictl stats`) show the sums.
+ * The pairs *_FULL / *_ERR are adjacent: sendmmsg_skip_failed() is given the first of a pair. */
+typedef enum {
+  IPCD_RTW_SPILLED,     /* queries that the worker chosen for a batch could not take (its queue full) and another worker took */
+  IPCD_RTW_FULL,        /* queries dropped by a router: every worker's queue was full (one round) */
+  IPCD_RTW_ERR,         /* queries dropped by a router: the send failed for another reason (EMSGSIZE, ...) */
+  IPCD_RRX_TRUNC,       /* router: datagrams larger than the receive buffer (MSG_TRUNC) */
+  IPCD_RRX_SHORT,       /* router: datagrams shorter than a DNS header */
+  IPCD_RREP_SHORT,      /* router: replies of a worker shorter than the IPC header */
+  IPCD_RREP_BADLEN,     /* router: replies of a worker whose payload_len does not fit the message */
+  IPCD_RREP_BADSOCK,    /* router: replies of a worker for a socket index that does not exist */
+  IPCD_RCLI_FULL,       /* router: replies the client socket refused (send buffer full) */
+  IPCD_RCLI_ERR,        /* router: replies the client socket refused for another reason */
+  IPCD_WRX_SHORT,       /* worker: messages of a router shorter than the IPC header */
+  IPCD_WRX_BADLEN,      /* worker: messages whose payload_len does not fit, or is shorter than a DNS header */
+  IPCD_WREP_FULL,       /* worker: replies the IPC to the router refused (queue full) */
+  IPCD_WREP_ERR,        /* worker: replies the IPC refused for another reason */
+  IPCD_WASYNC_FULL,     /* worker: queries dropped because the queue of the asynchronous resolution threads (program and forward zones) was full, or the query could not be copied */
+  IPCD_COUNT
+} ipcd_t;
+typedef struct {
+  alignas(64) _Atomic uint64_t c[IPCD_COUNT];
+} ipcd_slot_t;
+#define IPCD_BACKEND_SLOT KARIDNS_ROUTER_THREADS_MAX   /* the slots below it are the routers' */
+void ipcd_add(ipcd_t c, uint64_t n);
+uint64_t ipcd_total(ipcd_t c);
+size_t ipcd_format(char *buf, size_t cap);
+enum { SOCKBUF_IPC = 0, SOCKBUF_UDP = 1 };   /* sockbuf_note(): the queues between the routers and the workers, the UDP sockets of the routers */
+
 #ifdef KARIDNS_UNIT_TEST
 extern const char *g_config_path;
 extern int g_broker_sock;
@@ -1932,6 +1964,16 @@ bool dir_is_below(const char *dir, const struct stat *anc);
 bool startup_dir_shared_with_log(const char *path, const char *what);
 bool daemonize(void);
 void setup_ipc_tables(int num_workers);
+int sendmmsg_skip_failed(int fd, struct mmsghdr *msgs, int n, const char *path, bool is_ipc, ipcd_t first);
+int ipc_send_spill(int (*fds)[2], int nw, int *rr, struct mmsghdr *msgs, int n);
+void ipc_reply_failed(int err);
+void ipcd_set_self(int slot);
+void ipcd_init(void);
+unsigned long sockbuf_limit_for(unsigned long maxsockbuf);
+unsigned long sockbuf_maxsockbuf_for(unsigned long size);
+long long sockbuf_maxsockbuf(void);
+int sockbuf_set(int fd, int opt, int want, int *err);
+void sockbuf_note(int kind, int dir, int asked, int got);
 void run_frontend_router(pid_t backend_pid, int router_id);
 void *worker_thread_func(void *arg);
 #endif
