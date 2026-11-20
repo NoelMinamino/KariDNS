@@ -6,8 +6,9 @@
 # Every answer is checked: QR set, the id of a query of that socket, NOERROR, one A record 192.0.2.1, and the datagram comes from the address and port that
 # the query went to (a wildcard socket of the server has to answer from the address the query came to, a socket bound to an address from that address).
 # Usage: perl udp_router_split_client.pl PORT N NSOCK WINDOW WAIT_S IP[,IP...] [BATCH [PAUSE_MS]]
-# Output (one line): "sent=S received=R answered=A unanswered=U bad=B socks=K secs=T"
+# Output (one line): "sent=S received=R answered=A unanswered=U bad=B socks=K secs=T senderr=E"
 #   bad = answers that failed a check above; socks = the sockets that were answered at least once.
+#   senderr = sends the kernel refused at first (tried again, every 5 ms, up to 200 times).  The client waits WAIT_S seconds after the last send for the answers (a bound).
 use strict;
 use warnings;
 use Socket;
@@ -43,7 +44,7 @@ sub pkt {
 
 my %pending;                                   # id => the number of the socket it went from
 my %want_ip;                                   # id => the index in @dest of the address it went to
-my ($sent, $received, $answered, $bad) = (0, 0, 0, 0);
+my ($sent, $received, $answered, $bad, $senderr) = (0, 0, 0, 0, 0);
 my (%seen, %socks_ok);
 my $buf;
 sub drain {
@@ -73,7 +74,6 @@ sub drain {
 my $t0 = time;
 my $next = 1;
 my $end_sent;
-my $last_move = time;
 while (1) {
     my $moved = 0;
     for (my $b = 0; $b < $batch && $next <= $n && keys(%pending) < $window; $b++) {
@@ -82,7 +82,9 @@ while (1) {
         my $d = $i % @dest;
         $pending{$i & 0xffff} = $k;
         $want_ip{$i & 0xffff} = $d;
-        send($sock[$k], pkt($i), 0, sockaddr_in($port, $dest[$d]));
+        # (a send the kernel refuses for a moment, ENOBUFS on a loaded host, is tried again: a loss of the client is not one of the server)
+        my $tries = 0;
+        until (defined send($sock[$k], pkt($i), 0, sockaddr_in($port, $dest[$d]))) { $senderr++; last if ++$tries >= 200; sleep(0.005); }
         $sent++;
         $moved++;
     }
@@ -90,8 +92,7 @@ while (1) {
     $end_sent = time if $next > $n && !defined $end_sent;
     last if time - $t0 > 120;                    # (a server that does not answer at all: do not run for ever)
     last if $next > $n && !%pending;
-    last if defined $end_sent && (time - $end_sent > $wait_s || time - $last_move > 1.5);
-    if ($moved) { $last_move = time; }
+    last if defined $end_sent && time - $end_sent > $wait_s;   # (a bound only: a host that stalls for seconds is given the time, the answers are still checked)
     if ($pause_ms > 0) { sleep($pause_ms / 1000); } elsif (!$moved) { sleep(0.0005); }
 }
 for (my $q0 = time; time - $q0 < 1; ) { $q0 = time if drain(); sleep(0.01); }

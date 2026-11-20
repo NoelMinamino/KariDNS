@@ -124,12 +124,16 @@ kv() { echo "$1" | tr ' ' '\012' | sed -n "s/^$2=//p" | head -1; }   # kv "sent=
 
 # load LABEL N NSOCK WINDOW BATCH PAUSE_MS: the client against the server; every query answered, every answer right
 load() {
-    out=$(perl "$CLIENT" "$PORT" "$2" "$3" "$4" 5 "$IPS" "$5" "$6" 2>&1)
+    kari_udp_snap "$T/udp.snap"
+    out=$(perl "$CLIENT" "$PORT" "$2" "$3" "$4" 15 "$IPS" "$5" "$6" 2>&1)
     s=$(kv "$out" sent); r=$(kv "$out" received); u=$(kv "$out" unanswered); b=$(kv "$out" bad); k=$(kv "$out" socks)
     if [ "$s" = "$2" ] && [ "$r" = "$2" ] && [ "$u" = "0" ] && [ "$b" = "0" ]; then
         ok "$1: $2 queries from $3 sockets (to $IPS), all answered, all right ($out)"
     else
-        bad "$1: $out" "$out"
+        bad "$1: $out" "$out
+    netstat -s -p udp since the start of this load (the client and the server share the host):
+$(kari_udp_delta "$T/udp.snap")
+$(ctl ipcstats | grep -v '=0$')"
     fi
     LAST_SOCKS=${k:-0}
 }
@@ -144,6 +148,8 @@ one_server() {
     fi
     sum0=$(routed_sum); drop0=$(ipcv ipc.dropped.total)
     load "$lbl: 64 source ports" 20000 64 256 16 0
+    # (the counters of the routers are read until they reach the 20000 or 10 s are up: a router that is late on a loaded host is waited for)
+    i=0; while [ $i -lt 50 ] && [ "$(($(routed_sum) - sum0))" -lt 20000 ]; do sleep 0.2; i=$((i + 1)); done
     sum1=$(routed_sum); drop1=$(ipcv ipc.dropped.total)
     if [ "$LAST_SOCKS" = "64" ]; then ok "$lbl: every socket was answered"; else bad "$lbl: $LAST_SOCKS of 64 sockets were answered"; fi
     if [ "$((drop1 - drop0))" = "0" ]; then ok "$lbl: karictl ipcstats counted no drop"; else bad "$lbl: ipc.dropped.total grew by $((drop1 - drop0))" "$(ctl ipcstats | grep -v '=0$')"; fi
