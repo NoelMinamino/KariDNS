@@ -1533,6 +1533,19 @@ zone), digest of the zone content (hex)
 .TP 8
 \fBstore.zone.attached\fR
 1 when the zone is attached now (where the server can tell)
+.TP 8
+\fBstore.zone.elem\fR, \fB.resident\fR, \fB.staged\fR, \fB.elem_state\fR
+0.7, for a zone that does not answer: the attach table has an element for the
+zone, the element has its data, a worker's attach of it is in the staging table
+and not registered yet, the element's state (\fBresident\fR, \fBloading\fR,
+\fBerror\fR, \fBabsent\fR; \fBnone\fR without an element). Read only
+.TP 8
+\fBstore.zone.att_claim\fR, \fB.att_claim_req\fR, \fB.att_claim_workers\fR, \fB.fetch_claim\fR
+0.7: a claim for the attach of the zone is held (the workers that waited for a
+store thread joined it), its request is in a ring, the workers that wait (a bit
+set: bit n is worker n, bit 15 every worker from 15 up), and the claim for the
+fetch of the zone from the database is held. A claim that stays held while
+nothing is attached or fetched is a request that was lost
 .PP
 A bad argument, a zone that is not in the store (\fBERROR zone not found\fR), a
 name in several views without a view, or \fBzone\fR without a store are answered

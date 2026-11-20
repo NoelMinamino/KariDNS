@@ -86,10 +86,18 @@ waitfor() {   # waitfor SECONDS COMMAND...
 }
 state_done() { tail -1 "$ST" 2>/dev/null | grep -q "^END $NZ [0-9a-f]\{8\}\$"; }
 
+# sweep_diag: the sweep lost queries (one at a time, so no load: a query that parked and was not woken, or never got to the worker).  The lost names, what the server says about the first of them, the counters.
+sweep_diag() {
+    [ -s "$T/sweep.err" ] && sed 's/^/  /' "$T/sweep.err" | cut -c1-700
+    kari_lost_diag "$KCTL" "$PORT" $(sed -n 's/^LOST: //p' "$T/sweep.err" | tr ' ' '\n' | sed -n 's/^www\.\(.*\)$/\1/p')
+    echo "  [db diag] $($KCTL dbstatus 2>/dev/null | grep -E '^(fetchq|queries|fetch|cache):' | tr '\n' ' ')"
+    kari_ipc_diag "$KCTL" "$T/srv.log"
+}
+
 echo "== every zone is asked for once; the hot list is written in parts"
 start_srv
-R=$(perl tests/db/udp_a_sweep.pl 127.0.0.1 "$PORT" "$T/names")
-[ "$R" = "sent=$NZ answered=$NZ noerror=$NZ" ] && pass "all $NZ zones answered ($R)" || fail "sweep: $R"
+R=$(perl tests/db/udp_a_sweep.pl 127.0.0.1 "$PORT" "$T/names" 2> "$T/sweep.err")
+[ "$R" = "sent=$NZ answered=$NZ noerror=$NZ" ] && pass "all $NZ zones answered ($R)" || { fail "sweep: $R"; sweep_diag; }
 waitfor 60 state_done && pass "the state file lists $NZ zones (END $NZ)" || fail "state file: $(head -c 100 "$ST" 2>/dev/null | head -2) ... $(tail -1 "$ST" 2>/dev/null)"
 LINES=$(grep -c "" "$ST" 2>/dev/null)
 [ "${LINES:-0}" = "$((NZ + 2))" ] && pass "header, $NZ entries, END line" || fail "the file has $LINES lines"

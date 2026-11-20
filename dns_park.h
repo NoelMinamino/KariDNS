@@ -377,6 +377,8 @@ bool park_attach_pending(void);
 int park_att_claim(uint16_t sview, uint32_t zid, int w);
 void park_att_requested(uint16_t sview, uint32_t zid);          /* the request of the claim is in a ring */
 uint32_t park_att_take(uint16_t sview, uint32_t zid);
+/* read only (a diagnostic): is a claim held for the zone; *set the workers that wait for it, *req its request is in a ring */
+bool park_att_peek(uint16_t sview, uint32_t zid, uint32_t *set, bool *req);
 bool park_att_leave(uint16_t sview, uint32_t zid, int w);       /* worker w no longer waits for the zone (its entry was dropped without the zone) */
 /* B1: the claim also keeps the name key (park_name_key()) of the zone its first worker waits for (0: not known).  A zone id can be given to another zone after the claim was made; the store thread that
  * takes the claim and finds that the record's zone has another key than the tag knows that the claim's waiters are for a zone that is gone, and tells them (park_wake_queue_zid()).

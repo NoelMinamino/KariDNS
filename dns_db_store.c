@@ -2670,6 +2670,20 @@ static int bad_image_hook(uint32_t zid, void *ud) {
 }
 
 static bool attached_fn(uint32_t zid) { return dir_attach_get(zid) != NULL; }
+/* karictl store zone: where a zone is on its way to memory (read only: the element, its state, the staging table, the claims of the attach and of the fetch) */
+static void zdetail_fn(uint16_t sview, uint32_t zid, const char *view, const char *name, store_zdetail_t *o) {
+  rcu_aux_read_lock();
+  const zdir_elem_t *el = dir_attach_get(zid);
+  o->elem = el != NULL;
+  o->resident = el != NULL && zdir_entry(el) != NULL;
+  o->elem_state = el ? (int)atomic_load_explicit((const _Atomic uint8_t *)&el->state, memory_order_acquire) : -1;
+  o->staged = stg_get(zid) != NULL;
+  rcu_aux_read_unlock();
+  o->att_claim = park_att_peek(sview, zid, &o->att_set, &o->att_req);
+  char zn[STORE_NAME_MAX + 2];
+  snprintf(zn, sizeof(zn), "%s.", name);
+  o->fetch_claim = park_claim_held(park_claim_key(view, zn));
+}
 static uint64_t attached_count_fn(void) { return (uint64_t)dir_attach_count(); }
 
 /* what identifies the database a view reads, so that a store that was filled from another one is not trusted: a hash of the driver and the source */
@@ -3997,6 +4011,7 @@ bool db_store_start(const server_config_t *cfg) {
     if (vid != xvid) dmax_refresh(st, vid);                  /* (2.2: the reserved view is no directory of the query path) */
   atomic_fetch_add(&G.view_gen, 1);
   store_status_set_attached_fn(attached_fn);
+  store_status_set_zdetail_fn(zdetail_fn);
   store_status_set_attached_count_fn(attached_count_fn);
   store_status_set_recon_fn(recon_status_cb);
   dbreg_err_set_sink(&g_err_sink);                           /* design 6.7: the rejection texts of zones that have a record go to err.ring */

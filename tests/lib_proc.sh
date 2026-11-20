@@ -260,6 +260,30 @@ kari_lab_zones() {
     sed 's#^#tests/zones/#' "${ROOT:-.}/tests/zones/LAB_ZONES"
 }
 
+# kari_udp_snap FILE / kari_udp_delta FILE: the counters of `netstat -s -p udp` now, and what changed since the snapshot (the client and the server of a test are on one host, so a datagram that a socket buffer
+# could not take, "dropped due to full socket buffers", is counted here whichever side lost it; the server's own counters do not see it).  The lines are "+N label", the drops and errors among them.
+kari_udp_snap() { netstat -s -p udp 2>/dev/null | sed -n 's/^[[:space:]]*\([0-9][0-9]*\) \(.*[a-z].*\)$/\2=\1/p' > "$1"; }
+kari_udp_delta() {
+    netstat -s -p udp 2>/dev/null | sed -n 's/^[[:space:]]*\([0-9][0-9]*\) \(.*[a-z].*\)$/\2=\1/p' | awk -F= 'NR == FNR { a[$1] = $2; next } { d = $2 - a[$1]; if (d != 0) printf "    %+d %s\n", d, $1 }' "$1" -
+}
+
+# kari_lost_diag KARICTL PORT ZONE... : zones whose query got no right answer (the first 10 are looked at).  For each: what the server says about the zone (karictl store zone: the record, whether it is in memory,
+# where it is on its way there, the claims of the attach and of the fetch) and what a query for www.ZONE gets now (a query that is answered now was lost on the way, or waited for a wake-up that did not come).
+kari_lost_diag() {
+    _kld_ctl=$1
+    _kld_port=$2
+    shift 2
+    _kld_n=0
+    for _kld_z in "$@"; do
+        [ "$_kld_n" -ge 10 ] && break
+        _kld_n=$((_kld_n + 1))
+        echo "  [lost diag] $_kld_z"
+        printf '    server: %s\n' "$($_kld_ctl store -k zone "$_kld_z" 2>&1 | grep -E '^store\.zone\.(state|attached|elem|resident|staged|elem_state|att_claim|att_claim_req|att_claim_workers|fetch_claim)=|ERROR' | tr '\n' ' ')"
+        printf '    dbstatus: %s\n' "$($_kld_ctl dbstatus "$_kld_z" 2>&1 | head -3 | tr '\n' ' ')"
+        printf '    a query now: %s\n' "$(./dag @127.0.0.1 -p "$_kld_port" "www.$_kld_z" A +noall +comments +answer +nohexdump +time=3 +tries=1 2>&1 | grep -E 'status:|timed out|no servers|^www' | head -3 | tr '\n' ' ')"
+    done
+}
+
 # kari_ipc_diag KARICTL LOG : for a test that lost a query (or got a wrong answer under load) on a server it started.  KARICTL is the command that
 # reaches that server ("./karictl -c conf"), LOG its log.  Prints the drop counters between the routers and the workers that are not 0
 # (karictl ipcstats, 0.7: a query dropped there was never counted anywhere before) and the lines of the log about the IPC and UDP socket buffers

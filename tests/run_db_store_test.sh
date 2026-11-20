@@ -133,10 +133,11 @@ waitfor() {   # waitfor SECONDS COMMAND...
 }
 # pass_all FIRST LAST STEP: a www query for each zone, 8 at a time; prints the number that were not answered with 192.0.2.80
 pass_all() {
-    z=$1; bad=0; n=0; pids=""
+    z=$1; bad=0; BADZ=""; n=0; pids=""
     while [ "$z" -ge 1 ] && [ "$z" -le "$NZ" ]; do
         k=0
         while [ $k -lt 8 ] && [ "$z" -ge 1 ] && [ "$z" -le "$NZ" ]; do
+            zname $z > "$T/q.$k.z"
             ./dag @127.0.0.1 -p "$PA" "www.$(zname $z)" A +short +nohexdump +time=8 +tries=1 > "$T/q.$k" 2>/dev/null &
             pids="$pids $!"
             z=$((z + $3)); k=$((k + 1))
@@ -144,14 +145,14 @@ pass_all() {
         wait $pids; pids=""
         j=0
         while [ $j -lt $k ]; do
-            [ "$(head -1 "$T/q.$j")" = "192.0.2.80" ] || bad=$((bad + 1))
+            [ "$(head -1 "$T/q.$j")" = "192.0.2.80" ] || { bad=$((bad + 1)); BADZ="$BADZ $(cat "$T/q.$j.z")"; }
             j=$((j + 1))
         done
         n=$((n + k))
     done
     PASS_N=$n
     PASS_BAD=$bad
-    if [ "$bad" != 0 ]; then echo "  $bad queries not answered right: $(park_drops)"; kari_ipc_diag "$KA" "$T/a.log"; fi
+    if [ "$bad" != 0 ]; then echo "  $bad queries not answered right: $(park_drops)"; kari_lost_diag "$KA" "$PA" $BADZ; kari_ipc_diag "$KA" "$T/a.log"; fi
 }
 # the answers of the subset on a port, normalised, into FILE
 subset_answers() {   # subset_answers PORT FILE
