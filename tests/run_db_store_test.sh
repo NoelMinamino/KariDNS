@@ -137,7 +137,7 @@ pass_all() {
     while [ "$z" -ge 1 ] && [ "$z" -le "$NZ" ]; do
         k=0
         while [ $k -lt 8 ] && [ "$z" -ge 1 ] && [ "$z" -le "$NZ" ]; do
-            ./dag @127.0.0.1 -p "$PA" "www.$(zname $z)" A +short +nohexdump +time=8 +tries=3 > "$T/q.$k" 2>/dev/null &
+            ./dag @127.0.0.1 -p "$PA" "www.$(zname $z)" A +short +nohexdump +time=8 +tries=1 > "$T/q.$k" 2>/dev/null &
             pids="$pids $!"
             z=$((z + $3)); k=$((k + 1))
         done
