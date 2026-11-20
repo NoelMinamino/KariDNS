@@ -2321,9 +2321,9 @@ static void test_growth_sync_fails(void) {
   waitpid(pid, &stt, 0);
   CHECK(WIFEXITED(stt) && WEXITSTATUS(stt) == 0);
   uint64_t got[6] = { 0, 0, 0, 0, 0, 0 };
+  close(pfd[1]);                                                       /* (the child's end: a child that died early gives EOF here, not a hang) */
   CHECK(read(pfd[0], got, sizeof(got)) == (ssize_t)sizeof(got));
   close(pfd[0]);
-  close(pfd[1]);
   printf("  %" PRIu64 " puts, %" PRIu64 " growths, %" PRIu64 " failed syncs, index generation %" PRIu64 "\n", got[3], got[5], got[4], got[1]);
   CHECK_EQ((int64_t)got[0], 0);                                          /* (no put was refused: the sync is not the writer's) */
   CHECK_EQ(got[3], 5000);
@@ -2566,9 +2566,9 @@ static void test_no_wait_in_lock(int mode) {
   CHECK(WIFEXITED(stt) && WEXITSTATUS(stt) == 0);
   if (!WIFEXITED(stt) || WEXITSTATUS(stt) != 0) printf("  child exit %d\n", WIFEXITED(stt) ? WEXITSTATUS(stt) : -1);
   uint64_t got[8] = { 0 };
+  close(pfd[1]);                                                       /* (the child's end: a child that died early gives EOF here, not a hang) */
   CHECK(read(pfd[0], got, sizeof(got)) == (ssize_t)sizeof(got));
   close(pfd[0]);
-  close(pfd[1]);
   printf("  checkpoint flush held 400 ms: %" PRIu64 " writer calls meanwhile, the slowest %" PRIu64 " us; growth build held 400 ms: %" PRIu64 " calls, the slowest %" PRIu64 " us\n", got[1], got[0], got[5], got[4]);
   CHECK(got[1] > 0 && got[5] > 0);
   CHECK(got[2] == 1);                                                    /* (the calls ended while the flush still slept) */
@@ -3106,6 +3106,7 @@ static void test_journal_boost(void) {
   bool cut = false;
   uint32_t k = jbo_fill(s, 0, 5 * JBO_MAX / 2, &cut);
   store_stats(s, &st);
+  if (cut || st.journal_bytes < 5 * JBO_MAX / 2 || st.checkpoints != base) printf("  (step 1: cut %d, journal %" PRIu64 " bytes, journal_max %" PRIu64 ", checkpoints %" PRIu64 " (base %" PRIu64 "), growths %" PRIu64 ", ix_used %" PRIu64 " of %" PRIu64 " slots, space estimate %lld, %u puts)\n", (int)cut, (uint64_t)st.journal_bytes, (uint64_t)st.journal_max_bytes, (uint64_t)st.checkpoints, base, (uint64_t)st.growths, (uint64_t)st.ix_used, (uint64_t)st.ix_slots, (long long)st.space_estimate_bytes, k);
   CHECK(!cut);
   CHECK(st.journal_bytes >= 5 * JBO_MAX / 2);                            /* (past 2 x the normal size: with the normal one the writes would have waited here) */
   CHECK_EQ(st.checkpoints, base);
@@ -3199,15 +3200,19 @@ static void test_journal_boost_crash(void) {
     bool cut = true;
     const uint32_t k = jbo_fill(x, 0, 3 * JBO_MAX, &cut);
     store_stats(x, &cs);
-    if (cut || cs.journal_bytes < 3 * JBO_MAX || cs.checkpoints != base) _exit(4);   /* (three times the size at which the normal bound forces a checkpoint, and none was made) */
+    if (cut || cs.journal_bytes < 3 * JBO_MAX || cs.checkpoints != base) {
+      printf("  (step 4 of the child: cut %d, journal %" PRIu64 " bytes, checkpoints %" PRIu64 " (base %" PRIu64 "), growths %" PRIu64 ", ix_used %" PRIu64 " of %" PRIu64 " slots, %u puts)\n", (int)cut, (uint64_t)cs.journal_bytes, (uint64_t)cs.checkpoints, base, (uint64_t)cs.growths, (uint64_t)cs.ix_used, (uint64_t)cs.ix_slots, k);
+      fflush(stdout);
+      _exit(4);
+    }   /* (three times the size at which the normal bound forces a checkpoint, and none was made) */
     if (store_commit(x) != 0) _exit(5);
     if (write(pp[1], &k, sizeof(k)) != (ssize_t)sizeof(k)) _exit(6);
     _exit(0);                                                            /* (no close: the state a crash leaves) */
   }
   uint32_t k = 0;
+  close(pp[1]);                                                       /* (the child's end: a child that died early gives EOF here, not a hang) */
   CHECK(read(pp[0], &k, sizeof(k)) == (ssize_t)sizeof(k));
   close(pp[0]);
-  close(pp[1]);
   int stt = 0;
   waitpid(pid, &stt, 0);
   CHECK(WIFEXITED(stt) && WEXITSTATUS(stt) == 0);
@@ -7901,12 +7906,13 @@ static void test_bulk_nx_rule(void) {
     _exit(0);                                                            /* (no close) */
   }
   char ok = 0;
+  close(pp[1]);                                                       /* (the child's end: a child that died early gives EOF here, not a hang) */
   CHECK(read(pp[0], &ok, 1) == 1 && ok == 1);
   close(pp[0]);
-  close(pp[1]);
   int status = 0;
   CHECK(waitpid(pid, &status, 0) == pid);
   CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+  if (!(WIFEXITED(status) && WEXITSTATUS(status) == 0)) printf("  (the child ended with status %d, signal %d)\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1, WIFSIGNALED(status) ? WTERMSIG(status) : 0);
   /* the power loss: no record past the checkpoint reached the disk (every journal file keeps its header only) */
   DIR *dp = opendir(d.path);
   struct dirent *de;
@@ -8241,12 +8247,13 @@ static void test_torn_pairs(bool bulk) {
     _exit(0);                                                            /* (no close) */
   }
   char ok = 0;
+  close(pp[1]);                                                       /* (the child's end: a child that died early gives EOF here, not a hang) */
   CHECK(read(pp[0], &ok, 1) == 1 && ok == 1);
   close(pp[0]);
-  close(pp[1]);
   int status = 0;
   CHECK(waitpid(pid, &status, 0) == pid);
   CHECK(bulk ? (WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL) : (WIFEXITED(status) && WEXITSTATUS(status) == 0));
+  if (!(bulk ? (WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL) : (WIFEXITED(status) && WEXITSTATUS(status) == 0))) printf("  (the child ended with status %d, signal %d)\n", WIFEXITED(status) ? WEXITSTATUS(status) : -1, WIFSIGNALED(status) ? WTERMSIG(status) : 0);
   if (!bulk) {                                                           /* (the power loss: no record past the last checkpoint reached the disk) */
     DIR *dp = opendir(d.path);
     struct dirent *de;
