@@ -29,8 +29,10 @@ const check = (name, cond, why) => (cond ? ok(name) : bad(name, typeof why === '
 const eq = (name, got, want) => check(name, JSON.stringify(got) === JSON.stringify(want), () => `got ${JSON.stringify(got)}, wanted ${JSON.stringify(want)}`);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// Connection: close: no keep-alive socket is reused.  The API closes an idle one after 5 s; on a loaded CI VM the client could send on a socket
+// the server was closing at that moment (a CI run failed with "fetch failed", ECONNRESET).
 async function call(method, p, { body, cookie, csrf, origin } = {}) {
-  const h = {};
+  const h = { Connection: 'close' };
   if (cookie) h.Cookie = `karidns_session=${cookie}`;
   if (csrf) h['X-KariDNS-CSRF'] = csrf;
   if (origin) h.Origin = origin;
@@ -329,13 +331,14 @@ check('...the credentials rows of the audit log name the administrator', ca.some
 
 // G1: the files
 const origin = new URL(BASE).origin;
-const page = await fetch(`${origin}/`);
+const NOKA = { headers: { Connection: 'close' } };
+const page = await fetch(`${origin}/`, NOKA);
 const csp = page.headers.get('content-security-policy') ?? '';
 check('GET / is the page, with the policy of the GUI', page.status === 200 && /^text\/html/.test(page.headers.get('content-type')) && csp.startsWith("default-src 'none'; script-src 'self'") && page.headers.get('cache-control') === 'no-store' && page.headers.get('x-frame-options') === 'DENY', () => `${page.status} ${csp}`);
-const css = await fetch(`${origin}/ui/app.css`);
-const css2 = await fetch(`${origin}/ui/app.css`, { headers: { 'If-None-Match': css.headers.get('etag') } });
+const css = await fetch(`${origin}/ui/app.css`, NOKA);
+const css2 = await fetch(`${origin}/ui/app.css`, { headers: { Connection: 'close', 'If-None-Match': css.headers.get('etag') } });
 eq('/ui/ files: an ETag, and a 304 for it', [css.status, css.headers.get('cache-control'), css2.status], [200, 'no-cache', 304]);
-eq('...nothing outside the files', [(await fetch(`${origin}/ui/../etc/passwd`)).status, (await fetch(`${origin}/ui/%2e%2e/etc/passwd`)).status, (await fetch(`${origin}/etc/passwd`)).status], [404, 404, 404]);
+eq('...nothing outside the files', [(await fetch(`${origin}/ui/../etc/passwd`, NOKA)).status, (await fetch(`${origin}/ui/%2e%2e/etc/passwd`, NOKA)).status, (await fetch(`${origin}/etc/passwd`, NOKA)).status], [404, 404, 404]);
 
 
 // ---------------------------------------------------------------------------------------------------------------------------------- cost (planning 2.3, assumption 13.7)

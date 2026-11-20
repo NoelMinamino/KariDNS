@@ -20,8 +20,10 @@ const check = (name, cond, why) => (cond ? ok(name) : bad(name, typeof why === '
 const eq = (name, got, want) => check(name, JSON.stringify(got) === JSON.stringify(want), () => `got ${JSON.stringify(got)}, wanted ${JSON.stringify(want)}`);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// Connection: close: no keep-alive socket is reused.  The API closes an idle one after 5 s; on a loaded CI VM the client could send on a socket
+// the server was closing at that moment (a CI run failed with "fetch failed", ECONNRESET).
 async function call(method, p, { body, cookie, csrf, token, headers = {}, origin } = {}) {
-  const h = { ...headers };
+  const h = { Connection: 'close', ...headers };
   if (cookie) h.Cookie = `karidns_session=${cookie}`;
   if (token) h.Authorization = `Bearer ${token}`;
   if (csrf) h['X-KariDNS-CSRF'] = csrf;
