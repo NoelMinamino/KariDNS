@@ -415,7 +415,7 @@ static void test_additional_from_auth(void) {
     }
 }
 
-/* 0.7: options { router-threads; worker-threads; }: 1..4 and 1..128, unset = 0 (automatic), a second statement replaces the first */
+/* 0.7: options { router-threads; worker-threads; }: 1..8 and 1..128, unset = 0 (automatic), a second statement replaces the first */
 static void test_thread_options(void) {
     printf("[TEST] options router-threads / worker-threads...\n");
     server_config_t cfg;
@@ -431,8 +431,8 @@ static void test_thread_options(void) {
         CHECK(cfg.router_threads == 1 && cfg.worker_threads == 128);
         free_server_config_fields(&cfg);
     }
-    if (parse_ok("options { router-threads 4; };", &cfg)) {   /* each is read on its own */
-        CHECK(cfg.router_threads == 4 && cfg.worker_threads == 0);
+    if (parse_ok("options { router-threads 8; };", &cfg)) {   /* each is read on its own; 8 is the most (B3 phase 1: it was 4) */
+        CHECK(cfg.router_threads == 8 && cfg.worker_threads == 0);
         free_server_config_fields(&cfg);
     }
     if (parse_ok("options { worker-threads 5; worker-threads 6; router-threads 2; router-threads 1; };", &cfg)) {   /* the last one wins */
@@ -450,7 +450,7 @@ static void test_thread_options(void) {
         }
     expect_reject("router-threads without a value", "options { router-threads; };");
     expect_reject("worker-threads without a semicolon", "options { worker-threads 2 };");
-    expect_an_error("router-threads 5 names the range", "options { router-threads 5; };", "expected 1..4");
+    expect_an_error("router-threads 9 names the range", "options { router-threads 9; };", "expected 1..8");
     expect_an_error("worker-threads 129 names the range", "options { worker-threads 129; };", "expected 1..128");
 }
 

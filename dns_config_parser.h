@@ -13,7 +13,7 @@
 #define KARIDNS_TCP_BUF_MIN      4096
 #define KARIDNS_TCP_BUF_MAX      (64 * 1024 * 1024)
 /* options { router-threads; worker-threads; }: the Frontend routers and the Backend workers (dns_server_core.c plan_threads()) */
-#define KARIDNS_ROUTER_THREADS_MAX 4
+#define KARIDNS_ROUTER_THREADS_MAX 8
 #define KARIDNS_WORKER_THREADS_MAX 128
 #define KARIDNS_NSID_MAX         128                 /* options { nsid }: octets (RFC 5001 §2.3 puts no limit; a long one would not fit a 512-octet response) */
 #define KARIDNS_UDP_BUFSIZE_MIN  512                /* RFC 6891 §6.2.3 */

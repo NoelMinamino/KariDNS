@@ -117,7 +117,21 @@ _Static_assert(sizeof(udp_ipc_t) == 80, "udp_ipc_t: 16 octets of header and two 
  * to a router) carries a KLS1 record as the payload: the debug level and the logging runtime (dns_log_state.h, 0.7 M2) */
 #define UDP_IPC_LOGSTATE (-3)
 
+/* What the router knows of the destination address of the queries that come in on one of its UDP sockets (run_frontend_router()): a socket
+ * bound to a specific address always receives its queries at that address, so the address is taken from the bind() once, at start-up, and the socket
+ * is not asked for the destination in a cmsg of every datagram (IP_RECVDSTADDR / IP_PKTINFO / IPV6_RECVPKTINFO: kernel work and a parse per query).
+ * Only a wildcard socket is asked.  `valid` is false for a wildcard socket and for the sockets that only send NOTIFY (no destination is known). */
+typedef struct {
+  bool valid;
+  ipc_sockaddr_t addr;   /* family and address, as the cmsg of the wildcard socket gave them (nothing else is set) */
+} router_src_t;
+
 #define UDP_BATCH_SIZE 16
+
+/* recvmmsg() on a non-blocking socket that returned fewer datagrams than it was given room for has emptied the queue (the libc loop stops at the
+ * first EAGAIN and returns what it had), so asking again would only cost a syscall that answers EAGAIN.  The kqueue filter is EV_CLEAR: a datagram
+ * that arrives after the read (or while it is handled) raises the event again.  A full batch may have more behind it: read again. */
+static inline bool udp_batch_drained(int n_recv) { return n_recv < UDP_BATCH_SIZE; }
 #define UDP_IPC_PAYLOAD_MAX 65535
 #define UDP_IPC_BUFFER_SIZE ((sizeof(udp_ipc_t) + UDP_IPC_PAYLOAD_MAX + 7) & ~7)
 
@@ -1823,7 +1837,8 @@ void *control_thread_func(void *arg);
 void *response_logger_thread_func(void *arg);
 void *query_logger_thread_func(void *arg);
 bool init_async_io_pool(void);
-int open_router_udp_sockets(server_config_t *cfg, int out_fds[MAX_BIND_ADDRS], bool out_is_wildcard[MAX_BIND_ADDRS]);
+int open_router_udp_sockets(server_config_t *cfg, int out_fds[MAX_BIND_ADDRS], bool out_is_wildcard[MAX_BIND_ADDRS], router_src_t out_src[MAX_BIND_ADDRS]);
+bool router_src_from_sockaddr(const struct sockaddr_storage *ss, router_src_t *out);
 void setup_udp_socket_buffers(int fd, int desired_rcv, int desired_snd);
 void apply_tcp_listen_opts(int fd, const server_config_t *cfg, bool verbose);
 void apply_tcp_mss(int fd, tcp_stream_ctx_t *c, int mss);
@@ -1912,9 +1927,12 @@ typedef enum {
 } ipcd_t;
 typedef struct {
   alignas(64) _Atomic uint64_t c[IPCD_COUNT];
+  _Atomic uint64_t routed;   /* router slots: the queries the router read from its UDP sockets and handed to the workers (not a loss: shown as ipcrouter.<r>.queries) */
 } ipcd_slot_t;
 #define IPCD_BACKEND_SLOT KARIDNS_ROUTER_THREADS_MAX   /* the slots below it are the routers' */
 void ipcd_add(ipcd_t c, uint64_t n);
+void ipcd_routed_add(uint64_t n);
+uint64_t ipcd_routed(int slot);
 uint64_t ipcd_total(ipcd_t c);
 size_t ipcd_format(char *buf, size_t cap);
 enum { SOCKBUF_IPC = 0, SOCKBUF_UDP = 1 };   /* sockbuf_note(): the queues between the routers and the workers, the UDP sockets of the routers */
@@ -1926,7 +1944,7 @@ extern pid_t g_broker_pid;
 void start_connect_broker(void);
 extern int g_num_workers;
 extern int g_num_frontend_routers;
-extern int g_ipc_fds[4][128][2];
+extern int g_ipc_fds[KARIDNS_ROUTER_THREADS_MAX][KARIDNS_WORKER_THREADS_MAX][2];
 extern pid_t g_supervisor_pid;
 extern int g_pid_fd;
 extern char g_pid_file_path[1024];

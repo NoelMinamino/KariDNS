@@ -2725,6 +2725,39 @@ static void test_ipcd_counters(void) {
     ipc_reply_failed(EAGAIN);
     ipc_reply_failed(EBADF);
     assert(ipcd_total(IPCD_WREP_FULL) == wf0 + 2 && ipcd_total(IPCD_WREP_ERR) == we0 + 1);
+    // B3 phase 1: the queries each router passed on, in its own slot (one writer), shown per router and not as a drop
+    const uint64_t r0 = ipcd_routed(1), r2 = ipcd_routed(2);
+    pid = fork();
+    assert(pid >= 0);
+    if (pid == 0) {                                // a router: slot 2
+        ipcd_set_self(2);
+        ipcd_routed_add(7);
+        ipcd_routed_add(0);                        // (nothing)
+        ipcd_routed_add(5);
+        _exit(0);
+    }
+    assert(waitpid(pid, &st, 0) == pid && WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    assert(ipcd_routed(2) == r2 + 12 && ipcd_routed(1) == r0);
+    assert(ipcd_routed(-1) == 0 && ipcd_routed(IPCD_BACKEND_SLOT + 5) == 0);
+    const int saved_routers = g_num_frontend_routers;
+    g_num_frontend_routers = 3;
+    len = ipcd_format(buf, sizeof(buf));
+    assert(strstr(buf, "ipcrouter.0.queries=") != NULL && strstr(buf, "ipcrouter.1.queries=") != NULL);
+    char want[64];
+    snprintf(want, sizeof(want), "ipcrouter.2.queries=%llu\n", (unsigned long long)(r2 + 12));
+    assert(strstr(buf, want) != NULL && strstr(buf, "ipcrouter.3.queries=") == NULL);
+    dt = strstr(buf, "ipc.dropped.total=");
+    sum = 0;
+    for (int i = 0; i < IPCD_COUNT; i++)
+        if (i != IPCD_RTW_SPILLED) sum += ipcd_total((ipcd_t)i);
+    assert(dt != NULL && strtoull(dt + strlen("ipc.dropped.total="), NULL, 10) == sum);   // (the routed queries are not drops)
+    g_num_frontend_routers = saved_routers;
+    for (size_t cap = 1; cap < 1500; cap += 37) {   // (the router lines are cut at a line as well)
+        char small[1500];
+        size_t l = ipcd_format(small, cap);
+        assert(l < cap);
+        if (l > 0) assert(small[l - 1] == '\n');
+    }
     printf("  -> the IPC drop counters passed.\n");
 }
 
@@ -2759,13 +2792,196 @@ static void test_open_router_udp_sockets_and_buffers(void) {
 
     int out_fds[MAX_BIND_ADDRS];
     bool out_is_wc[MAX_BIND_ADDRS];
-    int num = open_router_udp_sockets(&cfg, out_fds, out_is_wc);
+    router_src_t out_src[MAX_BIND_ADDRS];
+    int num = open_router_udp_sockets(&cfg, out_fds, out_is_wc, out_src);
     assert(num == 1);
     assert(out_fds[0] >= 0);
     assert(out_is_wc[0] == false);
-
+    // B3 phase 1: a socket bound to one address is not asked for the destination of the queries; the address it is bound to is kept instead
+    int on = -1;
+    socklen_t onl = sizeof(on);
+#ifdef IP_RECVDSTADDR
+    assert(getsockopt(out_fds[0], IPPROTO_IP, IP_RECVDSTADDR, &on, &onl) == 0 && on == 0);
+#endif
+    assert(out_src[0].valid && out_src[0].addr.sin.sin_family == AF_INET);
+    struct in_addr lo;
+    assert(inet_pton(AF_INET, "127.0.0.1", &lo) == 1);
+    assert(memcmp(&out_src[0].addr.sin.sin_addr, &lo, sizeof(lo)) == 0);
     close(out_fds[0]);
+
+    // a wildcard socket is asked for it (the reply has to leave from the address the query came to) and keeps no address
+    test_set_listen(&cfg, "0.0.0.0", 35354);
+    cfg.listen[0].wildcard = true;
+    memset(out_src, 0x55, sizeof(out_src));
+    num = open_router_udp_sockets(&cfg, out_fds, out_is_wc, out_src);
+    assert(num == 1 && out_is_wc[0] == true && !out_src[0].valid);
+#ifdef IP_RECVDSTADDR
+    on = -1;
+    onl = sizeof(on);
+    assert(getsockopt(out_fds[0], IPPROTO_IP, IP_RECVDSTADDR, &on, &onl) == 0 && on == 1);
+#endif
+    close(out_fds[0]);
+
+    // IPv6 (a host without it skips this part): the wildcard asks (IPV6_RECVPKTINFO), the specific address does not and is kept
+    bool v6ok = false;   /* (open_router_udp_sockets() ends the process when a bind fails: only a host that has ::1 goes on) */
+    int s6 = socket(AF_INET6, SOCK_DGRAM, 0);
+    if (s6 >= 0) {
+        struct sockaddr_in6 pb;
+        memset(&pb, 0, sizeof(pb));
+        pb.sin6_family = AF_INET6;
+        pb.sin6_len = sizeof(pb);
+        pb.sin6_addr = in6addr_loopback;
+        v6ok = bind(s6, (struct sockaddr *)&pb, sizeof(pb)) == 0;
+        close(s6);
+    }
+    if (v6ok) {
+        static listen_addr_t l6[2];
+        memset(l6, 0, sizeof(l6));
+        l6[0].family = AF_INET6; l6[0].wildcard = true; l6[0].port = 35355; snprintf(l6[0].text, sizeof(l6[0].text), "::");
+        l6[1].family = AF_INET6; l6[1].port = 35356; snprintf(l6[1].text, sizeof(l6[1].text), "::1");
+        l6[1].addr[15] = 1;
+        cfg.listen = l6;
+        cfg.listen_count = 2;
+        num = open_router_udp_sockets(&cfg, out_fds, out_is_wc, out_src);
+        assert(num == 2);
+        {
+            assert(out_is_wc[0] && !out_src[0].valid && !out_is_wc[1] && out_src[1].valid);
+            assert(out_src[1].addr.sin6.sin6_family == AF_INET6 && memcmp(&out_src[1].addr.sin6.sin6_addr, &in6addr_loopback, 16) == 0);
+#ifdef IPV6_RECVPKTINFO
+            on = -1;
+            onl = sizeof(on);
+            assert(getsockopt(out_fds[0], IPPROTO_IPV6, IPV6_RECVPKTINFO, &on, &onl) == 0 && on == 1);
+            on = -1;
+            onl = sizeof(on);
+            assert(getsockopt(out_fds[1], IPPROTO_IPV6, IPV6_RECVPKTINFO, &on, &onl) == 0 && on == 0);
+#endif
+            close(out_fds[0]);
+            close(out_fds[1]);
+        }
+    }
+
+    // router_src_from_sockaddr(): family and address only (what the cmsg of a wildcard socket gives), nothing for another family
+    router_src_t rs;
+    struct sockaddr_storage ss;
+    memset(&ss, 0, sizeof(ss));
+    struct sockaddr_in *s4 = (struct sockaddr_in *)&ss;
+    s4->sin_family = AF_INET;
+    s4->sin_port = htons(53);
+    assert(inet_pton(AF_INET, "192.0.2.7", &s4->sin_addr) == 1);
+    assert(router_src_from_sockaddr(&ss, &rs) && rs.valid && rs.addr.sin.sin_family == AF_INET && rs.addr.sin.sin_port == 0);
+    assert(memcmp(&rs.addr.sin.sin_addr, &s4->sin_addr, 4) == 0);
+    memset(&ss, 0, sizeof(ss));
+    struct sockaddr_in6 *s6a = (struct sockaddr_in6 *)&ss;
+    s6a->sin6_family = AF_INET6;
+    s6a->sin6_port = htons(53);
+    s6a->sin6_scope_id = 3;
+    assert(inet_pton(AF_INET6, "2001:db8::7", &s6a->sin6_addr) == 1);
+    assert(router_src_from_sockaddr(&ss, &rs) && rs.valid && rs.addr.sin6.sin6_family == AF_INET6 && rs.addr.sin6.sin6_port == 0 && rs.addr.sin6.sin6_scope_id == 0);
+    assert(memcmp(&rs.addr.sin6.sin6_addr, &s6a->sin6_addr, 16) == 0);
+    memset(&ss, 0, sizeof(ss));
+    ss.ss_family = AF_UNIX;
+    memset(&rs, 0x55, sizeof(rs));
+    assert(!router_src_from_sockaddr(&ss, &rs) && !rs.valid);
     printf("  -> open_router_udp_sockets & setup_udp_socket_buffers passed.\n");
+}
+
+/* B3 phase 1: a batch shorter than the room given ends the read loop (udp_batch_drained()), because a datagram that arrives afterwards raises the
+ * EV_CLEAR event again.  The loop is the router's (and the worker's): read, and read again only after a full batch.  Checked on a UDP socket and on the
+ * AF_UNIX datagram pair of the IPC: batches of 0..40, a datagram that arrives while the batch is handled, and a queue that holds exactly 16. */
+static int drain_loop_like_router(int fd, int *reads) {
+    struct mmsghdr m[UDP_BATCH_SIZE];
+    struct iovec iov[UDP_BATCH_SIZE];
+    char buf[UDP_BATCH_SIZE][32];
+    int total = 0;
+    for (;;) {
+        for (int k = 0; k < UDP_BATCH_SIZE; k++) {
+            iov[k].iov_base = buf[k];
+            iov[k].iov_len = sizeof(buf[k]);
+            memset(&m[k], 0, sizeof(m[k]));
+            m[k].msg_hdr.msg_iov = &iov[k];
+            m[k].msg_hdr.msg_iovlen = 1;
+        }
+        int n = recvmmsg(fd, m, UDP_BATCH_SIZE, MSG_DONTWAIT, NULL);
+        (*reads)++;
+        if (n <= 0) break;
+        total += n;
+        if (udp_batch_drained(n)) break;
+    }
+    return total;
+}
+
+static int wait_event(int kq) {
+    struct kevent ev;
+    struct timespec ts = { 2, 0 };
+    return kevent(kq, NULL, 0, &ev, 1, &ts);
+}
+
+static void batch_drain_check(int rx, int tx, bool is_udp, const struct sockaddr_in *to) {
+    int kq = kqueue();
+    assert(kq >= 0);
+    struct kevent ev;
+    EV_SET(&ev, rx, EVFILT_READ, EV_ADD | EV_CLEAR, 0, 0, NULL);
+    assert(kevent(kq, &ev, 1, NULL, 0, NULL) == 0);
+    static const int sizes[] = { 1, 5, 15, 16, 17, 32, 33, 40 };
+    for (size_t i = 0; i < sizeof(sizes) / sizeof(sizes[0]); i++) {
+        for (int k = 0; k < sizes[i]; k++)
+            assert((is_udp ? sendto(tx, "x", 1, 0, (const struct sockaddr *)to, sizeof(*to)) : send(tx, "x", 1, 0)) == 1);
+        usleep(5000);   /* (the loopback delivers in the call; a netisr that does not is waited for) */
+        assert(wait_event(kq) == 1);
+        int reads = 0;
+        assert(drain_loop_like_router(rx, &reads) == sizes[i]);
+        // a short last batch needs no read after it; a queue that held a multiple of 16 needs the one that finds it empty
+        assert(reads == (sizes[i] % UDP_BATCH_SIZE == 0 ? sizes[i] / UDP_BATCH_SIZE + 1 : (sizes[i] + UDP_BATCH_SIZE - 1) / UDP_BATCH_SIZE));
+        struct timespec none = { 0, 0 };
+        assert(kevent(kq, NULL, 0, &ev, 1, &none) == 0);   // (nothing is left, the event is cleared)
+    }
+    // a datagram that arrives after the short read, while the batch is being handled: the event comes again, nothing waits for the next one
+    for (int round = 0; round < 20; round++) {
+        for (int k = 0; k < 5; k++)
+            assert((is_udp ? sendto(tx, "x", 1, 0, (const struct sockaddr *)to, sizeof(*to)) : send(tx, "x", 1, 0)) == 1);
+        usleep(5000);
+        assert(wait_event(kq) == 1);
+        int reads = 0;
+        assert(drain_loop_like_router(rx, &reads) == 5 && reads == 1);
+        assert((is_udp ? sendto(tx, "y", 1, 0, (const struct sockaddr *)to, sizeof(*to)) : send(tx, "y", 1, 0)) == 1);   // (after the read, before the next kevent)
+        assert(wait_event(kq) == 1);
+        reads = 0;
+        assert(drain_loop_like_router(rx, &reads) == 1 && reads == 1);
+    }
+    close(kq);
+}
+
+static void test_udp_batch_drained(void) {
+    printf("[TEST] Server Core: a short recvmmsg batch ends the router / worker read loop (udp_batch_drained, EV_CLEAR re-arm)...\n");
+    assert(udp_batch_drained(0) && udp_batch_drained(1) && udp_batch_drained(UDP_BATCH_SIZE - 1));
+    assert(!udp_batch_drained(UDP_BATCH_SIZE) && !udp_batch_drained(UDP_BATCH_SIZE + 1));
+
+    int rx = socket(AF_INET, SOCK_DGRAM, 0), tx = socket(AF_INET, SOCK_DGRAM, 0);
+    assert(rx >= 0 && tx >= 0);
+    struct sockaddr_in a;
+    memset(&a, 0, sizeof(a));
+    a.sin_family = AF_INET;
+    a.sin_len = sizeof(a);
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    assert(bind(rx, (struct sockaddr *)&a, sizeof(a)) == 0);
+    socklen_t al = sizeof(a);
+    assert(getsockname(rx, (struct sockaddr *)&a, &al) == 0);
+    int big = 1 << 20;
+    setsockopt(rx, SOL_SOCKET, SO_RCVBUF, &big, sizeof(big));
+    fcntl(rx, F_SETFL, fcntl(rx, F_GETFL, 0) | O_NONBLOCK);
+    batch_drain_check(rx, tx, true, &a);
+    close(rx);
+    close(tx);
+
+    int sv[2];
+    assert(socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) == 0);
+    setsockopt(sv[0], SOL_SOCKET, SO_RCVBUF, &big, sizeof(big));
+    setsockopt(sv[1], SOL_SOCKET, SO_SNDBUF, &big, sizeof(big));
+    fcntl(sv[0], F_SETFL, fcntl(sv[0], F_GETFL, 0) | O_NONBLOCK);
+    batch_drain_check(sv[0], sv[1], false, NULL);
+    close(sv[0]);
+    close(sv[1]);
+    printf("  -> udp_batch_drained passed.\n");
 }
 
 // ----------------------------------------------------------------------------
@@ -4818,11 +5034,16 @@ static void test_crypto_prewarm_survives_capability_mode(void) {
 static void test_plan_threads_and_cpus(void) {
     printf("[TEST] Server Core: plan_threads() / usable_cpu_count() / restart-only router-threads, worker-threads...\n");
     static const struct { int cpus; unsigned ro, wo; int r, w; } c[] = {
-        { 1, 0, 0, 1, 1 }, { 2, 0, 0, 1, 1 }, { 3, 0, 0, 1, 2 }, { 4, 0, 0, 2, 2 }, { 8, 0, 0, 2, 6 }, { 64, 0, 0, 2, 62 },
-        { 200, 0, 0, 2, 128 },                 /* clamped to MAX_WORKERS */
+        /* B3 phase 1: up to 3 CPUs 1 router; then half the CPUs as routers (at most KARIDNS_ROUTER_THREADS_MAX = 8) and the rest as workers */
+        { 1, 0, 0, 1, 1 }, { 2, 0, 0, 1, 1 }, { 3, 0, 0, 1, 2 }, { 4, 0, 0, 2, 2 }, { 5, 0, 0, 2, 3 }, { 6, 0, 0, 3, 3 }, { 7, 0, 0, 3, 4 },
+        { 8, 0, 0, 4, 4 }, { 12, 0, 0, 6, 6 }, { 16, 0, 0, 8, 8 }, { 17, 0, 0, 8, 9 }, { 32, 0, 0, 8, 24 }, { 64, 0, 0, 8, 56 },
+        { 200, 0, 0, 8, 128 },                 /* routers at the maximum, workers clamped to MAX_WORKERS */
         { 0, 0, 0, 1, 1 }, { -5, 0, 0, 1, 1 },  /* never below 1 */
-        { 8, 4, 0, 4, 6 }, { 8, 0, 3, 2, 3 }, { 1, 2, 7, 2, 7 }, { 200, 1, 128, 1, 128 },
+        /* the options replace each count; the default of the other one does not depend on them */
+        { 8, 4, 0, 4, 4 }, { 8, 0, 3, 4, 3 }, { 1, 2, 7, 2, 7 }, { 200, 1, 128, 1, 128 },
+        { 8, 8, 0, 8, 4 }, { 16, 8, 8, 8, 8 }, { 4, 0, 1, 2, 1 }, { 4, 3, 0, 3, 2 }, { 2, 8, 0, 8, 1 },
     };
+    assert(KARIDNS_ROUTER_THREADS_MAX == 8);
     for (size_t i = 0; i < sizeof(c) / sizeof(c[0]); i++) {
         int r = -1, w = -1;
         plan_threads(c[i].cpus, c[i].ro, c[i].wo, &r, &w);
@@ -8384,6 +8605,7 @@ int main(void) {
     test_control_restricted_keys();
     test_control_peer_admission();
     test_open_router_udp_sockets_and_buffers();
+    test_udp_batch_drained();
     test_sendmmsg_skip_failed();
     test_ipc_send_spill();
     test_sockbuf_set();
