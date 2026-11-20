@@ -7468,7 +7468,7 @@ STATIC_TEST void run_frontend_router(pid_t backend_pid, int router_id) {
             out_msg.msg_iov = &out_iov;
             out_msg.msg_iovlen = 1;
             out_msg.msg_name = &msg->client_addr;
-            out_msg.msg_namelen = msg->addr_len;
+            out_msg.msg_namelen = (socklen_t)(msg->addr_len <= sizeof(msg->client_addr) ? msg->addr_len : sizeof(msg->client_addr));   /* (from the Backend: never past client_addr) */
 
             router_cmsg_buf_t cbuf;
             memset(&cbuf, 0, sizeof(cbuf));
@@ -7572,10 +7572,13 @@ STATIC_TEST void run_frontend_router(pid_t backend_pid, int router_id) {
 
             fctx->cli_tx_iov[tx_count].iov_base = fctx->ipc_rx_buffers[k] + sizeof(udp_ipc_t);
             fctx->cli_tx_iov[tx_count].iov_len = msg->payload_len;
-            size_t copy_len = (msg->addr_len <= sizeof(fctx->cli_tx_addrs[tx_count])) ? msg->addr_len : sizeof(fctx->cli_tx_addrs[tx_count]);
+            /* addr_len comes from the Backend (hostile input): the address is at most the header's client_addr, and the length handed to the kernel is the
+             * length copied (a larger one would read past client_addr into the payload) */
+            const size_t copy_len = msg->addr_len <= sizeof(msg->client_addr) ? msg->addr_len : sizeof(msg->client_addr);
+            memset(&fctx->cli_tx_addrs[tx_count], 0, sizeof(fctx->cli_tx_addrs[tx_count]));
             memcpy(&fctx->cli_tx_addrs[tx_count], &msg->client_addr, copy_len);
             fctx->cli_tx_msgs[tx_count].msg_hdr.msg_name = &fctx->cli_tx_addrs[tx_count];
-            fctx->cli_tx_msgs[tx_count].msg_hdr.msg_namelen = msg->addr_len;
+            fctx->cli_tx_msgs[tx_count].msg_hdr.msg_namelen = (socklen_t)copy_len;
 
             bool is_wildcard = (cur_sock_idx >= 0 && cur_sock_idx < local_num_udp_fds) ? local_udp_is_wildcard[cur_sock_idx] : false;
 #ifdef IP_SENDSRCADDR
