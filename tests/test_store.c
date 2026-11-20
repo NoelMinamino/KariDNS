@@ -3198,7 +3198,11 @@ static void test_journal_boost_crash(void) {
     bool cut = true;
     const uint32_t k = jbo_fill(x, 0, 3 * JBO_MAX, &cut);
     store_stats(x, &cs);
-    if (cut || cs.journal_bytes < 3 * JBO_MAX || cs.checkpoints != base) _exit(4);   /* (three times the size at which the normal bound forces a checkpoint, and none was made) */
+    if (cut || cs.journal_bytes < 3 * JBO_MAX || cs.checkpoints != base) {
+      printf("  (step 4 of the child: cut %d, journal %" PRIu64 " bytes, checkpoints %" PRIu64 " (base %" PRIu64 "), growths %" PRIu64 ", ix_used %" PRIu64 " of %" PRIu64 " slots, %u puts)\n", (int)cut, (uint64_t)cs.journal_bytes, (uint64_t)cs.checkpoints, base, (uint64_t)cs.growths, (uint64_t)cs.ix_used, (uint64_t)cs.ix_slots, k);
+      fflush(stdout);
+      _exit(4);
+    }   /* (three times the size at which the normal bound forces a checkpoint, and none was made) */
     if (store_commit(x) != 0) _exit(5);
     if (write(pp[1], &k, sizeof(k)) != (ssize_t)sizeof(k)) _exit(6);
     _exit(0);                                                            /* (no close: the state a crash leaves) */
