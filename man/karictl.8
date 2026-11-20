@@ -578,6 +578,17 @@ was left to copy the query
 \fBipc.dropped.total\fR
 the sum of all of them but \fBspilled\fR
 .PP
+After the counters come the sizes of the socket buffers in force, as lines
+\fBipcbuf.<kind>.<direction>.asked=<bytes>\fR and \fB.got=<bytes>\fR:
+\fBqueue\fR is the queues between the routers and the workers, \fBudp\fR the UDP
+sockets of the routers, \fBrcv\fR and \fBsnd\fR the direction; \fBasked\fR is
+the largest size requested (\fBudp\-recvbuf\-size\fR, \fBudp\-sndbuf\-size\fR),
+\fBgot\fR the smallest size any socket of the kind has (0: not set yet; a UDP
+socket is set when its router has started). A \fBgot\fR below \fBasked\fR means
+the kernel limit \fBkern.ipc.maxsockbuf\fR held the request down (the server
+asks for the most the kernel takes; the start-up \fBWARNING\fR says which value
+to set).
+.PP
 A queue is full when the worker (or the router) does not read it as fast as it
 is filled: a CPU that is busy with something else, or buffers that are too
 small. The size of the queues is \fBudp\-recvbuf\-size\fR /

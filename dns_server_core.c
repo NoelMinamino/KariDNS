@@ -1932,6 +1932,75 @@ static void log_udp_send_drop(const char *path, bool is_ipc, int err, int droppe
   suppressed = 0;
 }
 
+/* ---- the size of a socket buffer (SO_RCVBUF / SO_SNDBUF): one helper for the IPC queues and the UDP sockets (0.7) ----
+ * The kernel refuses a request above sb_max_adj = kern.ipc.maxsockbuf * MCLBYTES / (MSIZE + MCLBYTES) (sbreserve_locked(), sys/kern/uipc_sockbuf.c; ENOBUFS)
+ * and the socket keeps the size it had: with the stock kern.ipc.maxsockbuf of 2 MB the 4 MB default would leave the queues at net.local.dgram.recvspace.  So
+ * sockbuf_set() asks for the most the kernel takes: first sb_max_adj, as the sysctl is read once at the start, then half and half again if that was refused
+ * as well, and never less than the socket has.  The sizes in force are noted for karictl ipcstats (kind 0: the queues between the routers and the workers,
+ * kind 1: the UDP sockets of the routers; asked: the largest request, got: the smallest size in force). */
+typedef struct {
+  _Atomic int asked[2][2];     /* [kind][0 = receive, 1 = send] */
+  _Atomic int got[2][2];       /* 0 = none noted yet */
+} sockbuf_sizes_t;
+static sockbuf_sizes_t g_sockbuf_fallback;
+static sockbuf_sizes_t *g_sockbuf_sizes = &g_sockbuf_fallback;
+
+/* The value of a numeric sysctl for a log line, -1 when it cannot be read. */
+static long long sysctl_num(const char *name) {
+  unsigned long v = 0;
+  size_t l = sizeof(v);
+  if (sysctlbyname(name, &v, &l, NULL, 0) != 0 || l != sizeof(v)) return -1;
+  return (long long)v;
+}
+
+/* sb_max_adj for a kern.ipc.maxsockbuf, and the kern.ipc.maxsockbuf that gives `size` (rounded up) */
+STATIC_TEST unsigned long sockbuf_limit_for(unsigned long maxsockbuf) {
+  return (unsigned long)((unsigned long long)maxsockbuf * MCLBYTES / (MSIZE + MCLBYTES));
+}
+STATIC_TEST unsigned long sockbuf_maxsockbuf_for(unsigned long size) {
+  return (unsigned long)(((unsigned long long)size * (MSIZE + MCLBYTES) + MCLBYTES - 1) / MCLBYTES);
+}
+
+static long long g_sockbuf_maxsockbuf = -2;       /* kern.ipc.maxsockbuf, read once (-1: cannot be read) */
+STATIC_TEST long long sockbuf_maxsockbuf(void) {
+  if (g_sockbuf_maxsockbuf < -1) g_sockbuf_maxsockbuf = sysctl_num("kern.ipc.maxsockbuf");
+  return g_sockbuf_maxsockbuf;
+}
+
+/* Sets option `opt` of fd to `want`, or to the most the kernel takes.  Returns the size in force (getsockopt; 0 when it cannot be read) and, in *err, the
+ * errno of the request for `want` (0 when it was taken). */
+STATIC_TEST int sockbuf_set(int fd, int opt, int want, int *err) {
+  int cur = 0;
+  socklen_t l = sizeof(cur);
+  *err = 0;
+  if (getsockopt(fd, SOL_SOCKET, opt, &cur, &l) != 0) cur = 0;
+  if (setsockopt(fd, SOL_SOCKET, opt, &want, sizeof(want)) != 0) {
+    *err = errno;
+    if (*err == ENOBUFS || *err == EINVAL) {
+      long long try = want;
+      const long long mx = sockbuf_maxsockbuf();
+      if (mx > 0 && (long long)sockbuf_limit_for((unsigned long)mx) < try) try = (long long)sockbuf_limit_for((unsigned long)mx);
+      else try /= 2;
+      for (; try > cur && try >= 4096; try /= 2) {
+        const int v = (int)try;
+        if (setsockopt(fd, SOL_SOCKET, opt, &v, sizeof(v)) == 0) break;
+      }
+    }
+  }
+  int got = 0;
+  l = sizeof(got);
+  if (getsockopt(fd, SOL_SOCKET, opt, &got, &l) != 0) got = 0;
+  return got;
+}
+
+/* The sizes in force, for karictl ipcstats (a router process notes its UDP sockets in the shared area: ipcd_init()) */
+STATIC_TEST void sockbuf_note(int kind, int dir, int asked, int got) {
+  int a = atomic_load_explicit(&g_sockbuf_sizes->asked[kind][dir], memory_order_relaxed);
+  while (asked > a && !atomic_compare_exchange_weak_explicit(&g_sockbuf_sizes->asked[kind][dir], &a, asked, memory_order_relaxed, memory_order_relaxed)) {}
+  int g = atomic_load_explicit(&g_sockbuf_sizes->got[kind][dir], memory_order_relaxed);
+  while ((g == 0 || got < g) && !atomic_compare_exchange_weak_explicit(&g_sockbuf_sizes->got[kind][dir], &g, got, memory_order_relaxed, memory_order_relaxed)) {}
+}
+
 /* ---- 0.7: counters of the queries and replies that are lost between the routers and the workers (dns_server_internal.h ipcd_t) ----
  * The slots are in an anonymous shared mapping (ipcd_init(), made before the Backend and the routers are forked: one slot per router, the
  * last is the Backend's), so the Backend can sum what the router processes counted.  g_ipcd_self is the slot of this process; until ipcd_set_self()
@@ -1948,12 +2017,13 @@ static const char *const g_ipcd_names[IPCD_COUNT] = {
 
 STATIC_TEST void ipcd_init(void) {
   if (g_ipcd_slots) return;
-  void *p = mmap(NULL, sizeof(ipcd_slot_t) * IPCD_SLOTS, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0);
+  void *p = mmap(NULL, sizeof(ipcd_slot_t) * IPCD_SLOTS + sizeof(sockbuf_sizes_t), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0);
   if (p == MAP_FAILED) {
     syslog(LOG_WARNING, "[IPC] cannot map the shared drop counters (%m): what the routers drop is not counted in karictl ipcstats");
     return;
   }
   g_ipcd_slots = p;                  /* (zero filled) */
+  g_sockbuf_sizes = (sockbuf_sizes_t *)(g_ipcd_slots + IPCD_SLOTS);
   g_ipcd_self = &g_ipcd_slots[IPCD_BACKEND_SLOT];
 }
 
@@ -1986,6 +2056,17 @@ size_t ipcd_format(char *buf, size_t cap) {
   }
   int w = snprintf(buf + len, cap - len, "ipc.dropped.total=%llu\n", (unsigned long long)dropped);
   if (w > 0 && (size_t)w < cap - len) len += (size_t)w;
+  /* the sizes of the socket buffers in force (smallest of each kind; asked = the largest request): ipcbuf.<kind>.<direction>.asked / .got, 0 = not set */
+  static const char *const kinds[2] = { "queue", "udp" };
+  static const char *const dirs[2] = { "rcv", "snd" };
+  for (int k = 0; k < 2; k++)
+    for (int d = 0; d < 2; d++) {
+      w = snprintf(buf + len, cap - len, "ipcbuf.%s.%s.asked=%d\nipcbuf.%s.%s.got=%d\n", kinds[k], dirs[d],
+                   atomic_load_explicit(&g_sockbuf_sizes->asked[k][d], memory_order_relaxed), kinds[k], dirs[d],
+                   atomic_load_explicit(&g_sockbuf_sizes->got[k][d], memory_order_relaxed));
+      if (w < 0 || (size_t)w >= cap - len) return len;
+      len += (size_t)w;
+    }
   return len;
 }
 
@@ -6326,7 +6407,7 @@ void *control_thread_func(void *arg) {
               (void)ctl_send_all(cfd, stbuf, stlen);
             } else if (strcmp(cmd, "ipcstats") == 0) {
               /* 0.7: the queries and replies lost between the routers and the workers (ipcd_t), as "ipc.<name>=<n>" lines (a read command) */
-              char ipbuf[1024];
+              char ipbuf[2048];
               size_t iplen = ipcd_format(ipbuf, sizeof(ipbuf));
               (void)ctl_send_all(cfd, ipbuf, iplen);
             } else if (strcmp(cmd, "storeop") == 0) {
@@ -6561,49 +6642,26 @@ void *control_thread_func(void *arg) {
 // 13. Frontend Router Process (マルチプロセス UDP送受信ルーティング)
 // ============================================================================
 
-/* The value of a numeric sysctl for a log line, -1 when it cannot be read. */
-static long long sysctl_num(const char *name) {
-  unsigned long v = 0;
-  size_t l = sizeof(v);
-  if (sysctlbyname(name, &v, &l, NULL, 0) != 0 || l != sizeof(v)) return -1;
-  return (long long)v;
+/* One UDP socket buffer: sockbuf_set() asks for `want`; the log says what it got and, when that is less, why and which sysctl to set (the sizes are also shown by
+ * karictl ipcstats, sockbuf_note()).  `what` is the option's name in the message, `knob` the configuration statement. */
+static void udp_sockbuf_one(int fd, int opt, int want, const char *what, const char *knob) {
+  int err = 0;
+  const int got = sockbuf_set(fd, opt, want, &err);
+  sockbuf_note(SOCKBUF_UDP, opt == SO_RCVBUF ? 0 : 1, want, got);
+  logev_post(LOGC_NETWORK, 2, NULL, 0, "[Network] UDP socket %d: %s requested %d, the system gives %d", fd, what, want, got);
+  if (got >= want) return;
+  if (got == 0 || (err != 0 && err != ENOBUFS && err != EINVAL)) {
+    syslog(LOG_WARNING, "[Network] WARNING: failed to set %s to %d: %s", what, want, strerror(err));
+    return;
+  }
+  const long long mx = sockbuf_maxsockbuf();
+  syslog(LOG_WARNING, "[Network] WARNING: UDP %s: asked %d, got %d (limited by kern.ipc.maxsockbuf=%lld; set it to %lu to get %d, or lower %s); a full socket buffer loses %s",
+         what, want, got, mx, sockbuf_maxsockbuf_for((unsigned long)want), want, knob, opt == SO_RCVBUF ? "queries" : "replies");
 }
 
 void setup_udp_socket_buffers(int fd, int desired_rcv, int desired_snd) {
-  if (desired_rcv > 0) {
-    if (setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &desired_rcv, sizeof(desired_rcv)) != 0) {
-      syslog(LOG_WARNING, "[Network] WARNING: failed to set SO_RCVBUF to %d: %m (the sysctl kern.ipc.maxsockbuf is %lld: raise it above the size asked for, or lower udp-recvbuf-size)", desired_rcv, sysctl_num("kern.ipc.maxsockbuf"));
-    } else {
-      int actual_rcv = 0;
-      socklen_t optlen = sizeof(actual_rcv);
-      if (getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &actual_rcv, &optlen) == 0) {
-        logev_post(LOGC_NETWORK, 2, NULL, 0, "[Network] UDP socket %d: SO_RCVBUF requested %d, the system gives %d", fd, desired_rcv, actual_rcv);
-        if (actual_rcv < desired_rcv) {
-          syslog(LOG_WARNING,
-                 "[Network] UDP SO_RCVBUF truncated by OS: requested %d bytes, got %d bytes "
-                 "(WARNING: raise the sysctl kern.ipc.maxsockbuf, now %lld, above the size asked for, or lower udp-recvbuf-size; a full socket buffer loses queries)",
-                 desired_rcv, actual_rcv, sysctl_num("kern.ipc.maxsockbuf"));
-        }
-      }
-    }
-  }
-  if (desired_snd > 0) {
-    if (setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &desired_snd, sizeof(desired_snd)) != 0) {
-      syslog(LOG_WARNING, "[Network] WARNING: failed to set SO_SNDBUF to %d: %m (the sysctl kern.ipc.maxsockbuf is %lld: raise it above the size asked for, or lower udp-sndbuf-size)", desired_snd, sysctl_num("kern.ipc.maxsockbuf"));
-    } else {
-      int actual_snd = 0;
-      socklen_t optlen = sizeof(actual_snd);
-      if (getsockopt(fd, SOL_SOCKET, SO_SNDBUF, &actual_snd, &optlen) == 0) {
-        logev_post(LOGC_NETWORK, 2, NULL, 0, "[Network] UDP socket %d: SO_SNDBUF requested %d, the system gives %d", fd, desired_snd, actual_snd);
-        if (actual_snd < desired_snd) {
-          syslog(LOG_WARNING,
-                 "[Network] UDP SO_SNDBUF truncated by OS: requested %d bytes, got %d bytes "
-                 "(WARNING: raise the sysctl kern.ipc.maxsockbuf, now %lld, above the size asked for, or lower udp-sndbuf-size; a full socket buffer loses replies)",
-                 desired_snd, actual_snd, sysctl_num("kern.ipc.maxsockbuf"));
-        }
-      }
-    }
-  }
+  if (desired_rcv > 0) udp_sockbuf_one(fd, SO_RCVBUF, desired_rcv, "SO_RCVBUF", "udp-recvbuf-size");
+  if (desired_snd > 0) udp_sockbuf_one(fd, SO_SNDBUF, desired_snd, "SO_SNDBUF", "udp-sndbuf-size");
 }
 
 int open_router_udp_sockets(server_config_t *cfg, int out_fds[MAX_BIND_ADDRS], bool out_is_wildcard[MAX_BIND_ADDRS]) {
@@ -7464,13 +7522,11 @@ STATIC_TEST bool daemonize(void) {
  * net.local.dgram.*) is counted; setup_ipc_tables() logs one warning for all of them. */
 static int g_ipc_buf_short;
 static int g_ipc_buf_asked, g_ipc_buf_got, g_ipc_buf_err;
-static void ipc_set_buf(int fd, int opt, int size) {
-  int got = 0;
-  socklen_t gl = sizeof(got);
-  const int rc = setsockopt(fd, SOL_SOCKET, opt, &size, sizeof(size));
-  const int err = rc != 0 ? errno : 0;
-  const int grc = getsockopt(fd, SOL_SOCKET, opt, &got, &gl);   /* (also after a refusal: what the socket has) */
-  if (rc != 0 || grc != 0 || got < size) {
+static void ipc_set_buf(int fd, int opt, int size, bool queue) {
+  int err = 0;
+  const int got = sockbuf_set(fd, opt, size, &err);          /* the size asked for, or the most the kernel takes (sockbuf_set()) */
+  if (queue) sockbuf_note(SOCKBUF_IPC, opt == SO_RCVBUF ? 0 : 1, size, got);
+  if (got < size) {
     g_ipc_buf_short++;
     g_ipc_buf_asked = size;
     g_ipc_buf_got = got;
@@ -7497,10 +7553,10 @@ STATIC_TEST void setup_ipc_tables(int num_workers) {
             fcntl(g_ipc_fds[f][w][0], F_GETFL, 0) | O_NONBLOCK);
       fcntl(g_ipc_fds[f][w][1], F_SETFL,
             fcntl(g_ipc_fds[f][w][1], F_GETFL, 0) | O_NONBLOCK);
-      ipc_set_buf(g_ipc_fds[f][w][0], SO_RCVBUF, rcvbuf_size);
-      ipc_set_buf(g_ipc_fds[f][w][0], SO_SNDBUF, sndbuf_size);
-      ipc_set_buf(g_ipc_fds[f][w][1], SO_RCVBUF, rcvbuf_size);
-      ipc_set_buf(g_ipc_fds[f][w][1], SO_SNDBUF, sndbuf_size);
+      ipc_set_buf(g_ipc_fds[f][w][0], SO_RCVBUF, rcvbuf_size, true);
+      ipc_set_buf(g_ipc_fds[f][w][0], SO_SNDBUF, sndbuf_size, true);
+      ipc_set_buf(g_ipc_fds[f][w][1], SO_RCVBUF, rcvbuf_size, true);
+      ipc_set_buf(g_ipc_fds[f][w][1], SO_SNDBUF, sndbuf_size, true);
     }
   }
 
@@ -7514,17 +7570,18 @@ STATIC_TEST void setup_ipc_tables(int num_workers) {
   fcntl(g_notify_ipc[1], F_SETFL,
         fcntl(g_notify_ipc[1], F_GETFL, 0) | O_NONBLOCK);
   int nbufsize = 1024 * 1024; // 1MB
-  ipc_set_buf(g_notify_ipc[0], SO_RCVBUF, nbufsize);
-  ipc_set_buf(g_notify_ipc[0], SO_SNDBUF, nbufsize);
-  ipc_set_buf(g_notify_ipc[1], SO_RCVBUF, nbufsize);
-  ipc_set_buf(g_notify_ipc[1], SO_SNDBUF, nbufsize);
+  ipc_set_buf(g_notify_ipc[0], SO_RCVBUF, nbufsize, false);
+  ipc_set_buf(g_notify_ipc[0], SO_SNDBUF, nbufsize, false);
+  ipc_set_buf(g_notify_ipc[1], SO_RCVBUF, nbufsize, false);
+  ipc_set_buf(g_notify_ipc[1], SO_SNDBUF, nbufsize, false);
   if (g_ipc_buf_short > 0)
-    syslog(LOG_WARNING, "[IPC] WARNING: %d socket buffer setting(s) between the routers and the workers did not get the size asked for (last: asked %d bytes, got %d%s%s). "
-                        "Queries and replies are dropped when a worker is busy (counted: karictl ipcstats).  Raise the sysctl kern.ipc.maxsockbuf (now %lld; it must be "
-                        "above the size asked for, which is udp-recvbuf-size / udp-sndbuf-size) and, for the default size the kernel falls back to, net.local.dgram.recvspace "
-                        "(now %lld) and net.local.dgram.maxdgram (now %lld)",
+    syslog(LOG_WARNING, "[IPC] WARNING: %d socket buffer setting(s) between the routers and the workers did not get the size asked for (last: asked %d, got %d%s%s; limited by "
+                        "kern.ipc.maxsockbuf=%lld; set it to %lu to get %d, or lower udp-recvbuf-size / udp-sndbuf-size).  A queue that is too small drops queries and replies when a "
+                        "worker is busy (counted: karictl ipcstats).  net.local.dgram.recvspace=%lld is what a socket keeps when the kernel could not enlarge it; "
+                        "net.local.dgram.maxdgram=%lld limits one message",
            g_ipc_buf_short, g_ipc_buf_asked, g_ipc_buf_got, g_ipc_buf_err ? ", setsockopt: " : "", g_ipc_buf_err ? strerror(g_ipc_buf_err) : "",
-           sysctl_num("kern.ipc.maxsockbuf"), sysctl_num("net.local.dgram.recvspace"), sysctl_num("net.local.dgram.maxdgram"));
+           sockbuf_maxsockbuf(), sockbuf_maxsockbuf_for((unsigned long)g_ipc_buf_asked), g_ipc_buf_asked,
+           sysctl_num("net.local.dgram.recvspace"), sysctl_num("net.local.dgram.maxdgram"));
   cap_rights_t n_rights_0, n_rights_1;
   cap_rights_init(&n_rights_0, CAP_RECV, CAP_EVENT);
   cap_rights_limit(g_notify_ipc[0], &n_rights_0);

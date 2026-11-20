@@ -10,7 +10,7 @@
 #   C  the Backend is stopped (SIGSTOP) while 2000 queries come, paced so that the router can read them all: the queues to the workers fill up
 #      and every query that did not fit is counted (router.worker.dropped_full > 0), none is lost without a count; the Backend goes on (SIGCONT)
 #      and the ones that were queued are answered
-#   D  an IPC / UDP buffer of 2 GiB that the kernel refuses: the server says so with the sysctl to raise ("[IPC] WARNING", kern.ipc.maxsockbuf)
+#   D  an IPC / UDP buffer above kern.ipc.maxsockbuf: the kernel refuses it, every buffer gets the most the kernel takes, the warning says "asked N, got M (limited by kern.ipc.maxsockbuf=X; set it to Y)"
 #
 # SKIP (exit 0, with the reason) without karidns, karictl, perl.  About 30 s.  See docs/karictl.md (ipcstats), docs/karidns.md (udp-recvbuf-size).
 # ==============================================================================
@@ -189,17 +189,36 @@ OUT=$(perl "$CLIENT" "$PORT" 500 100 1 10 16 0)
 stop_server
 
 # ---------------------------------------------------------------- D. the warning
-echo "== D. a buffer that the kernel refuses: the warning says which sysctl to raise"
+echo "== D. a buffer above kern.ipc.maxsockbuf (the stock 2 MB and the 4M default): the kernel refuses it, the sockets get the most it takes, and the warning says what to set"
 MAXB=$(sysctl -n kern.ipc.maxsockbuf 2>/dev/null || echo 0)
-if [ "$MAXB" -gt 0 ] && [ "$MAXB" -lt 2147483647 ] 2>/dev/null; then
-    write_conf 2147483647
+if [ "$MAXB" -gt 65536 ] && [ "$MAXB" -lt 1073741824 ] 2>/dev/null; then
+    ASK=$((MAXB * 2))                                   # (a stock host: 4 MB against 2 MB, the default size of the server)
+    LIMIT=$((MAXB * 2048 / 2304))                       # what the kernel takes: kern.ipc.maxsockbuf * MCLBYTES / (MSIZE + MCLBYTES)
+    NEED=$(((ASK * 2304 + 2047) / 2048))                # the kern.ipc.maxsockbuf that gives ASK
+    write_conf "$ASK"
     start_server
     kari_wait_log "$LOG" '\[IPC\] WARNING' 15 && ok "the server logs \"[IPC] WARNING\"" || bad "no [IPC] WARNING line in the log" "$(head -12 "$LOG")"
-    grep '\[IPC\] WARNING' "$LOG" | grep -q 'kern.ipc.maxsockbuf' && grep '\[IPC\] WARNING' "$LOG" | grep -q 'net.local.dgram.recvspace' && ok "it names kern.ipc.maxsockbuf and net.local.dgram.recvspace" || bad "the warning does not name the sysctls" "$(grep '\[IPC\]' "$LOG" | head -3)"
-    grep -q 'kern.ipc.maxsockbuf' "$LOG" && grep -q 'SO_RCVBUF' "$LOG" && ok "the UDP socket buffer warning names kern.ipc.maxsockbuf too" || bad "no UDP socket buffer warning with the sysctl" "$(grep -i 'network' "$LOG" | head -3)"
+    W=$(grep '\[IPC\] WARNING' "$LOG" | head -1)
+    case "$W" in
+    *"asked $ASK, got "*"limited by kern.ipc.maxsockbuf=$MAXB; set it to $NEED to get $ASK"*) ok "the warning says: asked $ASK, got M (limited by kern.ipc.maxsockbuf=$MAXB; set it to $NEED to get $ASK)" ;;
+    *) bad "the warning does not say asked / got / the sysctl and the value to set" "$W" ;;
+    esac
+    gotv() { ctl ipcstats 2>/dev/null | sed -n "s/^ipcbuf\.$1=//p" | head -1; }
+    i=0; while [ $i -lt 150 ] && [ "$(gotv udp.rcv.got)" -le 0 ] 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
+    QR=$(gotv queue.rcv.got); QS=$(gotv queue.snd.got); UR=$(gotv udp.rcv.got); US=$(gotv udp.snd.got)
+    echo "  sizes in force: queues rcv $QR snd $QS, UDP sockets rcv $UR snd $US (asked $ASK, the kernel takes $LIMIT)"
+    [ "$(gotv queue.rcv.asked)" = "$ASK" ] && [ "$(gotv udp.snd.asked)" = "$ASK" ] && ok "karictl ipcstats shows what was asked for ($ASK)" || bad "ipcbuf asked lines" "$(ctl ipcstats | grep ipcbuf)"
+    allok=1
+    for v in "$QR" "$QS" "$UR" "$US"; do
+        [ "${v:-0}" -le "$LIMIT" ] 2>/dev/null && [ "${v:-0}" -ge $((LIMIT / 2)) ] 2>/dev/null || allok=0
+    done
+    [ "$allok" = 1 ] && ok "every buffer got the most the kernel takes (between $((LIMIT / 2)) and $LIMIT), not the small default" || bad "a buffer is not near the limit $LIMIT" "$(ctl ipcstats | grep ipcbuf)"
+    grep -q "\[Network\] WARNING: UDP SO_RCVBUF: asked $ASK, got .*kern.ipc.maxsockbuf=$MAXB; set it to $NEED" "$LOG" && ok "the UDP socket warning has the same words" || bad "no UDP socket warning with the sysctl and the value to set" "$(grep -i 'network' "$LOG" | head -3)"
+    OUT=$(perl "$CLIENT" "$PORT" 2000 100 1 10 16 0)
+    [ "$(kv "$OUT" unanswered)" = 0 ] && ok "the server with the clamped buffers answers 2000 queries" || bad "clamped buffers: $OUT"
     stop_server
 else
-    echo "  (kern.ipc.maxsockbuf is $MAXB: a request of 2 GiB would not be refused here; part D skipped)"
+    echo "  (kern.ipc.maxsockbuf is $MAXB: part D skipped)"
 fi
 
 echo

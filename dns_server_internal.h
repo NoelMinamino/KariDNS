@@ -1917,6 +1917,7 @@ typedef struct {
 void ipcd_add(ipcd_t c, uint64_t n);
 uint64_t ipcd_total(ipcd_t c);
 size_t ipcd_format(char *buf, size_t cap);
+enum { SOCKBUF_IPC = 0, SOCKBUF_UDP = 1 };   /* sockbuf_note(): the queues between the routers and the workers, the UDP sockets of the routers */
 
 #ifdef KARIDNS_UNIT_TEST
 extern const char *g_config_path;
@@ -1968,6 +1969,11 @@ int ipc_send_spill(int (*fds)[2], int nw, int *rr, struct mmsghdr *msgs, int n);
 void ipc_reply_failed(int err);
 void ipcd_set_self(int slot);
 void ipcd_init(void);
+unsigned long sockbuf_limit_for(unsigned long maxsockbuf);
+unsigned long sockbuf_maxsockbuf_for(unsigned long size);
+long long sockbuf_maxsockbuf(void);
+int sockbuf_set(int fd, int opt, int want, int *err);
+void sockbuf_note(int kind, int dir, int asked, int got);
 void run_frontend_router(pid_t backend_pid, int router_id);
 void *worker_thread_func(void *arg);
 #endif

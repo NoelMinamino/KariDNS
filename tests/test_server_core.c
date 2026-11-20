@@ -2628,6 +2628,49 @@ static void *ipcd_hammer(void *arg) {
     return NULL;
 }
 
+// the size of a socket buffer: a request above what the kernel takes (kern.ipc.maxsockbuf) gets the most it takes, not the small default
+static void test_sockbuf_set(void) {
+    printf("[TEST] Server Core: sockbuf_set asks for the most the kernel takes...\n");
+    // the kernel's limit, sb_max_adj = maxsockbuf * MCLBYTES / (MSIZE + MCLBYTES) (2048 / 2304 here), and its inverse
+    assert(sockbuf_limit_for(0) == 0);
+    assert(sockbuf_limit_for(2304) == 2048);
+    assert(sockbuf_limit_for(2097152) == 1864135);                   // the stock 2 MB
+    assert(sockbuf_maxsockbuf_for(2048) == 2304);
+    assert(sockbuf_maxsockbuf_for(4194304) == 4718592);              // what the 4 MB default needs
+    for (unsigned long n = 1; n < 20000000UL; n = n * 3 + 7) assert(sockbuf_limit_for(sockbuf_maxsockbuf_for(n)) >= n);
+
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    assert(s >= 0);
+    int err = 0;
+    // a request that fits is taken as asked
+    assert(sockbuf_set(s, SO_RCVBUF, 65536, &err) == 65536 && err == 0);
+    // a request far above any maxsockbuf: refused, and the socket gets the most the kernel takes (not the 64 KiB it had)
+    int got = sockbuf_set(s, SO_RCVBUF, 1 << 30, &err);
+    const long long mx = sockbuf_maxsockbuf();
+    assert(err == ENOBUFS || err == EINVAL);
+    assert(got > 65536);
+    if (mx > 0) assert((unsigned long)got <= sockbuf_limit_for((unsigned long)mx) && (unsigned long)got * 2 > sockbuf_limit_for((unsigned long)mx));
+    // the same for the send buffer; asking again changes nothing
+    got = sockbuf_set(s, SO_SNDBUF, 1 << 30, &err);
+    assert(got > 65536);
+    assert(sockbuf_set(s, SO_SNDBUF, 1 << 30, &err) == got);
+    // a descriptor that is not a socket: nothing is read, nothing is set, the errno is the request's
+    assert(sockbuf_set(-1, SO_RCVBUF, 65536, &err) == 0 && err == EBADF);
+    close(s);
+
+    // the sizes in force: the largest request and the smallest size, per kind and direction; ipcd_format() prints them
+    sockbuf_note(SOCKBUF_IPC, 0, 2000000000, 1800000);
+    sockbuf_note(SOCKBUF_IPC, 0, 3000000, 5);
+    sockbuf_note(SOCKBUF_IPC, 0, 2000000000, 1800000);
+    sockbuf_note(SOCKBUF_UDP, 1, 2000000000, 7);          // (larger and smaller than anything an earlier test noted)
+    char buf[2048];
+    size_t len = ipcd_format(buf, sizeof(buf));
+    assert(len > 0 && len < sizeof(buf));
+    assert(strstr(buf, "ipcbuf.queue.rcv.asked=2000000000\n") != NULL && strstr(buf, "ipcbuf.queue.rcv.got=5\n") != NULL);
+    assert(strstr(buf, "ipcbuf.udp.snd.asked=2000000000\n") != NULL && strstr(buf, "ipcbuf.udp.snd.got=7\n") != NULL);
+    printf("  -> sockbuf_set passed.\n");
+}
+
 // the counters: a slot per process in a shared mapping, the sums, and the text of `karictl ipcstats`
 static void test_ipcd_counters(void) {
     printf("[TEST] Server Core: the shared IPC drop counters add up across processes...\n");
@@ -8343,6 +8386,7 @@ int main(void) {
     test_open_router_udp_sockets_and_buffers();
     test_sendmmsg_skip_failed();
     test_ipc_send_spill();
+    test_sockbuf_set();
     test_ipcd_counters();
     test_tcp_listen_and_zone_socket_opts();
     test_async_io_pool_and_tasks();

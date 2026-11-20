@@ -351,21 +351,24 @@ default and a non-zero value is held to at least 4096 (as BIND does for
 \fB4G\fR) is a configuration error with the file and line. The same size is
 asked for the queues between the Frontend routers and the Backend workers (one
 \fBAF_UNIX\fR datagram socket pair for each router and worker; 0.7). \fBThe
-kernel caps it, and a request above the cap is refused, not clipped\fR: the
-socket keeps the small default size (\fBnet.local.dgram.recvspace\fR, 16 KiB on
-FreeBSD 15; \fBnet.inet.udp.recvspace\fR for a UDP socket) and a full queue
-loses queries and replies. The cap is \fBkern.ipc.maxsockbuf\fR (2 MiB by
-default: the default \fB4M\fR is above it; a request must be below about 8/9 of
-it), so raise the sysctl (\fBsysctl kern.ipc.maxsockbuf=8388608\fR, and
-\fB/etc/sysctl.conf\fR) or write a smaller size. \fBnet.local.dgram.recvspace\fR
-is the size a queue has when the request is refused, and
-\fBnet.local.dgram.maxdgram\fR limits one message (a reply is refused with
-\fBEMSGSIZE\fR above it). When a buffer did not get the size asked for the
-server logs a \fBWARNING\fR at start-up (\fB[IPC] WARNING: ... socket buffer
-setting(s) ... did not get the size asked for\fR, and \fB[Network] UDP SO_RCVBUF
-truncated by OS\fR / \fBfailed to set SO_RCVBUF\fR) with the values of the
-sysctls. What is dropped between the routers and the workers is counted:
-\fBkarictl ipcstats\fR (\fBkarictl(8)\fR).
+kernel refuses a request above its limit instead of clipping it\fR: the limit is
+\fBkern.ipc.maxsockbuf * MCLBYTES / (MSIZE + MCLBYTES)\fR, about 8/9 of
+\fBkern.ipc.maxsockbuf\fR, which is 2 MiB on a stock FreeBSD, so the \fB4M\fR
+default is refused there. Since 0.7 the server then asks for the most the kernel
+takes (about 1.8 MB on a stock system; the socket never gets less than it had)
+and logs a \fBWARNING\fR at start-up: \fB[IPC] WARNING: ... asked N, got M
+(limited by kern.ipc.maxsockbuf=X; set it to Y to get N, or lower
+udp\-recvbuf\-size / udp\-sndbuf\-size)\fR and, for each UDP socket,
+\fB[Network] WARNING: UDP SO_RCVBUF: asked N, got M (limited by
+kern.ipc.maxsockbuf=X; set it to Y to get N ...)\fR. To get the full size set
+the sysctl to Y (\fBsysctl kern.ipc.maxsockbuf=8388608\fR, and in
+\fB/etc/sysctl.conf\fR) or write a size that fits. Before 0.7 the refused
+request left the sockets at the small kernel default
+(\fBnet.local.dgram.recvspace\fR, 16 KiB on FreeBSD 15), which loses
+queries. \fBnet.local.dgram.maxdgram\fR limits one message (a reply above it is
+refused with \fBEMSGSIZE\fR). The sizes in force are in \fBkarictl ipcstats\fR
+(\fBipcbuf.*\fR). What is dropped between the routers and the workers is
+counted: \fBkarictl ipcstats\fR (\fBkarictl(8)\fR).
 .TP 8
 \fBudp\-sndbuf\-size <size>;\fR
 \fIDefault:\fR \fB4M\fR
