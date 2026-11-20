@@ -311,7 +311,7 @@ kari_wait_log "$W/s.log" "no room for the copy of secondary zone" 5 || fail "8: 
 stop_secondary
 stop_primary
 start_secondary
-[ "$(serial_of sec.test)" = 2 ] || fail "8: after the put without room the restart does not serve the previous copy (serial $(serial_of sec.test))"
+[ "$(serial_of sec.test)" = 2 ] || { ctl store -k | grep "^xfr\." | tr "\n" " "; echo; grep -v "^\s*$" "$W/s.log" | tail -25; fail "8: after the put without room the restart does not serve the previous copy (serial $(serial_of sec.test))"; }
 pass "8: a put without room keeps the previous copy; the restart serves it"
 stop_secondary
 # 9: killed between the install of serial 3 and its put
@@ -538,7 +538,7 @@ catalog 3 u2new "coo.u1.zones IN PTR cat2.test."
 start_primary
 start_secondary
 wait_serial cat.test 3 15 || fail "12: catalog serial 3"
-wait_xfr_ge xfr.restore_identity 1 15 || fail "12: the member with a new unique-id kept the old copy"
+wait_xfr_ge xfr.restore_identity 1 15 || { ctl store -k | grep "^xfr\." | tr "\n" " "; echo; grep -v "^\s*$" "$W/s.log" | tail -25; fail "12: the member with a new unique-id kept the old copy"; }
 wait_serial m2.test 1 15 || fail "12: the reset member did not transfer"
 pass "12: a unique-id change while stopped resets that member (its old copy is deleted)"
 stop_secondary
