@@ -906,6 +906,16 @@ that failed in the background too; it is tried again)
 of the server makes such a name; a recovery would take one for a page of the
 long names that did not reach the disk). Should stay 0
 .TP 8
+\fBstore.reserve.zones\fR, \fB.nx_bytes\fR, \fB.zones_used\fR, \fB.nx_used\fR, \fB.refused\fR
+0.7: the address space the tables of the store are reserved for until the next
+start (\fBstore\-max\-zones\fR, or the RAM; see "Address space of the tables"
+under the zone store in karidns.md): the zones \fBzt\fR and \fBzc\fR have room
+for and the bytes of \fBnx\fR, what is used of them (the highest zone id, the
+bytes of long names), and the writes refused because a table was full (the zone
+is served from the database; an ERROR names
+\fBstore\-max\-zones\fR). \fB.refused\fR should stay 0; a WARNING says when a
+table is over 80 %
+.TP 8
 \fBstore.journal.commit_switches\fR
 0.7: commits that switched the journal to the next file (made ahead): the
 records of a commit are synced in their file while the writers append to the

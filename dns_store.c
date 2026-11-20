@@ -641,6 +641,10 @@ struct store {
   _Atomic uint64_t n_puts, n_replaces, n_deletes, n_growths, n_checkpoints, n_commits, n_write_errors;
   _Atomic uint64_t n_group_records, n_group_entries;      /* 0.7 M2: journal records of a group commit (store_set_known_n()) and the entries they carried */
   _Atomic uint64_t n_names_refused;                       /* 0.7: writer calls refused for a zero byte in the name (check_name_args()) */
+  _Atomic uint64_t n_resv_refused;                        /* 0.7: writes refused because zt / zc or nx reached its reserved address space (reserve_hit()) */
+  uint64_t last_resv_ms, last_resv_warn_ms;               /* (the log lines of the two, under the writer mutex) */
+  uint32_t resv_zones;                                    /* the zones the address space of zt and zc was reserved for at the open */
+  bool resv_from_opt;                                     /* ... and whether `store-max-zones` (max_zones) said so, or the RAM */
   _Atomic uint32_t state;
   store_recovery_t rec;
 
@@ -1453,6 +1457,18 @@ static void mtab_note_extended(mtab_t *t, uint64_t to) {
 static bool st_no_fallocate(int r) { return r == EINVAL || r == EOPNOTSUPP || r == ENODEV; }
 static void fs_probe(store_t *s);
 static void space_used(store_t *s, uint64_t n);
+static bool rl_ok(uint64_t *last, uint64_t every_ms);
+/* A table is as large as the address space reserved for it at the open (mtab_open(): the mapping is never moved, readers hold its base).  A write that needs more is refused with -ENOMEM
+ * (not -EFBIG / -ENOSPC: it is no disk-full state, nothing is made KNOWN and the cleaner does not run); the zone stays where it is (the database, or the secondary's refresh) and the next
+ * start reserves twice what the files hold (open_tables()), or what `store-max-zones` says. */
+static int reserve_hit(store_t *s, const mtab_t *t, uint64_t need) {
+  atomic_fetch_add_explicit(&s->n_resv_refused, 1, memory_order_relaxed);
+  if (rl_ok(&s->last_resv_ms, 60000))
+    st_log(s, 3, "store: the %s is full: it needs %" PRIu64 " bytes and %" PRIu64 " are reserved (room for %u zones, %s); zones that need more are not stored and are served from the database; "
+                 "raise `store-max-zones` in the database block and restart (the next start reserves at least twice what the files hold)",
+           t == &s->nx ? "table of long names" : "table of zones", need, (uint64_t)t->reserve, (unsigned)s->resv_zones, s->resv_from_opt ? "set by store-max-zones" : "derived from the RAM");
+  return -ENOMEM;
+}
 /* grow the data area to at least `need` bytes (never shrinks); the address of existing data does not change.  The new pages are anonymous memory, and no operation on the file is made
  * here (inside the writer mutex): UFS's posix_fallocate() syncs the file's vnode and waits for the lock that a checkpoint's fsync() of the table holds (holds of seconds).  The
  * room is checked against the free space (fs_probe(): a full disk is -ENOSPC now, not a checkpoint that cannot write); the flusher allocates the blocks ahead
@@ -1460,7 +1476,7 @@ static void space_used(store_t *s, uint64_t n);
 static int mtab_grow(store_t *s, mtab_t *t, uint64_t need) {
   uint64_t cur = atomic_load_explicit(&t->mapped, memory_order_relaxed);
   if (need <= cur) return 0;
-  if (need > t->reserve) return -EFBIG;
+  if (need > t->reserve) return reserve_hit(s, t, need);
   const uint64_t want = mtab_want(s, t, cur, need), ext = atomic_load_explicit(&t->extended, memory_order_acquire);
   if (ext < want) {                                   /* (the blocks are the flusher's and the checkpoint's to allocate: here only the room is checked; the reserve of the cleaner may be used, as an allocation could) */
     const uint64_t n = want - (ext > cur ? ext : cur);
@@ -4635,7 +4651,6 @@ static int put_locked(store_t *s, uint16_t view, const char *name, size_t nlen, 
     memcpy(nt.name, fn, nlen);
   } else {
     uint64_t off = jb_vget(s, j, V_NX_USED);
-    if (off + nlen > s->nx.reserve) return -EFBIG;
     if ((r = ensure_nx_cap(s, off + nlen)) < 0) return r;
     uint8_t *p = jb_op(j, OP_NX, 16 + nlen);
     if (!p) return -ENOMEM;
@@ -5734,6 +5749,9 @@ static void space_checkpoint(store_t *s) {
       break;
     }
   }
+  if ((VG(s, V_HWM) > s->zt.reserve / ST_REC / 5 * 4 || VG(s, V_NX_USED) > s->nx.reserve / 5 * 4) && rl_ok(&s->last_resv_warn_ms, 600000))
+    st_log(s, 4, "store: the tables are over 80 %% of the address space reserved for them: %" PRIu64 " of %" PRIu64 " zones, %" PRIu64 " of %" PRIu64 " bytes of long names; at the limit new zones are not "
+                 "stored (served from the database): raise `store-max-zones` in the database block and restart", (uint64_t)VG(s, V_HWM), (uint64_t)(s->zt.reserve / ST_REC), (uint64_t)VG(s, V_NX_USED), (uint64_t)s->nx.reserve);
   const int64_t avail = atomic_load_explicit(&s->avail_est, memory_order_relaxed);
   /* A first fill is not a growth to extrapolate: the store grows as fast as the database delivers (96 GB an hour at 54 GB free, then it stops: the zones are all there).  While zones are
    * known without an image the size to come is known: the zones still to be stored at the size of those stored so far, and the warning is about that (and the hour figure is not made). */
@@ -6753,6 +6771,11 @@ void store_stats(const store_t *s, store_stats_t *o) {
   o->bulk_end_pending = atomic_load_explicit(&s->bulk_end_pending, memory_order_relaxed) ? 1 : 0;
   o->bulk_cut = atomic_load_explicit(&s->bulk_cut, memory_order_relaxed) ? 1 : 0;
   o->names_refused = atomic_load_explicit(&s->n_names_refused, memory_order_relaxed);
+  o->reserve_zones = s->zt.reserve / ST_REC;
+  o->reserve_nx_bytes = s->nx.reserve;
+  o->reserve_zones_used = VG(s, V_HWM);
+  o->reserve_nx_used = VG(s, V_NX_USED);
+  o->reserve_refused = atomic_load_explicit(&s->n_resv_refused, memory_order_relaxed);
   o->flusher = s->fl_on;
   o->checkpoint_max_us = atomic_load_explicit(&s->ckpt_max_us, memory_order_relaxed);
   o->checkpoints_cancelled = atomic_load_explicit(&s->n_ckpt_cancel, memory_order_relaxed);
@@ -7224,6 +7247,44 @@ static void files_close(store_t *s) {
   if (s->jnext_fd >= 0) { close(s->jnext_fd); s->jnext_fd = -1; }
 }
 
+/* The zones the address space of zt and zc is reserved for (a table never moves, so it is the most the tables can hold until the next start).  `opt` (store-max-zones) when set; else the RAM
+ * decides, 256 bytes of it for a zone (a zone of a small server takes about that much in zt, zc, the index and the name; the tables are the part that is mapped, the rest of the memory is
+ * the zones themselves): physmem / 256 rounded up to a power of two, at least 1M zones and at most 2^25 (the largest the reservation was before: 4 GiB of address space for zt and zc).
+ * A host whose RAM is not known (physmem 0) keeps the old 2^25. */
+uint32_t store_reserve_zones(uint64_t physmem, uint32_t opt) {
+  if (opt) return opt;
+  if (physmem == 0) return 1u << 25;
+  const uint64_t z = physmem / 256;
+  uint32_t r = 1u << 20;
+  while (r < z && r < (1u << 25)) r <<= 1;
+  return r;
+}
+static uint64_t st_physmem(void) {
+#if defined(__FreeBSD__)
+  unsigned long pm = 0;
+  size_t l = sizeof(pm);
+  if (sysctlbyname("hw.physmem", &pm, &l, NULL, 0) == 0 && l == sizeof(pm)) return pm;
+#endif
+  return 0;
+}
+/* Open (or create) zt, zc and nx with the address space they may grow to: zones x 64 bytes for zt and zc each, zones x 32 bytes for nx (the long names; `nx_max` of the options says another
+ * size), and at least twice what the files hold now plus a growth step (a store that grew to its reservation opens with room again; a file is never larger than its table plus the growth step). */
+static int open_tables(store_t *s, uint64_t zt_cap, uint64_t nx_cap, bool create) {
+  const uint64_t pm = s->o.physmem ? s->o.physmem : st_physmem();
+  const uint32_t zones = store_reserve_zones(pm, s->o.max_zones);
+  s->resv_zones = zones;
+  s->resv_from_opt = s->o.max_zones != 0;
+  uint64_t zres = (uint64_t)zones * ST_REC, nres = s->o.nx_max ? s->o.nx_max : (uint64_t)zones * 32;
+  if (zt_cap && zt_cap * 2 * ST_REC + ST_CHUNK > zres) zres = zt_cap * 2 * ST_REC + ST_CHUNK;
+  if (nx_cap && nx_cap * 2 + ST_CHUNK > nres) nres = nx_cap * 2 + ST_CHUNK;
+  int r = mtab_open(s, &s->zt, "zt.1", FK_ZT, 64, (size_t)zres, create);
+  if (r == 0) r = mtab_open(s, &s->zc, "zc.1", FK_ZC, 64, (size_t)zres, create);
+  if (r == 0) r = mtab_open(s, &s->nx, "nx.1", FK_NX, 1, (size_t)nres, create);
+  if (r == 0) st_log(s, 6, "store: address space reserved for the tables: %u zones (%s), %" PRIu64 " bytes for zt and zc each, %" PRIu64 " for nx", zones,
+                     s->resv_from_opt ? "store-max-zones" : "from the RAM", zres, nres);
+  return r;
+}
+
 /* Adopt the state of superblock copy b: open and check the table files.  On failure the files are closed again. */
 /* a failure that says nothing about the files: the open fails with it and nothing is moved aside (only -EBADMSG, damage or another format, is) */
 static bool st_resource_err(int r) { return r == -ENOMEM || r == -EAGAIN || r == -EMFILE || r == -ENFILE || r == -ENOBUFS; }
@@ -7232,13 +7293,7 @@ static int adopt_sb(store_t *s, const sb_t *b) {
   s->hk0 = b->f.hk0;
   s->hk1 = b->f.hk1;
   s->seg_size = b->f.seg_size;
-  size_t zres = (size_t)(s->o.max_zones ? s->o.max_zones : (1u << 25)) * ST_REC;
-  if (b->f.zt_cap * ST_REC > zres) zres = (size_t)(b->f.zt_cap * 2 * ST_REC);
-  size_t nres = s->o.nx_max ? (size_t)s->o.nx_max : (size_t)1 << 30;
-  if (b->f.nx_cap > nres) nres = (size_t)b->f.nx_cap * 2;
-  int r = mtab_open(s, &s->zt, "zt.1", FK_ZT, 64, zres, false);
-  if (r == 0) r = mtab_open(s, &s->zc, "zc.1", FK_ZC, 64, zres, false);
-  if (r == 0) r = mtab_open(s, &s->nx, "nx.1", FK_NX, 1, nres, false);
+  int r = open_tables(s, b->f.zt_cap, b->f.nx_cap, false);
   if (r < 0) goto fail;
   if (atomic_load(&s->zt.mapped) < b->f.zt_cap * ST_REC || atomic_load(&s->zc.mapped) < b->f.zt_cap * ST_REC ||
       atomic_load(&s->nx.mapped) < b->f.nx_cap || b->f.v[V_HWM] > b->f.zt_cap || b->f.v[V_NX_USED] > b->f.nx_cap) { r = -EBADMSG; goto fail; }
@@ -7371,11 +7426,7 @@ static int create_store(store_t *s) {
   if (s->o.hash_seed[0] || s->o.hash_seed[1]) { s->hk0 = s->o.hash_seed[0]; s->hk1 = s->o.hash_seed[1]; }
   else st_random(&s->hk0, 16);
   s->seg_size = s->seg_size ? s->seg_size : (256ull << 20);
-  size_t zres = (size_t)(s->o.max_zones ? s->o.max_zones : (1u << 25)) * ST_REC;
-  size_t nres = s->o.nx_max ? (size_t)s->o.nx_max : (size_t)1 << 30;
-  int r = mtab_open(s, &s->zt, "zt.1", FK_ZT, 64, zres, true);
-  if (r == 0) r = mtab_open(s, &s->zc, "zc.1", FK_ZC, 64, zres, true);
-  if (r == 0) r = mtab_open(s, &s->nx, "nx.1", FK_NX, 1, nres, true);
+  int r = open_tables(s, 0, 0, true);
   uint64_t zones = s->o.expected_zones;
   if (r == 0) r = ensure_zt_cap(s, zones + 1);
   if (r == 0) r = ensure_nx_cap(s, 1);

@@ -1,4 +1,4 @@
-.TH KARIDNS.CONF 5 "2026-11-19" "KariDNS" "KariDNS Manual"
+.TH KARIDNS.CONF 5 "2026-11-20" "KariDNS" "KariDNS Manual"
 .\" Generated from docs/karidns.md by man/md2man.pl (make man): edit the Markdown manual, not this page.
 .SH NAME
 karidns.conf \- the configuration file of karidns(8)
@@ -3805,6 +3805,17 @@ begun. The cleaner removes whole segments, so a smaller size gives it finer
 steps (and more files). It is fixed when the store is made: a store that exists
 keeps its own size.
 .TP 8
+\fBstore\-max\-zones <n>;\fR
+\fIDefault:\fR by the RAM (\fB1M\fR..\fB32M\fR zones, see "Address space of the
+tables" below; \fB1024\fR..\fB2147483648\fR)
+.br
+\fIDescription:\fR 0.7, restart-only: the number of zones the tables of the
+store reserve address space for, which is the most zones the store can hold
+until the next start. Leave it out on a small server (the RAM decides). Raise it
+for a very large install, e.g. \fBstore\-max\-zones 100000000;\fR for 100
+million zones on a 16 GB host. Not a limit of the files: a start reserves at
+least twice what the files hold already.
+.TP 8
 \fBstore\-scrub\-interval <seconds>;\fR \fBstore\-scrub\-interval off;\fR
 \fIDefault:\fR \fB604800\fR (a week; \fB60\fR..\fB31536000\fR)
 .br
@@ -5090,53 +5101,79 @@ opened by the process that starts the server (as root), checked (owner, mode,
 locked), handed to the user the server runs as and inherited by the Backend,
 which limits the rights of the descriptor (look up, create, read, write, mmap,
 fsync, truncate, stat, unlink) and opens the files beneath it, also in the
-sandbox. The loader and the routers never get it. \fBCleaning (0.7).\fR Zone
-images are appended to the segment files \fBseg.N\fR (256 MiB each,
-\fBstore\-segment\-size\fR): a zone that is replaced or deleted leaves its old
-image dead in its segment, so a store whose zones change often would only
-grow. The \fBcleaner\fR, a thread of the store, takes the segment that is the
-most dead, as long as at least half of it is dead (and at least a quarter of a
-segment or 1 MiB of it), copies the live records unchanged to the open segment
-and removes the file. It works at 16 MiB a second at the most and takes the
-writer's lock for at most 256 records at a time, so writes go on. Since 0.7 the
-cleaner of the background leaves a segment alone while it is still dying (its
-dead bytes grew within the last second: a pass of the loader rewrites zone after
-zone, and the rest of the segment is most likely replaced within seconds, so
-copying it would be work thrown away), unless three quarters of it are dead, the
-disk is getting full or the cleaner was asked for (\fBkarictl store
-compact\fR). Each move is one record of the journal: after \fBkill \-9\fR or a
-power loss a zone's image is at its old place or its new one, never in none and
-never half; the bytes are checked (their checksum) before they are copied, and
-an image that fails it is not carried on: its zone becomes known without an
-image and is read from the database again. A segment file is removed only when
-(a) a checkpoint that follows the last move is on disk, (b) every reader that
-could still look at the old place has left, and (c) no attached zone holds an
-image from it. In \fBmap\fR mode an attached zone's image is a pointer into the
-mapped segment, so a segment that such an image points into is not cleaned, and
-one that was emptied meanwhile stays until the zone is taken out of memory or
-replaced (\fBkarictl store\fR: \fBstore.segments.pinned\fR); a zone that is hot
-and never changes can hold one segment for a long time, and the cost is that
-segment's dead space. \fBcopy\fR mode (the default on ZFS) has no pointers into
-segments: nothing waits for it. The number of a removed segment is used
-again. The same pass gives back the space of deleted zones' long names (those of
-more than 34 octets are kept in \fBnx.1\fR) when more than half of that file and
-at least 4 MiB is dead: it moves the names that are in use down, under the
-writer's lock, which takes a second at a million such names and happens
-rarely. \fBkarictl store compact\fR runs the cleaner without its rate limit
-until no segment is dead enough, \fBkarictl store\fR shows it
-(\fBstore.compact.*\fR, \fBstore.segments.dead_pct\fR). \fBDisk space.\fR The
-free space of the file system is read at every checkpoint, after each megabyte
-that is written and about once a second while images are written (\fBfstatfs\fR;
-on ZFS the quota counts). Half a segment of it (256 KiB to 128 MiB) is kept for
-the cleaner, which needs room to copy before it can free a segment: a new image
-is refused below that. A refused write, or one that fails (\fBENOSPC\fR,
-\fBEDQUOT\fR, \fBEFBIG\fR), runs the cleaner at once and tries again. If that
-does not make room, the store is \fBdegraded\fR: a zone that is new or changed
-gets its record (name, serial, version stamp, digest) \fBwithout an image\fR,
-like a zone the loader has not sent yet, and its old image is released. The
-server serves such a zone from memory as long as it is there; after it was taken
-out of memory (\fBmemory\-limit\fR) or after a restart the first query reads it
-from the database as for any zone without an image (the cost of a fetch, under
+sandbox. The loader and the routers never get it. \fBAddress space of the tables
+(0.7).\fR The tables of the store (\fBzt\fR and \fBzc\fR, 64 bytes a zone each,
+and \fBnx\fR, the long names) are mapped files that are never moved while the
+server runs, so the server reserves their address space (\fBPROT_NONE\fR, no
+memory and no swap is charged) when the store is opened. The Backend's virtual
+size (\fBVSZ\fR, \fBulimit \-v\fR) includes it: it is sized from the RAM, so
+that a small server does not show gigabytes. The rule: zones = \fBhw.physmem\fR
+/ 256 bytes, rounded up to a power of two, at least 1,048,576 and at most
+33,554,432 (2^25); \fBzt\fR and \fBzc\fR reserve 64 bytes a zone each and
+\fBnx\fR 32 bytes a zone. A server with 512 MB reserves 2M zones (256 MB for
+\fBzt\fR and \fBzc\fR, 64 MB for \fBnx\fR), one with 16 GB or more 32M (4 GiB
+and 1 GiB), the size before 0.7. \fBstore\-max\-zones\fR sets the number of
+zones itself. At every start the reservation is raised to at least twice what
+the files hold, so a store that has outgrown its reservation opens with room,
+whatever the option or the RAM say. The start logs it (\fBstore: address space
+reserved for the tables: ...\fR), and \fBkarictl store\fR shows
+\fBstore.reserve.*\fR. \fBAt the limit\fR (a table that is full: new zones, or
+new zones with names of more than 34 octets) the write is refused, with no harm
+to the zones that are in: the zone is served from the database as it is when the
+store cannot take it (a secondary's copy is not stored and is made again by the
+next refresh), an ERROR line names \fBstore\-max\-zones\fR (once a minute),
+\fBstore.reserve.refused\fR counts the refusals, and a WARNING says so at 80 %
+(at a checkpoint, once in ten minutes). Raise \fBstore\-max\-zones\fR and
+restart. The journal ring (64 MiB) and a segment (\fBstore\-segment\-size\fR)
+are reserved at their size too, not scaled with the RAM.
+.PP
+\fBCleaning (0.7).\fR Zone images are appended to the segment files \fBseg.N\fR
+(256 MiB each, \fBstore\-segment\-size\fR): a zone that is replaced or deleted
+leaves its old image dead in its segment, so a store whose zones change often
+would only grow. The \fBcleaner\fR, a thread of the store, takes the segment
+that is the most dead, as long as at least half of it is dead (and at least a
+quarter of a segment or 1 MiB of it), copies the live records unchanged to the
+open segment and removes the file. It works at 16 MiB a second at the most and
+takes the writer's lock for at most 256 records at a time, so writes go
+on. Since 0.7 the cleaner of the background leaves a segment alone while it is
+still dying (its dead bytes grew within the last second: a pass of the loader
+rewrites zone after zone, and the rest of the segment is most likely replaced
+within seconds, so copying it would be work thrown away), unless three quarters
+of it are dead, the disk is getting full or the cleaner was asked for
+(\fBkarictl store compact\fR). Each move is one record of the journal: after
+\fBkill \-9\fR or a power loss a zone's image is at its old place or its new
+one, never in none and never half; the bytes are checked (their checksum) before
+they are copied, and an image that fails it is not carried on: its zone becomes
+known without an image and is read from the database again. A segment file is
+removed only when (a) a checkpoint that follows the last move is on disk, (b)
+every reader that could still look at the old place has left, and (c) no
+attached zone holds an image from it. In \fBmap\fR mode an attached zone's image
+is a pointer into the mapped segment, so a segment that such an image points
+into is not cleaned, and one that was emptied meanwhile stays until the zone is
+taken out of memory or replaced (\fBkarictl store\fR:
+\fBstore.segments.pinned\fR); a zone that is hot and never changes can hold one
+segment for a long time, and the cost is that segment's dead space. \fBcopy\fR
+mode (the default on ZFS) has no pointers into segments: nothing waits for
+it. The number of a removed segment is used again. The same pass gives back the
+space of deleted zones' long names (those of more than 34 octets are kept in
+\fBnx.1\fR) when more than half of that file and at least 4 MiB is dead: it
+moves the names that are in use down, under the writer's lock, which takes a
+second at a million such names and happens rarely. \fBkarictl store compact\fR
+runs the cleaner without its rate limit until no segment is dead enough,
+\fBkarictl store\fR shows it (\fBstore.compact.*\fR,
+\fBstore.segments.dead_pct\fR). \fBDisk space.\fR The free space of the file
+system is read at every checkpoint, after each megabyte that is written and
+about once a second while images are written (\fBfstatfs\fR; on ZFS the quota
+counts). Half a segment of it (256 KiB to 128 MiB) is kept for the cleaner,
+which needs room to copy before it can free a segment: a new image is refused
+below that. A refused write, or one that fails (\fBENOSPC\fR, \fBEDQUOT\fR,
+\fBEFBIG\fR), runs the cleaner at once and tries again. If that does not make
+room, the store is \fBdegraded\fR: a zone that is new or changed gets its record
+(name, serial, version stamp, digest) \fBwithout an image\fR, like a zone the
+loader has not sent yet, and its old image is released. The server serves such a
+zone from memory as long as it is there; after it was taken out of memory
+(\fBmemory\-limit\fR) or after a restart the first query reads it from the
+database as for any zone without an image (the cost of a fetch, under
 \fBfetch\-concurrency\fR), so answers stay current. Images that are stored are
 served as before. \fBERROR\fR in syslog, once a minute, names the free bytes,
 the reserve and the dead bytes the cleaner could win; \fBkarictl store\fR says

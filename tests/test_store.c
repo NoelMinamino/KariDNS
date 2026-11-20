@@ -8335,6 +8335,157 @@ static void test_open_enomem(void) {
   tdir_free(&d);
 }
 
+/* 0.7: the address space of the tables is reserved by the RAM (store_reserve_zones()), or by `store-max-zones`; a table that reaches it refuses the write (-ENOMEM, loud, counted, no harm to the
+ * zones that are in), and the next start reserves twice what the files hold */
+static void test_reserve_sizing(void) {
+  printf("[the address space reserved for the tables: by the RAM, by the option, and at least twice what the files hold]\n");
+  CHECK_EQ(store_reserve_zones(0, 0), 1u << 25);                                   /* (the RAM is not known: the old reservation) */
+  CHECK_EQ(store_reserve_zones(100ull << 20, 0), 1u << 20);                         /* (small: the lower bound) */
+  CHECK_EQ(store_reserve_zones(256ull << 20, 0), 1u << 20);
+  CHECK_EQ(store_reserve_zones(512ull << 20, 0), 1u << 21);                         /* 512 MB: 2M zones, zt + zc 256 MB, nx 64 MB */
+  CHECK_EQ(store_reserve_zones((512ull << 20) - (8ull << 20), 0), 1u << 21);        /* (the RAM the kernel reports is a little less than the module size: rounded up) */
+  CHECK_EQ(store_reserve_zones(1000ull << 20, 0), 1u << 22);
+  CHECK_EQ(store_reserve_zones(1ull << 30, 0), 1u << 22);
+  CHECK_EQ(store_reserve_zones(16ull << 30, 0), 1u << 25);                          /* 16 GB: at the upper bound, more than 10M zones */
+  CHECK_EQ(store_reserve_zones(1ull << 40, 0), 1u << 25);
+  CHECK_EQ(store_reserve_zones(512ull << 20, 5000), 5000);                          /* the option wins, whatever the RAM */
+  CHECK_EQ(store_reserve_zones(0, 100000000u), 100000000u);                         /* (the 1-billion-record plan: 100M zones on a 16 GB host) */
+  tdir_t d;
+  tdir_new(&d, "resv_size");
+  store_opts_t o;
+  small_opts(&o);
+  o.physmem = 512ull << 20;
+  store_t *s = NULL;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (!s) { tdir_free(&d); return; }
+  store_stats_t st;
+  store_stats(s, &st);
+  CHECK_EQ(st.reserve_zones, 1u << 21);
+  CHECK_EQ(st.reserve_nx_bytes, (1u << 21) * 32ull);
+  CHECK_EQ(st.reserve_zones_used, 0);
+  CHECK_EQ(store_close(s), 0);
+  o.create = false;
+  o.physmem = 16ull << 30;                                                          /* (the next start has more RAM: the reservation follows) */
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (s) {
+    store_stats(s, &st);
+    CHECK_EQ(st.reserve_zones, 1u << 25);
+    CHECK_EQ(store_close(s), 0);
+  }
+  tdir_free(&d);
+  tdir_new(&d, "resv_opt");
+  small_opts(&o);
+  o.physmem = 16ull << 30;
+  o.max_zones = 3000;                                                               /* (the option wins over the RAM) */
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (s) {
+    store_stats(s, &st);
+    CHECK_EQ(st.reserve_zones, 3000);
+    CHECK_EQ(st.reserve_nx_bytes, 3000 * 32);
+    CHECK_EQ(store_close(s), 0);
+  }
+  o.create = false;                                                                 /* (a store that was made small: the files hold a growth step already, the start reserves twice that) */
+  o.max_zones = 0;
+  o.physmem = 0;                                                                    /* (hw.physmem of this host) */
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (s) {
+    store_stats(s, &st);
+    CHECK(st.reserve_zones >= 1u << 20);
+    CHECK_EQ(store_close(s), 0);
+  }
+  tdir_free(&d);
+}
+
+static void reserve_name(char *nm, size_t n, int i, bool lng) {
+  if (lng) snprintf(nm, n, "long-name-of-a-zone-that-goes-to-nx-%06d.example.test", i);
+  else snprintf(nm, n, "z%06d.example.test", i);
+}
+static void test_reserve_ceiling(bool lng) {
+  printf("[a table at its reserved address space (%s): the write is refused, loudly; the next start has room]\n", lng ? "long names, nx" : "zones, zt and zc");
+  tdir_t d;
+  tdir_new(&d, lng ? "resv_nx" : "resv_zt");
+  store_opts_t o;
+  small_opts(&o);
+  o.max_zones = 1024;
+  o.log = log_cb;
+  o.checkpoint_interval_ms = UINT32_MAX;
+  o.scrub_interval_s = UINT32_MAX;
+  log_clear();
+  store_t *s = NULL;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (!s) { tdir_free(&d); return; }
+  CHECK_EQ(store_view_add(s, "default"), 0);
+  CHECK(log_count(6, "address space reserved for the tables: 1024 zones (store-max-zones)") == 1);
+  uint8_t img[100];
+  memset(img, 7, sizeof(img));
+  int ok = 0, refused = 0;
+  for (int i = 0; i < 1100; i++) {
+    char nm[96];
+    reserve_name(nm, sizeof(nm), i, lng);
+    store_meta_t m = meta_of((uint32_t)i + 1, 1);
+    int r = store_put(s, 0, nm, strlen(nm), &m, img, sizeof(img), NULL);
+    if (r == 0) ok++;
+    else { CHECK_EQ(r, -ENOMEM); refused++; }
+  }
+  printf("  %d stored, %d refused\n", ok, refused);
+  CHECK(refused > 0);
+  CHECK(ok > 400);
+  CHECK(lng ? ok < 1024 : ok == 1024);
+  CHECK_EQ(ok + refused, 1100);
+  store_stats_t st;
+  store_stats(s, &st);
+  CHECK(st.reserve_refused >= (uint64_t)refused);
+  CHECK_EQ(st.reserve_zones, 1024);
+  CHECK_EQ(st.reserve_nx_bytes, 1024 * 32);
+  CHECK_EQ(st.degraded_puts, 0);                                                    /* (no disk-full state: nothing is made KNOWN, the cleaner does not run) */
+  CHECK_EQ(st.state & STORE_ST_DEGRADED_NOSPC, 0);
+  CHECK(log_count(3, "store-max-zones") == 1);                                      /* (one ERROR a minute, not one for every zone) */
+  CHECK(log_count(3, lng ? "table of long names" : "table of zones") == 1);
+  CHECK_EQ(store_checkpoint(s), 0);
+  CHECK(log_count(4, "over 80 %") >= 1);
+  CHECK(log_count(4, "store-max-zones") >= 1);
+  for (int i = 0; i < ok; i++) {                                                    /* the zones that are in are all there */
+    char nm[96];
+    reserve_name(nm, sizeof(nm), i, lng);
+    store_read_lock();
+    CHECK(store_find(s, 0, nm, strlen(nm)) != STORE_NONE);
+    store_read_unlock();
+  }
+  CHECK_EQ(store_close(s), 0);
+  o.create = false;                                                                 /* the same option: the next start reserves at least twice what the files hold */
+  log_clear();
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (s) {
+    store_stats(s, &st);
+    CHECK(st.reserve_zones >= 2048);
+    CHECK(st.reserve_nx_bytes >= 2 * 32768);
+    for (int i = ok; i < 1100; i++) {
+      char nm[96];
+      reserve_name(nm, sizeof(nm), i, lng);
+      store_meta_t m = meta_of((uint32_t)i + 1, 1);
+      CHECK_EQ(store_put(s, 0, nm, strlen(nm), &m, img, sizeof(img), NULL), 0);
+    }
+    for (int i = 0; i < 1100; i++) {
+      char nm[96];
+      reserve_name(nm, sizeof(nm), i, lng);
+      store_read_lock();
+      CHECK(store_find(s, 0, nm, strlen(nm)) != STORE_NONE);
+      store_read_unlock();
+    }
+    CHECK_EQ(store_close(s), 0);
+  }
+  /* a store that holds more than the option reserves opens (it is the files that count) */
+  o.max_zones = 1024;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (s) {
+    store_stats(s, &st);
+    CHECK(st.reserve_zones >= 2 * 1100);
+    CHECK_EQ(st.reserve_zones_used, 1100);
+    CHECK_EQ(store_close(s), 0);
+  }
+  tdir_free(&d);
+}
+
 int main(void) {
   const char *base = getenv("KARIDNS_STORE_TESTDIR");
   snprintf(g_base, sizeof(g_base), "%s/store_test.%d", base && *base ? base : ".", (int)getpid());
@@ -8412,6 +8563,7 @@ int main(void) {
   if (WANT("bulk")) { test_bulk_end_retry(); test_bulk_dead_store(); }
   if (WANT("bulk") || WANT("repair")) { test_rebuild_torn_name(); test_rebuild_names(); }
   if (WANT("repair") || WANT("enomem")) test_open_enomem();
+  if (WANT("reserve")) { test_reserve_sizing(); test_reserve_ceiling(false); test_reserve_ceiling(true); }
   if (WANT("bulk") || WANT("pairs")) { test_torn_pairs(true); test_torn_pairs(false); }
   if (WANT("clk")) {
     int citers = getenv("KARIDNS_STORE_KILLC_ITERS") ? atoi(getenv("KARIDNS_STORE_KILLC_ITERS")) : (UNDER_TSAN ? 25 : store_long() ? 100 : 50);
