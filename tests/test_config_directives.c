@@ -415,6 +415,45 @@ static void test_additional_from_auth(void) {
     }
 }
 
+/* 0.7: options { router-threads; worker-threads; }: 1..4 and 1..128, unset = 0 (automatic), a second statement replaces the first */
+static void test_thread_options(void) {
+    printf("[TEST] options router-threads / worker-threads...\n");
+    server_config_t cfg;
+    if (parse_ok("options { };", &cfg)) {
+        CHECK(cfg.router_threads == 0 && cfg.worker_threads == 0);
+        free_server_config_fields(&cfg);
+    }
+    if (parse_ok("options { router-threads 3; worker-threads 17; };", &cfg)) {
+        CHECK(cfg.router_threads == 3 && cfg.worker_threads == 17);
+        free_server_config_fields(&cfg);
+    }
+    if (parse_ok("options { router-threads 1; worker-threads 128; };", &cfg)) {
+        CHECK(cfg.router_threads == 1 && cfg.worker_threads == 128);
+        free_server_config_fields(&cfg);
+    }
+    if (parse_ok("options { router-threads 4; };", &cfg)) {   /* each is read on its own */
+        CHECK(cfg.router_threads == 4 && cfg.worker_threads == 0);
+        free_server_config_fields(&cfg);
+    }
+    if (parse_ok("options { worker-threads 5; worker-threads 6; router-threads 2; router-threads 1; };", &cfg)) {   /* the last one wins */
+        CHECK(cfg.router_threads == 1 && cfg.worker_threads == 6);
+        free_server_config_fields(&cfg);
+    }
+    static const char *const bad[] = { "0", "129", "-1", "junk", "2x", "4294967297", "1.5" };
+    static const char *const names[] = { "router-threads", "worker-threads" };
+    for (size_t n = 0; n < 2; n++)
+        for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+            char txt[160], label[96];
+            snprintf(txt, sizeof(txt), "\noptions { %s %s; };", names[n], bad[i]);
+            snprintf(label, sizeof(label), "%s %s", names[n], bad[i]);
+            expect_an_error(label, txt, "line 2|Invalid");
+        }
+    expect_reject("router-threads without a value", "options { router-threads; };");
+    expect_reject("worker-threads without a semicolon", "options { worker-threads 2 };");
+    expect_an_error("router-threads 5 names the range", "options { router-threads 5; };", "expected 1..4");
+    expect_an_error("worker-threads 129 names the range", "options { worker-threads 129; };", "expected 1..128");
+}
+
 static void test_options_syntax_errors(void) {
     printf("[TEST] options directives: missing value / missing semicolon are rejected...\n");
     static const char *names[] = {
@@ -5296,6 +5335,7 @@ int main(void) {
     test_ixfr_history_option();
     test_xfr_limits_option();
     test_additional_from_auth();
+    test_thread_options();
     test_options_syntax_errors();
     test_ecs_and_location_tags();
     test_ecs_trusted_resolvers();

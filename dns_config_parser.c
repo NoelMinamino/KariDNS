@@ -8445,6 +8445,8 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
   config->minimal_any = false;
   config->minimal_any_ttl = 86400;
   config->wire_cache_max_records = 0;
+  config->router_threads = 0;
+  config->worker_threads = 0;
   config->response_cache_size = 32 * 1024 * 1024;
   config->additional_from_auth = ADDITIONAL_AUTH_YES;
   config->notify_retry.retries = NOTIFY_RETRIES_DEFAULT;
@@ -8993,6 +8995,16 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
             return -1;
           }
           config->udp_bufsize = (uint16_t)v;
+        } else if (strcmp(key, "router-threads") == 0 || strcmp(key, "worker-threads") == 0) {
+          /* restart-only; 0 (not written) = by the CPUs the process may run on.  A second statement replaces the first, as for the other options */
+          const bool is_router = key[0] == 'r';
+          int n = 0;
+          if (parse_transport_param(ctx, NULL, key, false, 1, is_router ? KARIDNS_ROUTER_THREADS_MAX : KARIDNS_WORKER_THREADS_MAX, &n) != 0) {
+            free(key);
+            return -1;
+          }
+          if (is_router) config->router_threads = (uint32_t)n;
+          else config->worker_threads = (uint32_t)n;
         } else if (strcmp(key, "response-cache-size") == 0) {
           /* 0 = 使わない。それ以外は 4K/16M のような大きさ (上限 1024M)。書き損じは誤りにする */
           int sz = 0;

@@ -6149,7 +6149,7 @@ static void test_jr_states(bool flusher) {
     for (int w = 0; w < 5000; w++) {
       if (!flusher) (void)store_tick(s);
       store_stats(s, &st);
-      if (st.journal_state == STORE_JOURNAL_OK && st.ring_unwritten_bytes == 0) break;   /* (the retry has written what waited; the flusher may append a record of its own (a commit, a file switch) first: the ring is empty again a moment later) */
+      if (st.journal_state == STORE_JOURNAL_OK) break;
       usleep(1000);
     }
     CHECK_EQ(st.journal_state, STORE_JOURNAL_OK);

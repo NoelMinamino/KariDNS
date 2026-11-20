@@ -106,7 +106,7 @@ EOF
 newdb() { pf tests/db/pdns_schema.pgsql.sql > /dev/null && pf db/karidns_ext.pgsql.sql > /dev/null; }
 newdb || { fail "cannot create the schema"; exit 1; }
 
-for f in $(kari_lab_zones) tests/db/tagz.test.zone; do loadz "$f" || true; done
+for f in tests/zones/*.zone tests/db/tagz.test.zone; do loadz "$f" || true; done
 if [ -f tests/db/tdz.test.data ]; then loadz tests/db/tdz.test.data --format tinydns || true; fi
 mkzone d1.test 10 192.0.2.10; mkzone d2.test 20 192.0.2.20; mkzone d3.test 30 192.0.2.30
 cat > "$T/z/alias.test.zone" <<'EOF'

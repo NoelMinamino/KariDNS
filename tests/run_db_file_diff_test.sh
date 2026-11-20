@@ -105,7 +105,7 @@ WWW A 192.0.2.2
 Mail.Sub A 192.0.2.3
 @ MX 10 Mail.Sub
 EOF2
-for f in $(kari_lab_zones) tests/db/tagz.test.zone "$T/cand/mixed.test.zone"; do
+for f in tests/zones/*.zone tests/db/tagz.test.zone "$T/cand/mixed.test.zone"; do
     [ -f "$f" ] || continue
     N=$((N + 1))
     sz=$(wc -c < "$f" | tr -d ' ')

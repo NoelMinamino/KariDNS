@@ -225,7 +225,6 @@ T0=$(now_s)
 a=$(./dag @127.0.0.1 -p "$PORT" "www.$(zn 1).test" A +short +nohexdump +time=30 +tries=1 2>/dev/null | head -1)
 EL=$(perl -e "printf '%.1f', $(now_s) - $T0")
 [ "$a" = "192.0.2.80" ] && perl -e "exit(($EL >= 1.5 && $EL <= 12) ? 0 : 1)" && pass "the query was answered when the 3 s were up ($EL s)" || fail "answer '$a' after $EL s"
-i=0; while ! grep -q 'warm-before-serve: the time is up' "$LOG" && [ $i -lt 30 ]; do sleep 0.1; i=$((i + 1)); done   # (the ingest thread logs it a moment after the workers let the queries in, as in run_db_warm_test.sh)
 grep -q 'warm-before-serve: the time is up' "$LOG" && pass "the log says the time was up" || fail "no 'time is up' line in the log"
 stop_srv
 

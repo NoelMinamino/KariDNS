@@ -21,6 +21,10 @@
 #include <poll.h>
 #include <pthread.h>
 #include <sched.h>
+#ifdef __FreeBSD__
+#include <sys/param.h>
+#include <sys/cpuset.h>
+#endif
 #include <pwd.h>
 #include <signal.h>
 #include <stdalign.h>
@@ -128,8 +132,8 @@ STATIC_TEST _Atomic bool g_control_signals_ready = false;
 static pid_t g_manager_pid = 0;
 
 #define NUM_FRONTEND_ROUTERS 2
-#define MAX_FRONTEND_ROUTERS 4
-#define MAX_WORKERS 128
+#define MAX_FRONTEND_ROUTERS KARIDNS_ROUTER_THREADS_MAX
+#define MAX_WORKERS KARIDNS_WORKER_THREADS_MAX
 
 // Frontend/Backend IPC用グローバル変数
 STATIC_TEST int g_num_frontend_routers = NUM_FRONTEND_ROUTERS;
@@ -150,6 +154,31 @@ static struct {
   struct utsname un;
   int ncpus;
 } g_host_status_info;
+
+/* The CPUs this process may run on: its affinity mask (cpuset(1), a jail's cpuset), not the CPUs of the machine.  Under `cpuset -l 0` on an 8-CPU host
+ * 2 routers and 6 workers measured half the throughput of 1 and 1 (about 3 context switches per query).  Never below 1; the CPUs of the machine when
+ * the mask cannot be read.  Taken before the sandbox (the Backend cannot ask). */
+STATIC_TEST int usable_cpu_count(void) {
+  long n = sysconf(_SC_NPROCESSORS_ONLN);
+  int cpus = n > 0 ? (int)n : 1;
+#ifdef __FreeBSD__
+  cpuset_t set;
+  if (cpuset_getaffinity(CPU_LEVEL_WHICH, CPU_WHICH_PID, -1, sizeof(set), &set) == 0 && CPU_COUNT(&set) >= 1) cpus = CPU_COUNT(&set);
+#endif
+  return cpus;
+}
+
+/* The thread counts for `cpus` usable CPUs: 1-2 CPUs: 1 router + 1 worker; 3: 1 + 2; 4 or more: 2 routers + the rest as workers.  Then the clamps
+ * (MAX_FRONTEND_ROUTERS, MAX_WORKERS), then options { router-threads; worker-threads; } (already in range; 0 = not written) replace each count. */
+STATIC_TEST void plan_threads(int cpus, uint32_t opt_routers, uint32_t opt_workers, int *routers, int *workers) {
+  if (cpus < 1) cpus = 1;
+  *routers = cpus <= 3 ? 1 : 2;
+  *workers = cpus <= 3 ? (cpus >= 3 ? 2 : 1) : cpus - 2;
+  if (*routers > MAX_FRONTEND_ROUTERS) *routers = MAX_FRONTEND_ROUTERS;
+  if (*workers > MAX_WORKERS) *workers = MAX_WORKERS;
+  if (opt_routers) *routers = (int)opt_routers;
+  if (opt_workers) *workers = (int)opt_workers;
+}
 
 STATIC_TEST void capture_host_status_info(void) {
   if (uname(&g_host_status_info.un) != 0) memset(&g_host_status_info.un, 0, sizeof(g_host_status_info.un));
@@ -4124,7 +4153,7 @@ static bool str_differs(const char *a, const char *b) {
 }
 
 /* O-09: 起動時にだけ使う設定 (docs/karidns.md "General syntax") が変わっていれば名前を並べる */
-static void collect_restart_only_changes(const server_config_t *o, const server_config_t *n, char *buf, size_t sz) {
+STATIC_TEST void collect_restart_only_changes(const server_config_t *o, const server_config_t *n, char *buf, size_t sz) {
   if (o->port != n->port) append_list_item(buf, sz, "port");
   bool addrs_differ = o->bind_address_count != n->bind_address_count;
   for (int i = 0; !addrs_differ && i < n->bind_address_count; i++)
@@ -4157,6 +4186,8 @@ static void collect_restart_only_changes(const server_config_t *o, const server_
   if (o->tcp_window != n->tcp_window) append_list_item(buf, sz, "tcp-window");
   if (cfg_tcp_rcvbuf(o) != cfg_tcp_rcvbuf(n) || cfg_tcp_sndbuf(o) != cfg_tcp_sndbuf(n)) append_list_item(buf, sz, "tcp-receive-buffer / tcp-send-buffer");
   if (o->response_cache_size != n->response_cache_size) append_list_item(buf, sz, "response-cache-size");
+  if (o->router_threads != n->router_threads) append_list_item(buf, sz, "router-threads");
+  if (o->worker_threads != n->worker_threads) append_list_item(buf, sz, "worker-threads");
   if (o->control.enabled != n->control.enabled || str_differs(o->control.socket_path, n->control.socket_path) ||
       o->control.has_allow_gid != n->control.has_allow_gid || (n->control.has_allow_gid && o->control.allow_gid != n->control.allow_gid))
     append_list_item(buf, sz, "control-channel socket / allow-group");
@@ -8133,21 +8164,14 @@ int main(int argc, char **argv) {
              failed_zones);
   }
 
-  int total_cores = sysconf(_SC_NPROCESSORS_ONLN);
-  if (total_cores <= 0)
-    total_cores = 1;
+  const int usable_cpus = usable_cpu_count();
   int num_workers = 1;
-  if (total_cores <= 3) {
-    g_num_frontend_routers = 1;
-    num_workers = (total_cores >= 3) ? 2 : 1;
-  } else {   // 4 cores or more: two routers, the rest are workers
-    g_num_frontend_routers = 2;
-    num_workers = total_cores - 2;
+  plan_threads(usable_cpus, g_config_db.config_a.router_threads, g_config_db.config_a.worker_threads, &g_num_frontend_routers, &num_workers);
+  {
+    const bool ro = g_config_db.config_a.router_threads != 0, wo = g_config_db.config_a.worker_threads != 0;
+    syslog(LOG_INFO, "[Startup] %d routers, %d workers (%d CPUs usable of %d)%s%s%s%s", g_num_frontend_routers, num_workers, usable_cpus,
+           g_host_status_info.ncpus, ro || wo ? "; set by " : "", ro ? "router-threads" : "", ro && wo ? " and " : "", wo ? "worker-threads" : "");
   }
-  if (g_num_frontend_routers > MAX_FRONTEND_ROUTERS)
-    g_num_frontend_routers = MAX_FRONTEND_ROUTERS;
-  if (num_workers > MAX_WORKERS)
-    num_workers = MAX_WORKERS;
 
   setup_ipc_tables(num_workers);
 
