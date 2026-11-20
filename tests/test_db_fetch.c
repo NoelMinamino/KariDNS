@@ -343,6 +343,13 @@ static bool wait_places(uint32_t n, int ms) {
     return park_places_used() == n;
 }
 
+/* the claim mark of `key` is gone, waiting up to 2 s: the ingest thread clears it (fetch_release) at the top of its next round, after the wake was already queued */
+static bool not_claimed(uint64_t key) {
+    for (int i = 0; i < 400 && park_claim_held(key); i++) usleep(5000);
+    return !park_claim_held(key);
+}
+#define NOT_CLAIMED(key) not_claimed(key)
+
 /* the next FETCH_REQ on the fetch stream of the loader's end (the test), waiting up to ms */
 static bool req_next(ch_t *c, kdb_msg_t *m, int ms) { return ch_next(c, m, ms) && m->type == KDB_T_FETCH_REQ; }
 
