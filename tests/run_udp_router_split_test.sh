@@ -132,15 +132,22 @@ kv() { echo "$1" | tr ' ' '\012' | sed -n "s/^$2=//p" | head -1; }   # kv "sent=
 
 # load LABEL N NSOCK WINDOW BATCH PAUSE_MS: the client against the server; every query answered, every answer right
 load() {
-    kari_udp_snap "$T/udp.snap"
+    kari_udp_snap "$T/udp.snap"; qd0=$(sysctl -n net.inet.ip.intr_queue_drops 2>/dev/null || echo 0)
     out=$(perl "$CLIENT" "$PORT" "$2" "$3" "$4" 15 "$IPS" "$5" "$6" 2>&1)
     s=$(kv "$out" sent); r=$(kv "$out" received); u=$(kv "$out" unanswered); b=$(kv "$out" bad); k=$(kv "$out" socks)
+    qd=$(($(sysctl -n net.inet.ip.intr_queue_drops 2>/dev/null || echo 0) - qd0))
     if [ "$s" = "$2" ] && [ "$r" = "$2" ] && [ "$u" = "0" ] && [ "$b" = "0" ]; then
         ok "$1: $2 queries from $3 sockets (to $IPS), all answered, all right ($out)"
+        # loopback output goes through the one netisr IP input queue (256 deep): a burst of answers that overflows it is dropped by the kernel before
+        # UDP, counted in net.inet.ip.intr_queue_drops (seen on CI, 5 of 20000).  Such a loss is not the server's, when the queue dropped at least as many
+        # datagrams during this load (the checks that follow still demand that the routers and workers passed every query on and dropped none).
+    elif [ "$s" = "$2" ] && [ "$b" = "0" ] && [ "$((r + u))" = "$2" ] && [ "$u" -le "$qd" ]; then
+        ok "$1: $2 queries from $3 sockets (to $IPS), all right; $u answer(s) lost in the kernel's loopback IP input queue (net.inet.ip.intr_queue_drops +$qd) ($out)"
     else
         bad "$1: $out" "$out
     netstat -s -p udp since the start of this load (the client and the server share the host):
 $(kari_udp_delta "$T/udp.snap")
+    net.inet.ip.intr_queue_drops +$qd during this load
 $(ctl ipcstats | grep -v '=0$')"
     fi
     LAST_SOCKS=${k:-0}
