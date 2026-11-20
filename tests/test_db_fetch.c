@@ -343,6 +343,13 @@ static bool wait_places(uint32_t n, int ms) {
     return park_places_used() == n;
 }
 
+/* the claim mark of `key` is gone, waiting up to 2 s: the ingest thread clears it (fetch_release) at the top of its next round, after the wake was already queued */
+static bool not_claimed(uint64_t key) {
+    for (int i = 0; i < 400 && park_claim_held(key); i++) usleep(5000);
+    return !park_claim_held(key);
+}
+#define NOT_CLAIMED(key) not_claimed(key)
+
 /* the next FETCH_REQ on the fetch stream of the loader's end (the test), waiting up to ms */
 static bool req_next(ch_t *c, kdb_msg_t *m, int ms) { return ch_next(c, m, ms) && m->type == KDB_T_FETCH_REQ; }
 
@@ -1926,7 +1933,7 @@ int main(void) {
          * woken), the claim mark is gone as soon as the fetch has begun (the zone is LOADING) */
         CHECK(worker_ask(0, COLD_EL(0), "default", cz[0], KDB_FETCH_FULL) == 1);
         CHECK(req_next(&fetch5, &m, 5000) && strcmp(m.u.fetch_req.name, cz[0]) == 0 && m.u.fetch_req.priority == KDB_FETCH_PRIO_QUERY && m.u.fetch_req.mode == KDB_FETCH_FULL);
-        CHECK(park_places_used() == 1 && ST("fetchq", "in_flight") == 1 && !park_claim_held(park_claim_key("default", cz[0])));
+        CHECK(park_places_used() == 1 && ST("fetchq", "in_flight") == 1 && NOT_CLAIMED(park_claim_key("default", cz[0])));
         int zi = 0;
         CHECK(sscanf(cz[0], "z%d", &zi) == 1);
         send_zone(f5[0], &e, 0, cz[0], 1, m.u.fetch_req.request_id, 1000 + zi);
@@ -1936,7 +1943,7 @@ int main(void) {
         CHECK(fetch_gate("default", COLD_EL(0)) == FETCH_GATE_ASK);          /* (not ABSENT any more: no claim) */
         CHECK(park_claim_mark(park_claim_key("default", cz[0])) && park_fetch_request(0, "default", cz[0], KDB_FETCH_PRIO_QUERY | PARK_PRIO_CLAIMED, KDB_FETCH_FULL));
         CHECK(wake_next(&k, 5000) && park_key_is(&k, "default", cz[0]) && !k.failed);
-        CHECK(wait_places(0, 2000) && !ch_next(&fetch5, &m2, 200) && !park_claim_held(park_claim_key("default", cz[0])) && ST("fetchq", "queued") == 0);
+        CHECK(wait_places(0, 2000) && !ch_next(&fetch5, &m2, 200) && NOT_CLAIMED(park_claim_key("default", cz[0])) && ST("fetchq", "queued") == 0);
         (void)dbreg_test_evict("default", cz[0]);                                  /* (cold again) */
 
         /* a fetch that fails: the place is back, the workers are told */
@@ -1969,9 +1976,15 @@ int main(void) {
 
         /* a view that takes no database zones, a zone of the registry that does not exist: answered at once as failed, the marks go */
         CHECK(park_claim_mark(park_claim_key("nosuchview", "z.test.")) && park_fetch_request(0, "nosuchview", "z.test.", KDB_FETCH_PRIO_QUERY | PARK_PRIO_CLAIMED, KDB_FETCH_FULL));
-        CHECK(wake_next(&k, 5000) && park_key_is(&k, "nosuchview", "z.test.") && k.failed && wait_places(0, 2000) && !park_claim_held(park_claim_key("nosuchview", "z.test.")));
+        CHECK(wake_next(&k, 5000) && park_key_is(&k, "nosuchview", "z.test."));          /* (the wake) */
+        CHECK(k.failed);
+        CHECK(wait_places(0, 2000));
+        CHECK(NOT_CLAIMED(park_claim_key("nosuchview", "z.test.")));
         CHECK(park_claim_mark(park_claim_key("default", "ghost.test.")) && park_fetch_request(0, "default", "ghost.test.", KDB_FETCH_PRIO_QUERY | PARK_PRIO_CLAIMED, KDB_FETCH_FULL));
-        CHECK(wake_next(&k, 5000) && park_key_is(&k, "default", "ghost.test.") && k.failed && wait_places(0, 2000) && !park_claim_held(park_claim_key("default", "ghost.test.")));
+        CHECK(wake_next(&k, 5000) && park_key_is(&k, "default", "ghost.test."));          /* (the wake) */
+        CHECK(k.failed);
+        CHECK(wait_places(0, 2000));
+        CHECK(NOT_CLAIMED(park_claim_key("default", "ghost.test.")));
         CHECK(!ch_next(&fetch5, &m2, 200));
 
         /* ---- P-A: no rate limit (the default): 40 requests at once all go out, nothing waits, the bucket is not used */
@@ -2019,7 +2032,7 @@ int main(void) {
             for (int i = 0; i < 4; i++) {
                 send_failed(f5[0], &e, 0, fl[i].u.fetch_req.name, fl[i].u.fetch_req.request_id);
                 CHECK(req_next(&fetch5, &fl[i + 2], 5000) && strcmp(fl[i + 2].u.fetch_req.name, cz[10 + i]) == 0);
-                CHECK(!ch_next(&fetch5, &m2, 100) && ST("fetchq", "queued") == (unsigned)(3 - i) && park_places_used() == 2 && !park_claim_held(park_claim_key("default", cz[10 + i])));
+                CHECK(!ch_next(&fetch5, &m2, 100) && ST("fetchq", "queued") == (unsigned)(3 - i) && park_places_used() == 2 && NOT_CLAIMED(park_claim_key("default", cz[10 + i])));
                 drain_wakes();
             }
             CHECK(ST("cache", "shed") == s0 && ST("fetchq", "queue_dropped") == dd0);          /* (nothing was refused or dropped all the time) */
@@ -2048,7 +2061,7 @@ int main(void) {
             int64_t dt = mono_ms() - t0;
             printf("  (deadline: queued=%llu dt=%lld dropped=%llu d0=%llu)\n", ST("fetchq", "queued"), (long long)dt, ST("fetchq", "queue_dropped"), d0);
             CHECK(ST("fetchq", "queued") == 0 && dt >= 380 && dt < 3000);
-            CHECK(ST("fetchq", "queue_dropped") == d0 + 2 && !park_claim_held(park_claim_key("default", cz[16])) && !park_claim_held(park_claim_key("default", cz[17])));
+            CHECK(ST("fetchq", "queue_dropped") == d0 + 2 && NOT_CLAIMED(park_claim_key("default", cz[16])) && NOT_CLAIMED(park_claim_key("default", cz[17])));
             CHECK(park_places_used() == 2 && ST("cache", "shed") == s0 && ST("cache", "room_timeouts") == to0 && ST("cache", "room_waits") == rw0);   /* (not held up by room) */
             CHECK(!ch_next(&fetch5, &m2, 100));                                      /* (nothing was fetched for them) */
             for (int w = 0; w < GS_W; w++) {                                         /* the workers that asked are woken (not failed): a query with time left asks again; the others are not troubled (the claim knows who asked: worker 0 for cz[16], worker 1 for cz[17]) */
@@ -2090,11 +2103,11 @@ int main(void) {
             CHECK(ST("fetchq", "queued") == 1);
             CHECK(park_fetch_request_any("default", cz[21], KDB_FETCH_PRIO_BACKGROUND, KDB_FETCH_FULL));    /* (a background request: not queued, dropped) */
             for (int i = 0; i < 200 && ST("cache", "shed") == s0; i++) usleep(10000);
-            CHECK(ST("cache", "shed") == s0 + 1 && ST("fetchq", "queued") == 1 && !park_claim_held(park_claim_key("default", cz[21])));
+            CHECK(ST("cache", "shed") == s0 + 1 && ST("fetchq", "queued") == 1 && NOT_CLAIMED(park_claim_key("default", cz[21])));
             CHECK(!ch_next(&fetch5, &m2, 100));
             send_failed(f5[0], &e, 0, fl[0].u.fetch_req.name, fl[0].u.fetch_req.request_id);
             CHECK(req_next(&fetch5, &fl[2], 5000) && strcmp(fl[2].u.fetch_req.name, cz[20]) == 0 && fl[2].u.fetch_req.priority == KDB_FETCH_PRIO_QUERY);
-            CHECK(ST("fetchq", "queued") == 0 && !park_claim_held(park_claim_key("default", cz[20])));
+            CHECK(ST("fetchq", "queued") == 0 && NOT_CLAIMED(park_claim_key("default", cz[20])));
             send_failed(f5[0], &e, 0, fl[1].u.fetch_req.name, fl[1].u.fetch_req.request_id);
             send_failed(f5[0], &e, 0, fl[2].u.fetch_req.name, fl[2].u.fetch_req.request_id);
             CHECK(wait_places(0, 5000));
@@ -2118,7 +2131,7 @@ int main(void) {
             CHECK(worker_ask(0, COLD_EL(25), "default", cz[25], KDB_FETCH_FULL) == 1);                  /* (the queue is full: shed) */
             park_key_t dk;
             CHECK(wake_ring_next(0, &dk, 5000) && dk.ask == PARK_ASK_DROP && !dk.failed && park_key_is(&dk, "default", cz[25]));
-            CHECK(ST("fetchq", "queue_full") == qf0 + 1 && ST("cache", "shed") == sh0 + 1 && ST("fetchq", "queued") == 1 && !park_claim_held(park_claim_key("default", cz[25])));
+            CHECK(ST("fetchq", "queue_full") == qf0 + 1 && ST("cache", "shed") == sh0 + 1 && ST("fetchq", "queued") == 1 && NOT_CLAIMED(park_claim_key("default", cz[25])));
             CHECK(!ch_next(&fetch5, &m2, 100));
             send_failed(f5[0], &e, 0, fl[0].u.fetch_req.name, fl[0].u.fetch_req.request_id);
             CHECK(req_next(&fetch5, &fl[2], 5000) && strcmp(fl[2].u.fetch_req.name, cz[24]) == 0);       /* (the one that waited goes when a place is free) */
@@ -2270,7 +2283,7 @@ int main(void) {
                 CHECK(req_next(&fetch5, &m, 5000) && strcmp(m.u.fetch_req.name, cz[12]) == 0 && m.u.fetch_req.mode == KDB_FETCH_FULL);
                 CHECK(!dbreg_cache_over_limit());
                 CHECK(ST("cache", "evictions") > ev0 && ST("cache", "room_evictions") > re0 && ST("cache", "shed") == sh0 && ST("cache", "room_waits") == wt0);
-                CHECK(!park_wake_pending(park_wake_ring(0)) && park_places_used() == 1 && !park_claim_held(park_claim_key("default", cz[12])));
+                CHECK(!park_wake_pending(park_wake_ring(0)) && park_places_used() == 1 && NOT_CLAIMED(park_claim_key("default", cz[12])));
                 int zi = 0;
                 CHECK(sscanf(cz[12], "z%d", &zi) == 1);
                 send_zone(f5[0], &e, 0, cz[12], 1, m.u.fetch_req.request_id, 1000 + zi);
@@ -2298,7 +2311,7 @@ int main(void) {
                 CHECK(!park_wake_pending(park_wake_ring(0)) && !park_wake_pending(park_wake_ring(1)) && ST("cache", "shed") == sh0);
                 dbreg_cache_test_room_pause(false);
                 CHECK(req_next(&fetch5, &m, 5000) && strcmp(m.u.fetch_req.name, cz[13]) == 0);
-                CHECK(!dbreg_cache_over_limit() && ST("cache", "room_waiting") == 0 && ST("fetchq", "queued") == 0 && park_places_used() == 1 && !park_claim_held(key13));
+                CHECK(!dbreg_cache_over_limit() && ST("cache", "room_waiting") == 0 && ST("fetchq", "queued") == 0 && park_places_used() == 1 && NOT_CLAIMED(key13));
                 CHECK(ST("cache", "room_timeouts") == to0);
                 int zi = 0;
                 CHECK(sscanf(cz[13], "z%d", &zi) == 1);
@@ -2322,7 +2335,7 @@ int main(void) {
                 for (int i = 0; i < 400 && ST("cache", "room_waiting") != 0; i++) usleep(10000);
                 int64_t dt = mono_ms() - t0;
                 CHECK(ST("cache", "room_waiting") == 0 && ST("fetchq", "queued") == 0 && dt >= 380 && dt < 3000);
-                CHECK(ST("cache", "room_timeouts") == to0 + 1 && ST("fetchq", "queue_dropped") == d0 + 1 && park_places_used() == 0 && !park_claim_held(key14) && ST("cache", "shed") == sh0);
+                CHECK(ST("cache", "room_timeouts") == to0 + 1 && ST("fetchq", "queue_dropped") == d0 + 1 && park_places_used() == 0 && NOT_CLAIMED(key14) && ST("cache", "shed") == sh0);
                 CHECK(wake_ring_next(0, &k1, 2000) && !k1.failed && park_key_is(&k1, "default", cz[14]) && !ch_next(&fetch5, &m2, 100));
                 dbreg_cache_test_room_pause(false);
                 drain_wakes();
@@ -2348,7 +2361,7 @@ int main(void) {
                 CHECK(!park_wake_pending(park_wake_ring(0)) && ST("cache", "shed") == sh0 && ST("fetchq", "queue_dropped") == d0);
                 gate_cfg("fetch-concurrency 3; park-timeout 5000;", 3, 0, 0);                      /* (memory-limit away: no room is needed) */
                 CHECK(req_next(&fetch5, &m, 5000) && strcmp(m.u.fetch_req.name, cz[15]) == 0);
-                CHECK(ST("fetchq", "queued") == 0 && !park_claim_held(key15) && park_places_used() == 1);      /* (0.7: a fetch holds a place of fetch-concurrency with no memory-limit too) */
+                CHECK(ST("fetchq", "queued") == 0 && NOT_CLAIMED(key15) && park_places_used() == 1);      /* (0.7: a fetch holds a place of fetch-concurrency with no memory-limit too) */
                 send_failed(f5[0], &e, 0, cz[15], m.u.fetch_req.request_id);
                 CHECK(wake_next(&k, 5000) && park_key_is(&k, "default", cz[15]) && k.failed && ST("fetchq", "in_flight") == 0);
                 dbreg_cache_test_room_pause(false);
@@ -2420,7 +2433,7 @@ int main(void) {
             for (int i = 0; i < 100 && ST("fetchq", "queued") != 1; i++) usleep(2000);
             CHECK(ST("fetchq", "queued") == 1 && ST("fetchq", "table_full") == t0 && !ch_next(&fetch5, &m2, 200) && park_claim_held(park_claim_key("default", cz[300])));
             send_failed(f5[0], &e, 0, names[0], ids[0]);                                                      /* (the summary is answered: a slot is free) */
-            CHECK(req_next(&fetch5, &m2, 5000) && strcmp(m2.u.fetch_req.name, cz[300]) == 0 && ST("fetchq", "queued") == 0 && !park_claim_held(park_claim_key("default", cz[300])));
+            CHECK(req_next(&fetch5, &m2, 5000) && strcmp(m2.u.fetch_req.name, cz[300]) == 0 && ST("fetchq", "queued") == 0 && NOT_CLAIMED(park_claim_key("default", cz[300])));
             send_failed(f5[0], &e, 0, cz[300], m2.u.fetch_req.request_id);
             CHECK(wait_places(255, 2000) && ST("fetchq", "table_full") == t0);
             for (int i = 1; i < got; i++) {
@@ -2539,7 +2552,7 @@ int main(void) {
                    (unsigned long long)atomic_load(&g_gs_claimed), (unsigned long long)atomic_load(&g_gs_plain), (unsigned long long)atomic_load(&g_gs_ringfull), is1 - is0,
                    (unsigned long long)answered, maxused, ST("fetchq", "peak"), ST("fetchq", "queue_peak"), ST("fetchq", "waited"));
             CHECK(park_places_used() == 0 && ST("fetchq", "in_flight") == 0 && ST("fetchq", "queued") == 0);
-            for (int i = 0; i < GS_Z; i++) CHECK(!park_claim_held(park_claim_key("default", g_gs_zone[i])));       /* (every claim ended: no mark is left) */
+            for (int i = 0; i < GS_Z; i++) CHECK(NOT_CLAIMED(park_claim_key("default", g_gs_zone[i])));       /* (every claim ended: no mark is left) */
             CHECK(maxused <= 8);
             CHECK(atomic_load(&g_gs_claimed) > 0 && is1 > is0 && ST("fetchq", "waited") > 0);
             CHECK(shed1 == shed0 && rate1 == rate0);                                      /* (nothing was refused: the requests waited) */
