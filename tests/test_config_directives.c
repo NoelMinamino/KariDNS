@@ -452,6 +452,28 @@ static void test_thread_options(void) {
     expect_reject("worker-threads without a semicolon", "options { worker-threads 2 };");
     expect_an_error("router-threads 9 names the range", "options { router-threads 9; };", "expected 1..8");
     expect_an_error("worker-threads 129 names the range", "options { worker-threads 129; };", "expected 1..128");
+
+    /* 0.7 B3 phase 2: udp-receive backend | frontend (restart-only); not written = backend; any letter case; the last statement wins */
+    if (parse_ok("options { };", &cfg)) {
+        CHECK(cfg.udp_receive == UDP_RECEIVE_BACKEND);
+        free_server_config_fields(&cfg);
+    }
+    if (parse_ok("options { udp-receive frontend; };", &cfg)) {
+        CHECK(cfg.udp_receive == UDP_RECEIVE_FRONTEND);
+        free_server_config_fields(&cfg);
+    }
+    if (parse_ok("options { udp-receive frontend; udp-receive Backend; router-threads 2; };", &cfg)) {
+        CHECK(cfg.udp_receive == UDP_RECEIVE_BACKEND && cfg.router_threads == 2);
+        free_server_config_fields(&cfg);
+    }
+    if (parse_ok("options { udp-receive FRONTEND; };", &cfg)) {
+        CHECK(cfg.udp_receive == UDP_RECEIVE_FRONTEND);
+        free_server_config_fields(&cfg);
+    }
+    expect_an_error("udp-receive with another word", "\noptions { udp-receive routers; };", "line 2|udp-receive: invalid value 'routers'|backend or frontend");
+    expect_an_error("udp-receive without a value", "options { udp-receive; };", "udp-receive: a value is required");
+    expect_an_error("udp-receive without a semicolon", "options { udp-receive backend };", "udp-receive: missing ';'");
+    expect_an_error("udp-receive with a number", "options { udp-receive 1; };", "udp-receive: invalid value '1'");
 }
 
 static void test_options_syntax_errors(void) {

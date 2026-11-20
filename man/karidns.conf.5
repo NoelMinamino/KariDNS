@@ -1,4 +1,4 @@
-.TH KARIDNS.CONF 5 "2026-11-20" "KariDNS" "KariDNS Manual"
+.TH KARIDNS.CONF 5 "2026-11-21" "KariDNS" "KariDNS Manual"
 .\" Generated from docs/karidns.md by man/md2man.pl (make man): edit the Markdown manual, not this page.
 .SH NAME
 karidns.conf \- the configuration file of karidns(8)
@@ -175,14 +175,14 @@ configuration.
 Settings that are fixed when the server starts (\fBport\fR, \fBbind\-address\fR,
 \fBlisten\-on\fR, \fBlisten\-on\-v6\fR, \fBuser\fR, \fBgroup\fR,
 \fBpid\-file\fR, \fBudp\-recvbuf\-size\fR, \fBudp\-sndbuf\-size\fR,
-\fBtcp\-window\fR, \fBrouter\-threads\fR, \fBworker\-threads\fR, the
-\fBcontrol\-channel\fR socket path, \fBdnstap\fR, a log file in a directory that
-was not open at start-up (see \fBlogging\fR), and the interface snapshot that
-\fBlocalhost\fR / \fBlocalnets\fR in address match lists are evaluated against)
-need a restart; a reload (\fBSIGHUP\fR, \fBkarictl reload\fR / \fBreconfig\fR)
-applies everything else. When a reload changes one of them, the server logs a
-warning that names it, and \fBkarictl\fR shows it as \fBOK (restart needed
-for: ...)\fR.
+\fBtcp\-window\fR, \fBrouter\-threads\fR, \fBworker\-threads\fR,
+\fBudp\-receive\fR, the \fBcontrol\-channel\fR socket path, \fBdnstap\fR, a log
+file in a directory that was not open at start-up (see \fBlogging\fR), and the
+interface snapshot that \fBlocalhost\fR / \fBlocalnets\fR in address match lists
+are evaluated against) need a restart; a reload (\fBSIGHUP\fR, \fBkarictl
+reload\fR / \fBreconfig\fR) applies everything else. When a reload changes one
+of them, the server logs a warning that names it, and \fBkarictl\fR shows it as
+\fBOK (restart needed for: ...)\fR.
 .IP \(bu 2
 A reload that cannot be applied (the file cannot be read, a configuration error,
 a log file that cannot be opened) keeps the running configuration. A reload
@@ -847,6 +847,27 @@ configuration error (\fBkaricheck conf\fR shows it with the file and
 line). Changing either needs a restart: a reload that changes it logs a warning,
 answers \fBOK reloaded (restart needed for: router\-threads)\fR and keeps the
 counts of the start.
+.TP 8
+\fBudp\-receive backend|frontend;\fR
+\fIDefault:\fR \fBbackend\fR
+.br
+\fIDescription:\fR Who reads the UDP queries (0.7 B3 phase 2). \fBbackend\fR:
+every worker thread reads its own UDP socket of each listen address (the manager
+makes them before the fork, one per worker and address, all in the address's
+\fBSO_REUSEPORT_LB\fR group; the worker's descriptor may only receive) and the
+routers only send the replies: the router no longer reads every query and passes
+it on, which was its main cost per query. \fBfrontend\fR: the routers read the
+queries on their own sockets and hand them to the workers over the IPC, as
+before 0.7 (kept for comparison). Both answer the same; \fBkarictl ipcstats\fR
+shows the queries of each worker as \fBipcworker.<n>.queries\fR with
+\fBbackend\fR and those of each router as \fBipcrouter.<n>.queries\fR with
+\fBfrontend\fR. \fBbackend\fR needs one socket per worker and listen address:
+more than 4096 (\fBworker\-threads\fR x listen addresses), or more descriptors
+than the limit (\fBRLIMIT_NOFILE\fR, about twice the sockets plus the IPC
+pairs), refuses the start with the reason. A small server (1 router, 1 worker)
+has one socket per listen address either way. Any other value is a configuration
+error (\fBkaricheck conf\fR shows it with the file and line). Changing it needs
+a restart (\fBOK reloaded (restart needed for: udp\-receive)\fR).
 .TP 8
 \fBresponse\-cache\-size <size>;\fR
 \fIDefault:\fR \fB32M\fR

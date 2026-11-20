@@ -1,6 +1,8 @@
 #!/bin/sh
 # ==============================================================================
-# run_udp_router_split_test.sh - 4 Frontend routers and 4 Backend workers (B3 phase 1): the UDP path with several routers
+# run_udp_router_split_test.sh - 4 Frontend routers and 4 Backend workers (B3 phase 1 and 2): the UDP path with several routers, run once with
+#   udp-receive frontend (the routers read the queries, B3 phase 1) and once with udp-receive backend (the default since B3 phase 2: every worker reads
+#   its own UDP socket of each address and the routers only send the replies)
 #
 #   A  a server on the wildcard addresses (the default), router-threads 4 / worker-threads 4:
 #        - the start-up line "4 routers, 4 workers ... set by router-threads and worker-threads"
@@ -14,8 +16,12 @@
 #   B  a server bound to specific addresses (127.0.0.1, and the alias when root): the same load and checks; allow-query-on takes the address
 #        the socket is bound to (the router does not ask the kernel for the destination of these sockets): a zone with allow-query-on { 127.0.0.1; }
 #        answers a query to 127.0.0.1, one with allow-query-on { 192.0.2.77; } refuses it, and the alias is refused by the first
+#   With udp-receive backend A and B are the same, but the counters are the workers': the start-up line "udp-receive backend: N UDP receive socket(s)
+#   (4 worker(s) x M listen address(es))", ipcworker.<w>.queries above 0 for all four workers and their sum exactly the queries sent, and the routers
+#   read none of them (ipcrouter.<r>.queries do not move); the answers still come from the address and port the query went to (the router sends on
+#   its descriptor of the worker's socket).  With udp-receive frontend there are no ipcworker lines.
 #
-# SKIP (exit 0, with the reason) without karidns, karictl, dag, perl.  The alias checks are skipped without root (ifconfig lo0 alias).  About 40 s.
+# SKIP (exit 0, with the reason) without karidns, karictl, dag, perl.  The alias checks are skipped without root (ifconfig lo0 alias).  About 80 s (both modes).
 # See docs/karidns.md (thread layout, router-threads), docs/karictl.md (ipcstats).
 # ==============================================================================
 . "$(dirname "$0")/lib_proc.sh"
@@ -92,6 +98,7 @@ options {
     $1
     router-threads 4;
     worker-threads 4;
+    udp-receive $MODE;
     pid-file "none";
     $USER_OPT
 };
@@ -120,19 +127,27 @@ start_server() {
 
 ipcv() { ctl ipcstats 2>/dev/null | sed -n "s/^$1=//p" | head -1; }   # ipcv ipc.dropped.total / ipcv ipcrouter.2.queries
 routed_sum() { s=0; for r in 0 1 2 3; do s=$((s + $(ipcv ipcrouter.$r.queries))); done; echo "$s"; }
+wrecv_sum() { s=0; for w in 0 1 2 3; do v=$(ipcv ipcworker.$w.queries); s=$((s + ${v:-0})); done; echo "$s"; }   # (udp-receive backend: the workers' own sockets)
 kv() { echo "$1" | tr ' ' '\012' | sed -n "s/^$2=//p" | head -1; }   # kv "sent=3 received=2" received
 
 # load LABEL N NSOCK WINDOW BATCH PAUSE_MS: the client against the server; every query answered, every answer right
 load() {
-    kari_udp_snap "$T/udp.snap"
+    kari_udp_snap "$T/udp.snap"; qd0=$(sysctl -n net.inet.ip.intr_queue_drops 2>/dev/null || echo 0)
     out=$(perl "$CLIENT" "$PORT" "$2" "$3" "$4" 15 "$IPS" "$5" "$6" 2>&1)
     s=$(kv "$out" sent); r=$(kv "$out" received); u=$(kv "$out" unanswered); b=$(kv "$out" bad); k=$(kv "$out" socks)
+    qd=$(($(sysctl -n net.inet.ip.intr_queue_drops 2>/dev/null || echo 0) - qd0))
     if [ "$s" = "$2" ] && [ "$r" = "$2" ] && [ "$u" = "0" ] && [ "$b" = "0" ]; then
         ok "$1: $2 queries from $3 sockets (to $IPS), all answered, all right ($out)"
+        # loopback output goes through the one netisr IP input queue (256 deep): a burst of answers that overflows it is dropped by the kernel before
+        # UDP, counted in net.inet.ip.intr_queue_drops (seen on CI, 5 of 20000).  Such a loss is not the server's, when the queue dropped at least as many
+        # datagrams during this load (the checks that follow still demand that the routers and workers passed every query on and dropped none).
+    elif [ "$s" = "$2" ] && [ "$b" = "0" ] && [ "$((r + u))" = "$2" ] && [ "$u" -le "$qd" ]; then
+        ok "$1: $2 queries from $3 sockets (to $IPS), all right; $u answer(s) lost in the kernel's loopback IP input queue (net.inet.ip.intr_queue_drops +$qd) ($out)"
     else
         bad "$1: $out" "$out
     netstat -s -p udp since the start of this load (the client and the server share the host):
 $(kari_udp_delta "$T/udp.snap")
+    net.inet.ip.intr_queue_drops +$qd during this load
 $(ctl ipcstats | grep -v '=0$')"
     fi
     LAST_SOCKS=${k:-0}
@@ -146,19 +161,43 @@ one_server() {
     else
         bad "$lbl: start-up line" "$(grep Startup "$LOG")"
     fi
-    sum0=$(routed_sum); drop0=$(ipcv ipc.dropped.total)
+    if [ "$MODE" = "backend" ]; then
+        if grep -q '\[Startup\] udp-receive backend: [0-9]* UDP receive socket(s) (4 worker(s) x [0-9]* listen address(es))' "$LOG"; then
+            ok "$lbl: $(grep -o 'udp-receive backend: [0-9]* UDP receive socket(s) (.* listen address(es))' "$LOG" | head -1)"
+        else
+            bad "$lbl: no udp-receive backend start-up line" "$(grep Startup "$LOG")"
+        fi
+    elif grep -q 'udp-receive backend' "$LOG"; then
+        bad "$lbl: udp-receive frontend, but the log speaks of backend receive sockets" "$(grep 'udp-receive' "$LOG")"
+    fi
+    sum0=$(routed_sum); wsum0=$(wrecv_sum); drop0=$(ipcv ipc.dropped.total)
     load "$lbl: 64 source ports" 20000 64 256 16 0
-    # (the counters of the routers are read until they reach the 20000 or 10 s are up: a router that is late on a loaded host is waited for)
-    i=0; while [ $i -lt 50 ] && [ "$(($(routed_sum) - sum0))" -lt 20000 ]; do sleep 0.2; i=$((i + 1)); done
-    sum1=$(routed_sum); drop1=$(ipcv ipc.dropped.total)
+    # (the counters are read until they reach the 20000 or 10 s are up: a router or a worker that is late on a loaded host is waited for)
+    if [ "$MODE" = "backend" ]; then
+        i=0; while [ $i -lt 50 ] && [ "$(($(wrecv_sum) - wsum0))" -lt 20000 ]; do sleep 0.2; i=$((i + 1)); done
+    else
+        i=0; while [ $i -lt 50 ] && [ "$(($(routed_sum) - sum0))" -lt 20000 ]; do sleep 0.2; i=$((i + 1)); done
+    fi
+    sum1=$(routed_sum); wsum1=$(wrecv_sum); drop1=$(ipcv ipc.dropped.total)
     if [ "$LAST_SOCKS" = "64" ]; then ok "$lbl: every socket was answered"; else bad "$lbl: $LAST_SOCKS of 64 sockets were answered"; fi
     if [ "$((drop1 - drop0))" = "0" ]; then ok "$lbl: karictl ipcstats counted no drop"; else bad "$lbl: ipc.dropped.total grew by $((drop1 - drop0))" "$(ctl ipcstats | grep -v '=0$')"; fi
-    if [ "$((sum1 - sum0))" = "20000" ]; then ok "$lbl: the routers passed on 20000 queries (ipcrouter.<r>.queries)"; else bad "$lbl: the routers' counters grew by $((sum1 - sum0)), want 20000" "$(ctl ipcstats | grep ipcrouter)"; fi
-    idle=""
-    for r in 0 1 2 3; do
-        [ "$(ipcv ipcrouter.$r.queries)" -gt 0 ] || idle="$idle $r"
-    done
-    if [ -z "$idle" ]; then ok "$lbl: every router passed on queries ($(ctl ipcstats | grep ipcrouter | tr '\n' ' '))"; else bad "$lbl: routers that served nothing:$idle" "$(ctl ipcstats | grep ipcrouter)"; fi
+    if [ "$MODE" = "backend" ]; then
+        if [ "$((wsum1 - wsum0))" = "20000" ]; then ok "$lbl: the workers read 20000 queries from their own sockets (ipcworker.<w>.queries)"; else bad "$lbl: the workers' counters grew by $((wsum1 - wsum0)), want 20000" "$(ctl ipcstats | grep -E 'ipcworker|ipcrouter')"; fi
+        if [ "$((sum1 - sum0))" = "0" ]; then ok "$lbl: the routers read none of them (ipcrouter.<r>.queries did not move)"; else bad "$lbl: the routers' counters grew by $((sum1 - sum0)), want 0" "$(ctl ipcstats | grep -E 'ipcworker|ipcrouter')"; fi
+        idle=""
+        for w in 0 1 2 3; do
+            [ "$(ipcv ipcworker.$w.queries)" -gt 0 ] 2>/dev/null || idle="$idle $w"
+        done
+        if [ -z "$idle" ]; then ok "$lbl: every worker read queries ($(ctl ipcstats | grep ipcworker | tr '\n' ' '))"; else bad "$lbl: workers that read nothing:$idle" "$(ctl ipcstats | grep -E 'ipcworker|ipcrouter')"; fi
+    else
+        if [ "$((sum1 - sum0))" = "20000" ]; then ok "$lbl: the routers passed on 20000 queries (ipcrouter.<r>.queries)"; else bad "$lbl: the routers' counters grew by $((sum1 - sum0)), want 20000" "$(ctl ipcstats | grep ipcrouter)"; fi
+        idle=""
+        for r in 0 1 2 3; do
+            [ "$(ipcv ipcrouter.$r.queries)" -gt 0 ] || idle="$idle $r"
+        done
+        if [ -z "$idle" ]; then ok "$lbl: every router passed on queries ($(ctl ipcstats | grep ipcrouter | tr '\n' ' '))"; else bad "$lbl: routers that served nothing:$idle" "$(ctl ipcstats | grep ipcrouter)"; fi
+        if ctl ipcstats | grep -q '^ipcworker\.'; then bad "$lbl: ipcworker lines with udp-receive frontend" "$(ctl ipcstats | grep ipcworker)"; fi
+    fi
     load "$lbl: paced single queries (a short batch each)" 300 8 1 1 3
     load "$lbl: bursts of 33" 3300 33 33 33 0
 }
@@ -167,10 +206,11 @@ q() { _ip=$1; _n=$2; "$DAG" "@$_ip" -p "$PORT" "$_n" A +nohexdump +time=2 +tries
 answered() { if echo "$2" | grep -q "status: NOERROR" && echo "$2" | grep -Eq "$3"; then ok "$1"; else bad "$1: want NOERROR and /$3/" "$2"; fi; }
 refused() { if echo "$2" | grep -q "status: REFUSED"; then ok "$1"; else bad "$1: want REFUSED" "$2"; fi; }
 
-echo "== A. the wildcard addresses, 4 routers + 4 workers"
+for MODE in backend frontend; do
+echo "== A ($MODE). the wildcard addresses, 4 routers + 4 workers, udp-receive $MODE"
 write_conf ""
 if ! start_server; then bad "A: the server did not start" "$(tail -20 "$LOG")"; exit 1; fi
-one_server "A"
+one_server "A $MODE"
 if [ "$ALIAS_ADDED" = "1" ]; then
     answered "A: a query to the alias ($ALIAS_IP) is answered by the wildcard socket, from the alias (dag takes no answer from another address)" "$(q $ALIAS_IP www.example.test)" "192\.0\.2\.1"
 else
@@ -181,10 +221,10 @@ refused "A: allow-query-on { 192.0.2.77; } refuses a query to 127.0.0.1" "$(q 12
 [ "$ALIAS_ADDED" = "1" ] && refused "A: allow-query-on { 127.0.0.1; } refuses a query to $ALIAS_IP" "$(q $ALIAS_IP www.on.test)"
 stop_server
 
-echo "== B. sockets bound to specific addresses, 4 routers + 4 workers"
+echo "== B ($MODE). sockets bound to specific addresses, 4 routers + 4 workers, udp-receive $MODE"
 if [ "$ALIAS_ADDED" = "1" ]; then write_conf "bind-address { 127.0.0.1; $ALIAS_IP; };"; else write_conf "bind-address { 127.0.0.1; };"; fi
 if ! start_server; then bad "B: the server did not start" "$(tail -20 "$LOG")"; exit 1; fi
-one_server "B"
+one_server "B $MODE"
 answered "B: allow-query-on { 127.0.0.1; } lets a query to 127.0.0.1 in (the address the socket is bound to)" "$(q 127.0.0.1 www.on.test)" "192\.0\.2\.80"
 refused "B: allow-query-on { 192.0.2.77; } refuses a query to 127.0.0.1" "$(q 127.0.0.1 www.off.test)"
 if [ "$ALIAS_ADDED" = "1" ]; then
@@ -192,6 +232,7 @@ if [ "$ALIAS_ADDED" = "1" ]; then
     answered "B: the second address answers the queries it gets" "$(q $ALIAS_IP www.example.test)" "192\.0\.2\.1"
 fi
 stop_server
+done
 
 echo "== passed $PASS, failed $FAILS"
 [ "$FAILS" -eq 0 ]

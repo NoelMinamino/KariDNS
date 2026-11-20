@@ -28,8 +28,10 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // SQLite3's audit log and versions have the resolution of a second: a change "after" another is made after a pause
 const tick = () => sleep(PG ? 50 : 2200);
 
+// Connection: close: no keep-alive socket is reused.  The API closes an idle one after 5 s; on a loaded CI VM the client could send on a socket
+// the server was closing at that moment (a CI run failed with "fetch failed", ECONNRESET).
 async function call(method, p, { body, cookie, csrf, origin } = {}) {
-  const h = {};
+  const h = { Connection: 'close' };
   if (cookie) h.Cookie = `karidns_session=${cookie}`;
   if (csrf) h['X-KariDNS-CSRF'] = csrf;
   if (origin) h.Origin = origin;

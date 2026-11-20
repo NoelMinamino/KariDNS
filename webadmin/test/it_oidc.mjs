@@ -20,8 +20,10 @@ const bad = (name, why) => { fails++; console.log(`  [FAIL] ${name}${why ? ` (${
 const check = (name, cond, why) => (cond ? ok(name) : bad(name, typeof why === 'function' ? why() : why));
 const eq = (name, got, want) => check(name, JSON.stringify(got) === JSON.stringify(want), () => `got ${JSON.stringify(got)}, wanted ${JSON.stringify(want)}`);
 
+// Connection: close: no keep-alive socket is reused.  The API closes an idle one after 5 s; on a loaded CI VM the client could send on a socket
+// the server was closing at that moment (a CI run failed with "fetch failed", ECONNRESET).
 async function call(method, p, { body, cookie, csrf, origin } = {}) {
-  const h = {};
+  const h = { Connection: 'close' };
   if (cookie) h.Cookie = `karidns_session=${cookie}`;
   if (csrf) h['X-KariDNS-CSRF'] = csrf;
   if (origin) h.Origin = origin;
@@ -42,11 +44,11 @@ const session = (r) => {
   return s;
 };
 const ctl = async (c) => {
-  const r = await fetch(`${IDP}/__control`, { method: 'POST', body: JSON.stringify(c) });
+  const r = await fetch(`${IDP}/__control`, { method: 'POST', headers: { Connection: 'close' }, body: JSON.stringify(c) });
   if (r.status !== 200) bad('the fake provider takes its control', `${r.status} ${await r.text()}`);
 };
 const states = () => Number(execFileSync(process.env.IT_STATES_SQL, [], { encoding: 'utf8' }).trim());
-const get = (url, headers = {}) => fetch(url, { redirect: 'manual', headers });
+const get = (url, headers = {}) => fetch(url, { redirect: 'manual', headers: { Connection: 'close', ...headers } });
 
 // the browser's part by hand: start -> the provider -> the callback with the cookie of the start.  -> { location, session: { cookie, do }, start, cb }
 async function browse(query = '', { cookie } = {}) {

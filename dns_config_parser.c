@@ -8447,6 +8447,7 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
   config->wire_cache_max_records = 0;
   config->router_threads = 0;
   config->worker_threads = 0;
+  config->udp_receive = UDP_RECEIVE_BACKEND;
   config->response_cache_size = 32 * 1024 * 1024;
   config->additional_from_auth = ADDITIONAL_AUTH_YES;
   config->notify_retry.retries = NOTIFY_RETRIES_DEFAULT;
@@ -9005,6 +9006,34 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
           }
           if (is_router) config->router_threads = (uint32_t)n;
           else config->worker_threads = (uint32_t)n;
+        } else if (strcmp(key, "udp-receive") == 0) {
+          /* 0.7 B3 phase 2 (restart-only): backend | frontend (UDP_RECEIVE_*); a second statement replaces the first, as for the other options */
+          tok = get_next_token(ctx);
+          if (tok.type != TOKEN_STRING || !tok.value) {
+            conf_error(ctx, "options", "udp-receive: a value is required (backend or frontend)");
+            free(key);
+            free_token(&tok);
+            return -1;
+          }
+          if (strcasecmp(tok.value, "backend") == 0) {
+            config->udp_receive = UDP_RECEIVE_BACKEND;
+          } else if (strcasecmp(tok.value, "frontend") == 0) {
+            config->udp_receive = UDP_RECEIVE_FRONTEND;
+          } else {
+            conf_error(ctx, "options", "udp-receive: invalid value '%.64s' (expected backend or frontend)", tok.value);
+            free(key);
+            free_token(&tok);
+            return -1;
+          }
+          free_token(&tok);
+          tok = get_next_token(ctx);
+          if (tok.type != TOKEN_SEMICOLON) {
+            conf_error(ctx, "options", "udp-receive: missing ';'");
+            free(key);
+            free_token(&tok);
+            return -1;
+          }
+          free_token(&tok);
         } else if (strcmp(key, "response-cache-size") == 0) {
           /* 0 = 使わない。それ以外は 4K/16M のような大きさ (上限 1024M)。書き損じは誤りにする */
           int sz = 0;

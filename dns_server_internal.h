@@ -135,6 +135,13 @@ static inline bool udp_batch_drained(int n_recv) { return n_recv < UDP_BATCH_SIZ
 #define UDP_IPC_PAYLOAD_MAX 65535
 #define UDP_IPC_BUFFER_SIZE ((sizeof(udp_ipc_t) + UDP_IPC_PAYLOAD_MAX + 7) & ~7)
 
+// Frontend ルーター用 UDP制御メッセージバッファ共用体 (the worker's own UDP sockets use it too: udp-receive backend)
+#define ROUTER_CMSG_BUF_SIZE 128
+typedef union {
+  struct cmsghdr cmsg;
+  uint8_t buf[ROUTER_CMSG_BUF_SIZE];
+} router_cmsg_buf_t;
+
 // ワーカーローカル用 UDPバッチコンテキスト (ヒープ保持)
 typedef struct {
   struct mmsghdr rx_msgs[UDP_BATCH_SIZE];
@@ -145,14 +152,13 @@ typedef struct {
   struct mmsghdr tx_msgs[UDP_BATCH_SIZE];
   struct iovec   tx_iov[UDP_BATCH_SIZE];
   alignas(8) uint8_t tx_buffers[UDP_BATCH_SIZE][UDP_IPC_BUFFER_SIZE];
-} udp_batch_ctx_t;
 
-// Frontend ルーター用 UDP制御メッセージバッファ共用体
-#define ROUTER_CMSG_BUF_SIZE 128
-typedef union {
-  struct cmsghdr cmsg;
-  uint8_t buf[ROUTER_CMSG_BUF_SIZE];
-} router_cmsg_buf_t;
+  /* udp-receive backend (B3 phase 2): the datagrams read from the worker's own UDP sockets go into rx_buffers too, behind the room of the udp_ipc_t
+   * header that worker_udp_rx() fills in (the client from msg_name, the destination from the cmsg of a wildcard socket) */
+  struct mmsghdr urx_msgs[UDP_BATCH_SIZE];
+  struct iovec   urx_iov[UDP_BATCH_SIZE];
+  router_cmsg_buf_t urx_cbuf[UDP_BATCH_SIZE];
+} udp_batch_ctx_t;
 
 // Frontend ルーター用 UDPバッチコンテキスト
 typedef struct {
@@ -1838,7 +1844,30 @@ void *response_logger_thread_func(void *arg);
 void *query_logger_thread_func(void *arg);
 bool init_async_io_pool(void);
 int open_router_udp_sockets(server_config_t *cfg, int out_fds[MAX_BIND_ADDRS], bool out_is_wildcard[MAX_BIND_ADDRS], router_src_t out_src[MAX_BIND_ADDRS]);
+int open_router_udp_sockets_given(server_config_t *cfg, int n_given, int out_fds[MAX_BIND_ADDRS], bool out_is_wildcard[MAX_BIND_ADDRS], router_src_t out_src[MAX_BIND_ADDRS]);
 bool router_src_from_sockaddr(const struct sockaddr_storage *ss, router_src_t *out);
+
+/* ---- 0.7 B3 phase 2: udp-receive backend (decision Q2) ----
+ * The manager makes, before the Backend and the routers are forked, one SO_REUSEPORT_LB UDP socket per (worker, listen address): g_be_udp_fds[w][a],
+ * a < g_be_udp_count (0: udp-receive frontend, the routers read the queries as before).  The Backend limits its descriptors to CAP_RECV + CAP_EVENT
+ * (worker w reads only its own row, receive only: it never sends UDP, Rule 2); a router keeps the rows of the workers whose replies come to it
+ * (be_udp_reply_router()), limited to CAP_SEND + CAP_CONNECT (sendmsg with a destination) + CAP_GETSOCKNAME, and never reads them.  The replies take
+ * the Backend->Frontend IPC as before: sock_fd_idx a < g_be_udp_count names the address, and the router sends on its descriptor of that worker's
+ * socket (router_reply_fd()), so the reply leaves from the socket and the address the query came to. */
+#define BE_UDP_SOCKETS_MAX 4096              /* worker-threads x listen addresses: more is refused at start-up (be_udp_budget()) */
+#define WORKER_UDP_UDATA 4096                /* kevent udata of the worker's UDP socket a: WORKER_UDP_UDATA + a (never a TCP context pointer) */
+extern int g_be_udp_count;
+extern int g_be_udp_fds[KARIDNS_WORKER_THREADS_MAX][MAX_BIND_ADDRS];
+extern bool g_be_udp_wild[MAX_BIND_ADDRS];
+extern router_src_t g_be_udp_src[MAX_BIND_ADDRS];
+enum { UDP_RX_OK = 0, UDP_RX_TRUNC = 1, UDP_RX_SHORT = 2 };
+int udp_ipc_from_recv(udp_ipc_t *msg, const struct msghdr *mh, size_t len, int32_t sock_idx, bool want_dst, const router_src_t *bound_src);
+int router_reply_fd(int worker_idx, int32_t sock_idx, const int *local_fds, int num_local);
+int be_udp_reply_router(int worker, int routers);
+bool be_udp_budget(int workers, int addrs, int routers, long long nofile, char *err, size_t errlen);
+bool open_backend_udp_sockets(server_config_t *cfg, int num_workers, char *err, size_t errlen);
+void be_udp_close_all(void);
+int worker_udp_rx(udp_pass_t *pass, int fd, int sock_idx, int reply_fd);
 void setup_udp_socket_buffers(int fd, int desired_rcv, int desired_snd);
 void apply_tcp_listen_opts(int fd, const server_config_t *cfg, bool verbose);
 void apply_tcp_mss(int fd, tcp_stream_ctx_t *c, int mss);
@@ -1923,6 +1952,8 @@ typedef enum {
   IPCD_WREP_FULL,       /* worker: replies the IPC to the router refused (queue full) */
   IPCD_WREP_ERR,        /* worker: replies the IPC refused for another reason */
   IPCD_WASYNC_FULL,     /* worker: queries dropped because the queue of the asynchronous resolution threads (program and forward zones) was full, or the query could not be copied */
+  IPCD_WURX_TRUNC,      /* worker (udp-receive backend): datagrams of its own UDP socket larger than the receive buffer (MSG_TRUNC) */
+  IPCD_WURX_SHORT,      /* worker (udp-receive backend): datagrams of its own UDP socket shorter than a DNS header */
   IPCD_COUNT
 } ipcd_t;
 typedef struct {
@@ -1933,6 +1964,8 @@ typedef struct {
 void ipcd_add(ipcd_t c, uint64_t n);
 void ipcd_routed_add(uint64_t n);
 uint64_t ipcd_routed(int slot);
+void ipcd_wrecv_add(int worker, uint64_t n);   /* udp-receive backend: the queries worker `worker` read from its own UDP sockets (one writer per slot) */
+uint64_t ipcd_wrecv(int worker);
 uint64_t ipcd_total(ipcd_t c);
 size_t ipcd_format(char *buf, size_t cap);
 enum { SOCKBUF_IPC = 0, SOCKBUF_UDP = 1 };   /* sockbuf_note(): the queues between the routers and the workers, the UDP sockets of the routers */

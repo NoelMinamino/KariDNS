@@ -6,7 +6,8 @@
 # during start-up, and must not wait forever for a child.  Driven with the
 # fault-injection shim (tests/fi/kari_fi_preload.c).
 #  1. The Backend fails (its first pthread_create) while the Frontend routers are still
-#     starting (the first bind() of every router, its UDP socket, delayed 3 s; the Backend
+#     starting (the first bind() of every router, its UDP socket, delayed 3 s: this needs udp-receive frontend, with
+#     udp-receive backend the Frontend binds before the fork and the routers do not bind; the Backend
 #     binds only in its worker threads, which it never starts here).  The manager's SIGTERM
 #     used to reach a router that still ran the manager's flag-only handler and
 #     was lost; the router then waited for a Backend that was already gone.
@@ -69,7 +70,7 @@ $ORIGIN example.test.
 www IN A 192.0.2.10
 ZEOF
 cat > "$TMP_DIR/karidns.conf" <<EOF
-options { port $PORT; bind-address { 127.0.0.1; }; pid-file "$TMP_DIR/karidns.pid"; $USER_OPT };
+options { port $PORT; bind-address { 127.0.0.1; }; pid-file "$TMP_DIR/karidns.pid"; udp-receive frontend; $USER_OPT };
 zone "example.test" { type primary; file "$TMP_DIR/example.test.zone"; };
 EOF
 chmod 644 "$TMP_DIR"/*.zone "$TMP_DIR/karidns.conf"

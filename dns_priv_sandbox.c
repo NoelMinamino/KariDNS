@@ -401,6 +401,18 @@ bool limit_client_socket_rights(int fd) {
   return ok;
 }
 
+bool limit_udp_recv_rights(int fd) {
+  cap_rights_t rights;
+  cap_rights_init(&rights, CAP_RECV, CAP_EVENT);
+  return limit_fd_rights(fd, &rights, "UDP receive socket");
+}
+
+bool limit_udp_send_rights(int fd) {
+  cap_rights_t rights;
+  cap_rights_init(&rights, CAP_SEND, CAP_CONNECT, CAP_GETSOCKNAME);
+  return limit_fd_rights(fd, &rights, "UDP send socket");
+}
+
 void enter_capsicum_sandbox(void) {
 #ifndef SANITIZER_BUILD
   /* the sender thread may reconnect meanwhile (it limits its own socket): read the descriptor once */

@@ -15,7 +15,11 @@
 /* options { router-threads; worker-threads; }: the Frontend routers and the Backend workers (dns_server_core.c plan_threads()) */
 #define KARIDNS_ROUTER_THREADS_MAX 8
 #define KARIDNS_WORKER_THREADS_MAX 128
-#define KARIDNS_NSID_MAX         128                 /* options { nsid }: octets (RFC 5001 §2.3 puts no limit; a long one would not fit a 512-octet response) */
+/* options { udp-receive backend | frontend; } (0.7 B3 phase 2, restart-only): who reads the UDP queries.  backend (the default): every Backend worker
+ * reads its own receive-only sockets (one per listen address, made by the manager before the fork) and the routers only send the replies; frontend:
+ * the routers read the queries and hand them to the workers over the IPC, as before */
+enum { UDP_RECEIVE_BACKEND = 0, UDP_RECEIVE_FRONTEND = 1 };
+#define KARIDNS_NSID_MAX        128                 /* options { nsid }: octets (RFC 5001 §2.3 puts no limit; a long one would not fit a 512-octet response) */
 #define KARIDNS_UDP_BUFSIZE_MIN  512                /* RFC 6891 §6.2.3 */
 #define KARIDNS_UDP_BUFSIZE_MAX  4096
 #define KARIDNS_UDP_BUFSIZE_DEFAULT 1232             /* DNS Flag Day 2020 */
@@ -915,6 +919,7 @@ typedef struct server_config_s {
   uint32_t wire_cache_max_records;
   uint32_t router_threads;     /* `router-threads` (restart-only): the Frontend routers, 1..KARIDNS_ROUTER_THREADS_MAX; 0 = by the CPUs this process may run on */
   uint32_t worker_threads;     /* `worker-threads` (restart-only): the Backend workers, 1..KARIDNS_WORKER_THREADS_MAX; 0 = by the CPUs this process may run on */
+  uint8_t udp_receive;         /* `udp-receive` (restart-only): UDP_RECEIVE_BACKEND (0, also when not written) or UDP_RECEIVE_FRONTEND */
   size_t response_cache_size;  /* 共有の応答キャッシュの大きさ (オクテット)。0 = 使わない */
   uint64_t generation;         /* 公開した設定ごとに増える (応答キャッシュの鍵) */
   additional_from_auth_t additional_from_auth;

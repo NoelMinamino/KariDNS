@@ -375,6 +375,92 @@ int main(void) {
     CHECK(a1.rcode == 0 && a1.ancount == 1 && a2.rcode == 0 && a2.ancount == 1);
     CHECK(!read_answer(sk[1]).got);                                    /* once */
 
+    /* -- 0.7 B3 phase 2, udp-receive backend: the query comes in on the worker's own UDP socket (worker_udp_rx(): the header from msg_name and the
+     *    address the socket is bound to, socket index 2), is answered on the pair to the router with that index and the client's address; one for the
+     *    zone that is not in memory parks with them and its answer, after the wake-up, goes out the same way (the entry's pair, not the pass's) */
+    {
+        int us = socket(AF_INET, SOCK_DGRAM, 0), uc = socket(AF_INET, SOCK_DGRAM, 0);
+        CHECK(us >= 0 && uc >= 0);
+        struct sockaddr_in ua, ucl;
+        memset(&ua, 0, sizeof(ua));
+        ua.sin_family = AF_INET;
+#if defined(__FreeBSD__) || defined(__APPLE__)
+        ua.sin_len = sizeof(ua);
+#endif
+        ua.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        ucl = ua;
+        socklen_t sl = sizeof(ua);
+        CHECK(bind(us, (struct sockaddr *)&ua, sizeof(ua)) == 0 && getsockname(us, (struct sockaddr *)&ua, &sl) == 0);
+        sl = sizeof(ucl);
+        CHECK(bind(uc, (struct sockaddr *)&ucl, sizeof(ucl)) == 0 && getsockname(uc, (struct sockaddr *)&ucl, &sl) == 0);
+        fcntl(us, F_SETFL, fcntl(us, F_GETFL, 0) | O_NONBLOCK);
+        g_be_udp_count = 3;
+        g_be_udp_wild[2] = false;
+        struct sockaddr_storage bss;
+        memset(&bss, 0, sizeof(bss));
+        memcpy(&bss, &ua, sizeof(ua));
+        CHECK(router_src_from_sockaddr(&bss, &g_be_udp_src[2]));
+        const uint64_t q0 = atomic_load(&wctx.query_count), r0 = ipcd_wrecv(0);
+        const uint64_t short0 = ipcd_total(IPCD_WURX_SHORT), trunc0 = ipcd_total(IPCD_WURX_TRUNC);
+        uint8_t qb[600];
+        #define UDP_IN(id) do { size_t ql_ = build_query(qb, (id), true, 0); CHECK(sendto(uc, qb, ql_, 0, (struct sockaddr *)&ua, sizeof(ua)) == (ssize_t)ql_); \
+            struct pollfd up_ = { us, POLLIN, 0 }; CHECK(poll(&up_, 1, 2000) == 1); } while (0)
+        /* the raw answer on the router's pair: the header the router reads */
+        #define RAW_ANSWER(hdr, id_out) do { uint8_t rb_[sizeof(udp_ipc_t) + 4096]; struct pollfd rp_ = { sk[1], POLLIN, 0 }; ssize_t rn_ = poll(&rp_, 1, 1000) == 1 ? \
+            recv(sk[1], rb_, sizeof(rb_), 0) : -1; CHECK(rn_ > (ssize_t)sizeof(udp_ipc_t) + 12); memset(&(hdr), 0, sizeof(hdr)); (id_out) = 0; \
+            if (rn_ > (ssize_t)sizeof(udp_ipc_t) + 12) { memcpy(&(hdr), rb_, sizeof(hdr)); (id_out) = (uint16_t)((rb_[sizeof(udp_ipc_t)] << 8) | rb_[sizeof(udp_ipc_t) + 1]); } } while (0)
+
+        udp_ipc_t rh;
+        uint16_t rid;
+        UDP_IN(0x6101);                                              /* in memory: answered at once */
+        CHECK(worker_udp_rx(&w, us, 2, sk[0]) == 1 && w.n_tx == 0 && table.nwait == 0);
+        RAW_ANSWER(rh, rid);
+        CHECK(rid == 0x6101 && rh.sock_fd_idx == 2 && rh.addr_len == sizeof(struct sockaddr_in) && rh.client_addr.sin.sin_port == ucl.sin_port &&
+              rh.client_addr.sin.sin_addr.s_addr == htonl(INADDR_LOOPBACK));
+        CHECK(rh.has_source_addr && rh.source_addr.sin.sin_family == AF_INET && rh.source_addr.sin.sin_addr.s_addr == htonl(INADDR_LOOPBACK));
+
+        atomic_store(&el->entry, NULL);                              /* not in memory: parked, nothing sent, the zone asked for */
+        UDP_IN(0x6102);
+        CHECK(worker_udp_rx(&w, us, 2, sk[0]) == 1 && table.nwait == 1);
+        CHECK(park_fetch_pop(park_fetch_ring(0), &q) && strcmp(q.zone, "park.test.") == 0);
+        CHECK(!read_answer(sk[1]).got);
+        atomic_store(&el->entry, entry);
+        CHECK(park_wake_push(park_wake_ring(0), "default", "park.test.", false));
+        w.active_fd = -1;                                            /* (the parked entry knows the pair; the pass's is not used) */
+        park_service(&w, -1);
+        w.active_fd = sk[0];
+        CHECK(table.nwait == 0 && table.nready == 0);
+        RAW_ANSWER(rh, rid);
+        CHECK(rid == 0x6102 && rh.sock_fd_idx == 2 && rh.client_addr.sin.sin_port == ucl.sin_port && rh.has_source_addr &&
+              rh.source_addr.sin.sin_addr.s_addr == htonl(INADDR_LOOPBACK));
+        CHECK(!read_answer(sk[1]).got);                              /* once */
+
+        /* a datagram shorter than a DNS header and one larger than the buffer (cut: MSG_TRUNC) are dropped and counted, never run */
+        CHECK(sendto(uc, "short", 5, 0, (struct sockaddr *)&ua, sizeof(ua)) == 5);
+        static uint8_t big[5000];
+        memset(big, 0, sizeof(big));
+        CHECK(sendto(uc, big, sizeof(big), 0, (struct sockaddr *)&ua, sizeof(ua)) == (ssize_t)sizeof(big));
+        int runs = 0;
+        for (int i = 0; i < 200 && (ipcd_total(IPCD_WURX_SHORT) < short0 + 1 || ipcd_total(IPCD_WURX_TRUNC) < trunc0 + 1); i++) {   /* (bounded: 2 s) */
+            runs += worker_udp_rx(&w, us, 2, sk[0]);
+            usleep(10000);
+        }
+        CHECK(runs == 0 && ipcd_total(IPCD_WURX_SHORT) == short0 + 1 && ipcd_total(IPCD_WURX_TRUNC) == trunc0 + 1);
+        CHECK(!read_answer(sk[1]).got);
+        CHECK(atomic_load(&wctx.query_count) == q0 + 2 && ipcd_wrecv(0) == r0 + 2);
+        /* a socket index the Backend does not have reads nothing */
+        UDP_IN(0x6103);
+        CHECK(worker_udp_rx(&w, us, 3, sk[0]) == 0 && worker_udp_rx(&w, us, -1, sk[0]) == 0);
+        CHECK(worker_udp_rx(&w, us, 2, sk[0]) == 1);
+        RAW_ANSWER(rh, rid);
+        CHECK(rid == 0x6103 && rh.sock_fd_idx == 2);
+        #undef UDP_IN
+        #undef RAW_ANSWER
+        g_be_udp_count = 0;
+        close(us);
+        close(uc);
+    }
+
     /* -- woken while the zone is still not there: parked again, with the deadline it had; nothing asked again while a fetch is on its way (LOADING) ... */
     atomic_store(&el->entry, NULL);
     SEND_QUERY(0x3001, true, 0);
