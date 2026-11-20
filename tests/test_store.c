@@ -2540,6 +2540,7 @@ static void test_no_wait_in_lock(int mode) {
     out[4] = worst;
     out[5] = ops;
     out[6] = st.growths_background > bg0 && st.growths == g0 + (st.growths_background - bg0);
+    if (!out[6]) printf("  regrow: growths %" PRIu64 " (before %" PRIu64 "), background %" PRIu64 " (before %" PRIu64 "), ix_used %" PRIu64 " of %" PRIu64 " slots, %" PRIu64 " puts in the wait\n", (uint64_t)st.growths, g0, (uint64_t)st.growths_background, bg0, (uint64_t)st.ix_used, (uint64_t)st.ix_slots, ops);
     atomic_store(&store_test_regrow_hook, NULL);
     /* every zone is where the model says: by name and by source id */
     bool ok = true;
