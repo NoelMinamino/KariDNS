@@ -198,7 +198,12 @@ grep -q "\[dnstap\] [0-9]* messages dropped, the queue was full" "$TMP_DIR/karid
     || fail "log: no queue-full line"
 [ "$(grep -c "messages dropped, the queue was full" "$TMP_DIR/karidns.log")" -le 2 ] && pass "log: the line is rate-limited" \
     || fail "log: $(grep -c "messages dropped, the queue was full" "$TMP_DIR/karidns.log") queue-full lines"
-if wait_status "dnstap connected: yes" 20 && grep -q "connection #2" "$TMP_DIR/cap5.log" && [ "$(status_num "dnstap reconnects")" -ge 1 ]; then
+# the stalled collector keeps connection #1 open, so "connected: yes" holds before the Backend gives up on it: wait for all three
+# (connection #2 accepted, a reconnect counted, connected again) together, flooding meanwhile so that frames keep flowing
+reconnected() { grep -q "connection #2" "$TMP_DIR/cap5.log" && [ "$(status_num "dnstap reconnects")" -ge 1 ] && ctl status | grep -qx "dnstap connected: yes"; }
+i=0
+while [ $i -lt 40 ] && ! reconnected; do flood 200; sleep 0.5; i=$((i + 1)); done
+if reconnected; then
     pass "status: reconnected after the stall (dnstap reconnects: $(status_num "dnstap reconnects"))"
 else
     fail "no reconnect after the stall: $(ctl status | grep '^dnstap'); $(tail -3 "$TMP_DIR/cap5.log")"
