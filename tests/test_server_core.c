@@ -76,7 +76,6 @@ bool preflight_writable_path(const char *path, const char *what, bool foreground
 bool check_unix_socket_path(const char *path, const char *what);
 bool validate_program_zone_users(server_config_t *cfg);
 bool preflight_listen_ports(server_config_t *cfg);
-int sendmmsg_skip_failed(int fd, struct mmsghdr *msgs, int n, const char *path, bool is_ipc);
 
 // ----------------------------------------------------------------------------
 // 1. fast_ipv4_to_str Test
@@ -2455,7 +2454,9 @@ static void test_sendmmsg_skip_failed(void) {
         msgs[i].msg_hdr.msg_iovlen = 1;
     }
 
-    assert(sendmmsg_skip_failed(sv[0], msgs, 4, "test", true) == 1);
+    const uint64_t err0 = ipcd_total(IPCD_WREP_ERR), full0 = ipcd_total(IPCD_WREP_FULL);
+    assert(sendmmsg_skip_failed(sv[0], msgs, 4, "test", true, IPCD_WREP_FULL) == 1);
+    assert(ipcd_total(IPCD_WREP_ERR) == err0 + 1 && ipcd_total(IPCD_WREP_FULL) == full0);   // EMSGSIZE: "other failure", not "queue full"
     for (int i = 0; i < 3; i++) {
         char buf[64];
         ssize_t n = recv(sv[1], buf, sizeof(buf) - 1, MSG_DONTWAIT);
@@ -2467,7 +2468,9 @@ static void test_sendmmsg_skip_failed(void) {
     assert(recv(sv[1], extra, sizeof(extra), MSG_DONTWAIT) < 0);
 
     // 全件失敗 (EBADF) でも 1 通ずつ飛ばして終了し、無限ループしない
-    assert(sendmmsg_skip_failed(-1, msgs, 4, "test", false) == 4);
+    const uint64_t cerr0 = ipcd_total(IPCD_RCLI_ERR);
+    assert(sendmmsg_skip_failed(-1, msgs, 4, "test", false, IPCD_RCLI_FULL) == 4);
+    assert(ipcd_total(IPCD_RCLI_ERR) == cerr0 + 4);
 
     // 受信側が満杯 (EAGAIN / ENOBUFS) なら残りをまとめて破棄する
     fcntl(sv[0], F_SETFL, fcntl(sv[0], F_GETFL, 0) | O_NONBLOCK);
@@ -2482,11 +2485,204 @@ static void test_sendmmsg_skip_failed(void) {
     small_msgs[0].msg_hdr.msg_iov = &iov[0]; small_msgs[0].msg_hdr.msg_iovlen = 1;
     small_msgs[1].msg_hdr.msg_iov = &iov[2]; small_msgs[1].msg_hdr.msg_iovlen = 1;
     small_msgs[2].msg_hdr.msg_iov = &iov[3]; small_msgs[2].msg_hdr.msg_iovlen = 1;
-    assert(sendmmsg_skip_failed(sv[0], small_msgs, 3, "test", true) == 3);
+    assert(sendmmsg_skip_failed(sv[0], small_msgs, 3, "test", true, IPCD_WREP_FULL) == 3);
+    assert(ipcd_total(IPCD_WREP_FULL) == full0 + 3);                                       // a full queue: counted as such
 
     close(sv[0]);
     close(sv[1]);
     printf("  -> sendmmsg_skip_failed passed.\n");
+}
+
+// ----------------------------------------------------------------------------
+// ipc_send_spill (0.7): a worker whose queue is full does not lose the batch; the counters say what was lost
+// ----------------------------------------------------------------------------
+#define SPILL_NW 3
+static int spill_fds[SPILL_NW][2];
+static void spill_open(void) {
+    for (int w = 0; w < SPILL_NW; w++) {
+        assert(socketpair(AF_UNIX, SOCK_DGRAM, 0, spill_fds[w]) == 0);
+        fcntl(spill_fds[w][0], F_SETFL, fcntl(spill_fds[w][0], F_GETFL, 0) | O_NONBLOCK);
+        fcntl(spill_fds[w][1], F_SETFL, fcntl(spill_fds[w][1], F_GETFL, 0) | O_NONBLOCK);
+    }
+}
+static void spill_close(void) {
+    for (int w = 0; w < SPILL_NW; w++) { close(spill_fds[w][0]); close(spill_fds[w][1]); }
+}
+/* fills the queue of worker w with 1-octet datagrams until the kernel refuses; returns how many it took */
+static int spill_fill(int w) {
+    uint8_t b = 0xEE;
+    int n = 0;
+    while (n < 1000000 && send(spill_fds[w][0], &b, 1, MSG_DONTWAIT) > 0) n++;
+    assert(errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS);
+    return n;
+}
+/* counts (and discards) what worker w has queued; the test's own datagrams are 2 octets long, the filler's 1 */
+static int spill_drain(int w) {
+    uint8_t buf[16];
+    int n = 0;
+    ssize_t r;
+    while ((r = recv(spill_fds[w][1], buf, sizeof(buf), MSG_DONTWAIT)) > 0)
+        if (r == 2) n++;
+    return n;
+}
+static void spill_msgs(struct mmsghdr *m, struct iovec *iov, uint8_t (*pl)[2], int n) {
+    memset(m, 0, sizeof(*m) * (size_t)n);
+    for (int i = 0; i < n; i++) {
+        pl[i][0] = (uint8_t)i; pl[i][1] = 0xAA;
+        iov[i].iov_base = pl[i]; iov[i].iov_len = 2;
+        m[i].msg_hdr.msg_iov = &iov[i]; m[i].msg_hdr.msg_iovlen = 1;
+    }
+}
+
+static void test_ipc_send_spill(void) {
+    printf("[TEST] Server Core: ipc_send_spill moves a refused batch to the next worker and counts what no worker took...\n");
+    struct mmsghdr m[10];
+    struct iovec iov[10];
+    uint8_t pl[10][2];
+    int rr;
+
+    // no refusal: the first worker takes it, the round robin moves by one, nothing is counted
+    spill_open();
+    spill_msgs(m, iov, pl, 4);
+    uint64_t sp0 = ipcd_total(IPCD_RTW_SPILLED), fu0 = ipcd_total(IPCD_RTW_FULL), er0 = ipcd_total(IPCD_RTW_ERR);
+    rr = 0;
+    assert(ipc_send_spill(spill_fds, SPILL_NW, &rr, m, 4) == 0);
+    assert(rr == 1);
+    assert(spill_drain(0) == 4 && spill_drain(1) == 0 && spill_drain(2) == 0);
+    assert(ipcd_total(IPCD_RTW_SPILLED) == sp0 && ipcd_total(IPCD_RTW_FULL) == fu0 && ipcd_total(IPCD_RTW_ERR) == er0);
+
+    // worker 0 full: the whole batch goes to worker 1, and the round robin goes on from worker 2
+    (void)spill_fill(0);
+    rr = 0;
+    assert(ipc_send_spill(spill_fds, SPILL_NW, &rr, m, 4) == 0);
+    assert(rr == 2);
+    assert(spill_drain(1) == 4 && spill_drain(2) == 0);
+    assert(spill_drain(0) == 0);                   // (worker 0 got none of the batch)
+    assert(ipcd_total(IPCD_RTW_SPILLED) == sp0 + 4 && ipcd_total(IPCD_RTW_FULL) == fu0);
+    spill_close();
+
+    // the round wraps: worker 2 is full, the batch goes to worker 0
+    spill_open();
+    (void)spill_fill(2);
+    rr = 2;
+    sp0 = ipcd_total(IPCD_RTW_SPILLED);
+    assert(ipc_send_spill(spill_fds, SPILL_NW, &rr, m, 4) == 0);
+    assert(rr == 1);
+    assert(spill_drain(0) == 4 && spill_drain(1) == 0);
+    assert(ipcd_total(IPCD_RTW_SPILLED) == sp0 + 4);
+    spill_close();
+
+    // a queue that takes a part: the part it took stays there, the rest goes on, and every message arrives once
+    spill_open();
+    (void)spill_fill(0);
+    uint8_t junk[16];
+    for (int i = 0; i < 3; i++) assert(recv(spill_fds[0][1], junk, sizeof(junk), MSG_DONTWAIT) == 1);   // room for about three
+    spill_msgs(m, iov, pl, 10);
+    sp0 = ipcd_total(IPCD_RTW_SPILLED);
+    fu0 = ipcd_total(IPCD_RTW_FULL);
+    rr = 0;
+    assert(ipc_send_spill(spill_fds, SPILL_NW, &rr, m, 10) == 0);
+    int got0 = spill_drain(0), got1 = spill_drain(1), got2 = spill_drain(2);
+    assert(got0 + got1 + got2 == 10);
+    assert(got0 > 0 && got1 > 0 && got2 == 0);     // worker 0 took what fitted, worker 1 the rest
+    assert(ipcd_total(IPCD_RTW_SPILLED) == sp0 + (uint64_t)got1 && ipcd_total(IPCD_RTW_FULL) == fu0);
+    spill_close();
+
+    // every worker full: the batch is dropped and counted once, after one round (every worker tried), the round robin is where it began
+    spill_open();
+    for (int w = 0; w < SPILL_NW; w++) (void)spill_fill(w);
+    spill_msgs(m, iov, pl, 5);
+    sp0 = ipcd_total(IPCD_RTW_SPILLED);
+    fu0 = ipcd_total(IPCD_RTW_FULL);
+    rr = 1;
+    assert(ipc_send_spill(spill_fds, SPILL_NW, &rr, m, 5) == 5);
+    assert(rr == 1);
+    assert(ipcd_total(IPCD_RTW_FULL) == fu0 + 5 && ipcd_total(IPCD_RTW_SPILLED) == sp0);
+    for (int w = 0; w < SPILL_NW; w++) assert(spill_drain(w) == 0);
+    spill_close();
+
+    // a message that fails for its own reason (too large for a datagram) is dropped and counted as an error, and is not tried on another worker
+    spill_open();
+    static uint8_t big[256 * 1024];
+    struct iovec biov[3];
+    struct mmsghdr bm[3];
+    memset(bm, 0, sizeof(bm));
+    pl[0][0] = 1; pl[1][0] = 2; pl[0][1] = pl[1][1] = 0xAA;
+    biov[0].iov_base = pl[0]; biov[0].iov_len = 2;
+    biov[1].iov_base = big;   biov[1].iov_len = sizeof(big);
+    biov[2].iov_base = pl[1]; biov[2].iov_len = 2;
+    for (int i = 0; i < 3; i++) { bm[i].msg_hdr.msg_iov = &biov[i]; bm[i].msg_hdr.msg_iovlen = 1; }
+    er0 = ipcd_total(IPCD_RTW_ERR);
+    fu0 = ipcd_total(IPCD_RTW_FULL);
+    rr = 0;
+    assert(ipc_send_spill(spill_fds, SPILL_NW, &rr, bm, 3) == 1);
+    assert(ipcd_total(IPCD_RTW_ERR) == er0 + 1 && ipcd_total(IPCD_RTW_FULL) == fu0);
+    assert(spill_drain(0) == 2 && spill_drain(1) == 0);
+    spill_close();
+    printf("  -> ipc_send_spill passed.\n");
+}
+
+static void *ipcd_hammer(void *arg) {
+    (void)arg;
+    for (int i = 0; i < 20000; i++) ipcd_add(IPCD_WRX_SHORT, 1);
+    return NULL;
+}
+
+// the counters: a slot per process in a shared mapping, the sums, and the text of `karictl ipcstats`
+static void test_ipcd_counters(void) {
+    printf("[TEST] Server Core: the shared IPC drop counters add up across processes...\n");
+    ipcd_init();                                   // the mapping the Backend and the routers share (a test process is the Backend)
+    ipcd_init();                                   // (again: nothing changes)
+    const uint64_t t0 = ipcd_total(IPCD_RRX_TRUNC), s0 = ipcd_total(IPCD_RREP_BADSOCK);
+    pid_t pid = fork();
+    assert(pid >= 0);
+    if (pid == 0) {                                // a router: slot 1
+        ipcd_set_self(1);
+        ipcd_add(IPCD_RRX_TRUNC, 5);
+        ipcd_add(IPCD_RRX_TRUNC, 0);               // (nothing)
+        ipcd_set_self(IPCD_BACKEND_SLOT + 7);      // (a slot that does not exist: ignored, the counts stay in slot 1)
+        ipcd_add(IPCD_RREP_BADSOCK, 2);
+        _exit(0);
+    }
+    int st = 0;
+    assert(waitpid(pid, &st, 0) == pid && WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    ipcd_add(IPCD_RRX_TRUNC, 1);                   // this process's own slot
+    assert(ipcd_total(IPCD_RRX_TRUNC) == t0 + 6);
+    assert(ipcd_total(IPCD_RREP_BADSOCK) == s0 + 2);
+
+    char buf[2048];
+    size_t len = ipcd_format(buf, sizeof(buf));
+    assert(len > 0 && len < sizeof(buf) && buf[len] == '\0');
+    assert(strstr(buf, "ipc.router.rx.truncated=") != NULL && strstr(buf, "ipc.worker.reply.dropped_error=") != NULL);
+    assert(strstr(buf, "ipc.router.worker.spilled=") != NULL);
+    const char *dt = strstr(buf, "ipc.dropped.total=");
+    assert(dt != NULL);
+    uint64_t sum = 0;
+    for (int i = 0; i < IPCD_COUNT; i++)
+        if (i != IPCD_RTW_SPILLED) sum += ipcd_total((ipcd_t)i);
+    assert(strtoull(dt + strlen("ipc.dropped.total="), NULL, 10) == sum);   // the spills are not losses
+    // a buffer that is too small is cut at a line: no overflow
+    for (size_t cap = 1; cap < 80; cap += 7) {
+        char small[80];
+        memset(small, 'x', sizeof(small));
+        size_t l = ipcd_format(small, cap);
+        assert(l < cap);
+        if (l > 0) assert(small[l - 1] == '\n');
+    }
+    // the workers are threads of one process that add to one slot while the control thread sums (TSan: relaxed atomics, no race)
+    const uint64_t c0 = ipcd_total(IPCD_WRX_SHORT);
+    pthread_t th[4];
+    for (int i = 0; i < 4; i++) assert(pthread_create(&th[i], NULL, ipcd_hammer, NULL) == 0);
+    for (int i = 0; i < 50; i++) (void)ipcd_total(IPCD_WRX_SHORT);
+    for (int i = 0; i < 4; i++) assert(pthread_join(th[i], NULL) == 0);
+    assert(ipcd_total(IPCD_WRX_SHORT) == c0 + 4 * 20000);
+    // a reply that a plain send() could not hand over (the asynchronous resolution threads): queue full, or another failure
+    const uint64_t wf0 = ipcd_total(IPCD_WREP_FULL), we0 = ipcd_total(IPCD_WREP_ERR);
+    ipc_reply_failed(ENOBUFS);
+    ipc_reply_failed(EAGAIN);
+    ipc_reply_failed(EBADF);
+    assert(ipcd_total(IPCD_WREP_FULL) == wf0 + 2 && ipcd_total(IPCD_WREP_ERR) == we0 + 1);
+    printf("  -> the IPC drop counters passed.\n");
 }
 
 /* a configuration built by hand: listen on one IPv4 address (what config_build_listen() would have computed) */
@@ -8146,6 +8342,8 @@ int main(void) {
     test_control_peer_admission();
     test_open_router_udp_sockets_and_buffers();
     test_sendmmsg_skip_failed();
+    test_ipc_send_spill();
+    test_ipcd_counters();
     test_tcp_listen_and_zone_socket_opts();
     test_async_io_pool_and_tasks();
     test_meta_types_and_utils_helpers();

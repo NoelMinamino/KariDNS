@@ -37,11 +37,13 @@
 #include <string.h>
 #include <sys/capsicum.h> // Capsicum capability mode / rights
 #include <sys/file.h>     // flock
+#include <sys/mman.h>     // mmap: the shared drop counters (ipcd_init)
 #include <sys/event.h>    // kqueue
 #include <sys/param.h>
 #include <sys/procctl.h>  // PROC_TRAPCAP
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/sysctl.h>   // sysctlbyname: the buffer limits in the warnings
 #include <sys/time.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -1930,16 +1932,74 @@ static void log_udp_send_drop(const char *path, bool is_ipc, int err, int droppe
   suppressed = 0;
 }
 
-// sendmmsg() は途中の 1 通が失敗するとそこで止まり、送れた件数だけを返す
-// (失敗した 1 通以降は送られない)。戻り値を無視すると、過大な応答 (EMSGSIZE) や
-// 到達不能な宛先 (EHOSTUNREACH 等) 1 通のために同じバッチの他クライアント宛て応答まで
-// 捨ててしまうため、失敗した 1 通だけを飛ばして残りを送り直す。
-// EAGAIN / ENOBUFS (非ブロッキングで送信バッファ満杯) は送り直しても失敗するので
-// 従来どおり残りを破棄する。戻り値: 破棄した件数。
-STATIC_TEST int sendmmsg_skip_failed(int fd, struct mmsghdr *msgs, int n, const char *path, bool is_ipc) {
+/* ---- 0.7: counters of the queries and replies that are lost between the routers and the workers (dns_server_internal.h ipcd_t) ----
+ * The slots are in an anonymous shared mapping (ipcd_init(), made before the Backend and the routers are forked: one slot per router, the
+ * last is the Backend's), so the Backend can sum what the router processes counted.  g_ipcd_self is the slot of this process; until ipcd_set_self()
+ * (and in a unit test) it is a private slot, so that ipcd_add() never needs a test for NULL.  Relaxed adds: nothing is ordered by them. */
+#define IPCD_SLOTS (KARIDNS_ROUTER_THREADS_MAX + 1)
+static ipcd_slot_t g_ipcd_fallback;
+static ipcd_slot_t *g_ipcd_slots = NULL;
+static ipcd_slot_t *g_ipcd_self = &g_ipcd_fallback;
+static const char *const g_ipcd_names[IPCD_COUNT] = {
+  "router.worker.spilled", "router.worker.dropped_full", "router.worker.dropped_error", "router.rx.truncated", "router.rx.short",
+  "router.reply.short", "router.reply.bad_length", "router.reply.bad_socket", "router.client.dropped_full", "router.client.dropped_error",
+  "worker.rx.short", "worker.rx.bad_length", "worker.reply.dropped_full", "worker.reply.dropped_error", "worker.async.dropped_full",
+};
+
+STATIC_TEST void ipcd_init(void) {
+  if (g_ipcd_slots) return;
+  void *p = mmap(NULL, sizeof(ipcd_slot_t) * IPCD_SLOTS, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0);
+  if (p == MAP_FAILED) {
+    syslog(LOG_WARNING, "[IPC] cannot map the shared drop counters (%m): what the routers drop is not counted in karictl ipcstats");
+    return;
+  }
+  g_ipcd_slots = p;                  /* (zero filled) */
+  g_ipcd_self = &g_ipcd_slots[IPCD_BACKEND_SLOT];
+}
+
+STATIC_TEST void ipcd_set_self(int slot) {
+  if (g_ipcd_slots && slot >= 0 && slot < IPCD_SLOTS) g_ipcd_self = &g_ipcd_slots[slot];
+}
+
+void ipcd_add(ipcd_t c, uint64_t n) {
+  if (n) atomic_fetch_add_explicit(&g_ipcd_self->c[c], n, memory_order_relaxed);
+}
+
+uint64_t ipcd_total(ipcd_t c) {
+  uint64_t t = 0;
+  if (!g_ipcd_slots) return atomic_load_explicit(&g_ipcd_fallback.c[c], memory_order_relaxed);
+  for (int s = 0; s < IPCD_SLOTS; s++) t += atomic_load_explicit(&g_ipcd_slots[s].c[c], memory_order_relaxed);
+  return t;
+}
+
+/* The reply of `karictl ipcstats`: "ipc.<name>=<n>" lines, then ipc.dropped.total (every counter but the spills: a spilled query was served by
+ * another worker).  Text, so that a karictl of another version still reads it. */
+size_t ipcd_format(char *buf, size_t cap) {
+  size_t len = 0;
+  uint64_t dropped = 0;
+  for (int i = 0; i < IPCD_COUNT; i++) {
+    const uint64_t v = ipcd_total((ipcd_t)i);
+    if (i != IPCD_RTW_SPILLED) dropped += v;
+    int w = snprintf(buf + len, cap - len, "ipc.%s=%llu\n", g_ipcd_names[i], (unsigned long long)v);
+    if (w < 0 || (size_t)w >= cap - len) return len;
+    len += (size_t)w;
+  }
+  int w = snprintf(buf + len, cap - len, "ipc.dropped.total=%llu\n", (unsigned long long)dropped);
+  if (w > 0 && (size_t)w < cap - len) len += (size_t)w;
+  return len;
+}
+
+/* sendmmsg() は途中の 1 通が失敗するとそこで止まり、送れた件数だけを返す
+ * (失敗した 1 通以降は送られない)。戻り値を無視すると、過大な応答 (EMSGSIZE) や
+ * 到達不能な宛先 (EHOSTUNREACH 等) 1 通のために同じバッチの他クライアント宛て応答まで
+ * 捨ててしまうため、失敗した 1 通だけを飛ばして残りを送り直す。
+ * EAGAIN / ENOBUFS (非ブロッキングで送信バッファ満杯) は送り直しても失敗するので、そこで止めて
+ * 送れなかった残りの件数を返す (*rest: msgs[n - *rest .. n) が未送信)。
+ * 戻り値: そのメッセージ自身の失敗で捨てた件数 (*last_err に最後の errno)。 */
+static int sendmmsg_run(int fd, struct mmsghdr *msgs, int n, int *rest, int *last_err) {
   int off = 0;
-  int dropped = 0;
-  int last_err = 0;
+  int hard = 0;
+  *rest = 0;
   while (off < n) {
     int r = sendmmsg(fd, msgs + off, (unsigned int)(n - off), MSG_DONTWAIT);
     if (r > 0) {
@@ -1948,17 +2008,60 @@ STATIC_TEST int sendmmsg_skip_failed(int fd, struct mmsghdr *msgs, int n, const 
     }
     if (r < 0 && errno == EINTR)
       continue;
-    last_err = (r < 0) ? errno : EIO;
-    if (last_err == EAGAIN || last_err == EWOULDBLOCK || last_err == ENOBUFS) {
-      dropped += n - off;
+    int e = (r < 0) ? errno : EIO;
+    *last_err = e;
+    if (e == EAGAIN || e == EWOULDBLOCK || e == ENOBUFS) {
+      *rest = n - off;
       break;
     }
-    dropped++;  // msgs[off] だけを破棄して続行
+    hard++;  // msgs[off] だけを破棄して続行
     off++;
   }
-  if (dropped > 0)
-    log_udp_send_drop(path, is_ipc, last_err, dropped);
-  return dropped;
+  return hard;
+}
+
+/* One batch to one socket.  Whatever it cannot send is dropped, counted (`first` is the counter of "queue full", first + 1 the one of "other
+ * failure"), and logged once a second.  Returns the number dropped. */
+STATIC_TEST int sendmmsg_skip_failed(int fd, struct mmsghdr *msgs, int n, const char *path, bool is_ipc, ipcd_t first) {
+  int rest = 0, last_err = 0;
+  const int hard = sendmmsg_run(fd, msgs, n, &rest, &last_err);
+  ipcd_add(first, (uint64_t)rest);
+  ipcd_add((ipcd_t)(first + 1), (uint64_t)hard);
+  if (hard + rest > 0)
+    log_udp_send_drop(path, is_ipc, last_err, hard + rest);
+  return hard + rest;
+}
+
+/* A reply of a worker that a plain send() to the router could not hand over (the asynchronous resolution threads): counted as the batches are. */
+STATIC_TEST void ipc_reply_failed(int err) {
+  ipcd_add((err == EAGAIN || err == EWOULDBLOCK || err == ENOBUFS) ? IPCD_WREP_FULL : IPCD_WREP_ERR, 1);
+  log_udp_send_drop("Backend->Frontend IPC", true, err, 1);
+}
+
+/* Router -> workers (0.7): the batch msgs[0..n) goes to the worker *rr; what that worker's queue refuses (EAGAIN / ENOBUFS: the worker is
+ * busy for a moment) goes to the next worker, and so on, at most once round the nw workers.  Only what every queue refused is dropped and
+ * counted (IPCD_RTW_FULL; a send that failed for its own reason: IPCD_RTW_ERR, not tried elsewhere).  *rr is left at the worker after the last
+ * one tried, so without a spill it moves by one, as the round robin always did.  fds[w][0] is the router's end of worker w.  No allocation.
+ * Returns the number dropped. */
+STATIC_TEST int ipc_send_spill(int (*fds)[2], int nw, int *rr, struct mmsghdr *msgs, int n) {
+  int off = 0, off_first = 0, hard_total = 0, hard_later = 0, last_err = 0, w = *rr;
+  for (int tried = 0; off < n && tried < nw; tried++) {
+    int rest = 0;
+    const int hard = sendmmsg_run(fds[w][0], msgs + off, n - off, &rest, &last_err);
+    hard_total += hard;
+    if (tried > 0) hard_later += hard;
+    off = n - rest;
+    if (tried == 0) off_first = off;
+    w = (w + 1) % nw;
+  }
+  *rr = w;
+  const int full = n - off;
+  ipcd_add(IPCD_RTW_SPILLED, (uint64_t)(off - off_first - hard_later));        /* (what the first worker refused and a later one took) */
+  ipcd_add(IPCD_RTW_FULL, (uint64_t)full);
+  ipcd_add(IPCD_RTW_ERR, (uint64_t)hard_total);
+  if (full + hard_total > 0)
+    log_udp_send_drop("Frontend->Backend IPC", true, last_err, full + hard_total);
+  return full + hard_total;
 }
 
 async_io_pool_t g_async_io_pool;
@@ -2031,7 +2134,7 @@ STATIC_TEST void *async_io_worker_func(void *arg) {
           *res_msg = task.ipc_hdr;
           res_msg->payload_len = res_len;
           if (send(task.active_fd, res_buf_full, sizeof(udp_ipc_t) + res_len, 0) < 0)
-            log_udp_send_drop("Backend->Frontend IPC", true, errno, 1);
+            ipc_reply_failed(errno);
         } else if (slip_triggered) {
           submit_response_log(LOG_ACT_SENT, task.client_ip, task.client_port, task.qname, task.qclass, task.qtype,
                               res_buf[3] & 0x0F, task.has_edns, task.dnssec_ok);
@@ -2044,7 +2147,7 @@ STATIC_TEST void *async_io_worker_func(void *arg) {
           *res_msg = task.ipc_hdr;
           res_msg->payload_len = qlen;
           if (send(task.active_fd, res_buf_full, sizeof(udp_ipc_t) + qlen, 0) < 0)
-            log_udp_send_drop("Backend->Frontend IPC", true, errno, 1);
+            ipc_reply_failed(errno);
         } else {
           submit_response_log(LOG_ACT_DROP_RRL, task.client_ip, task.client_port, task.qname,
                               task.qclass, task.qtype, res_buf[3] & 0x0F, task.has_edns, task.dnssec_ok);
@@ -2739,6 +2842,7 @@ STATIC_TEST void udp_one(udp_pass_t *w, udp_ipc_t *ipc_msg, uint8_t *req_buf, ss
             if (route.entry && (route.entry->kind == ZONE_KIND_PROGRAM || route.entry->kind == ZONE_KIND_FORWARD)) {
               uint8_t *heap_req = malloc((size_t)payload_received);
               if (!heap_req) {
+                ipcd_add(IPCD_WASYNC_FULL, 1);
                 if (rlog_enabled) {
                   submit_response_log(LOG_ACT_DROP_RRL, client_ip, client_port, qname, qclass, qtype, 2, has_edns, dnssec_ok);
                 }
@@ -2773,6 +2877,7 @@ STATIC_TEST void udp_one(udp_pass_t *w, udp_ipc_t *ipc_msg, uint8_t *req_buf, ss
               if (!enqueue_async_io_task(&task)) {
                 release_zone_snapshot(task.snap);
                 free(task.req_buf);
+                ipcd_add(IPCD_WASYNC_FULL, 1);
                 if (rlog_enabled) {
                   submit_response_log(LOG_ACT_DROP_RRL, client_ip, client_port, qname, qclass, qtype, 2, has_edns, dnssec_ok);
                 }
@@ -2870,7 +2975,7 @@ STATIC_TEST void udp_one(udp_pass_t *w, udp_ipc_t *ipc_msg, uint8_t *req_buf, ss
               batch->tx_msgs[w->n_tx].msg_hdr.msg_controllen = 0;
               w->n_tx++;
               if (w->n_tx == UDP_BATCH_SIZE) {
-                sendmmsg_skip_failed(active_fd, batch->tx_msgs, w->n_tx, "Backend->Frontend IPC", true);
+                sendmmsg_skip_failed(active_fd, batch->tx_msgs, w->n_tx, "Backend->Frontend IPC", true, IPCD_WREP_FULL);
                 w->n_tx = 0;
               }
               rcu_reader_exit(ctx);
@@ -2960,7 +3065,7 @@ STATIC_TEST void park_service(udp_pass_t *w, int kq) {
       w->n_tx = 0;
       udp_one(w, ipc, req, len);
       if (w->n_tx > 0) {
-        sendmmsg_skip_failed(w->active_fd, w->batch->tx_msgs, w->n_tx, "Backend->Frontend IPC", true);
+        sendmmsg_skip_failed(w->active_fd, w->batch->tx_msgs, w->n_tx, "Backend->Frontend IPC", true, IPCD_WREP_FULL);
         w->n_tx = 0;
       }
       w->woken = false;
@@ -3221,20 +3326,26 @@ worker_startup_success:;
           pass.active_fd = active_fd;
           pass.n_tx = 0;
           pass.woken = false;
+          int n_served = 0;                  /* (the messages that were run: not the ones dropped below) */
           for (int p = 0; p < n_recv; p++) {
             ssize_t received = (ssize_t)batch->rx_msgs[p].msg_len;
-            if (received < (ssize_t)sizeof(udp_ipc_t))
+            if (received < (ssize_t)sizeof(udp_ipc_t)) {
+              ipcd_add(IPCD_WRX_SHORT, 1);
               continue;
+            }
 
             udp_ipc_t *ipc_msg = (udp_ipc_t *)batch->rx_buffers[p];
             if (ipc_msg->payload_len > received - (ssize_t)sizeof(udp_ipc_t) ||
-                ipc_msg->payload_len < DNS_HEADER_SIZE)
+                ipc_msg->payload_len < DNS_HEADER_SIZE) {
+              ipcd_add(IPCD_WRX_BADLEN, 1);
               continue;
+            }
             udp_one(&pass, ipc_msg, batch->rx_buffers[p] + sizeof(udp_ipc_t), ipc_msg->payload_len);
+            n_served++;
           }
-          atomic_fetch_add_explicit(&ctx->query_count, n_recv, memory_order_relaxed);
+          atomic_fetch_add_explicit(&ctx->query_count, (uint64_t)n_served, memory_order_relaxed);
           if (pass.n_tx > 0) {
-            sendmmsg_skip_failed(active_fd, batch->tx_msgs, pass.n_tx, "Backend->Frontend IPC", true);
+            sendmmsg_skip_failed(active_fd, batch->tx_msgs, pass.n_tx, "Backend->Frontend IPC", true, IPCD_WREP_FULL);
             pass.n_tx = 0;
           }
         }
@@ -6213,6 +6324,11 @@ void *control_thread_func(void *arg) {
               store_status_set_memory_fn(ctrl_store_memory);
               size_t stlen = store_status_control(arg, view_arg, stbuf, sizeof(stbuf));
               (void)ctl_send_all(cfd, stbuf, stlen);
+            } else if (strcmp(cmd, "ipcstats") == 0) {
+              /* 0.7: the queries and replies lost between the routers and the workers (ipcd_t), as "ipc.<name>=<n>" lines (a read command) */
+              char ipbuf[1024];
+              size_t iplen = ipcd_format(ipbuf, sizeof(ipbuf));
+              (void)ctl_send_all(cfd, ipbuf, iplen);
             } else if (strcmp(cmd, "storeop") == 0) {
               /* 0.7 S6: karictl store compact | checkpoint | scrub start | scrub stop: they change the store, so a read-only key does not have them (control_command_perm(): not a read command) */
               char sobuf[512];
@@ -6445,10 +6561,18 @@ void *control_thread_func(void *arg) {
 // 13. Frontend Router Process (マルチプロセス UDP送受信ルーティング)
 // ============================================================================
 
+/* The value of a numeric sysctl for a log line, -1 when it cannot be read. */
+static long long sysctl_num(const char *name) {
+  unsigned long v = 0;
+  size_t l = sizeof(v);
+  if (sysctlbyname(name, &v, &l, NULL, 0) != 0 || l != sizeof(v)) return -1;
+  return (long long)v;
+}
+
 void setup_udp_socket_buffers(int fd, int desired_rcv, int desired_snd) {
   if (desired_rcv > 0) {
     if (setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &desired_rcv, sizeof(desired_rcv)) != 0) {
-      syslog(LOG_WARNING, "[Network] Failed to set SO_RCVBUF to %d: %m", desired_rcv);
+      syslog(LOG_WARNING, "[Network] WARNING: failed to set SO_RCVBUF to %d: %m (the sysctl kern.ipc.maxsockbuf is %lld: raise it above the size asked for, or lower udp-recvbuf-size)", desired_rcv, sysctl_num("kern.ipc.maxsockbuf"));
     } else {
       int actual_rcv = 0;
       socklen_t optlen = sizeof(actual_rcv);
@@ -6457,15 +6581,15 @@ void setup_udp_socket_buffers(int fd, int desired_rcv, int desired_snd) {
         if (actual_rcv < desired_rcv) {
           syslog(LOG_WARNING,
                  "[Network] UDP SO_RCVBUF truncated by OS: requested %d bytes, got %d bytes "
-                 "(consider increasing kern.ipc.maxsockbuf sysctl)",
-                 desired_rcv, actual_rcv);
+                 "(WARNING: raise the sysctl kern.ipc.maxsockbuf, now %lld, above the size asked for, or lower udp-recvbuf-size; a full socket buffer loses queries)",
+                 desired_rcv, actual_rcv, sysctl_num("kern.ipc.maxsockbuf"));
         }
       }
     }
   }
   if (desired_snd > 0) {
     if (setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &desired_snd, sizeof(desired_snd)) != 0) {
-      syslog(LOG_WARNING, "[Network] Failed to set SO_SNDBUF to %d: %m", desired_snd);
+      syslog(LOG_WARNING, "[Network] WARNING: failed to set SO_SNDBUF to %d: %m (the sysctl kern.ipc.maxsockbuf is %lld: raise it above the size asked for, or lower udp-sndbuf-size)", desired_snd, sysctl_num("kern.ipc.maxsockbuf"));
     } else {
       int actual_snd = 0;
       socklen_t optlen = sizeof(actual_snd);
@@ -6474,8 +6598,8 @@ void setup_udp_socket_buffers(int fd, int desired_rcv, int desired_snd) {
         if (actual_snd < desired_snd) {
           syslog(LOG_WARNING,
                  "[Network] UDP SO_SNDBUF truncated by OS: requested %d bytes, got %d bytes "
-                 "(consider increasing kern.ipc.maxsockbuf sysctl)",
-                 desired_snd, actual_snd);
+                 "(WARNING: raise the sysctl kern.ipc.maxsockbuf, now %lld, above the size asked for, or lower udp-sndbuf-size; a full socket buffer loses replies)",
+                 desired_snd, actual_snd, sysctl_num("kern.ipc.maxsockbuf"));
         }
       }
     }
@@ -6749,6 +6873,7 @@ STATIC_TEST void run_frontend_router(pid_t backend_pid, int router_id) {
 
   alignas(udp_ipc_t) uint8_t buffer[UDP_IPC_BUFFER_SIZE];
   int rr = 0; // ラウンドロビン分配用
+  ipcd_set_self(router_id);   // 0.7: what this router drops is counted in its own slot of the shared area
   struct kevent ev_list[128];
   syslog(LOG_NOTICE, "[Frontend %d] UDP Router process started.", router_id);
   char router_who[24];
@@ -6807,9 +6932,13 @@ STATIC_TEST void run_frontend_router(pid_t backend_pid, int router_id) {
             ssize_t len = (ssize_t)fctx->rx_msgs[k].msg_len;
             // バッファ (BUFFER_SIZE) より大きいデータグラムは切り詰められて MSG_TRUNC 付きで返る。
             // 切れたメッセージは数と中身が合わない (UPDATE、TSIG) ので、送られていないメッセージに答えず捨てる
-            if (fctx->rx_msgs[k].msg_hdr.msg_flags & MSG_TRUNC)
+            if (fctx->rx_msgs[k].msg_hdr.msg_flags & MSG_TRUNC) {
+              ipcd_add(IPCD_RRX_TRUNC, 1);
               continue;
-            if (len >= DNS_HEADER_SIZE) {
+            }
+            if (len < DNS_HEADER_SIZE) {
+              ipcd_add(IPCD_RRX_SHORT, 1);
+            } else {
               udp_ipc_t *msg = (udp_ipc_t *)fctx->rx_buffers[k];
               msg->sock_fd_idx = ud;
               msg->addr_len = (uint16_t)fctx->rx_msgs[k].msg_hdr.msg_namelen;
@@ -6856,12 +6985,8 @@ STATIC_TEST void run_frontend_router(pid_t backend_pid, int router_id) {
               tx_count++;
             }
           }
-          if (tx_count > 0 && g_num_workers > 0) {
-            int target_worker = rr;
-            sendmmsg_skip_failed(g_ipc_fds[router_id][target_worker][0], fctx->ipc_tx_msgs, tx_count,
-                                 "Frontend->Backend IPC", true);
-            rr = (rr + 1) % g_num_workers;
-          }
+          if (tx_count > 0 && g_num_workers > 0)
+            ipc_send_spill(g_ipc_fds[router_id], g_num_workers, &rr, fctx->ipc_tx_msgs, tx_count);   /* (a worker whose queue is full: its part goes to the next worker) */
         }
       } else if (ud == 999 && router_id == 0) {
         // (2) Notify Outbound -> Pre-opened UDP Sockets (Capsicum safe)
@@ -7056,11 +7181,14 @@ STATIC_TEST void run_frontend_router(pid_t backend_pid, int router_id) {
 
           for (int k = 0; k < n_recv; k++) {
             ssize_t len = (ssize_t)fctx->ipc_rx_msgs[k].msg_len;
-            if (len < (ssize_t)sizeof(udp_ipc_t))
+            if (len < (ssize_t)sizeof(udp_ipc_t)) {
+              ipcd_add(IPCD_RREP_SHORT, 1);
               continue;
+            }
             udp_ipc_t *msg = (udp_ipc_t *)fctx->ipc_rx_buffers[k];
             ssize_t max_valid_payload = len - (ssize_t)sizeof(udp_ipc_t);
             if (msg->payload_len > max_valid_payload) {
+              ipcd_add(IPCD_RREP_BADLEN, 1);
               syslog(LOG_WARNING, "[Frontend %d] Dropping backend reply with inconsistent payload_len", router_id);
               continue;
             }
@@ -7070,11 +7198,12 @@ STATIC_TEST void run_frontend_router(pid_t backend_pid, int router_id) {
               continue;
             }
             if (msg->sock_fd_idx < 0 || msg->sock_fd_idx >= local_num_udp_fds) {
+              ipcd_add(IPCD_RREP_BADSOCK, 1);
               continue;
             }
 
             if (cur_sock_idx != -1 && msg->sock_fd_idx != cur_sock_idx && tx_count > 0) {
-              sendmmsg_skip_failed(local_udp_fds[cur_sock_idx], fctx->cli_tx_msgs, tx_count, "Frontend UDP", false);
+              sendmmsg_skip_failed(local_udp_fds[cur_sock_idx], fctx->cli_tx_msgs, tx_count, "Frontend UDP", false, IPCD_RCLI_FULL);
               tx_count = 0;
             }
             cur_sock_idx = msg->sock_fd_idx;
@@ -7134,7 +7263,7 @@ STATIC_TEST void run_frontend_router(pid_t backend_pid, int router_id) {
             tx_count++;
           }
           if (tx_count > 0 && cur_sock_idx >= 0 && cur_sock_idx < local_num_udp_fds) {
-            sendmmsg_skip_failed(local_udp_fds[cur_sock_idx], fctx->cli_tx_msgs, tx_count, "Frontend UDP", false);
+            sendmmsg_skip_failed(local_udp_fds[cur_sock_idx], fctx->cli_tx_msgs, tx_count, "Frontend UDP", false, IPCD_RCLI_FULL);
             tx_count = 0;
           }
         }
@@ -7334,20 +7463,25 @@ STATIC_TEST bool daemonize(void) {
 /* SO_RCVBUF / SO_SNDBUF of an IPC socket.  A refusal or a smaller buffer than asked for (the kernel clamps to kern.ipc.maxsockbuf and
  * net.local.dgram.*) is counted; setup_ipc_tables() logs one warning for all of them. */
 static int g_ipc_buf_short;
-static int g_ipc_buf_asked, g_ipc_buf_got;
+static int g_ipc_buf_asked, g_ipc_buf_got, g_ipc_buf_err;
 static void ipc_set_buf(int fd, int opt, int size) {
   int got = 0;
   socklen_t gl = sizeof(got);
-  if (setsockopt(fd, SOL_SOCKET, opt, &size, sizeof(size)) != 0 || getsockopt(fd, SOL_SOCKET, opt, &got, &gl) != 0 || got < size) {
+  const int rc = setsockopt(fd, SOL_SOCKET, opt, &size, sizeof(size));
+  const int err = rc != 0 ? errno : 0;
+  const int grc = getsockopt(fd, SOL_SOCKET, opt, &got, &gl);   /* (also after a refusal: what the socket has) */
+  if (rc != 0 || grc != 0 || got < size) {
     g_ipc_buf_short++;
     g_ipc_buf_asked = size;
     g_ipc_buf_got = got;
+    g_ipc_buf_err = err;
   }
 }
 
 STATIC_TEST void setup_ipc_tables(int num_workers) {
   g_num_workers = num_workers;
   g_ipc_buf_short = 0;
+  ipcd_init();   /* (before the Backend and the routers are forked: they share the counters) */
   server_config_t *cfg = &g_config_db.config_a;
   int rcvbuf_size = (cfg && cfg->udp_recvbuf_size > 0) ? cfg->udp_recvbuf_size : 4 * 1024 * 1024;
   int sndbuf_size = (cfg && cfg->udp_sndbuf_size > 0) ? cfg->udp_sndbuf_size : 4 * 1024 * 1024;
@@ -7385,8 +7519,12 @@ STATIC_TEST void setup_ipc_tables(int num_workers) {
   ipc_set_buf(g_notify_ipc[1], SO_RCVBUF, nbufsize);
   ipc_set_buf(g_notify_ipc[1], SO_SNDBUF, nbufsize);
   if (g_ipc_buf_short > 0)
-    syslog(LOG_WARNING, "[IPC] %d socket buffer setting(s) did not get the size asked for (last: asked %d bytes, got %d); queries may be dropped "
-                        "under load - raise kern.ipc.maxsockbuf and net.local.dgram.recvspace / maxdgram", g_ipc_buf_short, g_ipc_buf_asked, g_ipc_buf_got);
+    syslog(LOG_WARNING, "[IPC] WARNING: %d socket buffer setting(s) between the routers and the workers did not get the size asked for (last: asked %d bytes, got %d%s%s). "
+                        "Queries and replies are dropped when a worker is busy (counted: karictl ipcstats).  Raise the sysctl kern.ipc.maxsockbuf (now %lld; it must be "
+                        "above the size asked for, which is udp-recvbuf-size / udp-sndbuf-size) and, for the default size the kernel falls back to, net.local.dgram.recvspace "
+                        "(now %lld) and net.local.dgram.maxdgram (now %lld)",
+           g_ipc_buf_short, g_ipc_buf_asked, g_ipc_buf_got, g_ipc_buf_err ? ", setsockopt: " : "", g_ipc_buf_err ? strerror(g_ipc_buf_err) : "",
+           sysctl_num("kern.ipc.maxsockbuf"), sysctl_num("net.local.dgram.recvspace"), sysctl_num("net.local.dgram.maxdgram"));
   cap_rights_t n_rights_0, n_rights_1;
   cap_rights_init(&n_rights_0, CAP_RECV, CAP_EVENT);
   cap_rights_limit(g_notify_ipc[0], &n_rights_0);

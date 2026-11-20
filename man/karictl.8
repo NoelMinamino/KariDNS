@@ -120,6 +120,12 @@ Security counters: RRL dropped/slipped responses, Extended DNS Error counters
 (18 Prohibited, 20 Not Authoritative, 21 Not Supported, other) and truncated
 dnstap messages
 .IP \(bu 2
+IPC drops (0.7): \fBIPC dropped (router/worker queues, see karictl ipcstats):
+N\fR, the queries and replies that were lost between the Frontend routers and
+the Backend workers because a queue was full (or for another reason) and that no
+worker answered; \fBipcstats\fR has each place. 0 is what a server should
+show. The line is left out by a server of a version without \fBipcstats\fR
+.IP \(bu 2
 dnstap (0.7): \fBdnstap dropped (queue full): N\fR (messages lost because a ring
 was full: the collector reads too slowly, or \fBqueue\-size\fR is too small),
 \fBdnstap dropped (not connected): N\fR (messages lost while no collector was
@@ -472,9 +478,16 @@ responses by RCODE, EDNS / DO / ECS queries, rate-limit drops and slips, NOTIFY,
 transfers in and their failures, response cache hits and misses, SOA serial,
 role, time of the last transfer). The counters are cumulative since the server
 started (Prometheus \fBcounter\fRs); a zone that a reload replaces starts again
-at 0, which \fBrate()\fR handles as a counter reset. Queries that no zone
-answered (REFUSED for a name outside every zone, FORMERR, NOTIMP, ...) belong to
-no zone: they are in \fBkaridns_unzoned_responses_total{rcode}\fR, and
+at 0, which \fBrate()\fR handles as a counter reset. The queries and replies
+that were lost between the routers and the workers (0.7, \fBipcstats\fR below)
+are in the server part too:
+\fBkaridns_ipc_events_total{event="router.worker.dropped_full"}\fR and the other
+events of \fBipcstats\fR (the name without the \fBipc.\fR prefix;
+\fBrouter.worker.spilled\fR is not a loss), in JSON \fBipc\fR
+\fB{"router.worker.spilled":N, ...}\fR. They are left out when the server does
+not know \fBipcstats\fR. Queries that no zone answered (REFUSED for a name
+outside every zone, FORMERR, NOTIMP, ...) belong to no zone: they are in
+\fBkaridns_unzoned_responses_total{rcode}\fR, and
 \fBkaridns_responses_total{rcode}\fR is the zones' responses plus
 those. \fBkaridns_queries_total{proto}\fR counts the queries answered for a
 zone. \fBstats <zone> [view]\fR prints one zone (the same as \fBobservatory
@@ -511,6 +524,76 @@ needs the read permission of a restricted control key, like \fBobservatory\fR.
 karictl stats > /var/tmp/node_exporter/karidns.prom.$$ && mv /var/tmp/node_exporter/karidns.prom.$$ /var/tmp/node_exporter/karidns.prom
 karictl stats \-f json example.test
 karictl stats \-\-zones '*.example.test' \-\-limit 100
+.fi
+.RE
+.RE
+.TP 8
+\fBipcstats\fR
+The queries and replies that were lost, or moved, between the Frontend routers
+and the Backend workers (0.7), as lines \fBipc.<name>=<number>\fR: counters
+since the server started, summed over the routers and the workers. The reply is
+text (a \fBkarictl\fR of another version reads what is there: a name it does not
+know is printed or left out, never an error). Needs the read permission of a
+restricted control key.
+.RS 8
+.TP 8
+\fBipc.router.worker.spilled\fR
+queries that the worker chosen for a batch could not take (its queue was full)
+and another worker took: not a loss. A router sends the datagrams it read (up to
+16 at a time) to one worker, in turn; a worker that is busy for a moment no
+longer costs the batch, the rest goes to the next worker, at most once round all
+of them
+.TP 8
+\fBipc.router.worker.dropped_full\fR
+queries dropped because every worker's queue was full: each worker was tried
+.TP 8
+\fBipc.router.worker.dropped_error\fR
+queries dropped because the send failed for another reason (\fBEMSGSIZE\fR, ...)
+.TP 8
+\fBipc.router.rx.truncated\fR, \fBipc.router.rx.short\fR
+datagrams that the router dropped: larger than its receive buffer
+(\fBMSG_TRUNC\fR), or shorter than a DNS header (12 octets)
+.TP 8
+\fBipc.router.reply.short\fR, \fB.bad_length\fR, \fB.bad_socket\fR
+replies of a worker that the router dropped as malformed: shorter than the IPC
+header, a length that does not fit the message, a socket number that does not
+exist
+.TP 8
+\fBipc.router.client.dropped_full\fR, \fB.dropped_error\fR
+replies that the router could not send to the client: the UDP send buffer was
+full, or another error
+.TP 8
+\fBipc.worker.rx.short\fR, \fBipc.worker.rx.bad_length\fR
+messages of a router that a worker dropped as malformed
+.TP 8
+\fBipc.worker.reply.dropped_full\fR, \fB.dropped_error\fR
+replies that a worker had answered and the queue to the router did not take:
+full, or another error
+.TP 8
+\fBipc.worker.async.dropped_full\fR
+queries that a worker dropped because the queue of the asynchronous resolution
+threads (the queries for program zones and forward zones) was full, or no memory
+was left to copy the query
+.TP 8
+\fBipc.dropped.total\fR
+the sum of all of them but \fBspilled\fR
+.PP
+A queue is full when the worker (or the router) does not read it as fast as it
+is filled: a CPU that is busy with something else, or buffers that are too
+small. The size of the queues is \fBudp\-recvbuf\-size\fR /
+\fBudp\-sndbuf\-size\fR; when the kernel did not give the size asked for the
+server says so at start-up (\fB[IPC] WARNING\fR, see \fBudp\-recvbuf\-size\fR in
+\fBkaridns(8)\fR) and the sysctls \fBkern.ipc.maxsockbuf\fR,
+\fBnet.local.dgram.recvspace\fR and \fBnet.local.dgram.maxdgram\fR are the ones
+to raise. A datagram that the kernel drops at a full UDP socket of the router
+(before the router has read it) is in \fBnetstat \-s \-p udp\fR ("dropped due to
+full socket buffers"), not here. Every drop is also logged, once a second at the
+most (\fB[Frontend\->Backend IPC] dropped N UDP message(s): ...\fR).
+.PP
+.RS 2
+.nf
+karictl ipcstats
+karictl ipcstats | grep \-v '=0$'
 .fi
 .RE
 .RE

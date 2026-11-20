@@ -8206,7 +8206,7 @@ uint32_t control_command_perm(const char *cmd, bool has_arg) {
   if (!cmd) return CTLP_OTHER;
   if (strcmp(cmd, "reload") == 0) return has_arg ? CTLP_RELOAD_ZONE : CTLP_RELOAD;
   if (strcmp(cmd, "status") == 0 || strcmp(cmd, "zonestatus") == 0 || strcmp(cmd, "observatory") == 0 || strcmp(cmd, "dbstatus") == 0 || strcmp(cmd, "store") == 0 ||
-      strcmp(cmd, "stats") == 0 || strcmp(cmd, "obspage") == 0)
+      strcmp(cmd, "stats") == 0 || strcmp(cmd, "obspage") == 0 || strcmp(cmd, "ipcstats") == 0)
     return CTLP_READ;
   if (strcmp(cmd, "notrace") == 0) return CTLP_TRACE;   /* (the name `trace` allows both, as rndc's trace / notrace are one switch) */
   uint32_t p = control_perm_from_name(cmd);

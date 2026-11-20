@@ -259,3 +259,19 @@ store_prefill() {
 kari_lab_zones() {
     sed 's#^#tests/zones/#' "${ROOT:-.}/tests/zones/LAB_ZONES"
 }
+
+# kari_ipc_diag KARICTL LOG : for a test that lost a query (or got a wrong answer under load) on a server it started.  KARICTL is the command that
+# reaches that server ("./karictl -c conf"), LOG its log.  Prints the drop counters between the routers and the workers that are not 0
+# (karictl ipcstats, 0.7: a query dropped there was never counted anywhere before) and the lines of the log about the IPC and UDP socket buffers
+# and the drops ("[IPC] WARNING ..." says a buffer did not get the size asked for).  So the next failure shows whether the loss was there.
+kari_ipc_diag() {
+    _kid_ctl=$1
+    _kid_log=$2
+    echo "  [ipc diag] karictl ipcstats (counters that are not 0):"
+    _kid_out=$($_kid_ctl ipcstats 2>&1)
+    _kid_nz=$(printf '%s\n' "$_kid_out" | grep -v '=0$')
+    if [ -n "$_kid_nz" ]; then printf '%s\n' "$_kid_nz" | sed 's/^/    /'; else printf '%s\n' "$_kid_out" | head -3 | sed 's/^/    all 0, or no answer: /'; fi
+    echo "  [ipc diag] buffer and drop lines of $_kid_log:"
+    grep -h '\[IPC\]\|\[Network\] .*\(SO_RCVBUF\|SO_SNDBUF\)\|dropped [0-9]* UDP message' "$_kid_log" 2>/dev/null | head -6 | cut -c1-500 | sed 's/^/    /'
+    echo "  [ipc diag] kern.ipc.maxsockbuf=$(sysctl -n kern.ipc.maxsockbuf 2>/dev/null) net.local.dgram.recvspace=$(sysctl -n net.local.dgram.recvspace 2>/dev/null)"
+}

@@ -101,7 +101,7 @@ burst_check() {   # burst_check LABEL SEED: a burst of one query for every zone,
     OUT=$(perl tests/db/udp_cold_burst.pl "$PA" "$NZ" "$2" "$WINDOW" "$WAIT")
     echo "  $OUT"
     bv() { echo "$OUT" | sed -n "s/.* $1=\([0-9.]*\).*/\1/p" | head -1; }
-    [ "$(bv noerror)" = "$NZ" ] && [ "$(bv servfail)" = 0 ] && [ "$(bv lost)" = 0 ] && pass "$1: all $NZ queries answered with NOERROR (0 SERVFAIL, 0 lost)" || fail "$1: $OUT"; echo "  $(park_drops)"
+    [ "$(bv noerror)" = "$NZ" ] && [ "$(bv servfail)" = 0 ] && [ "$(bv lost)" = 0 ] && pass "$1: all $NZ queries answered with NOERROR (0 SERVFAIL, 0 lost)" || fail "$1: $OUT"; echo "  $(park_drops)"; [ "$(bv noerror)" = "$NZ" ] && [ "$(bv lost)" = 0 ] || kari_ipc_diag "$KA" "$T/a.log"
     SR0=$(server_refusals)
     case "$SR0" in
     "park_full=0 park_timeout=0 queue_full=0 queue_dropped=0 table_full=0") pass "$1: the server refused no stored zone on its own account ($SR0)" ;;
