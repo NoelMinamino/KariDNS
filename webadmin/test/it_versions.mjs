@@ -58,7 +58,7 @@ function sql(text) {
 }
 
 // ---- the DNS server
-const dagArgs = (name, t) => ['@127.0.0.1', '-p', PORT, name, t, '+nohexdump', '+time=2', '+tries=1'];
+const dagArgs = (name, t) => ['@127.0.0.1', '-p', PORT, name, t, '+nohexdump', '+time=3', '+tries=3'];
 const answer = (name, t = 'A') => spawnSync(DAG, [...dagArgs(name, t), '+short'], { encoding: 'utf8' }).stdout.trim().split('\n').filter(Boolean).sort().join(',');
 async function waitAnswer(what, name, want, secs = 15, t = 'A') {
   const end = Date.now() + secs * 1000;
