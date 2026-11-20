@@ -70,7 +70,10 @@ check() {   # check "description" command...
 
 # ---------------------------------------------------------------- reference stream and database
 echo "== reference stream from the zone files"
-"$Z2K" --ref "$T/ref.kdb" --list "$T/list.txt" tests/zones/*.zone > "$T/ref.log" 2>&1
+if command -v git >/dev/null 2>&1 && git ls-files --error-unmatch tests/zones/LAB_ZONES >/dev/null 2>&1; then   # (a checkout; the CI VMs have the files only)
+    git ls-files 'tests/zones/*.zone' | sed 's#^tests/zones/##' | LC_ALL=C sort | cmp -s - tests/zones/LAB_ZONES && ok "tests/zones/LAB_ZONES lists the zone files of the repository" || bad "tests/zones/LAB_ZONES differs from the zone files of the repository (git ls-files): a file was added or removed, update the list"
+fi
+"$Z2K" --ref "$T/ref.kdb" --list "$T/list.txt" $(kari_lab_zones) > "$T/ref.log" 2>&1
 RC=$?
 grep -c "^  \[ OK \]" "$T/ref.log" | sed 's/^/  zones taken: /'
 grep "^SKIP" "$T/ref.log" | sed 's/^/  /'
