@@ -1447,7 +1447,7 @@ int main(int argc, char **argv) {
         }
     } else if (strcmp(argv[optind], "ipcstats") == 0) {
         /* the lines "ipc.<name>=<n>" of the server, as they are (the server closes the connection after the reply) */
-        char ibuf[2048];
+        char ibuf[8192];          /* (0.7 B3 phase 2: an ipcworker line per worker, up to 128) */
         size_t total = 0;
         while (total < sizeof(ibuf) - 1) {
             r = ctl_recv(sock, ibuf + total, sizeof(ibuf) - 1 - total);

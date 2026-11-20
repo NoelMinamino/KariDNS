@@ -41,6 +41,7 @@
 #include <sys/event.h>    // kqueue
 #include <sys/param.h>
 #include <sys/procctl.h>  // PROC_TRAPCAP
+#include <sys/resource.h> // getrlimit: the descriptors of udp-receive backend (be_udp_budget)
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/sysctl.h>   // sysctlbyname: the buffer limits in the warnings
@@ -141,6 +142,12 @@ static pid_t g_manager_pid = 0;
 STATIC_TEST int g_num_frontend_routers = NUM_FRONTEND_ROUTERS;
 STATIC_TEST int g_ipc_fds[MAX_FRONTEND_ROUTERS][MAX_WORKERS][2];
 STATIC_TEST int g_num_workers = 0;
+/* udp-receive backend (B3 phase 2, dns_server_internal.h): the workers' own UDP sockets, made by the manager before the forks (open_backend_udp_sockets());
+ * g_be_udp_count = 0 is udp-receive frontend.  A descriptor that a process gave up is -1 */
+int g_be_udp_count = 0;
+int g_be_udp_fds[MAX_WORKERS][MAX_BIND_ADDRS];
+bool g_be_udp_wild[MAX_BIND_ADDRS];
+router_src_t g_be_udp_src[MAX_BIND_ADDRS];
 char g_startup_cwd[PATH_MAX] = "";
 int g_notify_ipc[2];
 /* NOTIFY の応答 (QR=1, OPCODE=4) を UDP ワーカーから制御スレッドへ渡す (Backend の中だけで使う) */
@@ -2017,7 +2024,12 @@ static const char *const g_ipcd_names[IPCD_COUNT] = {
   "router.worker.spilled", "router.worker.dropped_full", "router.worker.dropped_error", "router.rx.truncated", "router.rx.short",
   "router.reply.short", "router.reply.bad_length", "router.reply.bad_socket", "router.client.dropped_full", "router.client.dropped_error",
   "worker.rx.short", "worker.rx.bad_length", "worker.reply.dropped_full", "worker.reply.dropped_error", "worker.async.dropped_full",
+  "worker.udp.truncated", "worker.udp.short",
 };
+_Static_assert(sizeof(g_ipcd_names) / sizeof(g_ipcd_names[0]) == IPCD_COUNT, "a name for every IPC counter");
+/* udp-receive backend: the queries each worker read from its own UDP sockets (ipcworker.<w>.queries).  The workers are threads of the Backend, which
+ * also formats the reply: no shared mapping is needed; one cache line per worker (one writer each) */
+static struct { alignas(64) _Atomic uint64_t n; } g_ipcd_wrecv[KARIDNS_WORKER_THREADS_MAX];
 
 STATIC_TEST void ipcd_init(void) {
   if (g_ipcd_slots) return;
@@ -2049,6 +2061,15 @@ uint64_t ipcd_routed(int slot) {
   return (slot >= 0 && slot < IPCD_SLOTS) ? atomic_load_explicit(&g_ipcd_slots[slot].routed, memory_order_relaxed) : 0;
 }
 
+void ipcd_wrecv_add(int worker, uint64_t n) {
+  if (n && worker >= 0 && worker < KARIDNS_WORKER_THREADS_MAX)
+    atomic_store_explicit(&g_ipcd_wrecv[worker].n, atomic_load_explicit(&g_ipcd_wrecv[worker].n, memory_order_relaxed) + n, memory_order_relaxed);
+}
+
+uint64_t ipcd_wrecv(int worker) {
+  return (worker >= 0 && worker < KARIDNS_WORKER_THREADS_MAX) ? atomic_load_explicit(&g_ipcd_wrecv[worker].n, memory_order_relaxed) : 0;
+}
+
 uint64_t ipcd_total(ipcd_t c) {
   uint64_t t = 0;
   if (!g_ipcd_slots) return atomic_load_explicit(&g_ipcd_fallback.c[c], memory_order_relaxed);
@@ -2073,6 +2094,13 @@ size_t ipcd_format(char *buf, size_t cap) {
   /* the queries each router read and handed to the workers (B3: with several routers, SO_REUSEPORT_LB shares the clients' ports out; a router at 0 is idle) */
   for (int r = 0; r < g_num_frontend_routers && r < KARIDNS_ROUTER_THREADS_MAX; r++) {
     w = snprintf(buf + len, cap - len, "ipcrouter.%d.queries=%llu\n", r, (unsigned long long)ipcd_routed(r));
+    if (w < 0 || (size_t)w >= cap - len) return len;
+    len += (size_t)w;
+  }
+  /* udp-receive backend (B3 phase 2): the queries each worker read from its own UDP sockets (SO_REUSEPORT_LB shares the clients out over the workers;
+   * the routers' lines then count only what came in on their NOTIFY sockets) */
+  for (int wk = 0; g_be_udp_count > 0 && wk < g_num_workers && wk < KARIDNS_WORKER_THREADS_MAX; wk++) {
+    w = snprintf(buf + len, cap - len, "ipcworker.%d.queries=%llu\n", wk, (unsigned long long)ipcd_wrecv(wk));
     if (w < 0 || (size_t)w >= cap - len) return len;
     len += (size_t)w;
   }
@@ -3192,6 +3220,59 @@ STATIC_TEST void park_service(udp_pass_t *w, int kq) {
   }
 }
 
+/* udp-receive backend (B3 phase 2): the queries that came in on this worker's own UDP socket sock_idx (descriptor fd, receive only) are read in batches,
+ * given the udp_ipc_t header the router used to build (udp_ipc_from_recv(): the client, the destination, sock_idx), and run through udp_one() exactly
+ * as a message of a router; the replies go on reply_fd, the IPC pair to the router that sends this worker's replies (be_udp_reply_router()), which
+ * sends them on its descriptor of the same socket.  A query that parks keeps the header (and so sock_idx) and reply_fd in its entry (park_udp()).
+ * No allocation: the batch buffers of the worker.  Returns the number of queries run (the tests). */
+int worker_udp_rx(udp_pass_t *pass, int fd, int sock_idx, int reply_fd) {
+  udp_batch_ctx_t *batch = pass->batch;
+  if (sock_idx < 0 || sock_idx >= g_be_udp_count || sock_idx >= MAX_BIND_ADDRS) return 0;
+  const bool want_dst = g_be_udp_wild[sock_idx];       /* (only a wildcard socket was asked for the destination: udp_listen_socket()) */
+  const router_src_t *const bound_src = &g_be_udp_src[sock_idx];
+  int total = 0;
+  while (1) {
+    for (int k = 0; k < UDP_BATCH_SIZE; k++) {
+      udp_ipc_t *h = (udp_ipc_t *)batch->rx_buffers[k];
+      struct msghdr *mh = &batch->urx_msgs[k].msg_hdr;
+      batch->urx_iov[k].iov_base = batch->rx_buffers[k] + sizeof(udp_ipc_t);
+      batch->urx_iov[k].iov_len = BUFFER_SIZE;            /* (as the router: a larger datagram comes cut, MSG_TRUNC, and is dropped) */
+      mh->msg_iov = &batch->urx_iov[k];
+      mh->msg_iovlen = 1;
+      mh->msg_name = &h->client_addr;
+      mh->msg_namelen = sizeof(h->client_addr);
+      mh->msg_control = want_dst ? batch->urx_cbuf[k].buf : NULL;
+      mh->msg_controllen = want_dst ? sizeof(batch->urx_cbuf[k].buf) : 0;
+      mh->msg_flags = 0;
+    }
+    const int n_recv = recvmmsg(fd, batch->urx_msgs, UDP_BATCH_SIZE, MSG_DONTWAIT, NULL);
+    if (n_recv <= 0) break;                               /* EAGAIN (EV_CLEAR: the next datagram raises the event again) */
+    pass->active_fd = reply_fd;
+    pass->n_tx = 0;
+    pass->woken = false;
+    int n_served = 0;
+    for (int p = 0; p < n_recv; p++) {
+      udp_ipc_t *h = (udp_ipc_t *)batch->rx_buffers[p];
+      const int rx = udp_ipc_from_recv(h, &batch->urx_msgs[p].msg_hdr, batch->urx_msgs[p].msg_len, sock_idx, want_dst, bound_src);
+      if (rx != UDP_RX_OK) {
+        ipcd_add(rx == UDP_RX_TRUNC ? IPCD_WURX_TRUNC : IPCD_WURX_SHORT, 1);
+        continue;
+      }
+      udp_one(pass, h, batch->rx_buffers[p] + sizeof(udp_ipc_t), h->payload_len);
+      n_served++;
+    }
+    atomic_fetch_add_explicit(&pass->ctx->query_count, (uint64_t)n_served, memory_order_relaxed);
+    ipcd_wrecv_add(pass->worker_idx, (uint64_t)n_served);
+    if (pass->n_tx > 0) {
+      sendmmsg_skip_failed(reply_fd, batch->tx_msgs, pass->n_tx, "Backend->Frontend IPC", true, IPCD_WREP_FULL);
+      pass->n_tx = 0;
+    }
+    total += n_served;
+    if (udp_batch_drained(n_recv)) break;                /* (as the router and the IPC read loop) */
+  }
+  return total;
+}
+
 void *worker_thread_func(void *arg) {
   worker_ctx_t *ctx = (worker_ctx_t *)arg;
   logev_set_thread_sink(qlog_event_sink, ctx);    // batch 14: the event messages of this thread go into its ring
@@ -3291,6 +3372,17 @@ void *worker_thread_func(void *arg) {
     struct kevent ev_ipc;
     EV_SET(&ev_ipc, my_ipc_fd, EVFILT_READ, EV_ADD | EV_CLEAR, 0, 0, (void *)1);
     kevent(kq, &ev_ipc, 1, NULL, 0, NULL);
+  }
+  /* udp-receive backend (B3 phase 2): this worker's own UDP sockets, one per listen address (receive only: the Backend limited them before the threads
+   * started).  A socket that is not watched would keep its share of the clients unanswered: the start fails instead (X-33) */
+  const int be_reply_fd = g_be_udp_count > 0 && g_num_frontend_routers > 0 ? g_ipc_fds[be_udp_reply_router(w, g_num_frontend_routers)][w][1] : -1;
+  for (int a = 0; a < g_be_udp_count; a++) {
+    struct kevent ev_udp;
+    EV_SET(&ev_udp, g_be_udp_fds[w][a], EVFILT_READ, EV_ADD | EV_CLEAR, 0, 0, (void *)(uintptr_t)(WORKER_UDP_UDATA + a));
+    if (kevent(kq, &ev_udp, 1, NULL, 0, NULL) != 0) {
+      syslog(LOG_CRIT, "[Backend] worker %d: cannot watch its UDP socket %d (%m)", w, a);
+      goto worker_startup_failed;
+    }
   }
 
   pid_t parent_pid = getppid();
@@ -3452,6 +3544,10 @@ worker_startup_success:;
           if (udp_batch_drained(n_recv))
             break;   // the queue was emptied by this batch (EV_CLEAR: a message that comes later raises the event again), as in the router
         }
+      } else if (ev_list[i].filter == EVFILT_READ && (uintptr_t)ev_list[i].udata >= WORKER_UDP_UDATA &&
+                 (uintptr_t)ev_list[i].udata < WORKER_UDP_UDATA + MAX_BIND_ADDRS) {
+        // UDP (udp-receive backend: this worker's own socket of one listen address; the replies go to a router over the IPC)
+        (void)worker_udp_rx(&pass, (int)ev_list[i].ident, (int)((uintptr_t)ev_list[i].udata - WORKER_UDP_UDATA), be_reply_fd);
       } else if (ev_list[i].udata == (void *)2) {
         // TCP
         int active_tcp_fd = ev_list[i].ident;
@@ -4402,6 +4498,7 @@ STATIC_TEST void collect_restart_only_changes(const server_config_t *o, const se
   if (o->response_cache_size != n->response_cache_size) append_list_item(buf, sz, "response-cache-size");
   if (o->router_threads != n->router_threads) append_list_item(buf, sz, "router-threads");
   if (o->worker_threads != n->worker_threads) append_list_item(buf, sz, "worker-threads");
+  if (o->udp_receive != n->udp_receive) append_list_item(buf, sz, "udp-receive");
   if (o->control.enabled != n->control.enabled || str_differs(o->control.socket_path, n->control.socket_path) ||
       o->control.has_allow_gid != n->control.has_allow_gid || (n->control.has_allow_gid && o->control.allow_gid != n->control.allow_gid))
     append_list_item(buf, sz, "control-channel socket / allow-group");
@@ -6429,7 +6526,7 @@ void *control_thread_func(void *arg) {
               (void)ctl_send_all(cfd, stbuf, stlen);
             } else if (strcmp(cmd, "ipcstats") == 0) {
               /* 0.7: the queries and replies lost between the routers and the workers (ipcd_t), as "ipc.<name>=<n>" lines (a read command) */
-              char ipbuf[2048];
+              char ipbuf[8192];         /* (udp-receive backend: one ipcworker line per worker, up to 128) */
               size_t iplen = ipcd_format(ipbuf, sizeof(ipbuf));
               (void)ctl_send_all(cfd, ipbuf, iplen);
             } else if (strcmp(cmd, "storeop") == 0) {
@@ -6702,67 +6799,94 @@ bool router_src_from_sockaddr(const struct sockaddr_storage *ss, router_src_t *o
   return true;
 }
 
+/* One UDP socket of the listen address la, with the options every UDP listener of the server has (the routers' of udp-receive frontend, the workers' of
+ * udp-receive backend: one function, so the two cannot drift apart): the buffers, O_NONBLOCK, IPV6_V6ONLY, SO_REUSEPORT_LB (the kernel shares the clients
+ * out over every socket of the address), and on a wildcard socket the destination of every query (IP_RECVDSTADDR / IPV6_RECVPKTINFO).  Returns the
+ * descriptor; -1 when socket() fails (a family the host does not have: the address is skipped, as preflight_listen_ports() does); -2 when bind() fails
+ * (logged with the hint; the caller ends the start: fail closed). */
+static int udp_listen_socket(const listen_addr_t *la, int rcvbuf_size, int sndbuf_size, int extra_type) {
+  int opt = 1;
+  struct sockaddr_storage addr;
+  socklen_t addr_len = listen_addr_sockaddr(la, &addr);
+  const bool is_wildcard = la->wildcard;
+  int udp_fd = socket(la->family, SOCK_DGRAM | extra_type, 0);
+  if (udp_fd < 0) return -1;
+  setup_udp_socket_buffers(udp_fd, rcvbuf_size, sndbuf_size);
+  fcntl(udp_fd, F_SETFL, fcntl(udp_fd, F_GETFL, 0) | O_NONBLOCK);
+  if (la->family == AF_INET6) setsockopt(udp_fd, IPPROTO_IPV6, IPV6_V6ONLY, &opt, sizeof(opt));
+#ifdef SO_REUSEPORT_LB
+  int opt_lb = 1;
+  if (setsockopt(udp_fd, SOL_SOCKET, SO_REUSEPORT_LB, &opt_lb, sizeof(opt_lb)) < 0) {
+    int opt_reuse = 1;
+    setsockopt(udp_fd, SOL_SOCKET, SO_REUSEPORT, &opt_reuse, sizeof(opt_reuse));
+  }
+#else
+  int opt_reuse = 1;
+  setsockopt(udp_fd, SOL_SOCKET, SO_REUSEPORT, &opt_reuse, sizeof(opt_reuse));
+#endif
+  if (is_wildcard && la->family == AF_INET) {
+    int opt_dst = 1;
+#ifdef IP_RECVDSTADDR
+    setsockopt(udp_fd, IPPROTO_IP, IP_RECVDSTADDR, &opt_dst, sizeof(opt_dst));
+#elif defined(IP_PKTINFO)
+    setsockopt(udp_fd, IPPROTO_IP, IP_PKTINFO, &opt_dst, sizeof(opt_dst));
+#endif
+  } else if (is_wildcard) {
+    int opt_pktinfo = 1;
+#ifdef IPV6_RECVPKTINFO
+    setsockopt(udp_fd, IPPROTO_IPV6, IPV6_RECVPKTINFO, &opt_pktinfo, sizeof(opt_pktinfo));
+#elif defined(IPV6_PKTINFO)
+    setsockopt(udp_fd, IPPROTO_IPV6, IPV6_PKTINFO, &opt_pktinfo, sizeof(opt_pktinfo));
+#endif
+  }
+  if (bind(udp_fd, (struct sockaddr *)&addr, addr_len) != 0) {
+    int bind_errno = errno;
+    syslog(LOG_CRIT, "[Frontend] Failed to bind UDP%s socket to %s:%d: %s%s", la->family == AF_INET ? "v4" : "v6", la->text, (int)la->port,
+           strerror(bind_errno), bind_error_hint(bind_errno, la->port));
+    fprintf(stderr, "[ERROR] [Frontend] Failed to bind UDP%s socket to %s:%d: %s%s\n", la->family == AF_INET ? "v4" : "v6", la->text,
+            (int)la->port, strerror(bind_errno), bind_error_hint(bind_errno, la->port));
+    close(udp_fd);
+    return -2;
+  }
+  return udp_fd;
+}
+
+/* The destination the queries of the bound listener la come to, for its sockets (router_src_t): none for a wildcard address (the cmsg tells) */
+static void udp_listen_src(const listen_addr_t *la, router_src_t *out) {
+  memset(out, 0, sizeof(*out));
+  if (la->wildcard) return;
+  struct sockaddr_storage addr;
+  (void)listen_addr_sockaddr(la, &addr);
+  (void)router_src_from_sockaddr(&addr, out);
+}
+
 /* Opens the router UDP sockets.  A wildcard socket asks the kernel for the destination of every query (IP_RECVDSTADDR / IPV6_RECVPKTINFO: the reply must leave
  * from that address); a socket bound to one address does not: out_src[i] keeps the address it was bound to (B3 phase 1: less work in the kernel and in the
  * router for every query).  The sockets that only send NOTIFY (an ephemeral port, no query ever comes in) have neither. */
 int open_router_udp_sockets(server_config_t *cfg, int out_fds[MAX_BIND_ADDRS], bool out_is_wildcard[MAX_BIND_ADDRS], router_src_t out_src[MAX_BIND_ADDRS]) {
-  int num_fds = 0;
+  return open_router_udp_sockets_given(cfg, -1, out_fds, out_is_wildcard, out_src);
+}
+
+/* n_given < 0: the listen sockets are opened here (udp-receive frontend).  n_given >= 0 (udp-receive backend): out_fds[0 .. n_given) and their
+ * out_is_wildcard / out_src are filled already (the router's send descriptors of the workers' sockets of each listen address), and only the NOTIFY
+ * sockets are added behind them. */
+int open_router_udp_sockets_given(server_config_t *cfg, int n_given, int out_fds[MAX_BIND_ADDRS], bool out_is_wildcard[MAX_BIND_ADDRS], router_src_t out_src[MAX_BIND_ADDRS]) {
+  int num_fds = n_given > 0 ? (n_given < MAX_BIND_ADDRS ? n_given : MAX_BIND_ADDRS) : 0;
   int opt = 1;
   int rcvbuf_size = cfg->udp_recvbuf_size > 0 ? cfg->udp_recvbuf_size : 4 * 1024 * 1024;
   int sndbuf_size = cfg->udp_sndbuf_size > 0 ? cfg->udp_sndbuf_size : 4 * 1024 * 1024;
 
-  for (int i = 0; i < cfg->listen_count; i++) {
+  for (int i = 0; n_given < 0 && i < cfg->listen_count; i++) {
     const listen_addr_t *la = &cfg->listen[i];
-    struct sockaddr_storage addr;
-    socklen_t addr_len = listen_addr_sockaddr(la, &addr);
-    bool is_wildcard = la->wildcard;
     if (num_fds >= MAX_BIND_ADDRS) break;
-    int udp_fd = socket(la->family, SOCK_DGRAM, 0);
-    if (udp_fd < 0) continue;
-    setup_udp_socket_buffers(udp_fd, rcvbuf_size, sndbuf_size);
-    fcntl(udp_fd, F_SETFL, fcntl(udp_fd, F_GETFL, 0) | O_NONBLOCK);
-    if (la->family == AF_INET6) setsockopt(udp_fd, IPPROTO_IPV6, IPV6_V6ONLY, &opt, sizeof(opt));
-#ifdef SO_REUSEPORT_LB
-    int opt_lb = 1;
-    if (setsockopt(udp_fd, SOL_SOCKET, SO_REUSEPORT_LB, &opt_lb, sizeof(opt_lb)) < 0) {
-      int opt_reuse = 1;
-      setsockopt(udp_fd, SOL_SOCKET, SO_REUSEPORT, &opt_reuse, sizeof(opt_reuse));
-    }
-#else
-    int opt_reuse = 1;
-    setsockopt(udp_fd, SOL_SOCKET, SO_REUSEPORT, &opt_reuse, sizeof(opt_reuse));
-#endif
-    if (is_wildcard && la->family == AF_INET) {
-      int opt_dst = 1;
-#ifdef IP_RECVDSTADDR
-      setsockopt(udp_fd, IPPROTO_IP, IP_RECVDSTADDR, &opt_dst, sizeof(opt_dst));
-#elif defined(IP_PKTINFO)
-      setsockopt(udp_fd, IPPROTO_IP, IP_PKTINFO, &opt_dst, sizeof(opt_dst));
-#endif
-    } else if (is_wildcard) {
-      int opt_pktinfo = 1;
-#ifdef IPV6_RECVPKTINFO
-      setsockopt(udp_fd, IPPROTO_IPV6, IPV6_RECVPKTINFO, &opt_pktinfo, sizeof(opt_pktinfo));
-#elif defined(IPV6_PKTINFO)
-      setsockopt(udp_fd, IPPROTO_IPV6, IPV6_PKTINFO, &opt_pktinfo, sizeof(opt_pktinfo));
-#endif
-    }
-    if (bind(udp_fd, (struct sockaddr *)&addr, addr_len) == 0) {
-      logev_post(LOGC_NETWORK, 1, NULL, 0, "[Network] UDP listener %s#%d (socket %d)%s", la->text, (int)la->port, udp_fd,
-                 is_wildcard ? ": a wildcard address, the reply's source is taken from the destination of the query" : "");
-      out_is_wildcard[num_fds] = is_wildcard;
-      memset(&out_src[num_fds], 0, sizeof(out_src[num_fds]));
-      if (!is_wildcard) (void)router_src_from_sockaddr(&addr, &out_src[num_fds]);
-      out_fds[num_fds++] = udp_fd;
-    } else {
-      int bind_errno = errno;
-      syslog(LOG_CRIT, "[Frontend] Failed to bind UDP%s socket to %s:%d: %s%s", la->family == AF_INET ? "v4" : "v6", la->text, (int)la->port,
-             strerror(bind_errno), bind_error_hint(bind_errno, la->port));
-      fprintf(stderr, "[ERROR] [Frontend] Failed to bind UDP%s socket to %s:%d: %s%s\n", la->family == AF_INET ? "v4" : "v6", la->text,
-              (int)la->port, strerror(bind_errno), bind_error_hint(bind_errno, la->port));
-      close(udp_fd);
-      exit(EXIT_FAILURE);
-    }
+    int udp_fd = udp_listen_socket(la, rcvbuf_size, sndbuf_size, 0);
+    if (udp_fd == -1) continue;
+    if (udp_fd < 0) exit(EXIT_FAILURE);
+    logev_post(LOGC_NETWORK, 1, NULL, 0, "[Network] UDP listener %s#%d (socket %d)%s", la->text, (int)la->port, udp_fd,
+               la->wildcard ? ": a wildcard address, the reply's source is taken from the destination of the query" : "");
+    out_is_wildcard[num_fds] = la->wildcard;
+    udp_listen_src(la, &out_src[num_fds]);
+    out_fds[num_fds++] = udp_fd;
   }
 
   // Pre-bind the NOTIFY source addresses of the configuration (notify-source, notify-source-v6, the `source` of also-notify lists: every
@@ -6821,6 +6945,144 @@ int open_router_udp_sockets(server_config_t *cfg, int out_fds[MAX_BIND_ADDRS], b
   return num_fds;
 }
 
+/* The udp_ipc_t header of one datagram that recvmmsg() read from a UDP listener into the room behind the header (msg_name pointed at msg->client_addr):
+ * the router's read loop (udp-receive frontend) and the worker's (udp-receive backend) both build it here.  sock_idx is the index the reply names; the
+ * destination of the query (the reply's source) comes from the cmsg of a wildcard socket (want_dst: only those were asked for it), or is the address
+ * a specific socket is bound to (bound_src).  UDP_RX_TRUNC: larger than the buffer (MSG_TRUNC: a cut message does not match its counts: UPDATE, TSIG,
+ * so it is not answered); UDP_RX_SHORT: shorter than a DNS header.  Either is dropped and counted by the caller. */
+int udp_ipc_from_recv(udp_ipc_t *msg, const struct msghdr *mh, size_t len, int32_t sock_idx, bool want_dst, const router_src_t *bound_src) {
+  if (mh->msg_flags & MSG_TRUNC) return UDP_RX_TRUNC;
+  if (len < DNS_HEADER_SIZE) return UDP_RX_SHORT;
+  msg->sock_fd_idx = sock_idx;
+  msg->addr_len = (uint16_t)(mh->msg_namelen <= sizeof(msg->client_addr) ? mh->msg_namelen : sizeof(msg->client_addr));
+  msg->has_source_addr = false;
+  memset(&msg->source_addr, 0, sizeof(msg->source_addr));
+  msg->payload_len = (uint16_t)len;
+  if (!want_dst && bound_src && bound_src->valid) {
+    msg->has_source_addr = true;     /* the address the socket is bound to: where the query came in */
+    msg->source_addr = bound_src->addr;
+  }
+  for (struct cmsghdr *cmsg = want_dst ? CMSG_FIRSTHDR(mh) : NULL; cmsg != NULL; cmsg = CMSG_NXTHDR(mh, cmsg)) {
+#ifdef IP_RECVDSTADDR
+    if (cmsg->cmsg_level == IPPROTO_IP && cmsg->cmsg_type == IP_RECVDSTADDR && cmsg->cmsg_len >= CMSG_LEN(sizeof(struct in_addr))) {
+      msg->source_addr.sin.sin_family = AF_INET;
+      memcpy(&msg->source_addr.sin.sin_addr, CMSG_DATA(cmsg), sizeof(struct in_addr));
+      msg->has_source_addr = true;
+      break;
+    }
+#endif
+#ifdef IP_PKTINFO
+    if (cmsg->cmsg_level == IPPROTO_IP && cmsg->cmsg_type == IP_PKTINFO && cmsg->cmsg_len >= CMSG_LEN(sizeof(struct in_pktinfo))) {
+      struct in_pktinfo pi;
+      memcpy(&pi, CMSG_DATA(cmsg), sizeof(pi));
+      msg->source_addr.sin.sin_family = AF_INET;
+      msg->source_addr.sin.sin_addr = pi.ipi_addr;
+      msg->has_source_addr = true;
+      break;
+    }
+#endif
+#ifdef IPV6_PKTINFO
+    if (cmsg->cmsg_level == IPPROTO_IPV6 && cmsg->cmsg_type == IPV6_PKTINFO && cmsg->cmsg_len >= CMSG_LEN(sizeof(struct in6_pktinfo))) {
+      struct in6_pktinfo pi6;
+      memcpy(&pi6, CMSG_DATA(cmsg), sizeof(pi6));
+      msg->source_addr.sin6.sin6_family = AF_INET6;
+      msg->source_addr.sin6.sin6_addr = pi6.ipi6_addr;
+      msg->has_source_addr = true;
+      break;
+    }
+#endif
+  }
+  return UDP_RX_OK;
+}
+
+/* udp-receive backend: the router that the replies of worker `worker` go to (each worker sends all of them on its pair to one router, so the routers
+ * share the workers out: 4 + 4 is one worker per router) */
+int be_udp_reply_router(int worker, int routers) {
+  return routers > 0 && worker >= 0 ? worker % routers : 0;
+}
+
+/* The descriptor a router sends a worker's reply on.  sock_fd_idx comes from the Backend, which the router does not trust: an index outside the router's
+ * table, a worker that does not exist, or the socket of a worker whose replies go to another router (the router closed that descriptor) gives -1, and
+ * the caller drops the reply and counts it (IPCD_RREP_BADSOCK).  With udp-receive backend the first g_be_udp_count indices are the listen addresses
+ * (the socket of the replying worker for that address: the reply leaves from the socket the query came in on), the ones above them the router's own
+ * NOTIFY sockets; with udp-receive frontend every index is one of the router's sockets. */
+int router_reply_fd(int worker_idx, int32_t sock_idx, const int *local_fds, int num_local) {
+  if (sock_idx < 0 || sock_idx >= num_local || sock_idx >= MAX_BIND_ADDRS) return -1;
+  if (sock_idx < g_be_udp_count) {
+    if (worker_idx < 0 || worker_idx >= g_num_workers || worker_idx >= MAX_WORKERS) return -1;
+    return g_be_udp_fds[worker_idx][sock_idx];
+  }
+  return local_fds[sock_idx];
+}
+
+/* udp-receive backend at start-up: the receive sockets (workers x listen addresses) must fit BE_UDP_SOCKETS_MAX, and the descriptors of the Backend that
+ * grow with the workers (the receive sockets, the TCP listeners, the IPC pairs) and a reserve of 64 must fit the descriptor limit (RLIMIT_NOFILE,
+ * nofile; < 0: not known, not checked).  Refused at the start with the reason, never by an EMFILE while the server runs.  false: err says why. */
+bool be_udp_budget(int workers, int addrs, int routers, long long nofile, char *err, size_t errlen) {
+  const long long socks = (long long)workers * addrs;
+  if (socks > BE_UDP_SOCKETS_MAX) {
+    snprintf(err, errlen, "udp-receive backend needs one UDP socket per worker and listen address: %d worker(s) x %d address(es) = %lld, more than %d; "
+             "lower worker-threads, listen on fewer addresses, or set udp-receive frontend", workers, addrs, socks, BE_UDP_SOCKETS_MAX);
+    return false;
+  }
+  const long long need = 2 * socks + (long long)routers * workers + 64;
+  if (nofile >= 0 && need > nofile) {
+    snprintf(err, errlen, "udp-receive backend: %d worker(s) x %d address(es) need about %lld descriptors, the limit (RLIMIT_NOFILE) is %lld; "
+             "raise it (limits(1), login.conf openfiles), lower worker-threads, or set udp-receive frontend", workers, addrs, need, nofile);
+    return false;
+  }
+  return true;
+}
+
+/* udp-receive backend: the manager makes the workers' receive sockets before the Backend and the routers are forked (as root: the port may be
+ * privileged).  One socket per (worker, listen address) in the address's SO_REUSEPORT_LB group, with the options of every listener
+ * (udp_listen_socket()); close-on-exec, nothing is executed with them.  A family the host does not have skips the address (as the routers do);
+ * any other failure, or a bind that fails, refuses the start (err).  Sets g_be_udp_count, g_be_udp_wild, g_be_udp_src. */
+bool open_backend_udp_sockets(server_config_t *cfg, int num_workers, char *err, size_t errlen) {
+  const int rcvbuf_size = cfg->udp_recvbuf_size > 0 ? cfg->udp_recvbuf_size : 4 * 1024 * 1024;
+  const int sndbuf_size = cfg->udp_sndbuf_size > 0 ? cfg->udp_sndbuf_size : 4 * 1024 * 1024;
+  int a = 0;
+  g_be_udp_count = 0;
+  for (int i = 0; i < cfg->listen_count && a < MAX_BIND_ADDRS; i++) {
+    const listen_addr_t *la = &cfg->listen[i];
+    int w = 0;
+    for (; w < num_workers && w < MAX_WORKERS; w++) {
+      const int fd = udp_listen_socket(la, rcvbuf_size, sndbuf_size, SOCK_CLOEXEC);
+      if (fd >= 0) {
+        g_be_udp_fds[w][a] = fd;
+        continue;
+      }
+      const int e = errno;
+      for (int k = 0; k < w; k++) close(g_be_udp_fds[k][a]);
+      if (fd == -1 && w == 0) break;        /* (no socket of this family: the address is skipped) */
+      if (fd == -1) snprintf(err, errlen, "cannot make the UDP receive socket %d of %s#%d: %s", w, la->text, (int)la->port, strerror(e));
+      else snprintf(err, errlen, "cannot bind the UDP receive socket %d of %s#%d (logged above)", w, la->text, (int)la->port);
+      g_be_udp_count = a;
+      be_udp_close_all();
+      g_be_udp_count = 0;
+      return false;
+    }
+    if (w == 0) continue;
+    g_be_udp_wild[a] = la->wildcard;
+    udp_listen_src(la, &g_be_udp_src[a]);
+    logev_post(LOGC_NETWORK, 1, NULL, 0, "[Network] UDP listener %s#%d: %d receive socket(s), one per worker (udp-receive backend)%s", la->text, (int)la->port, w,
+               la->wildcard ? "; a wildcard address, the reply's source is taken from the destination of the query" : "");
+    a++;
+  }
+  g_be_udp_count = a;
+  return true;
+}
+
+/* The descriptors of the workers' UDP sockets that this process still holds are closed (the manager after the forks; a failed start) */
+void be_udp_close_all(void) {
+  for (int w = 0; w < g_num_workers && w < MAX_WORKERS; w++)
+    for (int a = 0; a < g_be_udp_count; a++)
+      if (g_be_udp_fds[w][a] >= 0) {
+        close(g_be_udp_fds[w][a]);
+        g_be_udp_fds[w][a] = -1;
+      }
+}
+
 STATIC_TEST void run_frontend_router(pid_t backend_pid, int router_id) {
   (void)backend_pid;   /* (not pinned to a CPU, as the workers: see worker_thread_func()) */
 
@@ -6857,7 +7119,35 @@ STATIC_TEST void run_frontend_router(pid_t backend_pid, int router_id) {
   int local_udp_fds[MAX_BIND_ADDRS];
   bool local_udp_is_wildcard[MAX_BIND_ADDRS];
   router_src_t local_udp_src[MAX_BIND_ADDRS];
-  int local_num_udp_fds = open_router_udp_sockets(cfg, local_udp_fds, local_udp_is_wildcard, local_udp_src);
+  int local_num_udp_fds;
+  /* udp-receive backend (B3 phase 2): the listen addresses are the workers' sockets, which the manager made; this router keeps the descriptors of the
+   * workers whose replies come to it, plus those of one worker (router_id % workers) that stand for the listen addresses in local_udp_fds[0 .. count)
+   * (the NOTIFY sockets, the pre-bind check), each limited to sending.  It never reads them and has no socket of its own in a listen address's
+   * SO_REUSEPORT_LB group (it would take a share of the queries) */
+  const int be_count = g_be_udp_count;
+  if (be_count > 0) {
+    const int hold = g_num_workers > 0 ? router_id % g_num_workers : -1;
+    for (int w = 0; w < g_num_workers; w++) {
+      const bool keep = w == hold || be_udp_reply_router(w, g_num_frontend_routers) == router_id;
+      for (int a = 0; a < be_count; a++) {
+        if (!keep) {
+          close(g_be_udp_fds[w][a]);
+          g_be_udp_fds[w][a] = -1;
+        } else if (!limit_udp_send_rights(g_be_udp_fds[w][a])) {
+          fprintf(stderr, "[ERROR] [Frontend %d] cannot limit a worker UDP socket to sending; aborting startup\n", router_id);
+          exit(EXIT_FAILURE);
+        }
+      }
+    }
+    for (int a = 0; a < be_count; a++) {
+      local_udp_fds[a] = hold >= 0 ? g_be_udp_fds[hold][a] : -1;
+      local_udp_is_wildcard[a] = g_be_udp_wild[a];
+      local_udp_src[a] = g_be_udp_src[a];
+    }
+    local_num_udp_fds = open_router_udp_sockets_given(cfg, be_count, local_udp_fds, local_udp_is_wildcard, local_udp_src);
+  } else {
+    local_num_udp_fds = open_router_udp_sockets(cfg, local_udp_fds, local_udp_is_wildcard, local_udp_src);
+  }
 
   // 特権破棄 (setgid / setuid)。非root起動で user/group が実行ユーザー自身を
   // 指している場合は降格不要としてそのまま続行する (resolve_run_identity 参照)。
@@ -6895,7 +7185,7 @@ STATIC_TEST void run_frontend_router(pid_t backend_pid, int router_id) {
     }
   }
 
-  for (int i = 0; i < local_num_udp_fds; i++) {
+  for (int i = be_count; i < local_num_udp_fds; i++) {     /* (udp-receive backend: the workers read the listen addresses; only the NOTIFY sockets are the router's to read) */
     struct kevent ev;
     EV_SET(&ev, local_udp_fds[i], EVFILT_READ, EV_ADD | EV_CLEAR, 0, 0,
            (void *)(uintptr_t)i);
@@ -6981,7 +7271,8 @@ STATIC_TEST void run_frontend_router(pid_t backend_pid, int router_id) {
   syslog(LOG_NOTICE, "[Frontend %d] UDP Router process started.", router_id);
   char router_who[24];
   snprintf(router_who, sizeof(router_who), "Frontend %d", router_id);
-  logev_post(LOGC_GENERAL, 1, NULL, 0, "[Frontend %d] %d UDP socket(s), replies from %d worker(s)%s, debug level %d", router_id, local_num_udp_fds,
+  logev_post(LOGC_GENERAL, 1, NULL, 0, "[Frontend %d] %d UDP socket(s)%s, replies from %d worker(s)%s, debug level %d", router_id, local_num_udp_fds,
+             be_count > 0 ? " (udp-receive backend: the workers read the queries, this router sends the replies)" : "",
              g_num_workers, router_id == 0 ? ", the NOTIFY sender" : "", klog_debug_level());
 
   while (1) {
@@ -7035,65 +7326,17 @@ STATIC_TEST void run_frontend_router(pid_t backend_pid, int router_id) {
 
           int tx_count = 0;
           for (int k = 0; k < n_recv; k++) {
-            ssize_t len = (ssize_t)fctx->rx_msgs[k].msg_len;
-            // バッファ (BUFFER_SIZE) より大きいデータグラムは切り詰められて MSG_TRUNC 付きで返る。
-            // 切れたメッセージは数と中身が合わない (UPDATE、TSIG) ので、送られていないメッセージに答えず捨てる
-            if (fctx->rx_msgs[k].msg_hdr.msg_flags & MSG_TRUNC) {
-              ipcd_add(IPCD_RRX_TRUNC, 1);
+            const ssize_t len = (ssize_t)fctx->rx_msgs[k].msg_len;
+            /* the header the worker reads (udp_ipc_from_recv(): the client, the destination); a datagram larger than BUFFER_SIZE comes cut with MSG_TRUNC and
+             * is not answered, one shorter than a DNS header neither: both are counted */
+            const int rx = udp_ipc_from_recv((udp_ipc_t *)fctx->rx_buffers[k], &fctx->rx_msgs[k].msg_hdr, (size_t)len, (int32_t)ud, want_dst, bound_src);
+            if (rx != UDP_RX_OK) {
+              ipcd_add(rx == UDP_RX_TRUNC ? IPCD_RRX_TRUNC : IPCD_RRX_SHORT, 1);
               continue;
             }
-            if (len < DNS_HEADER_SIZE) {
-              ipcd_add(IPCD_RRX_SHORT, 1);
-            } else {
-              udp_ipc_t *msg = (udp_ipc_t *)fctx->rx_buffers[k];
-              msg->sock_fd_idx = ud;
-              msg->addr_len = (uint16_t)fctx->rx_msgs[k].msg_hdr.msg_namelen;
-              msg->has_source_addr = false;
-              memset(&msg->source_addr, 0, sizeof(msg->source_addr));
-              msg->payload_len = (uint16_t)len;
-
-              if (!want_dst && bound_src->valid) {
-                msg->has_source_addr = true;     /* the address the socket is bound to: where the query came in */
-                msg->source_addr = bound_src->addr;
-              }
-              for (struct cmsghdr *cmsg = want_dst ? CMSG_FIRSTHDR(&fctx->rx_msgs[k].msg_hdr) : NULL;
-                   cmsg != NULL;
-                   cmsg = CMSG_NXTHDR(&fctx->rx_msgs[k].msg_hdr, cmsg)) {
-#ifdef IP_RECVDSTADDR
-                if (cmsg->cmsg_level == IPPROTO_IP && cmsg->cmsg_type == IP_RECVDSTADDR &&
-                    cmsg->cmsg_len >= CMSG_LEN(sizeof(struct in_addr))) {
-                  msg->source_addr.sin.sin_family = AF_INET;
-                  memcpy(&msg->source_addr.sin.sin_addr, CMSG_DATA(cmsg), sizeof(struct in_addr));
-                  msg->has_source_addr = true;
-                  break;
-                }
-#endif
-#ifdef IP_PKTINFO
-                if (cmsg->cmsg_level == IPPROTO_IP && cmsg->cmsg_type == IP_PKTINFO &&
-                    cmsg->cmsg_len >= CMSG_LEN(sizeof(struct in_pktinfo))) {
-                  struct in_pktinfo *pi = (struct in_pktinfo *)CMSG_DATA(cmsg);
-                  msg->source_addr.sin.sin_family = AF_INET;
-                  msg->source_addr.sin.sin_addr = pi->ipi_addr;
-                  msg->has_source_addr = true;
-                  break;
-                }
-#endif
-#ifdef IPV6_PKTINFO
-                if (cmsg->cmsg_level == IPPROTO_IPV6 && cmsg->cmsg_type == IPV6_PKTINFO &&
-                    cmsg->cmsg_len >= CMSG_LEN(sizeof(struct in6_pktinfo))) {
-                  struct in6_pktinfo *pi6 = (struct in6_pktinfo *)CMSG_DATA(cmsg);
-                  msg->source_addr.sin6.sin6_family = AF_INET6;
-                  msg->source_addr.sin6.sin6_addr = pi6->ipi6_addr;
-                  msg->has_source_addr = true;
-                  break;
-                }
-#endif
-              }
-
-              fctx->ipc_tx_iov[tx_count].iov_base = fctx->rx_buffers[k];
-              fctx->ipc_tx_iov[tx_count].iov_len = sizeof(udp_ipc_t) + len;
-              tx_count++;
-            }
+            fctx->ipc_tx_iov[tx_count].iov_base = fctx->rx_buffers[k];
+            fctx->ipc_tx_iov[tx_count].iov_len = sizeof(udp_ipc_t) + len;
+            tx_count++;
           }
           if (tx_count > 0 && g_num_workers > 0) {
             ipcd_routed_add((uint64_t)tx_count);
@@ -7291,6 +7534,7 @@ STATIC_TEST void run_frontend_router(pid_t backend_pid, int router_id) {
             break; // EAGAIN
 
           int cur_sock_idx = -1;
+          int cur_fd = -1;
           int tx_count = 0;
 
           for (int k = 0; k < n_recv; k++) {
@@ -7311,16 +7555,20 @@ STATIC_TEST void run_frontend_router(pid_t backend_pid, int router_id) {
               (void)klog_state_apply(fctx->ipc_rx_buffers[k] + sizeof(udp_ipc_t), msg->payload_len, router_who);
               continue;
             }
-            if (msg->sock_fd_idx < 0 || msg->sock_fd_idx >= local_num_udp_fds) {
+            /* the socket the reply leaves from (hostile input: an index that names no socket of this router, or the socket of a worker whose replies go
+             * to another router, is dropped and counted; udp-receive backend: the replying worker's socket of that listen address) */
+            const int sfd = router_reply_fd(worker_idx, msg->sock_fd_idx, local_udp_fds, local_num_udp_fds);
+            if (sfd < 0) {
               ipcd_add(IPCD_RREP_BADSOCK, 1);
               continue;
             }
 
             if (cur_sock_idx != -1 && msg->sock_fd_idx != cur_sock_idx && tx_count > 0) {
-              sendmmsg_skip_failed(local_udp_fds[cur_sock_idx], fctx->cli_tx_msgs, tx_count, "Frontend UDP", false, IPCD_RCLI_FULL);
+              sendmmsg_skip_failed(cur_fd, fctx->cli_tx_msgs, tx_count, "Frontend UDP", false, IPCD_RCLI_FULL);
               tx_count = 0;
             }
             cur_sock_idx = msg->sock_fd_idx;
+            cur_fd = sfd;
 
             fctx->cli_tx_iov[tx_count].iov_base = fctx->ipc_rx_buffers[k] + sizeof(udp_ipc_t);
             fctx->cli_tx_iov[tx_count].iov_len = msg->payload_len;
@@ -7376,8 +7624,8 @@ STATIC_TEST void run_frontend_router(pid_t backend_pid, int router_id) {
             }
             tx_count++;
           }
-          if (tx_count > 0 && cur_sock_idx >= 0 && cur_sock_idx < local_num_udp_fds) {
-            sendmmsg_skip_failed(local_udp_fds[cur_sock_idx], fctx->cli_tx_msgs, tx_count, "Frontend UDP", false, IPCD_RCLI_FULL);
+          if (tx_count > 0 && cur_fd >= 0) {
+            sendmmsg_skip_failed(cur_fd, fctx->cli_tx_msgs, tx_count, "Frontend UDP", false, IPCD_RCLI_FULL);
             tx_count = 0;
           }
           if (udp_batch_drained(n_recv))
@@ -8428,6 +8676,27 @@ int main(int argc, char **argv) {
 
   setup_ipc_tables(num_workers);
 
+  /* 0.7 B3 phase 2: udp-receive backend (the default): the workers' receive sockets are made now, as root and before any fork (the Backend and the
+   * routers inherit them).  The counts are checked first: a server whose sockets would not fit is refused here, with the reason */
+  if (g_config_db.config_a.udp_receive == UDP_RECEIVE_BACKEND) {
+    char be_err[512];
+    struct rlimit nofile;
+    const long long lim = getrlimit(RLIMIT_NOFILE, &nofile) == 0 && nofile.rlim_cur != RLIM_INFINITY ? (long long)nofile.rlim_cur : -1;
+    const int addrs = g_config_db.config_a.listen_count < MAX_BIND_ADDRS ? g_config_db.config_a.listen_count : MAX_BIND_ADDRS;
+    if (!be_udp_budget(num_workers, addrs, g_num_frontend_routers, lim, be_err, sizeof(be_err)) ||
+        !open_backend_udp_sockets(&g_config_db.config_a, num_workers, be_err, sizeof(be_err))) {
+      syslog(LOG_ERR, "[Startup] Refusing to start: %s", be_err);
+      fprintf(stderr, "[ERROR] Refusing to start: %s\n", be_err);
+      if (g_broker_pid > 0) kill(g_broker_pid, SIGTERM);
+      cleanup_pid_file();
+      free_server_config_fields(&g_config_db.config_a);
+      log_startup_refused();
+      return 1;
+    }
+    syslog(LOG_INFO, "[Startup] udp-receive backend: %d UDP receive socket(s) (%d worker(s) x %d listen address(es)); the routers send the replies",
+           num_workers * g_be_udp_count, num_workers, g_be_udp_count);
+  }
+
   if (g_config_db.config_a.control.enabled) {
     struct sockaddr_un un;
     memset(&un, 0, sizeof(un));
@@ -8699,6 +8968,7 @@ int main(int argc, char **argv) {
         close(g_ipc_fds[f][w][1]);
       }
     }
+    be_udp_close_all();   // B3 phase 2: the workers' UDP sockets are the Backend's and the routers' (the loader and the plugins never get them)
     close(g_notify_ipc[0]);
     close(g_notify_ipc[1]);
     close(g_notify_resp_ipc[0]);
@@ -8918,6 +9188,14 @@ int main(int argc, char **argv) {
     }
   }
   close(g_notify_ipc[0]); // Frontend側端点をクローズ
+  /* B3 phase 2 (udp-receive backend): the workers' UDP sockets may only receive here (CAP_RECV, CAP_EVENT), before any thread can use them: the Backend
+   * never sends UDP itself (Rule 2: no egress with a destination); the routers send the replies on their descriptors of the same sockets */
+  for (int w = 0; w < num_workers; w++)
+    for (int a = 0; a < g_be_udp_count; a++)
+      if (!limit_udp_recv_rights(g_be_udp_fds[w][a])) {
+        fprintf(stderr, "[ERROR] [Backend] cannot limit a worker UDP socket to receiving; aborting startup\n");
+        backend_exit(EXIT_FAILURE);
+      }
   server_config_t *cfg = &g_config_db.config_a;
   /* The ring of the threads that are not workers (AXFR, async I/O) has slots of 64 KB: about 270 MB of address space at the default queue size.
    * dnstap is switched on at start-up only, so it is allocated only then; without it write_dnstap_event() finds no ring and returns.

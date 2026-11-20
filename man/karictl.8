@@ -1,4 +1,4 @@
-.TH KARICTL 8 "2026-11-20" "KariDNS" "KariDNS Manual"
+.TH KARICTL 8 "2026-11-21" "KariDNS" "KariDNS Manual"
 .\" Generated from docs/karictl.md by man/md2man.pl (make man): edit the Markdown manual, not this page.
 .SH NAME
 karictl \- Remote Control and Management Utility for KariDNS
@@ -575,6 +575,11 @@ queries that a worker dropped because the queue of the asynchronous resolution
 threads (the queries for program zones and forward zones) was full, or no memory
 was left to copy the query
 .TP 8
+\fBipc.worker.udp.truncated\fR, \fBipc.worker.udp.short\fR
+datagrams that a worker read from its own UDP socket (\fBudp\-receive
+backend\fR) and dropped: larger than its receive buffer (\fBMSG_TRUNC\fR), or
+shorter than a DNS header; the counterparts of \fBipc.router.rx.*\fR
+.TP 8
 \fBipc.dropped.total\fR
 the sum of all of them but \fBspilled\fR
 .PP
@@ -586,6 +591,20 @@ losses and are not in \fBipc.dropped.total\fR. The kernel hands a client's
 queries to a router by the client's address and port, so a router that stays at
 0 while the others count is one that no client reached: a few clients that all
 send from one source port reach one router, however many routers there are.
+.PP
+With \fBudp\-receive backend\fR (the default, see \fBkaridns(8)\fR) the workers
+read the queries from their own UDP sockets, and the lines
+\fBipcworker.<n>.queries=<number>\fR (one per worker, from 0) count them; the
+router lines then count only what came in on the routers' NOTIFY sockets. The
+kernel shares the clients out over the workers by their address and port, as it
+does over the routers with \fBudp\-receive frontend\fR (no \fBipcworker\fR lines
+then). A reply still goes from the worker to a router (worker \fIn\fR to router
+\fIn\fR mod \fIrouters\fR), so \fBipc.worker.reply.*\fR and
+\fBipc.router.client.*\fR count the replies that were lost on the way;
+\fBipc.router.worker.*\fR and \fBipc.worker.rx.*\fR stay at 0 but for the NOTIFY
+sockets. A datagram that the kernel drops at a full UDP socket of a worker (the
+worker did not read it in time) is in \fBnetstat \-s \-p udp\fR, as for a
+router's.
 .PP
 After the counters come the sizes of the socket buffers in force, as lines
 \fBipcbuf.<kind>.<direction>.asked=<bytes>\fR and \fB.got=<bytes>\fR:

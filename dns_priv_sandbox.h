@@ -13,6 +13,11 @@ void enter_capsicum_sandbox(void);
 /* false (logged, errno set) = cap_rights_limit() failed and the descriptor keeps its wider rights; ENOSYS (no CAPABILITY_MODE in the kernel) is true */
 bool limit_server_socket_rights(int fd, bool is_listening_tcp);
 bool limit_client_socket_rights(int fd);
+/* 0.7 B3 phase 2 (udp-receive backend): the two kinds of descriptor of one worker UDP socket.  The Backend's may only receive (CAP_RECV, CAP_EVENT for
+ * kevent): no send, no connect, no socket option.  A router's may only send to the client (CAP_SEND, CAP_CONNECT: sendmsg() with a destination needs
+ * both in FreeBSD's kern_sendit(); CAP_GETSOCKNAME: the NOTIFY path looks the bound address up), never read */
+bool limit_udp_recv_rights(int fd);
+bool limit_udp_send_rights(int fd);
 int open_via_dir_cache(const char *path, int flags, mode_t mode, bool writable);
 /* 0.7 M2: an existing file in a directory that is in the cache as writable already (the log directories of the start-up); no directory is
  * opened, nothing is created (O_CREAT is taken out of flags).  -1 with errno EACCES when the directory is not in the cache. */
