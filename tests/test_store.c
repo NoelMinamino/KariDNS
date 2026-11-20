@@ -3105,6 +3105,7 @@ static void test_journal_boost(void) {
   bool cut = false;
   uint32_t k = jbo_fill(s, 0, 5 * JBO_MAX / 2, &cut);
   store_stats(s, &st);
+  if (cut || st.journal_bytes < 5 * JBO_MAX / 2 || st.checkpoints != base) printf("  (step 1: cut %d, journal %" PRIu64 " bytes, journal_max %" PRIu64 ", checkpoints %" PRIu64 " (base %" PRIu64 "), growths %" PRIu64 ", ix_used %" PRIu64 " of %" PRIu64 " slots, space estimate %lld, %u puts)\n", (int)cut, (uint64_t)st.journal_bytes, (uint64_t)st.journal_max_bytes, (uint64_t)st.checkpoints, base, (uint64_t)st.growths, (uint64_t)st.ix_used, (uint64_t)st.ix_slots, (long long)st.space_estimate_bytes, k);
   CHECK(!cut);
   CHECK(st.journal_bytes >= 5 * JBO_MAX / 2);                            /* (past 2 x the normal size: with the normal one the writes would have waited here) */
   CHECK_EQ(st.checkpoints, base);
