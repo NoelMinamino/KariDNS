@@ -312,7 +312,7 @@ else
     start pn3
     kari_wait_answer "$DAG" "$PN3" zs1.test. || true
     for z in zs1 zs2 zs3; do ctl pn3 notify $z.test > /dev/null; done
-    sleep 3
+    for p in "$SK6 src=127.0.0.2 " "$SK7 src=127.0.0.2 " "$SK8 "; do kari_wait_log "$W/sink3.log" "NOTIFY port=$p" 15 || true; done
     if grep -q "NOTIFY port=$SK6 src=127.0.0.2 " "$W/sink3.log"; then pass "S1: the server statement's notify-source (127.0.0.2) beats the source of the also-notify list (127.0.0.4)"
     else fail "S1: expected a NOTIFY from 127.0.0.2"; cat "$W/sink3.log"; fi
     if grep -q "NOTIFY port=$SK7 src=127.0.0.2 " "$W/sink3.log"; then pass "S2: the server statement's notify-source beats the zone's notify-source (127.0.0.4)"

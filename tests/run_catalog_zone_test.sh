@@ -130,7 +130,7 @@ zone3.zones IN PTR edu.example.
 EOF
 
 "$BIN_DIR/karictl" -f karictl.conf reload
-sleep 1
+kari_wait_log karidns.log "Processed membership for 'catalog.example.com.', desired members: 2" 30 2 || true
 # the line of the first load is in the log already: the reload adds a second one
 [ "$(grep -c "Processed membership for 'catalog.example.com.', desired members: 2" karidns.log)" -ge 2 ] || { echo "Failed to process membership after reload"; kill $SERVER_PID; exit 1; }
 
@@ -159,7 +159,7 @@ sleep 1
 echo "[+] Phase 0 Unique-ID Test: Changing unique-id of example.org..."
 sed -i '' -e 's/zone2\.zones/zone2_new\.zones/' catalog.zone
 "$BIN_DIR/karictl" -f karictl.conf reload
-sleep 1
+kari_wait_log karidns.log "Added new member 'example.org.' (unique-id: zone2_new)" 30 || true
 grep "Added new member 'example.org.' (unique-id: zone2_new)" karidns.log || {
     echo "Failed: example.org was not added correctly as a new member after unique-id change"; cat karidns.log; kill $SERVER_PID; exit 1; 
 }
@@ -234,7 +234,7 @@ xyz.zones IN PTR coo-test.test.
 EOF
 
 "$BIN_DIR/karictl" -f karictl.conf reload catalog2.example.com
-sleep 1
+kari_wait_log karidns.log "Name collision for 'coo-test.test.' between 'catalog1.example.com.' and 'catalog2.example.com.'" 30 || true
 
 # RFC 9432 §5.3.1: without a coo property in catalog1 pointing to catalog2, the claim is
 # ignored and the member stays with catalog1 (same unique-id, still served)
@@ -314,7 +314,7 @@ retain.zones IN PTR state-retain.test.
 EOF
 
 "$BIN_DIR/karictl" -f karictl.conf reload catalog2.example.com
-sleep 1
+kari_wait_log karidns.log "retained state for 'state-retain.test.' (unique-id: retain), owner catalog1.example.com. -> catalog2.example.com." 30 || true
 
 # Verify retention log
 grep "retained state for 'state-retain.test.' (unique-id: retain), owner catalog1.example.com. -> catalog2.example.com." karidns.log || { echo "Failed: State retention log missing"; cat karidns.log; kill $SERVER_PID; exit 1; }
@@ -381,7 +381,7 @@ echo "[+] Phase 5: RFC 9432 §5.1 Broken Catalog Zone Detection Tests..."
 # Test 5.1: Duplicate PTR records for the same unique-N
 cp "$ZONES_DIR/catalog_duplicate_ptr.zone" catalog1.zone
 "$BIN_DIR/karictl" -f karictl.conf reload catalog1.example.com
-sleep 1
+kari_wait_log karidns.log "has 2 PTR records (RFC 9432 requires exactly 1); catalog zone is broken" 30 || true
 grep "has 2 PTR records (RFC 9432 requires exactly 1); catalog zone is broken" karidns.log || {
     echo "Failed: duplicate PTR on same unique-N was not detected as broken catalog zone"; cat karidns.log; kill $SERVER_PID; exit 1;
 }
@@ -392,7 +392,7 @@ echo "[+] Test 5.1 (Duplicate PTR on same unique-N) successfully rejected."
 # Test 5.2: Different unique-N pointing to the same target domain
 cp "$ZONES_DIR/catalog_duplicate_target.zone" catalog1.zone
 "$BIN_DIR/karictl" -f karictl.conf reload catalog1.example.com
-sleep 1
+kari_wait_log karidns.log "is referenced by both 'node1' and 'node2' labels; catalog zone is broken" 30 || true
 grep "is referenced by both 'node1' and 'node2' labels; catalog zone is broken" karidns.log || {
     echo "Failed: duplicate target domain across labels was not detected as broken catalog zone"; cat karidns.log; kill $SERVER_PID; exit 1;
 }

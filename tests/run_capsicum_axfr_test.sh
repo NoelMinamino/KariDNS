@@ -111,7 +111,7 @@ echo "\$INCLUDE capsicum_include_test/dir1/common.inc" >> tests/zones/example.co
 
 chmod 0600 tests/karictl-test.conf 2>/dev/null || true
 ./karictl -f tests/karictl-test.conf reload example.com. || true
-sleep 1
+kari_wait_log server_capsicum.log 'Circular $INCLUDE detected' 15 || true
 
 # server_capsicum.log で "Circular $INCLUDE detected" を確認
 if ! grep -q "Circular \$INCLUDE detected" server_capsicum.log; then

@@ -143,7 +143,7 @@ echo "== SIGTERM"
 kill -TERM "$SRV"
 i=0; while [ $i -lt 100 ] && kill -0 "$SRV" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
 if kill -0 "$SRV" 2>/dev/null; then fail "karidns did not stop within 10 s"; else pass "karidns stopped"; fi
-sleep 0.5
+kari_wait_no_proc "karidns.*$T" 15 || true
 LEFT=$(pgrep -f "karidns.*$T" | tr '\n' ' ')
 [ -z "$LEFT" ] && pass "no process of this server is left (loader included)" || fail "left over: $LEFT"
 SRV=""

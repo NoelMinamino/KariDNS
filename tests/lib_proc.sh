@@ -18,6 +18,24 @@ export KARIDNS_NOSYSLOG
 KARIDNS_NO_DEFAULT_STORE=${KARIDNS_NO_DEFAULT_STORE:-1}
 export KARIDNS_NO_DEFAULT_STORE
 
+# kari_wait_no_proc PATTERN SECONDS : wait until no process command line matches PATTERN (pgrep -f), at most SECONDS.  A server that was stopped
+# leaves its loader / children for a moment: one look after a fixed sleep reports them as left over on a busy host.
+kari_wait_no_proc() {
+    _kwn_i=0
+    while [ "$_kwn_i" -lt $(($2 * 10)) ]; do
+        [ -z "$(pgrep -f "$1")" ] && return 0
+        sleep 0.1; _kwn_i=$((_kwn_i + 1))
+    done
+    return 1
+}
+
+# kari_log_tail LOG : the last lines of LOG (at most 12 lines in all: bad() of the webadmin tests prints the first 12 lines of its second argument), for a check that fails
+# with nothing else to show (a daemon that did not stop after SIGTERM).
+kari_log_tail() {
+    echo "tail of $1:"
+    tail -n 11 "$1" 2>&1
+}
+
 # kari_kill_tree PID... : SIGKILL each PID and all of its descendants.
 # karidns runs as supervisor + backend + frontend routers + broker, so killing
 # only $! would leave the children behind. Each process is stopped before its

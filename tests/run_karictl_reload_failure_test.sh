@@ -143,7 +143,7 @@ out=$(ctl reload); rc=$?
 echo "    reload -> rc=$rc $out"
 [ "$rc" -eq 3 ] && pass "reload exit 3" || fail "reload exit $rc (expected 3)"
 case "$out" in "ERROR configuration applied, but 1 zone(s) failed to load: b.example."*) pass "reply names the zone";; *) fail "reply: $out";; esac
-sleep 0.3
+kari_wait_log "$TMP_DIR/karidns.log" "Configuration reloaded, but 1 zone(s) failed to load: b.example." 10 || true
 grep -q "Configuration reloaded, but 1 zone(s) failed to load: b.example." "$TMP_DIR/karidns.log" && pass "logged" || fail "not logged"
 [ "$(answer www.a.example)" = "192.0.2.10" ] && pass "other zone answers" || fail "other zone does not answer"
 write_conf "$PORT" "$TMP_DIR/b.example.zone" ""
@@ -155,7 +155,7 @@ write_conf "$((PORT + 1))" "$TMP_DIR/b.example.zone" ""
 out=$(ctl reconfig); rc=$?
 echo "    reconfig -> rc=$rc $out"
 [ "$rc" -eq 0 ] && [ "$out" = "OK (restart needed for: port)" ] && pass "restart note" || fail "reply: $out"
-sleep 0.3
+kari_wait_log "$TMP_DIR/karidns.log" "changed settings take effect only after a restart: port" 10 || true
 grep -q "changed settings take effect only after a restart: port" "$TMP_DIR/karidns.log" && pass "warning logged" || fail "warning not logged"
 [ "$(answer www.a.example)" = "192.0.2.10" ] && pass "still listening on the old port" || fail "old port"
 

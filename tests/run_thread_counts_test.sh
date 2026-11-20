@@ -138,7 +138,7 @@ echo "=== 4. a reload that changes them ==="
 write_conf "router-threads 2; worker-threads 3;"
 out=$(ctl reconfig); rc=$?
 [ "$rc" -eq 0 ] && [ "$out" = "OK (restart needed for: router-threads, worker-threads)" ] && pass "restart note: $out" || fail "reconfig rc=$rc: $out"
-sleep 0.3
+kari_wait_log "$TMP_DIR/karidns.log" "changed settings take effect only after a restart: router-threads, worker-threads" 10 || true
 grep -q "changed settings take effect only after a restart: router-threads, worker-threads" "$TMP_DIR/karidns.log" && pass "warning logged" || fail "warning not logged"
 [ "$(status_workers)" = "1" ] && pass "still 1 worker thread" || fail "worker threads after the reload: $(status_workers)"
 out=$(ctl reconfig); rc=$?

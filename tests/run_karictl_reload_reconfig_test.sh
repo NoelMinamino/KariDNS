@@ -109,7 +109,8 @@ kari_wait_answer "$DAG" "$PORT" zone1.example.com. || true   # the checks below 
 echo "=== 1. Testing 'reconfig' when zone files are UNCHANGED ==="
 echo -n "Test: 'reconfig' skips reload for unchanged zones (mtime match) ... "
 "$KARICTL" -f "$TMP_DIR/karictl.conf" reconfig >/dev/null 2>&1
-sleep 0.5
+kari_wait_log "$TMP_DIR/karidns.log" "zone 'zone1\.example\.com\.' file unchanged (mtime match), skipping reload" 15 || true
+kari_wait_log "$TMP_DIR/karidns.log" "zone 'zone2\.example\.com\.' file unchanged (mtime match), skipping reload" 15 || true
 if grep -q "zone 'zone1\.example\.com\.' file unchanged (mtime match), skipping reload" "$TMP_DIR/karidns.log" && \
    grep -q "zone 'zone2\.example\.com\.' file unchanged (mtime match), skipping reload" "$TMP_DIR/karidns.log"; then
     echo "OK"

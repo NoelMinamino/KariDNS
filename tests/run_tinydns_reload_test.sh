@@ -76,7 +76,7 @@ printf '+www2.tiny.test:192.0.2.4:300\n' >> "$TMP_DIR/tiny.data"
 MTIME=$(stat -f %m "$TMP_DIR/tiny.data" 2>/dev/null || stat -c %Y "$TMP_DIR/tiny.data")
 OUT=$("$KARICTL" -f "$TMP_DIR/c.conf" reload tiny.test 2>&1); RC=$?
 if [ "$RC" -eq 0 ]; then ok "karictl reload tiny.test succeeded"; else fail "karictl reload tiny.test rc=$RC: $OUT"; fi
-sleep 0.5
+i=0; until "$DAG" www2.tiny.test A @127.0.0.1 -p "$PORT" +short +time=2 +tries=1 | grep -q '^192\.0\.2\.4$' || [ "$i" -ge 50 ]; do sleep 0.2; i=$((i + 1)); done
 
 if "$DAG" www2.tiny.test A @127.0.0.1 -p "$PORT" +short +time=2 +tries=1 | grep -q '^192\.0\.2\.4$'; then
     ok "record added before the reload is answered"
@@ -100,7 +100,7 @@ sleep 1
 printf '+www3.tiny.test:192.0.2.5:300\n' >> "$TMP_DIR/tiny.data"
 OUT=$("$KARICTL" -f "$TMP_DIR/c.conf" reload 2>&1); RC=$?
 if [ "$RC" -eq 0 ]; then ok "karictl reload (full) succeeded"; else fail "karictl reload (full) rc=$RC: $OUT"; fi
-sleep 0.5
+i=0; until "$DAG" www3.tiny.test A @127.0.0.1 -p "$PORT" +short +time=2 +tries=1 | grep -q '^192\.0\.2\.5$' || [ "$i" -ge 50 ]; do sleep 0.2; i=$((i + 1)); done
 if "$DAG" www3.tiny.test A @127.0.0.1 -p "$PORT" +short +time=2 +tries=1 | grep -q '^192\.0\.2\.5$' &&
    kill -0 "$SERVER_PID" 2>/dev/null && ! grep -q 'Terminating all children' "$TMP_DIR/server.log"; then
     ok "record added before the full reload is answered, server still running"

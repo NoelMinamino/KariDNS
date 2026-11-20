@@ -85,7 +85,7 @@ out=$("$DAG" @127.0.0.1 -p "$PORT" www.dotdot.example A +nohexdump 2>&1)
 printf '%s\n' "$out" | grep -q "status: NOERROR" && pass "NOERROR" || fail "status: $(printf '%s\n' "$out" | grep status)"
 printf '%s\n' "$out" | grep -q "192.0.2.10" && pass "answer from ../zones" || fail "no answer"
 grep -q "Failed to read file" "$TMP_DIR/karidns.log" && fail "log says Failed to read file" || pass "no read failure logged"
-sleep 1.5
+kari_wait_log "$TMP_DIR/logs/q.log" "www.dotdot.example" 15 || true
 grep -q "www.dotdot.example" "$TMP_DIR/logs/q.log" 2>/dev/null && pass "query log written to ../logs/q.log" || fail "query log missing"
 
 echo "=== 2. reload after start (inside the sandbox) ==="

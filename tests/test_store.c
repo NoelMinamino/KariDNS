@@ -5230,6 +5230,20 @@ static bool resident_of(store_t *s, uint32_t zid) {
   return ok;
 }
 
+/* Residency is a hint: memory pressure on a CI VM can evict a page between the write (or the open) and the question.  The test checks the store, not the page cache: it makes the record resident first
+ * (an image read checksums every byte of the record through the mapping, which faults its pages in) and asks then; a page that left again in between is read once more (a few tries, never another answer). */
+static bool resident_touched(store_t *s, uint32_t zid) {
+  bool ok = false;
+  for (int t = 0; t < 5 && !ok; t++) {
+    store_img_t im;
+    store_read_lock();
+    if (store_image_read(s, zid, &im) == 0) store_img_release(s, &im);
+    store_read_unlock();
+    ok = resident_of(s, zid);
+  }
+  return ok;
+}
+
 static void test_resident(int mode) {
   printf("[store_image_resident: %s mode]\n", mode == STORE_MODE_MAP ? "map" : "copy");
   tdir_t d;
@@ -5247,7 +5261,7 @@ static void test_resident(int mode) {
   /* a record that was written is in the page cache (and its segment is open) in MAP mode; COPY mode never says yes (a read with pread can block) */
   const bool yes_ok = fs_reports_written_pages(&d);
   if (yes_ok || mode != STORE_MODE_MAP)
-    for (uint32_t i = 0; i < 40; i += 7) CHECK_EQ(resident_of(s, zid[i]), mode == STORE_MODE_MAP);
+    for (uint32_t i = 0; i < 40; i += 7) CHECK_EQ(resident_touched(s, zid[i]), mode == STORE_MODE_MAP);
   /* a zone with no image (known), and a zone id that is free, are not resident */
   {
     char nm[160];
@@ -5283,7 +5297,7 @@ static void test_resident(int mode) {
   if (s) {
     CHECK(!resident_of(s, zid[2]));                                      /* (no segment is open yet) */
     store_open_segments(s);
-    if (yes_ok || mode != STORE_MODE_MAP) CHECK_EQ(resident_of(s, zid[2]), mode == STORE_MODE_MAP);             /* (opened: the pages written before the close are in the page cache) */
+    if (yes_ok || mode != STORE_MODE_MAP) CHECK_EQ(resident_touched(s, zid[2]), mode == STORE_MODE_MAP);       /* (opened: the pages written before the close are in the page cache) */
     store_img_t im;
     store_read_lock();
     CHECK_EQ(store_image_read(s, zid[2], &im), 0);

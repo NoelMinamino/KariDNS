@@ -328,7 +328,7 @@ run_check "karicheck conf warning when ecs-tags defined but ecs-enable no" \
 echo "=== 2. Starting KariDNS on port $PORT ==="
 "$KARIDNS" -f "$TMP_DIR/karidns.conf" > "$TMP_DIR/karidns.log" 2>&1 &
 SERVER_PID=$!
-sleep 1
+kari_wait_answer "$DAG" "$PORT" example.com. 15 || true
 
 if ! kill -0 "$SERVER_PID" 2>/dev/null; then
     echo "ERROR: KariDNS failed to start. Logs:"

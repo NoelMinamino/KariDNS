@@ -95,7 +95,7 @@ EOF
 echo "[*] Starting KariDNS on port $PORT..."
 "$BIN" -f "$CONF_FILE" > /tmp/karidns_axfr_multikey.$$.log 2>&1 &
 SERVER_PID=$!
-sleep 0.5
+kari_wait_answer "$DAG" "$PORT" multikey.test 15 || true
 
 # Test 1: AXFR with keyA (should succeed)
 echo "[*] Test 1: AXFR with keyA..."
