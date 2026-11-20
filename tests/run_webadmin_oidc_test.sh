@@ -57,9 +57,11 @@ cp "$ZONE" "$T/karidns-zone"
 
 # start_idp PORT REDIRECT_URI -> IDP (the pid) and IDP_URL
 start_idp() {
+    rm -f "$T/idp.out"       # (the file of the last start says "issuer" already: the redirection of a background command is made by the child, after this shell went on)
     IDP_PORT=$1 IDP_ISSUER_HOST=localhost IDP_REDIRECTS=$2 IDP_CLIENT_ID=$CLIENT_ID IDP_CLIENT_SECRET=$CLIENT_SECRET "$NODE" webadmin/test/e2e/idp.mjs > "$T/idp.out" 2>&1 &
     IDP=$!
-    i=0; while [ $i -lt 50 ] && ! grep -q '^issuer ' "$T/idp.out" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
+    # node needs a few seconds to start on a loaded host: wait for the line, or for the end of the process, not for a fixed 5 s
+    i=0; while [ $i -lt 600 ] && kill -0 "$IDP" 2>/dev/null && ! grep -q '^issuer ' "$T/idp.out" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
     IDP_URL=$(sed -n 's/^issuer //p' "$T/idp.out")
     [ -n "$IDP_URL" ] && ok "the fake provider is up at $IDP_URL" || { bad "the fake provider did not start" "$(cat "$T/idp.out")"; return 1; }
 }
