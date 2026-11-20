@@ -1,0 +1,4 @@
+www.example.test A
+mail.example.test MX +dnssec +bufsize=4096
+; comment
+x.example.test TYPE65280 +nord +class=CH

@@ -81,7 +81,7 @@ jobs:
             # sanitizer builds, the fuzz builds (fuzz_dag_all: run_dag_fuzzer_test.sh), test_response_cache (run_response_cache_test.sh runs the binary; its own
             # fallback compile line lacks sources the engine needs now and does not link) and the unit test binaries, plain and ASan
             ./configure --march=none --with-db-drivers="sqlite3 postgresql"
-            make -j"$NCPU" all karicheck-codelog test_coverage_sweep_tools-codelog karidns-dbloader karidns-zone karidns-zone-asan zone2sql zone2kdb asan tsan tools-asan fuzz_all fuzz_dag_all asan_test tinydns_test hash_test include_test response_cache_test test_response_cache vulnerability_test bench_serialize fetch_backend fake_dbloader karidns-evict test_store_status
+            make -j"$NCPU" all karicheck-codelog test_coverage_sweep_tools-codelog karidns-dbloader karidns-zone karidns-zone-asan zone2sql zone2kdb asan tsan tools-asan dnsqps-tsan fuzz_all fuzz_dag_all asan_test tinydns_test hash_test include_test response_cache_test test_response_cache vulnerability_test bench_serialize fetch_backend fake_dbloader karidns-evict test_store_status
             # stdin from /dev/null: no test may block reading the VM session's stdin
             make -j"$NCPU" unit-test-bins unit-test-bins-asan < /dev/null
             echo "::endgroup::"
@@ -203,6 +203,11 @@ jobs:
             sh ./tests/run_ci_dag_smoke.sh
             echo "::endgroup::"
 
+            echo "::group::🛡️ [Sanitizers] dnsqps under ASan/UBSan and TSan: the engine, its threads and the I/O paths (tests/run_dnsqps_test.sh)"
+            DNSQPS=./dnsqps-asan sh ./tests/run_dnsqps_test.sh
+            DNSQPS=./dnsqps-tsan sh ./tests/run_dnsqps_test.sh
+            echo "::endgroup::"
+
             echo "::group::🛡️ [Sanitizer & Fuzzing] Run Comprehensive Smoke Tests"
             ./tests/run_sanitizer_smoke_test.sh
             echo "::endgroup::"
@@ -288,8 +293,13 @@ jobs:
               run_notify_source_test,run_privilege_drop_root_test,run_nonroot_startup_test,run_query_log_rate_limit_test,\
               run_response_cache_test,run_rrl_window_test,run_tinydns_timestamp_test,run_ttl_harmonization_test,\
               run_ttl_harmonization_update_test,run_ttl_rfc2181_clamp_test,run_update_secondary_refused_test,\
-              run_zone_oom_partial_load_test,run_zone_type_secondary_test"
+              run_zone_oom_partial_load_test,run_zone_type_secondary_test,\
+              run_dnsqps_test,run_dnsqps_karidns_test,run_dnsqps_netmap_test"
+            export DNSQPS_TEST_REQUIRE=1   # tests/run_dnsqps_netmap_test.sh: a SKIP (no /dev/netmap) must fail here
             sh ./tests/run_all_suite.sh -j 4 --test-timeout 1200 --full-log --pg-clusters --tests "$FUNC_TESTS" < /dev/null
+            # the log of a passing test is not printed: show what tests/run_dnsqps_karidns_test.sh checked, and fail when it never reached its PASS line (a SKIP or a short circuit)
+            grep -h -E '^ok: (query file|generated mode|option sets|per-line options)|^PASS: dnsqps against karidns' tests/.test_logs/test_*.log || true
+            grep -q '^PASS: dnsqps against karidns' tests/.test_logs/test_*.log || { echo "::error title=dnsqps::run_dnsqps_karidns_test.sh did not reach its PASS line"; exit 1; }
             echo "::endgroup::"
 
             echo "::group::🔏 [Signer, WebAdmin] karidns-signer and karidns-webadmin: unit tests, SQLite3 and PostgreSQL (root: with a server)"

@@ -245,7 +245,7 @@ jobs:
       - name: Install dependencies (Linux)
         if: runner.os == 'Linux'
         run: |
-          sh .github/scripts/apt-install.sh libssl-dev zlib1g-dev libidn2-dev   # survives a mirror the runner cannot reach
+          sh .github/scripts/apt-install.sh libssl-dev zlib1g-dev libidn2-dev libxdp-dev libbpf-dev   # survives a mirror the runner cannot reach
 
       - name: Install dependencies (macOS)
         if: runner.os == 'macOS'
@@ -268,6 +268,16 @@ jobs:
           # X-09: queries a local mock server (no real domains or public resolvers)
           sh ./tests/run_ci_dag_smoke.sh
           echo "::endgroup::"
+
+      - name: Build and test dnsqps (warnings fail; unit tests plain and under ASan/UBSan; CLI and engine test)
+        run: |
+          sh tests/run_ci_dnsqps.sh
+
+      # AF_XDP end to end on a veth pair in generic XDP mode, two network namespaces (tests/run_dnsqps_xdp_test.sh); a SKIP is a failure
+      - name: dnsqps AF_XDP on a veth pair
+        if: runner.os == 'Linux'
+        run: |
+          sudo DNSQPS_TEST_REQUIRE=1 sh tests/run_dnsqps_xdp_test.sh
 
       # make install-dag, install-man-dag, install-docs-dag with GNU make (tests/run_install_test.sh: only dag is built here; the server, the
       # database parts and the packages are checked by the FreeBSD job)
@@ -312,6 +322,11 @@ jobs:
           # X-09: queries a local mock server (no real domains or public resolvers)
           DAG=./dag.exe sh ./tests/run_ci_dag_smoke.sh
           echo "::endgroup::"
+
+      - name: Build and test dnsqps.exe
+        shell: msys2 {0}
+        run: |
+          sh tests/run_ci_dnsqps.sh --no-unit
 
   # ---------------------------------------------------------------------------
   # Coverage quality gate (FreeBSD only: the server core needs kqueue/Capsicum).

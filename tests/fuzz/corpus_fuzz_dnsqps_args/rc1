@@ -1,0 +1,3 @@
+# rc
+--null-target=sink -z names.txt --miss 0.1 --qtypes A:70,AAAA:30 --zipf 0.9
++nord +cd
