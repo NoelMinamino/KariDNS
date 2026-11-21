@@ -87,6 +87,7 @@ run() { # label expected-min args... : a run that must complete most of its quer
 run "control (sendto)" 990 -s 10.99.0.2 -p 5300 -b 10.99.0.1 --io sendto -d "$T/q.txt" -N 1000 -T 1
 # AF_XDP, IPv4, the next hop resolved by ARP
 run "xdp IPv4, ARP" 19000 -s 10.99.0.2 -p 5300 -b 10.99.0.1 --io xdp --iface "$V0" --xdp-mode skb -d "$T/q.txt" -N 20000 -T 1 -c 2
+grep -qx '\[Status\] xdp skb, copy' "$T/out.err" || { fail "xdp skb on veth: no status line 'xdp skb, copy'"; grep Status "$T/out.err"; }
 # the next-hop MAC given
 run "xdp IPv4, --next-hop-mac" 4900 -s 10.99.0.2 -p 5300 -b 10.99.0.1 --io xdp --iface "$V0" --xdp-mode skb --next-hop-mac "$MAC1" -d "$T/q.txt" -N 5000 -T 1
 # the interface found from the source address
