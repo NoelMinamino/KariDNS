@@ -83,39 +83,9 @@ extern char g_startup_cwd[PATH_MAX];
 _Static_assert(IXFR_HISTORY_MAX <= UINT8_MAX, "ixfr_history and the history ring counters are uint8_t");
 #define MAX_TCP_CLIENTS 1000
 
-// Frontend/Backendプロセス間のUDPパケット受け渡し用コンパクトソケットアドレス (IPv4: 16B, IPv6: 28B, 8B aligned)
-typedef union {
-  alignas(8) struct sockaddr sa;
-  struct sockaddr_in sin;
-  struct sockaddr_in6 sin6;
-  struct {
-#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
-    uint8_t ss_len;
-    sa_family_t ss_family;
-#else
-    sa_family_t ss_family;
-#endif
-  };
-} ipc_sockaddr_t;
-
-// Frontend/Backendプロセス間のUDPパケット受け渡し用ヘッダ (80 bytes, 8B aligned)
-typedef struct {
-  int32_t sock_fd_idx;
-  uint16_t addr_len;
-  uint16_t payload_len;
-  bool has_source_addr;
-  uint8_t reserved[7];
-  alignas(8) ipc_sockaddr_t client_addr;
-  alignas(8) ipc_sockaddr_t source_addr;
-} udp_ipc_t;
-
-/* the layout is the format between the Frontend and the Backend (one binary, two processes): a change has to be deliberate */
-_Static_assert(sizeof(ipc_sockaddr_t) == 32, "ipc_sockaddr_t: 28 octets of sockaddr_in6, 8-aligned");
-_Static_assert(sizeof(udp_ipc_t) == 80, "udp_ipc_t: 16 octets of header and two ipc_sockaddr_t");
-
-/* sock_fd_idx values that are no socket: -2 on the notify pair is the Backend's stop command; UDP_IPC_LOGSTATE on a worker's pair (the Backend
- * to a router) carries a KLS1 record as the payload: the debug level and the logging runtime (dns_log_state.h, 0.7 M2) */
-#define UDP_IPC_LOGSTATE (-3)
+/* ipc_sockaddr_t, udp_ipc_t, UDP_IPC_LOGSTATE and the framing of the worker -> router replies (B3 phase 3) */
+#include "dns_ipc_frame.h"
+_Static_assert(UDP_IPC_REPLY_MIN == DNS_HEADER_SIZE, "a reply frame holds at least a DNS header");
 
 /* What the router knows of the destination address of the queries that come in on one of its UDP sockets (run_frontend_router()): a socket
  * bound to a specific address always receives its queries at that address, so the address is taken from the bind() once, at start-up, and the socket
@@ -149,7 +119,7 @@ typedef struct {
   alignas(8) uint8_t rx_buffers[UDP_BATCH_SIZE][UDP_IPC_BUFFER_SIZE];
   struct sockaddr_storage rx_addrs[UDP_BATCH_SIZE];
 
-  struct mmsghdr tx_msgs[UDP_BATCH_SIZE];
+  /* the replies, one frame each: ipc_reply_flush() gathers them into packed datagrams (B3 phase 3) */
   struct iovec   tx_iov[UDP_BATCH_SIZE];
   alignas(8) uint8_t tx_buffers[UDP_BATCH_SIZE][UDP_IPC_BUFFER_SIZE];
 
@@ -1954,6 +1924,7 @@ typedef enum {
   IPCD_WASYNC_FULL,     /* worker: queries dropped because the queue of the asynchronous resolution threads (program and forward zones) was full, or the query could not be copied */
   IPCD_WURX_TRUNC,      /* worker (udp-receive backend): datagrams of its own UDP socket larger than the receive buffer (MSG_TRUNC) */
   IPCD_WURX_SHORT,      /* worker (udp-receive backend): datagrams of its own UDP socket shorter than a DNS header */
+  IPCD_RREP_CUT,        /* router (B3 phase 3): datagrams of a worker whose frames it stopped reading at a bad frame that was not the first (the bad frame is counted by RREP_SHORT / RREP_BADLEN; the replies behind it are lost, their number unknown: not in ipc.dropped.total) */
   IPCD_COUNT
 } ipcd_t;
 typedef struct {
@@ -2018,6 +1989,8 @@ void setup_ipc_tables(int num_workers);
 int sendmmsg_skip_failed(int fd, struct mmsghdr *msgs, int n, const char *path, bool is_ipc, ipcd_t first);
 int ipc_send_spill(int (*fds)[2], int nw, int *rr, struct mmsghdr *msgs, int n);
 void ipc_reply_failed(int err);
+int ipc_reply_flush(int fd, udp_batch_ctx_t *batch, int n);
+extern size_t g_ipc_pack_max;
 void ipcd_set_self(int slot);
 void ipcd_init(void);
 unsigned long sockbuf_limit_for(unsigned long maxsockbuf);

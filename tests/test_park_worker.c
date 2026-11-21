@@ -334,11 +334,6 @@ int main(void) {
     w.worker_idx = 0;
     w.park_timeout_ms = 5000;
     udp_batch_ctx_t *batch = &wctx.batch;
-    for (int k = 0; k < UDP_BATCH_SIZE; k++) {                       /* as the worker thread sets its batch up */
-        memset(&batch->tx_msgs[k], 0, sizeof(batch->tx_msgs[k]));
-        batch->tx_msgs[k].msg_hdr.msg_iov = &batch->tx_iov[k];
-        batch->tx_msgs[k].msg_hdr.msg_iovlen = 1;
-    }
     uint8_t *rx = batch->rx_buffers[0];
 
     #define SEND_QUERY(id, edns, pad) do { size_t ql_ = build_query(rx + sizeof(udp_ipc_t), (id), (edns), (pad)); \

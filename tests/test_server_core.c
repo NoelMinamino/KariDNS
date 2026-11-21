@@ -2494,6 +2494,192 @@ static void test_sendmmsg_skip_failed(void) {
     printf("  -> sendmmsg_skip_failed passed.\n");
 }
 
+/* B3 phase 3: one frame (dns_ipc_frame.h) at off of buf: a udp_ipc_t for socket idx with pl octets of payload (the octets are the low byte of
+ * idx + their index).  Returns the frame's length (header + payload, unpadded). */
+static size_t ipcf_put(uint8_t *buf, size_t off, int32_t idx, uint16_t pl) {
+    udp_ipc_t h;
+    memset(&h, 0, sizeof(h));
+    h.sock_fd_idx = idx;
+    h.payload_len = pl;
+    memcpy(buf + off, &h, sizeof(h));
+    for (uint16_t i = 0; i < pl; i++) buf[off + sizeof(h) + i] = (uint8_t)(idx + i);
+    return sizeof(h) + pl;
+}
+
+/* udp_ipc_frame_next() (the router's reading of a worker's datagram, hostile input) and udp_ipc_pack() (the worker's grouping) */
+static void test_ipc_frame_parse_pack(void) {
+    printf("[TEST] Server Core: the framing of the worker -> router replies (parse: hostile lengths; pack: limit, padding)...\n");
+    static alignas(8) uint8_t d[4096];
+    const udp_ipc_t *h;
+    size_t off;
+    /* an empty datagram and one shorter than a header: short, as before the framing; the offset goes to the end */
+    off = 0;
+    assert(udp_ipc_frame_next(d, 0, &off, &h) == UDP_IPC_FRAME_SHORT && off == 0 && h == NULL);
+    off = 0;
+    assert(udp_ipc_frame_next(d, sizeof(udp_ipc_t) - 1, &off, &h) == UDP_IPC_FRAME_SHORT && off == sizeof(udp_ipc_t) - 1 && h == NULL);
+    /* one frame: the message of one reply, as before */
+    memset(d, 0xEE, sizeof(d));
+    size_t f0 = ipcf_put(d, 0, 4, 20);
+    off = 0;
+    assert(udp_ipc_frame_next(d, f0, &off, &h) == UDP_IPC_FRAME_OK && h == (const udp_ipc_t *)(void *)d && h->sock_fd_idx == 4 && h->payload_len == 20 && off == f0);
+    assert(udp_ipc_frame_next(d, f0, &off, &h) == UDP_IPC_FRAME_END && h == NULL);
+    /* three frames, the first two padded to 8 octets (100 -> 104), the last exact; then the end */
+    size_t o1 = udp_ipc_frame_padded(f0);
+    assert(o1 == 104);
+    size_t f1 = ipcf_put(d, o1, 5, 13);
+    size_t o2 = udp_ipc_frame_padded(o1 + f1);
+    size_t f2 = ipcf_put(d, o2, 6, 12);                  /* (exactly a DNS header: the shortest reply) */
+    size_t total = o2 + f2;
+    off = 0;
+    assert(udp_ipc_frame_next(d, total, &off, &h) == UDP_IPC_FRAME_OK && h->sock_fd_idx == 4 && off == o1);
+    assert(udp_ipc_frame_next(d, total, &off, &h) == UDP_IPC_FRAME_OK && h->sock_fd_idx == 5 && h->payload_len == 13 && off == o2);
+    assert(udp_ipc_frame_next(d, total, &off, &h) == UDP_IPC_FRAME_OK && h->sock_fd_idx == 6 && off == total);
+    assert(udp_ipc_frame_next(d, total, &off, &h) == UDP_IPC_FRAME_END);
+    /* the last frame with its padding (a padded frame that went alone): the padding is no frame */
+    off = o1;
+    assert(udp_ipc_frame_next(d, o1 + udp_ipc_frame_padded(f1), &off, &h) == UDP_IPC_FRAME_OK && off == o1 + udp_ipc_frame_padded(f1));
+    /* a length past the end of the datagram (by one octet), in the middle of a datagram: bad, and nothing after it is read */
+    off = o1;
+    assert(udp_ipc_frame_next(d, o1 + f1 - 1, &off, &h) == UDP_IPC_FRAME_BADLEN && off == o1 + f1 - 1 && h == NULL);
+    udp_ipc_t *w = (udp_ipc_t *)(void *)(d + o1);
+    w->payload_len = 65535;
+    off = 0;
+    assert(udp_ipc_frame_next(d, total, &off, &h) == UDP_IPC_FRAME_OK);
+    assert(udp_ipc_frame_next(d, total, &off, &h) == UDP_IPC_FRAME_BADLEN && off == total);
+    assert(udp_ipc_frame_next(d, total, &off, &h) == UDP_IPC_FRAME_END);
+    w->payload_len = 13;
+    /* a truncated frame: fewer octets left than a header after a good one */
+    off = 0;
+    assert(udp_ipc_frame_next(d, o1 + sizeof(udp_ipc_t) - 1, &off, &h) == UDP_IPC_FRAME_OK && off == o1);
+    assert(udp_ipc_frame_next(d, o1 + sizeof(udp_ipc_t) - 1, &off, &h) == UDP_IPC_FRAME_SHORT && off == o1 + sizeof(udp_ipc_t) - 1);
+    /* a reply of zero octets, or shorter than a DNS header: bad (the router would send an empty or broken datagram to the client) */
+    for (uint16_t pl = 0; pl < UDP_IPC_REPLY_MIN; pl++) {
+        size_t fl = ipcf_put(d, 0, 4, pl);
+        ipcf_put(d, udp_ipc_frame_padded(fl), 5, 20);
+        off = 0;
+        assert(udp_ipc_frame_next(d, udp_ipc_frame_padded(fl) + 100, &off, &h) == UDP_IPC_FRAME_BADLEN && off == udp_ipc_frame_padded(fl) + 100);
+    }
+    /* ... but a KLS1 record of the logging state is not a reply: any length (klog_state_apply() checks it) */
+    size_t fl = ipcf_put(d, 0, UDP_IPC_LOGSTATE, 3);
+    off = 0;
+    assert(udp_ipc_frame_next(d, fl, &off, &h) == UDP_IPC_FRAME_OK && h->sock_fd_idx == UDP_IPC_LOGSTATE && off == fl);
+    /* a buffer that is not aligned for the header is refused, never read through a misaligned pointer */
+    ipcf_put(d, 0, 4, 20);
+    memmove(d + 1, d, 100);
+    off = 0;
+    assert(udp_ipc_frame_next(d + 1, 100, &off, &h) == UDP_IPC_FRAME_SHORT && off == 100);
+
+    /* udp_ipc_pack(): exact fit, one more octet, a frame larger than the limit alone, zero padding over stale octets */
+    static alignas(8) uint8_t fb[UDP_BATCH_SIZE][sizeof(udp_ipc_t) + 1032];
+    struct iovec fr[UDP_BATCH_SIZE];
+    udp_ipc_group_t g[UDP_BATCH_SIZE];
+    memset(fb, 0xEE, sizeof(fb));
+    for (int i = 0; i < 3; i++) {
+        fr[i].iov_base = fb[i];
+        fr[i].iov_len = ipcf_put(fb[i], 0, i, 20);    /* 100 octets each: 104 + 104 + 100 = 308 packed */
+    }
+    assert(udp_ipc_pack(fr, 3, 308, g) == 1 && g[0].first == 0 && g[0].count == 3);
+    assert(fr[0].iov_len == 104 && fr[1].iov_len == 104 && fr[2].iov_len == 100);
+    for (int i = 0; i < 2; i++)
+        for (size_t q = 100; q < 104; q++) assert(fb[i][q] == 0);          /* (the padding is zero, not the stale 0xEE) */
+    assert(fb[2][100] == 0xEE);                                            /* (the last frame is not padded) */
+    for (int i = 0; i < 3; i++) fr[i].iov_len = 100;
+    assert(udp_ipc_pack(fr, 3, 307, g) == 2 && g[0].first == 0 && g[0].count == 2 && g[1].first == 2 && g[1].count == 1);
+    assert(fr[0].iov_len == 104 && fr[1].iov_len == 100 && fr[2].iov_len == 100);
+    /* a frame larger than the limit goes alone, between the others, as before the framing */
+    fr[0].iov_len = 100;
+    fr[1].iov_len = ipcf_put(fb[1], 0, 1, 1000);
+    assert(udp_ipc_pack(fr, 3, 500, g) == 3 && g[0].count == 1 && g[1].first == 1 && g[1].count == 1 && g[2].first == 2 && g[2].count == 1);
+    assert(fr[0].iov_len == 100 && fr[1].iov_len == 1080 && fr[2].iov_len == 100);
+    /* 16 replies in one datagram, each one read back from it */
+    for (int i = 0; i < UDP_BATCH_SIZE; i++) {
+        fr[i].iov_base = fb[i];
+        fr[i].iov_len = ipcf_put(fb[i], 0, i, (uint16_t)(12 + i * 3));
+    }
+    assert(udp_ipc_pack(fr, UDP_BATCH_SIZE, 8192, g) == 1 && g[0].count == UDP_BATCH_SIZE);
+    size_t t = 0;
+    for (int i = 0; i < UDP_BATCH_SIZE; i++) {
+        memcpy(d + t, fr[i].iov_base, fr[i].iov_len);
+        t += fr[i].iov_len;
+    }
+    off = 0;
+    for (int i = 0; i < UDP_BATCH_SIZE; i++) {
+        const size_t s = off;
+        assert(udp_ipc_frame_next(d, t, &off, &h) == UDP_IPC_FRAME_OK && h->sock_fd_idx == i && h->payload_len == 12 + i * 3);
+        assert(memcmp(d + s, fb[i], sizeof(udp_ipc_t) + h->payload_len) == 0);
+    }
+    assert(udp_ipc_frame_next(d, t, &off, &h) == UDP_IPC_FRAME_END);
+    assert(udp_ipc_pack(fr, 0, 8192, g) == 0);
+    printf("  -> the IPC frames passed.\n");
+}
+
+/* ipc_reply_flush(): the replies of one batch through a real unix datagram pair: packed under g_ipc_pack_max, the losses counted in replies */
+static void test_ipc_reply_flush(void) {
+    printf("[TEST] Server Core: ipc_reply_flush packs a batch of replies and counts what is lost in replies...\n");
+    udp_batch_ctx_t *b = malloc(sizeof(*b));
+    assert(b);
+    const size_t saved_max = g_ipc_pack_max;
+    int sv[2];
+    assert(socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) == 0);
+    fcntl(sv[0], F_SETFL, fcntl(sv[0], F_GETFL, 0) | O_NONBLOCK);
+    int big = 1 << 20;
+    (void)setsockopt(sv[0], SOL_SOCKET, SO_SNDBUF, &big, sizeof(big));
+    (void)setsockopt(sv[1], SOL_SOCKET, SO_RCVBUF, &big, sizeof(big));
+    static alignas(8) uint8_t rb[UDP_IPC_BUFFER_SIZE];
+    /* reads every datagram waiting on sv[1]: the datagrams and the frames in them (each frame checked against what was put in) */
+    #define DRAIN(ndg, nfr) do { (ndg) = 0; (nfr) = 0; ssize_t rn_; \
+        while ((rn_ = recv(sv[1], rb, sizeof(rb), MSG_DONTWAIT)) >= 0) { (ndg)++; size_t o_ = 0; const udp_ipc_t *h_; \
+            while (udp_ipc_frame_next(rb, (size_t)rn_, &o_, &h_) == UDP_IPC_FRAME_OK) { assert(h_->sock_fd_idx == (nfr)); (nfr)++; } \
+            assert(o_ == (size_t)rn_); } } while (0)
+    #define FILL(n, pl) do { for (int i_ = 0; i_ < (n); i_++) { b->tx_iov[i_].iov_base = b->tx_buffers[i_]; \
+        b->tx_iov[i_].iov_len = ipcf_put(b->tx_buffers[i_], 0, i_, (uint16_t)(pl)); } } while (0)
+    int ndg, nfr;
+    const uint64_t full0 = ipcd_total(IPCD_WREP_FULL), err0 = ipcd_total(IPCD_WREP_ERR);
+    /* 16 replies of 100 octets in one datagram (1660 octets: under the 2048 default) */
+    g_ipc_pack_max = UDP_IPC_PACK_DEFAULT;
+    FILL(UDP_BATCH_SIZE, 20);
+    assert(ipc_reply_flush(sv[0], b, UDP_BATCH_SIZE) == 0);
+    DRAIN(ndg, nfr);
+    assert(ndg == 1 && nfr == UDP_BATCH_SIZE);
+    /* 16 replies of 512 octets of payload under a limit of 2048: 3 per datagram (3 x 592 + padding = 1776), 6 datagrams */
+    FILL(UDP_BATCH_SIZE, 512);
+    assert(ipc_reply_flush(sv[0], b, UDP_BATCH_SIZE) == 0);
+    DRAIN(ndg, nfr);
+    assert(ndg == 6 && nfr == UDP_BATCH_SIZE);
+    /* a limit above what the kernel takes (net.local.dgram.maxdgram): the packed datagram is refused with EMSGSIZE and every reply goes alone */
+    g_ipc_pack_max = 1u << 20;
+    FILL(UDP_BATCH_SIZE, 1500);                        /* (16 x 1580 octets: more than 8192 together) */
+    assert(ipc_reply_flush(sv[0], b, UDP_BATCH_SIZE) == 0);
+    DRAIN(ndg, nfr);
+    assert(ndg == UDP_BATCH_SIZE && nfr == UDP_BATCH_SIZE);
+    assert(ipcd_total(IPCD_WREP_FULL) == full0 && ipcd_total(IPCD_WREP_ERR) == err0);
+    /* one reply alone, as before the framing */
+    g_ipc_pack_max = UDP_IPC_PACK_DEFAULT;
+    FILL(1, 30);
+    assert(ipc_reply_flush(sv[0], b, 1) == 0 && ipc_reply_flush(sv[0], b, 0) == 0);
+    DRAIN(ndg, nfr);
+    assert(ndg == 1 && nfr == 1);
+    /* a descriptor that fails (EBADF): every reply of every datagram counted as an error, not one per datagram */
+    FILL(UDP_BATCH_SIZE, 512);
+    assert(ipc_reply_flush(-1, b, UDP_BATCH_SIZE) == UDP_BATCH_SIZE);
+    assert(ipcd_total(IPCD_WREP_ERR) == err0 + UDP_BATCH_SIZE && ipcd_total(IPCD_WREP_FULL) == full0);
+    /* a full queue: what is not sent is counted as full, in replies */
+    uint8_t one = 0;
+    int filled = 0;
+    while (send(sv[0], &one, 1, MSG_DONTWAIT) > 0 && filled < 1000000) filled++;
+    assert(errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS);
+    FILL(UDP_BATCH_SIZE, 20);
+    assert(ipc_reply_flush(sv[0], b, UDP_BATCH_SIZE) == UDP_BATCH_SIZE);
+    assert(ipcd_total(IPCD_WREP_FULL) == full0 + UDP_BATCH_SIZE && ipcd_total(IPCD_WREP_ERR) == err0 + UDP_BATCH_SIZE);
+    #undef DRAIN
+    #undef FILL
+    g_ipc_pack_max = saved_max;
+    close(sv[0]);
+    close(sv[1]);
+    free(b);
+    printf("  -> ipc_reply_flush passed.\n");
+}
+
 // ----------------------------------------------------------------------------
 // ipc_send_spill (0.7): a worker whose queue is full does not lose the batch; the counters say what was lost
 // ----------------------------------------------------------------------------
@@ -2703,7 +2889,7 @@ static void test_ipcd_counters(void) {
     assert(dt != NULL);
     uint64_t sum = 0;
     for (int i = 0; i < IPCD_COUNT; i++)
-        if (i != IPCD_RTW_SPILLED) sum += ipcd_total((ipcd_t)i);
+        if (i != IPCD_RTW_SPILLED && i != IPCD_RREP_CUT) sum += ipcd_total((ipcd_t)i);
     assert(strtoull(dt + strlen("ipc.dropped.total="), NULL, 10) == sum);   // the spills are not losses
     // a buffer that is too small is cut at a line: no overflow
     for (size_t cap = 1; cap < 80; cap += 7) {
@@ -2750,7 +2936,7 @@ static void test_ipcd_counters(void) {
     dt = strstr(buf, "ipc.dropped.total=");
     sum = 0;
     for (int i = 0; i < IPCD_COUNT; i++)
-        if (i != IPCD_RTW_SPILLED) sum += ipcd_total((ipcd_t)i);
+        if (i != IPCD_RTW_SPILLED && i != IPCD_RREP_CUT) sum += ipcd_total((ipcd_t)i);
     assert(dt != NULL && strtoull(dt + strlen("ipc.dropped.total="), NULL, 10) == sum);   // (the routed queries are not drops)
     g_num_frontend_routers = saved_routers;
     for (size_t cap = 1; cap < 1500; cap += 37) {   // (the router lines are cut at a line as well)
@@ -3168,7 +3354,7 @@ static void test_router_reply_fd_and_budget(void) {
     const char *dt = strstr(fb, "ipc.dropped.total=");
     uint64_t sum = 0;
     for (int i = 0; i < IPCD_COUNT; i++)
-        if (i != IPCD_RTW_SPILLED) sum += ipcd_total((ipcd_t)i);
+        if (i != IPCD_RTW_SPILLED && i != IPCD_RREP_CUT) sum += ipcd_total((ipcd_t)i);
     assert(dt && strtoull(dt + strlen("ipc.dropped.total="), NULL, 10) == sum);   /* (the worker queries are not drops; the new drops are) */
     g_num_workers = KARIDNS_WORKER_THREADS_MAX;                                 /* (the reply of 128 workers fits the control thread's buffer) */
     fl = ipcd_format(fb, sizeof(fb));
@@ -3516,6 +3702,58 @@ static void test_router_backend_mode(void) {
                                                           (unsigned long long)want_bad);
     assert(ipcd_total(IPCD_RREP_BADSOCK) == want_bad);
     assert(be_wait_readable(c, 200) == 0);                           /* (none of them was sent) */
+    /* B3 phase 3: one datagram of packed frames (dns_ipc_frame.h).  20 replies (more than one batch of client sends, UDP_BATCH_SIZE) with one
+     * of a bad socket among them: 19 sent, each once and in order, the bad one counted; then a datagram whose second frame claims more
+     * octets than there are: the first is sent, the bad one counted as bad_length and the datagram as cut */
+    {
+        static alignas(udp_ipc_t) uint8_t pk[4096];
+        size_t po = 0;
+        for (int i = 0; i < 20; i++) {
+            po = udp_ipc_frame_padded(po);
+            memcpy(pk + po, m, sizeof(udp_ipc_t));
+            udp_ipc_t *ph = (udp_ipc_t *)(void *)(pk + po);
+            ph->sock_fd_idx = i == 7 ? 1 : 0;
+            ph->payload_len = (uint16_t)(12 + i);
+            memcpy(pk + po + sizeof(udp_ipc_t), "\x12\x34\x81\x80", 4);
+            pk[po + sizeof(udp_ipc_t)] = (uint8_t)i;               /* (the ID tells the replies apart) */
+            memset(pk + po + sizeof(udp_ipc_t) + 4, 'p', 8 + (size_t)i);
+            po += sizeof(udp_ipc_t) + 12 + (size_t)i;
+        }
+        const uint64_t bs0 = ipcd_total(IPCD_RREP_BADSOCK), bl0 = ipcd_total(IPCD_RREP_BADLEN), cut0 = ipcd_total(IPCD_RREP_CUT);
+        assert(send(worker_end, pk, po, 0) == (ssize_t)po);
+        int got = 0, last = -1;
+        for (int i = 0; i < 19; i++) {
+            if (be_wait_readable(c, 5000) != 1) break;
+            n = recvfrom(c, buf, sizeof(buf), MSG_DONTWAIT, (struct sockaddr *)&from, &fl);
+            if (n < 12 || buf[0] == 7 || (int)(uint8_t)buf[0] <= last || n != 12 + (uint8_t)buf[0]) break;
+            last = (uint8_t)buf[0];
+            got++;
+        }
+        for (int i = 0; i < 500 && ipcd_total(IPCD_RREP_BADSOCK) < bs0 + 1; i++) usleep(10000);   /* (bounded: 5 s) */
+        if (got != 19) printf("  [state] packed replies: %d of 19 (last ID %d, recv %zd), bad_socket +%llu\n", got, last, n,
+                              (unsigned long long)(ipcd_total(IPCD_RREP_BADSOCK) - bs0));
+        assert(got == 19 && last == 19 && ipcd_total(IPCD_RREP_BADSOCK) == bs0 + 1);
+        assert(be_wait_readable(c, 200) == 0);
+        /* a good frame, then one whose payload_len runs past the end of the datagram */
+        po = 0;
+        memcpy(pk, m, sizeof(udp_ipc_t) + 20);
+        ((udp_ipc_t *)(void *)pk)->sock_fd_idx = 0;
+        po = udp_ipc_frame_padded(sizeof(udp_ipc_t) + 20);
+        memcpy(pk + po, m, sizeof(udp_ipc_t) + 20);
+        ((udp_ipc_t *)(void *)(pk + po))->sock_fd_idx = 0;
+        ((udp_ipc_t *)(void *)(pk + po))->payload_len = 21;
+        po += sizeof(udp_ipc_t) + 20;
+        assert(send(worker_end, pk, po, 0) == (ssize_t)po);
+        rd = be_wait_readable(c, 5000);
+        n = rd == 1 ? recvfrom(c, buf, sizeof(buf), MSG_DONTWAIT, (struct sockaddr *)&from, &fl) : -1;
+        assert(n == 20 && memcmp(buf, "\x12\x34\x81\x80reply-from-router", 20) == 0);
+        for (int i = 0; i < 500 && ipcd_total(IPCD_RREP_CUT) < cut0 + 1; i++) usleep(10000);           /* (bounded: 5 s) */
+        if (ipcd_total(IPCD_RREP_CUT) != cut0 + 1 || ipcd_total(IPCD_RREP_BADLEN) != bl0 + 1)
+            printf("  [state] router.reply.cut +%llu, bad_length +%llu\n", (unsigned long long)(ipcd_total(IPCD_RREP_CUT) - cut0),
+                   (unsigned long long)(ipcd_total(IPCD_RREP_BADLEN) - bl0));
+        assert(ipcd_total(IPCD_RREP_CUT) == cut0 + 1 && ipcd_total(IPCD_RREP_BADLEN) == bl0 + 1);
+        assert(be_wait_readable(c, 200) == 0);
+    }
     /* a query to the listen address stays in the worker's socket: the router does not read it, and nothing comes on the worker's IPC */
     assert(sendto(c, "query-for-worker", 16, 0, (struct sockaddr *)&srv, sizeof(srv)) == 16);
     assert(be_wait_readable(g_be_udp_fds[0][0], 5000) == 1);
@@ -9172,6 +9410,8 @@ int main(void) {
     test_open_backend_udp_sockets();
     test_router_backend_mode();
     test_sendmmsg_skip_failed();
+    test_ipc_frame_parse_pack();
+    test_ipc_reply_flush();
     test_ipc_send_spill();
     test_sockbuf_set();
     test_ipcd_counters();

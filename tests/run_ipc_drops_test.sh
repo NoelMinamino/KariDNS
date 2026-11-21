@@ -140,10 +140,10 @@ fi
 OUT=$(perl "$CLIENT" "$PORT" 1 1 1 5)
 [ "$(kv "$OUT" answered)" = 1 ] && ok "the server answers a query (the load generator works)" || bad "no answer to the first query" "$OUT"
 ctl ipcstats > "$T/ipc0.txt" 2>&1
-want="router.worker.spilled router.worker.dropped_full router.worker.dropped_error router.rx.truncated router.rx.short router.reply.short router.reply.bad_length router.reply.bad_socket router.client.dropped_full router.client.dropped_error worker.rx.short worker.rx.bad_length worker.reply.dropped_full worker.reply.dropped_error worker.async.dropped_full worker.udp.truncated worker.udp.short dropped.total"
+want="router.worker.spilled router.worker.dropped_full router.worker.dropped_error router.rx.truncated router.rx.short router.reply.short router.reply.bad_length router.reply.bad_socket router.client.dropped_full router.client.dropped_error worker.rx.short worker.rx.bad_length worker.reply.dropped_full worker.reply.dropped_error worker.async.dropped_full worker.udp.truncated worker.udp.short router.reply.cut dropped.total"
 missing=""
 for k in $want; do grep -q "^ipc\\.$k=[0-9]*\$" "$T/ipc0.txt" || missing="$missing $k"; done
-[ -z "$missing" ] && ok "karictl ipcstats lists all 18 counters" || bad "karictl ipcstats lacks:$missing" "$(cat "$T/ipc0.txt")"
+[ -z "$missing" ] && ok "karictl ipcstats lists all 19 counters" || bad "karictl ipcstats lacks:$missing" "$(cat "$T/ipc0.txt")"
 [ "$(ipcv dropped.total)" = 0 ] && ok "nothing was dropped yet (ipc.dropped.total=0)" || bad "ipc.dropped.total=$(ipcv dropped.total) before any load"
 ctl stats > "$T/stats.prom" 2>&1
 grep -q '^karidns_ipc_events_total{event="router.worker.dropped_full"} 0$' "$T/stats.prom" && ok "karictl stats: karidns_ipc_events_total{event=...}" || bad "karictl stats has no karidns_ipc_events_total" "$(grep ipc "$T/stats.prom" | head -3)"

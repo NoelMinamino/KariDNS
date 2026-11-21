@@ -2024,7 +2024,7 @@ static const char *const g_ipcd_names[IPCD_COUNT] = {
   "router.worker.spilled", "router.worker.dropped_full", "router.worker.dropped_error", "router.rx.truncated", "router.rx.short",
   "router.reply.short", "router.reply.bad_length", "router.reply.bad_socket", "router.client.dropped_full", "router.client.dropped_error",
   "worker.rx.short", "worker.rx.bad_length", "worker.reply.dropped_full", "worker.reply.dropped_error", "worker.async.dropped_full",
-  "worker.udp.truncated", "worker.udp.short",
+  "worker.udp.truncated", "worker.udp.short", "router.reply.cut",
 };
 _Static_assert(sizeof(g_ipcd_names) / sizeof(g_ipcd_names[0]) == IPCD_COUNT, "a name for every IPC counter");
 /* udp-receive backend: the queries each worker read from its own UDP sockets (ipcworker.<w>.queries).  The workers are threads of the Backend, which
@@ -2084,7 +2084,7 @@ size_t ipcd_format(char *buf, size_t cap) {
   uint64_t dropped = 0;
   for (int i = 0; i < IPCD_COUNT; i++) {
     const uint64_t v = ipcd_total((ipcd_t)i);
-    if (i != IPCD_RTW_SPILLED) dropped += v;
+    if (i != IPCD_RTW_SPILLED && i != IPCD_RREP_CUT) dropped += v;   /* (a spill is served; a cut is a datagram, its bad frame is counted) */
     int w = snprintf(buf + len, cap - len, "ipc.%s=%llu\n", g_ipcd_names[i], (unsigned long long)v);
     if (w < 0 || (size_t)w >= cap - len) return len;
     len += (size_t)w;
@@ -2165,6 +2165,67 @@ STATIC_TEST int sendmmsg_skip_failed(int fd, struct mmsghdr *msgs, int n, const 
 STATIC_TEST void ipc_reply_failed(int err) {
   ipcd_add((err == EAGAIN || err == EWOULDBLOCK || err == ENOBUFS) ? IPCD_WREP_FULL : IPCD_WREP_ERR, 1);
   log_udp_send_drop("Backend->Frontend IPC", true, err, 1);
+}
+
+/* B3 phase 3: the most octets of one packed worker -> router datagram (dns_ipc_frame.h): net.local.dgram.maxdgram, read by setup_ipc_tables()
+ * before the fork (the Backend cannot read a sysctl in capability mode).  Until then (unit tests) a small default. */
+STATIC_TEST size_t g_ipc_pack_max = UDP_IPC_PACK_DEFAULT;
+
+/* One datagram of the frames iov[0 .. cnt): 0, or the errno (a datagram goes whole or not at all) */
+static int ipc_send_frames(int fd, struct iovec *iov, int cnt) {
+  struct msghdr mh;
+  memset(&mh, 0, sizeof(mh));
+  mh.msg_iov = iov;
+  mh.msg_iovlen = cnt;
+  ssize_t r;
+  do {
+    r = sendmsg(fd, &mh, MSG_DONTWAIT);
+  } while (r < 0 && errno == EINTR);
+  return r < 0 ? errno : 0;
+}
+
+/* The replies batch->tx_buffers[0 .. n) of a worker (batch->tx_iov[i]: the udp_ipc_t header and the reply) to its router on fd, packed into as
+ * few datagrams as fit under g_ipc_pack_max (udp_ipc_pack(): no copy, the iovecs are gathered).  What cannot go is dropped and counted in
+ * replies, not datagrams, as sendmmsg_skip_failed() counts them: a full queue (EAGAIN / ENOBUFS) stops the batch and counts every reply not sent
+ * as IPCD_WREP_FULL; another failure drops that datagram's replies (IPCD_WREP_ERR) and goes on.  A packed datagram the kernel refuses as too long
+ * (EMSGSIZE: net.local.dgram.maxdgram lowered since the start) is sent again one reply per datagram.  No allocation.  Returns the number
+ * dropped. */
+STATIC_TEST int ipc_reply_flush(int fd, udp_batch_ctx_t *batch, int n) {
+  if (n <= 0) return 0;
+  if (n > UDP_BATCH_SIZE) n = UDP_BATCH_SIZE;
+  udp_ipc_group_t g[UDP_BATCH_SIZE];
+  const int ng = udp_ipc_pack(batch->tx_iov, n, g_ipc_pack_max, g);
+  int full = 0, hard = 0, last_err = 0;
+  for (int k = 0; k < ng; k++) {
+    int e = ipc_send_frames(fd, &batch->tx_iov[g[k].first], g[k].count);
+    if (e == 0) continue;
+    if (e == EMSGSIZE && g[k].count > 1) {
+      /* (a padded frame sent alone ends with its zero padding: the router reads it as one frame) */
+      for (int i = 0; i < g[k].count; i++) {
+        e = ipc_send_frames(fd, &batch->tx_iov[g[k].first + i], 1);
+        if (e == 0) continue;
+        last_err = e;
+        if (e == EAGAIN || e == EWOULDBLOCK || e == ENOBUFS) {
+          full += g[k].count - i;
+          for (int j = k + 1; j < ng; j++) full += g[j].count;
+          goto done;
+        }
+        hard++;
+      }
+      continue;
+    }
+    last_err = e;
+    if (e == EAGAIN || e == EWOULDBLOCK || e == ENOBUFS) {
+      for (int j = k; j < ng; j++) full += g[j].count;
+      break;
+    }
+    hard += g[k].count;
+  }
+done:
+  ipcd_add(IPCD_WREP_FULL, (uint64_t)full);
+  ipcd_add(IPCD_WREP_ERR, (uint64_t)hard);
+  if (full + hard > 0) log_udp_send_drop("Backend->Frontend IPC", true, last_err, full + hard);
+  return full + hard;
 }
 
 /* Router -> workers (0.7): the batch msgs[0..n) goes to the worker *rr; what that worker's queue refuses (EAGAIN / ENOBUFS: the worker is
@@ -2849,7 +2910,10 @@ STATIC_TEST void udp_one(udp_pass_t *w, udp_ipc_t *ipc_msg, uint8_t *req_buf, ss
             }
 
             // --- 高速ワンパス走査 ---
-            char qname[DNS_NAME_TEXT_SIZE] = "";
+            /* B3 phase 3: only the first octet is cleared (the initialiser wrote all 1025 per query): parse_query_question_fast() ends
+             * the name with a NUL on every path, and nothing reads past it */
+            char qname[DNS_NAME_TEXT_SIZE];
+            qname[0] = '\0';
             uint16_t qtype = 0;
             uint16_t qclass = 1;
             size_t question_end = DNS_HEADER_SIZE;
@@ -3098,13 +3162,9 @@ STATIC_TEST void udp_one(udp_pass_t *w, udp_ipc_t *ipc_msg, uint8_t *req_buf, ss
                                  ipc_msg->has_source_addr ? &ipc_msg->source_addr : NULL, ipc_msg->has_source_addr, IPPROTO_UDP);
 
               batch->tx_iov[w->n_tx].iov_base = batch->tx_buffers[w->n_tx];
-              batch->tx_msgs[w->n_tx].msg_hdr.msg_name = NULL;
-              batch->tx_msgs[w->n_tx].msg_hdr.msg_namelen = 0;
-              batch->tx_msgs[w->n_tx].msg_hdr.msg_control = NULL;
-              batch->tx_msgs[w->n_tx].msg_hdr.msg_controllen = 0;
               w->n_tx++;
               if (w->n_tx == UDP_BATCH_SIZE) {
-                sendmmsg_skip_failed(active_fd, batch->tx_msgs, w->n_tx, "Backend->Frontend IPC", true, IPCD_WREP_FULL);
+                ipc_reply_flush(active_fd, batch, w->n_tx);
                 w->n_tx = 0;
               }
               rcu_reader_exit(ctx);
@@ -3194,7 +3254,7 @@ STATIC_TEST void park_service(udp_pass_t *w, int kq) {
       w->n_tx = 0;
       udp_one(w, ipc, req, len);
       if (w->n_tx > 0) {
-        sendmmsg_skip_failed(w->active_fd, w->batch->tx_msgs, w->n_tx, "Backend->Frontend IPC", true, IPCD_WREP_FULL);
+        ipc_reply_flush(w->active_fd, w->batch, w->n_tx);
         w->n_tx = 0;
       }
       w->woken = false;
@@ -3264,7 +3324,7 @@ int worker_udp_rx(udp_pass_t *pass, int fd, int sock_idx, int reply_fd) {
     atomic_fetch_add_explicit(&pass->ctx->query_count, (uint64_t)n_served, memory_order_relaxed);
     ipcd_wrecv_add(pass->worker_idx, (uint64_t)n_served);
     if (pass->n_tx > 0) {
-      sendmmsg_skip_failed(reply_fd, batch->tx_msgs, pass->n_tx, "Backend->Frontend IPC", true, IPCD_WREP_FULL);
+      ipc_reply_flush(reply_fd, batch, pass->n_tx);
       pass->n_tx = 0;
     }
     total += n_served;
@@ -3421,10 +3481,6 @@ worker_startup_success:;
     batch->rx_iov[k].iov_len = sizeof(batch->rx_buffers[k]);
     batch->rx_msgs[k].msg_hdr.msg_iov = &batch->rx_iov[k];
     batch->rx_msgs[k].msg_hdr.msg_iovlen = 1;
-
-    memset(&batch->tx_msgs[k], 0, sizeof(batch->tx_msgs[k]));
-    batch->tx_msgs[k].msg_hdr.msg_iov = &batch->tx_iov[k];
-    batch->tx_msgs[k].msg_hdr.msg_iovlen = 1;
   }
 
   udp_pass_t pass;
@@ -3538,7 +3594,7 @@ worker_startup_success:;
           }
           atomic_fetch_add_explicit(&ctx->query_count, (uint64_t)n_served, memory_order_relaxed);
           if (pass.n_tx > 0) {
-            sendmmsg_skip_failed(active_fd, batch->tx_msgs, pass.n_tx, "Backend->Frontend IPC", true, IPCD_WREP_FULL);
+            ipc_reply_flush(active_fd, batch, pass.n_tx);
             pass.n_tx = 0;
           }
           if (udp_batch_drained(n_recv))
@@ -3719,7 +3775,8 @@ process_tcp_client: ;
             tcp_drop_message(ctx_tcp);
             continue;
           }
-          char qname[DNS_NAME_TEXT_SIZE] = "";
+          char qname[DNS_NAME_TEXT_SIZE];                /* (only the first octet: as for UDP, parse_query_question_fast() ends the name with a NUL) */
+          qname[0] = '\0';
           uint16_t qtype = 0;
           uint16_t qclass = 1;
           size_t question_end = DNS_HEADER_SIZE;
@@ -7538,21 +7595,29 @@ STATIC_TEST void run_frontend_router(pid_t backend_pid, int router_id) {
           int tx_count = 0;
 
           for (int k = 0; k < n_recv; k++) {
-            ssize_t len = (ssize_t)fctx->ipc_rx_msgs[k].msg_len;
-            if (len < (ssize_t)sizeof(udp_ipc_t)) {
-              ipcd_add(IPCD_RREP_SHORT, 1);
-              continue;
+            /* B3 phase 3: a datagram of a worker holds one or more frames (dns_ipc_frame.h), each a reply as one datagram used to be; every
+             * frame is checked as the datagram was (hostile input).  The first bad frame ends the datagram: the frames before it were taken, what
+             * is behind it cannot be found.  It is counted as before (short / bad_length), and once more as a cut datagram when it was not the
+             * first frame (a packed datagram damaged half way: the replies behind it are lost and their number is not known). */
+            uint8_t *const dg = fctx->ipc_rx_buffers[k];
+            const size_t dlen = fctx->ipc_rx_msgs[k].msg_len;
+            size_t foff = 0;
+          for (;;) {
+            const size_t fstart = foff;
+            const udp_ipc_t *msg;
+            const udp_ipc_frame_rc_t frc = udp_ipc_frame_next(dg, dlen, &foff, &msg);
+            if (frc == UDP_IPC_FRAME_END) break;
+            if (frc != UDP_IPC_FRAME_OK) {
+              ipcd_add(frc == UDP_IPC_FRAME_SHORT ? IPCD_RREP_SHORT : IPCD_RREP_BADLEN, 1);
+              if (fstart > 0) ipcd_add(IPCD_RREP_CUT, 1);
+              if (frc == UDP_IPC_FRAME_BADLEN)
+                syslog(LOG_WARNING, "[Frontend %d] Dropping backend reply with inconsistent payload_len", router_id);
+              break;
             }
-            udp_ipc_t *msg = (udp_ipc_t *)fctx->ipc_rx_buffers[k];
-            ssize_t max_valid_payload = len - (ssize_t)sizeof(udp_ipc_t);
-            if (msg->payload_len > max_valid_payload) {
-              ipcd_add(IPCD_RREP_BADLEN, 1);
-              syslog(LOG_WARNING, "[Frontend %d] Dropping backend reply with inconsistent payload_len", router_id);
-              continue;
-            }
+            uint8_t *const payload = dg + (fstart + sizeof(udp_ipc_t));   /* (the frame's payload: inside dg, checked by udp_ipc_frame_next()) */
             if (msg->sock_fd_idx == UDP_IPC_LOGSTATE) {
               /* 0.7 M2: the debug level and the logging runtime of the Backend (hostile input: dns_log_state.h).  Not a reply: nothing is sent */
-              (void)klog_state_apply(fctx->ipc_rx_buffers[k] + sizeof(udp_ipc_t), msg->payload_len, router_who);
+              (void)klog_state_apply(payload, msg->payload_len, router_who);
               continue;
             }
             /* the socket the reply leaves from (hostile input: an index that names no socket of this router, or the socket of a worker whose replies go
@@ -7563,14 +7628,15 @@ STATIC_TEST void run_frontend_router(pid_t backend_pid, int router_id) {
               continue;
             }
 
-            if (cur_sock_idx != -1 && msg->sock_fd_idx != cur_sock_idx && tx_count > 0) {
+            /* (a batch of client sends is one socket's, and at most UDP_BATCH_SIZE: one datagram of a worker can hold more replies than that) */
+            if (tx_count > 0 && (msg->sock_fd_idx != cur_sock_idx || tx_count == UDP_BATCH_SIZE)) {
               sendmmsg_skip_failed(cur_fd, fctx->cli_tx_msgs, tx_count, "Frontend UDP", false, IPCD_RCLI_FULL);
               tx_count = 0;
             }
             cur_sock_idx = msg->sock_fd_idx;
             cur_fd = sfd;
 
-            fctx->cli_tx_iov[tx_count].iov_base = fctx->ipc_rx_buffers[k] + sizeof(udp_ipc_t);
+            fctx->cli_tx_iov[tx_count].iov_base = payload;
             fctx->cli_tx_iov[tx_count].iov_len = msg->payload_len;
             /* addr_len comes from the Backend (hostile input): the address is at most the header's client_addr, and the length handed to the kernel is the
              * length copied (a larger one would read past client_addr into the payload) */
@@ -7626,6 +7692,7 @@ STATIC_TEST void run_frontend_router(pid_t backend_pid, int router_id) {
               fctx->cli_tx_msgs[tx_count].msg_hdr.msg_controllen = 0;
             }
             tx_count++;
+          }
           }
           if (tx_count > 0 && cur_fd >= 0) {
             sendmmsg_skip_failed(cur_fd, fctx->cli_tx_msgs, tx_count, "Frontend UDP", false, IPCD_RCLI_FULL);
@@ -7847,6 +7914,10 @@ STATIC_TEST void setup_ipc_tables(int num_workers) {
   g_num_workers = num_workers;
   g_ipc_buf_short = 0;
   ipcd_init();   /* (before the Backend and the routers are forked: they share the counters) */
+  /* B3 phase 3: the packed replies of a worker stay under the kernel's limit of one unix datagram (a larger one is EMSGSIZE whatever the buffers
+   * are); 64 KiB at most, the size of the router's receive buffers.  Read here, before the fork: the Backend inherits it. */
+  const long long maxdgram = sysctl_num("net.local.dgram.maxdgram");
+  g_ipc_pack_max = maxdgram >= (long long)(sizeof(udp_ipc_t) + DNS_HEADER_SIZE) ? (maxdgram < 65536 ? (size_t)maxdgram : 65536) : UDP_IPC_PACK_DEFAULT;
   server_config_t *cfg = &g_config_db.config_a;
   int rcvbuf_size = (cfg && cfg->udp_recvbuf_size > 0) ? cfg->udp_recvbuf_size : 4 * 1024 * 1024;
   int sndbuf_size = (cfg && cfg->udp_sndbuf_size > 0) ? cfg->udp_sndbuf_size : 4 * 1024 * 1024;
