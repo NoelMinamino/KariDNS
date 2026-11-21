@@ -243,8 +243,6 @@ static int pkt_name(const uint8_t *pkt, size_t len, size_t off, uint8_t out[256]
     }
 }
 
-#define EDNS_OPT_COOKIE 10                        /* RFC 7873 section 8 */
-
 size_t alias_build_query(uint8_t *buf, size_t cap, uint16_t id, const uint8_t *name, size_t nlen, uint16_t qtype, const uint8_t *cc,
                          const uint8_t *sc, size_t sclen) {
     if (cc && sclen != 0 && (sclen < 8 || sclen > 32 || !sc)) return 0;   /* a server cookie is 8 to 32 octets (RFC 7873 section 4) */
@@ -270,17 +268,7 @@ size_t alias_build_query(uint8_t *buf, size_t cap, uint16_t id, const uint8_t *n
     buf[o++] = 0; buf[o++] = 0; buf[o++] = 0; buf[o++] = 0;
     buf[o++] = (uint8_t)(optlen >> 8);            /* RDLEN */
     buf[o++] = (uint8_t)optlen;
-    if (cc) {
-        /* RFC 7873 section 4: OPTION-CODE 10, the 8-octet client cookie, then the server cookie when one is known (section 5.1: every
-         * request carries a COOKIE option; the longer form with the server cookie last received from this server) */
-        buf[o++] = 0; buf[o++] = EDNS_OPT_COOKIE;
-        buf[o++] = (uint8_t)((8 + sclen) >> 8);
-        buf[o++] = (uint8_t)(8 + sclen);
-        memcpy(buf + o, cc, 8);
-        o += 8;
-        if (sclen) memcpy(buf + o, sc, sclen);
-        o += sclen;
-    }
+    if (cc) o += ckc_option_put(buf + o, cap - o, cc, sc, sclen);   /* RFC 7873 sections 4 and 5.1 (dns_cookie_client.c) */
     return o;
 }
 
@@ -307,29 +295,14 @@ static bool next_rr(const uint8_t *pkt, size_t len, size_t *off, rr_t *r) {
     return true;
 }
 
-/* The options of the OPT RR (RFC 6891 section 6.1.2: {code, length, data} to the end of the RDATA): the COOKIE option against the client
- * cookie sent.  false = discard the response (RFC 7873 section 5.3: an illegal COOKIE length - valid are 8 and 16 to 40, section 5.2.2 -, an
- * incorrect client cookie; here also two COOKIE options or an option list that runs past the RDATA, where the cookie cannot be checked). */
+/* the COOKIE option of the OPT RR against the client cookie sent (RFC 7873 section 5.3, ckc_option_parse()); false = discard the response */
 static bool opt_cookie(const uint8_t *rd, size_t rdlen, const uint8_t *cc, alias_parsed_t *out) {
-    size_t o = 0;
-    bool seen = false;
-    while (o < rdlen) {
-        if (rdlen - o < 4) return false;
-        uint16_t code = (uint16_t)((rd[o] << 8) | rd[o + 1]);
-        size_t olen = (size_t)((rd[o + 2] << 8) | rd[o + 3]);
-        o += 4;
-        if (olen > rdlen - o) return false;
-        if (code == EDNS_OPT_COOKIE) {
-            if (seen) return false;
-            seen = true;
-            if (olen < 8 || (olen > 8 && olen < 16) || olen > 40) return false;
-            if (memcmp(rd + o, cc, 8) != 0) return false;
-            out->cookie = olen == 8 ? ALIAS_CK_CLIENT : ALIAS_CK_SERVER;
-            out->sc_len = (uint8_t)(olen - 8);
-            memcpy(out->sc, rd + o + 8, olen - 8);   /* opaque to the client (RFC 7873 section 4.2; RFC 9018 section 4 defines the server's own form) */
-        }
-        o += olen;
-    }
+    ckc_seen_t s;
+    memset(&s, 0, sizeof(s));
+    if (!ckc_option_parse(rd, rdlen, cc, &s)) return false;
+    out->cookie = s.kind;
+    out->sc_len = s.sc_len;
+    memcpy(out->sc, s.sc, s.sc_len);
     return true;
 }
 
@@ -473,119 +446,13 @@ static ssize_t tcp_query(const struct sockaddr_storage *sa, socklen_t sl, const 
     return got == (ssize_t)rl ? got : -1;
 }
 
-/* ---- DNS Cookies (RFC 7873) of the resolver addresses: the alias thread only ---- */
-typedef struct {
-    bool used;
-    bool capable;                                 /* it sent a valid server cookie: its responses must carry one (RFC 7873 section 5.3) */
-    uint8_t fam;                                  /* AF_INET / AF_INET6 */
-    uint8_t addr[16];
-    uint16_t port;
-    uint8_t cc[8];                                /* the client cookie */
-    uint8_t sc[32];                               /* the newest server cookie, sc_len octets (0 = none) */
-    uint8_t sc_len;
-    uint32_t fails;                               /* resolutions in a row without an accepted answer */
-    int64_t cc_renew;                             /* alias_now() at which cc is replaced */
-    int64_t last_ok;                              /* alias_now() of the last accepted answer */
-    int64_t last_use;
-} ck_t;
-static ck_t g_ck[ALIAS_COOKIE_SLOTS];
+/* ---- DNS Cookies (RFC 7873) of the resolver addresses (dns_cookie_client.h): the alias thread only, so no log marks ---- */
+typedef ckc_entry_t ck_t;
+static ckc_entry_t g_ck_slots[ALIAS_COOKIE_SLOTS];
+static ckc_table_t g_ck = { .slots = g_ck_slots, .n = ALIAS_COOKIE_SLOTS, .who = "[Alias] resolver", .unit = "resolutions" };
 
-static void ck_addr(const struct sockaddr_storage *sa, uint8_t *fam, uint8_t addr[16], uint16_t *port) {
-    memset(addr, 0, 16);
-    if (sa->ss_family == AF_INET6) {
-        const struct sockaddr_in6 *s6 = (const struct sockaddr_in6 *)(const void *)sa;
-        *fam = AF_INET6;
-        memcpy(addr, &s6->sin6_addr, 16);
-        *port = s6->sin6_port;
-    } else {
-        const struct sockaddr_in *s4 = (const struct sockaddr_in *)(const void *)sa;
-        *fam = AF_INET;
-        memcpy(addr, &s4->sin_addr, 4);
-        *port = s4->sin_port;
-    }
-}
-
-static ck_t *ck_find(const struct sockaddr_storage *sa) {
-    uint8_t fam, addr[16];
-    uint16_t port;
-    ck_addr(sa, &fam, addr, &port);
-    for (int i = 0; i < ALIAS_COOKIE_SLOTS; i++)
-        if (g_ck[i].used && g_ck[i].fam == fam && g_ck[i].port == port && memcmp(g_ck[i].addr, addr, 16) == 0) return &g_ck[i];
-    return NULL;
-}
-
-/* the state of an address, made when it has none (a free slot, else the least recently used one); the client cookie is renewed when it is due */
-static ck_t *ck_get(const struct sockaddr_storage *sa, int64_t now) {
-    ck_t *c = ck_find(sa);
-    if (!c) {
-        c = &g_ck[0];
-        for (int i = 0; i < ALIAS_COOKIE_SLOTS; i++) {
-            if (!g_ck[i].used) { c = &g_ck[i]; break; }
-            if (g_ck[i].last_use < c->last_use) c = &g_ck[i];
-        }
-        memset(c, 0, sizeof(*c));
-        c->used = true;
-        ck_addr(sa, &c->fam, c->addr, &c->port);
-        c->cc_renew = INT64_MIN;
-        c->last_ok = now;
-    }
-    c->last_use = now;
-    if (now >= c->cc_renew) {
-        /* RFC 7873 section 4.1: a client cookie of at least 64 bits of entropy, different per server address and changed periodically;
-         * section 7.1: the default lifetime is one day, with a jitter of plus zero to minus at least 40 %.  RFC 9018 section 3: a random
-         * value per server is one of the allowed ways.  The server cookie was made for the old client cookie (RFC 7873 section 4.2), so it
-         * goes too; `capable` stays: the server still sends cookies.  Only between two resolutions: no query is outstanding (section 7.1) */
-        arc4random_buf(c->cc, sizeof(c->cc));
-        c->cc_renew = now + ALIAS_COOKIE_LIFETIME - (int64_t)arc4random_uniform(ALIAS_COOKIE_LIFETIME * 2 / 5 + 1);
-        c->sc_len = 0;
-    }
-    return c;
-}
-
-static void ck_text(const ck_t *c, char *out, size_t cap) {
-    char a[INET6_ADDRSTRLEN];
-    if (!inet_ntop(c->fam, c->addr, a, sizeof(a))) strlcpy(a, "?", sizeof(a));
-    snprintf(out, cap, c->fam == AF_INET6 ? "[%s]:%u" : "%s:%u", a, (unsigned)ntohs(c->port));
-}
-
-/* a response that passed the checks: keep the newest server cookie (RFC 7873 section 5.3: also from an error response) */
-static void ck_learn(ck_t *c, const alias_parsed_t *p) {
-    if (p->cookie != ALIAS_CK_SERVER) return;
-    memcpy(c->sc, p->sc, p->sc_len);
-    c->sc_len = p->sc_len;
-    if (!c->capable) {
-        c->capable = true;
-        char t[64];
-        ck_text(c, t, sizeof(t));
-        syslog(LOG_NOTICE, "[Alias] resolver %s sends DNS cookies: from now on its answers without a valid cookie are ignored (RFC 7873 section 5.3)", t);
-    }
-}
-
-/* the end of one resolution at this address: accepted = some response passed the checks */
-static void ck_account(ck_t *c, bool accepted, int64_t now) {
-    if (accepted) {
-        c->fails = 0;
-        c->last_ok = now;
-        return;
-    }
-    if (!c->capable) return;
-    c->fails++;
-    if (c->fails >= ALIAS_COOKIE_FORGET_FAILS && now - c->last_ok >= ALIAS_COOKIE_FORGET_SECS) {
-        /* a resolver that was replaced by one without cookies at the same address would never be heard again: after this many failed
-         * resolutions over this long, answers without a cookie are taken again (and the mark comes back with the next server cookie) */
-        c->capable = false;
-        c->sc_len = 0;
-        c->fails = 0;
-        char t[64];
-        ck_text(c, t, sizeof(t));
-        syslog(LOG_WARNING, "[Alias] resolver %s gave no answer with a valid DNS cookie in %d resolutions over %lld s: answers without a cookie are accepted from it again",
-               t, ALIAS_COOKIE_FORGET_FAILS, (long long)(now - c->last_ok));
-    }
-}
-
-/* RFC 7873 section 5.3 beyond what alias_parse_response() checks: once the address sent a server cookie, a response without one (no COOKIE
- * option, or the client cookie alone) is discarded, as one the client expected a COOKIE option in */
-static inline bool ck_acceptable(const ck_t *c, const alias_parsed_t *p) { return !c->capable || p->cookie == ALIAS_CK_SERVER; }
+static inline void ck_learn(ck_t *c, const alias_parsed_t *p) { ckc_learn(&g_ck, c, p->cookie, p->sc, p->sc_len); }
+static inline bool ck_acceptable(const ck_t *c, const alias_parsed_t *p) { return ckc_acceptable(&g_ck, c, p->cookie); }
 
 /* One exchange with one resolver: UDP, then TCP when truncated; once more after BADCOOKIE with the new server cookie (RFC 7873 section 5.3,
  * within the same time).  -1 = no accepted response, 0 = a usable answer in *p, 1 = an accepted response that is no usable answer.
@@ -656,11 +523,11 @@ static int net_resolve(const alias_rset_t *rs, const uint8_t *name, size_t nlen,
         if (rem == 0) break;
         uint32_t share = rem / (uint32_t)(rs->n - i);
         if (share == 0) share = 1;
-        ck_t *c = ck_get(&rs->sa[i], alias_now());
+        ck_t *c = ckc_get(&g_ck, &rs->sa[i], alias_now());
         bool accepted = false;
         alias_parsed_t p;
         int r = resolve_at(&rs->sa[i], rs->sl[i], c, name, nlen, qtype, share, deadline, (uint32_t)(rs->n - i), &p, &accepted);
-        ck_account(c, accepted, alias_now());
+        ckc_account(&g_ck, c, accepted, alias_now());
         if (accepted) any_answer = true;
         if (r == 0) {
             *out = p;
@@ -1276,7 +1143,7 @@ void alias_test_reset(void) {
     free(t);
     free(g_old_tab);
     g_old_tab = NULL;
-    memset(g_ck, 0, sizeof(g_ck));
+    memset(g_ck_slots, 0, sizeof(g_ck_slots));
 }
 
 void alias_test_want(const alias_rset_t *rs, const uint8_t *name, size_t nlen, uint32_t max_refresh) {
@@ -1293,7 +1160,7 @@ void alias_test_rescan(void) {
 }
 
 bool alias_test_cookie(const struct sockaddr_storage *sa, bool *capable, uint8_t cc[8], uint8_t *sc_len) {
-    const ck_t *c = ck_find(sa);
+    const ck_t *c = ckc_find(&g_ck, sa);
     if (!c) return false;
     *capable = c->capable;
     memcpy(cc, c->cc, 8);

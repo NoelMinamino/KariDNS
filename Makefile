@@ -50,7 +50,7 @@ LDFLAGS += -flto -pthread -lm $(BREW_LDFLAGS) $(DARWIN_LDFLAGS) $(HARDEN_LDFLAGS
 
 
 TARGET = karidns
-SRCS = dns_server_core.c dns_log.c dns_log_state.c dns_db_stream.c dns_db_ingest.c dns_db_recon.c dns_db_store.c dns_xfr_store.c dns_xfr_state.c dns_park.c dns_mem_advice.c dns_store_status.c dns_store.c dns_db_install.c dns_db_supervisor.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_rrl.c dns_tsig_acl.c dns_priv_sandbox.c dns_dynamic_update.c dns_axfr_ixfr.c dns_query_engine.c dns_plugin_sup.c dns_plugin_msg.c dns_alias.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_wire.c dns_config_parser.c dns_diag.c dns_zone_parser.c dns_tinydns_parser.c dns_utils.c dns_cidr.c dns_zone_image.c
+SRCS = dns_server_core.c dns_log.c dns_log_state.c dns_db_stream.c dns_db_ingest.c dns_db_recon.c dns_db_store.c dns_xfr_store.c dns_xfr_state.c dns_park.c dns_mem_advice.c dns_store_status.c dns_store.c dns_db_install.c dns_db_supervisor.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_rrl.c dns_tsig_acl.c dns_priv_sandbox.c dns_dynamic_update.c dns_axfr_ixfr.c dns_query_engine.c dns_plugin_sup.c dns_plugin_msg.c dns_alias.c dns_cookie_client.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_wire.c dns_config_parser.c dns_diag.c dns_zone_parser.c dns_tinydns_parser.c dns_utils.c dns_cidr.c dns_zone_image.c
 OBJS = $(SRCS:.c=.o)
 
 # dag を構成するモジュール (dag.c 以外)。fuzz / unit test / asan ビルドでも共有する
@@ -92,13 +92,13 @@ FUZZ_TARGET = tests/fuzz/fuzz_dns_wire
 FUZZ_SRCS = tests/fuzz/fuzz_dns_wire.c dns_wire.c dns_utils.c dns_zone_parser.c dns_cidr.c
 
 FUZZ_CORE_TARGET = tests/fuzz/fuzz_dns_server_core
-FUZZ_CORE_SRCS = tests/fuzz/fuzz_dns_server_core.c dns_log.c dns_log_state.c dns_db_stream.c dns_db_ingest.c dns_db_recon.c dns_db_store.c dns_xfr_store.c dns_xfr_state.c dns_park.c dns_mem_advice.c dns_store_status.c dns_store.c dns_db_install.c dns_db_supervisor.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_rrl.c dns_tsig_acl.c dns_priv_sandbox.c dns_dynamic_update.c dns_axfr_ixfr.c dns_query_engine.c dns_plugin_sup.c dns_plugin_msg.c dns_alias.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_wire.c dns_config_parser.c dns_diag.c dns_zone_parser.c dns_tinydns_parser.c dns_utils.c dns_cidr.c dns_zone_image.c
+FUZZ_CORE_SRCS = tests/fuzz/fuzz_dns_server_core.c dns_log.c dns_log_state.c dns_db_stream.c dns_db_ingest.c dns_db_recon.c dns_db_store.c dns_xfr_store.c dns_xfr_state.c dns_park.c dns_mem_advice.c dns_store_status.c dns_store.c dns_db_install.c dns_db_supervisor.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_rrl.c dns_tsig_acl.c dns_priv_sandbox.c dns_dynamic_update.c dns_axfr_ixfr.c dns_query_engine.c dns_plugin_sup.c dns_plugin_msg.c dns_alias.c dns_cookie_client.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_wire.c dns_config_parser.c dns_diag.c dns_zone_parser.c dns_tinydns_parser.c dns_utils.c dns_cidr.c dns_zone_image.c
 
 FUZZ_QUERY_ENGINE_TARGET = tests/fuzz/fuzz_query_engine
-FUZZ_QUERY_ENGINE_SRCS = tests/fuzz/fuzz_query_engine.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_rrl.c dns_tsig_acl.c dns_priv_sandbox.c dns_dynamic_update.c dns_axfr_ixfr.c dns_query_engine.c dns_plugin_sup.c dns_plugin_msg.c dns_alias.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_wire.c dns_config_parser.c dns_diag.c dns_zone_parser.c dns_tinydns_parser.c dns_utils.c dns_cidr.c dns_zone_image.c
+FUZZ_QUERY_ENGINE_SRCS = tests/fuzz/fuzz_query_engine.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_rrl.c dns_tsig_acl.c dns_priv_sandbox.c dns_dynamic_update.c dns_axfr_ixfr.c dns_query_engine.c dns_plugin_sup.c dns_plugin_msg.c dns_alias.c dns_cookie_client.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_wire.c dns_config_parser.c dns_diag.c dns_zone_parser.c dns_tinydns_parser.c dns_utils.c dns_cidr.c dns_zone_image.c
 
 FUZZ_XFR_PACKET_TARGET = tests/fuzz/fuzz_xfr_packet
-FUZZ_XFR_PACKET_SRCS = tests/fuzz/fuzz_xfr_packet.c dns_axfr_ixfr.c dns_wire.c dns_utils.c dns_config_parser.c dns_diag.c dns_zone_parser.c dns_tinydns_parser.c dns_cidr.c dns_tsig_acl.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_query_engine.c dns_plugin_sup.c dns_plugin_msg.c dns_alias.c dns_rrl.c dns_priv_sandbox.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_dynamic_update.c dns_zone_image.c
+FUZZ_XFR_PACKET_SRCS = tests/fuzz/fuzz_xfr_packet.c dns_axfr_ixfr.c dns_wire.c dns_utils.c dns_config_parser.c dns_diag.c dns_zone_parser.c dns_tinydns_parser.c dns_cidr.c dns_tsig_acl.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_query_engine.c dns_plugin_sup.c dns_plugin_msg.c dns_alias.c dns_cookie_client.c dns_rrl.c dns_priv_sandbox.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_dynamic_update.c dns_zone_image.c
 
 FUZZ_DB_STREAM_TARGET = tests/fuzz/fuzz_db_stream
 FUZZ_DB_STREAM_SRCS = tests/fuzz/fuzz_db_stream.c dns_db_stream.c dns_db_install.c $(PDNS_XFR_DEPS)
@@ -107,7 +107,7 @@ FUZZ_DB_STREAM_SRCS = tests/fuzz/fuzz_db_stream.c dns_db_stream.c dns_db_install
 FUZZ_DB_IMAGE_FRAMES_TARGET = tests/fuzz/fuzz_db_image_frames
 FUZZ_DB_IMAGE_FRAMES_SRCS = tests/fuzz/fuzz_db_image_frames.c dns_db_stream.c dns_zone_image.c dns_zone_parser.c dns_tinydns_parser.c dns_utils.c dns_wire.c dns_cidr.c dns_tsig_acl.c dns_config_parser.c dns_diag.c
 
-PDNS_XFR_DEPS = dns_axfr_ixfr.c dns_wire.c dns_utils.c dns_config_parser.c dns_diag.c dns_zone_parser.c dns_tinydns_parser.c dns_cidr.c dns_tsig_acl.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_query_engine.c dns_plugin_sup.c dns_plugin_msg.c dns_alias.c dns_rrl.c dns_priv_sandbox.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_dynamic_update.c dns_zone_image.c
+PDNS_XFR_DEPS = dns_axfr_ixfr.c dns_wire.c dns_utils.c dns_config_parser.c dns_diag.c dns_zone_parser.c dns_tinydns_parser.c dns_cidr.c dns_tsig_acl.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_query_engine.c dns_plugin_sup.c dns_plugin_msg.c dns_alias.c dns_cookie_client.c dns_rrl.c dns_priv_sandbox.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_dynamic_update.c dns_zone_image.c
 
 FUZZ_PDNS_CONTENT_TARGET = tests/fuzz/fuzz_pdns_content
 FUZZ_PDNS_CONTENT_SRCS = tests/fuzz/fuzz_pdns_content.c dns_pdns_reader.c dns_presigned.c dns_db_stream.c $(PDNS_XFR_DEPS)
@@ -117,6 +117,8 @@ FUZZ_NSEC3_REBUILD_SRCS = tests/fuzz/fuzz_nsec3_rebuild.c dns_pdns_reader.c dns_
 
 FUZZ_ALIAS_RESPONSE_TARGET = tests/fuzz/fuzz_alias_response
 FUZZ_ALIAS_RESPONSE_SRCS = tests/fuzz/fuzz_alias_response.c $(PDNS_XFR_DEPS)
+FUZZ_FORWARD_RESPONSE_TARGET = tests/fuzz/fuzz_forward_response
+FUZZ_FORWARD_RESPONSE_SRCS = tests/fuzz/fuzz_forward_response.c $(PDNS_XFR_DEPS)
 
 FUZZ_PDNS_METADATA_TARGET = tests/fuzz/fuzz_pdns_metadata
 FUZZ_PDNS_METADATA_SRCS = tests/fuzz/fuzz_pdns_metadata.c dns_pdns_reader.c dns_presigned.c dns_db_stream.c dns_config_parser.c dns_diag.c dns_wire.c dns_zone_parser.c dns_tinydns_parser.c dns_utils.c dns_cidr.c dns_tsig_acl.c dns_zone_image.c
@@ -131,7 +133,7 @@ FUZZ_DB_CHECKLINE_TARGET = tests/fuzz/fuzz_db_checkline
 FUZZ_DB_CHECKLINE_SRCS = tests/fuzz/fuzz_db_checkline.c dns_config_parser.c dns_diag.c dns_zone_parser.c dns_tinydns_parser.c dns_wire.c dns_utils.c dns_cidr.c dns_tsig_acl.c dns_zone_lint.c dns_db_checkproto.c dns_mem_advice.c
 
 FUZZ_DYNAMIC_UPDATE_TARGET = tests/fuzz/fuzz_dynamic_update
-FUZZ_DYNAMIC_UPDATE_SRCS = tests/fuzz/fuzz_dynamic_update.c dns_dynamic_update.c dns_wire.c dns_utils.c dns_config_parser.c dns_diag.c dns_zone_parser.c dns_tinydns_parser.c dns_cidr.c dns_tsig_acl.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_query_engine.c dns_plugin_sup.c dns_plugin_msg.c dns_alias.c dns_rrl.c dns_priv_sandbox.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_axfr_ixfr.c dns_zone_image.c
+FUZZ_DYNAMIC_UPDATE_SRCS = tests/fuzz/fuzz_dynamic_update.c dns_dynamic_update.c dns_wire.c dns_utils.c dns_config_parser.c dns_diag.c dns_zone_parser.c dns_tinydns_parser.c dns_cidr.c dns_tsig_acl.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_query_engine.c dns_plugin_sup.c dns_plugin_msg.c dns_alias.c dns_cookie_client.c dns_rrl.c dns_priv_sandbox.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_axfr_ixfr.c dns_zone_image.c
 
 FUZZ_ZONE_TARGET = tests/fuzz/fuzz_zone_parser
 FUZZ_ZONE_SRCS = tests/fuzz/fuzz_zone_parser.c dns_zone_parser.c dns_tinydns_parser.c dns_utils.c dns_wire.c dns_cidr.c
@@ -140,7 +142,7 @@ FUZZ_ZONE_IMAGE_TARGET = tests/fuzz/fuzz_zone_image
 FUZZ_ZONE_IMAGE_SRCS = tests/fuzz/fuzz_zone_image.c dns_zone_image.c dns_zone_parser.c dns_tinydns_parser.c dns_utils.c dns_wire.c dns_cidr.c dns_tsig_acl.c dns_config_parser.c dns_diag.c
 
 FUZZ_ZONE_IMAGE_VALIDATE_TARGET = tests/fuzz/fuzz_zone_image_validate
-FUZZ_ZONE_IMAGE_VALIDATE_SRCS = tests/fuzz/fuzz_zone_image_validate.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_rrl.c dns_tsig_acl.c dns_priv_sandbox.c dns_dynamic_update.c dns_axfr_ixfr.c dns_query_engine.c dns_plugin_sup.c dns_plugin_msg.c dns_alias.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_wire.c dns_config_parser.c dns_diag.c dns_zone_parser.c dns_tinydns_parser.c dns_utils.c dns_cidr.c dns_zone_image.c
+FUZZ_ZONE_IMAGE_VALIDATE_SRCS = tests/fuzz/fuzz_zone_image_validate.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_rrl.c dns_tsig_acl.c dns_priv_sandbox.c dns_dynamic_update.c dns_axfr_ixfr.c dns_query_engine.c dns_plugin_sup.c dns_plugin_msg.c dns_alias.c dns_cookie_client.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_wire.c dns_config_parser.c dns_diag.c dns_zone_parser.c dns_tinydns_parser.c dns_utils.c dns_cidr.c dns_zone_image.c
 
 FUZZ_JSON_ESCAPE_TARGET = tests/fuzz/fuzz_json_escape
 FUZZ_JSON_ESCAPE_SRCS = tests/fuzz/fuzz_json_escape.c dns_diag.c
@@ -200,7 +202,7 @@ FUZZ_DAG_TCP_REASSEMBLY_SRCS = tests/fuzz/fuzz_dag_tcp_reassembly.c tools/dag_tc
 
 .PHONY: distclean
 .PHONY: dnsqps dnsqps-asan dnsqps-tsan dnsqps_test fuzz_dnsqps_resp fuzz_dnsqps_args fuzz_dnsqps_msg
-.PHONY: set-version tapstat_test karicheck-codelog test_coverage_sweep_tools-codelog all clean run fuzz zone2kdb karidns-dbloader karidns-dbloader-tsan karidns-dbloader-asan karidns-zone karidns-zone-asan dbloader-check-drivers db_sqlite3_test db_pgsql_test fuzz_core fuzz_query_engine fuzz_zone_image fuzz_zone_image_validate fuzz_xfr_packet fuzz_dynamic_update fuzz_db_stream fuzz_db_image_frames fuzz_pdns_content fuzz_pdns_metadata fuzz_db_checkline fuzz_json_escape fuzz_zone_text fuzz_zone_changes fuzz_db_logline fuzz_plugin_msg fuzz_nsec3_rebuild fuzz_alias_response fuzz_xfr_state fuzz_ipc_frame clean-fuzz asan tsan fuzz_tsig fuzz_dag fuzz_tsig_verify dag tools response_cache_test \
+.PHONY: set-version tapstat_test karicheck-codelog test_coverage_sweep_tools-codelog all clean run fuzz zone2kdb karidns-dbloader karidns-dbloader-tsan karidns-dbloader-asan karidns-zone karidns-zone-asan dbloader-check-drivers db_sqlite3_test db_pgsql_test fuzz_core fuzz_query_engine fuzz_zone_image fuzz_zone_image_validate fuzz_xfr_packet fuzz_dynamic_update fuzz_db_stream fuzz_db_image_frames fuzz_pdns_content fuzz_pdns_metadata fuzz_db_checkline fuzz_json_escape fuzz_zone_text fuzz_zone_changes fuzz_db_logline fuzz_plugin_msg fuzz_nsec3_rebuild fuzz_alias_response fuzz_forward_response fuzz_xfr_state fuzz_ipc_frame clean-fuzz asan tsan fuzz_tsig fuzz_dag fuzz_tsig_verify dag tools response_cache_test \
 	fuzz_dag_hash fuzz_dag_iter_classify fuzz_dag_chunked_http fuzz_dag_rdata_yaml fuzz_dag_axfr_stream fuzz_dag_cli_args fuzz_dag_batch_file \
 	fuzz_dag_replay_pcap_reader fuzz_dag_replay_diff fuzz_dag_tcp_reassembly \
 	fuzz_dag_all fuzz_dag_test fuzz_karidns fuzz_karidns_test fuzz_all fuzz_test \
@@ -288,6 +290,9 @@ dns_query_engine.o: dns_query_engine.c
 
 dns_alias.o: dns_alias.c
 	$(CC) $(CFLAGS) -c dns_alias.c -o dns_alias.o
+
+dns_cookie_client.o: dns_cookie_client.c
+	$(CC) $(CFLAGS) -c dns_cookie_client.c -o dns_cookie_client.o
 
 dns_snapshot_rcu.o: dns_snapshot_rcu.c
 	$(CC) $(CFLAGS) -c dns_snapshot_rcu.c -o dns_snapshot_rcu.o
@@ -392,32 +397,32 @@ TEST_ZONEIMAGE_SRCS = tests/test_zone_image.c dns_zone_image.c dns_config_parser
 TEST_ZONEPATHS_SRCS = tests/test_zone_parser_paths.c dns_config_parser.c dns_diag.c dns_wire.c dns_zone_parser.c dns_tinydns_parser.c dns_utils.c dns_cidr.c dns_tsig_acl.c $(TEST_SYSLOG_QUIET)
 TEST_TINYPATHS_SRCS = tests/test_tinydns_paths.c dns_config_parser.c dns_diag.c dns_wire.c dns_zone_parser.c dns_tinydns_parser.c dns_utils.c dns_cidr.c dns_tsig_acl.c $(TEST_SYSLOG_QUIET)
 TEST_SIG0_SRCS = tests/test_sig0_sign.c dns_config_parser.c dns_diag.c dns_wire.c dns_zone_parser.c dns_tinydns_parser.c dns_utils.c dns_cidr.c dns_tsig_acl.c $(TEST_SYSLOG_QUIET)
-TEST_SNAPREBUILD_SRCS = tests/test_snapshot_rebuild.c dns_priv_sandbox.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_wire.c dns_utils.c dns_config_parser.c dns_diag.c dns_zone_parser.c dns_tinydns_parser.c dns_cidr.c dns_tsig_acl.c dns_query_engine.c dns_plugin_sup.c dns_plugin_msg.c dns_alias.c dns_rrl.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_dynamic_update.c dns_axfr_ixfr.c dns_zone_image.c $(TEST_SYSLOG_QUIET)
-TEST_HASH_SRCS = tests/test_hash_table.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_wire.c dns_utils.c dns_config_parser.c dns_diag.c dns_zone_parser.c dns_tinydns_parser.c dns_cidr.c dns_tsig_acl.c dns_query_engine.c dns_plugin_sup.c dns_plugin_msg.c dns_alias.c dns_rrl.c dns_priv_sandbox.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_dynamic_update.c dns_axfr_ixfr.c dns_zone_image.c $(TEST_SYSLOG_QUIET)
+TEST_SNAPREBUILD_SRCS = tests/test_snapshot_rebuild.c dns_priv_sandbox.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_wire.c dns_utils.c dns_config_parser.c dns_diag.c dns_zone_parser.c dns_tinydns_parser.c dns_cidr.c dns_tsig_acl.c dns_query_engine.c dns_plugin_sup.c dns_plugin_msg.c dns_alias.c dns_cookie_client.c dns_rrl.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_dynamic_update.c dns_axfr_ixfr.c dns_zone_image.c $(TEST_SYSLOG_QUIET)
+TEST_HASH_SRCS = tests/test_hash_table.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_wire.c dns_utils.c dns_config_parser.c dns_diag.c dns_zone_parser.c dns_tinydns_parser.c dns_cidr.c dns_tsig_acl.c dns_query_engine.c dns_plugin_sup.c dns_plugin_msg.c dns_alias.c dns_cookie_client.c dns_rrl.c dns_priv_sandbox.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_dynamic_update.c dns_axfr_ixfr.c dns_zone_image.c $(TEST_SYSLOG_QUIET)
 TEST_EPOCH_RCU_SRCS = tests/test_epoch_rcu.c dns_epoch_rcu.c $(TEST_SYSLOG_QUIET)
 TEST_DNSTAP_SRCS = tests/test_dnstap_engine.c dns_dnstap.c dns_wire.c dns_utils.c dns_config_parser.c dns_diag.c dns_zone_parser.c dns_tinydns_parser.c dns_cidr.c dns_tsig_acl.c $(TEST_SYSLOG_QUIET)
 TEST_EDNS_ECS_SRCS = tests/test_edns_ecs_engine.c dns_edns_ecs.c dns_wire.c dns_utils.c dns_cidr.c dns_tsig_acl.c dns_config_parser.c dns_diag.c dns_zone_parser.c dns_tinydns_parser.c dns_zone_image.c $(TEST_SYSLOG_QUIET)
 TEST_RFC_VECTORS_SRCS = tests/test_rfc_vectors.c dns_edns_ecs.c dns_rrl.c dns_wire.c dns_utils.c dns_cidr.c dns_tsig_acl.c dns_config_parser.c dns_diag.c dns_zone_parser.c dns_tinydns_parser.c dns_zone_image.c $(TEST_SYSLOG_QUIET)
-TEST_DYN_UPDATE_SRCS = tests/test_dynamic_update_engine.c dns_dynamic_update.c dns_wire.c dns_utils.c dns_config_parser.c dns_diag.c dns_zone_parser.c dns_tinydns_parser.c dns_cidr.c dns_tsig_acl.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_query_engine.c dns_plugin_sup.c dns_plugin_msg.c dns_alias.c dns_rrl.c dns_priv_sandbox.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_axfr_ixfr.c dns_zone_image.c $(TEST_SYSLOG_QUIET)
-TEST_AXFR_IXFR_SRCS = tests/test_axfr_ixfr_engine.c dns_axfr_ixfr.c dns_wire.c dns_utils.c dns_config_parser.c dns_diag.c dns_zone_parser.c dns_tinydns_parser.c dns_cidr.c dns_tsig_acl.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_query_engine.c dns_plugin_sup.c dns_plugin_msg.c dns_alias.c dns_rrl.c dns_priv_sandbox.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_dynamic_update.c dns_zone_image.c $(TEST_SYSLOG_QUIET)
+TEST_DYN_UPDATE_SRCS = tests/test_dynamic_update_engine.c dns_dynamic_update.c dns_wire.c dns_utils.c dns_config_parser.c dns_diag.c dns_zone_parser.c dns_tinydns_parser.c dns_cidr.c dns_tsig_acl.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_query_engine.c dns_plugin_sup.c dns_plugin_msg.c dns_alias.c dns_cookie_client.c dns_rrl.c dns_priv_sandbox.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_axfr_ixfr.c dns_zone_image.c $(TEST_SYSLOG_QUIET)
+TEST_AXFR_IXFR_SRCS = tests/test_axfr_ixfr_engine.c dns_axfr_ixfr.c dns_wire.c dns_utils.c dns_config_parser.c dns_diag.c dns_zone_parser.c dns_tinydns_parser.c dns_cidr.c dns_tsig_acl.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_query_engine.c dns_plugin_sup.c dns_plugin_msg.c dns_alias.c dns_cookie_client.c dns_rrl.c dns_priv_sandbox.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_dynamic_update.c dns_zone_image.c $(TEST_SYSLOG_QUIET)
 TEST_RRL_SRCS = tests/test_rrl_engine.c dns_rrl.c dns_config_parser.c dns_diag.c dns_zone_parser.c dns_tinydns_parser.c dns_wire.c dns_utils.c dns_cidr.c dns_tsig_acl.c $(TEST_SYSLOG_QUIET)
-TEST_QUERY_EXP_SRCS = tests/test_query_engine_expanded.c dns_query_engine.c dns_plugin_sup.c dns_plugin_msg.c dns_alias.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_wire.c dns_zone_parser.c dns_tinydns_parser.c dns_config_parser.c dns_diag.c dns_cidr.c dns_tsig_acl.c dns_utils.c dns_rrl.c dns_priv_sandbox.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_dynamic_update.c dns_axfr_ixfr.c dns_zone_image.c $(TEST_SYSLOG_QUIET)
-TEST_DNSSECPROOFS_SRCS = tests/test_dnssec_proofs.c dns_query_engine.c dns_plugin_sup.c dns_plugin_msg.c dns_alias.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_wire.c dns_zone_parser.c dns_tinydns_parser.c dns_config_parser.c dns_diag.c dns_cidr.c dns_tsig_acl.c dns_utils.c dns_rrl.c dns_priv_sandbox.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_dynamic_update.c dns_axfr_ixfr.c dns_zone_image.c $(TEST_SYSLOG_QUIET)
-TEST_QEPROTO_SRCS = tests/test_query_engine_protocol.c dns_query_engine.c dns_plugin_sup.c dns_plugin_msg.c dns_alias.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_wire.c dns_zone_parser.c dns_tinydns_parser.c dns_config_parser.c dns_diag.c dns_cidr.c dns_tsig_acl.c dns_utils.c dns_rrl.c dns_priv_sandbox.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_dynamic_update.c dns_axfr_ixfr.c dns_zone_image.c $(TEST_SYSLOG_QUIET)
-RESPONSE_CACHE_TEST_SRCS = tests/test_response_cache.c dns_query_engine.c dns_plugin_sup.c dns_plugin_msg.c dns_alias.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_wire.c dns_zone_parser.c dns_tinydns_parser.c dns_config_parser.c dns_diag.c dns_cidr.c dns_tsig_acl.c dns_utils.c dns_rrl.c dns_priv_sandbox.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_dynamic_update.c dns_axfr_ixfr.c dns_zone_image.c
-VULN_TEST_SRCS = tests/test_vulnerability_fixes.c dns_query_engine.c dns_plugin_sup.c dns_plugin_msg.c dns_alias.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_wire.c dns_zone_parser.c dns_tinydns_parser.c dns_config_parser.c dns_diag.c dns_cidr.c dns_tsig_acl.c dns_utils.c dns_rrl.c dns_priv_sandbox.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_dynamic_update.c dns_axfr_ixfr.c dns_zone_image.c
+TEST_QUERY_EXP_SRCS = tests/test_query_engine_expanded.c dns_query_engine.c dns_plugin_sup.c dns_plugin_msg.c dns_alias.c dns_cookie_client.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_wire.c dns_zone_parser.c dns_tinydns_parser.c dns_config_parser.c dns_diag.c dns_cidr.c dns_tsig_acl.c dns_utils.c dns_rrl.c dns_priv_sandbox.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_dynamic_update.c dns_axfr_ixfr.c dns_zone_image.c $(TEST_SYSLOG_QUIET)
+TEST_DNSSECPROOFS_SRCS = tests/test_dnssec_proofs.c dns_query_engine.c dns_plugin_sup.c dns_plugin_msg.c dns_alias.c dns_cookie_client.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_wire.c dns_zone_parser.c dns_tinydns_parser.c dns_config_parser.c dns_diag.c dns_cidr.c dns_tsig_acl.c dns_utils.c dns_rrl.c dns_priv_sandbox.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_dynamic_update.c dns_axfr_ixfr.c dns_zone_image.c $(TEST_SYSLOG_QUIET)
+TEST_QEPROTO_SRCS = tests/test_query_engine_protocol.c dns_query_engine.c dns_plugin_sup.c dns_plugin_msg.c dns_alias.c dns_cookie_client.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_wire.c dns_zone_parser.c dns_tinydns_parser.c dns_config_parser.c dns_diag.c dns_cidr.c dns_tsig_acl.c dns_utils.c dns_rrl.c dns_priv_sandbox.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_dynamic_update.c dns_axfr_ixfr.c dns_zone_image.c $(TEST_SYSLOG_QUIET)
+RESPONSE_CACHE_TEST_SRCS = tests/test_response_cache.c dns_query_engine.c dns_plugin_sup.c dns_plugin_msg.c dns_alias.c dns_cookie_client.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_wire.c dns_zone_parser.c dns_tinydns_parser.c dns_config_parser.c dns_diag.c dns_cidr.c dns_tsig_acl.c dns_utils.c dns_rrl.c dns_priv_sandbox.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_dynamic_update.c dns_axfr_ixfr.c dns_zone_image.c
+VULN_TEST_SRCS = tests/test_vulnerability_fixes.c dns_query_engine.c dns_plugin_sup.c dns_plugin_msg.c dns_alias.c dns_cookie_client.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_wire.c dns_zone_parser.c dns_tinydns_parser.c dns_config_parser.c dns_diag.c dns_cidr.c dns_tsig_acl.c dns_utils.c dns_rrl.c dns_priv_sandbox.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_dynamic_update.c dns_axfr_ixfr.c dns_zone_image.c
 
-TEST_CATALOG_SRCS = tests/test_catalog_zone_engine.c dns_catalog_zone.c dns_config_parser.c dns_diag.c dns_zone_parser.c dns_tinydns_parser.c dns_wire.c dns_utils.c dns_cidr.c dns_tsig_acl.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_query_engine.c dns_plugin_sup.c dns_plugin_msg.c dns_alias.c dns_rrl.c dns_priv_sandbox.c dns_dnstap.c dns_edns_ecs.c dns_dynamic_update.c dns_axfr_ixfr.c dns_zone_image.c $(TEST_SYSLOG_QUIET)
-TEST_SANDBOX_SRCS = tests/test_snapshot_sandbox_engine.c dns_priv_sandbox.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_wire.c dns_utils.c dns_config_parser.c dns_diag.c dns_zone_parser.c dns_tinydns_parser.c dns_cidr.c dns_tsig_acl.c dns_query_engine.c dns_plugin_sup.c dns_plugin_msg.c dns_alias.c dns_rrl.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_dynamic_update.c dns_axfr_ixfr.c dns_zone_image.c $(TEST_SYSLOG_QUIET)
+TEST_CATALOG_SRCS = tests/test_catalog_zone_engine.c dns_catalog_zone.c dns_config_parser.c dns_diag.c dns_zone_parser.c dns_tinydns_parser.c dns_wire.c dns_utils.c dns_cidr.c dns_tsig_acl.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_query_engine.c dns_plugin_sup.c dns_plugin_msg.c dns_alias.c dns_cookie_client.c dns_rrl.c dns_priv_sandbox.c dns_dnstap.c dns_edns_ecs.c dns_dynamic_update.c dns_axfr_ixfr.c dns_zone_image.c $(TEST_SYSLOG_QUIET)
+TEST_SANDBOX_SRCS = tests/test_snapshot_sandbox_engine.c dns_priv_sandbox.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_wire.c dns_utils.c dns_config_parser.c dns_diag.c dns_zone_parser.c dns_tinydns_parser.c dns_cidr.c dns_tsig_acl.c dns_query_engine.c dns_plugin_sup.c dns_plugin_msg.c dns_alias.c dns_cookie_client.c dns_rrl.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_dynamic_update.c dns_axfr_ixfr.c dns_zone_image.c $(TEST_SYSLOG_QUIET)
 TEST_DAG_ITER_SRCS = tests/test_dag_iter.c $(DAG_MOD_SRCS) dns_wire.c dns_utils.c dns_zone_parser.c dns_cidr.c $(TEST_SYSLOG_QUIET)
 TEST_DAGFORMAT_SRCS = tests/test_dag_format.c $(DAG_MOD_SRCS) dns_wire.c dns_utils.c dns_zone_parser.c dns_cidr.c dns_config_parser.c dns_diag.c dns_tinydns_parser.c dns_tsig_acl.c $(TEST_SYSLOG_QUIET)
-TEST_COV_SWEEP_SRCS = tests/test_coverage_sweep.c dns_query_engine.c dns_plugin_sup.c dns_plugin_msg.c dns_alias.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_wire.c dns_zone_parser.c dns_tinydns_parser.c dns_config_parser.c dns_diag.c dns_cidr.c dns_tsig_acl.c dns_utils.c dns_rrl.c dns_priv_sandbox.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_dynamic_update.c dns_axfr_ixfr.c dns_zone_image.c $(TEST_SYSLOG_QUIET)
+TEST_COV_SWEEP_SRCS = tests/test_coverage_sweep.c dns_query_engine.c dns_plugin_sup.c dns_plugin_msg.c dns_alias.c dns_cookie_client.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_wire.c dns_zone_parser.c dns_tinydns_parser.c dns_config_parser.c dns_diag.c dns_cidr.c dns_tsig_acl.c dns_utils.c dns_rrl.c dns_priv_sandbox.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_dynamic_update.c dns_axfr_ixfr.c dns_zone_image.c $(TEST_SYSLOG_QUIET)
 TEST_COV_SWEEP_NET_SRCS = tests/test_coverage_sweep_net.c $(DAG_MOD_SRCS) dns_wire.c dns_utils.c dns_zone_parser.c dns_cidr.c dns_config_parser.c dns_diag.c dns_tinydns_parser.c dns_tsig_acl.c $(TEST_SYSLOG_QUIET)
 TEST_COV_SWEEP_TOOLS_SRCS = tests/test_coverage_sweep_tools.c tests/test_coverage_sweep_karictl_main.c dns_config_parser.c dns_diag.c dns_zone_parser.c dns_tinydns_parser.c dns_wire.c dns_utils.c dns_cidr.c dns_tsig_acl.c dns_zone_lint.c dns_db_checkproto.c dns_mem_advice.c $(TEST_SYSLOG_QUIET)
 TEST_COV_SWEEP_DAG_SRCS = tests/test_coverage_sweep_dag.c $(DAG_MOD_SRCS) dns_wire.c dns_utils.c dns_zone_parser.c dns_cidr.c dns_config_parser.c dns_diag.c dns_tinydns_parser.c dns_tsig_acl.c $(TEST_SYSLOG_QUIET)
 TEST_DAGREASM_SRCS = tests/test_dag_reassembly.c tools/dag_pcap_l4.c tools/dag_tcp_reassembly.c $(TEST_SYSLOG_QUIET)
 TEST_DAG_TOOLS_SRCS = tests/test_dag_tools.c tools/dag_tcp_reassembly.c tools/dag_pcap_l4.c tools/dag_tsig_client.c tools/dag_replay.c tools/dnstap_decode.c tools/dag_transport.c tools/dag_http.c dns_zone_parser.c dns_config_parser.c dns_diag.c dns_tinydns_parser.c dns_cidr.c dns_tsig_acl.c dns_wire.c dns_utils.c $(TEST_SYSLOG_QUIET)
-TEST_SERVER_CORE_SRCS = tests/test_server_core.c dns_server_core.c dns_log.c dns_log_state.c dns_db_stream.c dns_db_ingest.c dns_db_recon.c dns_db_store.c dns_xfr_store.c dns_xfr_state.c dns_park.c dns_mem_advice.c dns_store_status.c dns_store.c dns_db_install.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_wire.c dns_utils.c dns_config_parser.c dns_diag.c dns_zone_parser.c dns_tinydns_parser.c dns_cidr.c dns_tsig_acl.c dns_query_engine.c dns_plugin_sup.c dns_plugin_msg.c dns_alias.c dns_rrl.c dns_priv_sandbox.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_dynamic_update.c dns_axfr_ixfr.c dns_zone_image.c $(TEST_SYSLOG_QUIET)
+TEST_SERVER_CORE_SRCS = tests/test_server_core.c dns_server_core.c dns_log.c dns_log_state.c dns_db_stream.c dns_db_ingest.c dns_db_recon.c dns_db_store.c dns_xfr_store.c dns_xfr_state.c dns_park.c dns_mem_advice.c dns_store_status.c dns_store.c dns_db_install.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_wire.c dns_utils.c dns_config_parser.c dns_diag.c dns_zone_parser.c dns_tinydns_parser.c dns_cidr.c dns_tsig_acl.c dns_query_engine.c dns_plugin_sup.c dns_plugin_msg.c dns_alias.c dns_cookie_client.c dns_rrl.c dns_priv_sandbox.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_dynamic_update.c dns_axfr_ixfr.c dns_zone_image.c $(TEST_SYSLOG_QUIET)
 
 FI_WRAP_LDFLAGS  = -Wl,--wrap=malloc -Wl,--wrap=calloc -Wl,--wrap=realloc -Wl,--wrap=strdup -Wl,--wrap=strndup -Wl,--wrap=posix_memalign
 FI_WRAP_LDFLAGS += -Wl,--wrap=open -Wl,--wrap=openat -Wl,--wrap=fopen -Wl,--wrap=read -Wl,--wrap=write -Wl,--wrap=send -Wl,--wrap=sendto -Wl,--wrap=recv -Wl,--wrap=recvfrom
@@ -432,9 +437,9 @@ FI_COMMON_SRCS = tests/fi/kari_fi.c
 
 TEST_FI_PARSERS_SRCS = tests/test_fi_parsers.c $(FI_COMMON_SRCS) dns_config_parser.c dns_diag.c dns_zone_parser.c dns_tinydns_parser.c dns_wire.c dns_utils.c dns_cidr.c dns_tsig_acl.c $(TEST_SYSLOG_QUIET)
 TEST_FI_WIRE_SRCS = tests/test_fi_wire.c $(FI_COMMON_SRCS) dns_wire.c dns_utils.c dns_zone_parser.c dns_tinydns_parser.c dns_config_parser.c dns_diag.c dns_cidr.c dns_tsig_acl.c $(TEST_SYSLOG_QUIET)
-TEST_FI_SNAPSHOT_SRCS = tests/test_fi_snapshot.c $(FI_COMMON_SRCS) dns_priv_sandbox.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_wire.c dns_utils.c dns_config_parser.c dns_diag.c dns_zone_parser.c dns_tinydns_parser.c dns_cidr.c dns_tsig_acl.c dns_query_engine.c dns_plugin_sup.c dns_plugin_msg.c dns_alias.c dns_rrl.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_dynamic_update.c dns_axfr_ixfr.c dns_zone_image.c $(TEST_SYSLOG_QUIET)
-TEST_FI_XFR_SRCS = tests/test_fi_xfr.c $(FI_COMMON_SRCS) dns_axfr_ixfr.c dns_wire.c dns_utils.c dns_config_parser.c dns_diag.c dns_zone_parser.c dns_tinydns_parser.c dns_cidr.c dns_tsig_acl.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_query_engine.c dns_plugin_sup.c dns_plugin_msg.c dns_alias.c dns_rrl.c dns_priv_sandbox.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_dynamic_update.c dns_zone_image.c $(TEST_SYSLOG_QUIET)
-TEST_FI_MISC_SRCS = tests/test_fi_misc.c $(FI_COMMON_SRCS) dns_dynamic_update.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_wire.c dns_utils.c dns_config_parser.c dns_diag.c dns_zone_parser.c dns_tinydns_parser.c dns_cidr.c dns_tsig_acl.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_query_engine.c dns_plugin_sup.c dns_plugin_msg.c dns_alias.c dns_rrl.c dns_priv_sandbox.c dns_axfr_ixfr.c dns_zone_image.c $(TEST_SYSLOG_QUIET)
+TEST_FI_SNAPSHOT_SRCS = tests/test_fi_snapshot.c $(FI_COMMON_SRCS) dns_priv_sandbox.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_wire.c dns_utils.c dns_config_parser.c dns_diag.c dns_zone_parser.c dns_tinydns_parser.c dns_cidr.c dns_tsig_acl.c dns_query_engine.c dns_plugin_sup.c dns_plugin_msg.c dns_alias.c dns_cookie_client.c dns_rrl.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_dynamic_update.c dns_axfr_ixfr.c dns_zone_image.c $(TEST_SYSLOG_QUIET)
+TEST_FI_XFR_SRCS = tests/test_fi_xfr.c $(FI_COMMON_SRCS) dns_axfr_ixfr.c dns_wire.c dns_utils.c dns_config_parser.c dns_diag.c dns_zone_parser.c dns_tinydns_parser.c dns_cidr.c dns_tsig_acl.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_query_engine.c dns_plugin_sup.c dns_plugin_msg.c dns_alias.c dns_cookie_client.c dns_rrl.c dns_priv_sandbox.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_dynamic_update.c dns_zone_image.c $(TEST_SYSLOG_QUIET)
+TEST_FI_MISC_SRCS = tests/test_fi_misc.c $(FI_COMMON_SRCS) dns_dynamic_update.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_wire.c dns_utils.c dns_config_parser.c dns_diag.c dns_zone_parser.c dns_tinydns_parser.c dns_cidr.c dns_tsig_acl.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_query_engine.c dns_plugin_sup.c dns_plugin_msg.c dns_alias.c dns_cookie_client.c dns_rrl.c dns_priv_sandbox.c dns_axfr_ixfr.c dns_zone_image.c $(TEST_SYSLOG_QUIET)
 TEST_FI_DAG_SRCS = tests/test_fi_dag.c $(FI_COMMON_SRCS) $(DAG_MOD_SRCS) dns_wire.c dns_utils.c dns_zone_parser.c dns_cidr.c dns_config_parser.c dns_diag.c dns_tinydns_parser.c dns_tsig_acl.c $(TEST_SYSLOG_QUIET)
 
 test_db_stream: $(TEST_DBSTREAM_SRCS)
@@ -1360,6 +1365,7 @@ COV_FUZZ_BINS += $(COV_FUZZ_DIR)/fuzz_zone_image_validate
 COV_FUZZ_BINS += $(COV_FUZZ_DIR)/fuzz_db_stream $(COV_FUZZ_DIR)/fuzz_db_image_frames
 COV_FUZZ_BINS += $(COV_FUZZ_DIR)/fuzz_pdns_content $(COV_FUZZ_DIR)/fuzz_pdns_metadata $(COV_FUZZ_DIR)/fuzz_nsec3_rebuild
 COV_FUZZ_BINS += $(COV_FUZZ_DIR)/fuzz_alias_response $(COV_FUZZ_DIR)/fuzz_db_checkline $(COV_FUZZ_DIR)/fuzz_db_logline $(COV_FUZZ_DIR)/fuzz_plugin_msg
+COV_FUZZ_BINS += $(COV_FUZZ_DIR)/fuzz_forward_response
 COV_FUZZ_BINS += $(COV_FUZZ_DIR)/fuzz_xfr_state $(COV_FUZZ_DIR)/fuzz_ipc_frame
 COV_FUZZ_BINS += $(COV_FUZZ_DIR)/fuzz_json_escape $(COV_FUZZ_DIR)/fuzz_zone_changes $(COV_FUZZ_DIR)/fuzz_zone_text $(COV_FUZZ_DIR)/fuzz_zone_parser $(COV_FUZZ_DIR)/fuzz_conf_parser $(COV_FUZZ_DIR)/fuzz_zone_image
 COV_FUZZ_BINS += $(COV_FUZZ_DIR)/fuzz_tsig_sign $(COV_FUZZ_DIR)/fuzz_dag_response
@@ -1376,6 +1382,7 @@ COV_FUZZ_OBJS += -object=$(COV_FUZZ_DIR)/fuzz_zone_image_validate
 COV_FUZZ_OBJS += -object=$(COV_FUZZ_DIR)/fuzz_db_stream -object=$(COV_FUZZ_DIR)/fuzz_db_image_frames
 COV_FUZZ_OBJS += -object=$(COV_FUZZ_DIR)/fuzz_pdns_content -object=$(COV_FUZZ_DIR)/fuzz_pdns_metadata -object=$(COV_FUZZ_DIR)/fuzz_nsec3_rebuild
 COV_FUZZ_OBJS += -object=$(COV_FUZZ_DIR)/fuzz_alias_response -object=$(COV_FUZZ_DIR)/fuzz_db_checkline -object=$(COV_FUZZ_DIR)/fuzz_db_logline -object=$(COV_FUZZ_DIR)/fuzz_plugin_msg
+COV_FUZZ_OBJS += -object=$(COV_FUZZ_DIR)/fuzz_forward_response
 COV_FUZZ_OBJS += -object=$(COV_FUZZ_DIR)/fuzz_xfr_state -object=$(COV_FUZZ_DIR)/fuzz_ipc_frame
 COV_FUZZ_OBJS += -object=$(COV_FUZZ_DIR)/fuzz_json_escape -object=$(COV_FUZZ_DIR)/fuzz_zone_changes -object=$(COV_FUZZ_DIR)/fuzz_zone_text -object=$(COV_FUZZ_DIR)/fuzz_zone_parser -object=$(COV_FUZZ_DIR)/fuzz_conf_parser -object=$(COV_FUZZ_DIR)/fuzz_zone_image
 COV_FUZZ_OBJS += -object=$(COV_FUZZ_DIR)/fuzz_tsig_sign -object=$(COV_FUZZ_DIR)/fuzz_dag_response
@@ -1425,6 +1432,10 @@ $(COV_FUZZ_DIR)/fuzz_nsec3_rebuild: $(FUZZ_NSEC3_REBUILD_SRCS)
 $(COV_FUZZ_DIR)/fuzz_alias_response: $(FUZZ_ALIAS_RESPONSE_SRCS)
 	@mkdir -p $(COV_FUZZ_DIR)
 	$(CC) $(COV_FUZZ_CFLAGS) -o $@ $(FUZZ_ALIAS_RESPONSE_SRCS) $(COV_FUZZ_LDFLAGS) -lcrypto -lpthread -lm
+
+$(COV_FUZZ_DIR)/fuzz_forward_response: $(FUZZ_FORWARD_RESPONSE_SRCS)
+	@mkdir -p $(COV_FUZZ_DIR)
+	$(CC) $(COV_FUZZ_CFLAGS) -o $@ $(FUZZ_FORWARD_RESPONSE_SRCS) $(COV_FUZZ_LDFLAGS) -lcrypto -lpthread -lm
 
 $(COV_FUZZ_DIR)/fuzz_db_logline: $(FUZZ_DB_LOGLINE_SRCS)
 	@mkdir -p $(COV_FUZZ_DIR)
@@ -1914,6 +1925,9 @@ fuzz_nsec3_rebuild: $(FUZZ_NSEC3_REBUILD_SRCS:.c=.fz.o)
 fuzz_alias_response: $(FUZZ_ALIAS_RESPONSE_SRCS:.c=.fz.o)
 	$(CC) -O1 -g -fsanitize=fuzzer,address,undefined -fPIE -o $(FUZZ_ALIAS_RESPONSE_TARGET) $(FUZZ_ALIAS_RESPONSE_SRCS:.c=.fz.o) $(LDFLAGS) -lcrypto -lpthread -lm
 
+fuzz_forward_response: $(FUZZ_FORWARD_RESPONSE_SRCS:.c=.fz.o)
+	$(CC) -O1 -g -fsanitize=fuzzer,address,undefined -fPIE -o $(FUZZ_FORWARD_RESPONSE_TARGET) $(FUZZ_FORWARD_RESPONSE_SRCS:.c=.fz.o) $(LDFLAGS) -lcrypto -lpthread -lm
+
 fuzz_pdns_metadata: $(FUZZ_PDNS_METADATA_SRCS:.c=.fz.o)
 	$(CC) -O1 -g -fsanitize=fuzzer,address,undefined -fPIE -o $(FUZZ_PDNS_METADATA_TARGET) $(FUZZ_PDNS_METADATA_SRCS:.c=.fz.o) $(LDFLAGS) -lcrypto
 
@@ -1976,7 +1990,7 @@ fuzz_dag_all: fuzz_tapstat fuzz_dag fuzz_dag_hash fuzz_dag_iter_classify fuzz_da
 fuzz_dag_test: fuzz_dag_all
 	@sh tests/run_fuzz_smoke_test.sh dag
 
-fuzz_karidns: fuzz fuzz_core fuzz_zone fuzz_zone_image fuzz_zone_image_validate fuzz_conf fuzz_tsig fuzz_tsig_verify fuzz_query_engine fuzz_xfr_packet fuzz_dynamic_update fuzz_db_stream fuzz_db_image_frames fuzz_pdns_content fuzz_pdns_metadata fuzz_db_checkline fuzz_json_escape fuzz_zone_text fuzz_zone_changes fuzz_db_logline fuzz_plugin_msg fuzz_nsec3_rebuild fuzz_alias_response fuzz_xfr_state fuzz_ipc_frame
+fuzz_karidns: fuzz fuzz_core fuzz_zone fuzz_zone_image fuzz_zone_image_validate fuzz_conf fuzz_tsig fuzz_tsig_verify fuzz_query_engine fuzz_xfr_packet fuzz_dynamic_update fuzz_db_stream fuzz_db_image_frames fuzz_pdns_content fuzz_pdns_metadata fuzz_db_checkline fuzz_json_escape fuzz_zone_text fuzz_zone_changes fuzz_db_logline fuzz_plugin_msg fuzz_nsec3_rebuild fuzz_alias_response fuzz_forward_response fuzz_xfr_state fuzz_ipc_frame
 
 fuzz_karidns_test: fuzz_karidns
 	@sh tests/run_fuzz_smoke_test.sh karidns
@@ -1988,7 +2002,7 @@ fuzz_test: fuzz_all
 
 clean-fuzz:
 	rm -f *.fz.o tests/fuzz/*.fz.o tools/*.fz.o
-	rm -f $(FUZZ_XFR_STATE_TARGET) $(FUZZ_IPC_FRAME_TARGET)
+	rm -f $(FUZZ_XFR_STATE_TARGET) $(FUZZ_IPC_FRAME_TARGET) $(FUZZ_ALIAS_RESPONSE_TARGET) $(FUZZ_FORWARD_RESPONSE_TARGET)
 	rm -f $(FUZZ_TARGET) $(FUZZ_CORE_TARGET) $(FUZZ_ZONE_TARGET) $(FUZZ_ZONE_IMAGE_TARGET) $(FUZZ_ZONE_IMAGE_VALIDATE_TARGET) tests/fuzz/generate_zone_image_corpus $(FUZZ_CONF_TARGET) $(FUZZ_JSON_ESCAPE_TARGET) $(FUZZ_ZONE_TEXT_TARGET) $(FUZZ_ZONE_CHANGES_TARGET) $(FUZZ_TSIG_TARGET) $(FUZZ_DAG_TARGET) $(FUZZ_TSIG_VERIFY_TARGET) $(FUZZ_DB_STREAM_TARGET) $(FUZZ_PDNS_CONTENT_TARGET) $(FUZZ_PDNS_METADATA_TARGET) $(FUZZ_DB_CHECKLINE_TARGET)
 	rm -f $(FUZZ_DAG_HASH_TARGET) $(FUZZ_DAG_CHUNKED_HTTP_TARGET) $(FUZZ_DAG_RDATA_YAML_TARGET) $(FUZZ_DAG_AXFR_STREAM_TARGET) $(FUZZ_DAG_CLI_ARGS_TARGET) $(FUZZ_DAG_BATCH_FILE_TARGET)
 	rm -f $(FUZZ_DAG_REPLAY_PCAP_READER_TARGET) $(FUZZ_DAG_REPLAY_DIFF_TARGET) $(FUZZ_DAG_TCP_REASSEMBLY_TARGET) $(FUZZ_DAG_ITER_TARGET) $(FUZZ_TAPSTAT_TARGET)
