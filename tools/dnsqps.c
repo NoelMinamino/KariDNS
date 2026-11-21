@@ -335,6 +335,7 @@ static void usage(FILE *f) {
 "      --agent-key FILE     shared secret (an agent asks for it, a controller sends the proof);  --no-local: this host sends nothing\n"
 "      --agent-no-key       an agent off loopback without a key (refused otherwise: a controller can aim the agent's load anywhere)\n"
 "      --agent-timeout SEC  connect, ready and answer bound of the controller (default 60)\n"
+"                           an agent sends with its own --io, --iface, MACs, -T, -c, -B, ... (the controller's are not used)\n"
 "  e.g. dnsqps --agents 192.0.2.41:5301 --agent-key k.txt -d queries.txt -Q 200k -l 10   (this host and the agent send 100k each)\n"
 "  e.g. dnsqps --agent 192.0.2.41:5301 --agent-key k.txt   (on the other host; the controller gives --agent-key k.txt too)\n"
 "\n"

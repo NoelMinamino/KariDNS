@@ -25,6 +25,10 @@ static int set_nonblock(dq_sock_t s) { u_long on = 1; return ioctlsocket(s, FION
 #include <netdb.h>
 #include <netinet/tcp.h>
 #include <poll.h>
+#ifdef __FreeBSD__
+#include <ifaddrs.h>
+#include <net/if.h>
+#endif
 #include <signal.h>
 #include <unistd.h>
 #define dq_close close
@@ -310,6 +314,33 @@ static int args_add(dq_args_t *a, const char *s, char *err, size_t errlen) {
 
 uint64_t dq_share(uint64_t total, unsigned k, unsigned i) { return total / k + (i < total % k ? 1 : 0); }
 
+#ifdef __FreeBSD__
+bool dq_ctl_over_netmap(const dq_cfg_t *c, dq_sock_t s) {
+    if (!c->iface[0] || !(c->io == DQ_IO_NETMAP || c->io == DQ_IO_AUTO)) return false;   /* auto with --iface is netmap on FreeBSD */
+    struct sockaddr_storage ss;
+    socklen_t sl = sizeof ss;
+    struct ifaddrs *ifa;
+    if (getsockname(s, (struct sockaddr *)&ss, &sl) < 0 || getifaddrs(&ifa) < 0) return false;
+    bool on = false;
+    for (const struct ifaddrs *p = ifa; p && !on; p = p->ifa_next) {
+        if (!p->ifa_addr || p->ifa_addr->sa_family != ss.ss_family || strcmp(p->ifa_name, c->iface)) continue;
+        if (ss.ss_family == AF_INET)
+            on = ((const struct sockaddr_in *)(const void *)p->ifa_addr)->sin_addr.s_addr == ((const struct sockaddr_in *)(const void *)&ss)->sin_addr.s_addr;
+        else if (ss.ss_family == AF_INET6)
+            on = !memcmp(&((const struct sockaddr_in6 *)(const void *)p->ifa_addr)->sin6_addr, &((const struct sockaddr_in6 *)(const void *)&ss)->sin6_addr, 16);
+    }
+    freeifaddrs(ifa);
+    return on;
+}
+#else
+bool dq_ctl_over_netmap(const dq_cfg_t *c, dq_sock_t s) { (void)c; (void)s; return false; }
+#endif
+
+static void netmap_why(const dq_cfg_t *c, char *err, size_t errlen) {
+    snprintf(err, errlen, "netmap on %.40s takes that interface from the host stack while it runs, and the control connection runs over it: "
+             "connect the controller and the agent over another interface, or send with --io sendto or mmsg on this host", c->iface);
+}
+
 /* the controller-only options are not sent: --agents V, --agent-key V, --agent-timeout V, --no-local, -j / --json, -S V / --interval V; -r is harmless */
 int dq_ctl_args(const dq_cfg_t *c, int argc, char **argv, unsigned k, unsigned i, dq_args_t *a, char *err, size_t errlen) {
     memset(a, 0, sizeof *a);
@@ -528,7 +559,15 @@ static void agent_session(const dq_cfg_t *ac, dq_sock_t cs, dq_run_fn run, atomi
         }
     dq_cfg_t cfg;
     dq_cfg_default(&cfg);
-    if (dq_agent_check_tokens(toks, nt, err, sizeof err) < 0 || dq_parse_args(&cfg, nt, toks, err, sizeof err) < 0 || dq_cfg_check(&cfg, err, sizeof err) < 0) {
+    if (dq_agent_check_tokens(toks, nt, err, sizeof err) < 0 || dq_parse_args(&cfg, nt, toks, err, sizeof err) < 0) {
+        send_err(&conn, err);
+        dq_conn_close(&conn);
+        return;
+    }
+    dq_cfg_take_host(&cfg, ac);   /* this host's sending path, from the agent's own command line */
+    int bad = dq_cfg_check(&cfg, err, sizeof err);
+    if (bad == 0 && dq_ctl_over_netmap(&cfg, cs)) { netmap_why(&cfg, err, sizeof err); bad = -1; }
+    if (bad < 0) {
         send_err(&conn, err);
         dq_conn_close(&conn);
         return;
@@ -705,6 +744,7 @@ int dq_controller(dq_cfg_t *c, int argc, char **argv, dq_run_fn run, atomic_bool
         dq_sock_t s = tcp_connect(a->name, c->agent_timeout, err, sizeof err);
         if (s == DQ_BADSOCK) { fprintf(stderr, "dnsqps: agent %s: %s\n", a->name, err); goto done; }
         dq_conn_init(&a->conn, s);
+        if (!c->no_local && dq_ctl_over_netmap(c, s)) { netmap_why(c, err, sizeof err); fprintf(stderr, "dnsqps: agent %s: %s\n", a->name, err); goto done; }
         dq_msg_t m;
         int g = 0;
         uint64_t end = dq_now_ns() + (uint64_t)(c->agent_timeout * 1e9);

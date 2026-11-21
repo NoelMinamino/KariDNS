@@ -110,6 +110,9 @@ typedef struct {
 } dq_cfg_t;
 
 void dq_cfg_default(dq_cfg_t *c);
+/* an agent's own sending path replaces the controller's: --io, --iface, the MACs, --next-hop, --xdp-mode, -b ADDR, -T, -c, -B, --queue,
+ * --sport-base, --cpu-base, --no-pin and --frame-mem describe a host, not the load (docs/dnsqps.md "Several client hosts") */
+void dq_cfg_take_host(dq_cfg_t *dst, const dq_cfg_t *src);
 /* argv without the program name; 0 = ok, -1 = error (err) */
 int dq_parse_args(dq_cfg_t *c, int argc, char **argv, char *err, size_t errlen);
 /* the text of an rc file (~/.dnsqpsrc): the same options, one or more per line, '#' starts a comment */
@@ -376,6 +379,9 @@ void dq_args_free(dq_args_t *a);
  * inflight, source prefix, and its own seed.  0 = ok */
 int dq_ctl_args(const dq_cfg_t *c, int argc, char **argv, unsigned k, unsigned i, dq_args_t *a, char *err, size_t errlen);
 uint64_t dq_share(uint64_t total, unsigned k, unsigned i);
+/* true when c sends with netmap on its --iface and the connection s has a local address on that interface: netmap(4) takes the NIC's rings
+ * from the host stack while it runs, so the control connection would stall (FreeBSD; false elsewhere) */
+bool dq_ctl_over_netmap(const dq_cfg_t *c, dq_sock_t s);
 /* the agent: serve until *quit; the controller: run the load on the senders and print the merged report; returns the exit status */
 int dq_agent_serve(const dq_cfg_t *c, dq_run_fn run, const atomic_bool *quit, atomic_bool *stop);
 int dq_controller(dq_cfg_t *c, int argc, char **argv, dq_run_fn run, atomic_bool *stop, FILE *st);

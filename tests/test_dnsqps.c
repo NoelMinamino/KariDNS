@@ -1072,6 +1072,53 @@ static void test_agent_msgs(void) {
     char nk0[] = "--agent-no-key";
     char *nk[] = { nk0 };
     CHECK(dq_agent_check_tokens(nk, 1, err, sizeof err) < 0);   /* a controller cannot send it */
+    {   /* the sending path is the agent's own: the controller's --io, --iface, -T, -c, -b ADDR, ... are replaced; the load options stay */
+        dq_cfg_t ac, rc;
+        dq_cfg_default(&ac);
+        char *ha[] = { "--agent", "127.0.0.1:5301", "--io", "netmap", "--iface", "em9", "-T", "3", "-c", "4", "-b", "192.0.2.7", "--frame-mem", "8", "--no-pin",
+                       "--src-mac", "02:00:00:00:00:01", "--next-hop", "192.0.2.1", "--queue", "2", "--sport-base", "50000", "--cpu-base", "1", "-B", "16" };
+        CHECK(dq_parse_args(&ac, (int)(sizeof ha / sizeof ha[0]), ha, err, sizeof err) == 0);
+        dq_cfg_default(&rc);
+        char *ra[] = { "-s", "192.0.2.53", "-d", "q", "--io", "sendto", "--iface", "em0", "-T", "9", "-c", "1", "-b", "192.0.2.99", "-Q", "5000", "--no-pin" };
+        CHECK(dq_parse_args(&rc, (int)(sizeof ra / sizeof ra[0]), ra, err, sizeof err) == 0);
+        dq_cfg_take_host(&rc, &ac);
+        CHECK(rc.io == DQ_IO_NETMAP && !strcmp(rc.iface, "em9") && rc.threads == 3 && rc.sockets == 4 && !strcmp(rc.bind, "192.0.2.7") && rc.frame_mem_mb == 8);
+        CHECK(rc.no_pin && !strcmp(rc.src_mac, "02:00:00:00:00:01") && !strcmp(rc.next_hop, "192.0.2.1") && rc.queue == 2 && rc.sport_base == 50000);
+        CHECK(rc.cpu_base == 1 && rc.batch == 16 && rc.rate == 5000 && !strcmp(rc.server, "192.0.2.53") && !strcmp(rc.qfile, "q") && !rc.agent[0]);
+        dq_cfg_default(&rc);
+        char *rb[] = { "-s", "192.0.2.53", "-d", "q", "-b", "198.18.4.0/24" };
+        CHECK(dq_parse_args(&rc, (int)(sizeof rb / sizeof rb[0]), rb, err, sizeof err) == 0);
+        dq_cfg_take_host(&rc, &ac);
+        CHECK(rc.srcpfx.on && !rc.bind[0]);   /* a -b prefix is the controller's share, not the agent's -b ADDR */
+    }
+#ifdef __FreeBSD__
+    {   /* netmap on the interface that carries the control connection is refused: a socket on 127.0.0.1 is on lo0 */
+        dq_cfg_t nc;
+        dq_cfg_default(&nc);
+        int s = socket(AF_INET, SOCK_DGRAM, 0);
+        struct sockaddr_in sa;
+        memset(&sa, 0, sizeof sa);
+        sa.sin_family = AF_INET;
+        sa.sin_port = htons(9);
+        sa.sin_addr.s_addr = htonl(0x7f000001);
+        CHECK(s >= 0 && connect(s, (struct sockaddr *)&sa, sizeof sa) == 0);
+        snprintf(nc.iface, sizeof nc.iface, "lo0");
+        nc.io = DQ_IO_NETMAP;
+        CHECK(dq_ctl_over_netmap(&nc, s));
+        nc.io = DQ_IO_AUTO;
+        CHECK(dq_ctl_over_netmap(&nc, s));
+        nc.io = DQ_IO_SENDTO;
+        CHECK(!dq_ctl_over_netmap(&nc, s));
+        nc.io = DQ_IO_NETMAP;
+        snprintf(nc.iface, sizeof nc.iface, "nosuch9");
+        CHECK(!dq_ctl_over_netmap(&nc, s));
+        nc.iface[0] = '\0';
+        CHECK(!dq_ctl_over_netmap(&nc, s));
+        if (s >= 0) close(s);
+        snprintf(nc.iface, sizeof nc.iface, "lo0");
+        CHECK(!dq_ctl_over_netmap(&nc, -1));   /* getsockname fails */
+    }
+#endif
     dq_cfg_default(&c);
     snprintf(c.agent, sizeof c.agent, "[::1]:5301");
     CHECK(dq_cfg_check(&c, err, sizeof err) == 0);

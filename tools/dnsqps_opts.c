@@ -245,6 +245,24 @@ void dq_cfg_default(dq_cfg_t *c) {
     dq_qopts_default(&c->qo);
 }
 
+void dq_cfg_take_host(dq_cfg_t *dst, const dq_cfg_t *src) {
+    memcpy(dst->iface, src->iface, sizeof dst->iface);
+    memcpy(dst->src_mac, src->src_mac, sizeof dst->src_mac);
+    memcpy(dst->next_hop_mac, src->next_hop_mac, sizeof dst->next_hop_mac);
+    memcpy(dst->next_hop, src->next_hop, sizeof dst->next_hop);
+    memcpy(dst->xdp_mode, src->xdp_mode, sizeof dst->xdp_mode);
+    if (!dst->srcpfx.on) memcpy(dst->bind, src->bind, sizeof dst->bind);   /* -b ADDR; a -b prefix is the controller's share */
+    dst->io = src->io;
+    dst->threads = src->threads;
+    dst->sockets = src->sockets;
+    dst->batch = src->batch;
+    dst->queue = src->queue;
+    dst->sport_base = src->sport_base;
+    dst->cpu_base = src->cpu_base;
+    dst->frame_mem_mb = src->frame_mem_mb;
+    dst->no_pin = src->no_pin;
+}
+
 static int bad(char *err, size_t n, const char *opt, const char *val) {
     snprintf(err, n, "bad value '%.60s' for --%s", val ? val : "", opt);
     return -1;

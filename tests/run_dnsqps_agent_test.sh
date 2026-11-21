@@ -228,6 +228,25 @@ echo "ok: the agent answers garbage, a bad length, a bad verb, banned options an
 [ "$rc" -eq 0 ] && [ "$(jnum sent < "$W/r14.json")" = "2000" ] || fail "the agent does not serve after the bad clients: exit $rc"
 echo "ok: the agent serves a controller after the bad clients"
 
+# ---------------------------------------------------------------- 7b. netmap on the interface of the control connection (FreeBSD: 127.0.0.1 is on lo0)
+# The agent's own --io / --iface are used (not the controller's); netmap there would take the interface from the host stack, so both sides refuse
+# before anything is opened.
+if [ "$(uname -s)" = "FreeBSD" ]; then
+    A5=$(kari_port 5 15756)
+    start_agent "$A5" --io netmap --iface lo0
+    # shellcheck disable=SC2086
+    "$DQ" -r --agents "127.0.0.1:$A5" $CTL -N 100 > "$W/r15.out" 2> "$W/r15.err"; rc=$?
+    [ "$rc" -eq 2 ] && grep -q "agent 127.0.0.1:$A5: netmap on lo0" "$W/r15.err" || fail "an agent with netmap on its control interface: exit $rc: $(cat "$W/r15.err")"
+    # shellcheck disable=SC2086
+    "$DQ" -r --io netmap --iface lo0 --agents "127.0.0.1:$A1" $CTL -N 100 > "$W/r16.out" 2> "$W/r16.err"; rc=$?
+    [ "$rc" -eq 2 ] && grep -q "netmap on lo0" "$W/r16.err" || fail "a controller with netmap on its control interface: exit $rc: $(cat "$W/r16.err")"
+    # the controller's --io netmap is not the agent's: an agent with the socket paths serves a netmap controller's command line (--no-local)
+    # shellcheck disable=SC2086
+    "$DQ" -r --io netmap --iface lo0 --no-local --agents "127.0.0.1:$A1" $CTL -N 2000 --json > "$W/r17.json" 2> "$W/r17.err"; rc=$?
+    [ "$rc" -eq 0 ] && [ "$(jnum sent < "$W/r17.json")" = "2000" ] || fail "an agent with its own sending path: exit $rc: $(cat "$W/r17.err")"
+    echo "ok: the sending path is the agent's own; netmap on the control interface is refused on both sides"
+fi
+
 # ---------------------------------------------------------------- 8. usage errors
 for bad in "--agent 0.0.0.0:5301" "--agent 127.0.0.1" "--agents nohost" "--no-local" "--agent-key $W/key"; do
     # shellcheck disable=SC2086
