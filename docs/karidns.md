@@ -1195,7 +1195,7 @@ Other kinds are ignored; those that change answers in PowerDNS (`SOA-EDIT`, `NSE
 
 **How the Backend runs it.** The Backend keeps an ordinary zone entry for the zone and the secondary machinery of the control thread does the rest, exactly as for a `zone { type slave; }`: the first transfer at the first tick (about a second after the zone arrived), then the SOA refresh / retry / expire timers (an expired zone answers SERVFAIL, RFC 1034 §4.3.5), IXFR with a fallback to AXFR (RFC 1995), NOTIFY accepted from the listed masters and, when `tsig-key` is set, only when signed with that key (RFC 1996, RFC 8945 §5.2), `also-notify` towards downstream secondaries after every transfer. As for configured secondaries, the masters are asked in order, each at every refresh until one is ahead (see Transfer and NOTIFY options), and the options of the view and of `options` (timers, `transfer-source`, ...) apply; a master's `source` cannot be written in the settings text.
 
-**Data lives in memory only** (database secondaries; the secondaries of karidns.conf and their catalog members keep a copy in the zone store since 0.7, see "Secondary zones: the copies in the zone store"). PowerDNS writes what a slave transfers into the database; KariDNS does not. After a restart of `karidns` a `SLAVE` zone is empty until its first transfer, and the rows of `records` of a `SLAVE` zone (a copy PowerDNS made) are ignored. A restart of the **loader** costs nothing: the loader compares the settings of every zone with what the Backend has (the digest of a secondary covers its settings text, profile and kind, not its data) and sends nothing for an unchanged zone, so no zone is transferred again.
+**Data lives in the zone store, not in the database** (0.7: database secondaries keep a copy in the zone store like the secondaries of karidns.conf, see "Secondary zones: the copies in the zone store"; with `store none` it lives in memory only). PowerDNS writes what a slave transfers into the database; KariDNS does not. After a restart of `karidns` a `SLAVE` zone answers from its stored copy (without the loader and without the database) and is refreshed from its masters; without a copy (no store, the first start) it is empty until its first transfer. The rows of `records` of a `SLAVE` zone (a copy PowerDNS made) are ignored. A restart of the **loader** costs nothing: the loader compares the settings of every zone with what the Backend has (the digest of a secondary covers its settings text, profile and kind, not its data) and sends nothing for an unchanged zone, so no zone is transferred again.
 
 **Changes.** A change of `domains.master`, of `AXFR-MASTER-TSIG`, of the ACL metadata or of the profile is applied by the next reload (`karictl reload`, `karictl reload <zone>`, the change log): the settings of the zone are replaced, the zone keeps its data, and a refresh from the new masters is started at once (an IXFR from the serial it holds; use `karictl retransfer <zone>` for a full transfer when the new master has an older serial, which a secondary refuses to follow). A zone whose type changes between `NATIVE` and `SLAVE`, or between `SLAVE` and `CONSUMER`, gets a new entry (the data of the old one goes). A deleted row removes the zone with the next reload, and a deleted `CONSUMER` takes the member zones it created with it. `karictl retransfer <zone>` works for `SLAVE` and `CONSUMER` zones; `karictl reload <zone>` re-reads the settings (it does not start a transfer), `karictl notify <zone>` sends NOTIFY to the zone's `also-notify` addresses; `karictl dbstatus <zone>` shows the masters, the key, the last successful transfer and its serial.
 
@@ -1373,8 +1373,8 @@ there, taken from the zone and falling back to the server-wide values (catalog m
 
 A secondary keeps what it transferred in the zone store, so that a restart serves the last good copy at once (also with the primary down)
 and its SOA timers carry across the restart. This covers the zones of karidns.conf (`type slave;` / `type secondary;`, with or without
-`file`), catalog zones that are secondaries and their member zones (RFC 9432). The secondaries of the database (`domains.type` SLAVE and
-CONSUMER) are not stored yet: they still start empty after a restart (see "Database zone types").
+`file`), catalog zones that are secondaries and their member zones (RFC 9432), and the secondaries of the database (`domains.type`
+SLAVE and CONSUMER, and the members of a CONSUMER; see "Database secondaries" below).
 
 - **Where.** In the store directory (`options { zone-store "<dir>"; }`, or the `store` of the database block; both written and different
   is an error), in a store view of its own named `_karidns-xfr`; that name is reserved and refused as the name of a view. Without a
@@ -1407,6 +1407,15 @@ CONSUMER) are not stored yet: they still start empty after a restart (see "Datab
 - **Removal.** A zone that leaves the configuration, changes to another type or leaves its catalog loses its copy (the copies of a
   catalog's members are kept until every catalog zone of the view has refreshed once after a start, so that a catalog whose own copy
   could not be used does not take them with it). A change of ownership of a member with the same unique-id (RFC 9432 §5.5) keeps it.
+- **Database secondaries.** Their copies are kept like the others, with the id of the zone's settings (`settings.dat` in the store
+  directory) and the zone's `domains.id` as part of who the zone is. At a start the copies are restored **without the loader and without
+  the database**: the ingest thread makes the zone's entry from its copy when the store's record of the zone (the one the reconcile with
+  the loader keeps) still names the same `domains.id`, so a restart with the database or the primaries down answers the zones (and the
+  members of a catalog consumer) from their copies; the loader's own jobs for the zones then find them (one entry per zone). A copy whose
+  zone has no such record any more (the row was deleted or renamed while the server was stopped, or the view now reads another database
+  file) or whose view takes no database zones any more is deleted; a copy whose settings are not in `settings.dat` waits for the loader.
+  At run time a row that is deleted, renamed or changes its type (SLAVE <-> CONSUMER, SLAVE -> NATIVE) takes its copy with it. Not
+  stored: the root zone and the names the store cannot name in a database view (they live outside the store's index, as before).
 - **Not stored** (memory only, counted as `xfr.unstorable`): a zone name longer than 245 octets; zones of a store whose 32 views are all
   used by the database (ERROR at the start); an image over 2 GiB; the zones of a view whose name has the same store tag (CRC-32C of the
   lower-cased name) as an earlier view of the configuration (WARNING `the views 'a' and 'b' map to the same store tag`; rename one of

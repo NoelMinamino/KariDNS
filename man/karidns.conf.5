@@ -6202,16 +6202,18 @@ options of the view and of \fBoptions\fR (timers,
 \fBtransfer\-source\fR, ...) apply; a master's \fBsource\fR cannot be written in
 the settings text.
 .PP
-\fBData lives in memory only\fR (database secondaries; the secondaries of
-karidns.conf and their catalog members keep a copy in the zone store since 0.7,
-see "Secondary zones: the copies in the zone store"). PowerDNS writes what a
-slave transfers into the database; KariDNS does not. After a restart of
-\fBkaridns\fR a \fBSLAVE\fR zone is empty until its first transfer, and the rows
-of \fBrecords\fR of a \fBSLAVE\fR zone (a copy PowerDNS made) are ignored. A
-restart of the \fBloader\fR costs nothing: the loader compares the settings of
-every zone with what the Backend has (the digest of a secondary covers its
-settings text, profile and kind, not its data) and sends nothing for an
-unchanged zone, so no zone is transferred again.
+\fBData lives in the zone store, not in the database\fR (0.7: database
+secondaries keep a copy in the zone store like the secondaries of karidns.conf,
+see "Secondary zones: the copies in the zone store"; with \fBstore none\fR it
+lives in memory only). PowerDNS writes what a slave transfers into the database;
+KariDNS does not. After a restart of \fBkaridns\fR a \fBSLAVE\fR zone answers
+from its stored copy (without the loader and without the database) and is
+refreshed from its masters; without a copy (no store, the first start) it is
+empty until its first transfer. The rows of \fBrecords\fR of a \fBSLAVE\fR zone
+(a copy PowerDNS made) are ignored. A restart of the \fBloader\fR costs nothing:
+the loader compares the settings of every zone with what the Backend has (the
+digest of a secondary covers its settings text, profile and kind, not its data)
+and sends nothing for an unchanged zone, so no zone is transferred again.
 .PP
 \fBChanges.\fR A change of \fBdomains.master\fR, of \fBAXFR\-MASTER\-TSIG\fR, of
 the ACL metadata or of the profile is applied by the next reload (\fBkarictl
@@ -6984,9 +6986,9 @@ A secondary keeps what it transferred in the zone store, so that a restart
 serves the last good copy at once (also with the primary down) and its SOA
 timers carry across the restart. This covers the zones of karidns.conf (\fBtype
 slave;\fR / \fBtype secondary;\fR, with or without \fBfile\fR), catalog zones
-that are secondaries and their member zones (RFC 9432). The secondaries of the
-database (\fBdomains.type\fR SLAVE and CONSUMER) are not stored yet: they still
-start empty after a restart (see "Database zone types").
+that are secondaries and their member zones (RFC 9432), and the secondaries of
+the database (\fBdomains.type\fR SLAVE and CONSUMER, and the members of a
+CONSUMER; see "Database secondaries" below).
 .IP \(bu 2
 \fBWhere.\fR In the store directory (\fBoptions { zone\-store "<dir>"; }\fR, or
 the \fBstore\fR of the database block; both written and different is an error),
@@ -7046,6 +7048,23 @@ until every catalog zone of the view has refreshed once after a start, so that a
 catalog whose own copy could not be used does not take them with it). A change
 of ownership of a member with the same unique-id (RFC 9432 \[u00A7]5.5) keeps
 it.
+.IP \(bu 2
+\fBDatabase secondaries.\fR Their copies are kept like the others, with the id
+of the zone's settings (\fBsettings.dat\fR in the store directory) and the
+zone's \fBdomains.id\fR as part of who the zone is. At a start the copies are
+restored \fBwithout the loader and without the database\fR: the ingest thread
+makes the zone's entry from its copy when the store's record of the zone (the
+one the reconcile with the loader keeps) still names the same \fBdomains.id\fR,
+so a restart with the database or the primaries down answers the zones (and the
+members of a catalog consumer) from their copies; the loader's own jobs for the
+zones then find them (one entry per zone). A copy whose zone has no such record
+any more (the row was deleted or renamed while the server was stopped, or the
+view now reads another database file) or whose view takes no database zones any
+more is deleted; a copy whose settings are not in \fBsettings.dat\fR waits for
+the loader. At run time a row that is deleted, renamed or changes its type
+(SLAVE <-> CONSUMER, SLAVE -> NATIVE) takes its copy with it. Not stored: the
+root zone and the names the store cannot name in a database view (they live
+outside the store's index, as before).
 .IP \(bu 2
 \fBNot stored\fR (memory only, counted as \fBxfr.unstorable\fR): a zone name
 longer than 245 octets; zones of a store whose 32 views are all used by the

@@ -51,6 +51,20 @@ bool xfr_store_active(void);
 /* 2.2: two configured views whose names have one store tag: the later view's secondaries are not persisted (a WARNING once).  Called by every pass of the restore thread; returns the number of views left out */
 int  xfr_store_config_check(const server_config_t *cfg);
 
+/* ---- P3: the database secondaries (SLAVE kind 4, CONSUMER kind 5; 3.3, 4.4, 5) ----
+ * Their copies are records `<tag>d.<zone>` of the reserved view, written by the end of every refresh like the others, with the id of the zone's settings (settings.dat) in the record and the
+ * domains.id in the identity.  The restore thread's start gives every stored `d` copy to the ingest thread as a restore job (db_ingest_xfr_restore_post()); the job makes the entry from the
+ * copy when the reconcile's record of the zone agrees (xfr_store_db_restore()), and job_execute_secondary() restores the copy into an entry it makes.  The DB delete paths ask for a pass
+ * (g_xfr_ops->db_gone); its GC deletes a `d` copy whose zone the registry no longer has, once every restore job of the start has run (R3). */
+/* the ingest thread: one restore job is done (the last one opens the GC of the `d` copies) */
+void xfr_store_db_job_done(void);
+/* the stored `d` copy of (view, zone): its kind, the id of its settings and its identity; false: none (or not STORED, or not of a database kind) */
+bool xfr_store_db_copy(const char *view, const char *zone, int *kind, uint32_t *settings, uint64_t *identity);
+/* delete the `d` copy of (view, zone) when it is still the copy of this identity (the row went while the server was stopped) */
+void xfr_store_db_copy_drop(const char *view, const char *zone, uint64_t identity);
+/* restore the copy into a new entry of a database secondary before it is registered (the ingest thread; the entry's xfr_db_sid is set); true: installed */
+bool xfr_store_db_restore(struct zone_db_entry_s *e);
+
 /* ---- the control channel ---- */
 /* zonestatus of a secondary: the `Store:` and `Last-refresh` lines (and `Expired:` when it is) appended to out (a NUL-terminated text); the length written */
 size_t xfr_store_zonestatus(struct zone_db_entry_s *e, const server_config_t *cfg, char *out, size_t cap);

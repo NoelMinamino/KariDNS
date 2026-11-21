@@ -657,6 +657,49 @@ static uint32_t dir_settings_id(zone_ext_shared_t *sh) {
   return id;
 }
 
+/* 0.7 P3 (secondary store 3.3): the copy of a database secondary names the id of its settings, so that its restore needs neither the loader nor the database (4.4) */
+uint32_t db_store_settings_id_of(const zone_db_entry_t *e) {
+  if (!e || e->source != ZONE_SRC_DB) return 0;
+  /* (the block is read in a section, where a swap of the settings cannot free it; the settings are held by a reference while a new id is made durable, which is file I/O and done outside) */
+  zone_ext_shared_t *sh = NULL;
+  uint32_t id = 0;
+  rcu_aux_read_lock();
+  const zone_config_t *c = atomic_load_explicit(&e->dbcfg, memory_order_acquire);
+  if (c && c->ext_shared && c->ext) {
+    zone_ext_shared_t *s = (zone_ext_shared_t *)(void *)c->ext;          /* (ext is the first member of zone_ext_shared_t) */
+    id = atomic_load_explicit(&s->store_id, memory_order_acquire);
+    if (!id) sh = zone_ext_shared_ref(s);
+  }
+  rcu_aux_read_unlock();
+  if (sh) {
+    id = dir_settings_id(sh);
+    zone_ext_shared_unref(sh);
+  }
+  return id;
+}
+zone_ext_shared_t *db_store_settings_by_id(uint32_t id) { return set_get(id); }
+bool db_store_name_ok(const char *zone) {
+  char n[STORE_NAME_MAX + 2];
+  size_t len;
+  return zone && store_name(zone, n, sizeof(n), &len);
+}
+/* 4.4: the reconcile's memory of a secondary of the database view (recon_meta(): KNOWN, STORE_F_NONSTORE, the domains.id); the restore of a copy takes the domain id from it */
+bool db_store_nonstore_sid(const char *view, const char *zone, int64_t *sid) {
+  store_t *st = atomic_load_explicit(&G.st, memory_order_acquire);
+  char n[STORE_NAME_MAX + 2];
+  size_t len;
+  if (!st || !view || !store_name(zone, n, sizeof(n), &len)) return false;
+  const int vid = store_view_id(st, view);
+  if (vid < 0 || vid == xfr_store_vid()) return false;
+  store_zone_t z;
+  store_read_lock();
+  const uint32_t zid = store_find(st, (uint16_t)vid, n, len);
+  const bool ok = zid != STORE_NONE && store_zone_get(st, zid, &z) == 0 && (z.flags & STORE_F_NONSTORE) && z.source_id != 0;
+  store_read_unlock();
+  if (ok && sid) *sid = z.source_id;
+  return ok;
+}
+
 /* ------------------------------------------------------------------------------------------------------------- */
 /* the attach table: zid -> the registry's element of a zone of the store that is in memory                      */
 /* ------------------------------------------------------------------------------------------------------------- */
@@ -1812,9 +1855,13 @@ void db_store_ma_inputs(ma_in_t *in) {
   store_stats_t ss;
   store_stats(st, &ss);
   in->store_mode = ss.mode == STORE_MODE_COPY ? MA_STORE_COPY : MA_STORE_MAP;
+  /* (0.7, secondary store 2.2: the secondaries' copies in the reserved view are no zones of the database: a restored copy is a heap version, counted where the secondary's version is) */
+  const int xv = xfr_store_vid();
   in->stored_zones = ss.zones_stored;
+  if (xv >= 0 && xv < STORE_MAX_VIEWS) in->stored_zones -= ss.views[xv].stored <= in->stored_zones ? ss.views[xv].stored : in->stored_zones;
   in->stored_image_bytes = 0;
-  for (uint32_t i = 0; i < ss.nviews && i < STORE_MAX_VIEWS; i++) in->stored_image_bytes += ss.views[i].image_bytes;
+  for (uint32_t i = 0; i < ss.nviews && i < STORE_MAX_VIEWS; i++)
+    if ((int)i != xv) in->stored_image_bytes += ss.views[i].image_bytes;
 }
 
 /* 0.7 fix 8: is the list of the zones of a database view still being made (a first fill whose first pass has not ended)?  A query for a zone that the pass has not listed yet is refused as for any name

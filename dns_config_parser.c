@@ -9252,7 +9252,7 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
       /* 0.7 (planing_0.7.x_secondary_store.md D8): the store keeps the secondaries' copies in a view of this name; no configured view may have it */
       if (strcasecmp(tok.value, KARIDNS_XFR_STORE_VIEW) == 0) {
         syslog(LOG_ERR, "[Config] View name '%s' is reserved (the zone store keeps the copies of the secondary zones under it); rejecting configuration", tok.value);
-        cfg_diag(ctx, DIAG_ERROR, DC_CONF_VIEW_NAME_LENGTH, "View name '%s' is reserved (the zone store keeps the copies of the secondary zones under it)\n", tok.value);
+        cfg_diag(ctx, DIAG_ERROR, DC_CONF_VIEW_NAME_RESERVED, "View name '%s' is reserved (the zone store keeps the copies of the secondary zones under it)\n", tok.value);
         free_token(&tok);
         if (ctx) ctx->error_occurred = true;
         return -1;

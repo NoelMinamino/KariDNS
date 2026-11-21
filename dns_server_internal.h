@@ -498,6 +498,7 @@ struct zone_x_s {
    * thread's next pass writes it once the end is on disk (dns_xfr_store.c) */
   _Atomic int xfr_store_retry;
   _Atomic(time_t) xfr_store_retry_at;
+  _Atomic int64_t xfr_db_sid;                   /* 0.7 (secondary store 3.3, P3): a database secondary or catalog consumer: the domains.id of its row, part of the identity of its copy (set by the ingest thread before the entry is registered) */
   _Atomic(time_t) last_denial_gap_log;          /* 0.7 (audit): when a missing NSEC / NSEC3 proof of this zone was last logged (dns_query_engine.c note_denial_gap()) */
   time_t last_loaded_mtime;
   off_t last_loaded_size;                       /* with the mtime: a reload re-reads a file only when one of them changed (reload_master_zone()) */
@@ -685,6 +686,7 @@ enum { XFR_OUT_NONE = 0, XFR_OUT_TRANSFERRED, XFR_OUT_UPTODATE, XFR_OUT_FAILED }
 typedef struct {
   void (*after_refresh)(zone_db_entry_t *e, int outcome, time_t attempt_at);   /* the end of a refresh (the transfer thread, it holds is_transferring and no lock) */
   void (*rebuilt)(void);                                                        /* a snapshot of the zones was published (a reconfiguration, a catalog change) */
+  void (*db_gone)(void);                                                        /* 0.7 P3: a database secondary or catalog consumer left the registry (deleted, replaced): the next pass looks at the copies */
 } xfr_store_ops_t;
 extern _Atomic(const xfr_store_ops_t *) g_xfr_ops;
 extern _Atomic int g_xfr_store_mode;
@@ -1378,6 +1380,9 @@ int dbreg_commit_store_only(const char *view, const char *name, const struct zon
 /* The entry registered for (view, name) or NULL.  Valid while the caller is the only ingest thread working on that
  * name (the ingest thread serializes zones of the same name). */
 zone_db_entry_t *dbreg_lookup_entry(const char *view, const char *name);
+/* 0.7 P3 (secondary store 5): does the registry have a database secondary or catalog consumer of this name (in memory)?  *catalog: a consumer; *source_id: its domains.id (the identity of its copy).
+ * Under the registry lock; nothing is held after the call */
+bool dbreg_db_secondary_of(const char *view, const char *name, bool *catalog, int64_t *source_id);
 /* the same for the ingest thread that is about to install a new version into the entry: the zone is marked busy (ZDIR_F_BUSY) until dbreg_commit() or dbreg_reject() for it, and is not taken out of memory meanwhile */
 zone_db_entry_t *dbreg_lookup_entry_busy(const char *view, const char *name);
 uint64_t zone_bytes_underflows(void);                             /* times a byte total would have gone below zero (a bug; 0) */

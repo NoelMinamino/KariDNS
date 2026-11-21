@@ -11,12 +11,16 @@
  *     re-check of a member whose unique-id changed during its transfer (M6), the GC with the per-view exemption of a catalog's members, a name too long, 32 views full,
  *     a store that cannot be opened (no pending bit, a reconfiguration's secondary is not held), the 30 s safety net (progress against a stall, R2'), and under TSan
  *     the restore against a concurrent transfer and the hooks of rebuilds from several threads.
+ *  3. P3, the database secondaries (a fake loader on socket pairs): their copies (key `d`, the domains.id in the identity, the settings id, R1), the orphan re-check through the
+ *     registry, the delete hook and a kind change; the restart without the loader (the restore jobs of 4.4 and every way out of them), the loader's jobs afterwards (one entry
+ *     per zone, the copy restored into an entry they make, a damaged copy put whole again), and R3 (the jobs held: a pass keeps every `d` copy).
  */
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdatomic.h>
@@ -25,6 +29,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/wait.h>
@@ -32,8 +37,11 @@
 #include <unistd.h>
 
 #include "../dns_config_parser.h"
+#include "../dns_db_ingest.h"
 #include "../dns_db_store.h"
+#include "../dns_db_stream.h"
 #include "../dns_epoch_rcu.h"
+#include "../dns_park.h"
 #include "../dns_server_internal.h"
 #include "../dns_snapshot_rcu.h"
 #include "../dns_store.h"
@@ -1079,6 +1087,422 @@ static int life6(void) {
   return g_failed;
 }
 
+/* ======================================================================================================================= 3. P3: the database secondaries */
+/* A server with a database block and the store: a fake loader on socket pairs (the protocol of tests/test_db_store.c) sends SLAVE and CONSUMER zones; the "transfers" are installs as in
+ * the lives above.  Lives D1 (the copies are written: key `d`, the domains.id in the identity, the settings id, source id 0, R1 two views with one domains.id; the orphan re-check through the
+ * registry; the delete hook; a kind change at run time), D2 (the restart without the loader: the restore jobs; every outcome of 4.4; then the loader's jobs find the entries, restore into
+ * an entry they make, put a damaged copy whole again, and a kind change while stopped deletes the old copy), D3 (R3: the jobs held, a pass meanwhile keeps every `d` copy). */
+
+typedef struct {
+  int fd;
+  kdb_framer_t fr;
+  uint8_t body[KDB_MAX_BODY];
+  uint8_t buf[65536];
+} dch_t;
+static dch_t g_dmain;
+static int g_dfd = -1;                                     /* the loader's end of the main stream */
+static kdb_enc_t g_denc;
+static server_config_t g_dcfg;
+static char g_dsdir[300];
+
+static bool dch_next(dch_t *c, kdb_msg_t *m, int ms) {
+  for (;;) {
+    kdb_frame_t fr;
+    kdb_rc_t rc = kdb_framer_next(&c->fr, &fr);
+    if (rc == KDB_OK) {
+      char why[KDB_REASON_LEN];
+      return kdb_decode(&fr, KDB_VIEWS_ANY, m, why, sizeof(why)) == KDB_OK;
+    }
+    if (rc != KDB_MORE) return false;
+    struct pollfd p = { c->fd, POLLIN, 0 };
+    if (poll(&p, 1, ms) <= 0) return false;
+    ssize_t n = read(c->fd, c->buf, sizeof(c->buf));
+    if (n <= 0 || kdb_framer_feed(&c->fr, c->buf, (size_t)n) != KDB_OK) return false;
+  }
+}
+static void dsend(void) {
+  CHECK(!g_denc.err);
+  size_t off = 0;
+  while (off < g_denc.len) {
+    ssize_t n = write(g_dfd, g_denc.buf + off, g_denc.len - off);
+    if (n > 0) off += (size_t)n;
+    else if (!(n < 0 && errno == EINTR)) break;
+  }
+  kdb_enc_reset(&g_denc);
+}
+
+/* the views: v1 and v2 take database zones (R1: the same domains.id in both), v9 too in life D1 only (its copy is deleted at the next start: a view that takes no database zones) */
+static int db_life_start(bool with_v9) {
+  char conf[2048];
+  snprintf(conf, sizeof(conf),
+           "options { database { driver sqlite3; database-file \"/nonexistent/z.db\"; loader-user \"nobody\"; loader-path \"/bin/true\"; store \"%s\"; }; };\n"
+           "view \"v1\" { match-clients { any; }; zone \"cs.test\" { type slave; masters { 192.0.2.1; }; primary-settings no; }; };\n"
+           "view \"v2\" { match-clients { none; }; };\n%s",
+           g_dsdir, with_v9 ? "view \"v9\" { match-clients { none; }; };\n" : "");
+  memset(&g_dcfg, 0, sizeof(g_dcfg));
+  if (parse_named_conf(conf, &g_dcfg) != 0) { printf("  [FAIL] the configuration does not parse\n"); return -1; }
+  atomic_store_explicit(&g_config_db.active, &g_dcfg, memory_order_release);
+  xfr_store_want(db_store_wanted(&g_dcfg));
+  rebuild_zone_db_from_config(&g_dcfg, false);
+  char msg[1024];
+  int lvl = 0;
+  if (!db_store_frontend_open_cfg(&g_dcfg, false, (uid_t)-1, (gid_t)-1, msg, sizeof(msg), &lvl)) { printf("  frontend: %s\n", msg); return -1; }
+  if (!db_store_start(&g_dcfg)) return -1;
+  int a[2], f[2], cs[2];
+  if (socketpair(AF_UNIX, SOCK_STREAM, 0, a) != 0 || socketpair(AF_UNIX, SOCK_STREAM, 0, f) != 0 || socketpair(AF_UNIX, SOCK_SEQPACKET, 0, cs) != 0) return -1;
+  int ends[3] = { a[1], f[1], cs[1] };
+  for (int i = 0; i < 3; i++) fcntl(ends[i], F_SETFL, fcntl(ends[i], F_GETFL, 0) | O_NONBLOCK);
+  park_register_worker(0, -1);
+  if (!db_ingest_start(a[1], cs[1], f[1])) return -1;
+  g_dfd = a[0];
+  g_dmain.fd = a[0];
+  kdb_framer_init(&g_dmain.fr, KDB_FROM_BACKEND, g_dmain.body, sizeof(g_dmain.body));
+  kdb_enc_init(&g_denc);
+  return 0;
+}
+static void db_hello(void) {
+  kdb_msg_t m;
+  kdb_enc_begin(&g_denc, KDB_T_HELLO);
+  kdb_enc_u16(&g_denc, 1, 1); kdb_enc_str(&g_denc, 2, "test-loader"); kdb_enc_str(&g_denc, 3, "sqlite3"); kdb_enc_u32(&g_denc, 4, 4242); kdb_enc_u32(&g_denc, 5, KDB_FEAT_IMAGE);
+  kdb_enc_u32(&g_denc, 6, ZONE_IMAGE_VERSION);
+  kdb_enc_end(&g_denc);
+  dsend();
+  CHECK(dch_next(&g_dmain, &m, 5000) && m.type == KDB_T_CONFIG);
+  CHECK(dch_next(&g_dmain, &m, 5000) && m.type == KDB_T_DEBUG);
+}
+typedef struct { uint16_t view; const char *zone; int64_t sid; uint8_t kind; } dz_t;
+/* one batch of secondary zones (ZONE_BEGIN of a secondary kind without data, the masters in the settings text), then BATCH_END and the answers up to BATCH_RESULT */
+static void db_batch(uint64_t id, const dz_t *z, int n) {
+  kdb_msg_t m;
+  kdb_enc_begin(&g_denc, KDB_T_BATCH_BEGIN);
+  kdb_enc_u64(&g_denc, 1, id); kdb_enc_u8(&g_denc, 2, (uint8_t)KDB_BATCH_DIFF); kdb_enc_u64(&g_denc, 3, 0);
+  kdb_enc_end(&g_denc);
+  dsend();
+  for (int i = 0; i < n; i++) {
+    uint8_t dig[KDB_DIGEST_LEN];
+    memset(dig, 0xCD, sizeof(dig));
+    kdb_enc_begin(&g_denc, KDB_T_ZONE_BEGIN);
+    kdb_enc_u16(&g_denc, 1, z[i].view); kdb_enc_name(&g_denc, 2, z[i].zone); kdb_enc_i64(&g_denc, 3, z[i].sid); kdb_enc_u8(&g_denc, 4, z[i].kind);
+    kdb_enc_u32(&g_denc, 5, 0); kdb_enc_u32(&g_denc, 6, 0); kdb_enc_u64(&g_denc, 7, 0); kdb_enc_bytes(&g_denc, 8, dig, sizeof(dig));
+    kdb_enc_str(&g_denc, 9, "masters { 192.0.2.1; };");
+    kdb_enc_end(&g_denc);
+    kdb_enc_begin(&g_denc, KDB_T_ZONE_END);
+    kdb_enc_u64(&g_denc, 1, 0);
+    kdb_enc_end(&g_denc);
+    dsend();
+  }
+  kdb_enc_begin(&g_denc, KDB_T_BATCH_END);
+  kdb_enc_u64(&g_denc, 1, id); kdb_enc_u32(&g_denc, 2, (uint32_t)n); kdb_enc_u32(&g_denc, 3, 0); kdb_enc_u32(&g_denc, 4, 0);
+  kdb_enc_end(&g_denc);
+  dsend();
+  bool got = false;
+  while (dch_next(&g_dmain, &m, 5000)) {
+    if (m.type == KDB_T_BATCH_RESULT) { got = true; break; }
+  }
+  CHECK(got);
+}
+static void db_delete(uint64_t id, uint16_t view, const char *zone, int64_t sid) {
+  kdb_msg_t m;
+  kdb_enc_begin(&g_denc, KDB_T_BATCH_BEGIN);
+  kdb_enc_u64(&g_denc, 1, id); kdb_enc_u8(&g_denc, 2, (uint8_t)KDB_BATCH_DIFF); kdb_enc_u64(&g_denc, 3, 0);
+  kdb_enc_end(&g_denc);
+  kdb_enc_begin(&g_denc, KDB_T_ZONE_DELETE);
+  kdb_enc_u16(&g_denc, 1, view); kdb_enc_name(&g_denc, 2, zone); kdb_enc_i64(&g_denc, 3, sid);
+  kdb_enc_end(&g_denc);
+  dsend();
+  CHECK(dch_next(&g_dmain, &m, 5000) && m.type == KDB_T_ZONE_RESULT && m.u.zone_result.status == KDB_ST_DELETED);
+  kdb_enc_begin(&g_denc, KDB_T_BATCH_END);
+  kdb_enc_u64(&g_denc, 1, id); kdb_enc_u32(&g_denc, 2, 0); kdb_enc_u32(&g_denc, 3, 0); kdb_enc_u32(&g_denc, 4, 1);
+  kdb_enc_end(&g_denc);
+  dsend();
+  bool got = false;
+  while (dch_next(&g_dmain, &m, 5000)) {
+    if (m.type == KDB_T_BATCH_RESULT) { got = true; break; }
+  }
+  CHECK(got);
+}
+static zone_db_entry_t *dent(const char *view, const char *zone, int ms) {
+  for (int i = 0; i <= ms / 10; i++) {
+    zone_db_entry_t *e = dbreg_lookup_entry(view, zone);
+    if (e || ms == 0) return e;
+    usleep(10000);
+  }
+  return NULL;
+}
+static bool drec(const char *view, int kind, const char *zone, store_zone_t *z, xfr_state_t *s) {
+  store_t *st = db_store_handle();
+  char k[XFR_KEY_MAX + 1];
+  const int n = xfr_key_make(view, kind, zone, k, sizeof(k));
+  if (!st || n < 0 || xfr_store_vid() < 0) return false;
+  store_read_lock();
+  const uint32_t zid = store_find(st, (uint16_t)xfr_store_vid(), k, (size_t)n);
+  const bool ok = zid != STORE_NONE && store_zone_get(st, zid, z) == 0;
+  store_read_unlock();
+  return ok && (!s || xfr_state_decode(z->digest, sizeof(z->digest), s) == 0);
+}
+/* the copy is gone within ms (the GC of a pass, asked for by a hook) */
+static bool drec_gone(const char *view, const char *zone, int ms) {
+  store_zone_t z;
+  for (int i = 0; i <= ms / 10; i++) {
+    if (!drec(view, XFR_K_DB_SLAVE, zone, &z, NULL)) return true;
+    usleep(10000);
+  }
+  return false;
+}
+/* the reconcile's record of a secondary of the database view (recon_meta(): KNOWN, STORE_F_NONSTORE, the domains.id) */
+static void nonstore(const char *view, const char *zone, int64_t sid) {
+  store_t *st = db_store_handle();
+  const int vid = store_view_id(st, view);
+  CHECK(vid >= 0);
+  store_meta_t m;
+  memset(&m, 0, sizeof(m));
+  m.source_id = sid;
+  m.source = (uint16_t)vid;
+  m.flags = STORE_F_NONSTORE;
+  char n[300];
+  snprintf(n, sizeof(n), "%s", zone);
+  size_t l = strlen(n);
+  if (l && n[l - 1] == '.') n[--l] = '\0';
+  CHECK_EQ(store_set_known(st, (uint16_t)vid, n, l, &m, NULL), 0);
+}
+static void damage_d(const char *view, const char *zone) {
+  store_zone_t z;
+  if (!drec(view, XFR_K_DB_SLAVE, zone, &z, NULL)) { CHECK(0); return; }
+  char p[512];
+  snprintf(p, sizeof(p), "%s/seg.%llu", g_dsdir, (unsigned long long)(z.loc >> 36));
+  int fd = open(p, O_RDWR);
+  CHECK(fd >= 0);
+  if (fd < 0) return;
+  const off_t off = (off_t)((z.loc & ((1ull << 36) - 1)) * 64) + 64 + (((off_t)z.klen + 15) & ~(off_t)15) + 40;
+  uint8_t b = 0;
+  CHECK(pread(fd, &b, 1, off) == 1);
+  b ^= 0x5A;
+  CHECK(pwrite(fd, &b, 1, off) == 1);
+  close(fd);
+}
+static uint32_t served_serial(zone_db_entry_t *e) {
+  uint32_t s = 0;
+  rcu_aux_read_lock();
+  zone_version_t *v = atomic_load(&e->rcu.active);
+  zone_image_soa_t nums;
+  const uint32_t soa = v && v->image ? zone_image_apex_soa(v->image) : ZONE_IMAGE_NONE;
+  if (soa != ZONE_IMAGE_NONE && zone_image_soa(v->image, soa, NULL, 0, NULL, 0, &nums) == 0) s = nums.serial;
+  rcu_aux_read_unlock();
+  return s;
+}
+
+static const dz_t g_dz1[] = {
+  { 0, "s1.test.", 501, KDB_ZK_SECONDARY },  { 1, "s1.test.", 501, KDB_ZK_SECONDARY },   /* (R1: one domains.id in two views) */
+  { 0, "del.test.", 502, KDB_ZK_SECONDARY }, { 0, "sid.test.", 503, KDB_ZK_SECONDARY }, { 0, "noset.test.", 504, KDB_ZK_SECONDARY },
+  { 0, "kind.test.", 505, KDB_ZK_SECONDARY }, { 2, "v9z.test.", 506, KDB_ZK_SECONDARY }, { 0, "bad.test.", 507, KDB_ZK_SECONDARY },
+  { 0, "c5.test.", 508, KDB_ZK_CATALOG },     { 0, "gone.test.", 509, KDB_ZK_SECONDARY }, { 0, "flip.test.", 510, KDB_ZK_SECONDARY },
+  { 0, "orph.test.", 511, KDB_ZK_SECONDARY },
+};
+#define NDZ1 ((int)(sizeof(g_dz1) / sizeof(g_dz1[0])))
+static const char *dvn(uint16_t v) { return v == 0 ? "v1" : v == 1 ? "v2" : "v9"; }
+
+/* life D1: the copies of the database secondaries are written */
+static int lifed1(void) {
+  printf("[life D1: the copies of the database secondaries]\n");
+  rcu_aux_thread_pin();
+  const time_t now = time(NULL);
+  if (db_life_start(true) != 0) return 1;
+  xfr_store_wait_start(5000);
+  CHECK(xfr_store_active());
+  db_hello();
+  db_batch(1, g_dz1, NDZ1);
+  zone_db_entry_t *e[NDZ1];
+  for (int i = 0; i < NDZ1; i++) {
+    e[i] = dent(dvn(g_dz1[i].view), g_dz1[i].zone, 2000);
+    CHECK(e[i] != NULL);
+    if (!e[i]) return 1;
+    CHECK_EQ(atomic_load(&zone_x(e[i])->xfr_db_sid), g_dz1[i].sid);
+  }
+  /* orph.test leaves the registry between its install and the end of its refresh: the copy written is deleted again (M6, through the registry) */
+  install(e[11], 30, XFR_ORIGIN_XFR, now - 10, 0);
+  CHECK_EQ(dbreg_delete("v1", "orph.test.", 511), 1);
+  xfr_store_counters_t c0 = ctr();
+  refresh_end(e[11], XFR_OUT_TRANSFERRED, now - 11);
+  CHECK_EQ(ctr().orphans_deleted, c0.orphans_deleted + 1);
+  store_zone_t z;
+  xfr_state_t s;
+  CHECK(!drec("v1", XFR_K_DB_SLAVE, "orph.test.", &z, NULL));
+  for (int i = 0; i < NDZ1 - 1; i++) {
+    install(e[i], (uint32_t)(10 + i), XFR_ORIGIN_XFR, now - 10, 0);
+    refresh_end(e[i], XFR_OUT_TRANSFERRED, now - 11);
+    const char *v = dvn(g_dz1[i].view);
+    const int kind = g_dz1[i].kind == KDB_ZK_CATALOG ? XFR_K_DB_CONSUMER : XFR_K_DB_SLAVE;
+    CHECK(drec(v, kind, g_dz1[i].zone, &z, &s));
+    CHECK(z.state == STORE_STATE_STORED && (z.flags & STORE_F_XFR) && !(z.flags & STORE_F_NONSTORE) && z.serial == (uint32_t)(10 + i) && z.source_id == 0 && z.settings != 0);
+    CHECK_EQ(s.kind, kind);
+    CHECK_EQ(s.identity, xfr_identity(kind, g_dz1[i].zone, v, NULL, g_dz1[i].sid));
+    CHECK(z.name[8] == 'd');
+    CHECK(db_store_settings_by_id(z.settings) != NULL);
+  }
+  /* R1: one domains.id in two views: two copies, two keys */
+  store_zone_t z1, z2;
+  CHECK(drec("v1", XFR_K_DB_SLAVE, "s1.test.", &z1, NULL) && drec("v2", XFR_K_DB_SLAVE, "s1.test.", &z2, NULL) && z1.zid != z2.zid);
+  /* the memory advice does not count the copies as zones of the database (review of #203) */
+  {
+    ma_in_t in;
+    memset(&in, 0, sizeof(in));
+    db_store_ma_inputs(&in);
+    CHECK_EQ(in.stored_zones, 0);
+    CHECK_EQ(in.stored_image_bytes, 0);
+  }
+  /* a failure write with the same settings id and nothing new is left out; a changed settings id is written (3.1 skip rule) */
+  {
+    store_t *st = db_store_handle();
+    char k[XFR_KEY_MAX + 1];
+    const int kn = xfr_key_make("v1", XFR_K_DB_SLAVE, "kind.test.", k, sizeof(k));
+    CHECK(drec("v1", XFR_K_DB_SLAVE, "kind.test.", &z, NULL));
+    const uint32_t sid0 = z.settings;
+    refresh_end(e[5], XFR_OUT_FAILED, now);
+    xfr_store_counters_t f0 = ctr();
+    refresh_end(e[5], XFR_OUT_FAILED, now + 1);
+    CHECK_EQ(ctr().state_skipped, f0.state_skipped + 1);
+    CHECK_EQ(store_set_digest(st, (uint16_t)xfr_store_vid(), k, (size_t)kn, z.serial, 0, z.digest, STORE_F_XFR, 0), 0);   /* (as if the settings had changed) */
+    xfr_store_counters_t f1 = ctr();
+    refresh_end(e[5], XFR_OUT_FAILED, now + 2);
+    CHECK_EQ(ctr().state_writes, f1.state_writes + 1);
+    CHECK(drec("v1", XFR_K_DB_SLAVE, "kind.test.", &z, NULL) && z.settings == sid0);
+  }
+  /* the reconcile's records the restart looks at (del.test: none; sid.test: another domains.id; v9z.test: its view is gone at the restart) */
+  nonstore("v1", "s1.test.", 501);
+  nonstore("v2", "s1.test.", 501);
+  nonstore("v1", "sid.test.", 999);
+  nonstore("v1", "noset.test.", 504);
+  nonstore("v1", "kind.test.", 505);
+  nonstore("v1", "bad.test.", 507);
+  nonstore("v1", "c5.test.", 508);
+  /* noset.test: its copy names settings that settings.dat does not have */
+  {
+    store_t *st = db_store_handle();
+    char k[XFR_KEY_MAX + 1];
+    const int kn = xfr_key_make("v1", XFR_K_DB_SLAVE, "noset.test.", k, sizeof(k));
+    CHECK(drec("v1", XFR_K_DB_SLAVE, "noset.test.", &z, NULL));
+    CHECK_EQ(store_set_digest(st, (uint16_t)xfr_store_vid(), k, (size_t)kn, z.serial, 0x7FFFFF, z.digest, STORE_F_XFR, 0), 0);
+  }
+  /* the delete hook: a row deleted (ZONE_DELETE) takes its copy with it at the next pass */
+  CHECK(drec("v1", XFR_K_DB_SLAVE, "gone.test.", &z, NULL));
+  db_delete(2, 0, "gone.test.", 509);
+  CHECK(drec_gone("v1", "gone.test.", 5000));
+  /* a kind change at run time: the CONSUMER entry replaces the SLAVE one, the SLAVE's copy (another identity) goes */
+  const dz_t flip = { 0, "flip.test.", 510, KDB_ZK_CATALOG };
+  db_batch(3, &flip, 1);
+  zone_db_entry_t *fe = dent("v1", "flip.test.", 0);
+  CHECK(fe && fe != e[10]);
+  CHECK(drec_gone("v1", "flip.test.", 5000));
+  /* zonestatus has the `Store:` line for a database secondary too */
+  char zs[1024];
+  rcu_aux_read_lock();
+  server_config_t *cfg = acquire_config_snapshot();
+  const size_t zl = xfr_store_zonestatus(e[0], cfg, zs, sizeof(zs));
+  release_config_snapshot(cfg);
+  rcu_aux_read_unlock();
+  CHECK(zl > 0 && strstr(zs, "Store: copy serial 10, ") != NULL);
+  damage_d("v1", "bad.test.");                                           /* (a bad checksum for the restart) */
+  db_store_stop();
+  return g_failed;
+}
+
+/* life D2: the restart, the loader away: the restore jobs (4.4), then the loader's jobs */
+static int lifed2(void) {
+  printf("[life D2: the restart without the loader; then the loader]\n");
+  rcu_aux_thread_pin();
+  if (db_life_start(false) != 0) return 1;
+  xfr_store_wait_start(5000);
+  zone_db_entry_t *s1 = dent("v1", "s1.test.", 5000), *s2 = dent("v2", "s1.test.", 5000);
+  CHECK(s1 && s2 && s1 != s2);
+  if (!s1 || !s2) return 1;
+  CHECK_EQ(served_serial(s1), 10);
+  CHECK_EQ(served_serial(s2), 11);
+  CHECK_EQ(atomic_load(&s1->serial), 10);
+  CHECK_EQ(atomic_load(&zone_x(s1)->xfr_db_sid), 501);
+  CHECK(!atomic_load(&s1->restore_pending) && s1->source == ZONE_SRC_DB && s1->is_secondary);
+  CHECK(atomic_load(&s1->last_successful_transfer) > 0);
+  zone_db_entry_t *ke = dent("v1", "kind.test.", 2000), *ce = dent("v1", "c5.test.", 2000);
+  CHECK(ke && served_serial(ke) == 15);
+  const zone_config_t *cc = ce ? atomic_load(&ce->dbcfg) : NULL;
+  CHECK(ce && cc && cc->is_catalog && served_serial(ce) == 18);
+  /* the jobs that do not make an entry: del.test (no record of the reconcile: the row went while stopped), sid.test (another domains.id: a new row of that name), noset.test (the settings
+   * are not in settings.dat: it waits for the loader), bad.test (a bad checksum: made KNOWN), v9z.test (its view takes no database zones any more: deleted by the scan) */
+  CHECK(drec_gone("v1", "del.test.", 5000));
+  CHECK(drec_gone("v1", "sid.test.", 5000));
+  CHECK(drec_gone("v9", "v9z.test.", 1000));
+  CHECK(!dent("v1", "del.test.", 0) && !dent("v1", "sid.test.", 0) && !dent("v1", "noset.test.", 0) && !dent("v1", "bad.test.", 0));
+  store_zone_t z;
+  CHECK(drec("v1", XFR_K_DB_SLAVE, "noset.test.", &z, NULL) && z.state == STORE_STATE_STORED);
+  CHECK(drec("v1", XFR_K_DB_SLAVE, "bad.test.", &z, NULL) && z.state == STORE_STATE_KNOWN);
+  CHECK(ctr().restore_bad >= 1);
+  /* the loader: its jobs find the restored entries (one entry per zone, M4 c), restore into the entry they make (noset.test, its settings come with the job), make an empty one for the
+   * KNOWN copy (bad.test), whose next up-to-date refresh puts the image whole (M2), and a kind change while stopped replaces the entry (kind.test: the SLAVE copy goes) */
+  db_hello();
+  const dz_t b2[] = { { 0, "s1.test.", 501, KDB_ZK_SECONDARY }, { 1, "s1.test.", 501, KDB_ZK_SECONDARY }, { 0, "noset.test.", 504, KDB_ZK_SECONDARY },
+                      { 0, "bad.test.", 507, KDB_ZK_SECONDARY }, { 0, "kind.test.", 505, KDB_ZK_CATALOG } };
+  db_batch(4, b2, 5);
+  CHECK(dent("v1", "s1.test.", 0) == s1 && dent("v2", "s1.test.", 0) == s2);
+  zone_db_entry_t *ne = dent("v1", "noset.test.", 0), *be = dent("v1", "bad.test.", 0);
+  CHECK(ne && served_serial(ne) == 14);
+  CHECK(be && served_serial(be) == 0);
+  if (be) {
+    install(be, 17, XFR_ORIGIN_XFR, time(NULL), 0);
+    xfr_store_counters_t u0 = ctr();
+    refresh_end(be, XFR_OUT_UPTODATE, time(NULL));
+    CHECK_EQ(ctr().puts_uptodate, u0.puts_uptodate + 1);
+    CHECK(drec("v1", XFR_K_DB_SLAVE, "bad.test.", &z, NULL) && z.state == STORE_STATE_STORED && z.serial == 17);
+  }
+  CHECK(dent("v1", "kind.test.", 0) != ke);
+  CHECK(drec_gone("v1", "kind.test.", 5000));
+  /* the copies that have their zone are kept by the GC */
+  const xfr_store_ops_t *o = atomic_load(&g_xfr_ops);
+  if (o) o->rebuilt();
+  xfr_store_wait_start(5000);
+  CHECK(drec("v1", XFR_K_DB_SLAVE, "s1.test.", &z, NULL) && drec("v2", XFR_K_DB_SLAVE, "s1.test.", &z, NULL) && drec("v1", XFR_K_DB_SLAVE, "noset.test.", &z, NULL));
+  CHECK(drec("v1", XFR_K_DB_CONSUMER, "c5.test.", &z, NULL));
+  store_check_report_t cr;
+  CHECK_EQ(store_check(db_store_handle(), &cr), 0);
+  CHECK_EQ(cr.errors, 0);
+  db_store_stop();
+  return g_failed;
+}
+
+/* life D3 (R3): the restore jobs held on the ingest thread; a pass meanwhile (a reconfiguration) keeps every `d` copy; released, they are restored */
+static _Atomic int g_dj_hold, g_dj_seen;
+static void dj_hook(const char *zone) {
+  (void)zone;
+  atomic_fetch_add(&g_dj_seen, 1);
+  for (int i = 0; i < 1000 && atomic_load(&g_dj_hold); i++) usleep(10000);         /* (bounded: 10 s) */
+}
+static int lifed3(void) {
+  printf("[life D3: the restore jobs held; the GC keeps the copies (R3)]\n");
+  rcu_aux_thread_pin();
+  atomic_store(&g_dj_hold, 1);
+  atomic_store(&db_ingest_test_xfr_job_hook, dj_hook);
+  if (db_life_start(false) != 0) return 1;
+  xfr_store_wait_start(5000);
+  for (int i = 0; i < 500 && atomic_load(&g_dj_seen) == 0; i++) usleep(10000);
+  CHECK(atomic_load(&g_dj_seen) > 0);
+  const xfr_store_ops_t *o = atomic_load(&g_xfr_ops);
+  CHECK(o != NULL);
+  if (o) o->rebuilt();                                                   /* (a reconfiguration's pass while the jobs wait) */
+  xfr_store_wait_start(5000);
+  store_zone_t z;
+  CHECK(drec("v1", XFR_K_DB_SLAVE, "s1.test.", &z, NULL) && drec("v2", XFR_K_DB_SLAVE, "s1.test.", &z, NULL) && drec("v1", XFR_K_DB_SLAVE, "noset.test.", &z, NULL));
+  CHECK(!dent("v1", "s1.test.", 0));
+  atomic_store(&g_dj_hold, 0);
+  CHECK(dent("v1", "s1.test.", 5000) != NULL && dent("v2", "s1.test.", 5000) != NULL);
+  /* noset.test has no entry (the loader is away and its settings are not known): once every job ran, the GC keeps its copy, which the reconcile's record of the zone names (it waits
+   * for the loader); after a pass with the jobs done too */
+  if (o) o->rebuilt();
+  xfr_store_wait_start(5000);
+  CHECK(drec("v1", XFR_K_DB_SLAVE, "noset.test.", &z, NULL) && !dent("v1", "noset.test.", 0));
+  CHECK(drec("v1", XFR_K_DB_SLAVE, "s1.test.", &z, NULL));
+  atomic_store(&db_ingest_test_xfr_job_hook, NULL);
+  db_store_stop();
+  return g_failed;
+}
+
 static int run_child(int (*fn)(void)) {
   fflush(stdout);
   pid_t pid = fork();
@@ -1127,6 +1551,10 @@ int main(void) {
   snprintf(g_store, sizeof(g_store), "zone-store \"%s/store8\";", g_dir);
   snprintf(g_sdir, sizeof(g_sdir), "%s/store8", g_dir);
   run_child(life8);
+  snprintf(g_dsdir, sizeof(g_dsdir), "%s/dbstore", g_dir);
+  run_child(lifed1);
+  run_child(lifed2);
+  run_child(lifed3);
   char cmd[600];
   snprintf(cmd, sizeof(cmd), "rm -rf '%s'", g_dir);
   if (system(cmd) != 0) printf("  (could not remove %s)\n", g_dir);

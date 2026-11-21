@@ -77,6 +77,7 @@ X (CONF_WIRE_CACHE_MAX_RECORDS, "conf.wire-cache.max-records", 'E', "wire-cache-
 X (CONF_CONTROL_CHANNEL_PLACEMENT, "conf.control-channel.placement", 'E', "control-channel is written inside options { }")
 X (CONF_CONTROL_CHANNEL_OPTION, "conf.control-channel.option", 'E', "an unknown option in control-channel { }")
 X (CONF_VIEW_NAME_LENGTH, "conf.view.name-length", 'E', "a view name is too long")
+X (CONF_VIEW_NAME_RESERVED, "conf.view.name-reserved", 'E', "a view has the name the zone store keeps the secondaries' copies under (_karidns-xfr)")
 X (CONF_VIEW_DUPLICATE, "conf.view.duplicate", 'E', "a view is defined twice")
 
 /* ---- conf: the checks of karicheck on a parsed configuration (tools/karicheck.c) ---- */

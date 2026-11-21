@@ -1241,6 +1241,13 @@ bool zone_restore_pending_clear(zone_db_entry_t *e) {
   atomic_fetch_sub_explicit(&g_xfr_pending, 1, memory_order_relaxed);
   return true;
 }
+/* 0.7 P3 (secondary store 3.3): a database secondary or catalog consumer left the registry (its row was deleted or renamed, its kind changed): the restore thread is asked for a pass, whose GC
+ * deletes the copy that has no zone any more.  Called with no lock held (the hook only enqueues; nothing of the store is done here) */
+static inline bool dbreg_entry_is_db_secondary(const zone_db_entry_t *e) { return e && e->source == ZONE_SRC_DB && e->is_secondary; }
+static void dbreg_db_secondary_gone(void) {
+  const xfr_store_ops_t *xo = atomic_load_explicit(&g_xfr_ops, memory_order_acquire);
+  if (xo && xo->db_gone) xo->db_gone();
+}
 
 uint32_t zone_secondary_stale_max(const server_config_t *cfg, const zone_config_t *zcfg, const char *view) {
   zone_veff_t v;
@@ -4018,6 +4025,7 @@ static int dbreg_commit_x(const char *view, const char *name, zone_db_entry_t *e
     bool sh_cfg = dbreg_config_shadows(view, name);
     int rc = -1;
     zdir_gent_t *gent = NULL;
+    bool gone_sec = false;                                          /* (0.7 P3: a database secondary is replaced: the GC of its copy, after the lock) */
     pthread_mutex_lock(&g_zone_db_rebuild_lock);
     bool sh_cat = !sh_cfg && dbreg_catalog_member_locked(view, name);
     bool sh = sh_cfg || sh_cat;
@@ -4061,6 +4069,7 @@ static int dbreg_commit_x(const char *view, const char *name, zone_db_entry_t *e
          * entry's reference is given back when the readers that may have it are gone, and the delta looks at it (a catalog consumer
          * that is replaced takes its members with it). */
         gent->entry = cur;
+        gone_sec = dbreg_entry_is_db_secondary(cur);
         gent->sh_old = NULL;
         gent->apex_old = NULL;
         gent->served = in_index;
@@ -4122,6 +4131,7 @@ static int dbreg_commit_x(const char *view, const char *name, zone_db_entry_t *e
 out:
     pthread_mutex_unlock(&g_zone_db_rebuild_lock);
     free(gent);
+    if (gone_sec) dbreg_db_secondary_gone();
     if (shadowed) *shadowed = sh;
     if (created && atomic_load_explicit(&g_cache_limit, memory_order_relaxed)) cache_peak_note();
     return rc;
@@ -4283,6 +4293,24 @@ zone_db_entry_t *dbreg_lookup_entry(const char *view, const char *name) {
     }
     pthread_mutex_unlock(&g_zone_db_rebuild_lock);
     return e;
+}
+
+bool dbreg_db_secondary_of(const char *view, const char *name, bool *catalog, int64_t *source_id) {
+    bool ok = false;
+    pthread_mutex_lock(&g_zone_db_rebuild_lock);
+    dbreg_view_t *rv = dbreg_view_get(view, false);
+    dbreg_zone_t *z = rv ? dbreg_find(rv, name, zdir_name_hash(name)) : NULL;
+    zone_db_entry_t *e = z ? zdir_entry(z) : NULL;
+    if (dbreg_entry_is_db_secondary(e)) {                     /* (the registry holds the entry's reference: it is not freed while the lock is held) */
+        rcu_aux_read_lock();                                  /* (a swap of the settings block retires the old one after a grace period) */
+        const zone_config_t *dc = atomic_load_explicit(&e->dbcfg, memory_order_acquire);
+        if (catalog) *catalog = dc && dc->is_catalog;
+        rcu_aux_read_unlock();
+        if (source_id) *source_id = z->source_id;
+        ok = true;
+    }
+    pthread_mutex_unlock(&g_zone_db_rebuild_lock);
+    return ok;
 }
 
 /* The ingest thread takes the entry of a zone to install a new version into it (a long time: the zone is built and published meanwhile).  The
@@ -5992,12 +6020,17 @@ int dbreg_delete(const char *view, const char *name, int64_t source_id) {
     int rc = 0;
     if (dbdir()) {                                                            /* 0.7 S3: a zone of the store (a zone of the heap directory is looked for below) */
         const int sr = dbreg_delete_store(view, name, source_id);
-        if (sr) return sr;
+        if (sr < 0) return sr;
+        /* 0.7 P3: a record that was deleted may have been the reconcile's memory of a secondary or catalog consumer (STORE_F_NONSTORE), whose zone is an element of the heap directory:
+         * that goes too (below).  Returning here left the zone served after its row was deleted, and its copy in the store for ever */
+        if (sr > 0) rc = 1;
     }
+    bool gone_sec = false;                                                   /* (0.7 P3: a database secondary leaves: the GC of its copy, after the lock) */
     pthread_mutex_lock(&g_zone_db_rebuild_lock);
     dbreg_view_t *rv = dbreg_view_get(view, false);
     dbreg_zone_t *z = rv ? dbreg_find(rv, name, zdir_name_hash(name)) : NULL;
     if (z && (source_id == 0 || z->source_id == source_id)) {      /* (0.7 WP7b: source id 0 is a delete by name: the loader found no such zone in the database) */
+        gone_sec = dbreg_entry_is_db_secondary(zdir_entry(z));
         /* An element that is in the index, or waits in the queue of additions, leaves the index with the next delta; any other
          * one only older snapshots can have (a rebuild hid it): it goes to the garbage at once.  Never freed here: the readers of
          * an older snapshot can have found it in the shared directory. */
@@ -6018,6 +6051,7 @@ int dbreg_delete(const char *view, const char *name, int64_t source_id) {
         }
     }
     pthread_mutex_unlock(&g_zone_db_rebuild_lock);
+    if (rc == 1 && gone_sec) dbreg_db_secondary_gone();
     return rc;
 }
 

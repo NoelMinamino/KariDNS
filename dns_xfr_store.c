@@ -16,6 +16,8 @@
 #include <unistd.h>
 
 #include "dns_catalog_zone.h"
+#include "dns_db_ingest.h"
+#include "dns_db_store.h"
 #include "dns_epoch_rcu.h"
 #include "dns_log.h"
 #include "dns_server_internal.h"
@@ -74,6 +76,9 @@ static struct {
   _Atomic uint64_t restored, restored_expired, file_won, restore_bad, restore_identity, restore_ms, restore_timeouts, gc_deleted;
   /* D9 */
   _Atomic uint64_t stale_capped, expire_events, expired_zones;
+  /* P3 (R3): the restore jobs of the `d` copies the start gave the ingest thread, the ones that ran; dbj_hold: one could not be given (the `d` copies are kept this run) */
+  _Atomic uint64_t dbj_posted, dbj_done;
+  _Atomic bool dbj_hold;
 } X = { .mu = PTHREAD_MUTEX_INITIALIZER, .cv = PTHREAD_COND_INITIALIZER, .zmu = PTHREAD_MUTEX_INITIALIZER, .vid = -1 };
 
 #ifdef KARIDNS_UNIT_TEST
@@ -238,15 +243,55 @@ typedef struct {
   bool has_file;
   xfr_eff_t eff;
   uint32_t view_tag;
+  bool db;                                            /* a database secondary or catalog consumer (kind 4 / 5, P3) */
+  uint32_t settings;                                  /* ... the id of its settings in settings.dat (2.1: the record's settings), set by the writes after a refresh, outside the read section */
 } xinfo_t;
 
+static void note_unstorable(const zone_db_entry_t *e, const char *why) {
+  atomic_fetch_add_explicit(&X.unstorable, 1, memory_order_relaxed);
+  if (!atomic_exchange_explicit(&X.unstorable_logged, 1, memory_order_relaxed))
+    syslog(LOG_NOTICE, "[Store] secondary zone '%s' (view '%s') is not kept in the zone store: %s (it is kept in memory only, as before; xfr.unstorable)", e->domain, zone_vname(e), why);
+}
+
 /* The key, the identity and the primaries digest of the entry, from the configuration in force.  Inside an RCU read section (the configuration and the snapshot are
- * read).  false: not a zone this module stores (a database secondary: P3; no name the store can hold). */
+ * read).  false: not a zone this module stores (no name the store can hold; a database secondary whose domains.id is not known yet). */
 static bool entry_info(zone_db_entry_t *e, const server_config_t *cfg, zone_db_snapshot_t *snap, xinfo_t *xi) {
   memset(xi, 0, sizeof(*xi));
-  if (!e || !e->is_secondary || e->source == ZONE_SRC_DB) return false;
+  if (!e || !e->is_secondary) return false;
   const char *view = zone_vname(e);
   if (view_nokey(view)) return false;                  /* (2.2: the view's tag is another view's: not persisted; the WARNING is the config check's) */
+  if (e->source == ZONE_SRC_DB) {
+    /* P3 (3.3): a database secondary (SLAVE, kind 4) or catalog consumer (CONSUMER, kind 5).  Its kind is the one of its own settings block (dbcfg; the received settings of B8t-2 do not make a
+     * zone a catalog), its identity has the domains.id of its row (R1: the record's source id stays 0), its primaries are those the transfer asks (zone_entry_config(): dbcfg, or rxcfg) */
+    const zone_config_t *dc = atomic_load_explicit(&e->dbcfg, memory_order_acquire);
+    const zone_x_t *dx = zone_x(e);
+    const int64_t sid = dx ? atomic_load_explicit(&((zone_x_t *)dx)->xfr_db_sid, memory_order_acquire) : 0;
+    if (!dc || sid == 0) return false;                 /* (an entry the ingest thread has not given its domain id: not stored until it has, the next refresh) */
+    if (!db_store_name_ok(e->domain)) {                /* (W12: the root zone and the names the store cannot name in a database view live in the heap directory only, un_apply()) */
+      note_unstorable(e, "the zone store cannot name it in a database view");
+      return false;
+    }
+    const zone_config_t *tcfg = zone_entry_config((server_config_t *)cfg, e);
+    xi->db = true;
+    xi->kind = dc->is_catalog ? XFR_K_DB_CONSUMER : XFR_K_DB_SLAVE;
+    xi->view_tag = xfr_view_tag(view);
+    uint32_t pd = 0;
+    if (tcfg) {
+      const zone_ext_t *x = zext(tcfg);
+      for (int i = 0; i < x->masters_count; i++)
+        if (x->masters[i].ip) pd = xfr_primaries_add(pd, x->masters[i].ip, x->masters[i].port, x->masters[i].key);
+      pd = xfr_primaries_add(pd, "", 0, x->tsig_key);
+    }
+    xi->primaries = pd;
+    xfr_opts_effective(cfg, tcfg, view, &xi->eff);
+    xi->identity = xfr_identity(xi->kind, e->domain, view, NULL, sid);
+    xi->klen = xfr_key_make(view, xi->kind, e->domain, xi->key, sizeof(xi->key));
+    if (xi->klen < 0) {
+      note_unstorable(e, "its name is longer than 245 octets");
+      return false;
+    }
+    return true;
+  }
   const zone_config_t *zcfg = e->is_catalog_member ? NULL : zone_entry_config((server_config_t *)cfg, e);
   xi->kind = e->is_catalog_member ? XFR_K_MEMBER : (zcfg && zcfg->is_catalog) ? XFR_K_CATALOG : XFR_K_CONFIG;
   xi->has_file = zcfg && zcfg->file;
@@ -276,10 +321,7 @@ static bool entry_info(zone_db_entry_t *e, const server_config_t *cfg, zone_db_s
   xi->identity = xfr_identity(xi->kind, e->domain, view, zone_entry_catalog_uid(e), 0);
   xi->klen = xfr_key_make(view, xi->kind, e->domain, xi->key, sizeof(xi->key));
   if (xi->klen < 0) {
-    atomic_fetch_add_explicit(&X.unstorable, 1, memory_order_relaxed);
-    if (!atomic_exchange_explicit(&X.unstorable_logged, 1, memory_order_relaxed))
-      syslog(LOG_NOTICE, "[Store] secondary zone '%s' (view '%s') is not kept in the zone store: its name is longer than %d octets (it is kept in memory only, as before; xfr.unstorable)",
-             e->domain, view, XFR_KEY_ZONE_MAX);
+    note_unstorable(e, "its name is longer than 245 octets");
     return false;
   }
   return true;
@@ -296,8 +338,9 @@ static bool entry_info_now(zone_db_entry_t *e, xinfo_t *xi) {
   return ok;
 }
 
-/* M6: is the entry still the one the snapshot has for its view and zone? */
+/* M6: is the entry still the one the snapshot has for its view and zone?  A database secondary: the one the registry has (it is registered before the snapshot shows it; 3.1) */
 static bool entry_current(zone_db_entry_t *e) {
+  if (e->source == ZONE_SRC_DB) return dbreg_lookup_entry(zone_vname(e), e->domain) == e;     /* (compared, never dereferenced) */
   rcu_aux_read_lock();
   zone_db_snapshot_t *snap = acquire_zone_snapshot();
   view_snapshot_t *vs = snap ? snapshot_find_view(snap, zone_vname(e)) : NULL;
@@ -420,6 +463,7 @@ static int put_image(store_t *st, uint16_t vid, zone_db_entry_t *e, const xinfo_
   memset(&m, 0, sizeof(m));
   m.flags = img_flags(p.v->image);
   m.serial = p.serial;
+  m.settings = xi->settings;                            /* (P3, 2.1: a database secondary names its settings, so that the restore needs no loader; else 0) */
   m.stamp_time = (uint64_t)time(NULL);                  /* the save time of these bytes (D7) */
   xfr_state_encode(&s, m.digest);
 #ifdef KARIDNS_TEST_EVICT
@@ -468,7 +512,7 @@ static int put_state(store_t *st, uint16_t vid, const xinfo_t *xi, uint32_t expe
     const int ur = xs_unbulk(st);
     if (ur < 0) return ur;
   }
-  const int r = store_set_digest(st, vid, xi->key, (size_t)xi->klen, expect_serial, 0, dg, STORE_F_XFR, 0);
+  const int r = store_set_digest(st, vid, xi->key, (size_t)xi->klen, expect_serial, xi->settings, dg, STORE_F_XFR, 0);
   if (r == 0) atomic_fetch_add_explicit(&X.state_writes, 1, memory_order_relaxed);
   else if (r == -ESTALE || r == -ENOENT) atomic_fetch_add_explicit(&X.state_stale, 1, memory_order_relaxed);       /* (replaced or gone meanwhile: the next outcome writes again) */
   else atomic_fetch_add_explicit(&X.put_errors, 1, memory_order_relaxed);
@@ -489,6 +533,7 @@ static void after_refresh_pinned(store_t *st, uint16_t vid16, zone_db_entry_t *e
   const int vid = vid16;
   xinfo_t xi;
   if (!entry_info_now(e, &xi)) return;
+  if (xi.db) xi.settings = db_store_settings_id_of(e);  /* (P3: may append the text to settings.dat once; outside any read section, no lock held) */
   if (outcome != XFR_OUT_NONE && store_bulk_pending(st)) {              /* (0.7: put off until the end of the unlogged fill is on disk, xs_unbulk(); the restore thread's pass writes it) */
     zone_x_t *const x = zone_x_need(e);                                  /* (a secondary has its extension from the start; no memory: the write waits for the next refresh) */
     if (x) {
@@ -534,7 +579,8 @@ static void after_refresh_pinned(store_t *st, uint16_t vid16, zone_db_entry_t *e
       upd = old;
       upd.flags |= XFR_SF_FAILED;
       upd.last_attempt = attempt_at > 0 ? (uint32_t)attempt_at : 0;
-      if (xfr_failure_skip(&old, &upd, time(NULL), atomic_load_explicit(&e->retry, memory_order_relaxed)))
+      /* (P3: a database secondary whose settings changed writes the new id even when nothing else did) */
+      if (z.settings == xi.settings && xfr_failure_skip(&old, &upd, time(NULL), atomic_load_explicit(&e->retry, memory_order_relaxed)))
         atomic_fetch_add_explicit(&X.state_skipped, 1, memory_order_relaxed);
       else
         wrote = put_state(st, (uint16_t)vid, &xi, z.serial, &upd) == 0;
@@ -776,11 +822,65 @@ static bool hset_has(const hset_t *s, uint64_t h) {
   return false;
 }
 
-static uint64_t gc_run(store_t *st, uint16_t vid, const hset_t *cur, const hset_t *exempt, bool cur_ok) {
+/* ---- P3: the database secondaries (3.3, 4.4, 5) ---- */
+
+/* the database views of the configuration, by store tag (a view whose tag is an earlier view's is left out: its zones are not persisted, 2.2) */
+#define XFR_DBV_MAX XFR_NOKEY_MAX
+typedef struct { uint32_t tag; char name[KARIDNS_VIEW_NAME_MAX]; } dbv_t;
+typedef struct { dbv_t v[XFR_DBV_MAX]; int n; bool db; } dbvs_t;
+static void dbvs_of(const server_config_t *cfg, dbvs_t *o) {
+  o->n = 0;
+  o->db = cfg && cfg->database.enabled;
+  for (const view_config_t *v = o->db ? cfg->views : NULL; v && o->n < XFR_DBV_MAX; v = v->next) {
+    if (v->database_none || !v->name || view_nokey(v->name)) continue;
+    o->v[o->n].tag = xfr_view_tag(v->name);
+    snprintf(o->v[o->n].name, sizeof(o->v[o->n].name), "%s", v->name);
+    o->n++;
+  }
+}
+static const char *dbvs_find(const dbvs_t *o, uint32_t tag) {
+  for (int i = 0; i < o->n; i++)
+    if (o->v[i].tag == tag) return o->v[i].name;
+  return NULL;
+}
+
+/* R3: the copies of the database secondaries are exempt from the GC until every restore job of the start (4.4) has run on the ingest thread */
+static bool db_gc_open(void) {
+  return !atomic_load_explicit(&X.dbj_hold, memory_order_acquire) &&
+         atomic_load_explicit(&X.dbj_done, memory_order_acquire) >= atomic_load_explicit(&X.dbj_posted, memory_order_acquire);
+}
+
+/* Is the `d` copy (tag, zone, state) of a zone of the database?  It is when the registry has a database secondary of its identity (the same kind and domains.id), or, when the registry has
+ * no zone of the name (the loader has not sent it yet: its restore waits for the loader, 4.4), when the reconcile's record of the zone names the copy's domains.id.  A view that is no
+ * database view any more, another zone of the name (a primary, another kind or row), or neither: no */
+static bool db_copy_current(const dbvs_t *dv, uint32_t tag, const char *zone, const xfr_state_t *s) {
+  const char *view = dbvs_find(dv, tag);
+  bool cat = false;
+  int64_t sid = 0;
+  if (!view) return false;
+  if (dbreg_db_secondary_of(view, zone, &cat, &sid)) return xfr_identity(cat ? XFR_K_DB_CONSUMER : XFR_K_DB_SLAVE, zone, view, NULL, sid) == s->identity;
+  if (dbreg_lookup_entry(view, zone)) return false;
+  return db_store_nonstore_sid(view, zone, &sid) && xfr_identity(s->kind, zone, view, NULL, sid) == s->identity;
+}
+
+/* one record goes (the GC) */
+static bool gc_delete(store_t *st, uint16_t vid, const char *name, size_t kl, uint32_t zid) {
+  if (xs_unbulk(st) != 0 || store_delete_name(st, vid, name, kl) != 0) return false;
+  zs_del(zid);
+  return true;
+}
+
+/* consok: the keys of the database catalog consumers that are registered and have refreshed since the start; exempt gets the view tag (+ 1) of every other consumer whose copy is found */
+static uint64_t gc_run(store_t *st, uint16_t vid, const hset_t *cur, hset_t *exempt, const hset_t *consok, bool cur_ok, const dbvs_t *dv) {
   if (!cur_ok || !atomic_load_explicit(&X.zs_built, memory_order_acquire)) return 0;      /* (a set that could not be made completely deletes nothing) */
   zbits_t b;
   if (!zs_copy(&b)) return 0;
   uint64_t deleted = 0;
+  /* (P3: the members' copies are judged after the walk: a database catalog consumer whose own copy is seen in it and that has not refreshed (not restored yet: its restore job, or the
+   * loader, makes it later) keeps its view's members, M6 per view.  Before P3 a member of a database consumer lost its copy at the first pass of a start, when no consumer existed yet) */
+  typedef struct { uint32_t zid, tag; } gcm_t;
+  gcm_t *mem = NULL;
+  size_t nm = 0, mcap = 0;
   for (size_t w = 0; w < b.nw; w++) {
     for (uint64_t bits = b.w[w]; bits; bits &= bits - 1) {
       const uint32_t zid = (uint32_t)(w * 64 + (size_t)__builtin_ctzll(bits));
@@ -799,16 +899,40 @@ static uint64_t gc_run(store_t *st, uint16_t vid, const hset_t *cur, const hset_
       if (xfr_key_parse(z.name, kl, &tag, &kc, zone, sizeof(zone)) != 0) continue;      /* (not a key of this module: left alone) */
       xfr_state_t s;
       const bool sok = xfr_state_decode(z.digest, sizeof(z.digest), &s) == 0;
-      if (sok && (s.kind == XFR_K_DB_SLAVE || s.kind == XFR_K_DB_CONSUMER)) continue;      /* (R3: the database secondaries are P3's: never deleted here) */
-      if (sok && s.kind == XFR_K_MEMBER && hset_has(exempt, (uint64_t)tag + 1)) continue;   /* (M6: a catalog of that view has not refreshed since the start) */
-      if (xs_unbulk(st) == 0 && store_delete_name(st, vid, z.name, kl) == 0) {
-        zs_del(zid);
-        deleted++;
+      /* P3 (5, R3): a `d` copy goes when no database secondary of its identity is registered, once every restore job of the start has run (a copy whose restore has not run yet is kept) */
+      if (sok && s.kind == XFR_K_DB_CONSUMER && kc == 'd' && !hset_has(consok, key_hash(z.name, kl)) && !hset_add(exempt, (uint64_t)tag + 1)) {
+        free(mem);                                    /* (no memory for the exemption: nothing more is deleted this pass) */
+        free(b.w);
+        return deleted;
       }
+      if (sok && (s.kind == XFR_K_DB_SLAVE || s.kind == XFR_K_DB_CONSUMER) && (kc != 'd' || !db_gc_open() || db_copy_current(dv, tag, zone, &s))) continue;
+      if (sok && s.kind == XFR_K_MEMBER) {
+        if (nm == mcap) {
+          const size_t nc = mcap ? mcap * 2 : 64;
+          gcm_t *nmem = realloc(mem, nc * sizeof(*nmem));
+          if (!nmem) continue;                        /* (no memory: the member is kept) */
+          mem = nmem;
+          mcap = nc;
+        }
+        mem[nm++] = (gcm_t){ zid, tag };
+        continue;
+      }
+      if (gc_delete(st, vid, z.name, kl, zid)) deleted++;
       progress_stamp();
     }
   }
   free(b.w);
+  for (size_t i = 0; i < nm; i++) {
+    if (hset_has(exempt, (uint64_t)mem[i].tag + 1)) continue;                             /* (M6: a catalog of that view has not refreshed since the start) */
+    store_zone_t z;
+    store_read_lock();
+    const int gr = store_zone_get(st, mem[i].zid, &z);
+    store_read_unlock();
+    if (gr != 0 || z.view != vid || z.state == STORE_STATE_FREE || hset_has(cur, key_hash(z.name, strlen(z.name)))) continue;     /* (it changed meanwhile: the next pass) */
+    if (gc_delete(st, vid, z.name, strlen(z.name), mem[i].zid)) deleted++;
+    progress_stamp();
+  }
+  free(mem);
   if (deleted) atomic_fetch_add_explicit(&X.gc_deleted, deleted, memory_order_relaxed);
   return deleted;
 }
@@ -821,11 +945,14 @@ static uint64_t pass_run(void) {
   if (!snap) return 0;
   zone_db_entry_t **pend = NULL, **retry = NULL;
   size_t np = 0, cap = 0, nr = 0, rcap = 0;
-  hset_t cur = { 0 }, exempt = { 0 };
+  hset_t cur = { 0 }, exempt = { 0 }, consok = { 0 };
   bool cur_ok = true;
   rcu_aux_read_lock();
   server_config_t *cfg = acquire_config_snapshot();
   (void)xfr_store_config_check(cfg);                  /* (2.2: first, so that the keys of this pass are the ones of the configuration in force) */
+  dbvs_t *dv = calloc(1, sizeof(*dv));                 /* (P3: the database views of this configuration, for the GC of the `d` copies) */
+  if (dv) dbvs_of(cfg, dv);
+  else cur_ok = false;
   for (size_t v = 0; v < snap->view_count; v++) {
     size_t count = 0;
     zdir_elem_t *const *list = zdir_tick_list(&snap->views[v], &count);
@@ -836,14 +963,20 @@ static uint64_t pass_run(void) {
         /* (a database catalog consumer that has not refreshed keeps its members' copies too: M6 per view) */
         const zone_config_t *dz = zone_entry_config((server_config_t *)cfg, e);
         if (dz && dz->is_catalog && !atomic_load_explicit(&zone_xr(e)->xfr_refreshed, memory_order_acquire)) cur_ok = hset_add(&exempt, (uint64_t)xfr_view_tag(zone_vname(e)) + 1) && cur_ok;
-        continue;
-      }
-      xinfo_t xi;
-      /* (an entry with no key, a name too long or a view whose tag collides, is not in the set; its pending bit is cleared by the restore like any other: RS_NOINFO) */
-      if (entry_info(e, cfg, snap, &xi)) {
-        cur_ok = hset_add(&cur, key_hash(xi.key, (size_t)xi.klen)) && cur_ok;
-        if (xi.kind == XFR_K_CATALOG && !atomic_load_explicit(&zone_xr(e)->xfr_refreshed, memory_order_acquire))
-          cur_ok = hset_add(&exempt, (uint64_t)xi.view_tag + 1) && cur_ok;
+        else if (dz && dz->is_catalog) {               /* (a consumer that refreshed: its copy, which the walk of the GC sees, does not hold its view's members) */
+          char ck[XFR_KEY_MAX + 1];
+          const int cl = xfr_key_make(zone_vname(e), XFR_K_DB_CONSUMER, e->domain, ck, sizeof(ck));
+          if (cl > 0) cur_ok = hset_add(&consok, key_hash(ck, (size_t)cl)) && cur_ok;
+        }
+        /* (P3: its own copy is judged by the registry in the GC, db_copy_current(); a write of it that was put off is retried below) */
+      } else {
+        xinfo_t xi;
+        /* (an entry with no key, a name too long or a view whose tag collides, is not in the set; its pending bit is cleared by the restore like any other: RS_NOINFO) */
+        if (entry_info(e, cfg, snap, &xi)) {
+          cur_ok = hset_add(&cur, key_hash(xi.key, (size_t)xi.klen)) && cur_ok;
+          if (xi.kind == XFR_K_CATALOG && !atomic_load_explicit(&zone_xr(e)->xfr_refreshed, memory_order_acquire))
+            cur_ok = hset_add(&exempt, (uint64_t)xi.view_tag + 1) && cur_ok;
+        }
       }
       if (atomic_load_explicit(&zone_xr(e)->xfr_store_retry, memory_order_acquire) != 0) {     /* (0.7: a store write that waited for the end of an unlogged fill) */
         if (nr == rcap) {
@@ -881,19 +1014,23 @@ static uint64_t pass_run(void) {
     if (outcome != 0) after_refresh_pinned(st, (uint16_t)vid, e, outcome, atomic_load_explicit(&x->xfr_store_retry_at, memory_order_relaxed));
   }
   free(retry);
-  const uint64_t del = gc_run(st, (uint16_t)vid, &cur, &exempt, cur_ok);
+  const uint64_t del = dv ? gc_run(st, (uint16_t)vid, &cur, &exempt, &consok, cur_ok, dv) : 0;
+  free(consok.h);
+  free(dv);
   free(cur.h);
   free(exempt.h);
   release_zone_snapshot(snap);
   return del;
 }
 
+static void db_start_scan(store_t *st, uint16_t vid);
 static void *restore_thread(void *arg) {
   (void)arg;
   rcu_aux_thread_pin();
   store_t *st = atomic_load_explicit(&X.st, memory_order_acquire);
   const int vid = xfr_store_vid();
   if (st && vid >= 0) zs_build(st, (uint16_t)vid);
+  if (st && vid >= 0) db_start_scan(st, (uint16_t)vid);     /* (P3, 4.4: the copies of the database secondaries, restored by jobs of the ingest thread) */
 #ifdef KARIDNS_TEST_EVICT
   /* (the thread is stalled with entries pending, and makes no progress: the tick's skip of pending entries and the 30 s safety net are tested with it) */
   for (unsigned waited = 0; X.hold_ms && waited < X.hold_ms && !X.stop; waited += 50) usleep(50000);
@@ -945,7 +1082,130 @@ static void ask_pass(void) {
   pthread_mutex_unlock(&X.mu);
 }
 
-static const xfr_store_ops_t g_ops = { .after_refresh = after_refresh, .rebuilt = ask_pass };
+/* P3: a database secondary left the registry (dbreg_delete(), a replacing entry): a pass, whose GC deletes its copy (5).  The hook only asks; the pass is shared by the hooks that come meanwhile */
+static void db_gone(void) {
+  pthread_mutex_lock(&X.mu);
+  X.req_gen++;
+  pthread_cond_broadcast(&X.cv);
+  pthread_mutex_unlock(&X.mu);
+}
+
+static const xfr_store_ops_t g_ops = { .after_refresh = after_refresh, .rebuilt = ask_pass, .db_gone = db_gone };
+
+/* ------------------------------------------------------------------------------------------------------------- */
+/* P3: the database secondaries (4.4: their copies are restored by jobs of the ingest thread, without the loader)  */
+/* ------------------------------------------------------------------------------------------------------------- */
+
+/* The restore thread's start: every stored `d` copy of the reserved view gets a restore job on the ingest thread (dns_db_ingest.c), which makes the zone's entry from the copy when the reconcile's
+ * record of the zone (its domains.id) agrees with the copy's identity; the jobs and job_execute_secondary() run on that one thread, so a zone never gets two entries (M4 c).  A copy of a view that is
+ * no database view any more (the database block or the view was removed) has no zone it could be restored into: it is deleted.  A KNOWN copy (its image was found damaged) is not restored: the
+ * loader's job makes the entry and its refresh stores the copy again. */
+static void db_start_scan(store_t *st, uint16_t vid) {
+  zbits_t b;
+  dbvs_t *dv = calloc(1, sizeof(*dv));
+  if (!dv || !zs_copy(&b)) {
+    free(dv);
+    atomic_store_explicit(&X.dbj_hold, true, memory_order_release);       /* (no memory: the `d` copies are not restored and stay exempt from the GC for this run) */
+    return;
+  }
+  rcu_aux_read_lock();
+  server_config_t *cfg = acquire_config_snapshot();
+  dbvs_of(cfg, dv);
+  release_config_snapshot(cfg);
+  rcu_aux_read_unlock();
+  uint64_t posted = 0, dropped = 0;
+  for (size_t w = 0; w < b.nw; w++) {
+    for (uint64_t bits = b.w[w]; bits; bits &= bits - 1) {
+      const uint32_t zid = (uint32_t)(w * 64 + (size_t)__builtin_ctzll(bits));
+      store_zone_t z;
+      store_read_lock();
+      const int gr = store_zone_get(st, zid, &z);
+      store_read_unlock();
+      if (gr != 0 || z.view != vid || z.state != STORE_STATE_STORED || !(z.flags & STORE_F_XFR)) continue;
+      const size_t kl = strlen(z.name);
+      uint32_t tag = 0;
+      char kc = 0, zone[STORE_NAME_MAX + 2];
+      xfr_state_t s;
+      if (xfr_key_parse(z.name, kl, &tag, &kc, zone, sizeof(zone)) != 0 || kc != 'd' || xfr_state_decode(z.digest, sizeof(z.digest), &s) != 0 ||
+          (s.kind != XFR_K_DB_SLAVE && s.kind != XFR_K_DB_CONSUMER))
+        continue;
+      const char *view = dbvs_find(dv, tag);
+      if (!view) {
+        rec_delete(st, vid, z.name, kl, zid);
+        atomic_fetch_add_explicit(&X.gc_deleted, 1, memory_order_relaxed);
+        dropped++;
+        continue;
+      }
+      atomic_fetch_add_explicit(&X.dbj_posted, 1, memory_order_acq_rel);
+      if (!db_ingest_xfr_restore_post(view, zone)) {
+        atomic_fetch_sub_explicit(&X.dbj_posted, 1, memory_order_acq_rel);
+        atomic_store_explicit(&X.dbj_hold, true, memory_order_release);   /* (no memory for the job: the copy waits for the loader's job, and no `d` copy is deleted this run) */
+      } else {
+        posted++;
+      }
+      progress_stamp();
+    }
+  }
+  free(b.w);
+  free(dv);
+  if (posted || dropped)
+    syslog(LOG_INFO, "[Store] secondaries: %" PRIu64 " stored copy(ies) of database secondaries are restored by the ingest thread, %" PRIu64 " of a view that takes no database zones deleted",
+           posted, dropped);
+}
+
+void xfr_store_db_job_done(void) {
+  const uint64_t d = atomic_fetch_add_explicit(&X.dbj_done, 1, memory_order_acq_rel) + 1;
+  if (d >= atomic_load_explicit(&X.dbj_posted, memory_order_acquire)) db_gone();   /* (the last one: the GC may judge the `d` copies now, R3) */
+}
+
+/* the `d` copy of (view, zone): STORED, of this module, its state readable and of a database kind */
+bool xfr_store_db_copy(const char *view, const char *zone, int *kind, uint32_t *settings, uint64_t *identity) {
+  store_t *st = atomic_load_explicit(&X.st, memory_order_acquire);
+  const int vid = xfr_store_vid();
+  char k[XFR_KEY_MAX + 1];
+  const int kl = xfr_key_make(view, XFR_K_DB_SLAVE, zone, k, sizeof(k));
+  if (!st || vid < 0 || kl < 0) return false;
+  store_zone_t z;
+  store_read_lock();
+  const uint32_t zid = store_find(st, (uint16_t)vid, k, (size_t)kl);
+  const bool got = zid != STORE_NONE && store_zone_get(st, zid, &z) == 0;
+  store_read_unlock();
+  xfr_state_t s;
+  if (!got || z.state != STORE_STATE_STORED || !(z.flags & STORE_F_XFR) || xfr_state_decode(z.digest, sizeof(z.digest), &s) != 0 ||
+      (s.kind != XFR_K_DB_SLAVE && s.kind != XFR_K_DB_CONSUMER))
+    return false;
+  *kind = s.kind;
+  *settings = z.settings;
+  *identity = s.identity;
+  return true;
+}
+
+/* the `d` copy of (view, zone) is of no zone any more (4.4: the row was deleted, renamed or purged while the server was stopped): deleted when it is still the copy of that identity */
+void xfr_store_db_copy_drop(const char *view, const char *zone, uint64_t identity) {
+  store_t *st = atomic_load_explicit(&X.st, memory_order_acquire);
+  const int vid = xfr_store_vid();
+  char k[XFR_KEY_MAX + 1];
+  const int kl = xfr_key_make(view, XFR_K_DB_SLAVE, zone, k, sizeof(k));
+  if (!st || vid < 0 || kl < 0) return;
+  store_zone_t z;
+  store_read_lock();
+  const uint32_t zid = store_find(st, (uint16_t)vid, k, (size_t)kl);
+  const bool got = zid != STORE_NONE && store_zone_get(st, zid, &z) == 0;
+  store_read_unlock();
+  xfr_state_t s;
+  if (!got || xfr_state_decode(z.digest, sizeof(z.digest), &s) != 0 || s.identity != identity) return;
+  rec_delete(st, (uint16_t)vid, k, (size_t)kl, z.zid);
+  atomic_fetch_add_explicit(&X.restore_identity, 1, memory_order_relaxed);
+  syslog(LOG_INFO, "[Store] the stored copy of database secondary zone '%s' (view '%s') is of no zone of the database now (the row was deleted, renamed or purged while the server was stopped): it is deleted",
+         zone, view);
+}
+
+/* 4.4 / 3.3: the copy restored into a database secondary's new entry, before the ingest thread registers it (no tick, no transfer and no query can reach the entry yet, so it needs no
+ * restore_pending).  The caller is the ingest thread (pinned in the auxiliary RCU, holding no lock); xfr_db_sid of the entry is set.  true: the copy is installed */
+bool xfr_store_db_restore(zone_db_entry_t *e) {
+  if (!e || e->source != ZONE_SRC_DB || !e->is_secondary || !xfr_store_active()) return false;
+  return restore_do(e) == RS_RESTORED;
+}
 
 /* ------------------------------------------------------------------------------------------------------------- */
 /* the core                                                                                                        */
@@ -1096,7 +1356,7 @@ size_t xfr_store_zonestatus(zone_db_entry_t *e, const server_config_t *cfg, char
   const int vid = xfr_store_vid();
   if (atomic_load_explicit(&e->restore_pending, memory_order_acquire)) {
     APP("Store: restore pending\n");
-  } else if (!st || vid < 0 || e->source == ZONE_SRC_DB) {
+  } else if (!st || vid < 0) {
     APP("Store: off\n");
   } else {
     xinfo_t xi;

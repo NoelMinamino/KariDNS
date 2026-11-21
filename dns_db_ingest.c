@@ -33,6 +33,7 @@
 #include <sys/types.h>
 #include <sys/uio.h>
 
+#include "dns_catalog_zone.h"
 #include "dns_config_parser.h"
 #include "dns_db_install.h"
 #include "dns_db_recon.h"
@@ -1119,10 +1120,12 @@ static bool entry_has_settings(const zone_db_entry_t *e, const zone_ext_shared_t
  * settings are replaced (new masters or key: the zone is re-pointed and asked to refresh at once), and entered in the registry
  * with the serial and digest the loader sent (serial 0, the digest of the settings), which is what a restarted loader compares:
  * a zone that did not change is not sent again, so nothing is transferred again.  What the entry holds (the zone it transferred
- * from the masters) is not touched here, and it lives in memory only. */
+ * from the masters) is not touched here.  0.7 P3: with the zone store its copy is kept there (dns_xfr_store.h): a new entry gets the stored
+ * copy before it is registered, so that it answers and refreshes from it (IXFR) instead of starting empty. */
+static void consumer_members(zone_db_entry_t *e, const char *view);
 static void job_execute_secondary(ing_job_t *j) {
   zone_db_entry_t *entry = dbreg_lookup_entry(j->view_name, j->zone);
-  bool created = false;
+  bool created = false, restored = false;
   if (entry) {
     const zone_config_t *oc = atomic_load_explicit(&entry->dbcfg, memory_order_acquire);
     /* the zone was a primary, or a SLAVE became a CONSUMER (or back): a new entry replaces it */
@@ -1143,7 +1146,14 @@ static void job_execute_secondary(ing_job_t *j) {
     }
     db_entry_set_config(entry, nc);
     apply_ixfr_depth(entry, nc);
-    atomic_store_explicit(&entry->refresh_now, true, memory_order_release);      /* the masters or the key may have changed */
+    atomic_store_explicit(&entry->refresh_now, true, memory_order_release);      /* the masters or the key may have changed (the refresh writes the copy's state with the new settings id, 3.3) */
+  }
+  {
+    /* 0.7 P3: the domains.id is part of the identity of the zone's copy in the store; a new entry gets its copy (the restore job of the start, which runs on this thread too, finds the entry
+     * then and does nothing: M4 c) */
+    zone_x_t *sx = zone_x_need(entry);
+    if (sx) atomic_store_explicit(&sx->xfr_db_sid, j->source_id, memory_order_release);
+    if (created && sx && xfr_store_active()) restored = xfr_store_db_restore(entry);
   }
   bool shadowed = false;
   if (dbreg_commit(j->view_name, j->zone, entry, created, j->source_id, j->serial, j->digest, &shadowed) != 0) {
@@ -1152,6 +1162,7 @@ static void job_execute_secondary(ing_job_t *j) {
     goto rejected;
   }
   j->status = shadowed ? KDB_ST_SHADOWED : KDB_ST_APPLIED;
+  if (restored && j->zkind == KDB_ZK_CATALOG) consumer_members(entry, j->view_name);
   return;
 rejected:
   (void)dbreg_reject(j->view_name, j->zone, j->source_id, j->reason);
@@ -5077,6 +5088,126 @@ static void *cache_thread(void *arg) {
   return NULL;
 }
 
+/* ------------------------------------------------------------------------------------------------------------- */
+/* 0.7 P3: the restore of the database secondaries' copies (planing_0.7.x_secondary_store.md 4.4)                  */
+/* ------------------------------------------------------------------------------------------------------------- */
+
+/* The restore thread of the store (dns_xfr_store.c) posts one job per stored copy of a database secondary at its start, maybe before this thread runs.  The jobs run on this thread (the stream
+ * thread: with the store there are no builders), each after the loader's jobs of the same zone that are in flight, so the loader's job and the restore never make two entries of one zone (M4 c). */
+typedef struct xr_job {
+  struct xr_job *next;
+  char view[KARIDNS_VIEW_NAME_MAX];
+  char zone[DNS_NAME_TEXT_SIZE];
+} xr_job_t;
+static pthread_mutex_t g_xr_mu = PTHREAD_MUTEX_INITIALIZER;
+static xr_job_t *g_xr_head, **g_xr_tail = &g_xr_head;
+static _Atomic uint32_t g_xr_n;
+#ifdef KARIDNS_UNIT_TEST
+void (*_Atomic db_ingest_test_xfr_job_hook)(const char *zone);
+#endif
+
+bool db_ingest_xfr_restore_post(const char *view, const char *zone) {
+  xr_job_t *j = calloc(1, sizeof(*j));
+  if (!j) return false;
+  snprintf(j->view, sizeof(j->view), "%s", view);
+  snprintf(j->zone, sizeof(j->zone), "%s", zone);
+  pthread_mutex_lock(&g_xr_mu);
+  *g_xr_tail = j;
+  g_xr_tail = &j->next;
+  atomic_fetch_add_explicit(&g_xr_n, 1, memory_order_release);
+  pthread_mutex_unlock(&g_xr_mu);
+  ing_kick();                                            /* (the thread looks at the jobs at the top of every round; before it runs it looks at its start) */
+  return true;
+}
+
+/* the members of a catalog consumer whose copy was restored (RFC 9432 §5): its catalog is read from the restored version as a transfer of it would, so that the members (with their own copies)
+ * are there before the primary answers.  After the registration: the delta is published first, so that the consumer is in the snapshot the membership is made against. */
+static void consumer_members(zone_db_entry_t *e, const char *view) {
+  if (g_ing.nbuilders) return;                           /* (a builder thread: the snapshot is the stream thread's to publish; the members come with the next transfer of the consumer) */
+  apply_delta(&g_ing);
+  rcu_aux_read_lock();
+  server_config_t *cfg = acquire_config_snapshot();
+  const zone_config_t *zc = zone_entry_config(cfg, e);
+  if (zc && zc->is_catalog) catalog_process_membership(e, zc, view);
+  release_config_snapshot(cfg);
+  rcu_aux_read_unlock();
+}
+
+/* one job: the zone gets its entry from the copy when it has none (the loader's job may have made it already, with the copy restored), the reconcile's record of the zone (STORE_F_NONSTORE)
+ * still names a row of the same identity (its domains.id; the row may have been deleted, renamed or purged while the server was stopped: then the copy goes), and the settings the copy names
+ * are in settings.dat (else the zone waits for the loader, as before). */
+static uint64_t g_xr_restored, g_xr_dropped, g_xr_waiting;
+static void xr_one(ing_t *g, const xr_job_t *q) {
+  drain_name(g, q->view, q->zone);
+  if (!xfr_store_active() || dbreg_lookup_entry(q->view, q->zone)) return;
+  int kind = 0;
+  uint32_t settings = 0;
+  uint64_t identity = 0;
+  if (!xfr_store_db_copy(q->view, q->zone, &kind, &settings, &identity)) return;    /* (gone or made KNOWN meanwhile) */
+  int64_t sid = 0;
+  if (!db_store_nonstore_sid(q->view, q->zone, &sid) || xfr_identity(kind, q->zone, q->view, NULL, sid) != identity) {
+    xfr_store_db_copy_drop(q->view, q->zone, identity);
+    g_xr_dropped++;
+    return;
+  }
+  zone_ext_shared_t *sh = db_store_settings_by_id(settings);
+  if (!sh) {
+    g_xr_waiting++;
+    syslog(LOG_INFO, "[DB] zone '%s' (view '%s'): the settings its stored copy names are not in settings.dat; it waits for the loader", q->zone, q->view);
+    return;
+  }
+  zone_db_entry_t *e = new_db_entry(q->view, q->zone, sh, kind == XFR_K_DB_CONSUMER ? KDB_ZK_CATALOG : KDB_ZK_SECONDARY);
+  zone_x_t *x = e ? zone_x_need(e) : NULL;
+  if (!x) {
+    if (e) free_zone_db_entry(e);
+    return;
+  }
+  atomic_store_explicit(&x->xfr_db_sid, sid, memory_order_release);
+  if (!xfr_store_db_restore(e)) {                        /* (a damaged image, another serial, a copy of another zone: logged and handled there; the loader's job makes the entry) */
+    free_zone_db_entry(e);
+    return;
+  }
+  /* the registry learns the zone as from the loader's job (serial 0, no digest: the loader's own job compares nothing of it and finds the entry) */
+  static const uint8_t zero[32];
+  bool shadowed = false;
+  if (dbreg_commit(q->view, q->zone, e, true, sid, 0, zero, &shadowed) != 0) {
+    free_zone_db_entry(e);
+    return;
+  }
+  g_xr_restored++;
+  if (kind == XFR_K_DB_CONSUMER) consumer_members(e, q->view);
+}
+
+static void xr_run(ing_t *g) {
+  if (atomic_load_explicit(&g_xr_n, memory_order_acquire) == 0) return;
+  for (;;) {
+    pthread_mutex_lock(&g_xr_mu);
+    xr_job_t *q = g_xr_head;
+    if (q) {
+      g_xr_head = q->next;
+      if (!g_xr_head) g_xr_tail = &g_xr_head;
+      atomic_fetch_sub_explicit(&g_xr_n, 1, memory_order_release);
+    }
+    pthread_mutex_unlock(&g_xr_mu);
+    if (!q) break;
+#ifdef KARIDNS_UNIT_TEST
+    void (*h)(const char *) = atomic_load_explicit(&db_ingest_test_xfr_job_hook, memory_order_acquire);
+    if (h) h(q->zone);
+#endif
+    xr_one(g, q);
+    free(q);
+    xfr_store_db_job_done();
+  }
+  static uint64_t said;
+  const uint64_t all = g_xr_restored + g_xr_dropped + g_xr_waiting;
+  if (all != said) {
+    said = all;
+    apply_delta(g);                                      /* (the restored zones answer now, not at the next delta of the batch) */
+    syslog(LOG_NOTICE, "[DB] secondaries: %" PRIu64 " database secondary zone(s) restored from their stored copies, %" PRIu64 " copy(ies) of zones no longer in the database deleted, %" PRIu64 " wait for the loader",
+           g_xr_restored, g_xr_dropped, g_xr_waiting);
+  }
+}
+
 static void *ingest_thread(void *arg) {
   ing_t *g = arg;
   rcu_aux_thread_pin();
@@ -5084,6 +5215,7 @@ static void *ingest_thread(void *arg) {
   struct kevent evs[8];
   int64_t win_start = mono_ns(), busy_ns = 0, t_wake = win_start;
   for (;;) {
+    xr_run(g);                                           /* 0.7 P3: the restore jobs of the database secondaries' copies (also those posted before this thread ran) */
     struct timespec ts, *tp = NULL;
     int64_t wait_ms = -1;
     if (dbreg_pending_count() > 0) {                     /* new zones are waiting to become visible */
@@ -5530,10 +5662,10 @@ static void secondary_status(status_ctx_t *c, const zone_db_entry_t *e, const zo
   char t[40];
   fmt_time((int64_t)last, t, sizeof(t));
   if (last > 0)
-    st_append(c, "  transfer: last successful %s, serial %u (kept in memory only; a restart transfers it again)\n", t,
-              (unsigned)atomic_load_explicit(&e->serial, memory_order_relaxed));
+    st_append(c, "  transfer: last successful %s, serial %u (%s)\n", t, (unsigned)atomic_load_explicit(&e->serial, memory_order_relaxed),
+              xfr_store_active() ? "a copy is kept in the zone store; a restart restores it" : "kept in memory only; a restart transfers it again");     /* (0.7 P3) */
   else
-    st_append(c, "  transfer: no transfer has succeeded yet (kept in memory only)\n");
+    st_append(c, "  transfer: no transfer has succeeded yet (%s)\n", xfr_store_active() ? "the first one is kept in the zone store" : "kept in memory only");
   /* B8t-2: the settings the primary sent with the zone (Extended AXFR version 3); the statements of the zone's own metadata win */
   if (atomic_load_explicit(&zone_xr(e)->rxcfg, memory_order_acquire))
     st_append(c, "  settings from the primary: in force (what the zone's own metadata sets wins over them)\n");
