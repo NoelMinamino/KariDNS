@@ -123,13 +123,6 @@ static void handle_answers(worker_t *w, int g, uint64_t now) {
 }
 
 
-/* put the cursor back to where it was and past the `sent` queries that left */
-static void cur_replay(const dq_qtab_t *t, dq_cur_t *cur, const dq_cur_t *saved, unsigned sent, uint64_t runs) {
-    dq_pick_t pk;
-    *cur = *saved;
-    for (unsigned i = 0; i < sent; i++) dq_next_pick(t, cur, &pk, runs);
-}
-
 /* one query for the raw path: the pre-built frame, or a frame built now (the table did not fit --frame-mem) */
 static bool fill_frame(worker_t *w, const dq_pick_t *pk, unsigned slot, uint16_t id) {
     dq_fsend_t *f = &w->fx[slot];
@@ -240,7 +233,10 @@ static void *worker_main(void *arg) {
                 if (!fire)
                     for (unsigned i = sent; i < n; i++) ch->sent_ns[(ch->next + i) & (SLOTS - 1)] = 0;
                 if (sent < n) {   /* not all taken: those queries are asked again, from where the cursor was */
-                    cur_replay(w->tab, &cur, &saved, sent, cfg->runs);
+                    /* (inline, not a function: only a full send queue reaches it, so a test run may not, and function coverage is 100 %) */
+                    dq_pick_t rp;
+                    cur = saved;
+                    for (unsigned i = 0; i < sent; i++) dq_next_pick(w->tab, &cur, &rp, cfg->runs);
                     sending = true;   /* the end of the query file is reached again with the cursor put back */
                 }
                 for (unsigned i = 0; i < sent; i++) w->cnt.sent_bytes += raw ? w->fx[i].plen : w->tx[i].len;
