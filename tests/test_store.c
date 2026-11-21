@@ -3237,6 +3237,60 @@ static void test_journal_boost_crash(void) {
   tdir_free(&d);
 }
 
+/* A checkpoint that the flusher found due (here: after a growth, which asks for one) and that waited for the checkpoint flags while another checkpoint was made (store_checkpoint()) is
+ * not made when that one took its reason away: due is asked again under the writer mutex, "something was written since" is no reason of its own.  It was: the extra checkpoint
+ * cut the journal of a bulk fill at a fraction of its raised size (jboost and its crash variant, after store_reserve() + store_checkpoint(), on loaded CI VMs). */
+static _Atomic int g_fdue_state;                                         /* 0 idle, 1 the flusher waits in the hook, 2 released, 3 its st_ckpt() returned */
+static _Atomic bool g_fdue_armed;
+static void fdue_hook(int step) {
+  if (step == 1 && atomic_exchange(&g_fdue_armed, false)) {
+    atomic_store(&g_fdue_state, 1);
+    for (int w = 0; w < 20000 && atomic_load(&g_fdue_state) == 1; w++) usleep(1000);   /* (released by the test, at most 20 s) */
+  } else if (step == 2 && atomic_load(&g_fdue_state) == 2) {
+    atomic_store(&g_fdue_state, 3);
+  }
+}
+static void test_ckpt_due_again(void) {
+  printf("[a checkpoint the flusher found due is not made when another checkpoint took its reason away meanwhile]\n");
+  tdir_t d;
+  tdir_new(&d, "ckdue");
+  store_opts_t o;
+  small_opts(&o);
+  o.journal_max_bytes = 64u << 20;
+  o.checkpoint_interval_ms = UINT32_MAX;
+  o.scrub_interval_s = UINT32_MAX;
+  store_t *s = NULL;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (!s) { tdir_free(&d); return; }
+  CHECK_EQ(store_view_add(s, "default"), 0);
+  CHECK_EQ(store_checkpoint(s), 0);
+  atomic_store(&g_fdue_state, 0);
+  atomic_store(&g_fdue_armed, true);
+  atomic_store(&store_test_fl_ckpt_hook, fdue_hook);
+  CHECK_EQ(store_reserve(s, 3000), 0);                                   /* (a growth of the index: a checkpoint is wanted, the flusher is woken) */
+  for (int w = 0; w < 10000 && atomic_load(&g_fdue_state) != 1; w++) usleep(1000);
+  store_stats_t st;
+  store_stats(s, &st);
+  if (atomic_load(&g_fdue_state) != 1) printf("  (the flusher found no checkpoint due: state %d, growths %" PRIu64 ", checkpoints %" PRIu64 ")\n", atomic_load(&g_fdue_state), (uint64_t)st.growths, (uint64_t)st.checkpoints);
+  CHECK_EQ(atomic_load(&g_fdue_state), 1);
+  CHECK(st.growths >= 1);
+  CHECK_EQ(store_checkpoint(s), 0);                                      /* (the flusher waits before it asks for the flags: this one is made first and names the new index) */
+  store_stats(s, &st);
+  const uint64_t base = st.checkpoints;
+  CHECK_EQ(put_i(s, 0, 0, 1, NULL), 0);                                  /* (written since: what the flusher's checkpoint used to test) */
+  atomic_store(&g_fdue_state, 2);
+  for (int w = 0; w < 10000 && atomic_load(&g_fdue_state) != 3; w++) usleep(1000);
+  store_stats(s, &st);
+  if (atomic_load(&g_fdue_state) != 3 || st.checkpoints != base)
+    printf("  (state %d, checkpoints %" PRIu64 " (base %" PRIu64 "), journal %" PRIu64 " bytes of %" PRIu64 ")\n", atomic_load(&g_fdue_state), (uint64_t)st.checkpoints, base, (uint64_t)st.journal_bytes, (uint64_t)st.journal_max_bytes);
+  CHECK_EQ(atomic_load(&g_fdue_state), 3);
+  CHECK_EQ(st.checkpoints, base);
+  atomic_store(&store_test_fl_ckpt_hook, NULL);
+  CHECK(verify_i(s, 0, 0, 1));
+  CHECK_EQ(store_close(s), 0);
+  tdir_free(&d);
+}
+
 static void test_journal_bound(int mode) {
   printf("[the journal stays below 2 x journal_max_bytes while a checkpoint is slow; a close leaves a fuzzy checkpoint (%s)]\n", mode == STORE_MODE_MAP ? "MAP" : "COPY");
   tdir_t d;
@@ -5303,7 +5357,7 @@ static void test_resident(int mode) {
     CHECK_EQ(store_image_read(s, zid[2], &im), 0);
     store_img_release(s, &im);
     store_read_unlock();
-    if (yes_ok || mode != STORE_MODE_MAP) CHECK_EQ(resident_of(s, zid[2]), mode == STORE_MODE_MAP);
+    if (yes_ok || mode != STORE_MODE_MAP) CHECK_EQ(resident_touched(s, zid[2]), mode == STORE_MODE_MAP);       /* (after the read: the page cache may have let the pages go again since, resident_touched() reads them in again) */
     if (mode == STORE_MODE_MAP) {
       /* the pages leave the page cache (as far as the system lets a test make it): the answer follows, whichever it is, and never crashes */
       store_zone_t z;
@@ -8567,7 +8621,7 @@ int main(void) {
   if (WANT("nowait")) { test_no_wait_in_lock(STORE_MODE_MAP); test_no_wait_in_lock(STORE_MODE_COPY); test_growth_catchup(); test_retire_after_unlock(); }
   if (WANT("ixwait")) { test_reserve_survives_growth(); test_index_wait(); }
   if (WANT("jbound")) { test_journal_bound(STORE_MODE_MAP); test_journal_bound(STORE_MODE_COPY); }
-  if (WANT("jboost")) { test_journal_boost(); test_journal_boost_crash(); }
+  if (WANT("jboost")) { test_journal_boost(); test_journal_boost_crash(); test_ckpt_due_again(); }
   if (WANT("kfz")) test_kill_loop(UNDER_TSAN ? 25 : 50, 3);
   if (WANT("kgrow")) test_kill_loop(UNDER_TSAN ? 20 : 50, 4);
   if (WANT("ahead")) { test_ahead_tables(); test_ahead_segments(STORE_MODE_MAP); test_ahead_segments(STORE_MODE_COPY); test_ahead_crash(STORE_MODE_MAP); test_ahead_crash(STORE_MODE_COPY); }
