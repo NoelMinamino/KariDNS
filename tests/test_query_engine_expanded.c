@@ -10359,7 +10359,8 @@ enum { B9N_OK, B9N_TC, B9N_WRONGID, B9N_NXDOMAIN, B9N_DOWN,
        B9N_CK,             /* 0.7: answers with the client cookie of the query and g_b9n_sc (RFC 7873) */
        B9N_CK_SPOOF,       /* first a forged answer (192.0.2.99) with another client cookie, then the real one */
        B9N_CK_DOWNGRADE,   /* a forged answer without COOKIE (192.0.2.98), one with the client cookie only (192.0.2.97), then nothing */
-       B9N_CK_BAD };       /* BADCOOKIE with g_b9n_sc unless the query carries g_b9n_sc */
+       B9N_CK_BAD,         /* BADCOOKIE with g_b9n_sc unless the query carries g_b9n_sc */
+       B9N_CK_BAD2 };      /* UDP: BADCOOKIE with g_b9n_sc whatever the query carries; TCP: the answer (RFC 7873 s5.3) */
 static int g_b9n_mode;
 static int g_b9n_udp, g_b9n_tcp;
 static uint8_t g_b9n_sc[16];
@@ -10443,7 +10444,7 @@ static void b9n_cookie_reply(int fd, const uint8_t *q, size_t n, int mode) {
         b9n_opt(w, &wl, cc, NULL, 0, 0);                              /* the client cookie alone */
         (void)send(fd, w, wl, 0);
         return;
-    } else if (mode == B9N_CK_BAD && !(qsclen == 16 && memcmp(qsc, g_b9n_sc, 16) == 0)) {
+    } else if (mode == B9N_CK_BAD2 || (mode == B9N_CK_BAD && !(qsclen == 16 && memcmp(qsc, g_b9n_sc, 16) == 0))) {
         atomic_fetch_add(&g_b9n_badck, 1);
         rl = qe;                                                      /* BADCOOKIE = 23: header RCODE 7, extended 1 (RFC 7873 s8, RFC 6891 s6.1.3) */
         r[3] = 0x80 | 7;
@@ -11076,6 +11077,17 @@ static void test_alias_cookie_network(void) {
     assert(alias_lookup(rs.key, n_bc, sizeof(n_bc), 1, &a) && a.n == 2);
     assert(alias_lookup(rs.key, n_bc, sizeof(n_bc), 28, &a) && a.n == 1);
     assert(atomic_load(&g_b9n_badck) == 1 && g_b9n_udp == udp0 + 3);
+    /* BADCOOKIE to the retry with the new server cookie too: the same query over TCP (s5.3 "SHOULD retry using TCP"), for A and AAAA */
+    uint8_t n_b2[] = { 2, 'b', '2', 4, 't', 'e', 's', 't', 0 };
+    atomic_store(&g_b9n_badck, 0);
+    udp0 = g_b9n_udp;
+    int tcp0 = g_b9n_tcp;
+    g_b9n_mode = B9N_CK_BAD2;
+    alias_test_want(&rs, n_b2, sizeof(n_b2), 0);
+    alias_test_pass();
+    assert(alias_lookup(rs.key, n_b2, sizeof(n_b2), 1, &a) && a.n == 2);
+    assert(alias_lookup(rs.key, n_b2, sizeof(n_b2), 28, &a) && a.n == 1);
+    assert(atomic_load(&g_b9n_badck) == 4 && g_b9n_udp == udp0 + 4 && g_b9n_tcp == tcp0 + 2);
     /* the client cookie is renewed after its lifetime (s7.1); the server cookie of the old one is dropped and learnt again */
     g_b9_now += ALIAS_COOKIE_LIFETIME + 1;
     g_b9n_mode = B9N_CK;

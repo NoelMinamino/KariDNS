@@ -494,7 +494,9 @@ static int resolve_at(const struct sockaddr_storage *sa, socklen_t sl, ck_t *c, 
         if (!got) return -1;
         *accepted = true;
         ck_learn(c, p);
-        if (p->truncated) {
+        /* TCP after a truncated answer, and after a BADCOOKIE to the retry with the new server cookie (RFC 7873 section 5.3: the client
+         * "SHOULD retry using TCP") */
+        if (p->truncated || (attempt == 1 && p->badcookie)) {
             /* TCP gets this resolver's share of what is left, not all of it: the resolvers after this one still need time */
             uint32_t tcp_ms = remaining_ms(deadline) / left;
             ssize_t tg = tcp_query(sa, sl, q, ql, tcp_ms, g_rbuf, sizeof(g_rbuf));

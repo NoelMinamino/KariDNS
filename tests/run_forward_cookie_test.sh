@@ -11,6 +11,11 @@
 #   4. a truncated answer: the same query (the same client cookie) over TCP, the TCP answer served.
 #   5. a client without EDNS: the query to the forwarder carries an OPT RR with the cookie, the reply to the client has no OPT RR.
 #   6. a forwarder without cookies still works and is not marked.
+#   7. this server's own cookies (RFC 7873 section 5.2) come before forwarding, as for an authoritative zone: over UDP an invalid server
+#      cookie gets BADCOOKIE and the forwarder sees no query; over TCP it is forwarded with a fresh server cookie in the reply; a valid
+#      server cookie is forwarded.  A second server with require-server-cookie: a client cookie alone over UDP gets BADCOOKIE (as for its
+#      primary zone) and is not forwarded; the server cookie of that BADCOOKIE is then forwarded; over TCP, and without a cookie, forwarded.
+#   8. BADCOOKIE to the retry with the new server cookie: the same query over TCP (RFC 7873 section 5.3), answered.
 set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cd "$ROOT" || exit 1
@@ -45,7 +50,7 @@ check() {   # check DESCRIPTION EXPECTED ACTUAL
 count() { grep -c -- "$2" "$1" 2>/dev/null || true; }
 
 BASE=$(kari_port 0 $((20000 + $$ % 20000)))
-P_K=$BASE; P_CK=$((BASE + 1)); P_NC=$((BASE + 2))
+P_K=$BASE; P_CK=$((BASE + 1)); P_NC=$((BASE + 2)); P_K2=$((BASE + 3))
 USER_OPT=""
 [ "$(id -u)" = "0" ] && USER_OPT='user "nobody"; group "nobody";'   # root: the server refuses to run without a user to drop to
 
@@ -57,9 +62,17 @@ dg.fw.test A 60 192.0.2.30
 bc.fw.test A 60 192.0.2.40
 tc.fw.test A 60 192.0.2.50
 ne.fw.test A 60 192.0.2.55
+iv.fw.test A 60 192.0.2.56
+ok.fw.test A 60 192.0.2.57
+b2.fw.test A 60 192.0.2.45
+r1.fw.test A 60 192.0.2.71
+r2.fw.test A 60 192.0.2.72
+r3.fw.test A 60 192.0.2.73
+r4.fw.test A 60 192.0.2.74
 spoof sp.fw.test
 downgrade dg.fw.test
 badcookie bc.fw.test
+badcookie-udp b2.fw.test
 trunc tc.fw.test
 EOF
 cat > "$T/nc.data" <<'EOF'
@@ -69,6 +82,13 @@ cat > "$T/k.conf" <<EOF
 options { pid-file "none"; bind-address { 127.0.0.1; }; port $P_K; $USER_OPT };
 zone "fw.test." { type forward; forwarders { 127.0.0.1 port $P_CK; }; forward-timeout 3000; };
 zone "nc.test." { type forward; forwarders { 127.0.0.1 port $P_NC; }; forward-timeout 3000; };
+EOF
+# the second server: require-server-cookie, the same forwarder, and a primary zone to compare with
+printf '$ORIGIN au.test.\n$TTL 300\n@ SOA ns hostmaster 1 3600 600 86400 300\n@ NS ns\nns A 192.0.2.1\nwww A 192.0.2.2\n' > "$T/au.test.zone"
+cat > "$T/k2.conf" <<EOF
+options { pid-file "none"; bind-address { 127.0.0.1; }; port $P_K2; require-server-cookie yes; $USER_OPT };
+zone "fw.test." { type forward; forwarders { 127.0.0.1 port $P_CK; }; forward-timeout 3000; };
+zone "au.test." { type primary; file "$T/au.test.zone"; };
 EOF
 chmod 644 "$T"/*
 
@@ -164,6 +184,71 @@ grep -q '^ne.fw.test 1 udp cc=[0-9a-f]' "$T/ck.cookies" && pass "the query to th
 echo "== 6. a forwarder without cookies"
 check "a name through a forwarder without cookies" "NOERROR|a.nc.test. IN A 192.0.2.60;" "$(q a.nc.test)"
 grep -q "forwarder 127.0.0.1:$P_NC sends DNS cookies" "$T/k.log" && fail "the forwarder without cookies was marked" || pass "the forwarder without cookies is not marked"
+
+# ================================================================ 7. this server's own cookies come first
+echo "== 7. this server's cookie policy before forwarding (RFC 7873 section 5.2)"
+# qc PORT NAME [dag options] -> STATUS|answer addresses|the COOKIE of the reply (hex).  +nobadcookie: dag shows the BADCOOKIE itself
+qc() {
+    _p=$1; _n=$2; shift 2
+    out=$($DAG @127.0.0.1 -p "$_p" "$_n" A +nohexdump +nobadcookie +time=4 +tries=1 "$@" 2>/dev/null)
+    st=$(printf '%s\n' "$out" | sed -n 's/.*status: \([A-Z0-9]*\).*/\1/p' | head -1)
+    an=$(printf '%s\n' "$out" | awk '!/^;/ && $4 == "A" { print $5 }' | sort | tr '\n' ' ' | sed 's/ $//')
+    c=$(printf '%s\n' "$out" | sed -n 's/.*COOKIE: \([0-9a-fA-F]*\).*/\1/p' | head -1 | tr 'A-F' 'a-f')
+    echo "$st|$an|$c"
+}
+fwd_n() { count "$T/ck.log" "^$1 1 "; }   # the queries the forwarder got for NAME
+CC=0102030405060708
+BAD_SC=00112233445566778899aabbccddeeff
+r=$(qc "$P_K" iv.fw.test +cookie=$CC$BAD_SC)
+case $r in 'BADCOOKIE||'$CC*) pass "an invalid server cookie over UDP gets BADCOOKIE with the client's cookie" ;; *) fail "invalid server cookie over UDP: $r" ;; esac
+case $r in *"|$CC$BAD_SC") fail "the BADCOOKIE carries the invalid server cookie back" ;; *"|$CC"????????????????*) pass "... and a new server cookie" ;; *) fail "no server cookie in the BADCOOKIE: $r" ;; esac
+check "... and the forwarder saw no query" "0" "$(fwd_n iv.fw.test)"
+r=$(qc "$P_K" iv.fw.test +cookie=$CC$BAD_SC +tcp)
+case $r in 'NOERROR|192.0.2.56|'$CC*) pass "over TCP the same query is forwarded and answered (section 5.2.3)" ;; *) fail "invalid server cookie over TCP: $r" ;; esac
+case $r in *"|$CC$BAD_SC") fail "the TCP reply carries the invalid server cookie back" ;; *"|$CC"????????????????*) pass "... with a fresh server cookie" ;; *) fail "no server cookie in the TCP reply: $r" ;; esac
+check "... and the forwarder got it once" "1" "$(fwd_n iv.fw.test)"
+GOOD=$(qc "$P_K" ok.fw.test +cookie=$CC | cut -d'|' -f3)
+r=$(qc "$P_K" ok.fw.test +cookie=$GOOD)
+check "a valid server cookie over UDP is forwarded and answered" "NOERROR|192.0.2.57" "$(printf '%s\n' "$r" | cut -d'|' -f1-2)"
+check "... (two queries forwarded)" "2" "$(fwd_n ok.fw.test)"
+
+# the second server, with require-server-cookie yes
+"$KARIDNS" -c "$T/k2.conf" -f > "$T/k2.log" 2>&1 &
+PID_K2=$!
+PIDS="$PIDS $PID_K2"
+i=0
+while [ $i -lt 200 ]; do
+    case $(qc "$P_K2" au.test +nocookie) in 'NOERROR|'*) break ;; esac
+    kill -0 "$PID_K2" 2>/dev/null || break
+    sleep 0.1; i=$((i + 1))
+done
+case $(qc "$P_K2" au.test +nocookie) in 'NOERROR|'*) pass "a server with require-server-cookie yes starts" ;; *) fail "the second karidns did not start"; tail -20 "$T/k2.log" ;; esac
+r=$(qc "$P_K2" www.au.test +cookie=$CC)
+case $r in 'BADCOOKIE||'$CC????????????????*) pass "require-server-cookie: a client cookie alone gets BADCOOKIE from a primary zone" ;; *) fail "primary zone, client cookie alone: $r" ;; esac
+r=$(qc "$P_K2" r1.fw.test +cookie=$CC)
+case $r in 'BADCOOKIE||'$CC????????????????*) pass "... and from a forward zone" ;; *) fail "forward zone, client cookie alone: $r" ;; esac
+check "... which the forwarder never saw" "0" "$(fwd_n r1.fw.test)"
+SC2=$(printf '%s\n' "$r" | cut -d'|' -f3)
+check "the server cookie of the BADCOOKIE is forwarded and answered" "NOERROR|192.0.2.71" "$(qc "$P_K2" r1.fw.test +cookie=$SC2 | cut -d'|' -f1-2)"
+check "... once" "1" "$(fwd_n r1.fw.test)"
+check "require-server-cookie: a client cookie alone over TCP is forwarded" "NOERROR|192.0.2.72" "$(qc "$P_K2" r2.fw.test +cookie=$CC +tcp | cut -d'|' -f1-2)"
+check "... once" "1" "$(fwd_n r2.fw.test)"
+check "require-server-cookie: a query without a cookie is forwarded (as a primary zone answers it)" "NOERROR|192.0.2.73" "$(qc "$P_K2" r3.fw.test +nocookie | cut -d'|' -f1-2)"
+r=$(qc "$P_K2" r4.fw.test +cookie=$CC$BAD_SC)
+case $r in 'BADCOOKIE||'*) pass "require-server-cookie: an invalid server cookie gets BADCOOKIE" ;; *) fail "invalid server cookie with require-server-cookie: $r" ;; esac
+check "... not forwarded" "0" "$(fwd_n r4.fw.test)"
+# dag's own retry (+badcookie, the default) with the new server cookie gets the answer
+check "dag retries with the new server cookie and gets the answer" "NOERROR|r4.fw.test. IN A 192.0.2.74;" "$($DAG @127.0.0.1 -p "$P_K2" r4.fw.test A +nohexdump +noall +comments +answer +nottlid +time=4 +tries=1 2>/dev/null | { out=$(cat); st=$(printf '%s\n' "$out" | sed -n 's/.*status: \([A-Z0-9]*\).*/\1/p' | tail -1); an=$(printf '%s\n' "$out" | grep -v '^;' | grep -v '^$' | tr -s ' \t' ' ' | sort | tr '\n' ';'); echo "$st|$an"; })"
+kill -0 "$PID_K2" 2>/dev/null && pass "the second server still runs" || fail "the second server exited"
+
+# ================================================================ 8. TCP after a second BADCOOKIE
+echo "== 8. BADCOOKIE to the retry: TCP (RFC 7873 section 5.3)"
+check "a name whose UDP queries always get BADCOOKIE is answered over TCP" "NOERROR|b2.fw.test. IN A 192.0.2.45;" "$(q b2.fw.test)"
+# (the first query may carry an older server cookie of this thread or the newest one: only the retry's is known)
+case $(grep '^b2.fw.test 1 ' "$T/ck.cookies" | awk 'NR == 2 { $NF = $(NF - 1) " " $NF } { print $3, $NF }' | head -3 | tr '\n' ' ') in
+    'udp badcookie udp cur=yes badcookie tcp answer ') pass "BADCOOKIE, the retry with the new server cookie BADCOOKIE again, then TCP" ;;
+    *) fail "the exchange: $(grep '^b2.fw.test 1 ' "$T/ck.cookies" | tr '\n' ';')" ;;
+esac
 
 kill -0 "$PID_K" 2>/dev/null && pass "the server still runs" || fail "the server exited"
 echo ""

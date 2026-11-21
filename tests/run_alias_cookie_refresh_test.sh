@@ -6,7 +6,7 @@
 #   1. a resolver with cookies: every query carries a client cookie, the later ones the server cookie it sent; the server logs once
 #      that the resolver sends cookies; a forged answer with another client cookie that comes first is ignored (the real one is
 #      served); once cookies were seen, a forged answer without a COOKIE option is ignored too; BADCOOKIE then one retry with the new
-#      server cookie resolves the name.
+#      server cookie resolves the name; a BADCOOKIE to that retry too: the same query over TCP resolves it (section 5.3).
 #   2. a resolver without cookies still works (its answers carry no OPT RR).
 #   3. alias-max-refresh-time: a target with an upstream TTL of a day is looked up again every 5 s with `alias-max-refresh-time 5;`;
 #      two zones that share a target with 6 s and the default take the smaller; a target without a cap is not looked up again in that
@@ -58,6 +58,8 @@ t.target.test AAAA 60 2001:db8::10
 sp.target.test A 6 192.0.2.20
 dg.target.test A 6 192.0.2.30
 bc.target.test A 60 192.0.2.40
+b2.target.test A 60 192.0.2.45
+badcookie-udp b2.target.test
 spoof sp.target.test
 downgrade dg.target.test
 badcookie bc.target.test
@@ -74,7 +76,8 @@ mkzone() {   # mkzone ORIGIN "records"
 mkzone ck.test 'a ALIAS t.target.test.
 sp ALIAS sp.target.test.
 dg ALIAS dg.target.test.
-bc ALIAS bc.target.test.'
+bc ALIAS bc.target.test.
+b2 ALIAS b2.target.test.'
 mkzone nc.test 'a ALIAS t.target.test.'
 mkzone cap.test 'r ALIAS long.target.test.'
 mkzone share1.test 's ALIAS sh.target.test.'
@@ -168,6 +171,14 @@ bc_lines=$(grep '^bc.target.test 1 ' "$T/ck.cookies")
 case $(printf '%s\n' "$bc_lines" | awk '{ print $(NF - 1), $NF }' | head -2 | tr '\n' ' ') in
     'cur=no badcookie cur=yes answer ') pass "BADCOOKIE then one retry with the new server cookie, answered" ;;
     *) fail "the BADCOOKIE exchange: $bc_lines" ;;
+esac
+# BADCOOKIE to the retry too: TCP (RFC 7873 section 5.3: the client SHOULD retry using TCP)
+if wait_value b2.ck.test A "192.0.2.45" 20; then pass "a name whose UDP queries always get BADCOOKIE is resolved over TCP"; else fail "b2.ck.test not resolved: $(q b2.ck.test A)"; fi
+b2_lines=$(grep '^b2.target.test 1 ' "$T/ck.cookies")
+# (the first query may carry the newest server cookie or not, as the other targets were resolved before it: only the retry's is known)
+case $(printf '%s\n' "$b2_lines" | awk 'NR == 2 { $NF = $(NF - 1) " " $NF } { print $3, $NF }' | head -3 | tr '\n' ' ') in
+    'udp badcookie udp cur=yes badcookie tcp answer ') pass "BADCOOKIE, BADCOOKIE to the retry with the new server cookie, then TCP" ;;
+    *) fail "the BADCOOKIE / TCP exchange: $b2_lines" ;;
 esac
 
 # ================================================================ 2. a resolver without cookies

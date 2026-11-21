@@ -17,6 +17,8 @@
 #                                          COOKIE option comes before the real one
 #   badcookie <name>                       the first query for each type of the name gets BADCOOKIE (RCODE 23) with a new server
 #                                          cookie (the epoch goes up); a query that carries that server cookie is answered
+#   badcookie-udp <name>                   every UDP query of the name gets BADCOOKIE with a new server cookie (the retry with it
+#                                          too); over TCP the name is answered (RFC 7873 section 5.3: the client SHOULD retry over TCP)
 # Without --cookies no OPT RR is sent (a resolver without cookies).
 # A query for a name with a CNAME is answered with the CNAME chain (at most 10 links) and the records of the final name, like
 # a recursive resolver; a name with nothing is NOERROR without data.  While the file given by --down exists no UDP query is
@@ -82,7 +84,7 @@ sub load_data {
             next if $line eq '' || $line =~ /^#/;
             my @f = split /\s+/, $line;
             if ($f[0] =~ /^(nxdomain|servfail|refused|trunc)$/) { $special{lc $f[1]} = $f[0]; next; }
-            if ($f[0] =~ /^(spoof|downgrade|badcookie)$/) { $mod{lc $f[1]} = $f[0]; next; }
+            if ($f[0] =~ /^(spoof|downgrade|badcookie|badcookie-udp)$/) { $mod{lc $f[1]} = $f[0]; next; }
             my ($n, $t, $ttl, $v) = @f;
             push @{ $rr{lc $n}{uc $t} }, [$ttl, $v];
         }
@@ -195,10 +197,12 @@ sub answer {
     my $m = $mod->{$qname} // '';
     my $what = 'answer';
     my @out;
-    if ($m eq 'badcookie' && !$bc_done{"$qname $qtype"}) {
+    if (($m eq 'badcookie' && !$bc_done{"$qname $qtype"}) || ($m eq 'badcookie-udp' && !$over_tcp)) {
         $bc_done{"$qname $qtype"} = 1;
+        my $was = $sc eq server_cookie() ? "yes" : "no";   # badcookie-udp: cur says whether the query carried the cookie in force when it came
         $epoch++;
-        logline($cklog, "$qname $qtype $how cc=" . unpack('H*', $cc) . " sc=" . length($sc) . " cur=" . ($sc eq server_cookie() ? "yes" : "no") . " badcookie");
+        my $cur = $m eq 'badcookie-udp' ? $was : ($sc eq server_cookie() ? "yes" : "no");
+        logline($cklog, "$qname $qtype $how cc=" . unpack('H*', $cc) . " sc=" . length($sc) . " cur=$cur badcookie");
         return (packet($id, $flags, $question, 23, 0, 0, '', opt_rr($cc, server_cookie(), 1)));   # RFC 7873 section 8: 23 = 16 * 1 + 7
     }
     if (!$over_tcp && $m eq 'spoof') {

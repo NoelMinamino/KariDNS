@@ -602,17 +602,24 @@ TCP connection). When the TCP fallback fails, the client gets the header of the
 truncated answer with its question and TC=1 (it asks again over TCP; the
 truncated answer itself is not relayed, RFC 2181 \[u00A7]9). BADCOOKIE (extended
 RCODE 23) is answered by one retry with the server cookie of that response,
-within that forwarder's share of \fBforward\-timeout\fR; a second BADCOOKIE
-moves on to the next forwarder. A forwarder that gives no accepted answer in 5
-queries in a row over at least 300 s is no longer expected to send cookies
-(logged once as a warning), so that a forwarder replaced by one without cookies
-at the same address is heard again. A query that cannot carry a cookie (one with
-a SIG(0) RR, which must stay last) is relayed as it is to forwarders without
-cookies and not sent to one that sends cookies. There is no option to require
-cookies. Forward-zone queries are answered by several threads (the async I/O
-pool for UDP and TCP, the TLS and DoH threads); each keeps its own cookies for
-up to 64 forwarder addresses (the least recently used one is reused) and learns
-each forwarder's server cookie for its own client cookie (\[u00A7]4.2), and a
+within that forwarder's share of \fBforward\-timeout\fR; a BADCOOKIE to that
+retry sends the same query over TCP (\[u00A7]5.3: the client SHOULD retry using
+TCP), with the time that is still left, and when TCP gives no answer (or
+BADCOOKIE again) the next forwarder is asked. A forwarder that gives no accepted
+answer in 5 queries in a row over at least 300 s is no longer expected to send
+cookies (logged once as a warning), so that a forwarder replaced by one without
+cookies at the same address is heard again. A query that cannot carry a cookie
+(one with a SIG(0) RR, which must stay last) is relayed as it is to forwarders
+without cookies and not sent to one that sends cookies. There is no option to
+require cookies from the forwarders. The cookies between the client and this
+server are this server's own (\[u00A7]5.2): a UDP query with an invalid server
+cookie, or a client cookie alone with \fBrequire\-server\-cookie yes\fR, gets
+BADCOOKIE from this server and is not forwarded, as for an authoritative zone
+(0.7; it used to be forwarded); over TCP it is forwarded and the reply carries a
+fresh server cookie. Forward-zone queries are answered by several threads (the
+async I/O pool for UDP and TCP); each keeps its own cookies for up to 64
+forwarder addresses (the least recently used one is reused) and learns each
+forwarder's server cookie for its own client cookie (\[u00A7]4.2), and a
 process-wide mark per forwarder makes every thread expect cookies from a
 forwarder as soon as one thread has seen its server cookie.
 .RE
@@ -818,12 +825,14 @@ expects the option; this stops a forged answer that leaves the option out), and
 truncated answer, a response without a cookie is still taken: an off-path forger
 cannot answer on a TCP connection). BADCOOKIE (extended RCODE 23) is answered by
 one retry with the server cookie of that response, within the 3 s of the
-resolution. An address that gives no accepted answer in 5 resolutions in a row
-over at least 300 s is no longer expected to send cookies (logged once as a
-warning), so that a resolver replaced by one without cookies at the same address
-is heard again (the failures meanwhile are served stale, see Failure). There is
-no option to require cookies. The cookie state lives in the resolving thread
-only (512 addresses, the least recently used one is reused).
+resolution, and a BADCOOKIE to that retry by the same query over TCP
+(\[u00A7]5.3: the client SHOULD retry using TCP). An address that gives no
+accepted answer in 5 resolutions in a row over at least 300 s is no longer
+expected to send cookies (logged once as a warning), so that a resolver replaced
+by one without cookies at the same address is heard again (the failures
+meanwhile are served stale, see Failure). There is no option to require
+cookies. The cookie state lives in the resolving thread only (512 addresses, the
+least recently used one is reused).
 .IP \(bu 2
 \fBFailure.\fR A target that has \fBnever\fR been resolved (a zone that was just
 loaded, or a resolver that is down since the start) answers SERVFAIL until the
