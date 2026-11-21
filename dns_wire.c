@@ -3954,7 +3954,10 @@ int parse_edns_opt(const uint8_t *req, size_t req_len,
                     uint16_t qdcount, uint16_t ancount_req,
                     uint16_t nscount_req, uint16_t arcount_req,
                     edns_info_t *edns) {
-    memset(edns, 0, sizeof(edns_info_t));
+    /* B3 phase 3: not a memset of the whole struct, which wrote the 16 KiB of ede_list for every query (9.5 % of a worker's time at
+     * 600k qps).  edns_info_reset() clears every field a reader can see; an ede_list entry is written whole below before ede_count
+     * counts it, and every reader stops at ede_count. */
+    edns_info_reset(edns);
     edns->udp_payload_size = 512;
 
     int opt_rr_count = 0;

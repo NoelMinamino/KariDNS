@@ -557,18 +557,29 @@ datagrams that the router dropped: larger than its receive buffer
 \fBipc.router.reply.short\fR, \fB.bad_length\fR, \fB.bad_socket\fR
 replies of a worker that the router dropped as malformed: shorter than the IPC
 header, a length that does not fit the message, a socket number that does not
-exist
+exist. Since 0.7 B3 phase 3 a worker packs the replies of one batch into few
+datagrams (frames, see \fBudp\-receive\fR in \fBkaridns(8)\fR), and these count
+the frames: a reply of no octet is a bad length too
 .TP 8
 \fBipc.router.client.dropped_full\fR, \fB.dropped_error\fR
 replies that the router could not send to the client: the UDP send buffer was
-full, or another error
+full, or another error. A full queue (\fBENOBUFS\fR: the network interface's
+transmit queue; \fBEAGAIN\fR) is waited for first: the router sends the rest of
+the batch again, in order, for at most 300 microseconds, and only what is still
+refused then is dropped and counted here; a socket that used up that time is
+tried once per batch, without waiting, until a batch goes out whole
+.TP 8
+\fBipc.router.client.retried\fR
+replies that the client socket refused for a moment and took when the router
+sent them again: not a loss, not in \fBipc.dropped.total\fR
 .TP 8
 \fBipc.worker.rx.short\fR, \fBipc.worker.rx.bad_length\fR
 messages of a router that a worker dropped as malformed
 .TP 8
 \fBipc.worker.reply.dropped_full\fR, \fB.dropped_error\fR
 replies that a worker had answered and the queue to the router did not take:
-full, or another error
+full, or another error (counted in replies, also when several went in one
+datagram)
 .TP 8
 \fBipc.worker.async.dropped_full\fR
 queries that a worker dropped because the queue of the asynchronous resolution
@@ -580,8 +591,15 @@ datagrams that a worker read from its own UDP socket (\fBudp\-receive
 backend\fR) and dropped: larger than its receive buffer (\fBMSG_TRUNC\fR), or
 shorter than a DNS header; the counterparts of \fBipc.router.rx.*\fR
 .TP 8
+\fBipc.router.reply.cut\fR
+datagrams of a worker that the router stopped reading at a bad frame that was
+not their first one (the frame itself is in \fBshort\fR or \fBbad_length\fR; the
+replies after it in that datagram are lost and their number is not known). A
+datagram, not a reply, so not in \fBipc.dropped.total\fR. It stays 0 unless the
+Backend sends something broken
+.TP 8
 \fBipc.dropped.total\fR
-the sum of all of them but \fBspilled\fR
+the sum of all of them but \fBspilled\fR, \fBcut\fR and \fBretried\fR
 .PP
 After the totals come the queries that each Frontend router read from its UDP
 sockets and handed to the workers, as lines \fBipcrouter.<n>.queries=<number>\fR

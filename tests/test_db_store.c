@@ -628,12 +628,6 @@ static void wk_init(wk_t *k) {
     k->w.park = &k->table;
     k->w.worker_idx = 0;
     k->w.park_timeout_ms = 5000;
-    udp_batch_ctx_t *b = &k->wctx.batch;
-    for (int i = 0; i < UDP_BATCH_SIZE; i++) {
-        memset(&b->tx_msgs[i], 0, sizeof(b->tx_msgs[i]));
-        b->tx_msgs[i].msg_hdr.msg_iov = &b->tx_iov[i];
-        b->tx_msgs[i].msg_hdr.msg_iovlen = 1;
-    }
 }
 
 static void wk_free(wk_t *k) {

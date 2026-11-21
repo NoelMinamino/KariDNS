@@ -3203,9 +3203,22 @@ static void test_edns_info_reset(void) {
     CHECK(a->present && a->dnssec_ok && a->ede_count == 1 && b->ede_count == 1);
     CHECK(a->ede_list[0].code == 18 && strcmp(a->ede_list[0].text, "hiyo") == 0);
     CHECK(memcmp(a, b, offsetof(edns_info_t, ede_list)) == 0);
-    CHECK(memcmp(a->ede_list, b->ede_list, sizeof(a->ede_list[0])) == 0);
+    CHECK(a->ede_list[0].code == b->ede_list[0].code && strcmp(a->ede_list[0].text, b->ede_list[0].text) == 0);   /* (the octets after the text's NUL are not read: strlen() in assemble_edns_opt()) */
     CHECK(memcmp((uint8_t *)a + offsetof(edns_info_t, has_nsid_query), (uint8_t *)b + offsetof(edns_info_t, has_nsid_query),
                  sizeof(*a) - offsetof(edns_info_t, has_nsid_query)) == 0);
+    /* B3 phase 3: parse_edns_opt() itself resets with edns_info_reset() (it used to memset all 16 KiB): from a struct full of stale
+     * bytes, with no reset by the caller, the visible state is the same and the entries after ede_count are not written */
+    memset(a, 0xAA, sizeof(*a));
+    CHECK(parse_edns_opt(opt_q, sizeof(opt_q), 1, 0, 0, 1, a) == 0);
+    CHECK(memcmp(a, b, offsetof(edns_info_t, ede_list)) == 0);
+    CHECK(a->ede_list[0].code == b->ede_list[0].code && strcmp(a->ede_list[0].text, b->ede_list[0].text) == 0);   /* (the octets after the text's NUL are not read: strlen() in assemble_edns_opt()) */
+    CHECK(memcmp((uint8_t *)a + offsetof(edns_info_t, has_nsid_query), (uint8_t *)b + offsetof(edns_info_t, has_nsid_query),
+                 sizeof(*a) - offsetof(edns_info_t, has_nsid_query)) == 0);
+    CHECK(((uint8_t *)&a->ede_list[1])[0] == 0xAA && ((uint8_t *)&a->ede_list[MAX_EDE_COUNT - 1])[sizeof(parsed_ede_t) - 1] == 0xAA);
+    /* a request without an OPT after a stale struct: nothing of the old content is visible */
+    memset(a, 0xAA, sizeof(*a));
+    CHECK(parse_edns_opt(opt_q, 19, 1, 0, 0, 0, a) == 0);
+    CHECK(!a->present && a->ede_count == 0 && !a->has_cookie && !a->has_ecs && !a->send_expire && a->udp_payload_size == 512);
     free(a);
     free(b);
 }
