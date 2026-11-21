@@ -905,7 +905,9 @@ static void test_cookie_and_frames(void) {
     dq_cur_init(&cur, &t, 0, 1, 5);
     for (int i = 0; i < 2000; i++) {
         dq_pick_t p;
-        CHECK(dq_next_pick(&t, &cur, &p, 0));
+        bool got = dq_next_pick(&t, &cur, &p, 0);
+        CHECK(got);
+        if (!got) break;   /* p is not set: GCC with -flto warns otherwise */
         uint16_t fl, co;
         const uint8_t *fr = dq_pf_get(&pf, dq_pf_index(&t, &p), &fl, &co);
         dq_udp_view_t v;
