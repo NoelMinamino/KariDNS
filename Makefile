@@ -1824,7 +1824,7 @@ clean: clean-fuzz coverage-clean
 	@# karicheck's objects outside $(OBJS): an uninstrumented copy left here would be linked into the coverage build
 	rm -f dns_zone_lint.o dns_db_checkproto.o karicheck-codelog test_coverage_sweep_tools-codelog
 	rm -f karidns-zone karidns-zone-asan karidns-asan karidns-tsan karidns-evict *.ev.o test_epoch_rcu-tsan test_zone_dir-tsan test_zone_dir test_park-tsan test_db_fetch-tsan test_server_core-tsan test_park_worker-tsan test_db_registry-tsan test_db_stream-tsan test_pdns_reader-tsan test_park test_db_fetch test_park_worker *.asan.o *.tsan.o test_asan_overflow test_conf_include test_config_directives test_acl_match test_listen_on test_xfr_opts test_server_stmt test_wire_helpers test_zone_image test_zone_parser_paths test_tinydns_paths test_sig0_sign test_snapshot_rebuild test_dnssec_proofs test_query_engine_protocol test_dag_format test_dag_iter test_dag_reassembly test_hash_table test_epoch_rcu test_dnstap_engine test_tapstat test_edns_ecs_engine test_rfc_vectors test_dynamic_update_engine test_axfr_ixfr_engine test_rrl_engine test_query_engine_expanded test_response_cache test_cidr test_tinydns_parser test_vulnerability_fixes test_catalog_zone_engine test_snapshot_sandbox_engine test_dag_tools test_server_core test_fi_parsers test_fi_wire test_fi_snapshot test_fi_xfr test_fi_misc test_fi_dag test_coverage_sweep test_coverage_sweep_dag test_coverage_sweep_net test_coverage_sweep_tools test_db_stream test_pdns_reader test_presigned test_zone_text test_zone_import test_db_supervisor test_plugin_msg test_db_sqlite3 test_db_registry test_db_pgsql karidns-dbloader karidns-dbloader-tsan karidns-dbloader-asan tests/db/zone2sql tests/db/zone2kdb fake_dbloader test_store test_store-asan test_store-tsan test_db_store test_db_store-asan test_db_store-tsan test_xfr_store test_xfr_store-asan test_xfr_store-tsan
-	rm -f $(DNSQPS_TARGET) dnsqps-asan dnsqps-tsan test_dnsqps test_dnsqps-asan $(DNSQPS_OBJS) $(FUZZ_DNSQPS_RESP_TARGET) $(FUZZ_DNSQPS_ARGS_TARGET) $(FUZZ_DNSQPS_MSG_TARGET) $(FUZZ_DNSQPS_MSG_TARGET)
+	rm -f $(DNSQPS_TARGET) dnsqps-asan dnsqps-tsan test_dnsqps test_dnsqps-asan $(DNSQPS_OBJS) $(FUZZ_DNSQPS_RESP_TARGET) $(FUZZ_DNSQPS_ARGS_TARGET) $(FUZZ_DNSQPS_MSG_TARGET)
 	rm -f $(UT_ASAN_BINS)
 	rm -f *.uta.o *.utn.o tests/*.uta.o tests/*.utn.o tools/*.uta.o tools/*.utn.o
 	rm -f tests/fi/kari_fi_preload.so
@@ -1961,7 +1961,7 @@ fuzz_dnsqps_msg: $(FUZZ_DNSQPS_MSG_SRCS:.c=.fz.o)
 fuzz_tapstat: $(FUZZ_TAPSTAT_SRCS:.c=.fz.o)
 	$(CC) -O1 -g -fsanitize=fuzzer,address,undefined -fPIE -o $(FUZZ_TAPSTAT_TARGET) $(FUZZ_TAPSTAT_SRCS:.c=.fz.o) $(LDFLAGS)
 
-fuzz_dag_all: fuzz_tapstat fuzz_dag fuzz_dag_hash fuzz_dag_iter_classify fuzz_dag_chunked_http fuzz_dag_rdata_yaml fuzz_dag_axfr_stream fuzz_dag_cli_args fuzz_dag_batch_file fuzz_dag_replay_pcap_reader fuzz_dag_replay_diff fuzz_dag_tcp_reassembly fuzz_dnsqps_resp fuzz_dnsqps_args
+fuzz_dag_all: fuzz_tapstat fuzz_dag fuzz_dag_hash fuzz_dag_iter_classify fuzz_dag_chunked_http fuzz_dag_rdata_yaml fuzz_dag_axfr_stream fuzz_dag_cli_args fuzz_dag_batch_file fuzz_dag_replay_pcap_reader fuzz_dag_replay_diff fuzz_dag_tcp_reassembly fuzz_dnsqps_resp fuzz_dnsqps_args fuzz_dnsqps_msg
 
 fuzz_dag_test: fuzz_dag_all
 	@sh tests/run_fuzz_smoke_test.sh dag
