@@ -70,6 +70,13 @@ run "netmap, --next-hop-mac" 4900 $COMMON --next-hop-mac "$RMAC" -d "$T/q.txt" -
 run "netmap, ARP" 19000 $COMMON -d "$T/q.txt" -N 20000 -T 1 -c 2
 # generated queries, an open loop
 run "netmap generated, open loop" 1900 $COMMON --next-hop-mac "$RMAC" -z "$T/q.txt" --miss 0.2 -Q 2000 -l 1.5 -T 1
+# pre-built frames with a source prefix and a cookie per query: the raw reflector drops a frame whose IPv4 or UDP checksum is wrong, so every answer proves
+# the incremental update (RFC 1624) of the source address, the port, the ID and the cookie; the answers go to addresses of the prefix and are still counted
+run "netmap, source prefix, cookie=random" 4900 -s 10.88.0.2 -p 5300 -b 198.18.0.0/24 --io netmap --iface vale0:c --src-mac $CMAC --next-hop-mac "$RMAC" -d "$T/q.txt" -N 5000 -T 1 -c 3 +edns +cookie=random
+run "netmap, prefix, generated, small --frame-mem 0 (a frame per query)" 1900 -s 10.88.0.2 -p 5300 -b 198.19.0.0/16 --io netmap --iface vale0:c --src-mac $CMAC --next-hop-mac "$RMAC" -z "$T/q.txt" --miss 0.2 -Q 2000 -l 1.5 -T 1 --frame-mem 0 +edns +cookie=random
+run "netmap, prefix, ARP resolved from the prefix" 4900 -s 10.88.0.2 -p 5300 -b 198.18.0.0/24 --io netmap --iface vale0:c --src-mac $CMAC -d "$T/q.txt" -N 5000 -T 1
+out=$("$DQ" -r -s 10.88.0.2 -p 5300 -b 192.0.2.0/24 --io netmap --iface vale0:c --src-mac "$CMAC" --next-hop-mac "$RMAC" -d "$T/q.txt" -N 5 2>&1 >/dev/null); rc=$?
+[ "$rc" -eq 2 ] && echo "$out" | grep -q 'backscatter' || fail "a prefix outside the reserved ranges: exit $rc ($out)"
 # an ARP request nobody answers: a clear error, exit 2
 out=$("$DQ" -r -s 10.88.0.9 -p 5300 -b 10.88.0.1 --io netmap --iface vale0:c --src-mac "$CMAC" -d "$T/q.txt" -N 5 2>&1 >/dev/null); rc=$?
 # (the switch floods the request, the reflector ignores it: the resolution runs out)
