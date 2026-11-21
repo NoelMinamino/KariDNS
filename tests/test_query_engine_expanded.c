@@ -10575,6 +10575,321 @@ static void test_b9a_alias_network(void) {
     printf("  -> resolver client passed.\n");
 }
 
+/* ---- 0.7: the shared client side of DNS Cookies (dns_cookie_client.c), used by the ALIAS resolvers and the forwarders ---- */
+static size_t ckt_msg(uint8_t *b, uint16_t id, uint8_t flags2, uint8_t rcode, bool opt, uint8_t ext, const uint8_t *opts, size_t olen) {
+    static const uint8_t q[] = { 3, 'w', 'w', 'w', 2, 'f', 'w', 4, 't', 'e', 's', 't', 0, 0, 1, 0, 1 };
+    size_t n = 0;
+    b[n++] = (uint8_t)(id >> 8); b[n++] = (uint8_t)id; b[n++] = flags2; b[n++] = rcode;
+    b[n++] = 0; b[n++] = 1; b[n++] = 0; b[n++] = 0; b[n++] = 0; b[n++] = 0; b[n++] = 0; b[n++] = opt ? 1 : 0;
+    memcpy(b + n, q, sizeof(q));
+    n += sizeof(q);
+    if (opt) {
+        b[n++] = 0; b[n++] = 0; b[n++] = 41; b[n++] = 0x10; b[n++] = 0x00; b[n++] = ext; b[n++] = 0; b[n++] = 0x80; b[n++] = 0;
+        b[n++] = (uint8_t)(olen >> 8); b[n++] = (uint8_t)olen;
+        if (olen) memcpy(b + n, opts, olen);
+        n += olen;
+    }
+    return n;
+}
+static void ckt_sa(struct sockaddr_storage *ss, const char *ip, uint16_t port) {
+    memset(ss, 0, sizeof(*ss));
+    if (strchr(ip, ':')) {
+        struct sockaddr_in6 *s6 = (struct sockaddr_in6 *)ss;
+        s6->sin6_family = AF_INET6;
+        s6->sin6_port = htons(port);
+        assert(inet_pton(AF_INET6, ip, &s6->sin6_addr) == 1);
+    } else {
+        struct sockaddr_in *s4 = (struct sockaddr_in *)ss;
+        s4->sin_family = AF_INET;
+        s4->sin_port = htons(port);
+        assert(inet_pton(AF_INET, ip, &s4->sin_addr) == 1);
+    }
+}
+
+static void test_cookie_client_option(void) {
+    printf("[TEST] 0.7: dns_cookie_client: the COOKIE option, built and checked (RFC 7873 s4, s5.1, s5.3)...\n");
+    static const uint8_t cc[8] = { 1, 2, 3, 4, 5, 6, 7, 8 };
+    uint8_t sc[32], o[64];
+    for (int i = 0; i < 32; i++) sc[i] = (uint8_t)(0xA0 + i);
+    /* the two forms of section 4: 8 octets, or 16 to 40 */
+    assert(ckc_option_put(o, sizeof(o), cc, NULL, 0) == 12 && o[0] == 0 && o[1] == 10 && o[2] == 0 && o[3] == 8 && memcmp(o + 4, cc, 8) == 0);
+    assert(ckc_option_put(o, sizeof(o), cc, sc, 16) == 28 && o[3] == 24 && memcmp(o + 12, sc, 16) == 0);
+    assert(ckc_option_put(o, sizeof(o), cc, sc, 32) == 44 && o[3] == 40);
+    assert(ckc_option_put(o, sizeof(o), cc, sc, 7) == 0);                     /* a server cookie is 8 to 32 octets */
+    assert(ckc_option_put(o, sizeof(o), cc, sc, 33) == 0);
+    assert(ckc_option_put(o, sizeof(o), cc, NULL, 8) == 0);
+    assert(ckc_option_put(o, 11, cc, NULL, 0) == 0);                          /* does not fit */
+    assert(ckc_option_put(o, sizeof(o), NULL, NULL, 0) == 0);
+
+    ckc_seen_t s;
+    size_t ol;
+    memset(&s, 0, sizeof(s));
+    assert(ckc_option_parse(o, 0, cc, &s) && s.kind == CKC_NONE);            /* no options */
+    ol = ckc_option_put(o, sizeof(o), cc, sc, 16);
+    memset(&s, 0, sizeof(s));
+    assert(ckc_option_parse(o, ol, cc, &s) && s.kind == CKC_SERVER && s.sc_len == 16 && memcmp(s.sc, sc, 16) == 0);
+    ol = ckc_option_put(o, sizeof(o), cc, NULL, 0);
+    memset(&s, 0, sizeof(s));
+    assert(ckc_option_parse(o, ol, cc, &s) && s.kind == CKC_CLIENT && s.sc_len == 0);
+    /* another option before it (NSID, length 0) and after it (padding) */
+    uint8_t mix[80];
+    size_t ml = 0;
+    mix[ml++] = 0; mix[ml++] = 3; mix[ml++] = 0; mix[ml++] = 0;
+    ml += ckc_option_put(mix + ml, sizeof(mix) - ml, cc, sc, 8);
+    mix[ml++] = 0; mix[ml++] = 12; mix[ml++] = 0; mix[ml++] = 2; mix[ml++] = 0; mix[ml++] = 0;
+    memset(&s, 0, sizeof(s));
+    assert(ckc_option_parse(mix, ml, cc, &s) && s.kind == CKC_SERVER && s.sc_len == 8);
+    /* discarded: another client cookie, illegal lengths (9..15, 41, under 8), two COOKIE options, a list that runs past the RDATA */
+    static const uint8_t other[8] = { 1, 2, 3, 4, 5, 6, 7, 9 };
+    ol = ckc_option_put(o, sizeof(o), other, sc, 16);
+    memset(&s, 0, sizeof(s));
+    assert(!ckc_option_parse(o, ol, cc, &s));
+    const size_t bad[] = { 0, 7, 9, 15, 41 };
+    for (size_t k = 0; k < (sizeof(bad) / sizeof(bad[0])); k++) {
+        uint8_t b[64] = { 0, 10, 0, (uint8_t)bad[k] };
+        memcpy(b + 4, cc, 8);
+        memset(&s, 0, sizeof(s));
+        assert(!ckc_option_parse(b, 4 + bad[k], cc, &s));
+    }
+    ol = ckc_option_put(o, sizeof(o), cc, NULL, 0);
+    ol += ckc_option_put(o + ol, sizeof(o) - ol, cc, sc, 8);
+    memset(&s, 0, sizeof(s));
+    assert(!ckc_option_parse(o, ol, cc, &s));
+    ol = ckc_option_put(o, sizeof(o), cc, sc, 16);
+    memset(&s, 0, sizeof(s));
+    assert(!ckc_option_parse(o, ol - 1, cc, &s));                             /* the option runs past the RDATA */
+    assert(!ckc_option_parse(o, 3, cc, &s));                                  /* less than an option header */
+    printf("  -> option passed.\n");
+}
+
+typedef struct { ckc_table_t *t; struct sockaddr_storage *sa; int logged; } ckt_thr_t;
+static void *ckt_thread(void *p) {
+    ckt_thr_t *a = p;
+    uint8_t sc[16];
+    memset(sc, 0x55, sizeof(sc));
+    for (int r = 0; r < 200; r++) {
+        ckc_entry_t *c = ckc_get(a->t, a->sa, 1000);
+        if (ckc_learn(a->t, c, CKC_SERVER, sc, 16)) a->logged++;
+        c->capable = false;                                                   /* this thread learns it again; the line is logged once */
+    }
+    return NULL;
+}
+
+static void test_cookie_client_state(void) {
+    printf("[TEST] 0.7: dns_cookie_client: the state of the server addresses (RFC 7873 s4.1, s5.3, s7.1), the log marks...\n");
+    ckc_entry_t slots[3];
+    memset(slots, 0, sizeof(slots));
+    ckc_table_t t = { .slots = slots, .n = 3, .who = "[Test] server", .unit = "exchanges" };
+    struct sockaddr_storage a1, a2, a3, a4, a1p, a6;
+    ckt_sa(&a1, "192.0.2.1", 53); ckt_sa(&a2, "192.0.2.2", 53); ckt_sa(&a3, "192.0.2.3", 53); ckt_sa(&a4, "192.0.2.4", 53);
+    ckt_sa(&a1p, "192.0.2.1", 5353); ckt_sa(&a6, "2001:db8::1", 53);
+    assert(!ckc_find(&t, &a1));
+    ckc_entry_t *c1 = ckc_get(&t, &a1, 1000);
+    assert(c1 && c1->used && !c1->capable && c1->sc_len == 0 && c1->last_ok == 1000);
+    assert(c1->cc_renew > 1000 + CKC_LIFETIME * 3 / 5 - 1 && c1->cc_renew <= 1000 + CKC_LIFETIME);   /* one day minus 0..40 % (s7.1) */
+    uint8_t cc1[8];
+    memcpy(cc1, c1->cc, 8);
+    assert(ckc_get(&t, &a1, 1001) == c1 && memcmp(c1->cc, cc1, 8) == 0);     /* the same address, the same cookie */
+    ckc_entry_t *cp = ckc_get(&t, &a1p, 1002);                               /* another port is another server */
+    assert(cp != c1 && memcmp(cp->cc, cc1, 8) != 0);
+    ckc_entry_t *c6 = ckc_get(&t, &a6, 1003);
+    assert(c6 != c1 && c6 != cp && ckc_find(&t, &a6) == c6);
+    /* learning: only a server cookie of 8..32 octets; the first one sets the mark (logged), the later ones only replace the cookie */
+    uint8_t sc[32];
+    memset(sc, 0x11, sizeof(sc));
+    assert(!ckc_learn(&t, c1, CKC_CLIENT, sc, 0) && !c1->capable);
+    assert(!ckc_learn(&t, c1, CKC_SERVER, sc, 7) && !c1->capable);
+    assert(ckc_learn(&t, c1, CKC_SERVER, sc, 16) && c1->capable && c1->sc_len == 16);
+    memset(sc, 0x22, sizeof(sc));
+    assert(!ckc_learn(&t, c1, CKC_SERVER, sc, 24) && c1->sc_len == 24 && c1->sc[0] == 0x22);
+    /* downgrade protection: once capable, only CKC_SERVER is acceptable */
+    assert(ckc_acceptable(&t, c1, CKC_SERVER) && !ckc_acceptable(&t, c1, CKC_CLIENT) && !ckc_acceptable(&t, c1, CKC_NONE));
+    assert(ckc_acceptable(&t, cp, CKC_NONE) && ckc_acceptable(&t, cp, CKC_CLIENT));
+    /* rotation (s7.1): after cc_renew the client cookie is new and the server cookie goes (s4.2); the mark stays */
+    int64_t due = c1->cc_renew;
+    assert(ckc_get(&t, &a1, due - 1) == c1 && memcmp(c1->cc, cc1, 8) == 0 && c1->sc_len == 24);
+    assert(ckc_get(&t, &a1, due) == c1 && memcmp(c1->cc, cc1, 8) != 0 && c1->sc_len == 0 && c1->capable);
+    assert(c1->cc_renew > due);
+    /* the mark goes after CKC_FORGET_FAILS failed exchanges in a row AND CKC_FORGET_SECS since the last accepted answer */
+    int64_t now = due;
+    assert(!ckc_account(&t, c1, true, now) && c1->fails == 0 && c1->last_ok == now);
+    for (int k = 0; k < CKC_FORGET_FAILS + 3; k++) assert(!ckc_account(&t, c1, false, now + 10));   /* many, but too soon */
+    assert(c1->capable && c1->fails == CKC_FORGET_FAILS + 3);
+    assert(!ckc_account(&t, c1, true, now + 20) && c1->fails == 0);         /* an accepted answer starts the count again */
+    for (int k = 0; k < CKC_FORGET_FAILS - 1; k++) assert(!ckc_account(&t, c1, false, now + 20 + CKC_FORGET_SECS));
+    assert(c1->capable);
+    memset(sc, 0x33, sizeof(sc));
+    assert(!ckc_learn(&t, c1, CKC_SERVER, sc, 16));
+    assert(ckc_account(&t, c1, false, now + 20 + CKC_FORGET_SECS) && !c1->capable && c1->sc_len == 0 && c1->fails == 0);
+    assert(ckc_acceptable(&t, c1, CKC_NONE));
+    assert(!ckc_account(&t, cp, false, now + 100000) && cp->fails == 0);    /* never capable: nothing to count */
+    assert(ckc_learn(&t, c1, CKC_SERVER, sc, 16) && c1->capable);           /* the next server cookie sets it again, logged again */
+    /* a full table reuses the least recently used slot */
+    ckc_get(&t, &a1, now + 30);
+    ckc_get(&t, &a6, now + 31);
+    ckc_entry_t *c4 = ckc_get(&t, &a4, now + 32);
+    assert(c4 == cp && !ckc_find(&t, &a1p) && ckc_find(&t, &a1) == c1 && ckc_find(&t, &a6) == c6);
+    assert(!c4->capable && c4->sc_len == 0 && c4->fails == 0);
+    (void)a2; (void)a3;
+
+    /* the process-wide marks: several threads with tables of their own learn the same address, one line in all */
+    _Atomic uint64_t marks[8];
+    for (int i = 0; i < 8; i++) atomic_init(&marks[i], 0);
+    ckc_entry_t ts[4][2];
+    ckc_table_t tt[4];
+    ckt_thr_t ta[4];
+    pthread_t th[4];
+    memset(ts, 0, sizeof(ts));
+    for (int i = 0; i < 4; i++) {
+        tt[i] = (ckc_table_t){ .slots = ts[i], .n = 2, .who = "[Test] server", .unit = "exchanges", .marks = marks, .nmarks = 8 };
+        ta[i] = (ckt_thr_t){ .t = &tt[i], .sa = &a2, .logged = 0 };
+    }
+    for (int i = 0; i < 4; i++) assert(pthread_create(&th[i], NULL, ckt_thread, &ta[i]) == 0);
+    for (int i = 0; i < 4; i++) pthread_join(th[i], NULL);
+    assert(ta[0].logged + ta[1].logged + ta[2].logged + ta[3].logged == 1);
+    /* the clear is logged by the first thread whose mark goes; another address in the same slot is logged every time */
+    ckc_entry_t *x0 = ckc_get(&tt[0], &a2, 2000), *x1 = ckc_get(&tt[1], &a2, 2000);
+    x0->capable = x1->capable = true;
+    x0->last_ok = x1->last_ok = 0;
+    for (int k = 0; k < CKC_FORGET_FAILS - 1; k++) { ckc_account(&tt[0], x0, false, 2000); ckc_account(&tt[1], x1, false, 2000); }
+    assert(ckc_account(&tt[0], x0, false, 2000) && !x0->capable);
+    assert(!ckc_account(&tt[1], x1, false, 2000) && !x1->capable);
+    /* a thread that has not seen the cookie itself expects it once another thread has (downgrade protection in every thread), counts
+     * its failures, and its forgetting clears the process-wide mark (logged once) */
+    assert(ckc_learn(&tt[0], x0, CKC_SERVER, sc, 16) && x0->capable);
+    ckc_entry_t *x2 = ckc_get(&tt[2], &a2, 2100), *x3 = ckc_get(&tt[3], &a2, 2100);
+    assert(!x2->capable && ckc_expected(&tt[2], x2) && !ckc_acceptable(&tt[2], x2, CKC_NONE) && !ckc_acceptable(&tt[2], x2, CKC_CLIENT));
+    assert(ckc_acceptable(&tt[2], x2, CKC_SERVER));
+    assert(!ckc_learn(&tt[3], x3, CKC_SERVER, sc, 16) && x3->capable);     /* learnt here too: no second line */
+    x2->last_ok = 0;
+    for (int k = 0; k < CKC_FORGET_FAILS - 1; k++) assert(!ckc_account(&tt[2], x2, false, 2100));
+    assert(x2->fails == CKC_FORGET_FAILS - 1);
+    assert(ckc_account(&tt[2], x2, false, 2100) && !ckc_expected(&tt[2], x2));
+    assert(ckc_expected(&tt[0], x0) && !ckc_expected(&tt[1], x1));          /* the threads that know it themselves keep it */
+    _Atomic uint64_t one[1];
+    atomic_init(&one[0], 0);
+    ckc_table_t m1 = tt[2], m2 = tt[3];
+    m1.marks = m2.marks = one;
+    m1.nmarks = m2.nmarks = 1;
+    ckc_entry_t *y1 = ckc_get(&m1, &a3, 3000), *y2 = ckc_get(&m2, &a4, 3000);
+    assert(ckc_learn(&m1, y1, CKC_SERVER, sc, 16));                          /* takes the one slot */
+    assert(ckc_learn(&m2, y2, CKC_SERVER, sc, 16));                          /* another address: logged although not marked */
+    y2->capable = false;
+    assert(ckc_learn(&m2, y2, CKC_SERVER, sc, 16));
+    printf("  -> state passed.\n");
+}
+
+static void test_cookie_client_msg(void) {
+    printf("[TEST] 0.7: dns_cookie_client: whole messages - the OPT RR found, the cookie checked, the COOKIE options replaced (RFC 6891 s6.1, RFC 7873 s5.3)...\n");
+    static const uint8_t cc[8] = { 9, 8, 7, 6, 5, 4, 3, 2 }, other[8] = { 0 };
+    uint8_t sc[16], o[64], m[512], out[512], ecs[] = { 0, 8, 0, 4, 0, 1, 0, 0 };
+    memset(sc, 0x77, sizeof(sc));
+    ckc_seen_t s;
+    ckc_msg_t mm;
+    size_t n, r;
+    bool added;
+
+    /* a response with ECS and our cookie + a server cookie: accepted, kind SERVER */
+    size_t ol = 0;
+    memcpy(o, ecs, sizeof(ecs)); ol += sizeof(ecs);
+    ol += ckc_option_put(o + ol, sizeof(o) - ol, cc, sc, 16);
+    n = ckt_msg(m, 0x1234, 0x81, 0x80, true, 0, o, ol);
+    assert(ckc_msg_scan(m, n, &mm) && mm.opt_count == 1 && !mm.has_sig && mm.rr_end == n && mm.rdlen == ol);
+    assert(ckc_msg_check(m, n, cc, &s) == 0 && s.opt && s.kind == CKC_SERVER && s.sc_len == 16 && !s.badcookie);
+    assert(ckc_msg_check(m, n, other, &s) == -1 && s.kind == CKC_NONE);    /* another client cookie: discarded */
+    /* BADCOOKIE: extended RCODE 1, RCODE 7 (RFC 7873 s8) */
+    n = ckt_msg(m, 1, 0x81, 0x87, true, 1, o, ol);
+    assert(ckc_msg_check(m, n, cc, &s) == 0 && s.badcookie && s.kind == CKC_SERVER);
+    n = ckt_msg(m, 1, 0x81, 0x87, true, 0, o, ol);                         /* RCODE 7 alone is YXRRSET, not BADCOOKIE */
+    assert(ckc_msg_check(m, n, cc, &s) == 0 && !s.badcookie);
+    /* no OPT RR, an OPT RR without COOKIE */
+    n = ckt_msg(m, 1, 0x81, 0x80, false, 0, NULL, 0);
+    assert(ckc_msg_check(m, n, cc, &s) == 0 && !s.opt && s.kind == CKC_NONE);
+    n = ckt_msg(m, 1, 0x81, 0x80, true, 0, ecs, sizeof(ecs));
+    assert(ckc_msg_check(m, n, cc, &s) == 0 && s.opt && s.kind == CKC_NONE);
+    /* two OPT RRs: discarded; an OPT RR in the answer section or with an owner other than the root: cannot be walked (no cookie) */
+    n = ckt_msg(m, 1, 0x81, 0x80, true, 0, o, ol);
+    memcpy(m + n, m + 29, 11 + ol); n += 11 + ol; m[11] = 2;
+    assert(!ckc_msg_scan(m, n, &mm) || mm.opt_count == 2);
+    assert(ckc_msg_check(m, n, cc, &s) == -1);
+    n = ckt_msg(m, 1, 0x81, 0x80, true, 0, o, ol);
+    m[7] = 1; m[11] = 0;                                                    /* the OPT RR counted as an answer */
+    assert(!ckc_msg_scan(m, n, &mm) && ckc_msg_check(m, n, cc, &s) == 0 && s.kind == CKC_NONE);
+    /* cut inside the OPT RR (a truncated message): no cookie seen */
+    n = ckt_msg(m, 1, 0x83, 0x80, true, 0, o, ol);
+    assert(ckc_msg_check(m, n - 3, cc, &s) == 0 && s.kind == CKC_NONE && !s.opt);
+    assert(!ckc_msg_scan(m, 11, &mm));
+    /* a compressed owner name in the answer is skipped without being followed */
+    {
+        size_t k = ckt_msg(m, 1, 0x81, 0x80, false, 0, NULL, 0);
+        m[7] = 1;
+        static const uint8_t an[] = { 0xC0, 12, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 192, 0, 2, 1 };
+        memcpy(m + k, an, sizeof(an)); k += sizeof(an);
+        m[k++] = 0; m[k++] = 0; m[k++] = 41; m[k++] = 4; m[k++] = 0; m[k++] = 0; m[k++] = 0; m[k++] = 0; m[k++] = 0;
+        r = ckc_option_put(m + k + 2, 64, cc, NULL, 0);
+        m[k++] = 0; m[k++] = (uint8_t)r; k += r; m[11] = 1;
+        assert(ckc_msg_check(m, k, cc, &s) == 0 && s.kind == CKC_CLIENT);
+        m[29] = 0x40;                                                       /* a label type 01 */
+        assert(!ckc_msg_scan(m, k, &mm));
+    }
+
+    /* rewrite SET: the COOKIE options replaced, ECS kept, RDLEN fixed; the message after the OPT RR copied */
+    uint8_t mine[64];
+    size_t myl = ckc_option_put(mine, sizeof(mine), cc, NULL, 0);
+    n = ckt_msg(m, 7, 0x01, 0x00, true, 0, o, ol);
+    r = ckc_msg_rewrite(m, n, out, sizeof(out), mine, myl, CKC_RW_SET, &added);
+    assert(r == n - 16 && !added && out[11] == 1);
+    assert(ckc_msg_check(out, r, cc, &s) == 0 && s.kind == CKC_CLIENT && s.opt);
+    assert(memcmp(out + 29 + 11, ecs, sizeof(ecs)) == 0 && out[29 + 9] == 0 && out[29 + 10] == sizeof(ecs) + 12);
+    assert(out[29 + 3] == 0x10 && out[29 + 7] == 0x80);                     /* the client's payload size and DO bit stay */
+    /* SET on a message without an OPT RR: one added (512, version 0, no flags), ARCOUNT 1 */
+    n = ckt_msg(m, 7, 0x01, 0x00, false, 0, NULL, 0);
+    m[n++] = 0xEE;                                                          /* trailing octet: stays after the OPT RR */
+    r = ckc_msg_rewrite(m, n, out, sizeof(out), mine, myl, CKC_RW_SET, &added);
+    assert(added && r == n + 11 + myl && out[11] == 1 && out[r - 1] == 0xEE);
+    assert(out[29] == 0 && out[31] == 41 && out[32] == 2 && out[33] == 0 && out[34] == 0 && out[36] == 0);
+    assert(ckc_msg_check(out, r - 1, cc, &s) == 0 && s.kind == CKC_CLIENT);
+    /* KEEP without an OPT RR: unchanged; DROP: the OPT RR removed */
+    r = ckc_msg_rewrite(m, n, out, sizeof(out), mine, myl, CKC_RW_KEEP, &added);
+    assert(r == n && !added && memcmp(out, m, n) == 0);
+    n = ckt_msg(m, 7, 0x81, 0x00, true, 0, o, ol);
+    r = ckc_msg_rewrite(m, n, out, sizeof(out), NULL, 0, CKC_RW_DROP, &added);
+    assert(r == 29 && out[11] == 0 && memcmp(out, m, 11) == 0);
+    r = ckc_msg_rewrite(m, n, out, sizeof(out), NULL, 0, CKC_RW_KEEP, NULL);   /* only removed */
+    assert(r == n - ol + sizeof(ecs) && ckc_msg_check(out, r, cc, &s) == 0 && s.opt && s.kind == CKC_NONE);
+    /* refused: a TSIG RR in the additional section, two OPT RRs, an option list that runs past the RDATA, too small a buffer */
+    n = ckt_msg(m, 7, 0x01, 0x00, false, 0, NULL, 0);
+    {
+        static const uint8_t tsig[] = { 0, 0, 250, 0, 255, 0, 0, 0, 0, 0, 0 };
+        memcpy(m + n, tsig, sizeof(tsig)); n += sizeof(tsig); m[11] = 1;
+        assert(ckc_msg_scan(m, n, &mm) && mm.has_sig);
+        assert(ckc_msg_rewrite(m, n, out, sizeof(out), mine, myl, CKC_RW_SET, &added) == 0);
+    }
+    n = ckt_msg(m, 1, 0x81, 0x80, true, 0, o, ol);
+    memcpy(m + n, m + 29, 11 + ol); n += 11 + ol; m[11] = 2;
+    assert(ckc_msg_rewrite(m, n, out, sizeof(out), mine, myl, CKC_RW_KEEP, NULL) == 0);
+    {
+        uint8_t badopt[] = { 0, 8, 0, 9, 0, 1 };                            /* ECS claims 9 octets, 2 there */
+        n = ckt_msg(m, 1, 0x81, 0x80, true, 0, badopt, sizeof(badopt));
+        assert(ckc_msg_rewrite(m, n, out, sizeof(out), mine, myl, CKC_RW_KEEP, NULL) == 0);
+        uint8_t shortopt[] = { 0, 8, 0 };
+        n = ckt_msg(m, 1, 0x81, 0x80, true, 0, shortopt, sizeof(shortopt));
+        assert(ckc_msg_rewrite(m, n, out, sizeof(out), mine, myl, CKC_RW_KEEP, NULL) == 0);
+    }
+    n = ckt_msg(m, 7, 0x01, 0x00, true, 0, o, ol);
+    for (size_t cap = 0; cap < n - 16; cap++) assert(ckc_msg_rewrite(m, n, out, cap, mine, myl, CKC_RW_SET, NULL) == 0);
+    assert(ckc_msg_rewrite(m, n, out, n - 16, mine, myl, CKC_RW_SET, NULL) == n - 16);
+    n = ckt_msg(m, 7, 0x01, 0x00, false, 0, NULL, 0);
+    assert(ckc_msg_rewrite(m, n, out, n + 11 + myl - 1, mine, myl, CKC_RW_SET, NULL) == 0);
+    assert(ckc_msg_rewrite(m, n, out, n - 1, mine, myl, CKC_RW_KEEP, NULL) == 0);
+    n = ckt_msg(m, 7, 0x81, 0x00, true, 0, o, ol);
+    assert(ckc_msg_rewrite(m, n, out, 28, NULL, 0, CKC_RW_DROP, NULL) == 0);
+    m[10] = 0xFF; m[11] = 0xFF;                                             /* ARCOUNT 65535 with no RRs to walk: malformed */
+    assert(ckc_msg_rewrite(m, n, out, sizeof(out), mine, myl, CKC_RW_SET, NULL) == 0);
+    assert(!ckc_msg_scan(m, 5, &mm));
+    printf("  -> messages passed.\n");
+}
+
 /* ---- 0.7: DNS Cookies (RFC 7873) on the queries to the ALIAS resolvers: the parser and the builder ---- */
 static void b9_pk_opt(b9_pk_t *p, uint8_t ext_rcode, const uint8_t *opts, size_t olen) {
     p->b[p->n++] = 0;                                              /* the root */
@@ -11996,6 +12311,9 @@ int main(void) {
     test_b9a_alias_lua_queries();
     test_b9a_alias_response_parser();
     test_b9a_alias_network();
+    test_cookie_client_option();
+    test_cookie_client_state();
+    test_cookie_client_msg();
     test_alias_cookie_parser();
     test_alias_cookie_network();
     test_alias_max_refresh_sched();

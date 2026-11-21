@@ -41,6 +41,7 @@
 #include <stdint.h>
 #include <sys/socket.h>
 #include "dns_config_parser.h"
+#include "dns_cookie_client.h"
 
 #define ALIAS_MAX_RESOLVERS        KARIDNS_ALIAS_RESOLVERS_MAX
 #define ALIAS_MAX_TARGETS_PER_ZONE 1024
@@ -59,9 +60,9 @@
 #define ALIAS_DEAD_SECS            10
 #define ALIAS_RESOLVE_BUDGET_MS    3000       /* all resolvers of one resolution together */
 #define ALIAS_COOKIE_SLOTS         512        /* resolver addresses with cookie state (64 resolver lists x 8); the least recently used is reused */
-#define ALIAS_COOKIE_LIFETIME      86400      /* a client cookie is renewed after this, minus 0..40 % jitter (RFC 7873 section 7.1: default one day) */
-#define ALIAS_COOKIE_FORGET_FAILS  5          /* resolutions in a row without an accepted answer ... */
-#define ALIAS_COOKIE_FORGET_SECS   300        /* ... and this long since the last one: the address is no longer expected to send cookies */
+#define ALIAS_COOKIE_LIFETIME      CKC_LIFETIME     /* a client cookie is renewed after this, minus 0..40 % jitter (RFC 7873 section 7.1: default one day) */
+#define ALIAS_COOKIE_FORGET_FAILS  CKC_FORGET_FAILS /* resolutions in a row without an accepted answer ... */
+#define ALIAS_COOKIE_FORGET_SECS   CKC_FORGET_SECS  /* ... and this long since the last one: the address is no longer expected to send cookies */
 
 typedef struct {
     uint64_t key;                                       /* hash of the resolver list; 0 = none */
@@ -104,11 +105,11 @@ uint64_t alias_scan_count(void);     /* the scans of the zones since start (kari
 
 /* ---- exposed for the unit tests ---- */
 enum {
-    ALIAS_CK_NONE = 0,                /* no COOKIE option (or none was sent) */
-    ALIAS_CK_CLIENT = 1,              /* our client cookie, no server cookie (option length 8) */
-    ALIAS_CK_SERVER = 2               /* our client cookie and a server cookie of sc_len (8..32) octets */
+    ALIAS_CK_NONE = CKC_NONE,         /* no COOKIE option (or none was sent) */
+    ALIAS_CK_CLIENT = CKC_CLIENT,     /* our client cookie, no server cookie (option length 8) */
+    ALIAS_CK_SERVER = CKC_SERVER      /* our client cookie and a server cookie of sc_len (8..32) octets */
 };
-#define ALIAS_RCODE_BADCOOKIE 23      /* RFC 7873 section 8 */
+#define ALIAS_RCODE_BADCOOKIE CKC_RCODE_BADCOOKIE /* RFC 7873 section 8 */
 typedef struct {
     int rc;                           /* 0 = usable answer, 1 = RCODE other than NOERROR, -1 = malformed / loop / too long a chain, -2 = not the answer to this query (ID, QR, question; a COOKIE option of an illegal length or with another client cookie) */
     uint8_t n;

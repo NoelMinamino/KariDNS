@@ -13,6 +13,7 @@
 #include "dns_siphash.h"
 #include "dns_zone_image.h"
 #include "dns_alias.h"
+#include "dns_cookie_client.h"
 #include "dns_plugin_sup.h"
 
 #ifdef __FreeBSD__
@@ -2653,16 +2654,92 @@ size_t dns_rrl_slip_response(uint8_t *res, size_t res_len, size_t buf_cap) {
   return len;
 }
 
-_Thread_local static uint8_t s_forward_req_buf[65535];
+/* the query to the forwarders: the client's message, plus an OPT RR (11 octets) and this server's COOKIE option when it had none */
+_Thread_local static uint8_t s_forward_req_buf[65535 + 11 + CKC_OPTION_MAX];
 _Thread_local static uint8_t s_forward_res_buf[65535];
+
+/* 0.7: DNS Cookies (RFC 7873, dns_cookie_client.h) on the queries to the forwarders, as for the ALIAS resolvers (dns_alias.c).  A forward
+ * zone is answered by several threads at once: the ASYNC_IO_POOL_SIZE threads of the async I/O pool that UDP and TCP hand these queries
+ * to (dns_server_core.c async_io_worker_func()), and the threads that call the query engine themselves (TLS, DoH).  Each of these
+ * threads keeps its own table of forwarder addresses: no lock, and nothing shared on the query path but the process-wide marks of the
+ * forwarders that send cookies (g_fwd_ck_marks, C11 atomics).  Each thread has its own client cookie per forwarder and learns that
+ * forwarder's server cookie for it (RFC 7873 section 4.2: the server cookie is made from the client cookie it was sent, so every pair is
+ * valid on its own).  Once one thread has seen a server cookie from a forwarder, every thread expects one from it (the mark,
+ * ckc_expected()): the downgrade protection does not wait until each thread has learnt the forwarder, and the log lines come once per
+ * forwarder.  The table is fixed (FWD_COOKIE_SLOTS addresses per thread, the least recently used one is reused): no
+ * allocation (Rule 1). */
+#define FWD_COOKIE_SLOTS 64
+#define FWD_COOKIE_MARKS 256
+static _Thread_local ckc_entry_t t_fwd_ck_slots[FWD_COOKIE_SLOTS];
+static _Thread_local ckc_table_t t_fwd_ck;
+static _Atomic uint64_t g_fwd_ck_marks[FWD_COOKIE_MARKS];
+
+static ckc_table_t *fwd_ck_table(void) {
+  if (!t_fwd_ck.slots)
+    t_fwd_ck = (ckc_table_t){ .slots = t_fwd_ck_slots, .n = FWD_COOKIE_SLOTS, .who = "[Forward] forwarder", .unit = "queries",
+                              .marks = g_fwd_ck_marks, .nmarks = FWD_COOKIE_MARKS };
+  return &t_fwd_ck;
+}
+
+/* A reply with the header of the forwarder's response (src: DNS_HEADER_SIZE octets), the client's question and TC=1 (the client asks
+ * again over TCP): for a response larger than the client takes, or a truncated one that TCP did not replace.  The question is the
+ * client's own (it matched the response's, question_section_matches()); when even that does not fit, the header alone with QDCOUNT 0.
+ * The caller adds the OPT RR (add_opt_to_bare_passthrough()). */
+static int fwd_truncated_reply(const uint8_t *req, size_t req_len, const uint8_t *src, uint8_t *res, size_t max_res_len) {
+  if (max_res_len < DNS_HEADER_SIZE) return 0;
+  memcpy(res, src, DNS_HEADER_SIZE);
+  res[0] = req[0]; res[1] = req[1];
+  res[2] |= 0x82; // QR=1, TC=1
+  memset(res + 4, 0, DNS_HEADER_SIZE - 4);
+  uint16_t qdcount = (uint16_t)((req[4] << 8) | req[5]);
+  size_t qend = get_question_end_offset(req, req_len, qdcount);
+  if (qdcount == 0 || qend <= DNS_HEADER_SIZE || qend > req_len || qend > max_res_len) return DNS_HEADER_SIZE;
+  memcpy(res + DNS_HEADER_SIZE, req + DNS_HEADER_SIZE, qend - DNS_HEADER_SIZE);
+  res[4] = req[4]; res[5] = req[5];
+  return (int)qend;
+}
+
+/* The reply to the client from the forwarder's response src[0..n).  When the query carried this server's cookie (cookied), the OPT RR
+ * of the response belongs to this server's exchange with the forwarder (RFC 6891 section 6.1.1: an OPT RR is not forwarded): the
+ * forwarder's COOKIE option is taken out and the client's (this server's cookie for the client, RFC 7873 section 5.2; ccopt) put in, and
+ * an OPT RR that was added to a query without one (added) is removed again (RFC 6891 section 7: no OPT RR to a requestor without EDNS).
+ * The forwarder's cookies never reach the client: with them a client could forge this server's next answers from that forwarder.  A
+ * cookied response that cannot be walked is not relayed: TC=1 with the question when it was truncated, else SERVFAIL. */
+static int fwd_reply(const uint8_t *req, size_t req_len, const uint8_t *src, size_t n, bool cookied, bool added, const uint8_t *ccopt,
+                     size_t ccopt_len, uint8_t *res, size_t max_res_len) {
+  if (cookied) {
+    size_t m = ckc_msg_rewrite(src, n, res, max_res_len, ccopt, ccopt_len, added ? CKC_RW_DROP : CKC_RW_KEEP, NULL);
+    if (m >= DNS_HEADER_SIZE) {
+      res[0] = req[0]; res[1] = req[1]; // クライアントの元のトランザクションIDへ復元
+      return (int)m;
+    }
+    ckc_msg_t mm;
+    bool walks = ckc_msg_scan(src, n, &mm) && !mm.has_sig && mm.opt_count <= 1;
+    if (walks || (src[2] & 0x02)) return fwd_truncated_reply(req, req_len, src, res, max_res_len);   /* larger than the client takes, or cut */
+    return build_synthetic_servfail(req, req_len, res, max_res_len);
+  }
+  if (n > max_res_len) return fwd_truncated_reply(req, req_len, src, res, max_res_len);
+  memcpy(res, src, n);
+  res[0] = req[0]; res[1] = req[1]; // クライアントの元のトランザクションIDへ復元
+  return (int)n;
+}
+
+static int dispatch_forward_zone_ck(const zone_config_t *zcfg, const uint8_t *req, size_t req_len, uint8_t *res, size_t max_res_len,
+                                    const edns_info_t *edns);
 
 STATIC_TEST int dispatch_forward_zone(const zone_config_t *zcfg, const uint8_t *req, size_t req_len,
                                  uint8_t *res, size_t max_res_len) {
+  return dispatch_forward_zone_ck(zcfg, req, req_len, res, max_res_len, NULL);
+}
+
+/* edns: the client's EDNS state (its cookie and this server's cookie for it), NULL = none */
+static int dispatch_forward_zone_ck(const zone_config_t *zcfg, const uint8_t *req, size_t req_len, uint8_t *res, size_t max_res_len,
+                                    const edns_info_t *edns) {
   const zone_ext_t *x = zext(zcfg);
   if (req_len < DNS_HEADER_SIZE || x->forwarders_count == 0) {
     return build_synthetic_servfail(req, req_len, res, max_res_len);
   }
-  if (req_len > sizeof(s_forward_req_buf)) {
+  if (req_len > sizeof(s_forward_res_buf)) {
     return build_synthetic_servfail(req, req_len, res, max_res_len);
   }
 
@@ -2670,11 +2747,14 @@ STATIC_TEST int dispatch_forward_zone(const zone_config_t *zcfg, const uint8_t *
   // 各フォワーダーにフル分与せず、この締切までの残り時間を使う。
   uint32_t total_budget = x->forward_timeout_ms > 0 ? x->forward_timeout_ms : 2000;
   int64_t deadline = monotonic_ms() + total_budget;
-
-  memcpy(s_forward_req_buf, req, req_len);
   uint16_t fresh_id = (uint16_t)(arc4random() & 0xFFFF);
-  s_forward_req_buf[0] = fresh_id >> 8;
-  s_forward_req_buf[1] = fresh_id & 0xFF;
+
+  /* the COOKIE option of the reply to the client: this server's own cookies for it (RFC 7873 section 5.2.1-5.2.4, made by the caller) */
+  uint8_t ccopt[CKC_OPTION_MAX];
+  size_t ccopt_len = 0;
+  if (edns && edns->has_cookie)
+    ccopt_len = ckc_option_put(ccopt, sizeof(ccopt), edns->client_cookie, edns->server_cookie, edns->server_cookie_len);
+  ckc_table_t *ckt = fwd_ck_table();
 
   for (int i = 0; i < x->forwarders_count; i++) {
     uint32_t rem = remaining_ms(deadline);
@@ -2693,48 +2773,113 @@ STATIC_TEST int dispatch_forward_zone(const zone_config_t *zcfg, const uint8_t *
       continue;
     }
 
-    int sock = broker_connect(ss.ss_family, SOCK_DGRAM, (struct sockaddr *)&ss, ss_len);
-    if (sock < 0) {
-      syslog(LOG_WARNING, "[Forward] zone '%s': connect to forwarder '%s:%d' failed",
-             zcfg->domain, fwd->ip, fwd->port);
-      continue;
-    }
-
     /* D-20: 残り時間を、まだ試していないフォワーダー (このフォワーダーを含む) で等分する。
      * 最初のフォワーダーが応答しなくても、後ろのフォワーダーに時間が残る。 */
     uint32_t share = rem / (uint32_t)(x->forwarders_count - i);
     if (share == 0) share = 1;
     int64_t fwd_deadline = monotonic_ms() + share;
 
+    ckc_entry_t *ck = ckc_get(ckt, &ss, monotonic_ms() / 1000);
     ssize_t got = -1;
-    bool mismatched = false;
-    if (send(sock, s_forward_req_buf, req_len, 0) == (ssize_t)req_len) {
-      /* ID・QR・質問が一致する応答だけを受け取る (RFC 5452 §9.1)。一致しないデータグラムは
-       * 捨てて、このフォワーダーの持ち時間が尽きるまで待ち続ける (D-20)。 */
-      for (;;) {
-        uint32_t wait_ms = remaining_ms(fwd_deadline);
-        if (wait_ms == 0) break;
-        struct pollfd pfd = { .fd = sock, .events = POLLIN };
-        int pr = poll(&pfd, 1, (int)wait_ms);
-        if (pr < 0 && errno == EINTR) continue;
-        if (pr <= 0) break;
-        ssize_t n = recv(sock, s_forward_res_buf, sizeof(s_forward_res_buf), 0);
-        if (n < 0) break; /* ICMP unreachable など: 次のフォワーダーへ */
-        if (n >= (ssize_t)DNS_HEADER_SIZE &&
-            ((s_forward_res_buf[0] << 8) | s_forward_res_buf[1]) == fresh_id &&
-            (s_forward_res_buf[2] & 0x80) &&
-            question_section_matches(s_forward_res_buf, (size_t)n, req, req_len)) {
+    size_t qlen = req_len;
+    bool cookied = false, added = false, accepted = false, mismatched = false, ck_bad = false, connect_failed = false, skipped = false;
+    bool plain = false;               /* the client's message as it is, without this server's cookie */
+    ckc_seen_t seen;
+    memset(&seen, 0, sizeof(seen));
+    /* attempt 2: after BADCOOKIE with the new server cookie (RFC 7873 section 5.3), or without the OPT RR this server added when a
+     * forwarder without cookies answered FORMERR / NOTIMP without one (a server without EDNS, RFC 6891 section 7) */
+    for (int attempt = 0; attempt < 2; attempt++) {
+      cookied = false;
+      if (!plain) {
+        uint8_t opt[CKC_OPTION_MAX];
+        size_t olen = ckc_option_put(opt, sizeof(opt), ck->cc, ck->sc, ck->sc_len);
+        size_t ql = olen ? ckc_msg_rewrite(req, req_len, s_forward_req_buf, sizeof(s_forward_req_buf), opt, olen, CKC_RW_SET, &added) : 0;
+        if (ql >= DNS_HEADER_SIZE) {
+          cookied = true;
+          qlen = ql;
+        } else if (ckc_expected(ckt, ck)) {
+          /* the message cannot carry a cookie (a SIG(0) RR must stay last): without one an answer from a forwarder that sends
+           * cookies could be forged, so this forwarder is not asked */
+          syslog(LOG_WARNING, "[Forward] zone '%s': the query cannot carry a DNS cookie; not sent to forwarder '%s:%d', which sends cookies",
+                 zcfg->domain, fwd->ip, fwd->port);
+          skipped = true;   /* no exchange: not counted against the forwarder (ckc_account) */
+          break;
+        }
+      }
+      if (!cookied) {
+        memcpy(s_forward_req_buf, req, req_len);
+        qlen = req_len;
+        added = false;
+      }
+      s_forward_req_buf[0] = fresh_id >> 8;
+      s_forward_req_buf[1] = fresh_id & 0xFF;
+
+      int sock = broker_connect(ss.ss_family, SOCK_DGRAM, (struct sockaddr *)&ss, ss_len);
+      if (sock < 0) {
+        connect_failed = true;
+        break;
+      }
+      got = -1;
+      if (send(sock, s_forward_req_buf, qlen, 0) == (ssize_t)qlen) {
+        /* ID・QR・質問が一致する応答だけを受け取る (RFC 5452 §9.1)。一致しないデータグラムは
+         * 捨てて、このフォワーダーの持ち時間が尽きるまで待ち続ける (D-20)。
+         * DNS Cookie (RFC 7873 §5.3): クライアントクッキーが違う・長さが不正・COOKIE が二つある応答、Cookie を返すと分かっている
+         * フォワーダーからの Server Cookie のない UDP 応答 (ダウングレード) も捨てて待ち続ける。 */
+        for (;;) {
+          uint32_t wait_ms = remaining_ms(fwd_deadline);
+          if (wait_ms == 0) break;
+          struct pollfd pfd = { .fd = sock, .events = POLLIN };
+          int pr = poll(&pfd, 1, (int)wait_ms);
+          if (pr < 0 && errno == EINTR) continue;
+          if (pr <= 0) break;
+          ssize_t n = recv(sock, s_forward_res_buf, sizeof(s_forward_res_buf), 0);
+          if (n < 0) break; /* ICMP unreachable など: 次のフォワーダーへ */
+          if (n < (ssize_t)DNS_HEADER_SIZE || ((s_forward_res_buf[0] << 8) | s_forward_res_buf[1]) != fresh_id ||
+              !(s_forward_res_buf[2] & 0x80) || !question_section_matches(s_forward_res_buf, (size_t)n, req, req_len)) {
+            mismatched = true;
+            continue;
+          }
+          if (cookied && (ckc_msg_check(s_forward_res_buf, (size_t)n, ck->cc, &seen) < 0 || !ckc_acceptable(ckt, ck, seen.kind))) {
+            ck_bad = true;
+            continue;
+          }
           got = n;
           break;
         }
-        mismatched = true;
       }
+      close(sock);
+      if (got < (ssize_t)DNS_HEADER_SIZE) break;
+      accepted = true;
+      if (!cookied) break;
+      ckc_learn(ckt, ck, seen.kind, seen.sc, seen.sc_len);
+      if (seen.badcookie) {
+        /* RFC 7873 §5.3: BADCOOKIE with our client cookie: once more with the server cookie it carried, within this forwarder's share.
+         * A second BADCOOKIE (or one without a new server cookie) is no answer: the next forwarder */
+        got = -1;
+        if (seen.kind == CKC_SERVER && attempt == 0 && remaining_ms(fwd_deadline) > 0) continue;
+        break;
+      }
+      unsigned rc = s_forward_res_buf[3] & 0x0Fu;
+      if (added && !seen.opt && !ckc_expected(ckt, ck) && (rc == 1 || rc == 4) && attempt == 0 && remaining_ms(fwd_deadline) > 0) {
+        plain = true;
+        got = -1;
+        continue;
+      }
+      break;
     }
-    close(sock);
+    if (!skipped) ckc_account(ckt, ck, accepted, monotonic_ms() / 1000);
 
+    if (connect_failed) {
+      syslog(LOG_WARNING, "[Forward] zone '%s': connect to forwarder '%s:%d' failed",
+             zcfg->domain, fwd->ip, fwd->port);
+      continue;
+    }
     if (mismatched)
       syslog(LOG_WARNING, "[Forward] zone '%s': forwarder '%s:%d' returned a mismatched "
              "response (id/question mismatch), discarded", zcfg->domain, fwd->ip, fwd->port);
+    if (ck_bad)
+      syslog(LOG_WARNING, "[Forward] zone '%s': a response from forwarder '%s:%d' with a wrong or missing DNS cookie was discarded "
+             "(RFC 7873 section 5.3)", zcfg->domain, fwd->ip, fwd->port);
     if (got < (ssize_t)DNS_HEADER_SIZE) {
       syslog(LOG_WARNING, "[Forward] zone '%s': forwarder '%s:%d' timed out or failed, trying next",
              zcfg->domain, fwd->ip, fwd->port);
@@ -2743,48 +2888,30 @@ STATIC_TEST int dispatch_forward_zone(const zone_config_t *zcfg, const uint8_t *
 
     if (s_forward_res_buf[2] & 0x02) { // TC bit
       uint32_t rem_tcp = remaining_ms(deadline);
+      uint8_t hdr[DNS_HEADER_SIZE];
+      memcpy(hdr, s_forward_res_buf, sizeof(hdr));
+      uint8_t *tbuf = s_forward_res_buf;
       if (rem_tcp > 0) {
-        ssize_t tcp_got = forward_via_tcp(&ss, ss_len, s_forward_req_buf, req_len,
-                                          s_forward_res_buf, sizeof(s_forward_res_buf), rem_tcp);
+        /* the same query (with the same cookie) over TCP.  A COOKIE option that is there must be right (RFC 7873 §5.3); one that is
+         * missing is accepted over TCP, where an off-path forger cannot answer (the three-way handshake), as for ALIAS.  Of the UDP
+         * answer only the header is kept: a truncated answer is not to be used for its content (RFC 2181 §9) */
+        ssize_t tcp_got = forward_via_tcp(&ss, ss_len, s_forward_req_buf, qlen, tbuf, sizeof(s_forward_res_buf), rem_tcp);
         if (tcp_got >= (ssize_t)DNS_HEADER_SIZE) {
-          uint16_t tcp_resp_id = (s_forward_res_buf[0] << 8) | s_forward_res_buf[1];
-          if (tcp_resp_id == fresh_id && (s_forward_res_buf[2] & 0x80) &&
-              question_section_matches(s_forward_res_buf, (size_t)tcp_got, req, req_len)) {
-            got = tcp_got;
+          uint16_t tcp_resp_id = (tbuf[0] << 8) | tbuf[1];
+          ckc_seen_t tseen;
+          if (tcp_resp_id == fresh_id && (tbuf[2] & 0x80) &&
+              question_section_matches(tbuf, (size_t)tcp_got, req, req_len) &&
+              (!cookied || ckc_msg_check(tbuf, (size_t)tcp_got, ck->cc, &tseen) == 0)) {
+            if (cookied) ckc_learn(ckt, ck, tseen.kind, tseen.sc, tseen.sc_len);
+            return fwd_reply(req, req_len, tbuf, (size_t)tcp_got, cookied, added, ccopt, ccopt_len, res, max_res_len);
           }
         }
       }
-      // TCPフォールバックが失敗した場合は、UDPで得た(TC付きの)応答を
-      // そのまま使う(何も返さないよりはマシ、というBIND等と同じ扱い)。
+      // TCP フォールバックが失敗した場合は、UDP で得た (TC 付きの) 応答のヘッダーとクライアントの質問を TC=1 で返す
+      // (クライアントが TCP で問い直す。以前は UDP の応答をそのまま返していたが、TCP の応答で上書きされた後だった)。
+      return fwd_truncated_reply(req, req_len, hdr, res, max_res_len);
     }
-
-    if ((size_t)got > max_res_len) {
-      size_t copy_len = max_res_len;
-      memcpy(res, s_forward_res_buf, copy_len);
-      res[0] = req[0]; res[1] = req[1];
-      res[2] |= 0x82; // QR=1, TC=1
-      res[4] = req[4]; res[5] = req[5];
-      res[6] = 0; res[7] = 0;
-      res[8] = 0; res[9] = 0;
-      res[10] = 0; res[11] = 0;
-      uint16_t qdcount = (req[4] << 8) | req[5];
-      size_t qlen = get_question_end_offset(res, copy_len, qdcount);
-      if (qlen < DNS_HEADER_SIZE || qlen > copy_len) {
-        size_t req_qlen = get_question_end_offset(req, req_len, qdcount);
-        if (req_qlen >= DNS_HEADER_SIZE && req_qlen <= max_res_len) {
-          memcpy(res + DNS_HEADER_SIZE, req + DNS_HEADER_SIZE, req_qlen - DNS_HEADER_SIZE);
-          qlen = req_qlen;
-        } else {
-          qlen = DNS_HEADER_SIZE;
-        }
-      }
-      return (int)qlen;
-    }
-
-    size_t copy_len = (size_t)got;
-    memcpy(res, s_forward_res_buf, copy_len);
-    res[0] = req[0]; res[1] = req[1]; // クライアントの元のトランザクションIDへ復元
-    return (int)copy_len;
+    return fwd_reply(req, req_len, s_forward_res_buf, (size_t)got, cookied, added, ccopt, ccopt_len, res, max_res_len);
   }
 
   syslog(LOG_ERR, "[Forward] zone '%s': all %d forwarder(s) failed or timed out", zcfg->domain, x->forwarders_count);
@@ -4263,7 +4390,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
       return plugin_result_len;
     }
     if (fwd_zone) {
-      int fwd_len = dispatch_forward_zone(zcfg, req, req_len, res, max_res_len);
+      int fwd_len = dispatch_forward_zone_ck(zcfg, req, req_len, res, max_res_len, &edns);
       return add_opt_to_bare_passthrough(res, max_res_len, fwd_len, &edns, is_tcp, cfg);
     }
   }
