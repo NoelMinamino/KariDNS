@@ -420,7 +420,7 @@ uint64_t park_lookup_take_fails(void);            /* ... how many times, all wor
 void park_shed_set_ttl(uint32_t ms);                      /* 0: nothing is remembered */
 void park_shed_remember(uint64_t key, int64_t now_ms);
 bool park_shed_held(uint64_t key, int64_t now_ms);
-void park_shed_release(int64_t now_ms);                   /* every name remembered until now is forgotten */
+void park_shed_release(int64_t now_ms);                   /* every name stamped before the millisecond now_ms is forgotten; the names of now_ms itself are kept (the caller releases them at a later look) */
 uint64_t park_shed_remembered(void);                      /* names put in the table, since the start */
 uint64_t park_shed_releases(void);                        /* releases that forgot at least one name */
 

@@ -5663,21 +5663,27 @@ static int run_lookup_body(const char *dir) {
         uint64_t sr[6];
         const uint64_t shed0 = lk_stats().shed, exp0 = lk_stats().expired, rem0 = lk_stats().remembered, rel0 = lk_stats().remember_releases;
         atomic_store(&db_ingest_test_lq_max, 3);
+        const int64_t t_ask7 = mono_ms();
         for (int i = 0; i < 12; i++) {
             snprintf(nm, sizeof(nm), "s%d.nz.test.", i);
             CHECK(lk_asked(nm));
         }
+        int rw = 0;                                                                             /* (the three that find the queue full are shed as the asks are taken, before any answer: wait for that) */
+        while (rw < 5000 && lk_stats().remembered < rem0 + 3) { usleep(1000); rw++; }             /* (the counter of the shed goes up before the name is remembered) */
+        const int64_t t_shed = mono_ms();                                                       /* (the sheds are done; the check below looks at this moment, not after the waits: a slow runner may pass park-timeout) */
+        const store_lookup_t ls7 = lk_stats();
+        CHECK_MSG(ls7.remembered >= rem0 + 3 && ls7.shed == shed0 + 3, "remembered %llu, want %llu or more after %d ms (shed %llu from %llu, expired %llu from %llu)", (unsigned long long)ls7.remembered,
+                  (unsigned long long)(rem0 + 3), rw, (unsigned long long)ls7.shed, (unsigned long long)shed0, (unsigned long long)ls7.expired, (unsigned long long)exp0);
         for (int i = 0; i < 6; i++) {
             snprintf(nm, sizeof(nm), "s%d.nz.test.", i);
             sr[i] = lk_next(&fetchc, nm);
         }
         CHECK(!ch_next(&fetchc, &m, 300));
         CHECK(lk_stats().in_flight == 6 && lk_stats().pending == 3 && lk_stats().shed == shed0 + 3);
-        for (int t = 0; t < 400 && lk_stats().remembered < rem0 + 3; t++) usleep(1000);            /* (the counter of the shed goes up before the name is remembered) */
-        const int64_t t_shed = mono_ms();                                                       /* (the sheds are done; the check below looks at this moment, not after the waits: a slow runner may pass park-timeout) */
         for (int i = 9; i < 12; i++) {
             snprintf(nm, sizeof(nm), "s%d.nz.test.", i);
-            CHECK(park_shed_held(park_lookup_claim_key("default", nm), t_shed));                  /* (a name that was shed is remembered: its worker asks no more for it) */
+            CHECK_MSG(park_shed_held(park_lookup_claim_key("default", nm), t_shed), "%s not held %lld ms after the asks: remembered %llu from %llu, releases %llu from %llu",   /* (a name that was shed is remembered: its worker asks no more for it) */
+                      nm, (long long)(t_shed - t_ask7), (unsigned long long)ls7.remembered, (unsigned long long)rem0, (unsigned long long)ls7.remember_releases, (unsigned long long)rel0);
             CHECK(wake_for(nm, &k, 5000) && k.ask == PARK_ASK_DROP && !k.failed && !park_claim_held(park_lookup_claim_key("default", nm)));
         }
         CHECK(!shed_held_now("s0.nz.test.") && !shed_held_now("s8.nz.test."));                    /* (the ones that were asked for, or wait, are not) */

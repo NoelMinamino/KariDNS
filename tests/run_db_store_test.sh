@@ -157,6 +157,7 @@ pass_all() {
 # the answers of the subset on a port, normalised, into FILE
 subset_answers() {   # subset_answers PORT FILE
     sp=$1; sout=$2
+    kari_udp_snap "$T/udp.snap"; sysctl -n net.inet.ip.intr_queue_drops > "$T/iqd.snap" 2>/dev/null || echo 0 > "$T/iqd.snap"
     : > "$sout.tmp"
     z=1
     while [ $z -le "$NZ" ]; do
@@ -170,6 +171,21 @@ subset_answers() {   # subset_answers PORT FILE
         z=$((z + STEP))
     done
     mv "$sout.tmp" "$sout"
+}
+# subset_diff REF FILE: why the answers of the subset differ.  The diff; the queries whose answers differ (a ";; communications error ... timed out" line in one is a try that got no answer: dag tried again)
+# and the state of their zones; the drop counters of the park and the attach counters of the store; the IPC drops; what the kernel dropped since subset_answers began (UDP socket buffers, the netisr
+# queue of the loopback).  The CI jobs print the whole log of a failed test (--full-log), so one failure shows where the query was lost.
+subset_diff() {
+    diff -u "$1" "$2" | head -60
+    perl -e 'my %b; for my $i (0, 1) { open(my $h, "<", $ARGV[$i]) or next; my $k = ""; while (<$h>) { if (/^## (.*)/) { $k = $1; next } $b{$k}[$i] .= $_ } }
+        for my $k (sort keys %b) { print "$k\n" if ($b{$k}[0] // "") ne ($b{$k}[1] // "") }' "$1" "$2" > "$T/differs"
+    sed 's/^/  differs: /' "$T/differs" | head -20
+    echo "  $(park_drops)"
+    $KA store -k 2>/dev/null | grep -E "^store.(attach|cold|park|wa)" | head -40
+    kari_lost_diag "$KA" "$PA" $(grep -o -i 'z[0-9]*\.test' "$T/differs" | tr 'A-Z' 'a-z' | sort -u)
+    kari_ipc_diag "$KA" "$T/a.log"
+    echo "  the kernel since the queries began (netstat -s -p udp):"; kari_udp_delta "$T/udp.snap"
+    echo "  net.inet.ip.intr_queue_drops: $(cat "$T/iqd.snap") -> $(sysctl -n net.inet.ip.intr_queue_drops 2>/dev/null)"
 }
 
 echo "== the reference server (every zone in memory, no store) and the server under test (memory-limit 1m, a store)"
@@ -219,7 +235,7 @@ ST_ATT=$(sf store.zones.attached)
 echo "  answers on the subset: the server with the store against the reference"
 subset_answers "$PB" "$T/ref.ans"
 subset_answers "$PA" "$T/a1.ans"
-if cmp -s "$T/ref.ans" "$T/a1.ans" && [ -s "$T/ref.ans" ]; then pass "the answers are the reference's ($(grep -c '^##' "$T/ref.ans") queries, $(wc -l < "$T/ref.ans" | tr -d ' ') lines)"; else fail "the answers differ from the reference"; diff -u "$T/ref.ans" "$T/a1.ans" | head -60; fi
+if cmp -s "$T/ref.ans" "$T/a1.ans" && [ -s "$T/ref.ans" ]; then pass "the answers are the reference's ($(grep -c '^##' "$T/ref.ans") queries, $(wc -l < "$T/ref.ans" | tr -d ' ') lines)"; else fail "the answers differ from the reference"; subset_diff "$T/ref.ans" "$T/a1.ans"; fi
 waitfor 30 stored_all >/dev/null
 
 echo "== kill -9, a restart on the same store, the loader stopped: answered from the store alone"
@@ -235,7 +251,7 @@ pass_all 1 "$NZ" 1
 [ "$(fetches)" = 0 ] && pass "no zone was read from the loader (fetch issued=0)" || fail "fetch issued=$(fetches) after the restart"
 [ "$(sf store.attach.count)" -gt 0 ] 2>/dev/null && pass "the zones were attached from the store ($(sf store.attach.count))" || fail "no attach after the restart: $($KA store | head -20)"
 subset_answers "$PA" "$T/a2.ans"
-if cmp -s "$T/ref.ans" "$T/a2.ans"; then pass "the answers after the restart are the reference's"; else fail "the answers after the restart differ"; diff -u "$T/ref.ans" "$T/a2.ans" | head -60; echo "  $(park_drops)"; $KA store -k 2>/dev/null | grep -E "^store.(attach|cold|park|wa)" | head -40; fi
+if cmp -s "$T/ref.ans" "$T/a2.ans"; then pass "the answers after the restart are the reference's"; else fail "the answers after the restart differ"; subset_diff "$T/ref.ans" "$T/a2.ans"; fi
 [ -n "$LPID" ] && kill -CONT "$LPID" 2>/dev/null
 
 echo "== a damaged record: that zone is read from the database, the others still attach"

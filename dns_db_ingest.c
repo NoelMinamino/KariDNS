@@ -3672,20 +3672,24 @@ static void lookup_hist(int64_t ns) {
  * (shed_release_check()).  Only this thread calls these (the statics need no atomics); the counters are the park table's. */
 static int64_t s_shed_last_ms;                           /* when a name was remembered last (the loop looks for the catch-up while the entries could still be live) */
 static int64_t s_shed_rel_ms;                            /* ... and when the names were released last */
+static bool s_shed_since;                                /* a name was remembered after the last release (not s_shed_last_ms > s_shed_rel_ms: both can fall in one millisecond) */
 static void shed_remember(uint64_t ckey) {
   if (!ckey) return;
   s_shed_last_ms = now_ms();
+  s_shed_since = true;
   park_shed_remember(ckey, s_shed_last_ms);
 }
 
 /* The queue is empty and a lookup could be made: this thread has caught up, so the names that were remembered are asked again by the next query (at most once in an eighth of park-timeout: a thread that is
- * on and off the edge of its queue would otherwise forget the names at every pass). */
+ * on and off the edge of its queue would otherwise forget the names at every pass).  park_shed_release(now) forgets the names stamped before the millisecond `now` and keeps the ones of `now`, so that a name shed
+ * right after the release in the same millisecond is held; the names shed in the current millisecond before it are released at the next look (the loop looks every ING_WQ_TICK_MS while names are remembered). */
 static void shed_release_check(const ing_t *g) {
-  if (s_shed_last_ms <= s_shed_rel_ms || g->nlq != 0 || !lookup_ready(g)) return;      /* (nothing was remembered since the last release, or not caught up) */
+  if (!s_shed_since || g->nlq != 0 || !lookup_ready(g)) return;      /* (nothing was remembered since the last release, or not caught up) */
   const int64_t now = now_ms();
   const int64_t gap = (int64_t)atomic_load_explicit(&g_park_timeout_ms, memory_order_relaxed) / 8;
-  if (now - s_shed_rel_ms < (gap > 10 ? gap : 10)) return;
+  if (now - s_shed_rel_ms < (gap > 10 ? gap : 10) || now <= s_shed_last_ms) return;      /* (a name was remembered in this millisecond: it would be kept, the next look releases it) */
   s_shed_rel_ms = now;
+  s_shed_since = false;
   park_shed_release(now);
 }
 
@@ -5081,7 +5085,7 @@ static void *ingest_thread(void *arg) {
     if ((g->nwarm > 0 || (g->apex_walk && g->fetch_fd >= 0)) && (wait_ms < 0 || wait_ms > 50)) wait_ms = 50;      /* zones to read before a query asks, or the walk for apexes (while there is a fetch stream): try again soon */
     if (g->bg_on && g->fetch_fd >= 0 && (wait_ms < 0 || wait_ms > 50)) wait_ms = 50;           /* 0.7 WP7b: the bodies the reconcile wants are being asked for: look again soon (a pause after a failed round, a free place) */
     if ((g->nwq > 0 || g->nlq > 0) && (wait_ms < 0 || wait_ms > ING_WQ_TICK_MS)) wait_ms = ING_WQ_TICK_MS;     /* 0.7 P-B: requests wait (for the bucket, room, a place): look again, and at their deadlines */
-    if (s_shed_last_ms > s_shed_rel_ms && now_ms() < s_shed_last_ms + (int64_t)atomic_load_explicit(&g_park_timeout_ms, memory_order_relaxed) && (wait_ms < 0 || wait_ms > ING_WQ_TICK_MS))
+    if (s_shed_since && now_ms() < s_shed_last_ms + (int64_t)atomic_load_explicit(&g_park_timeout_ms, memory_order_relaxed) && (wait_ms < 0 || wait_ms > ING_WQ_TICK_MS))
       wait_ms = ING_WQ_TICK_MS;                          /* 0.7: names are remembered as shed: look again soon, to forget them when this thread has caught up (shed_release_check()) */
     if (g->hold && (wait_ms < 0 || wait_ms > 50)) wait_ms = 50;           /* warm-before-serve: look at the warm-up and the time often */
     if (wait_ms < 0 || wait_ms > 10000) wait_ms = 10000;                  /* (the busy share of dbstatus is closed at the end of a window, so the thread wakes at least that often) */

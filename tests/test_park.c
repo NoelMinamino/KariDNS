@@ -1506,6 +1506,14 @@ static void test_shed_names(void) {
   park_shed_release(T + 1500);
   park_shed_release(T + 1600);                                                    /* (a release that had nothing to forget is not counted) */
   CHECK(!park_shed_held(ka, T + 1700) && park_shed_releases() == r0 + 2);
+  /* a release and a shed in one millisecond: the stamp cannot tell before from after, so the names of the release's own millisecond are kept; the one shed after the release must be held (test_db_store proto7 part 7
+   * saw its three shed names released by the catch-up of the same millisecond, floor = stamp + 1) */
+  park_shed_remember(ka, T + 1750);
+  park_shed_release(T + 1800);
+  park_shed_remember(kb, T + 1800);
+  CHECK(!park_shed_held(ka, T + 1800) && park_shed_held(kb, T + 1800) && park_shed_held(kb, T + 1900) && park_shed_releases() == r0 + 3);
+  park_shed_release(T + 1901);
+  CHECK(!park_shed_held(kb, T + 1901));
   /* a window of PARK_SHED_WIN = 8 slots that are all live: the oldest gives its place up.  Keys that point at the same slot (key >> 8 equal) and differ in their high halves. */
   uint64_t kw[10];
   for (int i = 0; i < 10; i++) kw[i] = ((uint64_t)(0x1000 + i) << 32) | 0x5500u | 1u;
