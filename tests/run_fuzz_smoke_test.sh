@@ -132,7 +132,7 @@ if [ "$MODE" = "dag" ] || [ "$MODE" = "all" ]; then
         fuzz_dag_response fuzz_dag_hash fuzz_dag_iter_classify fuzz_dag_chunked_http \
         fuzz_dag_rdata_yaml fuzz_dag_axfr_stream fuzz_dag_cli_args fuzz_dag_batch_file \
         fuzz_dag_replay_pcap_reader fuzz_dag_replay_diff fuzz_dag_tcp_reassembly fuzz_tapstat \
-        fuzz_dnsqps_resp fuzz_dnsqps_args
+        fuzz_dnsqps_resp fuzz_dnsqps_args fuzz_dnsqps_msg
 fi
 
 if [ "$MODE" = "karidns" ] || [ "$MODE" = "all" ]; then

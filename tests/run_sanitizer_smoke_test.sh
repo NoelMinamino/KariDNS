@@ -272,7 +272,7 @@ pids=""
 FUZZ_NEW_DIR=$(mktemp -d "${TMPDIR:-/tmp}/kari_san_fuzz.XXXXXX")
 for target in fuzz_dns_wire fuzz_dns_server_core fuzz_zone_parser fuzz_zone_image fuzz_zone_image_validate fuzz_conf_parser fuzz_tsig_sign fuzz_tsig_verify \
               fuzz_query_engine fuzz_xfr_packet fuzz_dynamic_update fuzz_db_stream fuzz_db_image_frames fuzz_pdns_content fuzz_pdns_metadata fuzz_db_checkline fuzz_json_escape fuzz_zone_text fuzz_zone_changes fuzz_db_logline fuzz_plugin_msg fuzz_nsec3_rebuild fuzz_alias_response fuzz_xfr_state fuzz_ipc_frame \
-              fuzz_dag_response fuzz_dag_hash fuzz_dag_iter_classify fuzz_dag_chunked_http fuzz_dag_rdata_yaml fuzz_dag_axfr_stream fuzz_dag_cli_args fuzz_dag_batch_file fuzz_tapstat fuzz_dnsqps_resp fuzz_dnsqps_args; do
+              fuzz_dag_response fuzz_dag_hash fuzz_dag_iter_classify fuzz_dag_chunked_http fuzz_dag_rdata_yaml fuzz_dag_axfr_stream fuzz_dag_cli_args fuzz_dag_batch_file fuzz_tapstat fuzz_dnsqps_resp fuzz_dnsqps_args fuzz_dnsqps_msg; do
     bin="tests/fuzz/$target"
     corpus="tests/fuzz/corpus_$target"
     [ -d "$corpus" ] || corpus="tests/fuzz/corpus"

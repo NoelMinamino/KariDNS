@@ -68,6 +68,20 @@ int dq_raw_prepare(dq_target_t *tg, const dq_cfg_t *c, char *err, size_t errlen)
     return -1;
 }
 #else
+/* the first address of the family on the interface (the sender address of the ARP / neighbor request when the source is a prefix) */
+static bool iface_addr(const char *ifname, bool v6, uint8_t out[16]) {
+    struct ifaddrs *ifa, *p;
+    bool ok = false;
+    if (getifaddrs(&ifa) < 0) return false;
+    for (p = ifa; p && !ok; p = p->ifa_next) {
+        if (!p->ifa_addr || strcmp(p->ifa_name, ifname) != 0) continue;
+        if (!v6 && p->ifa_addr->sa_family == AF_INET) { memcpy(out, &((struct sockaddr_in *)p->ifa_addr)->sin_addr, 4); ok = true; }
+        if (v6 && p->ifa_addr->sa_family == AF_INET6) { memcpy(out, &((struct sockaddr_in6 *)p->ifa_addr)->sin6_addr, 16); ok = true; }
+    }
+    freeifaddrs(ifa);
+    return ok;
+}
+
 /* the interface that holds addr, and its MAC (AF_PACKET on Linux, AF_LINK on the BSDs and macOS) */
 static int find_iface(const dq_target_t *tg, const uint8_t *addr, char *ifname, size_t iflen, uint8_t mac[6], bool *got_mac) {
     struct ifaddrs *ifa, *p;
@@ -107,7 +121,14 @@ static int find_iface(const dq_target_t *tg, const uint8_t *addr, char *ifname, 
 int dq_raw_prepare(dq_target_t *tg, const dq_cfg_t *c, char *err, size_t errlen) {
     uint8_t sip[16];
     int fam;
-    if (!c->bind[0] || !dq_parse_ip(c->bind, sip, &fam) || (fam == 2) != tg->v6) {
+    if (c->srcpfx.on) {   /* -b ADDR/LEN: the frames are built with the base address and patched per query */
+        if (c->srcpfx.v6 != tg->v6 || !c->iface[0]) {
+            snprintf(err, errlen, "-b ADDR/LEN: the prefix must be of the same family as the server, and --iface is needed");
+            return -1;
+        }
+        memcpy(sip, c->srcpfx.base, 16);
+        tg->pfx = c->srcpfx;
+    } else if (!c->bind[0] || !dq_parse_ip(c->bind, sip, &fam) || (fam == 2) != tg->v6) {
         snprintf(err, errlen, "a kernel-bypass path needs the source address of the same family as the server: -b ADDR");
         return -1;
     }
@@ -125,6 +146,8 @@ int dq_raw_prepare(dq_target_t *tg, const dq_cfg_t *c, char *err, size_t errlen)
     if (c->next_hop[0]) dq_parse_ip(c->next_hop, tg->hop_ip, &fam);
     else memcpy(tg->hop_ip, tg->dst_ip, 16);
     if (c->next_hop_mac[0]) { dq_parse_mac(c->next_hop_mac, tg->dst_mac); tg->have_dst_mac = true; }
+    memcpy(tg->arp_ip, tg->src_ip, 16);
+    if (c->srcpfx.on && !iface_addr(tg->ifname, tg->v6, tg->arp_ip)) memcpy(tg->arp_ip, tg->src_ip, 16);   /* the interface's own address, else the first of the prefix */
     tg->sport_base = (uint16_t)c->sport_base;
     return 0;
 }
@@ -306,9 +329,9 @@ static int mmsg_open(dq_io_t **io, const dq_cfg_t *c, dq_target_t *tg, unsigned 
 }
 #endif
 
-const dq_io_ops_t dq_io_sendto = { "sendto", sendto_open, sendto_send, sock_recv, sock_close };
+const dq_io_ops_t dq_io_sendto = { "sendto", sendto_open, sendto_send, sock_recv, sock_close, NULL };
 #ifdef DQ_HAVE_MMSG
-const dq_io_ops_t dq_io_mmsg = { "mmsg", mmsg_open, mmsg_send, sock_recv, sock_close };
+const dq_io_ops_t dq_io_mmsg = { "mmsg", mmsg_open, mmsg_send, sock_recv, sock_close, NULL };
 #endif
 
 const dq_io_ops_t *dq_io_for(int mode, const char **why) {

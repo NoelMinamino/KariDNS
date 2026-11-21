@@ -45,7 +45,7 @@ const char *dns_rcode_name(unsigned rcode);
 
 /* ---------------------------------------------------------------- query options (dig-style) */
 typedef struct {
-    bool edns, dnssec, nsid, cookie, rd, cd, ad, aa, subnet;
+    bool edns, dnssec, nsid, cookie, cookie_rand, cookie_set, rd, cd, ad, aa, subnet;   /* cookie_rand: a new client cookie per query; cookie_set: cookie_val was given (+cookie=HEX) */
     uint16_t bufsize, padding, qclass;
     uint8_t opcode, sn_family, sn_prefix;
     uint8_t sn_addr[16];
@@ -59,13 +59,34 @@ int dq_qopts_parse_tok(dq_qopts_t *o, const char *tok, char *err, size_t errlen)
 /* the fixed part of a query for one option set: the two flag bytes, the class and the OPT record */
 typedef struct {
     uint8_t flags[2];
-    uint16_t qclass, padding, tail_len;
+    bool cookie_rand;            /* the 8 cookie bytes at tail[cookie_toff] are replaced per query */
+    uint16_t qclass, padding, tail_len, cookie_toff;
     uint8_t tail[DQ_TAILMAX];
 } dq_prof_t;
 
 bool dq_prof_make(dq_prof_t *p, const dq_qopts_t *o);
 /* ID 0 | flags | 1 question | name | type | class | OPT (RFC 6891, with the RFC 7830 padding when asked); returns the length, 0 when it does not fit */
 size_t dq_compose(uint8_t *out, size_t cap, const dq_prof_t *p, const uint8_t *wname, size_t nlen, uint16_t qtype);
+
+/* ---------------------------------------------------------------- source prefix (-b ADDR/LEN on the raw paths) */
+typedef struct {
+    bool on, v6;
+    unsigned len;                 /* the prefix length in bits */
+    uint8_t base[16], mask[16];   /* the network address (host bits cleared) and the network bits */
+} dq_srcpfx_t;
+
+/* "198.18.0.0/16", "2001:db8::/48": the host bits of the address are cleared; false when not of that form */
+bool dq_parse_prefix(const char *s, dq_srcpfx_t *p);
+/* true when the whole range is inside 198.18.0.0/15 (RFC 2544), 240.0.0.0/4 or 2001:db8::/32 (RFC 3849) */
+bool dq_prefix_reserved(const dq_srcpfx_t *p);
+/* an address of the range: the network bits of base, random host bits (uniform) */
+void dq_prefix_pick(const dq_srcpfx_t *p, uint64_t *rng, uint8_t out[16]);
+/* slice i of k disjoint, equal sub-prefixes (k >= 1; the length grows by ceil(log2 k)); false when there are not enough host bits */
+bool dq_prefix_slice(const dq_srcpfx_t *p, unsigned k, unsigned i, dq_srcpfx_t *out);
+/* "198.18.0.0/16" */
+void dq_prefix_format(const dq_srcpfx_t *p, char *buf, size_t n);
+/* xorshift64* : the generator of the cookies, the source addresses and the generated queries; *s must not be 0 */
+uint64_t dq_rng_next(uint64_t *s);
 
 /* ---------------------------------------------------------------- configuration */
 enum { DQ_IO_AUTO = 0, DQ_IO_SENDTO, DQ_IO_MMSG, DQ_IO_XDP, DQ_IO_NETMAP };
@@ -76,13 +97,22 @@ typedef struct {
     int port;
     double duration, timeout, interval, zipf, miss;
     uint64_t runs, count, rate, inflight, seed;
-    unsigned threads, sockets, batch, miss_pool, queue, sport_base, cpu_base;
+    unsigned threads, sockets, batch, miss_pool, queue, sport_base, cpu_base, frame_mem_mb;
+    dq_srcpfx_t srcpfx;           /* -b with a /LEN */
+    bool allow_any_source;
+    char agent[128], agents[512], agent_key[512];   /* --agent ADDR:PORT, --agents H:P,H:P, --agent-key FILE */
+    double agent_timeout;
+    bool no_local;
+    bool agent_no_key;   /* --agent-no-key: an agent on a non-loopback address without --agent-key */
     int io;
     bool json, null_target, null_sink, no_pin, help, version, ignore_rc, verbose;
     dq_qopts_t qo;
 } dq_cfg_t;
 
 void dq_cfg_default(dq_cfg_t *c);
+/* an agent's own sending path replaces the controller's: --io, --iface, the MACs, --next-hop, --xdp-mode, -b ADDR, -T, -c, -B, --queue,
+ * --sport-base, --cpu-base, --no-pin and --frame-mem describe a host, not the load (docs/dnsqps.md "Several client hosts") */
+void dq_cfg_take_host(dq_cfg_t *dst, const dq_cfg_t *src);
 /* argv without the program name; 0 = ok, -1 = error (err) */
 int dq_parse_args(dq_cfg_t *c, int argc, char **argv, char *err, size_t errlen);
 /* the text of an rc file (~/.dnsqpsrc): the same options, one or more per line, '#' starts a comment */
@@ -96,6 +126,8 @@ bool dq_parse_u64(const char *s, uint64_t *out, uint64_t max);
 bool dq_parse_dbl(const char *s, double *out, double min, double max);
 bool dq_parse_mac(const char *s, uint8_t mac[6]);
 bool dq_parse_ip(const char *s, uint8_t ip[16], int *family);
+bool dq_hostport_strict(const char *s, char *host, size_t hostlen, int *port);
+#define DQ_MAXAGENTS 16
 
 /* ---------------------------------------------------------------- the query table */
 typedef struct { uint32_t name_off; uint16_t qtype; uint8_t prof; uint8_t nlen; } dq_ent_t;
@@ -130,6 +162,22 @@ void dq_cur_init(dq_cur_t *c, const dq_qtab_t *t, unsigned worker, unsigned nwor
 /* the next query, ID 0, into out; returns the length, 0 when the worker has run its `runs` passes (file mode) */
 size_t dq_next_query(const dq_qtab_t *t, dq_cur_t *c, uint8_t *out, size_t cap, uint64_t max_runs);
 
+/* one query of the table, before it is put together: the entry, the slot of the type (generated mode), and where its 8 client-cookie bytes are
+ * in the DNS message when the profile asks for a cookie per query (0 = none) */
+typedef struct { size_t ent; unsigned tidx; uint16_t qtype, cookie_poff; uint8_t prof; } dq_pick_t;
+/* the next query of the cursor; false when the worker has run its `runs` passes (file mode) */
+bool dq_next_pick(const dq_qtab_t *t, dq_cur_t *c, dq_pick_t *p, uint64_t max_runs);
+/* the DNS message of a pick, ID 0; the length, 0 when it does not fit */
+size_t dq_compose_pick(const dq_qtab_t *t, const dq_pick_t *p, uint8_t *out, size_t cap);
+
+/* ---------------------------------------------------------------- pre-built frames (raw paths) */
+#define DQ_FRMAX (DQ_MAXQ + 64)   /* the largest frame: headers + the largest query */
+/* every query of the table as a whole Ethernet / IP / UDP frame, built once.  Read only after the build, so the threads share it.  Record of frame i at
+ * buf + off[i]: u16 frame length, u16 offset of the cookie bytes in the frame (0 = none), the frame.  Cost per frame: 8 (off) + 4 + headers (42 or 62)
+ * + the DNS message (12 + name + 4 + the OPT record and padding of the profile) */
+typedef struct { uint8_t *buf; uint64_t *off; size_t n; uint64_t bytes; } dq_pf_t;
+
+
 /* ---------------------------------------------------------------- answers (untrusted) */
 typedef struct {
     uint16_t id, rcode;          /* rcode with the extended bits of an OPT record */
@@ -161,6 +209,7 @@ typedef struct {
     const char *io_name;
     unsigned threads, sockets;
     char server[300];
+    char io_buf[24];             /* the I/O path name of a merged or received report (io_name points here) */
     bool sink;
 } dq_report_t;
 
@@ -171,6 +220,9 @@ uint64_t dq_hist_pct(const dq_hist_t *h, double p);   /* the upper edge of the b
 size_t dq_hist_bucket(uint64_t ns);
 uint64_t dq_hist_bucket_hi(size_t idx);
 void dq_counts_add(dq_counts_t *d, const dq_counts_t *s);
+/* the buckets as "i:n,i:n" (the length, (size_t)-1 when cap is too small) and back; decode needs a dq_hist_init()ed histogram and sets b[] and count (sum and extremes are the caller's) */
+size_t dq_hist_encode(const dq_hist_t *h, char *out, size_t cap);
+bool dq_hist_decode(dq_hist_t *h, const char *s);
 void dq_print_text(FILE *f, const dq_report_t *r);
 void dq_print_json(FILE *f, const dq_report_t *r);
 void dq_print_interval(FILE *f, double t, double dt, uint64_t sent, uint64_t done, uint64_t lost, uint64_t lat_sum, uint64_t lat_cnt);
@@ -193,10 +245,29 @@ typedef struct {
 
 void dq_frame_tpl_init(dq_frame_tpl_t *t, const uint8_t smac[6], const uint8_t dmac[6], bool v6, const uint8_t *sip, const uint8_t *dip,
                        uint16_t sport, uint16_t dport);
+/* the table as frames: the bytes needed (UINT64_MAX when a query does not fit), and the build (0 = ok) */
+uint64_t dq_pf_size(const dq_qtab_t *t, const dq_frame_tpl_t *tpl);
+int dq_pf_build(dq_pf_t *pf, const dq_qtab_t *t, const dq_frame_tpl_t *tpl, char *err, size_t errlen);
+void dq_pf_free(dq_pf_t *pf);
+size_t dq_pf_index(const dq_qtab_t *t, const dq_pick_t *p);
+const uint8_t *dq_pf_get(const dq_pf_t *pf, size_t i, uint16_t *flen, uint16_t *cookie_off);
+
+/* what one send changes in a frame of the table (or of a frame built just now) */
+typedef struct {
+    const uint8_t *frame;
+    uint16_t flen, plen, id, cookie_off;   /* plen: the DNS message; cookie_off: the 8 cookie bytes in the frame, 0 = none */
+    bool set_sip;
+    uint8_t cookie[8], sip[16];
+} dq_fsend_t;
+/* copy the frame to dst and patch the DNS ID, the UDP source port, the source address (set_sip) and the cookie; the IPv4 header checksum and the UDP checksum
+ * are updated incrementally (RFC 1624).  Returns the frame length, 0 when cap is too small */
+size_t dq_frame_emit(uint8_t *dst, size_t cap, const dq_fsend_t *s, bool v6, uint16_t sport);
 /* header + payload with the lengths and checksums set; returns the frame length, 0 when cap is too small */
 size_t dq_frame_build(const dq_frame_tpl_t *t, uint8_t *out, size_t cap, const uint8_t *payload, size_t plen);
 /* a UDP datagram addressed to our_ip (4 or 16 bytes, family v6) in an Ethernet frame (one VLAN tag allowed); 0 = ok, -1 = anything else */
 int dq_frame_parse_udp(const uint8_t *f, size_t n, bool v6, const uint8_t *our_ip, dq_udp_view_t *v);
+/* the same for a destination in a range: our_ip and mask (the network bits, 4 or 16 bytes) say which addresses are ours; mask NULL = exactly our_ip */
+int dq_frame_parse_udp_pfx(const uint8_t *f, size_t n, bool v6, const uint8_t *our_ip, const uint8_t *mask, dq_udp_view_t *v);
 size_t dq_arp_request(uint8_t *out, size_t cap, const uint8_t smac[6], const uint8_t sip[4], const uint8_t tip[4]);
 bool dq_arp_reply_parse(const uint8_t *f, size_t n, const uint8_t tip[4], uint8_t mac[6]);
 size_t dq_nd_solicit(uint8_t *out, size_t cap, const uint8_t smac[6], const uint8_t sip[16], const uint8_t tip[16]);
@@ -221,6 +292,8 @@ typedef struct {
     bool v6;
     char ifname[64];
     uint8_t src_mac[6], dst_mac[6], src_ip[16], dst_ip[16], hop_ip[16];
+    uint8_t arp_ip[16];       /* the sender address of the ARP / neighbor request: the interface address (src_ip, or the first of the prefix) */
+    dq_srcpfx_t pfx;          /* -b ADDR/LEN: src_ip is its base address */
     bool have_dst_mac;
     uint16_t dport, sport_base;
     unsigned ports_per_worker;
@@ -239,6 +312,8 @@ typedef struct {
     /* up to max answers; waits up to wait_us when none is ready; the buffers stay valid until the next call */
     int (*recv)(dq_io_t *io, dq_rx_t *p, unsigned max, unsigned wait_us);
     void (*close)(dq_io_t *io);
+    /* the raw paths: send pre-built frames instead of send() (NULL on the socket paths) */
+    int (*send_frames)(dq_io_t *io, unsigned chan, const dq_fsend_t *p, unsigned n);
 } dq_io_ops_t;
 
 extern const dq_io_ops_t dq_io_sendto, dq_io_mmsg, dq_io_xdp, dq_io_netmap;
@@ -261,5 +336,54 @@ typedef struct {
 int dq_raw_resolve_mac(const dq_rawif_t *r, dq_target_t *tg, char *err, size_t errlen);
 /* the raw reflector of the netmap test (dnsqps --reflect with --io=netmap): returns when *stop is set */
 int dq_netmap_reflect(const dq_cfg_t *c, const atomic_bool *stop, char *err, size_t errlen);
+
+/* ---------------------------------------------------------------- the engine's hooks and the agent / controller (dnsqps_agent.c)
+ * One dnsqps (the controller, --agents) drives others (--agent ADDR:PORT) over TCP: the agents take the run parameters, set up (query table, frames,
+ * the I/O path), say READY, wait for GO, run, and send the result with the latency histogram, which the controller adds to its own.  A control
+ * message is a 4-byte big-endian length (1 .. DQ_MSG_MAX) and that many bytes of lines: the first line is the verb, the others are key=value. */
+typedef struct { uint64_t sent, done, lost, lat_sum, lat_cnt; } dq_livesum_t;
+typedef struct {
+    int (*ready)(void *ctx);                         /* the setup is done: 0 = start now, -1 = drop the run */
+    int (*tick)(void *ctx, dq_livesum_t *live);      /* every ~10 ms while it runs; live = this process's totals, which the hook may add to; 1 = stop */
+    void *ctx;
+} dq_run_hooks_t;
+/* runs one load (the engine of dnsqps.c): 0 = ran (rep filled), -1 = setup failed (err) */
+typedef int (*dq_run_fn)(dq_cfg_t *cfg, const dq_run_hooks_t *hooks, dq_report_t *rep, char *err, size_t errlen);
+
+#define DQ_MSG_MAX   262144u
+#define DQ_MSG_MAXKV 600
+#define DQ_MAXTOK    400
+typedef struct { char *verb; unsigned n; char *k[DQ_MSG_MAXKV], *v[DQ_MSG_MAXKV]; } dq_msg_t;
+/* buf holds len bytes and has room for one more (a NUL is put after them); it is cut up in place.  0 = ok */
+int dq_msg_parse(char *buf, size_t len, dq_msg_t *m, char *err, size_t errlen);
+const char *dq_msg_get(const dq_msg_t *m, const char *key);
+bool dq_msg_u64(const dq_msg_t *m, const char *key, uint64_t *out);   /* decimal digits only, at most 2^58 */
+typedef struct { char *p; size_t len; bool ovf; } dq_msgb_t;           /* p: 4 bytes of length, then the lines */
+bool dq_msgb_init(dq_msgb_t *b, const char *verb);
+bool dq_msgb_kv(dq_msgb_t *b, const char *key, const char *val);
+bool dq_msgb_u64(dq_msgb_t *b, const char *key, uint64_t v);
+void dq_msgb_free(dq_msgb_t *b);
+typedef struct { dq_sock_t s; uint8_t hdr[4]; unsigned hgot; uint32_t plen; size_t pgot; char *buf; bool done; } dq_conn_t;
+void dq_conn_init(dq_conn_t *c, dq_sock_t s);
+void dq_conn_close(dq_conn_t *c);
+int dq_conn_send(dq_conn_t *c, dq_msgb_t *b, unsigned timeout_ms);                       /* 0 = sent, -1 = error or timeout */
+int dq_conn_recv(dq_conn_t *c, unsigned wait_ms, dq_msg_t *m, char *err, size_t errlen);   /* 1 = a message (valid until the next call), 0 = not yet, -1 = closed or bad */
+/* the options an agent takes from a controller: nothing that starts another listener, controller or help run */
+int dq_agent_check_tokens(char **t, int n, char *err, size_t errlen);
+/* a result message of an agent: counters, the histogram; checked field by field (the agent is not trusted) */
+int dq_result_put(dq_msgb_t *b, const dq_report_t *r);
+int dq_result_get(const dq_msg_t *m, dq_report_t *r, char *err, size_t errlen);
+typedef struct { char *t[DQ_MAXTOK]; int n; } dq_args_t;
+void dq_args_free(dq_args_t *a);
+/* the tokens for sender i of k senders: the controller's command line without the controller-only options, then this sender's share of the rate, count,
+ * inflight, source prefix, and its own seed.  0 = ok */
+int dq_ctl_args(const dq_cfg_t *c, int argc, char **argv, unsigned k, unsigned i, dq_args_t *a, char *err, size_t errlen);
+uint64_t dq_share(uint64_t total, unsigned k, unsigned i);
+/* true when c sends with netmap on its --iface and the connection s has a local address on that interface: netmap(4) takes the NIC's rings
+ * from the host stack while it runs, so the control connection would stall (FreeBSD; false elsewhere) */
+bool dq_ctl_over_netmap(const dq_cfg_t *c, dq_sock_t s);
+/* the agent: serve until *quit; the controller: run the load on the senders and print the merged report; returns the exit status */
+int dq_agent_serve(const dq_cfg_t *c, dq_run_fn run, const atomic_bool *quit, atomic_bool *stop);
+int dq_controller(dq_cfg_t *c, int argc, char **argv, dq_run_fn run, atomic_bool *stop, FILE *st);
 
 #endif

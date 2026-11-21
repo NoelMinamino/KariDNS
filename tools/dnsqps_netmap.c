@@ -1,6 +1,6 @@
 /* dnsqps: the netmap path (FreeBSD; net/netmap_user.h is in the base system).
  * One netmap descriptor per worker on the ring pair (--queue + worker) of the interface, or on a VALE switch port ("vale0:name", used by the tests).  Queries
- * are wrapped in Ethernet / IP / UDP by dq_frame_build() and injected into the transmit ring; answers are read from the receive ring and matched on
+ * are copied from pre-built Ethernet / IP / UDP frames (dq_frame_emit() patches the ID, port, source address and cookie) into the transmit ring; answers are read from the receive ring and matched on
  * the source address and port and the destination port (one source port per channel).  While a NIC is in netmap mode the host stack does not see its
  * traffic: use an interface the machine does not need for anything else (docs/dnsqps.md).  The next-hop MAC comes from --next-hop-mac or an ARP / neighbor
  * request sent through the ring itself. */
@@ -20,12 +20,11 @@
 
 typedef struct {
     struct nm_desc *d;
-    dq_frame_tpl_t tpl[DQ_MAXCHAN];
     unsigned nchan;
     bool v6;
-    uint8_t our_ip[16], srv_ip[16];
+    uint8_t our_ip[16], srv_ip[16], pfx_mask[16];   /* our_ip: our address, or the base of the source prefix (then pfx_mask: its network bits) */
+    bool pfx;
     uint16_t sport0, dport;
-    uint8_t txbuf[2048];
 } nmio_t;
 
 /* "vale0:a" is used as it is; an interface becomes "netmap:IFNAME-RING" */
@@ -84,29 +83,47 @@ static int nm_open_io(dq_io_t **out, const dq_cfg_t *c, dq_target_t *tg, unsigne
     x->dport = tg->dport;
     memcpy(x->our_ip, tg->src_ip, 16);
     memcpy(x->srv_ip, tg->dst_ip, 16);
+    x->pfx = tg->pfx.on;
+    memcpy(x->pfx_mask, tg->pfx.mask, 16);
     if (!tg->have_dst_mac) {
         dq_rawif_t rif = { nm_tx_raw, nm_rx_raw, x };
         if (dq_raw_resolve_mac(&rif, tg, err, errlen) < 0) { nm_close_io((dq_io_t *)x); return -1; }
     }
-    for (unsigned i = 0; i < nchan; i++)
-        dq_frame_tpl_init(&x->tpl[i], tg->src_mac, tg->dst_mac, tg->v6, tg->src_ip, tg->dst_ip, (uint16_t)(x->sport0 + i), tg->dport);
     *out = (dq_io_t *)x;
     return 0;
 }
 
-static int nm_send(dq_io_t *p, unsigned chan, const dq_tx_t *pk, unsigned n) {
-    nmio_t *x = (nmio_t *)p;
-    unsigned sent = 0;
-    for (; sent < n; sent++) {
-        size_t fl = dq_frame_build(&x->tpl[chan], x->txbuf, sizeof x->txbuf, pk[sent].buf, pk[sent].len);
-        if (fl == 0) return sent ? (int)sent : -1;
-        if (nm_inject(x->d, x->txbuf, fl) == 0) {   /* the ring is full: hand it to the kernel and try once more */
-            ioctl(NETMAP_FD(x->d), NIOCTXSYNC, NULL);
-            if (nm_inject(x->d, x->txbuf, fl) == 0) break;
+/* pre-built frames straight into the transmit ring: the frame is copied into the slot and patched there (dq_frame_emit); one NIOCTXSYNC per call.  When the
+ * ring is full the kernel gets what is there and the rest is tried once more, as nm_inject() does */
+static unsigned nm_fill(nmio_t *x, unsigned chan, const dq_fsend_t *pk, unsigned n) {
+    struct nm_desc *d = x->d;
+    unsigned sent = 0, nr = d->last_tx_ring - d->first_tx_ring + 1, ri = d->cur_tx_ring;
+    for (unsigned c = 0; c < nr && sent < n; c++, ri++) {
+        if (ri > d->last_tx_ring) ri = d->first_tx_ring;
+        struct netmap_ring *ring = NETMAP_TXRING(d->nifp, ri);
+        while (sent < n && !nm_ring_empty(ring)) {
+            struct netmap_slot *sl = &ring->slot[ring->cur];
+            size_t fl = dq_frame_emit((uint8_t *)NETMAP_BUF(ring, sl->buf_idx), ring->nr_buf_size, &pk[sent], x->v6, (uint16_t)(x->sport0 + chan));
+            if (fl == 0) return sent;
+            sl->len = (uint16_t)fl;
+            sl->flags = 0;
+            ring->head = ring->cur = nm_ring_next(ring, ring->cur);
+            d->cur_tx_ring = ri;
+            sent++;
         }
     }
+    return sent;
+}
+
+static int nm_send_frames(dq_io_t *p, unsigned chan, const dq_fsend_t *pk, unsigned n) {
+    nmio_t *x = (nmio_t *)p;
+    unsigned sent = nm_fill(x, chan, pk, n);
+    if (sent < n) {
+        ioctl(NETMAP_FD(x->d), NIOCTXSYNC, NULL);
+        sent += nm_fill(x, chan, pk + sent, n - sent);
+    }
     ioctl(NETMAP_FD(x->d), NIOCTXSYNC, NULL);
-    return (int)sent;
+    return sent == 0 && n > 0 ? 0 : (int)sent;
 }
 
 static unsigned nm_scan(nmio_t *x, dq_rx_t *out, unsigned max) {
@@ -116,7 +133,7 @@ static unsigned nm_scan(nmio_t *x, dq_rx_t *out, unsigned max) {
         const uint8_t *b = nm_nextpkt(x->d, &h);
         if (!b) break;
         dq_udp_view_t v;
-        if (dq_frame_parse_udp(b, h.caplen, x->v6, x->our_ip, &v) < 0 || v.sport != x->dport || memcmp(v.sip, x->srv_ip, x->v6 ? 16 : 4) != 0) continue;
+        if (dq_frame_parse_udp_pfx(b, h.caplen, x->v6, x->our_ip, x->pfx ? x->pfx_mask : NULL, &v) < 0 || v.sport != x->dport || memcmp(v.sip, x->srv_ip, x->v6 ? 16 : 4) != 0) continue;
         if (v.dport < x->sport0 || (unsigned)(v.dport - x->sport0) >= x->nchan) continue;
         out[got].buf = v.payload;
         out[got].len = (uint16_t)v.plen;
@@ -139,7 +156,7 @@ static int nm_recv(dq_io_t *p, dq_rx_t *out, unsigned max, unsigned wait_us) {
     return (int)got;
 }
 
-const dq_io_ops_t dq_io_netmap = { "netmap", nm_open_io, nm_send, nm_recv, nm_close_io };
+const dq_io_ops_t dq_io_netmap = { "netmap", nm_open_io, NULL, nm_recv, nm_close_io, nm_send_frames };
 
 /* the raw reflector of the tests: --reflect ADDR:PORT --io=netmap --iface vale0:r --src-mac MAC */
 int dq_netmap_reflect(const dq_cfg_t *c, const atomic_bool *stop, char *err, size_t errlen) {

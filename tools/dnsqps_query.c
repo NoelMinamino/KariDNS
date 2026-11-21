@@ -79,10 +79,27 @@ int dq_qopts_parse_tok(dq_qopts_t *o, const char *tok, char *err, size_t errlen)
     const char *k = key;
     if (!strncmp(k, "no", 2) && k[2]) { neg = true; k += 2; }
 
+    if (!strcmp(k, "cookie") && val) {   /* +cookie=random: a new client cookie per query (dnsqps's own); +cookie=HEX16: this client cookie (dig's +cookie=value, without a server cookie) */
+        if (neg) { seterr(err, errlen, "'+%s' takes no value", "nocookie"); return -1; }
+        if (!strcmp(val, "random")) { o->cookie_rand = true; }
+        else {
+            if (strlen(val) != 16) { seterr(err, errlen, "'+%s' needs random or 16 hex digits (a client cookie, RFC 7873 4.1)", "cookie"); return -1; }
+            for (int i = 0; i < 16; i++) {
+                if (!isxdigit((unsigned char)val[i])) { seterr(err, errlen, "'+%s' needs random or 16 hex digits (a client cookie, RFC 7873 4.1)", "cookie"); return -1; }
+                unsigned h = (unsigned)(isdigit((unsigned char)val[i]) ? val[i] - '0' : (tolower((unsigned char)val[i]) - 'a' + 10));
+                o->cookie_val[i / 2] = (uint8_t)((i & 1) ? (o->cookie_val[i / 2] | h) : (h << 4));
+            }
+            o->cookie_rand = false;
+            o->cookie_set = true;
+        }
+        o->cookie = o->edns = true;
+        return 0;
+    }
     bool *bf = bool_field(o, k);
     if (bf) {
         if (val && strcmp(k, "edns") != 0) { seterr(err, errlen, "'+%s' takes no value", k); return -1; }
         *bf = !neg;
+        if (bf == &o->cookie && neg) o->cookie_rand = false;
         /* dig: these ask for EDNS */
         if (!neg && (bf == &o->dnssec || bf == &o->nsid || bf == &o->cookie)) o->edns = true;
         return 0;
@@ -147,6 +164,8 @@ bool dq_prof_make(dq_prof_t *p, const dq_qopts_t *o) {
     if (o->nsid) { t[n++] = 0; t[n++] = 3; t[n++] = 0; t[n++] = 0; }   /* RFC 5001 */
     if (o->cookie) {                                                     /* RFC 7873: a client cookie */
         t[n++] = 0; t[n++] = 10; t[n++] = 0; t[n++] = 8;
+        p->cookie_rand = o->cookie_rand;
+        p->cookie_toff = (uint16_t)n;
         memcpy(t + n, o->cookie_val, 8);
         n += 8;
     }
@@ -286,7 +305,7 @@ static int add_ent(dq_qtab_t *t, const uint8_t *wire, size_t nlen, uint16_t qtyp
 static int find_prof(dq_qtab_t *t, const dq_prof_t *p) {
     for (unsigned i = 0; i < t->nprof; i++)
         if (memcmp(t->profs[i].flags, p->flags, 2) == 0 && t->profs[i].qclass == p->qclass && t->profs[i].padding == p->padding &&
-            t->profs[i].tail_len == p->tail_len && memcmp(t->profs[i].tail, p->tail, p->tail_len) == 0)
+            t->profs[i].tail_len == p->tail_len && t->profs[i].cookie_rand == p->cookie_rand && memcmp(t->profs[i].tail, p->tail, p->tail_len) == 0)
             return (int)i;
     if (t->nprof >= DQ_MAXPROF) return -1;
     t->profs[t->nprof] = *p;
@@ -462,7 +481,7 @@ void dq_cur_init(dq_cur_t *c, const dq_qtab_t *t, unsigned worker, unsigned nwor
     c->runs_done = 0;
 }
 
-static inline uint64_t rng_next(uint64_t *s) {
+uint64_t dq_rng_next(uint64_t *s) {
     uint64_t x = *s;
     x ^= x >> 12;
     x ^= x << 25;
@@ -471,19 +490,30 @@ static inline uint64_t rng_next(uint64_t *s) {
     return x * 0x2545F4914F6CDD1Dull;
 }
 
-size_t dq_next_query(const dq_qtab_t *t, dq_cur_t *c, uint8_t *out, size_t cap, uint64_t max_runs) {
+static void pick_fill(const dq_qtab_t *t, size_t ent, unsigned tidx, uint16_t qtype, uint8_t prof, dq_pick_t *p) {
+    const dq_ent_t *e = &t->ents[ent];
+    p->ent = ent;
+    p->tidx = tidx;
+    p->qtype = qtype;
+    p->prof = prof;
+    /* the cookie bytes: after the header, the name, type and class of the question, and the OPT record up to the option's data */
+    p->cookie_poff = t->profs[prof].cookie_rand ? (uint16_t)(12 + e->nlen + 4 + t->profs[prof].cookie_toff) : 0;
+}
+
+bool dq_next_pick(const dq_qtab_t *t, dq_cur_t *c, dq_pick_t *p, uint64_t max_runs) {
     if (!t->gen) {
         if (c->pos >= t->n) {   /* the end of a pass over this worker's share */
             c->runs_done++;
-            if (max_runs && c->runs_done >= max_runs) return 0;
+            if (max_runs && c->runs_done >= max_runs) return false;
             c->pos %= c->stride;
-            if (c->pos >= t->n) return 0;
+            if (c->pos >= t->n) return false;
         }
         const dq_ent_t *e = &t->ents[c->pos];
+        pick_fill(t, c->pos, 0, e->qtype, e->prof, p);
         c->pos += c->stride;
-        return dq_compose(out, cap, &t->profs[e->prof], t->names + e->name_off, e->nlen, e->qtype);
+        return true;
     }
-    uint64_t r1 = rng_next(&c->rng), r2 = rng_next(&c->rng), r3 = rng_next(&c->rng);
+    uint64_t r1 = dq_rng_next(&c->rng), r2 = dq_rng_next(&c->rng), r3 = dq_rng_next(&c->rng);
     size_t idx;
     if (t->nmiss && (uint32_t)r1 < t->miss_thr) {
         idx = t->nhit + (size_t)((r1 >> 32) % t->nmiss);
@@ -499,6 +529,82 @@ size_t dq_next_query(const dq_qtab_t *t, dq_cur_t *c, uint8_t *out, size_t cap, 
     uint32_t q = (uint32_t)(r3 >> 32);
     unsigned ti = 0;
     while (ti + 1 < t->ntypes && q > t->cum[ti]) ti++;
-    const dq_ent_t *e = &t->ents[idx];
-    return dq_compose(out, cap, &t->profs[0], t->names + e->name_off, e->nlen, t->types[ti]);
+    pick_fill(t, idx, ti, t->types[ti], 0, p);
+    return true;
+}
+
+size_t dq_compose_pick(const dq_qtab_t *t, const dq_pick_t *p, uint8_t *out, size_t cap) {
+    const dq_ent_t *e = &t->ents[p->ent];
+    return dq_compose(out, cap, &t->profs[p->prof], t->names + e->name_off, e->nlen, p->qtype);
+}
+
+size_t dq_next_query(const dq_qtab_t *t, dq_cur_t *c, uint8_t *out, size_t cap, uint64_t max_runs) {
+    dq_pick_t p;
+    return dq_next_pick(t, c, &p, max_runs) ? dq_compose_pick(t, &p, out, cap) : 0;
+}
+
+/* ---------------------------------------------------------------- pre-built frames */
+static size_t pf_count(const dq_qtab_t *t) { return t->gen ? t->n * t->ntypes : t->n; }
+
+/* the pick of frame i (the inverse of dq_pf_index) */
+static void pick_at(const dq_qtab_t *t, size_t i, dq_pick_t *p) {
+    if (t->gen) pick_fill(t, i / t->ntypes, (unsigned)(i % t->ntypes), t->types[i % t->ntypes], 0, p);
+    else pick_fill(t, i, 0, t->ents[i].qtype, t->ents[i].prof, p);
+}
+
+size_t dq_pf_index(const dq_qtab_t *t, const dq_pick_t *p) { return t->gen ? p->ent * t->ntypes + p->tidx : p->ent; }
+
+uint64_t dq_pf_size(const dq_qtab_t *t, const dq_frame_tpl_t *tpl) {
+    uint64_t total = 0;
+    uint8_t q[DQ_MAXQ];
+    size_t n = pf_count(t);
+    for (size_t i = 0; i < n; i++) {
+        dq_pick_t p;
+        pick_at(t, i, &p);
+        size_t l = dq_compose_pick(t, &p, q, sizeof q);
+        if (l == 0) return UINT64_MAX;
+        total += 8 + 4 + tpl->hlen + l;
+    }
+    return total;
+}
+
+void dq_pf_free(dq_pf_t *pf) {
+    free(pf->buf);
+    free(pf->off);
+    memset(pf, 0, sizeof *pf);
+}
+
+int dq_pf_build(dq_pf_t *pf, const dq_qtab_t *t, const dq_frame_tpl_t *tpl, char *err, size_t errlen) {
+    memset(pf, 0, sizeof *pf);
+    uint64_t need = dq_pf_size(t, tpl);
+    size_t n = pf_count(t);
+    if (need == UINT64_MAX || need > SIZE_MAX / 2) { snprintf(err, errlen, "a query does not fit a frame"); return -1; }
+    pf->buf = malloc((size_t)(need - 8 * (uint64_t)n));   /* need counts the offsets too */
+    pf->off = malloc(n * sizeof *pf->off);
+    if (!pf->buf || !pf->off) { dq_pf_free(pf); snprintf(err, errlen, "out of memory for %zu frames", n); return -1; }
+    uint8_t q[DQ_MAXQ];
+    uint64_t at = 0;
+    for (size_t i = 0; i < n; i++) {
+        dq_pick_t p;
+        pick_at(t, i, &p);
+        size_t l = dq_compose_pick(t, &p, q, sizeof q);
+        uint8_t *rec = pf->buf + at;
+        size_t fl = l ? dq_frame_build(tpl, rec + 4, DQ_FRMAX, q, l) : 0;
+        if (fl == 0) { dq_pf_free(pf); snprintf(err, errlen, "a query does not fit a frame"); return -1; }
+        uint16_t co = p.cookie_poff ? (uint16_t)(tpl->hlen + p.cookie_poff) : 0;
+        rec[0] = (uint8_t)(fl >> 8); rec[1] = (uint8_t)fl;
+        rec[2] = (uint8_t)(co >> 8); rec[3] = (uint8_t)co;
+        pf->off[i] = at;
+        at += 4 + fl;
+    }
+    pf->n = n;
+    pf->bytes = need;
+    return 0;
+}
+
+const uint8_t *dq_pf_get(const dq_pf_t *pf, size_t i, uint16_t *flen, uint16_t *cookie_off) {
+    const uint8_t *rec = pf->buf + pf->off[i];
+    *flen = (uint16_t)((rec[0] << 8) | rec[1]);
+    *cookie_off = (uint16_t)((rec[2] << 8) | rec[3]);
+    return rec + 4;
 }
