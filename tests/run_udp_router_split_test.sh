@@ -151,7 +151,11 @@ $(kari_udp_delta "$T/udp.snap")
 $(ctl ipcstats | grep -v '=0$')"
     fi
     LAST_SOCKS=${k:-0}
+    LOST_Q=${u:-0}   # (the unanswered queries load() accepted as lost in the kernel's queue: the query itself may be what was dropped)
 }
+
+# in_lost N: N queries reached the server: 20000, or fewer by at most the LOST_Q that the kernel's queue explains
+in_lost() { [ "$1" -le 20000 ] && [ "$1" -ge $((20000 - LOST_Q)) ]; }
 
 # one_server LABEL: the checks A (wildcard) and B (specific addresses) share
 one_server() {
@@ -174,15 +178,15 @@ one_server() {
     load "$lbl: 64 source ports" 20000 64 256 16 0
     # (the counters are read until they reach the 20000 or 10 s are up: a router or a worker that is late on a loaded host is waited for)
     if [ "$MODE" = "backend" ]; then
-        i=0; while [ $i -lt 50 ] && [ "$(($(wrecv_sum) - wsum0))" -lt 20000 ]; do sleep 0.2; i=$((i + 1)); done
+        i=0; while [ $i -lt 50 ] && [ "$(($(wrecv_sum) - wsum0))" -lt $((20000 - LOST_Q)) ]; do sleep 0.2; i=$((i + 1)); done
     else
-        i=0; while [ $i -lt 50 ] && [ "$(($(routed_sum) - sum0))" -lt 20000 ]; do sleep 0.2; i=$((i + 1)); done
+        i=0; while [ $i -lt 50 ] && [ "$(($(routed_sum) - sum0))" -lt $((20000 - LOST_Q)) ]; do sleep 0.2; i=$((i + 1)); done
     fi
     sum1=$(routed_sum); wsum1=$(wrecv_sum); drop1=$(ipcv ipc.dropped.total)
     if [ "$LAST_SOCKS" = "64" ]; then ok "$lbl: every socket was answered"; else bad "$lbl: $LAST_SOCKS of 64 sockets were answered"; fi
     if [ "$((drop1 - drop0))" = "0" ]; then ok "$lbl: karictl ipcstats counted no drop"; else bad "$lbl: ipc.dropped.total grew by $((drop1 - drop0))" "$(ctl ipcstats | grep -v '=0$')"; fi
     if [ "$MODE" = "backend" ]; then
-        if [ "$((wsum1 - wsum0))" = "20000" ]; then ok "$lbl: the workers read 20000 queries from their own sockets (ipcworker.<w>.queries)"; else bad "$lbl: the workers' counters grew by $((wsum1 - wsum0)), want 20000" "$(ctl ipcstats | grep -E 'ipcworker|ipcrouter')"; fi
+        if in_lost $((wsum1 - wsum0)); then ok "$lbl: the workers read $((wsum1 - wsum0)) of 20000 queries from their own sockets (ipcworker.<w>.queries; $LOST_Q lost in the kernel's queue allowed)"; else bad "$lbl: the workers' counters grew by $((wsum1 - wsum0)), want 20000" "$(ctl ipcstats | grep -E 'ipcworker|ipcrouter')"; fi
         if [ "$((sum1 - sum0))" = "0" ]; then ok "$lbl: the routers read none of them (ipcrouter.<r>.queries did not move)"; else bad "$lbl: the routers' counters grew by $((sum1 - sum0)), want 0" "$(ctl ipcstats | grep -E 'ipcworker|ipcrouter')"; fi
         idle=""
         for w in 0 1 2 3; do
@@ -190,7 +194,7 @@ one_server() {
         done
         if [ -z "$idle" ]; then ok "$lbl: every worker read queries ($(ctl ipcstats | grep ipcworker | tr '\n' ' '))"; else bad "$lbl: workers that read nothing:$idle" "$(ctl ipcstats | grep -E 'ipcworker|ipcrouter')"; fi
     else
-        if [ "$((sum1 - sum0))" = "20000" ]; then ok "$lbl: the routers passed on 20000 queries (ipcrouter.<r>.queries)"; else bad "$lbl: the routers' counters grew by $((sum1 - sum0)), want 20000" "$(ctl ipcstats | grep ipcrouter)"; fi
+        if in_lost $((sum1 - sum0)); then ok "$lbl: the routers passed on $((sum1 - sum0)) of 20000 queries (ipcrouter.<r>.queries; $LOST_Q lost in the kernel's queue allowed)"; else bad "$lbl: the routers' counters grew by $((sum1 - sum0)), want 20000" "$(ctl ipcstats | grep ipcrouter)"; fi
         idle=""
         for r in 0 1 2 3; do
             [ "$(ipcv ipcrouter.$r.queries)" -gt 0 ] || idle="$idle $r"

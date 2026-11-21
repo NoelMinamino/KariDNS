@@ -167,6 +167,13 @@ int alias_resolvers_fill(const server_config_t *cfg, const zone_config_t *zcfg, 
     return out->n;
 }
 
+uint32_t alias_max_refresh(const server_config_t *cfg, const zone_config_t *zcfg, bool db_zone) {
+    uint32_t v = zext(zcfg)->alias_max_refresh;
+    if (v == 0 && cfg) v = cfg->alias_max_refresh;
+    if (v == 0 && db_zone && cfg && cfg->database.enabled) v = cfg->database.alias_max_refresh;
+    return v ? v : KARIDNS_ALIAS_MAX_REFRESH_DEFAULT;
+}
+
 /* ------------------------------------------------------------------------------------------------------------- */
 /* wire format helpers                                                                                             */
 /* ------------------------------------------------------------------------------------------------------------- */
@@ -236,8 +243,13 @@ static int pkt_name(const uint8_t *pkt, size_t len, size_t off, uint8_t out[256]
     }
 }
 
-size_t alias_build_query(uint8_t *buf, size_t cap, uint16_t id, const uint8_t *name, size_t nlen, uint16_t qtype) {
-    if (nlen == 0 || nlen > 255 || cap < 12 + nlen + 4 + 11) return 0;
+#define EDNS_OPT_COOKIE 10                        /* RFC 7873 section 8 */
+
+size_t alias_build_query(uint8_t *buf, size_t cap, uint16_t id, const uint8_t *name, size_t nlen, uint16_t qtype, const uint8_t *cc,
+                         const uint8_t *sc, size_t sclen) {
+    if (cc && sclen != 0 && (sclen < 8 || sclen > 32 || !sc)) return 0;   /* a server cookie is 8 to 32 octets (RFC 7873 section 4) */
+    size_t optlen = cc ? 4 + 8 + sclen : 0;
+    if (nlen == 0 || nlen > 255 || cap < 12 + nlen + 4 + 11 + optlen) return 0;
     size_t o = 0;
     buf[o++] = (uint8_t)(id >> 8);
     buf[o++] = (uint8_t)id;
@@ -256,7 +268,19 @@ size_t alias_build_query(uint8_t *buf, size_t cap, uint16_t id, const uint8_t *n
     buf[o++] = 0; buf[o++] = 41;
     buf[o++] = 0x04; buf[o++] = 0xD0;
     buf[o++] = 0; buf[o++] = 0; buf[o++] = 0; buf[o++] = 0;
-    buf[o++] = 0; buf[o++] = 0;
+    buf[o++] = (uint8_t)(optlen >> 8);            /* RDLEN */
+    buf[o++] = (uint8_t)optlen;
+    if (cc) {
+        /* RFC 7873 section 4: OPTION-CODE 10, the 8-octet client cookie, then the server cookie when one is known (section 5.1: every
+         * request carries a COOKIE option; the longer form with the server cookie last received from this server) */
+        buf[o++] = 0; buf[o++] = EDNS_OPT_COOKIE;
+        buf[o++] = (uint8_t)((8 + sclen) >> 8);
+        buf[o++] = (uint8_t)(8 + sclen);
+        memcpy(buf + o, cc, 8);
+        o += 8;
+        if (sclen) memcpy(buf + o, sc, sclen);
+        o += sclen;
+    }
     return o;
 }
 
@@ -283,8 +307,34 @@ static bool next_rr(const uint8_t *pkt, size_t len, size_t *off, rr_t *r) {
     return true;
 }
 
+/* The options of the OPT RR (RFC 6891 section 6.1.2: {code, length, data} to the end of the RDATA): the COOKIE option against the client
+ * cookie sent.  false = discard the response (RFC 7873 section 5.3: an illegal COOKIE length - valid are 8 and 16 to 40, section 5.2.2 -, an
+ * incorrect client cookie; here also two COOKIE options or an option list that runs past the RDATA, where the cookie cannot be checked). */
+static bool opt_cookie(const uint8_t *rd, size_t rdlen, const uint8_t *cc, alias_parsed_t *out) {
+    size_t o = 0;
+    bool seen = false;
+    while (o < rdlen) {
+        if (rdlen - o < 4) return false;
+        uint16_t code = (uint16_t)((rd[o] << 8) | rd[o + 1]);
+        size_t olen = (size_t)((rd[o + 2] << 8) | rd[o + 3]);
+        o += 4;
+        if (olen > rdlen - o) return false;
+        if (code == EDNS_OPT_COOKIE) {
+            if (seen) return false;
+            seen = true;
+            if (olen < 8 || (olen > 8 && olen < 16) || olen > 40) return false;
+            if (memcmp(rd + o, cc, 8) != 0) return false;
+            out->cookie = olen == 8 ? ALIAS_CK_CLIENT : ALIAS_CK_SERVER;
+            out->sc_len = (uint8_t)(olen - 8);
+            memcpy(out->sc, rd + o + 8, olen - 8);   /* opaque to the client (RFC 7873 section 4.2; RFC 9018 section 4 defines the server's own form) */
+        }
+        o += olen;
+    }
+    return true;
+}
+
 void alias_parse_response(const uint8_t *pkt, size_t len, uint16_t id, const uint8_t *name, size_t nlen, uint16_t qtype,
-                          alias_parsed_t *out) {
+                          const uint8_t *cc, alias_parsed_t *out) {
     memset(out, 0, sizeof(*out));
     out->rc = -1;
     if (len < 12) return;
@@ -303,17 +353,50 @@ void alias_parse_response(const uint8_t *pkt, size_t len, uint16_t id, const uin
         return;
     }
     off = nx + 4;
-    if (pkt[2] & 0x02) {                          /* TC: the caller asks again over TCP */
-        out->truncated = true;
-        return;
+    size_t an_start = off;
+    unsigned an = (unsigned)((pkt[6] << 8) | pkt[7]);
+    const unsigned an_ns = an + (unsigned)((pkt[8] << 8) | pkt[9]), total = an_ns + (unsigned)((pkt[10] << 8) | pkt[11]);
+    const bool tc = (pkt[2] & 0x02) != 0;
+    /* the OPT RR: at most one, owned by the root, in the additional section (RFC 6891 section 6.1.1); its TTL carries the upper 8 bits of
+     * the RCODE (section 6.1.3).  Every RR is walked (each takes at least 11 octets, so the walk ends with the message).  A truncated
+     * message may end inside an RR: the walk stops there (TCP is asked next; no COOKIE option was seen) */
+    unsigned ext_rcode = 0;
+    bool opt_seen = false;
+    for (unsigned i = 0; i < total; i++) {
+        rr_t r;
+        if (!next_rr(pkt, len, &off, &r)) {
+            if (tc) break;
+            return;
+        }
+        if (r.type != 41) continue;
+        if (i < an_ns || opt_seen || r.olen != 1) {
+            if (tc) break;
+            return;
+        }
+        opt_seen = true;
+        ext_rcode = r.ttl >> 24;
+        if (cc && !opt_cookie(pkt + r.rd_off, r.rdlen, cc, out)) {
+            out->cookie = ALIAS_CK_NONE;
+            out->sc_len = 0;
+            out->rc = -2;                         /* RFC 7873 section 5.3: discarded; the real answer may still come */
+            return;
+        }
     }
-    if ((pkt[3] & 0x0F) != 0) {
+    unsigned rcode = (ext_rcode << 4) | (pkt[3] & 0x0Fu);
+    if (rcode == ALIAS_RCODE_BADCOOKIE) {         /* RFC 7873 section 5.3: the caller retries with the server cookie of this response */
+        out->badcookie = true;
         out->rc = 1;
         return;
     }
-    unsigned an = (unsigned)((pkt[6] << 8) | pkt[7]);
+    if (tc) {                                     /* TC: the caller asks again over TCP */
+        out->truncated = true;
+        return;
+    }
+    if (rcode != 0) {
+        out->rc = 1;
+        return;
+    }
     if (an > 1024) return;
-    size_t an_start = off;
     /* follow the CNAME chain from the target inside the answer (RFC 1034 section 3.6.2); at most ALIAS_MAX_CNAME hops */
     uint8_t cur[256];
     int curlen = (int)nlen;
@@ -390,35 +473,139 @@ static ssize_t tcp_query(const struct sockaddr_storage *sa, socklen_t sl, const 
     return got == (ssize_t)rl ? got : -1;
 }
 
-/* One resolution of (name, qtype) at the resolvers of rs.  0 = a usable answer in *out, 1 = an answer but not a usable one (an RCODE
- * other than NOERROR, malformed), 2 = no resolver answered at all. */
-static int net_resolve(const alias_rset_t *rs, const uint8_t *name, size_t nlen, uint16_t qtype, alias_parsed_t *out) {
-    int64_t deadline = monotonic_ms() + ALIAS_RESOLVE_BUDGET_MS;
-    bool any_answer = false;
-    memset(out, 0, sizeof(*out));
-    out->rc = -1;
-    uint8_t q[600];                               /* built once; only the ID differs per resolver */
-    size_t ql = alias_build_query(q, sizeof(q), 0, name, nlen, qtype);
-    if (ql == 0) return 1;
-    for (int i = 0; i < rs->n; i++) {
-        uint32_t rem = remaining_ms(deadline);
-        if (rem == 0) break;
-        uint32_t share = rem / (uint32_t)(rs->n - i);
-        if (share == 0) share = 1;
-        const struct sockaddr_storage *sa = &rs->sa[i];
+/* ---- DNS Cookies (RFC 7873) of the resolver addresses: the alias thread only ---- */
+typedef struct {
+    bool used;
+    bool capable;                                 /* it sent a valid server cookie: its responses must carry one (RFC 7873 section 5.3) */
+    uint8_t fam;                                  /* AF_INET / AF_INET6 */
+    uint8_t addr[16];
+    uint16_t port;
+    uint8_t cc[8];                                /* the client cookie */
+    uint8_t sc[32];                               /* the newest server cookie, sc_len octets (0 = none) */
+    uint8_t sc_len;
+    uint32_t fails;                               /* resolutions in a row without an accepted answer */
+    int64_t cc_renew;                             /* alias_now() at which cc is replaced */
+    int64_t last_ok;                              /* alias_now() of the last accepted answer */
+    int64_t last_use;
+} ck_t;
+static ck_t g_ck[ALIAS_COOKIE_SLOTS];
+
+static void ck_addr(const struct sockaddr_storage *sa, uint8_t *fam, uint8_t addr[16], uint16_t *port) {
+    memset(addr, 0, 16);
+    if (sa->ss_family == AF_INET6) {
+        const struct sockaddr_in6 *s6 = (const struct sockaddr_in6 *)(const void *)sa;
+        *fam = AF_INET6;
+        memcpy(addr, &s6->sin6_addr, 16);
+        *port = s6->sin6_port;
+    } else {
+        const struct sockaddr_in *s4 = (const struct sockaddr_in *)(const void *)sa;
+        *fam = AF_INET;
+        memcpy(addr, &s4->sin_addr, 4);
+        *port = s4->sin_port;
+    }
+}
+
+static ck_t *ck_find(const struct sockaddr_storage *sa) {
+    uint8_t fam, addr[16];
+    uint16_t port;
+    ck_addr(sa, &fam, addr, &port);
+    for (int i = 0; i < ALIAS_COOKIE_SLOTS; i++)
+        if (g_ck[i].used && g_ck[i].fam == fam && g_ck[i].port == port && memcmp(g_ck[i].addr, addr, 16) == 0) return &g_ck[i];
+    return NULL;
+}
+
+/* the state of an address, made when it has none (a free slot, else the least recently used one); the client cookie is renewed when it is due */
+static ck_t *ck_get(const struct sockaddr_storage *sa, int64_t now) {
+    ck_t *c = ck_find(sa);
+    if (!c) {
+        c = &g_ck[0];
+        for (int i = 0; i < ALIAS_COOKIE_SLOTS; i++) {
+            if (!g_ck[i].used) { c = &g_ck[i]; break; }
+            if (g_ck[i].last_use < c->last_use) c = &g_ck[i];
+        }
+        memset(c, 0, sizeof(*c));
+        c->used = true;
+        ck_addr(sa, &c->fam, c->addr, &c->port);
+        c->cc_renew = INT64_MIN;
+        c->last_ok = now;
+    }
+    c->last_use = now;
+    if (now >= c->cc_renew) {
+        /* RFC 7873 section 4.1: a client cookie of at least 64 bits of entropy, different per server address and changed periodically;
+         * section 7.1: the default lifetime is one day, with a jitter of plus zero to minus at least 40 %.  RFC 9018 section 3: a random
+         * value per server is one of the allowed ways.  The server cookie was made for the old client cookie (RFC 7873 section 4.2), so it
+         * goes too; `capable` stays: the server still sends cookies.  Only between two resolutions: no query is outstanding (section 7.1) */
+        arc4random_buf(c->cc, sizeof(c->cc));
+        c->cc_renew = now + ALIAS_COOKIE_LIFETIME - (int64_t)arc4random_uniform(ALIAS_COOKIE_LIFETIME * 2 / 5 + 1);
+        c->sc_len = 0;
+    }
+    return c;
+}
+
+static void ck_text(const ck_t *c, char *out, size_t cap) {
+    char a[INET6_ADDRSTRLEN];
+    if (!inet_ntop(c->fam, c->addr, a, sizeof(a))) strlcpy(a, "?", sizeof(a));
+    snprintf(out, cap, c->fam == AF_INET6 ? "[%s]:%u" : "%s:%u", a, (unsigned)ntohs(c->port));
+}
+
+/* a response that passed the checks: keep the newest server cookie (RFC 7873 section 5.3: also from an error response) */
+static void ck_learn(ck_t *c, const alias_parsed_t *p) {
+    if (p->cookie != ALIAS_CK_SERVER) return;
+    memcpy(c->sc, p->sc, p->sc_len);
+    c->sc_len = p->sc_len;
+    if (!c->capable) {
+        c->capable = true;
+        char t[64];
+        ck_text(c, t, sizeof(t));
+        syslog(LOG_NOTICE, "[Alias] resolver %s sends DNS cookies: from now on its answers without a valid cookie are ignored (RFC 7873 section 5.3)", t);
+    }
+}
+
+/* the end of one resolution at this address: accepted = some response passed the checks */
+static void ck_account(ck_t *c, bool accepted, int64_t now) {
+    if (accepted) {
+        c->fails = 0;
+        c->last_ok = now;
+        return;
+    }
+    if (!c->capable) return;
+    c->fails++;
+    if (c->fails >= ALIAS_COOKIE_FORGET_FAILS && now - c->last_ok >= ALIAS_COOKIE_FORGET_SECS) {
+        /* a resolver that was replaced by one without cookies at the same address would never be heard again: after this many failed
+         * resolutions over this long, answers without a cookie are taken again (and the mark comes back with the next server cookie) */
+        c->capable = false;
+        c->sc_len = 0;
+        c->fails = 0;
+        char t[64];
+        ck_text(c, t, sizeof(t));
+        syslog(LOG_WARNING, "[Alias] resolver %s gave no answer with a valid DNS cookie in %d resolutions over %lld s: answers without a cookie are accepted from it again",
+               t, ALIAS_COOKIE_FORGET_FAILS, (long long)(now - c->last_ok));
+    }
+}
+
+/* RFC 7873 section 5.3 beyond what alias_parse_response() checks: once the address sent a server cookie, a response without one (no COOKIE
+ * option, or the client cookie alone) is discarded, as one the client expected a COOKIE option in */
+static inline bool ck_acceptable(const ck_t *c, const alias_parsed_t *p) { return !c->capable || p->cookie == ALIAS_CK_SERVER; }
+
+/* One exchange with one resolver: UDP, then TCP when truncated; once more after BADCOOKIE with the new server cookie (RFC 7873 section 5.3,
+ * within the same time).  -1 = no accepted response, 0 = a usable answer in *p, 1 = an accepted response that is no usable answer.
+ * *accepted is set when a response passed the checks. */
+static int resolve_at(const struct sockaddr_storage *sa, socklen_t sl, ck_t *c, const uint8_t *name, size_t nlen, uint16_t qtype,
+                      uint32_t share, int64_t deadline, uint32_t left, alias_parsed_t *p, bool *accepted) {
+    int64_t at_deadline = monotonic_ms() + share;
+    for (int attempt = 0; attempt < 2; attempt++) {
+        uint8_t q[600];
         uint16_t id = (uint16_t)(arc4random() & 0xFFFF);
-        q[0] = (uint8_t)(id >> 8);
-        q[1] = (uint8_t)id;
-        int fd = broker_connect(sa->ss_family, SOCK_DGRAM, (struct sockaddr *)(void *)sa, rs->sl[i]);
-        if (fd < 0) continue;
-        int64_t fwd_deadline = monotonic_ms() + share;
-        ssize_t got = -1;
-        alias_parsed_t p;
-        memset(&p, 0, sizeof(p));
-        p.rc = -2;
+        size_t ql = alias_build_query(q, sizeof(q), id, name, nlen, qtype, c->cc, c->sc, c->sc_len);
+        if (ql == 0) return 1;
+        int fd = broker_connect(sa->ss_family, SOCK_DGRAM, (struct sockaddr *)(void *)sa, sl);
+        if (fd < 0) return -1;
+        bool got = false;
+        memset(p, 0, sizeof(*p));
+        p->rc = -2;
         if (send(fd, q, ql, MSG_NOSIGNAL) == (ssize_t)ql) {
             for (;;) {
-                uint32_t wait_ms = remaining_ms(fwd_deadline);
+                uint32_t wait_ms = remaining_ms(at_deadline);
                 if (wait_ms == 0) break;
                 struct pollfd pfd = { .fd = fd, .events = POLLIN };
                 int pr = poll(&pfd, 1, (int)wait_ms);
@@ -426,23 +613,56 @@ static int net_resolve(const alias_rset_t *rs, const uint8_t *name, size_t nlen,
                 if (pr <= 0) break;
                 ssize_t n = recv(fd, g_rbuf, sizeof(g_rbuf), 0);
                 if (n < 0) break;                 /* ICMP unreachable and the like: the next resolver */
-                alias_parse_response(g_rbuf, (size_t)n, id, name, nlen, qtype, &p);
-                if (p.rc == -2) continue;         /* not the answer to this query: keep waiting (RFC 5452 section 9.1) */
-                got = n;
+                alias_parse_response(g_rbuf, (size_t)n, id, name, nlen, qtype, c->cc, p);
+                /* not the answer to this query (RFC 5452 section 9.1), or a cookie that is wrong or missing (RFC 7873 section 5.3): keep waiting */
+                if (p->rc == -2 || !ck_acceptable(c, p)) {
+                    p->rc = -2;
+                    continue;
+                }
+                got = true;
                 break;
             }
         }
         close(fd);
-        if (got < 0) continue;
-        any_answer = true;
-        if (p.truncated) {
+        if (!got) return -1;
+        *accepted = true;
+        ck_learn(c, p);
+        if (p->truncated) {
             /* TCP gets this resolver's share of what is left, not all of it: the resolvers after this one still need time */
-            uint32_t tcp_ms = remaining_ms(deadline) / (uint32_t)(rs->n - i);
-            ssize_t tg = tcp_query(sa, rs->sl[i], q, ql, tcp_ms, g_rbuf, sizeof(g_rbuf));
-            if (tg < 0) continue;
-            alias_parse_response(g_rbuf, (size_t)tg, id, name, nlen, qtype, &p);
+            uint32_t tcp_ms = remaining_ms(deadline) / left;
+            ssize_t tg = tcp_query(sa, sl, q, ql, tcp_ms, g_rbuf, sizeof(g_rbuf));
+            if (tg < 0) return 1;
+            /* a COOKIE option that is there must be right (s5.3); one that is missing is accepted over TCP, where an off-path forger
+             * cannot answer (the three-way handshake) and some resolvers send no cookie */
+            alias_parse_response(g_rbuf, (size_t)tg, id, name, nlen, qtype, c->cc, p);
+            if (p->rc == -2) return 1;
+            ck_learn(c, p);
         }
-        if (p.rc == 0) {
+        if (p->badcookie && p->cookie == ALIAS_CK_SERVER && attempt == 0 && remaining_ms(at_deadline) > 0) continue;
+        return p->rc == 0 ? 0 : 1;
+    }
+    return 1;
+}
+
+/* One resolution of (name, qtype) at the resolvers of rs.  0 = a usable answer in *out, 1 = an answer but not a usable one (an RCODE
+ * other than NOERROR, malformed), 2 = no resolver answered at all. */
+static int net_resolve(const alias_rset_t *rs, const uint8_t *name, size_t nlen, uint16_t qtype, alias_parsed_t *out) {
+    int64_t deadline = monotonic_ms() + ALIAS_RESOLVE_BUDGET_MS;
+    bool any_answer = false;
+    memset(out, 0, sizeof(*out));
+    out->rc = -1;
+    for (int i = 0; i < rs->n; i++) {
+        uint32_t rem = remaining_ms(deadline);
+        if (rem == 0) break;
+        uint32_t share = rem / (uint32_t)(rs->n - i);
+        if (share == 0) share = 1;
+        ck_t *c = ck_get(&rs->sa[i], alias_now());
+        bool accepted = false;
+        alias_parsed_t p;
+        int r = resolve_at(&rs->sa[i], rs->sl[i], c, name, nlen, qtype, share, deadline, (uint32_t)(rs->n - i), &p, &accepted);
+        ck_account(c, accepted, alias_now());
+        if (accepted) any_answer = true;
+        if (r == 0) {
             *out = p;
             return 0;
         }
@@ -531,6 +751,8 @@ typedef struct {
     int64_t fetched;
     int64_t next_try;
     uint32_t fails;
+    uint32_t max_refresh;                          /* alias-max-refresh-time in force: the smallest of the zones that want the job */
+    uint32_t scan_cap;                             /* the smallest value of the zones of the scan that is running (0 = none yet) */
     uint8_t rd[ALIAS_MAX_RR * 16];
 } job_t;
 
@@ -595,12 +817,22 @@ static job_t *job_find(uint64_t key, uint16_t qtype, const uint8_t *name, size_t
     return NULL;
 }
 
-/* marks (key, name, A and AAAA) as wanted, adding the jobs; false when the global cap is reached */
-static bool want(int rset, const uint8_t *name, size_t nlen) {
+/* the time from a fetch to the next refresh: two thirds of the TTL, at most alias-max-refresh-time, at least ALIAS_MIN_REFRESH */
+static uint32_t refresh_interval(uint32_t ttl, uint32_t max_refresh) {
+    uint32_t iv = (uint32_t)((uint64_t)ttl * 2 / 3);
+    if (iv > max_refresh) iv = max_refresh;
+    return iv > ALIAS_MIN_REFRESH ? iv : ALIAS_MIN_REFRESH;
+}
+
+/* marks (key, name, A and AAAA) as wanted by a zone with alias-max-refresh-time cap, adding the jobs; false when the global cap is reached.
+ * A job several zones want takes the smallest of their values (scan_cap; apply_caps() puts it in force after the scan). */
+static bool want(int rset, const uint8_t *name, size_t nlen, uint32_t cap) {
     static const uint16_t types[2] = { 1, 28 };
+    if (cap == 0) cap = KARIDNS_ALIAS_MAX_REFRESH_DEFAULT;
     for (int t = 0; t < 2; t++) {
         job_t *j = job_find(g_rsets[rset].key, types[t], name, nlen);
         if (j) {
+            if (j->scan_cap == 0 || cap < j->scan_cap) j->scan_cap = cap;
             j->wanted = true;
             continue;
         }
@@ -620,6 +852,7 @@ static bool want(int rset, const uint8_t *name, size_t nlen) {
         j->nlen = (uint8_t)nlen;
         memcpy(j->name, name, nlen);
         j->wanted = true;
+        j->max_refresh = j->scan_cap = cap;
         g_jobs[g_njobs++] = j;
         if (!g_jidx || g_njobs * 2 + 16 > g_jidx_size) {
             if (!jidx_rebuild()) {
@@ -656,6 +889,20 @@ static void sweep_unwanted(void) {
             g_jidx_size = 0;
             g_changed = true;
         }
+    }
+}
+
+/* after a scan: the smallest alias-max-refresh-time of the zones is in force.  A job whose next refresh is now later than its fetch plus
+ * the new interval is refreshed at that time (a reconfiguration that lowers the value applies to the results already held); a job that
+ * is failing keeps its retry time */
+static void apply_caps(void) {
+    for (size_t i = 0; i < g_njobs; i++) {
+        job_t *j = g_jobs[i];
+        if (j->scan_cap == 0 || j->scan_cap == j->max_refresh) continue;
+        j->max_refresh = j->scan_cap;
+        if (!j->have || j->fails != 0) continue;
+        int64_t due = j->fetched + refresh_interval(j->ttl, j->max_refresh);
+        if (j->next_try > due) j->next_try = due;
     }
 }
 
@@ -794,8 +1041,7 @@ static void run_pass(void) {
             j->fetched = now;
             memcpy(j->rd, p.rd, (size_t)p.n * p.rdlen);
             j->fails = 0;
-            uint32_t third = (uint32_t)((uint64_t)p.ttl * 2 / 3);
-            j->next_try = now + (third > ALIAS_MIN_REFRESH ? third : ALIAS_MIN_REFRESH);
+            j->next_try = now + refresh_interval(p.ttl, j->max_refresh);
             if (j->logged_fail) {
                 log_job(j, "resolved again");
                 j->logged_fail = false;
@@ -803,8 +1049,8 @@ static void run_pass(void) {
             if (logev_wanted(LOGC_GENERAL, 2)) {      /* 0.7 M3, debug 2: when the next refresh is and why */
                 char t[1100];
                 name_text(j->name, j->nlen, t, sizeof(t));
-                logev_post(LOGC_GENERAL, 2, NULL, 0, "[Alias] ALIAS target '%.200s' (%s): %d record(s), TTL %u; next refresh in %lld s (two thirds of the TTL, at least %d)", t,
-                           j->qtype == 1 ? "A" : "AAAA", (int)p.n, (unsigned)p.ttl, (long long)(j->next_try - now), ALIAS_MIN_REFRESH);
+                logev_post(LOGC_GENERAL, 2, NULL, 0, "[Alias] ALIAS target '%.200s' (%s): %d record(s), TTL %u; next refresh in %lld s (two thirds of the TTL, at most alias-max-refresh-time %u, at least %d)", t,
+                           j->qtype == 1 ? "A" : "AAAA", (int)p.n, (unsigned)p.ttl, (long long)(j->next_try - now), (unsigned)j->max_refresh, ALIAS_MIN_REFRESH);
             }
             g_changed = true;
         } else {
@@ -865,7 +1111,10 @@ typedef struct {
 static void scan_zones(void) {
     scan_note_t notes[SCAN_NOTES_MAX];
     int n_notes = 0, n_lost = 0;
-    for (size_t i = 0; i < g_njobs; i++) g_jobs[i]->wanted = false;
+    for (size_t i = 0; i < g_njobs; i++) {
+        g_jobs[i]->wanted = false;
+        g_jobs[i]->scan_cap = 0;
+    }
     rcu_aux_read_lock();
     server_config_t *cfg = acquire_config_snapshot();
     zone_db_snapshot_t *snap = acquire_zone_snapshot();
@@ -891,6 +1140,7 @@ att_restart:;
                 const zone_config_t *zc = zone_entry_config(cfg, e);
                 alias_rset_t rs;
                 if (alias_resolvers_fill(cfg, zc, e->source == ZONE_SRC_DB, &rs) == 0) continue;
+                const uint32_t cap = alias_max_refresh(cfg, zc, e->source == ZONE_SRC_DB);
                 int ri = rset_get(&rs);
                 if (ri < 0) {
                     if (n_notes < SCAN_NOTES_MAX) {
@@ -914,7 +1164,7 @@ att_restart:;
                         uint8_t w[256];
                         size_t wl;
                         if (!alias_wire_lower(zone_image_rr_rdata(img, k), zone_image_rr_rdlen(img, k), w, &wl)) continue;
-                        if (!want(ri, w, wl)) {
+                        if (!want(ri, w, wl, cap)) {
                             capped = true;
                             break;
                         }
@@ -936,6 +1186,7 @@ att_restart:;
     rcu_aux_read_unlock();
     sweep_unwanted();
     reclaim_rsets();
+    apply_caps();
     for (int i = 0; i < n_notes; i++) {
         if (notes[i].rsets)
             syslog(LOG_WARNING, "[Alias] more than %d different alias-resolver lists; zone '%s' is not expanded", MAX_RSETS, notes[i].zone);
@@ -1025,11 +1276,35 @@ void alias_test_reset(void) {
     free(t);
     free(g_old_tab);
     g_old_tab = NULL;
+    memset(g_ck, 0, sizeof(g_ck));
 }
 
-void alias_test_want(const alias_rset_t *rs, const uint8_t *name, size_t nlen) {
+void alias_test_want(const alias_rset_t *rs, const uint8_t *name, size_t nlen, uint32_t max_refresh) {
     int ri = rset_get(rs);
-    if (ri >= 0) (void)want(ri, name, nlen);
+    if (ri >= 0) (void)want(ri, name, nlen, max_refresh);
+    apply_caps();
+}
+
+void alias_test_rescan(void) {
+    for (size_t i = 0; i < g_njobs; i++) {
+        g_jobs[i]->wanted = false;
+        g_jobs[i]->scan_cap = 0;
+    }
+}
+
+bool alias_test_cookie(const struct sockaddr_storage *sa, bool *capable, uint8_t cc[8], uint8_t *sc_len) {
+    const ck_t *c = ck_find(sa);
+    if (!c) return false;
+    *capable = c->capable;
+    memcpy(cc, c->cc, 8);
+    *sc_len = c->sc_len;
+    return true;
+}
+
+int64_t alias_test_next_try(const uint8_t *name, size_t nlen, uint16_t qtype) {
+    for (size_t i = 0; i < g_njobs; i++)
+        if (g_jobs[i]->qtype == qtype && g_jobs[i]->nlen == nlen && memcmp(g_jobs[i]->name, name, nlen) == 0) return g_jobs[i]->next_try;
+    return -1;
 }
 
 void alias_test_pass(void) { run_pass(); }

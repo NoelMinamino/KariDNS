@@ -149,6 +149,7 @@ tests/run_dag_yaml_rrsig_decode_test.sh	0
 tests/run_dag_yaml_socket_family_force_test.sh	1
 tests/run_dag_yaml_socket_family_test.sh	1
 tests/run_db_alias_lua_test.sh	70
+tests/run_alias_cookie_refresh_test.sh	60
 tests/run_db_apex_test.sh	12
 tests/run_db_auth_rls_test.sh	15
 tests/run_db_auth_schema_test.sh	9

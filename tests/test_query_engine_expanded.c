@@ -12,6 +12,7 @@
 #include <netinet/in.h>
 #include <poll.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <sys/socket.h>
 #include <sys/resource.h>
 #include <sys/wait.h>
@@ -10065,8 +10066,8 @@ static void test_b9a_alias_lua_queries(void) {
     uint8_t bad_name[] = { 7, 'n', 'o', 'w', 'h', 'e', 'r', 'e', 6, 't', 'a', 'r', 'g', 'e', 't', 4, 't', 'e', 's', 't', 0 };
     b9_ask(&z, &cfg, "a.al.test.", 1, &r);          assert(r.rcode == 2 && r.an == 0);                              /* never resolved: SERVFAIL */
     b9_ask(&z, &cfg, "a.al.test.", 65401, &r);      assert(r.rcode == 0 && r.an == 0);                              /* the ALIAS RR is not an answer any more */
-    alias_test_want(&rs, t_name, sizeof(t_name));
-    alias_test_want(&rs, bad_name, sizeof(bad_name));
+    alias_test_want(&rs, t_name, sizeof(t_name), 0);
+    alias_test_want(&rs, bad_name, sizeof(bad_name), 0);
     assert(alias_test_job_count() == 4);
     alias_test_pass();
     assert(g_b9_calls == 4);
@@ -10234,35 +10235,35 @@ static void test_b9a_alias_response_parser(void) {
     b9_pk_hdr(&p, 0x1234, 0x80, 0, 2, "T.Target.Test.", 1);
     b9_pk_rr(&p, NULL, 1, 1, 60, a1, 4);
     b9_pk_rr(&p, NULL, 1, 1, 50, a2, 4);
-    alias_parse_response(p.b, p.n, 0x1234, qn, qnl, 1, &o);
+    alias_parse_response(p.b, p.n, 0x1234, qn, qnl, 1, NULL, &o);
     assert(o.rc == 0 && o.n == 2 && o.rdlen == 4 && o.ttl == 50 && memcmp(o.rd, a1, 4) == 0 && memcmp(o.rd + 4, a2, 4) == 0);
     /* a duplicate address is kept once */
     b9_pk_hdr(&p, 0x1234, 0x80, 0, 2, "t.target.test.", 1);
     b9_pk_rr(&p, NULL, 1, 1, 60, a1, 4);
     b9_pk_rr(&p, NULL, 1, 1, 60, a1, 4);
-    alias_parse_response(p.b, p.n, 0x1234, qn, qnl, 1, &o);
+    alias_parse_response(p.b, p.n, 0x1234, qn, qnl, 1, NULL, &o);
     assert(o.rc == 0 && o.n == 1);
     /* not our answer: ID, QR, opcode, question (name, type) */
     b9_pk_hdr(&p, 0x1234, 0x80, 0, 1, "t.target.test.", 1); b9_pk_rr(&p, NULL, 1, 1, 60, a1, 4);
-    alias_parse_response(p.b, p.n, 0x1235, qn, qnl, 1, &o); assert(o.rc == -2);
+    alias_parse_response(p.b, p.n, 0x1235, qn, qnl, 1, NULL, &o); assert(o.rc == -2);
     b9_pk_hdr(&p, 0x1234, 0x00, 0, 1, "t.target.test.", 1); b9_pk_rr(&p, NULL, 1, 1, 60, a1, 4);
-    alias_parse_response(p.b, p.n, 0x1234, qn, qnl, 1, &o); assert(o.rc == -2);                       /* QR=0 */
+    alias_parse_response(p.b, p.n, 0x1234, qn, qnl, 1, NULL, &o); assert(o.rc == -2);                       /* QR=0 */
     b9_pk_hdr(&p, 0x1234, 0x80 | 0x28, 0, 1, "t.target.test.", 1); b9_pk_rr(&p, NULL, 1, 1, 60, a1, 4);
-    alias_parse_response(p.b, p.n, 0x1234, qn, qnl, 1, &o); assert(o.rc == -2);                       /* opcode 5 */
+    alias_parse_response(p.b, p.n, 0x1234, qn, qnl, 1, NULL, &o); assert(o.rc == -2);                       /* opcode 5 */
     b9_pk_hdr(&p, 0x1234, 0x80, 0, 1, "u.target.test.", 1); b9_pk_rr(&p, NULL, 1, 1, 60, a1, 4);
-    alias_parse_response(p.b, p.n, 0x1234, qn, qnl, 1, &o); assert(o.rc == -2);                       /* another question */
+    alias_parse_response(p.b, p.n, 0x1234, qn, qnl, 1, NULL, &o); assert(o.rc == -2);                       /* another question */
     b9_pk_hdr(&p, 0x1234, 0x80, 0, 1, "t.target.test.", 28); b9_pk_rr(&p, NULL, 28, 1, 60, a1, 4);
-    alias_parse_response(p.b, p.n, 0x1234, qn, qnl, 1, &o); assert(o.rc == -2);                       /* another type */
+    alias_parse_response(p.b, p.n, 0x1234, qn, qnl, 1, NULL, &o); assert(o.rc == -2);                       /* another type */
     /* RCODE: NXDOMAIN, SERVFAIL and REFUSED are not an answer; TC asks for TCP */
     b9_pk_hdr(&p, 0x1234, 0x80, 3, 0, "t.target.test.", 1);
-    alias_parse_response(p.b, p.n, 0x1234, qn, qnl, 1, &o); assert(o.rc == 1);
+    alias_parse_response(p.b, p.n, 0x1234, qn, qnl, 1, NULL, &o); assert(o.rc == 1);
     b9_pk_hdr(&p, 0x1234, 0x80, 2, 0, "t.target.test.", 1);
-    alias_parse_response(p.b, p.n, 0x1234, qn, qnl, 1, &o); assert(o.rc == 1);
+    alias_parse_response(p.b, p.n, 0x1234, qn, qnl, 1, NULL, &o); assert(o.rc == 1);
     b9_pk_hdr(&p, 0x1234, 0x82, 0, 0, "t.target.test.", 1);
-    alias_parse_response(p.b, p.n, 0x1234, qn, qnl, 1, &o); assert(o.truncated && o.rc == -1);
+    alias_parse_response(p.b, p.n, 0x1234, qn, qnl, 1, NULL, &o); assert(o.truncated && o.rc == -1);
     /* NODATA: NOERROR without addresses is an answer (empty, short TTL) */
     b9_pk_hdr(&p, 0x1234, 0x80, 0, 0, "t.target.test.", 1);
-    alias_parse_response(p.b, p.n, 0x1234, qn, qnl, 1, &o); assert(o.rc == 0 && o.n == 0 && o.ttl == ALIAS_NEG_TTL);
+    alias_parse_response(p.b, p.n, 0x1234, qn, qnl, 1, NULL, &o); assert(o.rc == 0 && o.n == 0 && o.ttl == ALIAS_NEG_TTL);
     /* a CNAME chain (the owner of the second link in upper case), the final RRset's TTL is the one used; records of other names and
      * classes are ignored */
     b9_pk_hdr(&p, 0x1234, 0x80, 0, 5, "t.target.test.", 1);
@@ -10273,7 +10274,7 @@ static void test_b9a_alias_response_parser(void) {
     b9_pk_rr(&p, "end.other.test.", 1, 1, 77, a1, 4);
     b9_pk_rr(&p, "end.other.test.", 1, 3, 77, a2, 4);             /* CLASS CH: ignored */
     b9_pk_rr(&p, "unrelated.test.", 1, 1, 77, a2, 4);             /* not in the chain: ignored */
-    alias_parse_response(p.b, p.n, 0x1234, qn, qnl, 1, &o);
+    alias_parse_response(p.b, p.n, 0x1234, qn, qnl, 1, NULL, &o);
     assert(o.rc == 0 && o.n == 1 && o.ttl == 20 && memcmp(o.rd, a1, 4) == 0);    /* the smallest TTL of the CNAMEs followed (RFC 2181 s5.2) */
     b9_pk_hdr(&p, 0x1234, 0x80, 0, 3, "t.target.test.", 1);
     l = b9_pk_name(cn, "mid.other.test.");
@@ -10281,21 +10282,21 @@ static void test_b9a_alias_response_parser(void) {
     l2 = b9_pk_name(cn2, "end.other.test.");
     b9_pk_rr(&p, "mid.other.test.", 5, 1, 90, cn2, l2);
     b9_pk_rr(&p, "end.other.test.", 1, 1, 77, a1, 4);
-    alias_parse_response(p.b, p.n, 0x1234, qn, qnl, 1, &o);
+    alias_parse_response(p.b, p.n, 0x1234, qn, qnl, 1, NULL, &o);
     assert(o.rc == 0 && o.n == 1 && o.ttl == 77);                                /* the final RRset is the smallest */
     /* a chain that ends without addresses is NODATA */
     b9_pk_hdr(&p, 0x1234, 0x80, 0, 1, "t.target.test.", 1);
     l = b9_pk_name(cn, "gone.other.test.");
     b9_pk_rr(&p, NULL, 5, 1, 500, cn, l);
-    alias_parse_response(p.b, p.n, 0x1234, qn, qnl, 1, &o); assert(o.rc == 0 && o.n == 0 && o.ttl == ALIAS_NEG_TTL);
+    alias_parse_response(p.b, p.n, 0x1234, qn, qnl, 1, NULL, &o); assert(o.rc == 0 && o.n == 0 && o.ttl == ALIAS_NEG_TTL);
     b9_pk_hdr(&p, 0x1234, 0x80, 0, 1, "t.target.test.", 1);                      /* ... and does not outlive a shorter CNAME */
     b9_pk_rr(&p, NULL, 5, 1, 1, cn, l);
-    alias_parse_response(p.b, p.n, 0x1234, qn, qnl, 1, &o); assert(o.rc == 0 && o.n == 0 && o.ttl == 1 && ALIAS_NEG_TTL > 1);
+    alias_parse_response(p.b, p.n, 0x1234, qn, qnl, 1, NULL, &o); assert(o.rc == 0 && o.n == 0 && o.ttl == 1 && ALIAS_NEG_TTL > 1);
     /* a loop, and a chain longer than ALIAS_MAX_CNAME, are refused */
     b9_pk_hdr(&p, 0x1234, 0x80, 0, 2, "t.target.test.", 1);
     l = b9_pk_name(cn, "b.test.");   b9_pk_rr(&p, NULL, 5, 1, 60, cn, l);
     l = b9_pk_name(cn, "t.target.test."); b9_pk_rr(&p, "b.test.", 5, 1, 60, cn, l);
-    alias_parse_response(p.b, p.n, 0x1234, qn, qnl, 1, &o); assert(o.rc == -1);
+    alias_parse_response(p.b, p.n, 0x1234, qn, qnl, 1, NULL, &o); assert(o.rc == -1);
     {
         char owner[32], target[32];
         b9_pk_hdr(&p, 0x1234, 0x80, 0, 12, "t.target.test.", 1);
@@ -10306,16 +10307,16 @@ static void test_b9a_alias_response_parser(void) {
             b9_pk_rr(&p, i == 0 ? NULL : owner, 5, 1, 60, cn, l);
             snprintf(owner, sizeof(owner), "%s", target);
         }
-        alias_parse_response(p.b, p.n, 0x1234, qn, qnl, 1, &o); assert(o.rc == -1);
+        alias_parse_response(p.b, p.n, 0x1234, qn, qnl, 1, NULL, &o); assert(o.rc == -1);
     }
     /* malformed: an RR that runs past the end, a compression pointer that goes forward, a pointer to itself, a wrong A length */
     b9_pk_hdr(&p, 0x1234, 0x80, 0, 1, "t.target.test.", 1); b9_pk_rr(&p, NULL, 1, 1, 60, a1, 4);
-    alias_parse_response(p.b, p.n - 2, 0x1234, qn, qnl, 1, &o); assert(o.rc == -1);
+    alias_parse_response(p.b, p.n - 2, 0x1234, qn, qnl, 1, NULL, &o); assert(o.rc == -1);
     b9_pk_hdr(&p, 0x1234, 0x80, 0, 1, "t.target.test.", 1); b9_pk_rr(&p, NULL, 1, 1, 60, a1, 4);
     p.b[p.n - 4 - 10 - 2 + 1] = 0xFF;                              /* the owner pointer now points far forward */
-    alias_parse_response(p.b, p.n, 0x1234, qn, qnl, 1, &o); assert(o.rc == -1);
+    alias_parse_response(p.b, p.n, 0x1234, qn, qnl, 1, NULL, &o); assert(o.rc == -1);
     b9_pk_hdr(&p, 0x1234, 0x80, 0, 1, "t.target.test.", 1); b9_pk_rr(&p, NULL, 1, 1, 60, a1, 3);
-    alias_parse_response(p.b, p.n, 0x1234, qn, qnl, 1, &o); assert(o.rc == 0 && o.n == 0);          /* a 3-octet A is no address */
+    alias_parse_response(p.b, p.n, 0x1234, qn, qnl, 1, NULL, &o); assert(o.rc == 0 && o.n == 0);          /* a 3-octet A is no address */
     b9_pk_hdr(&p, 0x1234, 0x80, 0, 1, "t.target.test.", 1);
     {
         size_t at = p.n;
@@ -10324,21 +10325,21 @@ static void test_b9a_alias_response_parser(void) {
         memset(p.b + p.n, 0, 6);
         p.n += 6;
     }
-    alias_parse_response(p.b, p.n, 0x1234, qn, qnl, 1, &o); assert(o.rc == -1);
+    alias_parse_response(p.b, p.n, 0x1234, qn, qnl, 1, NULL, &o); assert(o.rc == -1);
     for (size_t cut = 0; cut < 40; cut++) {                       /* truncated at every length: never a crash */
         b9_pk_hdr(&p, 0x1234, 0x80, 0, 1, "t.target.test.", 1); b9_pk_rr(&p, NULL, 1, 1, 60, a1, 4);
-        alias_parse_response(p.b, cut < p.n ? cut : p.n, 0x1234, qn, qnl, 1, &o);
+        alias_parse_response(p.b, cut < p.n ? cut : p.n, 0x1234, qn, qnl, 1, NULL, &o);
     }
     /* AAAA */
     uint8_t v6[16] = { 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 };
     b9_pk_hdr(&p, 0x1234, 0x80, 0, 1, "t.target.test.", 28); b9_pk_rr(&p, NULL, 28, 1, 90, v6, 16);
-    alias_parse_response(p.b, p.n, 0x1234, qn, qnl, 28, &o); assert(o.rc == 0 && o.n == 1 && o.rdlen == 16 && o.ttl == 90 && memcmp(o.rd, v6, 16) == 0);
+    alias_parse_response(p.b, p.n, 0x1234, qn, qnl, 28, NULL, &o); assert(o.rc == 0 && o.n == 1 && o.rdlen == 16 && o.ttl == 90 && memcmp(o.rd, v6, 16) == 0);
     /* an upstream TTL is cut to ALIAS_MAX_TTL; the high bit is not a negative TTL */
     b9_pk_hdr(&p, 0x1234, 0x80, 0, 1, "t.target.test.", 1); b9_pk_rr(&p, NULL, 1, 1, 0xFFFFFFFFu, a1, 4);
-    alias_parse_response(p.b, p.n, 0x1234, qn, qnl, 1, &o); assert(o.rc == 0 && o.ttl == ALIAS_MAX_TTL);
+    alias_parse_response(p.b, p.n, 0x1234, qn, qnl, 1, NULL, &o); assert(o.rc == 0 && o.ttl == ALIAS_MAX_TTL);
     /* the query */
     uint8_t q[600];
-    size_t ql = alias_build_query(q, sizeof(q), 0xBEEF, qn, qnl, 1);
+    size_t ql = alias_build_query(q, sizeof(q), 0xBEEF, qn, qnl, 1, NULL, NULL, 0);
     assert(ql == 12 + qnl + 4 + 11 && q[0] == 0xBE && q[1] == 0xEF && q[2] == 0x01 && q[5] == 1 && q[11] == 1 && q[ql - 11] == 0 && q[ql - 10] == 0 && q[ql - 9] == 41);
     /* names: lower-casing, validity */
     uint8_t w[256];
@@ -10354,10 +10355,31 @@ static void test_b9a_alias_response_parser(void) {
 }
 
 /* ---- B9a: the network side of the ALIAS resolver (dns_alias.c net_resolve / tcp_query) against a resolver thread behind socketpairs ---- */
-enum { B9N_OK, B9N_TC, B9N_WRONGID, B9N_NXDOMAIN, B9N_DOWN };
+enum { B9N_OK, B9N_TC, B9N_WRONGID, B9N_NXDOMAIN, B9N_DOWN,
+       B9N_CK,             /* 0.7: answers with the client cookie of the query and g_b9n_sc (RFC 7873) */
+       B9N_CK_SPOOF,       /* first a forged answer (192.0.2.99) with another client cookie, then the real one */
+       B9N_CK_DOWNGRADE,   /* a forged answer without COOKIE (192.0.2.98), one with the client cookie only (192.0.2.97), then nothing */
+       B9N_CK_BAD };       /* BADCOOKIE with g_b9n_sc unless the query carries g_b9n_sc */
 static int g_b9n_mode;
 static int g_b9n_udp, g_b9n_tcp;
+static uint8_t g_b9n_sc[16];
+static _Atomic int g_b9n_badck, g_b9n_last_sclen;
 typedef struct { int fd; int type; int mode; } b9n_srv_t;
+
+/* the OPT RR with a COOKIE option (cc, sc) and the upper RCODE bits ext at r[*o]; ARCOUNT 1 */
+static void b9n_opt(uint8_t *r, size_t *o, const uint8_t *cc, const uint8_t *sc, size_t sclen, uint8_t ext) {
+    size_t p = *o;
+    r[p++] = 0; r[p++] = 0; r[p++] = 41; r[p++] = 0x04; r[p++] = 0xD0;
+    r[p++] = ext; r[p++] = 0; r[p++] = 0; r[p++] = 0;
+    r[p++] = 0; r[p++] = (uint8_t)(4 + 8 + sclen);
+    r[p++] = 0; r[p++] = 10; r[p++] = 0; r[p++] = (uint8_t)(8 + sclen);
+    memcpy(r + p, cc, 8);
+    p += 8;
+    if (sclen) memcpy(r + p, sc, sclen);
+    p += sclen;
+    r[10] = 0; r[11] = 1;
+    *o = p;
+}
 
 static size_t b9n_response(const uint8_t *q, size_t n, int mode, bool tcp, uint8_t *r) {
     size_t qe = 12;
@@ -10385,10 +10407,62 @@ static size_t b9n_response(const uint8_t *q, size_t n, int mode, bool tcp, uint8
     return o;
 }
 
+/* the cookie modes (UDP): the query's COOKIE option is read at its fixed place after the question (alias_build_query()) */
+static void b9n_cookie_reply(int fd, const uint8_t *q, size_t n, int mode) {
+    size_t qe = 12;
+    while (qe < n && q[qe]) qe += 1 + q[qe];
+    qe += 1 + 4;
+    uint8_t cc[8] = { 0 }, qsc[32];
+    size_t qsclen = 0;
+    if (qe + 15 + 8 <= n && q[qe + 2] == 41 && q[qe + 12] == 10) {
+        size_t l = q[qe + 14];
+        memcpy(cc, q + qe + 15, 8);
+        if (l > 8 && l <= 40 && qe + 15 + l <= n) {
+            qsclen = l - 8;
+            memcpy(qsc, q + qe + 23, qsclen);
+        }
+    }
+    atomic_store(&g_b9n_last_sclen, (int)qsclen);
+    uint8_t r[1200], w[1200];
+    size_t rl = b9n_response(q, n, B9N_OK, false, r), wl;
+    if (mode == B9N_CK_SPOOF) {
+        uint8_t bad[8];
+        memcpy(bad, cc, 8);
+        bad[0] ^= 0xFF;
+        memcpy(w, r, rl);
+        w[qe + 12 + 3] = 99;                                          /* the first address */
+        wl = rl;
+        b9n_opt(w, &wl, bad, g_b9n_sc, 16, 0);
+        (void)send(fd, w, wl, 0);
+    } else if (mode == B9N_CK_DOWNGRADE) {
+        memcpy(w, r, rl);
+        w[qe + 12 + 3] = 98;
+        (void)send(fd, w, rl, 0);                                     /* no OPT at all */
+        w[qe + 12 + 3] = 97;
+        wl = rl;
+        b9n_opt(w, &wl, cc, NULL, 0, 0);                              /* the client cookie alone */
+        (void)send(fd, w, wl, 0);
+        return;
+    } else if (mode == B9N_CK_BAD && !(qsclen == 16 && memcmp(qsc, g_b9n_sc, 16) == 0)) {
+        atomic_fetch_add(&g_b9n_badck, 1);
+        rl = qe;                                                      /* BADCOOKIE = 23: header RCODE 7, extended 1 (RFC 7873 s8, RFC 6891 s6.1.3) */
+        r[3] = 0x80 | 7;
+        r[6] = r[7] = 0;
+        b9n_opt(r, &rl, cc, g_b9n_sc, 16, 1);
+        (void)send(fd, r, rl, 0);
+        return;
+    }
+    b9n_opt(r, &rl, cc, g_b9n_sc, 16, 0);
+    (void)send(fd, r, rl, 0);
+}
+
 static void *b9n_server(void *arg) {
     b9n_srv_t *s = arg;
     uint8_t q[600], r[1200];
-    if (s->type == SOCK_DGRAM) {
+    if (s->type == SOCK_DGRAM && s->mode >= B9N_CK) {
+        ssize_t n = recv(s->fd, q, sizeof(q), 0);
+        if (n > 12) b9n_cookie_reply(s->fd, q, (size_t)n, s->mode);
+    } else if (s->type == SOCK_DGRAM) {
         ssize_t n = recv(s->fd, q, sizeof(q), 0);
         if (n > 12) {
             size_t rl = b9n_response(q, (size_t)n, s->mode, false, r);
@@ -10458,30 +10532,30 @@ static void test_b9a_alias_network(void) {
     uint8_t n_dn[] = { 2, 'd', 'n', 4, 't', 'e', 's', 't', 0 };
 
     g_b9n_mode = B9N_OK;
-    alias_test_want(&rs, n_ok, sizeof(n_ok));
+    alias_test_want(&rs, n_ok, sizeof(n_ok), 0);
     alias_test_pass();
     assert(alias_lookup(rs.key, n_ok, sizeof(n_ok), 1, &a) && a.n == 2 && a.rdlen == 4 && a.ttl == 60 && a.rdata[3] == 10 && a.rdata[7] == 11);
     assert(alias_lookup(rs.key, n_ok, sizeof(n_ok), 28, &a) && a.n == 1 && a.rdlen == 16 && a.rdata[15] == 0x10);
     assert(g_b9n_udp == 2 && g_b9n_tcp == 0);
 
     g_b9n_mode = B9N_TC;                                              /* a truncated answer: the same question over TCP */
-    alias_test_want(&rs, n_tc, sizeof(n_tc));
+    alias_test_want(&rs, n_tc, sizeof(n_tc), 0);
     alias_test_pass();
     assert(alias_lookup(rs.key, n_tc, sizeof(n_tc), 1, &a) && a.n == 3);
     assert(g_b9n_tcp >= 1);
 
     g_b9n_mode = B9N_WRONGID;
-    alias_test_want(&rs, n_id, sizeof(n_id));
+    alias_test_want(&rs, n_id, sizeof(n_id), 0);
     alias_test_pass();
     assert(alias_lookup(rs.key, n_id, sizeof(n_id), 1, &a) && a.n == 2);
 
     g_b9n_mode = B9N_NXDOMAIN;                                        /* no result: SERVFAIL for the query */
-    alias_test_want(&rs, n_nx, sizeof(n_nx));
+    alias_test_want(&rs, n_nx, sizeof(n_nx), 0);
     alias_test_pass();
     assert(!alias_lookup(rs.key, n_nx, sizeof(n_nx), 1, &a));
 
     g_b9n_mode = B9N_DOWN;                                            /* the broker cannot connect: the resolver set is left alone for a while */
-    alias_test_want(&rs, n_dn, sizeof(n_dn));
+    alias_test_want(&rs, n_dn, sizeof(n_dn), 0);
     int before = g_b9n_udp;
     alias_test_pass();
     assert(!alias_lookup(rs.key, n_dn, sizeof(n_dn), 1, &a));
@@ -10499,6 +10573,322 @@ static void test_b9a_alias_network(void) {
     g_b9_broker = NULL;
     free_server_config_fields(&cfg);
     printf("  -> resolver client passed.\n");
+}
+
+/* ---- 0.7: DNS Cookies (RFC 7873) on the queries to the ALIAS resolvers: the parser and the builder ---- */
+static void b9_pk_opt(b9_pk_t *p, uint8_t ext_rcode, const uint8_t *opts, size_t olen) {
+    p->b[p->n++] = 0;                                              /* the root */
+    p->b[p->n++] = 0; p->b[p->n++] = 41;
+    p->b[p->n++] = 0x04; p->b[p->n++] = 0xD0;
+    p->b[p->n++] = ext_rcode; p->b[p->n++] = 0; p->b[p->n++] = 0; p->b[p->n++] = 0;
+    p->b[p->n++] = (uint8_t)(olen >> 8); p->b[p->n++] = (uint8_t)olen;
+    memcpy(p->b + p->n, opts, olen);
+    p->n += olen;
+    p->b[11]++;                                                    /* ARCOUNT */
+}
+static size_t b9_ck_opt(uint8_t *o, const uint8_t *cc, size_t cclen, const uint8_t *sc, size_t sclen) {
+    o[0] = 0; o[1] = 10; o[2] = (uint8_t)((cclen + sclen) >> 8); o[3] = (uint8_t)(cclen + sclen);
+    memcpy(o + 4, cc, cclen);
+    if (sclen) memcpy(o + 4 + cclen, sc, sclen);
+    return 4 + cclen + sclen;
+}
+
+static void test_alias_cookie_parser(void) {
+    printf("[TEST] 0.7: DNS Cookies of the ALIAS resolver client: COOKIE option checks, BADCOOKIE, the query (RFC 7873 s4, s5.1, s5.3)...\n");
+    uint8_t qn[64];
+    size_t qnl = b9_pk_name(qn, "t.target.test.");
+    alias_parsed_t o;
+    b9_pk_t p;
+    uint8_t a1[4] = { 192, 0, 2, 10 };
+    const uint8_t cc[8] = { 1, 2, 3, 4, 5, 6, 7, 8 }, other[8] = { 1, 2, 3, 4, 5, 6, 7, 9 };
+    uint8_t sc[40], opt[200];
+    for (int i = 0; i < 40; i++) sc[i] = (uint8_t)(0x40 + i);
+    size_t ol;
+#define CK_ANSWER(scl) do { b9_pk_hdr(&p, 0x1234, 0x80, 0, 1, "t.target.test.", 1); b9_pk_rr(&p, NULL, 1, 1, 60, a1, 4); \
+                            ol = b9_ck_opt(opt, cc, 8, sc, (scl)); b9_pk_opt(&p, 0, opt, ol); } while (0)
+    CK_ANSWER(16);                                                 /* our client cookie and a server cookie of 16 octets (RFC 9018's size) */
+    alias_parse_response(p.b, p.n, 0x1234, qn, qnl, 1, cc, &o);
+    assert(o.rc == 0 && o.n == 1 && o.cookie == ALIAS_CK_SERVER && o.sc_len == 16 && memcmp(o.sc, sc, 16) == 0);
+    alias_parse_response(p.b, p.n, 0x1234, qn, qnl, 1, NULL, &o);  /* no cookie was sent: the option is not looked at */
+    assert(o.rc == 0 && o.n == 1 && o.cookie == ALIAS_CK_NONE && o.sc_len == 0);
+    alias_parse_response(p.b, p.n, 0x1234, qn, qnl, 1, other, &o); /* another client cookie: discarded (s5.3) */
+    assert(o.rc == -2 && o.n == 0 && o.cookie == ALIAS_CK_NONE && o.sc_len == 0);
+    CK_ANSWER(0);                                                  /* the client cookie alone (length 8) */
+    alias_parse_response(p.b, p.n, 0x1234, qn, qnl, 1, cc, &o);
+    assert(o.rc == 0 && o.cookie == ALIAS_CK_CLIENT && o.sc_len == 0);
+    CK_ANSWER(8);                                                  /* the shortest and the longest server cookie */
+    alias_parse_response(p.b, p.n, 0x1234, qn, qnl, 1, cc, &o);
+    assert(o.rc == 0 && o.cookie == ALIAS_CK_SERVER && o.sc_len == 8);
+    CK_ANSWER(32);
+    alias_parse_response(p.b, p.n, 0x1234, qn, qnl, 1, cc, &o);
+    assert(o.rc == 0 && o.cookie == ALIAS_CK_SERVER && o.sc_len == 32 && memcmp(o.sc, sc, 32) == 0);
+    /* illegal lengths (valid: 8 and 16 to 40, s5.2.2): discarded */
+    static const size_t bad_len[] = { 0, 7, 9, 15, 41 };
+    for (size_t k = 0; k < sizeof(bad_len) / sizeof(bad_len[0]); k++) {
+        b9_pk_hdr(&p, 0x1234, 0x80, 0, 1, "t.target.test.", 1); b9_pk_rr(&p, NULL, 1, 1, 60, a1, 4);
+        uint8_t raw[60];
+        memcpy(raw, cc, 8);
+        memcpy(raw + 8, sc, 40);
+        ol = b9_ck_opt(opt, raw, bad_len[k], NULL, 0);
+        b9_pk_opt(&p, 0, opt, ol);
+        alias_parse_response(p.b, p.n, 0x1234, qn, qnl, 1, cc, &o);
+        assert(o.rc == -2 && o.n == 0);
+    }
+    /* two COOKIE options; an option that runs past the RDATA: discarded (the cookie cannot be checked) */
+    b9_pk_hdr(&p, 0x1234, 0x80, 0, 1, "t.target.test.", 1); b9_pk_rr(&p, NULL, 1, 1, 60, a1, 4);
+    ol = b9_ck_opt(opt, cc, 8, sc, 16);
+    ol += b9_ck_opt(opt + ol, cc, 8, sc, 16);
+    b9_pk_opt(&p, 0, opt, ol);
+    alias_parse_response(p.b, p.n, 0x1234, qn, qnl, 1, cc, &o); assert(o.rc == -2);
+    b9_pk_hdr(&p, 0x1234, 0x80, 0, 1, "t.target.test.", 1); b9_pk_rr(&p, NULL, 1, 1, 60, a1, 4);
+    static const uint8_t past[] = { 0, 3, 0, 50, 'n', 's' };
+    b9_pk_opt(&p, 0, past, sizeof(past));
+    alias_parse_response(p.b, p.n, 0x1234, qn, qnl, 1, cc, &o); assert(o.rc == -2);
+    alias_parse_response(p.b, p.n, 0x1234, qn, qnl, 1, NULL, &o); assert(o.rc == 0 && o.n == 1);   /* not looked at without a cookie */
+    b9_pk_hdr(&p, 0x1234, 0x80, 0, 1, "t.target.test.", 1); b9_pk_rr(&p, NULL, 1, 1, 60, a1, 4);
+    static const uint8_t three[] = { 0, 3, 0 };                    /* an option header cut short */
+    b9_pk_opt(&p, 0, three, sizeof(three));
+    alias_parse_response(p.b, p.n, 0x1234, qn, qnl, 1, cc, &o); assert(o.rc == -2);
+    /* other options around the cookie are skipped (NSID before, padding after) */
+    b9_pk_hdr(&p, 0x1234, 0x80, 0, 1, "t.target.test.", 1); b9_pk_rr(&p, NULL, 1, 1, 60, a1, 4);
+    ol = 0;
+    opt[ol++] = 0; opt[ol++] = 3; opt[ol++] = 0; opt[ol++] = 2; opt[ol++] = 'n'; opt[ol++] = '1';
+    ol += b9_ck_opt(opt + ol, cc, 8, sc, 16);
+    opt[ol++] = 0; opt[ol++] = 12; opt[ol++] = 0; opt[ol++] = 3; opt[ol++] = 0; opt[ol++] = 0; opt[ol++] = 0;
+    b9_pk_opt(&p, 0, opt, ol);
+    alias_parse_response(p.b, p.n, 0x1234, qn, qnl, 1, cc, &o); assert(o.rc == 0 && o.cookie == ALIAS_CK_SERVER && o.sc_len == 16);
+    /* no OPT RR in the response of a query with a cookie: an answer without COOKIE (whether that is taken is the caller's rule) */
+    b9_pk_hdr(&p, 0x1234, 0x80, 0, 1, "t.target.test.", 1); b9_pk_rr(&p, NULL, 1, 1, 60, a1, 4);
+    alias_parse_response(p.b, p.n, 0x1234, qn, qnl, 1, cc, &o); assert(o.rc == 0 && o.n == 1 && o.cookie == ALIAS_CK_NONE);
+    /* an OPT RR in the answer section, one not owned by the root, two of them (RFC 6891 s6.1.1): malformed */
+    b9_pk_hdr(&p, 0x1234, 0x80, 0, 1, "t.target.test.", 1);
+    ol = b9_ck_opt(opt, cc, 8, sc, 16); b9_pk_opt(&p, 0, opt, ol);
+    p.b[11]--;
+    alias_parse_response(p.b, p.n, 0x1234, qn, qnl, 1, cc, &o); assert(o.rc == -1);
+    b9_pk_hdr(&p, 0x1234, 0x80, 0, 1, "t.target.test.", 1); b9_pk_rr(&p, NULL, 1, 1, 60, a1, 4);
+    b9_pk_rr(&p, "x.test.", 41, 1232, 0, opt, ol);
+    p.b[11]++;
+    alias_parse_response(p.b, p.n, 0x1234, qn, qnl, 1, cc, &o); assert(o.rc == -1);
+    CK_ANSWER(16);
+    b9_pk_opt(&p, 0, opt, ol);
+    alias_parse_response(p.b, p.n, 0x1234, qn, qnl, 1, cc, &o); assert(o.rc == -1);
+    /* BADCOOKIE: header RCODE 7 and extended RCODE 1 = 23 (RFC 7873 s8, RFC 6891 s6.1.3); the new server cookie is reported */
+    b9_pk_hdr(&p, 0x1234, 0x80, 7, 0, "t.target.test.", 1);
+    ol = b9_ck_opt(opt, cc, 8, sc + 3, 16); b9_pk_opt(&p, 1, opt, ol);
+    alias_parse_response(p.b, p.n, 0x1234, qn, qnl, 1, cc, &o);
+    assert(o.rc == 1 && o.badcookie && o.cookie == ALIAS_CK_SERVER && o.sc_len == 16 && memcmp(o.sc, sc + 3, 16) == 0);
+    alias_parse_response(p.b, p.n, 0x1234, qn, qnl, 1, other, &o); assert(o.rc == -2 && !o.badcookie);   /* ... with another client cookie: discarded */
+    b9_pk_hdr(&p, 0x1234, 0x80, 0, 0, "t.target.test.", 1);        /* extended 1, header 0 = 16 (BADVERS): an error, not BADCOOKIE */
+    b9_pk_opt(&p, 1, opt, ol);
+    alias_parse_response(p.b, p.n, 0x1234, qn, qnl, 1, cc, &o); assert(o.rc == 1 && !o.badcookie);
+    /* TC: the cookie is checked first; a truncated message cut inside an RR still asks for TCP */
+    b9_pk_hdr(&p, 0x1234, 0x82, 0, 0, "t.target.test.", 1);
+    ol = b9_ck_opt(opt, cc, 8, sc, 16); b9_pk_opt(&p, 0, opt, ol);
+    alias_parse_response(p.b, p.n, 0x1234, qn, qnl, 1, cc, &o); assert(o.truncated && o.cookie == ALIAS_CK_SERVER);
+    alias_parse_response(p.b, p.n, 0x1234, qn, qnl, 1, other, &o); assert(o.rc == -2 && !o.truncated);
+    b9_pk_hdr(&p, 0x1234, 0x82, 0, 2, "t.target.test.", 1); b9_pk_rr(&p, NULL, 1, 1, 60, a1, 4); b9_pk_rr(&p, NULL, 1, 1, 60, a1, 4);
+    p.n -= 3;
+    alias_parse_response(p.b, p.n, 0x1234, qn, qnl, 1, cc, &o); assert(o.truncated && o.rc == -1 && o.cookie == ALIAS_CK_NONE);
+#undef CK_ANSWER
+    /* the query: the COOKIE option after the OPT header (RFC 7873 s4, s5.1) */
+    uint8_t q[600];
+    size_t ql = alias_build_query(q, sizeof(q), 0xBEEF, qn, qnl, 28, cc, sc, 16), oo = 12 + qnl + 4;
+    assert(ql == oo + 11 + 4 + 8 + 16 && q[11] == 1);
+    assert(q[oo] == 0 && q[oo + 2] == 41 && q[oo + 9] == 0 && q[oo + 10] == 28 && q[oo + 11] == 0 && q[oo + 12] == 10 && q[oo + 13] == 0 && q[oo + 14] == 24);
+    assert(memcmp(q + oo + 15, cc, 8) == 0 && memcmp(q + oo + 23, sc, 16) == 0);
+    ql = alias_build_query(q, sizeof(q), 0xBEEF, qn, qnl, 1, cc, NULL, 0);
+    assert(ql == oo + 11 + 4 + 8 && q[oo + 10] == 12 && q[oo + 14] == 8);
+    assert(alias_build_query(q, sizeof(q), 0xBEEF, qn, qnl, 1, cc, sc, 7) == 0);
+    assert(alias_build_query(q, sizeof(q), 0xBEEF, qn, qnl, 1, cc, sc, 33) == 0);
+    assert(alias_build_query(q, sizeof(q), 0xBEEF, qn, qnl, 1, cc, NULL, 16) == 0);
+    assert(alias_build_query(q, oo + 11 + 4 + 8 - 1, 0xBEEF, qn, qnl, 1, cc, NULL, 0) == 0);
+    assert(alias_build_query(q, oo + 11 + 4 + 8, 0xBEEF, qn, qnl, 1, cc, NULL, 0) == oo + 11 + 4 + 8);
+    /* the query echoed as its response (QR set) carries our cookie */
+    ql = alias_build_query(q, sizeof(q), 0xBEEF, qn, qnl, 1, cc, sc, 16);
+    q[2] |= 0x80;
+    alias_parse_response(q, ql, 0xBEEF, qn, qnl, 1, cc, &o); assert(o.rc == 0 && o.n == 0 && o.cookie == ALIAS_CK_SERVER && o.sc_len == 16);
+    printf("  -> cookie parser and query passed.\n");
+}
+
+/* ---- 0.7: the cookie state of a resolver address over resolutions (net_resolve with the socketpair resolver of test_b9a_alias_network) ---- */
+static void test_alias_cookie_network(void) {
+    printf("[TEST] 0.7: DNS Cookies per resolver: learnt, forged answers ignored, downgrade refused, BADCOOKIE retried, renewal, forgetting...\n");
+    server_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.alias_resolvers = calloc(1, sizeof(ip_port_t));
+    cfg.alias_resolvers[0].ip = strdup("192.0.2.60");
+    cfg.alias_resolvers[0].port = 53;
+    cfg.alias_resolvers_count = 1;
+    alias_rset_t rs;
+    assert(alias_resolvers_fill(&cfg, NULL, false, &rs) == 1);
+    alias_test_reset();
+    g_alias_now_hook = b9_now;
+    g_alias_resolve_hook = NULL;
+    g_b9_now = 20000;
+    g_b9_broker = b9n_broker;
+    g_b9n_udp = g_b9n_tcp = 0;
+    alias_answer_t a;
+    bool cap = false;
+    uint8_t cc0[8], cc1[8], sl = 0;
+    uint8_t n_c1[] = { 2, 'c', '1', 4, 't', 'e', 's', 't', 0 };
+    uint8_t n_sp[] = { 2, 's', 'p', 4, 't', 'e', 's', 't', 0 };
+    uint8_t n_bc[] = { 2, 'b', 'c', 4, 't', 'e', 's', 't', 0 };
+    uint8_t n_ro[] = { 2, 'r', 'o', 4, 't', 'e', 's', 't', 0 };
+    uint8_t n_dg[] = { 2, 'd', 'g', 4, 't', 'e', 's', 't', 0 };
+    uint8_t n_fg[] = { 2, 'f', 'g', 4, 't', 'e', 's', 't', 0 };
+    assert(!alias_test_cookie(&rs.sa[0], &cap, cc0, &sl));
+    /* a resolver that sends cookies: the second query (AAAA) carries the server cookie of the first answer */
+    memset(g_b9n_sc, 0x5A, sizeof(g_b9n_sc));
+    g_b9n_mode = B9N_CK;
+    alias_test_want(&rs, n_c1, sizeof(n_c1), 0);
+    alias_test_pass();
+    assert(alias_lookup(rs.key, n_c1, sizeof(n_c1), 1, &a) && a.n == 2 && a.rdata[3] == 10);
+    assert(alias_lookup(rs.key, n_c1, sizeof(n_c1), 28, &a) && a.n == 1);
+    assert(alias_test_cookie(&rs.sa[0], &cap, cc0, &sl) && cap && sl == 16);
+    assert(atomic_load(&g_b9n_last_sclen) == 16);
+    /* a forged answer with another client cookie comes first: ignored, the real one is taken */
+    g_b9n_mode = B9N_CK_SPOOF;
+    alias_test_want(&rs, n_sp, sizeof(n_sp), 0);
+    alias_test_pass();
+    assert(alias_lookup(rs.key, n_sp, sizeof(n_sp), 1, &a) && a.n == 2 && a.rdata[3] == 10);
+    /* BADCOOKIE: the server changed its cookie; one retry with the new one (s5.3), the next query uses it at once */
+    memset(g_b9n_sc, 0x77, sizeof(g_b9n_sc));
+    atomic_store(&g_b9n_badck, 0);
+    int udp0 = g_b9n_udp;
+    g_b9n_mode = B9N_CK_BAD;
+    alias_test_want(&rs, n_bc, sizeof(n_bc), 0);
+    alias_test_pass();
+    assert(alias_lookup(rs.key, n_bc, sizeof(n_bc), 1, &a) && a.n == 2);
+    assert(alias_lookup(rs.key, n_bc, sizeof(n_bc), 28, &a) && a.n == 1);
+    assert(atomic_load(&g_b9n_badck) == 1 && g_b9n_udp == udp0 + 3);
+    /* the client cookie is renewed after its lifetime (s7.1); the server cookie of the old one is dropped and learnt again */
+    g_b9_now += ALIAS_COOKIE_LIFETIME + 1;
+    g_b9n_mode = B9N_CK;
+    alias_test_want(&rs, n_ro, sizeof(n_ro), 0);
+    alias_test_pass();
+    assert(alias_lookup(rs.key, n_ro, sizeof(n_ro), 1, &a) && a.n == 2);
+    assert(alias_test_cookie(&rs.sa[0], &cap, cc1, &sl) && cap && sl == 16 && memcmp(cc0, cc1, 8) != 0);
+    /* downgrade: once cookies were seen, an answer without COOKIE and one with the client cookie alone are ignored */
+    g_b9n_mode = B9N_CK_DOWNGRADE;
+    alias_test_want(&rs, n_dg, sizeof(n_dg), 0);
+    alias_test_pass();                                             /* waits the resolution budget (3 s) for the real answer */
+    assert(!alias_lookup(rs.key, n_dg, sizeof(n_dg), 1, &a) && !alias_lookup(rs.key, n_dg, sizeof(n_dg), 28, &a));
+    assert(alias_test_cookie(&rs.sa[0], &cap, cc1, &sl) && cap);
+    /* the resolver gives no accepted answer for long: after ALIAS_COOKIE_FORGET_FAILS resolutions over ALIAS_COOKIE_FORGET_SECS it is not expected
+     * to send cookies any more (one that was replaced by a resolver without cookies) */
+    g_b9n_mode = B9N_DOWN;
+    for (int k = 0; k < ALIAS_COOKIE_FORGET_FAILS - 2; k++) {
+        g_b9_now += 400;
+        alias_test_pass();
+        assert(alias_test_cookie(&rs.sa[0], &cap, cc1, &sl) && cap);
+    }
+    g_b9_now += 400;
+    alias_test_pass();
+    assert(alias_test_cookie(&rs.sa[0], &cap, cc1, &sl) && !cap && sl == 0);
+    g_b9n_mode = B9N_OK;                                           /* answers without cookies are taken again */
+    g_b9_now += 400;
+    alias_test_want(&rs, n_fg, sizeof(n_fg), 0);
+    alias_test_pass();
+    assert(alias_lookup(rs.key, n_fg, sizeof(n_fg), 1, &a) && a.n == 2);
+    assert(alias_test_cookie(&rs.sa[0], &cap, cc1, &sl) && !cap);
+
+    alias_test_reset();
+    g_alias_now_hook = NULL;
+    g_b9_broker = NULL;
+    free_server_config_fields(&cfg);
+    printf("  -> cookie state passed.\n");
+}
+
+/* ---- 0.7: alias-max-refresh-time in the scheduler: the cap, the smallest value of the zones, a reconfiguration; the order of the settings ---- */
+static int g_b9_bigttl;
+static int b9_resolve_big(const alias_rset_t *rs, const uint8_t *name, size_t nlen, uint16_t qtype, alias_parsed_t *out) {
+    int rc = b9_resolve(rs, name, nlen, qtype, out);
+    if (rc == 0 && g_b9_bigttl) out->ttl = ALIAS_MAX_TTL;
+    return rc;
+}
+
+static void test_alias_max_refresh_sched(void) {
+    printf("[TEST] 0.7: alias-max-refresh-time: refresh = min(2/3 TTL, cap), smallest of the zones, reconfiguration, precedence...\n");
+    server_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.alias_resolvers = calloc(1, sizeof(ip_port_t));
+    cfg.alias_resolvers[0].ip = strdup("192.0.2.53");
+    cfg.alias_resolvers[0].port = 53;
+    cfg.alias_resolvers_count = 1;
+    alias_rset_t rs;
+    assert(alias_resolvers_fill(&cfg, NULL, false, &rs) == 1);
+    alias_test_reset();
+    g_alias_now_hook = b9_now;
+    g_alias_resolve_hook = b9_resolve_big;
+    g_b9_now = 1000;
+    g_b9_fail = 0;
+    g_b9_ttl0 = 0;
+    g_b9_bigttl = 1;
+    uint8_t t_name[] = { 1, 't', 6, 't', 'a', 'r', 'g', 'e', 't', 4, 't', 'e', 's', 't', 0 };
+    alias_answer_t a;
+    alias_test_want(&rs, t_name, sizeof(t_name), 0);               /* the default, 3600 s */
+    alias_test_pass();
+    assert(alias_test_next_try(t_name, sizeof(t_name), 1) == 1000 + KARIDNS_ALIAS_MAX_REFRESH_DEFAULT);
+    assert(alias_lookup(rs.key, t_name, sizeof(t_name), 1, &a) && a.ttl == ALIAS_MAX_TTL);   /* the TTL served is not cut */
+    alias_test_want(&rs, t_name, sizeof(t_name), 600);             /* another zone of the same scan with a smaller value: it wins and applies at once */
+    assert(alias_test_next_try(t_name, sizeof(t_name), 1) == 1600 && alias_test_next_try(t_name, sizeof(t_name), 28) == 1600);
+    alias_test_want(&rs, t_name, sizeof(t_name), 7200);            /* a larger value of a third zone changes nothing */
+    assert(alias_test_next_try(t_name, sizeof(t_name), 1) == 1600);
+    g_b9_now = 1600;
+    alias_test_pass();
+    assert(alias_test_next_try(t_name, sizeof(t_name), 1) == 2200);
+    /* a reconfiguration: the zones now say 60; the result held is refreshed 60 s after its fetch */
+    alias_test_rescan();
+    alias_test_want(&rs, t_name, sizeof(t_name), 60);
+    assert(alias_test_next_try(t_name, sizeof(t_name), 1) == 1660);
+    g_b9_now = 1660;
+    alias_test_pass();
+    assert(alias_test_next_try(t_name, sizeof(t_name), 1) == 1720);
+    assert(alias_lookup(rs.key, t_name, sizeof(t_name), 1, &a) && a.ttl == ALIAS_MAX_TTL && !a.stale);
+    /* back to 7200: the next refresh stays where it is, the one after it uses the new value */
+    alias_test_rescan();
+    alias_test_want(&rs, t_name, sizeof(t_name), 7200);
+    assert(alias_test_next_try(t_name, sizeof(t_name), 1) == 1720);
+    g_b9_now = 1720;
+    alias_test_pass();
+    assert(alias_test_next_try(t_name, sizeof(t_name), 1) == 1720 + 7200);
+    /* a short upstream TTL is still refreshed after two thirds of it, and never sooner than ALIAS_MIN_REFRESH */
+    g_b9_bigttl = 0;
+    alias_test_rescan();
+    alias_test_want(&rs, t_name, sizeof(t_name), 5);
+    g_b9_now = 1720 + 7200;
+    alias_test_pass();
+    assert(alias_test_next_try(t_name, sizeof(t_name), 1) == g_b9_now + ALIAS_MIN_REFRESH);
+    /* a failing job keeps its retry time when the value changes */
+    g_b9_fail = 1;
+    g_b9_now += ALIAS_MIN_REFRESH;
+    alias_test_pass();
+    int64_t retry = alias_test_next_try(t_name, sizeof(t_name), 1);
+    alias_test_rescan();
+    alias_test_want(&rs, t_name, sizeof(t_name), 3600);
+    assert(alias_test_next_try(t_name, sizeof(t_name), 1) == retry);
+    g_b9_fail = 0;
+
+    /* the order of the settings: the zone, options, options { database { } } (database zones only), the default */
+    zone_config_t zc;
+    memset(&zc, 0, sizeof(zc));
+    zone_ext_t *x = zone_ext_mut(&zc);
+    assert(alias_max_refresh(&cfg, &zc, true) == KARIDNS_ALIAS_MAX_REFRESH_DEFAULT && alias_max_refresh(NULL, NULL, false) == KARIDNS_ALIAS_MAX_REFRESH_DEFAULT);
+    cfg.database.enabled = true;
+    cfg.database.alias_max_refresh = 900;
+    assert(alias_max_refresh(&cfg, &zc, true) == 900 && alias_max_refresh(&cfg, &zc, false) == KARIDNS_ALIAS_MAX_REFRESH_DEFAULT);
+    cfg.alias_max_refresh = 1800;
+    assert(alias_max_refresh(&cfg, &zc, true) == 1800 && alias_max_refresh(&cfg, NULL, false) == 1800);
+    x->alias_max_refresh = 30;
+    assert(alias_max_refresh(&cfg, &zc, true) == 30 && alias_max_refresh(&cfg, &zc, false) == 30);
+    free(zc.ext);
+    cfg.database.enabled = false;
+
+    alias_test_reset();
+    g_alias_now_hook = NULL;
+    g_alias_resolve_hook = NULL;
+    free_server_config_fields(&cfg);
+    printf("  -> alias-max-refresh-time passed.\n");
 }
 
 /* ---- BIND compatibility, batch 7: the built-in CHAOS zones (version.bind, hostname.bind, id.server) and minimal-responses.
@@ -11606,6 +11996,9 @@ int main(void) {
     test_b9a_alias_lua_queries();
     test_b9a_alias_response_parser();
     test_b9a_alias_network();
+    test_alias_cookie_parser();
+    test_alias_cookie_network();
+    test_alias_max_refresh_sched();
     test_wildcard_priority_over_cname_synthesis();
     test_edns_client_subnet_ipv6_scope_prefix_zero();
     test_edns_client_subnet_ipv4_prefix_clamping();

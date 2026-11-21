@@ -671,14 +671,17 @@ zone "example.test." { ...; alias\-resolver { 192.0.2.54; }; };         # this z
 .fi
 .RE
 .PP
-\fBalias\-resolver\fR names 1 to 8 resolvers (IP addresses, never names). A
-zone's list replaces the options list; for the zones of the database the order
-is the zone's settings text (or its profile), then \fBoptions { alias\-resolver
-}\fR, then \fBoptions { database { alias\-resolver } }\fR. It works for file
-zones, transferred zones and database zones alike. A statement may be written in
-the settings text of a database zone and in a profile (it is not sent with
-Extended AXFR: a resolver address is local to the server). A configuration
-reload takes effect at once.
+\fBalias\-max\-refresh\-time <duration>;\fR (5 s to 1 day, default 3600 s)
+bounds the time between two lookups of a target (see Refresh below); it can be
+written where \fBalias\-resolver\fR can, and is looked up in the same
+order. \fBalias\-resolver\fR names 1 to 8 resolvers (IP addresses, never
+names). A zone's list replaces the options list; for the zones of the database
+the order is the zone's settings text (or its profile), then \fBoptions {
+alias\-resolver }\fR, then \fBoptions { database { alias\-resolver } }\fR. It
+works for file zones, transferred zones and database zones alike. A statement
+may be written in the settings text of a database zone and in a profile (it is
+not sent with Extended AXFR: a resolver address is local to the server). A
+configuration reload takes effect at once.
 .PP
 With it, A and AAAA at an ALIAS name are answered with the addresses the
 resolver gives for the target, as PowerDNS does with \fBexpand\-alias=yes\fR and
@@ -735,10 +738,40 @@ so a downstream cache never keeps the data longer than the resolver
 allowed. (PowerDNS gives the upstream TTL as it is, without the ALIAS record's
 TTL and without counting down.)
 .IP \(bu 2
-\fBRefresh.\fR A target is queried again after two thirds of its TTL and at
-least 5 seconds after the last time (an upstream TTL of 0 gives a 5 second
-refresh and TTL 0 answers). A new zone version keeps the results of the targets
-it still has; a target that no zone has any more is dropped.
+\fBRefresh.\fR A target is queried again after two thirds of its TTL, at most
+\fBalias\-max\-refresh\-time\fR (default 3600 s, 0.7) and at least 5 seconds
+after the last time (an upstream TTL of 0 gives a 5 second refresh and TTL 0
+answers). Without the cap an answer with a TTL of a day would be kept for 16
+hours, also a forged one; with it, the resolver is asked again within the cap
+whatever the TTL, and the TTL served stays the rule above. A target that zones
+with different values share (the same resolver list) is looked up at the
+smallest of them; a reconfiguration that lowers the value applies to the results
+already held (one fetched longer ago than the new value is looked up at once). A
+new zone version keeps the results of the targets it still has; a target that no
+zone has any more is dropped.
+.IP \(bu 2
+\fBDNS Cookies (0.7, RFC 7873).\fR Every query to a resolver carries a COOKIE
+option: a client cookie of 8 random octets per resolver address (\[u00A7]4.1,
+RFC 9018 \[u00A7]3), replaced about once a day (one day minus a random 0 to 40
+%, \[u00A7]7.1; the server cookie learnt for the old one is dropped with it),
+and the newest server cookie that address sent (\[u00A7]5.1). A response whose
+COOKIE option carries another client cookie or has an illegal length (valid are
+8 and 16 to 40 octets) is ignored and the thread keeps waiting for the real
+answer (\[u00A7]5.3), as for a wrong ID. A resolver that never sent a server
+cookie is answered as before: responses without a COOKIE option are taken. Once
+an address has sent a valid server cookie, its responses without one (no COOKIE
+option, or the client cookie alone) are ignored too (\[u00A7]5.3: the client
+expects the option; this stops a forged answer that leaves the option out), and
+\fB[Alias] resolver ... sends DNS cookies\fR is logged once (over TCP, after a
+truncated answer, a response without a cookie is still taken: an off-path forger
+cannot answer on a TCP connection). BADCOOKIE (extended RCODE 23) is answered by
+one retry with the server cookie of that response, within the 3 s of the
+resolution. An address that gives no accepted answer in 5 resolutions in a row
+over at least 300 s is no longer expected to send cookies (logged once as a
+warning), so that a resolver replaced by one without cookies at the same address
+is heard again (the failures meanwhile are served stale, see Failure). There is
+no option to require cookies. The cookie state lives in the resolving thread
+only (512 addresses, the least recently used one is reused).
 .IP \(bu 2
 \fBFailure.\fR A target that has \fBnever\fR been resolved (a zone that was just
 loaded, or a resolver that is down since the start) answers SERVFAIL until the
