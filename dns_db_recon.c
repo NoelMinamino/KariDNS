@@ -98,6 +98,7 @@ bool db_recon_note(dbrt_counts_t *c, int r, const char *zone, bool *unstorable_l
     return true;
   case DBR_SAME:
   case DBR_KEPT:
+  case DBR_HELD:                 /* (signer-wait: the version the Backend has stays) */
     c->unchanged++;
     return false;
   case DBR_UNSTORABLE:

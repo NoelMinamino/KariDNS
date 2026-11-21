@@ -1,4 +1,4 @@
-.TH KARIDNS\-DBLOADER 8 "2026-11-17" "KariDNS" "KariDNS Manual"
+.TH KARIDNS\-DBLOADER 8 "2026-11-22" "KariDNS" "KariDNS Manual"
 .\" Generated from docs/karidns-dbloader.md by man/md2man.pl (make man): edit the Markdown manual, not this page.
 .SH NAME
 karidns\-dbloader \- reads the PowerDNS 5.1 tables of a SQLite3 or PostgreSQL
@@ -561,14 +561,27 @@ that one zone by query at that time; the loader has no list of them.
 .IP \(bu 2
 \fBReload requests.\fR \fBreload\fR (scope all) drains the change log; \fBreload
 \-force\fR makes a pass. A reload of one zone is a \fBCHANGES\fR entry with the
-\fBforce\fR flag (read the body whatever the stamp says), a \fBZONE_FAILED\fR
-when the zone cannot be loaded, or a \fBZONE_DELETE\fR by name (source id 0)
-when the database has no such zone. With auto reload the polling, \fBLISTEN\fR
-and the coalescing are as before; a change starts a drain. With signer-wait a
-changed zone with the metadata \fBX\-KARIDNS\-SIGNER=1\fR is held back in an
-auto drain (not sent; \fBdbstatus\fR shows how many wait) and goes out with a
-reload of that zone, a reload of everything, or when it is not the signer's any
-more.
+\fBforce\fR flag and the version stamp the zone has in the request's snapshot
+(the Backend compares the stamp, so a change that kept the serial is read; the
+body is read whatever the stamp says only with \fBkarictl reload <zone>
+force\fR), a \fBZONE_FAILED\fR when the zone cannot be loaded, or a
+\fBZONE_DELETE\fR by name (source id 0) when the database has no such zone. With
+auto reload the polling, \fBLISTEN\fR and the coalescing are as before; a change
+starts a drain. With signer-wait a changed zone with the metadata
+\fBX\-KARIDNS\-SIGNER=1\fR is sent in an auto drain as an upsert with the flag
+\fBhold\fR (\fBKDB_EF_HOLD\fR, 0x4; the metadata is read in a snapshot of its
+own, and a drain whose metadata cannot be read fails and is made again: the zone
+is never sent without the flag because the read failed). The Backend's store
+keeps the image it has and records the newer stamp with the record flag
+\fBSTORE_F_SIGNER_HELD\fR (the body is not asked for); a zone the store has no
+image of, a version it refused, or the version it has is not held, and the
+Backend says so with a \fBZONE_RESULT\fR that carries the \fBsource_id\fR (tag
+5), which takes the zone off the loader's list. The zone goes on that list
+(\fBdbstatus\fR shows how many wait) and goes out without the flag with a reload
+of that zone, a reload of everything, or when it is not the signer's any more. A
+loader that connects (a restart of the loader or of the server) releases every
+held record: the scan of the store asks for its body, so the version is read as
+it is, as the full comparison of a start does without the store.
 .IP \(bu 2
 \fBSources without the version 3 tables.\fR A PowerDNS schema without
 \fBkaridns_zone_state\fR has no stamps: every detected change is a pass, built

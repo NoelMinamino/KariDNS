@@ -2997,7 +2997,7 @@ static void p_manifest_end(int fd, kdb_enc_t *e, uint64_t batch, uint64_t n, uin
     kdb_enc_end(e);
     ch_send(fd, e);
 }
-typedef struct { int64_t sid; uint8_t op; char name[400]; bool has_name; uint8_t kind; bool stamped; uint64_t gen, time; bool force; } pc_t;
+typedef struct { int64_t sid; uint8_t op; char name[400]; bool has_name; uint8_t kind; bool stamped; uint64_t gen, time; bool force, hold; } pc_t;
 static void p_changes(int fd, kdb_enc_t *e, uint64_t batch, uint64_t cursor, bool last, const pc_t *c, int n) {
     kdb_enc_begin(e, KDB_T_CHANGES);
     kdb_enc_u64(e, 1, batch); kdb_enc_u16(e, 2, 0); kdb_enc_u64(e, 3, cursor); kdb_enc_u8(e, 4, last ? 1 : 0); kdb_enc_bytes(e, 5, g_pident, strlen(g_pident));
@@ -3007,7 +3007,7 @@ static void p_changes(int fd, kdb_enc_t *e, uint64_t batch, uint64_t cursor, boo
         if (c[i].has_name) kdb_enc_name(e, 3, c[i].name);
         if (c[i].op == KDB_CH_UPSERT) {
             kdb_enc_u8(e, 4, c[i].kind); kdb_enc_u64(e, 5, c[i].gen); kdb_enc_u64(e, 6, c[i].time);
-            uint8_t fl = (uint8_t)((c[i].stamped ? KDB_EF_STAMPED : 0) | (c[i].force ? KDB_EF_FORCE : 0));
+            uint8_t fl = (uint8_t)((c[i].stamped ? KDB_EF_STAMPED : 0) | (c[i].force ? KDB_EF_FORCE : 0) | (c[i].hold ? KDB_EF_HOLD : 0));
             if (fl) kdb_enc_u8(e, 7, fl);
         }
         kdb_enc_nest_end(e);
@@ -4824,6 +4824,157 @@ static int run_stamp_race(const char *dir) {
     test_exit(g_failed ? 1 : 0);
 }
 
+/* The ZONE_RESULTs with a source id (the answers to upserts with KDB_EF_HOLD that were not held) up to BATCH_RESULT: their number, or -1 (no BATCH_RESULT) */
+static int p_result_holds(ch_t *mainc, kdb_msg_t *m, int ms, int64_t *sid, uint8_t *status, int max) {
+    int n = 0;
+    while (ch_next(mainc, m, ms)) {
+        if (m->type == KDB_T_BATCH_RESULT) return n;
+        if (m->type == KDB_T_ZONE_RESULT && m->u.zone_result.has_source_id && n < max) {
+            sid[n] = m->u.zone_result.source_id;
+            status[n] = m->u.zone_result.status;
+            n++;
+        }
+    }
+    return -1;
+}
+
+/* is the record wanted by the scan of the wanted bodies (db_recon_scan() from the start of the store)? */
+static bool scan_wants(int64_t sid) {
+    uint32_t cur = 0;
+    db_scan_item_t it;
+    for (int guard = 0; guard < 1000; guard++) {
+        const int rc = db_recon_scan(&cur, 4096, &it);
+        if (rc == 0) return false;
+        if (rc == 1 && it.source_id == sid) return true;
+    }
+    return false;
+}
+
+/* phase 12 (0.7, signer-wait with the store): an upsert with KDB_EF_HOLD.  A zone the store has an image of keeps it (the new stamp is recorded with STORE_F_SIGNER_HELD, nothing is asked for, no
+ * answer); a zone it does not have is read as it is (asked for, and a ZONE_RESULT with its source id says the loader it does not wait); the version it has is nothing to wait for (UNCHANGED with the
+ * source id).  An upsert without the flag releases a held record (asked for, the image of the new body clears the flag); a held record is not wanted by the scan until a loader connects again
+ * (db_recon_held_reset()). */
+static int run_signer_hold(const char *dir) {
+    printf("[the store protocol: signer-wait, upserts with KDB_EF_HOLD (phase 12)]\n");
+    char sdir[600];
+    snprintf(sdir, sizeof(sdir), "%s/s", dir);
+    static server_config_t cfg;
+    char conf[2048];
+    snprintf(conf, sizeof(conf),
+             "options { database { driver sqlite3; database-file \"/nonexistent/z.db\"; loader-user \"nobody\"; loader-path \"/bin/true\"; store \"%s\"; store-mode map; "
+             "store-threads 2; }; };\n"
+             "view \"default\" { match-clients { any; }; zone \"static.test\" { type master; }; };\n", sdir);
+    CHECK(parse_named_conf(conf, &cfg) == 0);
+    atomic_store_explicit(&g_config_db.active, &cfg, memory_order_release);
+    rebuild_zone_db_from_config(&cfg, false);
+    char msg[400];
+    CHECK(db_store_frontend_open(&cfg.database, false, (uid_t)-1, (gid_t)-1, msg, sizeof(msg)) && db_store_dir_fd() >= 0);
+    CHECK(db_store_start(&cfg) && db_store_enabled());
+    store_t *st = db_store_handle();
+    CHECK(st != NULL);
+    int a[2], f[2], cs[2];
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, a) == 0 && socketpair(AF_UNIX, SOCK_STREAM, 0, f) == 0 && socketpair(AF_UNIX, SOCK_SEQPACKET, 0, cs) == 0);
+    int ends[3] = { a[1], f[1], cs[1] };
+    for (int i = 0; i < 3; i++) fcntl(ends[i], F_SETFL, fcntl(ends[i], F_GETFL, 0) | O_NONBLOCK);
+    park_register_worker(0, -1);
+    CHECK(db_ingest_start(a[1], cs[1], f[1]));
+    static ch_t mainc, fetchc;
+    ch_init(&mainc, a[0], KDB_FROM_BACKEND);
+    ch_init(&fetchc, f[0], KDB_FROM_BACKEND);
+    kdb_enc_t e;
+    kdb_enc_init(&e);
+    kdb_msg_t m;
+    memset(&g_wctx, 0, sizeof(g_wctx));
+    g_query_bg_fetch = no_bg_fetch;
+    g_query_bg_attach = no_bg_fetch;
+    kdb_enc_begin(&e, KDB_T_HELLO);
+    kdb_enc_u16(&e, 1, 1); kdb_enc_str(&e, 2, "test-loader"); kdb_enc_str(&e, 3, "sqlite3"); kdb_enc_u32(&e, 4, 4242); kdb_enc_u32(&e, 5, (KDB_FEAT_STORE) | KDB_FEAT_IMAGE); kdb_enc_u32(&e, 6, ZONE_IMAGE_VERSION);
+    kdb_enc_end(&e);
+    ch_send(a[0], &e);
+    CHECK(ch_next(&mainc, &m, 5000) && m.type == KDB_T_CONFIG && m.u.config.store_proto);
+    CHECK(ch_next(&mainc, &m, 5000) && m.type == KDB_T_DEBUG);
+    store_zone_t z;
+    rq_t rq[16];
+    int64_t hs[8];
+    uint8_t hst[8];
+    uint64_t bid = 1, cur = 100;
+    const int ZH = 2100, ZN = 2101;
+    char nh[64], nn[64], rh[64], rn[64];
+    pn_name(nh, sizeof(nh), ZH); pn_name(nn, sizeof(nn), ZN);
+    snprintf(rh, sizeof(rh), "m%04d.test", ZH); snprintf(rn, sizeof(rn), "m%04d.test", ZN);
+    pc_t c[2];
+
+    /* -- H is in the store with the stamp (1,10), serial 1 */
+    memset(c, 0, sizeof(c));
+    c[0] = (pc_t){ .sid = p_sid(ZH), .op = KDB_CH_UPSERT, .has_name = true, .stamped = true, .gen = 1, .time = 10 };  snprintf(c[0].name, sizeof(c[0].name), "%s", nh);
+    p_batch_begin(a[0], &e, bid, KDB_BATCH_AUTO, 0);
+    p_changes(a[0], &e, bid, ++cur, true, c, 1);
+    p_batch_end(a[0], &e, bid++, 1, 0);
+    CHECK(p_result(&mainc, &m, 10000));
+    int n = rq_collect(&fetchc, rq, 16, 1500);
+    CHECK(n == 1 && rq_find(rq, n, nh));
+    if (n == 1) send_zone(f[0], &e, nh, 1, rq[0].id, p_sid(ZH));
+    CHECK(wait_rec(st, rh, STORE_STATE_STORED, 1, 1, false, 10000));
+
+    /* -- held: H with the stamp (2,20) keeps its image; N (new to the store) is read as it is and answered */
+    memset(c, 0, sizeof(c));
+    c[0] = (pc_t){ .sid = p_sid(ZH), .op = KDB_CH_UPSERT, .has_name = true, .stamped = true, .gen = 2, .time = 20, .hold = true };  snprintf(c[0].name, sizeof(c[0].name), "%s", nh);
+    c[1] = (pc_t){ .sid = p_sid(ZN), .op = KDB_CH_UPSERT, .has_name = true, .stamped = true, .gen = 1, .time = 10, .hold = true };  snprintf(c[1].name, sizeof(c[1].name), "%s", nn);
+    p_batch_begin(a[0], &e, bid, KDB_BATCH_AUTO, 0);
+    p_changes(a[0], &e, bid, ++cur, true, c, 2);
+    p_batch_end(a[0], &e, bid++, 2, 0);
+    int nhs = p_result_holds(&mainc, &m, 10000, hs, hst, 8);
+    CHECK(nhs == 1 && hs[0] == p_sid(ZN) && hst[0] == KDB_ST_APPLIED);
+    if (nhs != 1) printf("  (hold answers: %d, first sid %lld)\n", nhs, nhs > 0 ? (long long)hs[0] : 0LL);
+    n = rq_collect(&fetchc, rq, 16, 1500);
+    CHECK(n == 1 && rq_find(rq, n, nn) && !rq_find(rq, n, nh));
+    if (n >= 1 && rq_find(rq, n, nn)) send_zone(f[0], &e, nn, 1, rq_find(rq, n, nn)->id, p_sid(ZN));
+    CHECK(wait_rec(st, rn, STORE_STATE_STORED, 1, 1, false, 10000));
+    CHECK(zrec(st, rh, &z) && z.state == STORE_STATE_STORED && z.serial == 1 && z.stamp_gen == 2 && z.stamp_time == 20 && (z.flags & STORE_F_SIGNER_HELD) && !(z.flags & STORE_F_STALE));
+    CHECK(!scan_wants(p_sid(ZH)));                                      /* (held for this loader: the scan passes it) */
+
+    /* -- again: H with the same stamp stays held (no answer, nothing asked for); N with the version it has is nothing to wait for (UNCHANGED) */
+    p_batch_begin(a[0], &e, bid, KDB_BATCH_AUTO, 0);
+    p_changes(a[0], &e, bid, ++cur, true, c, 2);
+    p_batch_end(a[0], &e, bid++, 2, 0);
+    nhs = p_result_holds(&mainc, &m, 10000, hs, hst, 8);
+    CHECK(nhs == 1 && hs[0] == p_sid(ZN) && hst[0] == KDB_ST_UNCHANGED);
+    n = rq_collect(&fetchc, rq, 16, 1000);
+    CHECK(n == 0);
+    CHECK(zrec(st, rh, &z) && z.serial == 1 && z.stamp_gen == 2 && (z.flags & STORE_F_SIGNER_HELD));
+
+    /* -- released: H without the flag, the stamp the record has: the body is asked for, the image of the new one clears the flag */
+    c[0].hold = false;
+    p_batch_begin(a[0], &e, bid, KDB_BATCH_AUTO, 0);
+    p_changes(a[0], &e, bid, ++cur, true, c, 1);
+    p_batch_end(a[0], &e, bid++, 1, 0);
+    CHECK(p_result_holds(&mainc, &m, 10000, hs, hst, 8) == 0);
+    CHECK(zrec(st, rh, &z) && (z.flags & STORE_F_STALE) && !(z.flags & STORE_F_SIGNER_HELD));
+    n = rq_collect(&fetchc, rq, 16, 1500);
+    CHECK(n == 1 && rq_find(rq, n, nh));
+    if (n == 1) send_zone(f[0], &e, nh, 2, rq[0].id, p_sid(ZH));
+    CHECK(wait_rec(st, rh, STORE_STATE_STORED, 2, 2, false, 10000));
+    CHECK(zrec(st, rh, &z) && !(z.flags & STORE_F_SIGNER_HELD));
+
+    /* -- held again (3,30), then a new loader: the held record is wanted by the scan (the version is read as it is) */
+    c[0].hold = true;
+    c[0].gen = 3;
+    c[0].time = 30;
+    p_batch_begin(a[0], &e, bid, KDB_BATCH_AUTO, 0);
+    p_changes(a[0], &e, bid, ++cur, true, c, 1);
+    p_batch_end(a[0], &e, bid++, 1, 0);
+    CHECK(p_result_holds(&mainc, &m, 10000, hs, hst, 8) == 0);
+    CHECK(zrec(st, rh, &z) && z.serial == 2 && z.stamp_gen == 3 && (z.flags & STORE_F_SIGNER_HELD));
+    CHECK(!scan_wants(p_sid(ZH)));
+    db_recon_held_reset();                                              /* (what the HELLO of a loader does) */
+    CHECK(scan_wants(p_sid(ZH)));
+    gc_snapshot_wait_idle();
+    db_store_batch_end();
+    printf("%d checks, %d failed\n", g_checks, g_failed);
+    fflush(stdout);
+    test_exit(g_failed ? 1 : 0);
+}
+
 /* phase 4: a legacy loader (no store protocol) installs three zones with three settings texts; the process ends without a clean stop.  Phase 5: the next start, with the second record of settings.dat made
  * unusable by the test (no room for its id): the file is not cut, the ids of the others are what they were, and a new text gets the next id */
 static int run_settings(int phase, const char *dir) {
@@ -6399,11 +6550,11 @@ static int proto_main(const char *self) {
     snprintf(dir, sizeof(dir), "%s/test_db_store_proto.XXXXXX", tmp && *tmp ? tmp : "/tmp");
     if (!mkdtemp(dir)) { perror("mkdtemp"); return 1; }
     int bad = 0;
-    for (int phase = 0; phase < 12; phase++) {
+    for (int phase = 0; phase < 13; phase++) {
         char cmd[900];
         snprintf(cmd, sizeof(cmd), "%s proto%d %s", self, phase, dir);
         if (run_part(cmd) != 0) bad++;
-        if (phase == 0 || phase == 2 || phase == 3 || phase == 5 || phase == 6 || phase == 7 || phase == 8) {                   /* (phase 0 is the legacy loader on an empty store, phase 3 the fixes of the review, phase 4 the settings: the next phases start on a new store; phase 5 follows phase 4 on its store) */
+        if (phase == 0 || phase == 2 || phase == 3 || phase == 5 || phase == 6 || phase == 7 || phase == 8 || phase == 11) {                   /* (phase 0 is the legacy loader on an empty store, phase 3 the fixes of the review, phase 4 the settings: the next phases start on a new store; phase 5 follows phase 4 on its store; phase 12, signer-wait, starts on a new store too) */
             char rm[700];
             snprintf(rm, sizeof(rm), "rm -rf %s/s", dir);
             (void)!system(rm);
@@ -6605,6 +6756,7 @@ int main(int argc, char **argv) {
     if (argc > 2 && strcmp(argv[1], "attab") == 0) return run_attab(argv[2]);
     if (argc > 1 && strcmp(argv[1], "s5") == 0) return run_s5(argc > 2 ? argv[2] : "map");
     if (argc > 1 && strcmp(argv[1], "heap") == 0) return run_heap(argc > 2 ? atoi(argv[2]) : 100000, argc > 3 ? argv[3] : "map");
+    if (argc > 2 && strcmp(argv[1], "proto12") == 0) return run_signer_hold(argv[2]);
     if (argc > 2 && strncmp(argv[1], "proto", 5) == 0 && argv[1][5] == '3') return run_fixes(argv[2]);
     if (argc > 2 && strncmp(argv[1], "proto", 5) == 0 && argv[1][5] == '6') return run_stamp_race(argv[2]);
     if (argc > 2 && strncmp(argv[1], "proto", 5) == 0 && argv[1][5] == '7') return run_lookup_body(argv[2]);

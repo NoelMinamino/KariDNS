@@ -435,7 +435,7 @@ static void test_roundtrip_backend(void) {
             break;
         }
         case 4: CHECK(m.u.inventory_end.last_change_seq == 11 && m.u.inventory_end.n_zones == 3); break;
-        case 5: CHECK(m.u.zone_result.view == 2 && m.u.zone_result.status == KDB_ST_REJECTED && m.u.zone_result.reason.len == 11); CHECK_STR(m.u.zone_result.name, ZN); break;
+        case 5: CHECK(m.u.zone_result.view == 2 && m.u.zone_result.status == KDB_ST_REJECTED && m.u.zone_result.reason.len == 11 && !m.u.zone_result.has_source_id); CHECK_STR(m.u.zone_result.name, ZN); break;
         case 6: CHECK(m.u.batch_result.batch_id == 9 && m.u.batch_result.n_request_ids == 2 && m.u.batch_result.request_ids[7] == 42);
             CHECK(m.u.batch_result.n_applied == 4 && m.u.batch_result.n_unchanged == 3 && m.u.batch_result.n_rejected == 2 && m.u.batch_result.n_deleted == 1); break;
         }
@@ -862,6 +862,18 @@ static void test_backend_direction_rejects(void) {
     kdb_enc_reset(&e); kdb_enc_begin(&e, KDB_T_ZONE_RESULT);
     kdb_enc_u16(&e, 1, 0); kdb_enc_name(&e, 2, ZN); kdb_enc_u8(&e, 3, KDB_ST_NOT_RESIDENT + 1); kdb_enc_end(&e);
     CHECK_RC("status 7", decode_backend(&e, 2), KDB_E_RANGE);
+    /* 0.7 signer-wait: tag 5, the source id of the answer to an upsert with KDB_EF_HOLD that was not held */
+    kdb_enc_reset(&e); kdb_enc_begin(&e, KDB_T_ZONE_RESULT);
+    kdb_enc_u16(&e, 1, 0); kdb_enc_name(&e, 2, ZN); kdb_enc_u8(&e, 3, KDB_ST_APPLIED); kdb_enc_i64(&e, 5, 4242); kdb_enc_end(&e);
+    {
+        kdb_framer_t f;
+        kdb_framer_init(&f, KDB_FROM_BACKEND, g_rbuf, sizeof(g_rbuf));
+        kdb_frame_t fr;
+        kdb_msg_t zm;
+        char why[KDB_REASON_LEN];
+        CHECK(kdb_framer_feed(&f, e.buf, e.len) == KDB_OK && kdb_framer_next(&f, &fr) == KDB_OK && kdb_decode(&fr, 2, &zm, why, sizeof(why)) == KDB_OK);
+        CHECK(zm.u.zone_result.has_source_id && zm.u.zone_result.source_id == 4242 && zm.u.zone_result.status == KDB_ST_APPLIED);
+    }
     kdb_enc_reset(&e); kdb_enc_begin(&e, KDB_T_BATCH_RESULT);
     { uint8_t ids[12] = { 0 };
       kdb_enc_u64(&e, 1, 1); kdb_enc_bytes(&e, 2, ids, 12); kdb_enc_u32(&e, 3, 0); kdb_enc_u32(&e, 4, 0); kdb_enc_u32(&e, 5, 0); kdb_enc_u32(&e, 6, 0); }
@@ -2734,10 +2746,10 @@ static void test_store_proto(void) {
         kdb_iter_t it;
         kdb_changes_entry_t en;
         kdb_changes_entries(&m, &it);
-        CHECK(kdb_changes_entries_next(&it, &en) && en.source_id == 1 && en.op == KDB_CH_UPSERT && en.has_name && en.kind == 0 && en.stamped && en.force && en.has_serial && en.serial == 4242);
+        CHECK(kdb_changes_entries_next(&it, &en) && en.source_id == 1 && en.op == KDB_CH_UPSERT && en.has_name && en.kind == 0 && en.stamped && en.force && en.has_serial && en.serial == 4242 && !en.hold);
         CHECK_STR(en.name, "a.test.");
         CHECK(en.stamp_gen == 9 && en.stamp_time == 1700000001u);
-        CHECK(kdb_changes_entries_next(&it, &en) && en.source_id == 2 && en.kind == 2 && !en.stamped && !en.force && !en.has_serial);
+        CHECK(kdb_changes_entries_next(&it, &en) && en.source_id == 2 && en.kind == 2 && !en.stamped && !en.force && !en.hold && !en.has_serial);
         CHECK(kdb_changes_entries_next(&it, &en) && en.source_id == 3 && en.op == KDB_CH_DELETE && !en.has_name && en.name[0] == '\0');
         CHECK(kdb_changes_entries_next(&it, &en) && en.op == KDB_CH_DELETE && en.has_name);
         CHECK_STR(en.name, "d.test.");
@@ -2758,8 +2770,16 @@ static void test_store_proto(void) {
     CHECK_RC("a delete with a name that is not canonical", dec_loader(&e, &m, why), KDB_E_TLV_NAME);
     kdb_enc_reset(&e); ms_changes_hdr(&e, 7, 0, 1, 2, NULL); kdb_enc_end(&e);
     CHECK_RC("last 2", dec_loader(&e, &m, why), KDB_E_RANGE);
-    kdb_enc_reset(&e); ms_changes_hdr(&e, 7, 0, 1, 0, NULL); ms_entry(&e, 1, KDB_CH_UPSERT, "a.test.", 0, 4); kdb_enc_end(&e);
-    CHECK_RC("an unknown entry flag", dec_loader(&e, &m, why), KDB_E_RANGE);
+    kdb_enc_reset(&e); ms_changes_hdr(&e, 7, 0, 1, 1, NULL); ms_entry(&e, 5, KDB_CH_UPSERT, "h.test.", 0, KDB_EF_STAMPED | KDB_EF_HOLD); kdb_enc_end(&e);
+    CHECK_RC("an upsert with KDB_EF_HOLD (signer-wait)", dec_loader(&e, &m, why), KDB_OK);
+    {
+        kdb_iter_t it;
+        kdb_changes_entry_t en;
+        kdb_changes_entries(&m, &it);
+        CHECK(kdb_changes_entries_next(&it, &en) && en.hold && en.stamped && !en.force);
+    }
+    kdb_enc_reset(&e); ms_changes_hdr(&e, 7, 0, 1, 1, NULL); ms_entry(&e, 5, KDB_CH_UPSERT, "h.test.", 0, 0x8); kdb_enc_end(&e);
+    CHECK_RC("entry flag bit 3 is reserved", dec_loader(&e, &m, why), KDB_E_RANGE);
 
     /* the Backend's state machine: a pass and a drain in a batch (batch 7: sess_to() sends BATCH_BEGIN 7) */
     kdb_enc_reset(&e);

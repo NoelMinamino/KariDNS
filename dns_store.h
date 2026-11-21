@@ -82,6 +82,7 @@ enum { STORE_STATE_FREE = 0, STORE_STATE_KNOWN = 1, STORE_STATE_STORED = 2 };
 #define STORE_F_NONSTORE      0x0040u   /* 0.7 WP7b: a secondary or catalog zone of the database: the record only remembers the zone for the reconcile (it is a heap zone, never stored, never found by a query) */
 #define STORE_F_STALE         0x0080u   /* 0.7 WP7b: the database has another version of the zone than the image (the record's stamp is the wanted one): the body is fetched in the background; the image keeps serving meanwhile */
 #define STORE_F_XFR           0x0100u   /* 0.7: a secondary's copy (the reserved view `_karidns-xfr`); the digest is the secondary state (dns_xfr_store.h) */
+#define STORE_F_SIGNER_HELD   0x0200u   /* 0.7: signer-wait: the database has another version (the record's stamp) that waits for karidns-signer; the image keeps serving and the body is not asked for until the loader releases the zone, or a loader connects again (dns_db_store.c) */
 
 /* access mode of the images */
 enum { STORE_MODE_AUTO = 0, STORE_MODE_MAP = 1, STORE_MODE_COPY = 2 };

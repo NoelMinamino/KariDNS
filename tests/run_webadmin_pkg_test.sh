@@ -241,7 +241,9 @@ same "...and accepted after the reload (SIGHUP read the configuration again)" "$
 $RC onestop > "$T/rc_stop.out" 2>&1 && ok "onestop" || bad "onestop" "$(cat "$T/rc_stop.out")"
 i=0; while [ $i -lt 100 ] && kill -0 "$CHILD" 2> /dev/null; do sleep 0.1; i=$((i + 1)); done
 kill -0 "$CHILD" 2> /dev/null && { bad "the daemon is still running"; kill -KILL "$CHILD" "$SUP" 2> /dev/null; } || ok "the daemon is gone"
-kill -0 "$SUP" 2> /dev/null && { bad "the supervisor is still running"; kill -KILL "$SUP" 2> /dev/null; } || ok "...and the supervisor"
+# the supervisor exits after it has reaped the child: wait for it too (bounded), not one look right after the child is gone
+i=0; while [ $i -lt 100 ] && kill -0 "$SUP" 2> /dev/null; do sleep 0.1; i=$((i + 1)); done
+kill -0 "$SUP" 2> /dev/null && { bad "the supervisor is still running 10 s after the stop" "$(ps -o pid,stat,etime,command -p "$SUP" 2> /dev/null)"; kill -KILL "$SUP" 2> /dev/null; } || ok "...and the supervisor"
 [ ! -e /var/run/karidns_webadmin/child.pid ] && ok "the child pid file is removed after the stop" || bad "child.pid is left"
 rm -rf /var/run/karidns_webadmin
 $RC onereload > /dev/null 2>&1 && bad "reload of a service that is not running succeeded" || ok "reload says 'not running' and fails when nothing runs"

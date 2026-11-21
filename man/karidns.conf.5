@@ -1,4 +1,4 @@
-.TH KARIDNS.CONF 5 "2026-11-21" "KariDNS" "KariDNS Manual"
+.TH KARIDNS.CONF 5 "2026-11-22" "KariDNS" "KariDNS Manual"
 .\" Generated from docs/karidns.md by man/md2man.pl (make man): edit the Markdown manual, not this page.
 .SH NAME
 karidns.conf \- the configuration file of karidns(8)
@@ -4200,10 +4200,15 @@ down. PowerDNS on the same database reads the database live and serves a change
 at once: documented in \fBkaridns\-dbloader(8)\fR. The setting is not used by a
 database without the metadata. The waiting set is per view (a zone that waits in
 one view does not hold the same name back in another), and a waiting zone that
-loses the metadata is read as it is at the next batch. A plain \fBkaridns\-zone
-import\fR into such a zone replaces the data and keeps its DNSSEC records and
-the signer's metadata (\fBkaridns\-zone(8)\fR); the loader then holds the new
-data back until the signer has signed it.
+loses the metadata is read as it is at the next batch. With the zone store
+(\fBstore\fR, the default of a production server) the loader sends the change
+with a hold flag and the store keeps the version it has; the record remembers
+the newer version (\fBkarictl dbstatus <zone>\fR: "the database has another
+version, which waits for the signer"), and a start of the server or of the
+loader reads a held version as it is, in the background. A plain
+\fBkaridns\-zone import\fR into such a zone replaces the data and keeps its
+DNSSEC records and the signer's metadata (\fBkaridns\-zone(8)\fR); the loader
+then holds the new data back until the signer has signed it.
 .IP \(bu 2
 PostgreSQL does not poll: see "PostgreSQL" below (\fBLISTEN\fR);
 \fBpoll\-interval\fR is then only the interval of a liveness check and of the
