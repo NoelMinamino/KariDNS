@@ -143,9 +143,11 @@ if wait_value a.ck.test A "192.0.2.10" 20; then pass "an ALIAS through a resolve
 check "the addresses of the target" "NOERROR|a.ck.test. IN A 192.0.2.10;a.ck.test. IN A 192.0.2.11;" "$(q a.ck.test A)"
 if kari_wait_log "$T/k.log" "resolver 127.0.0.1:$P_CK sends DNS cookies" 10; then pass "the server logs that the resolver sends cookies"; else fail "no 'sends DNS cookies' line"; tail -5 "$T/k.log"; fi
 check "... once" "1" "$(count "$T/k.log" "resolver 127.0.0.1:$P_CK sends DNS cookies")"
+# the mock writes one line per query it got; the alias thread asks for A and AAAA of each target in its own time: wait (bounded) for 4 queries
+i=0; while [ "$(count "$T/ck.cookies" ' udp ')" -lt 4 ] && [ $i -lt 100 ]; do sleep 0.1; i=$((i + 1)); done
 n_q=$(count "$T/ck.cookies" ' udp ')
 n_nocc=$(count "$T/ck.cookies" ' cc=- ')
-[ "$n_q" -ge 4 ] && [ "$n_nocc" = 0 ] && pass "every query carries a client cookie ($n_q queries)" || { fail "queries without a client cookie: $n_nocc of $n_q"; cat "$T/ck.cookies"; }
+[ "$n_q" -ge 4 ] && [ "$n_nocc" = 0 ] && pass "every query carries a client cookie ($n_q queries)" || { fail "queries without a client cookie: $n_nocc of $n_q (want 0 of at least 4)"; cat "$T/ck.cookies"; }
 n_sc=$(count "$T/ck.cookies" ' sc=16 ')
 [ "$n_sc" -ge 1 ] && pass "the later queries carry the server cookie ($n_sc)" || { fail "no query with the server cookie"; cat "$T/ck.cookies"; }
 n_cc=$(sed -n 's/.* cc=\([0-9a-f]*\) .*/\1/p' "$T/ck.cookies" | sort -u | wc -l | tr -d ' ')

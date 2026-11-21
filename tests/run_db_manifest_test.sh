@@ -191,8 +191,8 @@ run auto --auto=1 --cursor=state:"$T/st4" -- sleep:200 \
     batches:2 sleep:1500 reloadzone:0:z20.test. batches:3 sleep:300
 has "an auto batch follows the change" auto.out '^BB kind=4 '
 has "the zone that changed is an upsert" auto.log '^C 0 up 21 z21\.test\. '
-hasnt "a zone of the signer that changed is held back" auto.log '^C 0 up 20 z20.test. 0 1 0 '
-has "a reload of that zone sends it (force)" auto.log '^C 0 up 20 z20.test. 0 0 1 0 0 '
+has "a zone of the signer that changed is sent with the hold flag (the Backend keeps the version it has: KDB_EF_HOLD)" auto.log '^C 0 up 20 z20\.test\. 0 1 0 .* hold$'
+has "a reload of that zone sends it (force, with its version stamp, without the hold flag)" auto.log '^C 0 up 20 z20\.test\. 0 1 1 [1-9][0-9]* [1-9][0-9]* [0-9]*$'
 
 echo "== memory: the loader keeps no table of the zones"
 # 100,000 zones against 10,000: the resident size of the loader after a first fill, and after a drain of every zone, must not grow with the zones

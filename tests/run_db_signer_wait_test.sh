@@ -123,7 +123,7 @@ conf() {   # conf "DATABASE-OPTIONS" [views]
     cat > "$T/s.conf" <<EOF
 options {
     user "nobody"; pid-file "none"; listen-on { 127.0.0.1; }; port $PORT;
-    database { driver sqlite3; database-file "$DB"; loader-user "nobody"; loader-path "$T/karidns-dbloader"; db-reload-timeout 10; auto-reload yes; poll-interval ${POLL:-1}; coalesce 300; $1 };
+    database { driver sqlite3; database-file "$DB"; loader-user "nobody"; loader-path "$T/karidns-dbloader"; $(store_stmt "$T") db-reload-timeout 10; auto-reload yes; poll-interval ${POLL:-1}; coalesce 300; $1 };
 };
 control-channel { socket "$T/ctl.sock"; secret "$SECRET"; };
 EOF
@@ -213,7 +213,8 @@ sleep 3
 check_ans "waiting again" "192.0.2.21" www.sg.test
 stop_server
 start_server
-check_ans "a restart reads the changed zone as it is (the full comparison of the start)" "192.0.2.22" www.sg.test
+# (with the store the version is read in the background after the start: the Backend held it for the loader before, db_recon_held_reset(); bounded wait in both modes)
+if wait_ans www.sg.test 192.0.2.22 10; then pass "a restart reads the changed zone as it is (the full comparison of the start; the store: the held version is fetched)"; else fail "a restart: got '$(qa www.sg.test)', want 192.0.2.22"; dbst | sed 's/^/         /'; fi
 nowait && pass "...and nothing waits after the restart" || fail "waiting zones after the restart"
 
 # ================================================================ S2

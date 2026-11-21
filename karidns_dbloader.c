@@ -3331,17 +3331,25 @@ static void sigw_del(struct lio *io, vstate_t *vs, int64_t id) {
 }
 
 /* Which of the ids (ascending) have the metadata X-KARIDNS-SIGNER=1: yes[k].  As zones_are_signers() (one query per DB_IN_MAX ids where the driver has
- * scan_metadata_in); a read that fails: no id is one (the zone is sent, as it always was). */
-static void ids_are_signers(const ctx_t *x, const int64_t *ids, size_t n, bool *yes) {
+ * scan_metadata_in).  own_snap: the caller holds no snapshot (the store protocol reads page by page, store_view()): the scans are made in one of their own, as the
+ * driver wants them (PostgreSQL scans are cursors, which need a transaction; without one every scan failed and every zone of the signer was sent at once).
+ * 0, or the error of the read (then no id is one; x->conn has the message), or -1 (out of memory). */
+static int ids_are_signers(const ctx_t *x, const int64_t *ids, size_t n, bool *yes, bool own_snap) {
     const db_driver_t *drv = x->drv;
     idset_t s = {0};
     int rc = 0;
     memset(yes, 0, n * sizeof(*yes));
+    if (n == 0) return 0;
+    if (own_snap && (rc = drv->begin_snapshot(x->conn)) != 0) return rc;
     if (drv->scan_metadata_in) {
         for (size_t pos = 0; pos < n && rc == 0 && !s.oom; pos += DB_IN_MAX)
             rc = drv->scan_metadata_in(x->conn, ids + pos, n - pos > DB_IN_MAX ? DB_IN_MAX : n - pos, signer_ids_cb, &s);
     } else {
         for (size_t k = 0; k < n && rc == 0 && !s.oom; k++) rc = drv->scan_metadata(x->conn, &ids[k], signer_ids_cb, &s);
+    }
+    if (own_snap) {
+        int ec = drv->end_snapshot(x->conn);
+        if (rc == 0) rc = ec;
     }
     if (rc == 0 && !s.oom)
         for (size_t k = 0; k < n; k++) {
@@ -3354,6 +3362,7 @@ static void ids_are_signers(const ctx_t *x, const int64_t *ids, size_t n, bool *
             yes[k] = lo < s.n && s.v[lo] == ids[k];
         }
     free(s.v);
+    return rc == DB_STOPPED ? 0 : rc != 0 ? rc : s.oom ? -1 : 0;
 }
 
 /* ---- messages ---- */
@@ -3406,10 +3415,10 @@ static int st_ch_flush(ctx_t *x, uint64_t cursor, bool last) {
     return send_enc(x);
 }
 
-static int st_ch_add(ctx_t *x, int64_t id, uint8_t op, const char *canon, uint8_t kind, bool stamped, uint64_t gen, uint64_t at, bool force, bool has_serial,
+static int st_ch_add(ctx_t *x, int64_t id, uint8_t op, const char *canon, uint8_t kind, bool stamped, uint64_t gen, uint64_t at, uint8_t eflags, bool has_serial,
                      uint32_t serial) {
     if (st_ch_open(x) != 0) return -1;
-    uint8_t fl = (uint8_t)((stamped ? KDB_EF_STAMPED : 0) | (force ? KDB_EF_FORCE : 0));
+    uint8_t fl = (uint8_t)((stamped ? KDB_EF_STAMPED : 0) | eflags);          /* (eflags: KDB_EF_FORCE, KDB_EF_HOLD) */
     if (kdb_enc_nest_begin(&x->enc, 6) != 0 || kdb_enc_i64(&x->enc, 1, id) != 0 || kdb_enc_u8(&x->enc, 2, op) != 0 || (canon && kdb_enc_name(&x->enc, 3, canon) != 0) ||
         (op == KDB_CH_UPSERT && kdb_enc_u8(&x->enc, 4, kind) != 0) || (op == KDB_CH_UPSERT && kdb_enc_u64(&x->enc, 5, gen) != 0) ||
         (op == KDB_CH_UPSERT && kdb_enc_u64(&x->enc, 6, at) != 0) || (fl && kdb_enc_u8(&x->enc, 7, fl) != 0) ||
@@ -3612,19 +3621,22 @@ static int st_lookup(ctx_t *x, int64_t id, st_look_t *l) {
 }
 
 /* The entry of a domain for this view: an upsert when it exists, is mapped here and can be sent; else a delete (with the name when there is one).  `held`:
- * the signer keeps the zone (signer-wait): nothing is sent, the zone waits.  0, or -1 (out of memory / encoder). */
+ * the signer keeps the zone (signer-wait): the upsert carries KDB_EF_HOLD, so the Backend keeps the version it has (a zone it does not have is read as it is, and its answer
+ * takes the zone off the list again: ZONE_RESULT with the source id), and the zone goes on the list of the zones that wait (named as the database names it, as plan_diff() does).
+ * 0, or -1 (out of memory / encoder). */
 static int st_emit_row(ctx_t *x, int64_t id, const st_rowinfo_t *r, bool held, bool force) {
     struct lio *io = x->io;
     vstate_t *vs = &io->vst[x->vslot];
     char canon[DNS_NAME_TEXT_SIZE];
     bool have_canon = r->found && pdns_canonical_zone_name(r->name, canon);
     if (r->found && r->mapped && have_canon && !zone_type_reason(r->has_type ? r->type : NULL)) {
-        if (held) return sigw_add(io, vs, id, canon) != 0 ? -1 : 0;
-        sigw_del(io, vs, id);
-        return st_ch_add(x, id, KDB_CH_UPSERT, canon, zone_sec_kind(r->has_type ? r->type : NULL), r->has_state, r->gen, r->at, force, false, 0);
+        if (held && !force && sigw_add(io, vs, id, r->name) != 0) return -1;
+        if (!held || force) sigw_del(io, vs, id);
+        return st_ch_add(x, id, KDB_CH_UPSERT, canon, zone_sec_kind(r->has_type ? r->type : NULL), r->has_state, r->gen, r->at,
+                         force ? KDB_EF_FORCE : held ? KDB_EF_HOLD : 0, false, 0);
     }
     sigw_del(io, vs, id);
-    return st_ch_add(x, id, KDB_CH_DELETE, have_canon ? canon : NULL, 0, false, 0, 0, false, false, 0);
+    return st_ch_add(x, id, KDB_CH_DELETE, have_canon ? canon : NULL, 0, false, 0, 0, 0, false, 0);
 }
 
 /* 0, -1 (out of memory / encoder), -2 (a database error: x->st.dberr) */
@@ -3680,8 +3692,14 @@ static int st_sigw_release(ctx_t *x, vstate_t *vs, bool all) {
         return -1;
     }
     for (size_t i = 0; i < n; i++) ids[i] = vs->sigw[i].id;
-    ids_are_signers(x, ids, n, yes);
-    int rc = 0;
+    int rc = all ? 0 : ids_are_signers(x, ids, n, yes, true);     /* (a reload of everything releases them all: the metadata is not read) */
+    if (rc != 0) {
+        free(ids);
+        free(yes);
+        if (rc == -1) return -1;
+        x->st.dberr = rc;
+        return -2;
+    }
     for (size_t i = 0; i < n && rc == 0; i++)
         if (all || !yes[i]) rc = st_entry_for(x, ids[i], false, false);
     free(ids);
@@ -3758,7 +3776,17 @@ static int st_drain(ctx_t *x, const db_schema_info_t *si, uint64_t *cursor, bool
             size_t k = 0;
             for (size_t i = 0; i < it.n; i++)
                 if (it.v[i].op == KDB_CH_UPSERT) ids[k++] = it.v[i].id;
-            ids_are_signers(x, ids, k, yes);
+            int rs = ids_are_signers(x, ids, k, yes, true);
+            if (rs == -1) {
+                status = EXIT_ERROR;
+                lg(LOG_ERR, "out of memory");
+                x->oom = true;
+                goto out;
+            }
+            if (rs != 0) {                                   /* (the zones are not sent without knowing: the drain is made again from the cursor) */
+                status = db_err(x, rs, "reading the metadata X-KARIDNS-SIGNER");
+                goto out;
+            }
             k = 0;
             for (size_t i = 0; i < it.n; i++)
                 if (it.v[i].op == KDB_CH_UPSERT) held[i] = yes[k++];
@@ -3767,7 +3795,7 @@ static int st_drain(ctx_t *x, const db_schema_info_t *si, uint64_t *cursor, bool
             int rc2 = 0;
             if (it.v[i].op == KDB_CH_DELETE) {
                 sigw_del(io, vs, it.v[i].id);
-                rc2 = st_ch_add(x, it.v[i].id, KDB_CH_DELETE, NULL, 0, false, 0, 0, false, false, 0);
+                rc2 = st_ch_add(x, it.v[i].id, KDB_CH_DELETE, NULL, 0, false, 0, 0, 0, false, 0);
                 i++;
             } else {
                 size_t j = i;
@@ -3973,7 +4001,11 @@ static int st_emit_listed(ctx_t *x, const db_schema_info_t *si, const char *only
             }
             return 0;
         }
-        if (st_ch_add(x, z->id, KDB_CH_UPSERT, z->canon, zone_sec_kind(z->type), false, 0, 0, true, z->has_serial, z->serial) != 0 ||
+        /* the version stamp of the zone (karidns_zone_state, read in this snapshot) as a drain sends it: without it the Backend compared the serial, and a change that kept the
+         * serial (a reload request for a zone whose records changed) was "unchanged" */
+        st_look_t sl;
+        const bool stamped = si->has_zone_state && x->drv->manifest_page && st_lookup(x, z->id, &sl) == 0 && sl.found && sl.has_state;
+        if (st_ch_add(x, z->id, KDB_CH_UPSERT, z->canon, zone_sec_kind(z->type), stamped, stamped ? sl.gen : 0, stamped ? sl.at : 0, KDB_EF_FORCE, z->has_serial, z->serial) != 0 ||
             st_ch_flush(x, vs->seq, false) != 0) {
             x->io_error = !x->enc.err;
             x->oom = x->enc.err;
@@ -3987,7 +4019,7 @@ static int st_emit_listed(ctx_t *x, const db_schema_info_t *si, const char *only
             uint64_t xs[COV_XIDS];
             unsigned nx = 0;
             if (cov_read(x, z->id, &m, xs, &nx) == 0) {
-                ids_are_signers(x, &z->id, 1, &yes);
+                (void)ids_are_signers(x, &z->id, 1, &yes, false);      /* (inside the reload's snapshot; a read that fails: no cover mark, the zone may be listed once more) */
                 if (yes) {
                     if (cov_set(vs, z->id, m, xs, nx) != 0) return EXIT_ERROR;
                 } else {
@@ -5110,6 +5142,11 @@ static void io_dispatch(struct lio *io, const kdb_frame_t *fr) {
         io->inv_seq = m.u.inventory_end.last_change_seq;
         break;
     case KDB_T_ZONE_RESULT: {
+        if (m.u.zone_result.has_source_id) {         /* 0.7 signer-wait: an upsert with KDB_EF_HOLD that the Backend did not hold (it had no image of the zone, refused its version, or has the version): the zone does not wait */
+            const int hs = io->idx_slot ? io->idx_slot[m.u.zone_result.view] : -1;
+            if (hs >= 0 && (size_t)hs < io->nvn) sigw_del(io, &io->vst[hs], m.u.zone_result.source_id);
+            break;
+        }
         io->n_results++;
         int zslot = io->idx_slot ? io->idx_slot[m.u.zone_result.view] : -1;
         fev_drain(io, true);                         /* (the zones the fetch thread served before this result) */
