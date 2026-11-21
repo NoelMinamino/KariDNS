@@ -158,15 +158,24 @@ start_primary() {
     kari_wait_answer "$DAG" "$PPORT" sec.test. 15 || { cat "$W/p.log"; fail "the primary did not start"; }
 }
 # wait_gone PID CONF: PID is reaped and no process of CONF is left (the next start must not meet the old control socket); fails after 10 s
+# (kari_conf_pids used to miss the name karidns-evict, the build this test runs: this wait and kari_kill_conf saw no process, and a start could meet the control socket of
+# a Backend of the old instance that was still there, "Another KariDNS instance is already running")
 wait_gone() {
     [ -z "$1" ] || wait "$1" 2>/dev/null || true
     _wg=0
     while [ -n "$(kari_conf_pids "$2")" ]; do
         _wg=$((_wg + 1))
-        [ "$_wg" -lt 100 ] || fail "a process of $2 did not exit"
+        [ "$_wg" -lt 100 ] || { proc_state "$2"; fail "a process of $2 did not exit"; }
         sleep 0.1
     done
     return 0
+}
+# proc_state CONF: the processes of CONF and the holders of a control socket (for a failure)
+proc_state() {
+    echo "processes of $1:"
+    for _p in $(kari_conf_pids "$1"); do ps -ww -o pid,ppid,stat,etime,comm -p "$_p" | tail -n +2; done
+    echo "sockets named ctl.sock (the server binds it by its directory: sockstat shows the name only):"
+    sockstat -u 2>/dev/null | grep -F " ctl.sock" || true
 }
 stop_primary() { _sp=$PPID_; [ -n "$PPID_" ] && kari_kill_tree "$PPID_"; PPID_=""; kari_kill_conf "$W/primary.conf"; wait_gone "$_sp" "$W/primary.conf"; }
 # start_secondary [env...]: the log of this run is $W/s.log (the one before is appended to $W/s.all)
@@ -178,7 +187,7 @@ start_secondary() {
     while ! ctl status > /dev/null 2>&1; do
         i=$((i + 1))
         [ "$i" -lt 200 ] || fail "the secondary did not start"
-        kill -0 "$SPID" 2>/dev/null || fail "the secondary exited"
+        kill -0 "$SPID" 2>/dev/null || { tail -n 5 "$W/s.log"; proc_state "$W/secondary.conf"; fail "the secondary exited"; }
         sleep 0.1
     done
 }
