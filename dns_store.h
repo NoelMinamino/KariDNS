@@ -686,6 +686,8 @@ extern _Atomic uint32_t store_test_jx_cap;
 void store_test_probe(store_t *s);
 /* the rounds of the flusher's commit loop (a loop that spins shows here); the flusher stopped as the first step of a close does (the store stays usable: the writers make the due work) */
 extern _Atomic uint64_t store_test_fl_loops;
+/* the flusher's checkpoint thread: 1: it found a checkpoint due (ckpt_due()) and has not asked for the flags yet, 2: its st_ckpt() returned */
+extern void (*_Atomic store_test_fl_ckpt_hook)(int step);
 /* the longest span the leader writes at once (0: 4 MiB): a small one cuts records in the middle (the torn tails of the tests) */
 extern _Atomic uint32_t store_test_jw_run;
 void store_test_stop_flusher(store_t *s);

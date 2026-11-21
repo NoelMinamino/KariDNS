@@ -340,7 +340,7 @@ detect_ncpu() {
 # environment survives the privilege drop); a server whose environment carries
 # this suite's id is ours.  Match the process name, not the argument list:
 # "-f karidns" would also match any command whose path contains "karidns".
-KARIDNS_PROC_RE='karidns(-asan|-tsan)?'
+KARIDNS_PROC_RE='karidns(-asan|-tsan|-evict)?'
 KARIDNS_SUITE_ID="suite-$$-$(date +%s)"
 export KARIDNS_SUITE_ID
 # 0.7 M4: the servers of the tests write nothing to the host's system log (their syslog lines go to their stderr only, docs/karidns.md
