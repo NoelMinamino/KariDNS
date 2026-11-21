@@ -9,7 +9,7 @@
  *     the writes at the end of a refresh (transferred, up to date: state only or the whole image, failed and its skip, a scrub's KNOWN record stored again), the restore
  *     decisions (restored, no record, KNOWN, a bad checksum, a serial mismatch, another identity, D7 both ways, expired while stopped, a recent failure), the orphan
  *     re-check of a member whose unique-id changed during its transfer (M6), the GC with the per-view exemption of a catalog's members, a name too long, 32 views full,
- *     a store that cannot be opened (no pending bit, a reconfiguration's secondary is not held), the 30 s safety net (progress against a stall, R2'), and under TSan
+ *     a store that cannot be opened (no pending bit, a reconfiguration's secondary is not held), the 30 s safety net (progress against a stall, R2'), a secondary whose name has no key (life 9: served, not stored, xfr.unstorable), and under TSan
  *     the restore against a concurrent transfer and the hooks of rebuilds from several threads.
  *  3. P3, the database secondaries (a fake loader on socket pairs): their copies (key `d`, the domains.id in the identity, the settings id, R1), the orphan re-check through the
  *     registry, the delete hook and a kind change; the restart without the loader (the restore jobs of 4.4 and every way out of them), the loader's jobs afterwards (one entry
@@ -1087,6 +1087,44 @@ static int life6(void) {
   return g_failed;
 }
 
+/* life 9 (2.2, W12): a secondary whose canonical name is longer than 245 octets has no key: it is transferred and served as before, its copy is not stored (xfr.unstorable, one NOTICE),
+ * zonestatus says why */
+static char g_long_zone[300];
+static int life9(void) {
+  printf("[life 9: a name too long for a key]\n");
+  rcu_aux_thread_pin();
+  char lab[62];
+  memset(lab, 'a', 61);
+  lab[61] = '\0';
+  snprintf(g_long_zone, sizeof(g_long_zone), "%s.%s.%s.%s.", lab, lab, lab, lab);                          /* (247 octets without the trailing dot) */
+  static char extra[512];
+  snprintf(extra, sizeof(extra), "  zone \"%.*s\" { type slave; masters { 192.0.2.1; }; primary-settings no; };\n", (int)strlen(g_long_zone) - 1, g_long_zone);
+  g_extra_zones = extra;
+  if (life_start(g_store, true) != 0) return 1;
+  wait_pass();
+  zone_db_entry_t *e = ent(g_long_zone);
+  CHECK(e != NULL);
+  if (!e) return 1;
+  const time_t now = time(NULL);
+  const xfr_store_counters_t c0 = ctr();
+  install(e, 5, XFR_ORIGIN_XFR, now, 0);
+  refresh_end(e, XFR_OUT_TRANSFERRED, now);
+  const xfr_store_counters_t c1 = ctr();
+  CHECK(c1.unstorable > c0.unstorable);
+  CHECK_EQ(c1.puts, c0.puts);
+  CHECK_EQ(atomic_load(&e->serial), 5);                                    /* (the zone itself is served as before) */
+  char zs[1024];
+  rcu_aux_read_lock();
+  server_config_t *cfg = acquire_config_snapshot();
+  const size_t zl = xfr_store_zonestatus(e, cfg, zs, sizeof(zs));
+  release_config_snapshot(cfg);
+  rcu_aux_read_unlock();
+  CHECK(zl > 0 && strstr(zs, "Store: not kept (the name is too long)") != NULL);
+  g_extra_zones = "";
+  db_store_stop();
+  return g_failed;
+}
+
 /* ======================================================================================================================= 3. P3: the database secondaries */
 /* A server with a database block and the store: a fake loader on socket pairs (the protocol of tests/test_db_store.c) sends SLAVE and CONSUMER zones; the "transfers" are installs as in
  * the lives above.  Lives D1 (the copies are written: key `d`, the domains.id in the identity, the settings id, source id 0, R1 two views with one domains.id; the orphan re-check through the
@@ -1551,6 +1589,8 @@ int main(void) {
   snprintf(g_store, sizeof(g_store), "zone-store \"%s/store8\";", g_dir);
   snprintf(g_sdir, sizeof(g_sdir), "%s/store8", g_dir);
   run_child(life8);
+  snprintf(g_store, sizeof(g_store), "zone-store \"%s/store9\";", g_dir);
+  run_child(life9);
   snprintf(g_dsdir, sizeof(g_dsdir), "%s/dbstore", g_dir);
   run_child(lifed1);
   run_child(lifed2);
