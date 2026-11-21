@@ -85,7 +85,7 @@ done_=$(jnum completed < "$W/r2.json"); nx=$(sed -n 's/.*"NXDOMAIN":\([0-9]*\).*
 echo "ok: generated mode, $nx NXDOMAIN of $done_"
 
 # every option set must be a well-formed query
-for opts in "+dnssec" "+bufsize=4096" "+nsid" "+cookie" "+padding=128" "+subnet=192.0.2.0/24" "+subnet=2001:db8::/32" "+edns +dnssec +nsid +cookie +padding=64 +subnet=192.0.2.0/24" \
+for opts in "+dnssec" "+bufsize=4096" "+nsid" "+cookie" "+cookie=random" "+edns +cookie=random +nsid +padding=128" "+padding=128" "+subnet=192.0.2.0/24" "+subnet=2001:db8::/32" "+edns +dnssec +nsid +cookie +padding=64 +subnet=192.0.2.0/24" \
             "+nord" "+cd" "+ad" "+aa" "+noedns" "+class=IN"; do
     # a loaded host may drop a few datagrams (the suite runs four tests at a time): up to 3 attempts for 90 % of the answers; a rcode other than NOERROR and
     # NXDOMAIN (FORMERR: a malformed query) fails at once

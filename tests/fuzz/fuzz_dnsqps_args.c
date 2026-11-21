@@ -47,6 +47,20 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
             dq_cur_t cur;
             dq_cur_init(&cur, &t, 0, 1, 1);
             for (int i = 0; i < 8; i++) dq_next_query(&t, &cur, q, sizeof q, 1);
+            /* the pre-built frames of the same table, and the picks that index them */
+            static const uint8_t mac[6] = { 2, 0, 0, 0, 0, 1 }, ip[4] = { 198, 18, 0, 1 };
+            dq_frame_tpl_t tpl;
+            dq_pf_t pf;
+            dq_frame_tpl_init(&tpl, mac, mac, false, ip, ip, 40000, 53);
+            if (dq_pf_build(&pf, &t, &tpl, err, sizeof err) == 0) {
+                dq_cur_init(&cur, &t, 0, 1, 1);
+                for (int i = 0; i < 8; i++) {
+                    dq_pick_t pk;
+                    uint16_t fl, co;
+                    if (dq_next_pick(&t, &cur, &pk, 1)) dq_pf_get(&pf, dq_pf_index(&t, &pk), &fl, &co);
+                }
+                dq_pf_free(&pf);
+            }
             dq_qtab_free(&t);
         }
         free(copy);
