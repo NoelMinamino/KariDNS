@@ -2116,6 +2116,7 @@ _Atomic bool store_test_no_rule_t = false;
 _Atomic uint64_t store_test_jr_cap = 0;
 _Atomic uint32_t store_test_jx_cap = 0;
 _Atomic uint64_t store_test_fl_loops = 0;
+void (*_Atomic store_test_fl_ckpt_hook)(int step) = NULL;
 _Atomic uint32_t store_test_jw_run = 0;
 void store_test_probe(store_t *s) { fs_probe(s); }
 static void bg_stop_join(store_t *s);
@@ -3392,7 +3393,7 @@ static bool ck_acquire_fl(store_t *s) {
   return ok;
 }
 
-static bool bulk_due(const store_t *s, uint64_t now);
+static bool ckpt_due(const store_t *s, uint64_t now);
 /* A checkpoint from a thread that holds no lock (the flusher, store_checkpoint()): the flags, the begin under the writer mutex, the rest without it.  force: also when nothing was
  * written since the last one.  fl: the flusher's checkpoint thread (it gives way to a checkpoint handed to it, and returns 1).  0, or -errno. */
 /* The checkpoint that ends a bulk fill failed, or was not tried (no room): the next try comes after a back-off, 1 s doubling up to 5 min (ckpt_due()), so that a disk that is full or failing is not
@@ -3416,7 +3417,11 @@ static int st_ckpt(store_t *s, bool force, bool fl) {
   r = jold_sync(s);                                   /* (a journal whose sync failed: synced first, with no lock held) */
   if (r == 0) {
     wr_lock_raw(s);
-    const bool need = force || s->lsn > s->ckpt_lsn || bulk_due(s, st_now_ms()) || end;     /* (a bulk fill moves no LSN; its end is due until it is on disk) */
+    /* (not forced: the caller found it due (the flusher, bg_due()) before it waited for the flags, and another checkpoint may have been made meanwhile and taken the reason away (the
+     * growth's ck_want, a full journal): due is asked again here, under the mutex.  "Something was written since" alone is not a reason: a checkpoint the flusher had found due after a
+     * growth, made after store_checkpoint() had already made one and the writes had begun again, cut the journal of a bulk fill (store_journal_boost()) at a fraction of its raised size,
+     * test_store jboost on loaded CI VMs.  A bulk fill moves no LSN; its end is due until it is on disk) */
+    const bool need = force || ckpt_due(s, st_now_ms()) || end;
     r = need ? unclean_now_locked(s) : 1;           /* (writers go on while this checkpoint flushes: a clean flag on disk goes first) */
     if (r == 0) r = ck_begin_locked(s, false, true);
     if (r == 0 && end && !s->ck.bulk) {
@@ -7742,7 +7747,15 @@ static void *fl_ckpt_main(void *arg) {
     if (s->bg_stop || s->ck_handoff) continue;
     pthread_mutex_unlock(&s->bg_mu);
     int r = 0;
-    if (ckpt_due(s, st_now_ms()) && (r = st_ckpt(s, false, true)) == 0) ck_after(s);
+    if (ckpt_due(s, st_now_ms())) {
+#ifdef KARIDNS_UNIT_TEST
+      st_hook(&store_test_fl_ckpt_hook, 1);
+#endif
+      if ((r = st_ckpt(s, false, true)) == 0) ck_after(s);
+#ifdef KARIDNS_UNIT_TEST
+      st_hook(&store_test_fl_ckpt_hook, 2);
+#endif
+    }
     pthread_mutex_lock(&s->bg_mu);
     if (r < 0) bg_backoff(s, 1000);
   }

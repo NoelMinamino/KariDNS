@@ -51,13 +51,15 @@ kari_kill_tree() {
     return 0
 }
 
-# kari_conf_pids CONF... : print the PIDs of karidns/karidns-asan/karidns-tsan
+# kari_conf_pids CONF... : print the PIDs of karidns/karidns-asan/karidns-tsan/karidns-evict
 # processes whose argument list contains one of the CONF paths as a separate
 # word. CONF must be specific to the test (an absolute path, or a path under
 # its own temporary directory), exactly as it was passed on the command line.
+# (karidns-evict, the build with the test knobs, was missing: a wait for the processes of a
+# conf saw none, and the next start met the old Backend's control socket, which still answered.)
 kari_conf_pids() {
     local _kc_pid _kc_cmd _kc_conf
-    for _kc_pid in $(pgrep -x 'karidns(-asan|-tsan)?' 2>/dev/null); do
+    for _kc_pid in $(pgrep -x 'karidns(-asan|-tsan|-evict)?' 2>/dev/null); do
         _kc_cmd=$(ps -ww -o command= -p "$_kc_pid" 2>/dev/null) || continue
         for _kc_conf in "$@"; do
             [ -n "$_kc_conf" ] || continue
