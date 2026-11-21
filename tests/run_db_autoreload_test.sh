@@ -223,11 +223,14 @@ sleep 1.5
 
 echo "== S1: coalescing: a burst of edits is one batch"
 B0=$(n_auto)
-n=1; while [ $n -le 8 ]; do sq "UPDATE records SET content = '192.0.2.1$n' WHERE name = 'www.z2.test'"; sleep 0.03; n=$((n + 1)); done
+# (one sqlite3 for the 8 commits, each statement in a transaction of its own: one process each, 30 ms apart, could take longer than the window on a loaded
+# host, as the PostgreSQL sibling did, CI flake row 21)
+n=1; BURST=""; while [ $n -le 8 ]; do BURST="$BURST UPDATE records SET content = '192.0.2.1$n' WHERE name = 'www.z2.test';"; n=$((n + 1)); done
+sq "$BURST"
 if wait_ans www.z2.test 192.0.2.18 8000; then pass "the last value of the burst is served ($WAIT_MS ms after the burst)"; else fail "the burst: last value not served (got '$got')"; fi
 sleep 2.5
 B1=$(n_auto)
-[ $((B1 - B0)) -eq 1 ] && pass "8 commits in 0.3 s gave one auto batch" || fail "8 commits gave $((B1 - B0)) auto batch(es)"
+[ $((B1 - B0)) -eq 1 ] && pass "8 commits of one sqlite3 gave one auto batch" || fail "8 commits gave $((B1 - B0)) auto batch(es)"
 
 echo "== S1: an explicit karictl reload next to auto reload"
 sleep 1

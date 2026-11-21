@@ -3454,12 +3454,29 @@ static void test_signer_cover(void) {
     vstate_t vs;
     memset(&vs, 0, sizeof(vs));
     CHECK(!cov_covers(&vs, false, 1, 0) && vs.ncov == 0);                                  /* no marks: nothing is covered */
-    CHECK(cov_set(&vs, 5, 50) == 0 && cov_set(&vs, 2, 20) == 0 && cov_set(&vs, 9, 90) == 0 && cv_is(&vs, "2:20,5:50,9:90"));    /* sorted by domain id */
-    CHECK(cov_set(&vs, 5, 40) == 0 && cv_is(&vs, "2:20,5:50,9:90"));                         /* a mark never goes back */
-    CHECK(cov_set(&vs, 5, 60) == 0 && cv_is(&vs, "2:20,5:60,9:90"));                         /* it moves forward */
+    CHECK(cov_set(&vs, 5, 50, NULL, 0) == 0 && cov_set(&vs, 2, 20, NULL, 0) == 0 && cov_set(&vs, 9, 90, NULL, 0) == 0 && cv_is(&vs, "2:20,5:50,9:90"));    /* sorted by domain id */
+    CHECK(cov_set(&vs, 5, 40, NULL, 0) == 0 && cv_is(&vs, "2:20,5:50,9:90"));                         /* a mark never goes back */
+    CHECK(cov_set(&vs, 5, 60, NULL, 0) == 0 && cv_is(&vs, "2:20,5:60,9:90"));                         /* it moves forward */
     CHECK(cov_covers(&vs, false, 5, 60) && cov_covers(&vs, false, 5, 1) && !cov_covers(&vs, false, 5, 61));        /* SQLite3: the cursor is the highest seq, pos <= m */
     CHECK(!cov_covers(&vs, true, 5, 60) && cov_covers(&vs, true, 5, 59) && !cov_covers(&vs, true, 5, 61));         /* PostgreSQL: the xmin, every xid below it is in the snapshot */
     CHECK(!cov_covers(&vs, false, 3, 1) && !cov_covers(&vs, false, 10, 1) && !cov_covers(&vs, false, 0, 1));       /* a zone without a mark */
+    /* 0.7 (CI flake row 19): PostgreSQL, the transactions above the xmin that the reload's snapshot saw (changes_cover()) are covered too, no other one */
+    {
+        const uint64_t seen[2] = { 75, 70 };
+        CHECK(cov_set(&vs, 5, 60, seen, 2) == 0 && vs.cov[1].nx == 2);
+        CHECK(cov_covers(&vs, true, 5, 59) && cov_covers(&vs, true, 5, 70) && cov_covers(&vs, true, 5, 75));
+        CHECK(!cov_covers(&vs, true, 5, 60) && !cov_covers(&vs, true, 5, 71) && !cov_covers(&vs, true, 5, 76));
+        CHECK(!cov_covers(&vs, true, 2, 70) && !cov_covers(&vs, true, 9, 95) && !cov_covers(&vs, true, 2, 75));                                    /* (the transactions of zone 5's mark only) */
+        /* the store protocol: an entry stands for the zone's rows of a page, positions lo .. hi */
+        CHECK(cov_range(&vs, true, 5, 10, 59) && cov_range(&vs, true, 5, 70, 70) && cov_range(&vs, true, 5, 75, 75));
+        CHECK(!cov_range(&vs, true, 5, 70, 75) && !cov_range(&vs, true, 5, 59, 70) && !cov_range(&vs, true, 5, 71, 71) && !cov_range(&vs, true, 7, 1, 1));
+        CHECK(cov_range(&vs, false, 5, 60, 60) && !cov_range(&vs, false, 5, 61, 61));                             /* SQLite3: the highest seq of the page */
+        const uint64_t many[COV_XIDS + 3] = { 99, 98, 97, 96, 95, 94, 93, 92, 91, 90, 89 };
+        CHECK(cov_set(&vs, 5, 60, many, COV_XIDS + 3) == 0 && vs.cov[1].nx == COV_XIDS);                         /* (more than fit: the highest are kept) */
+        CHECK(cov_covers(&vs, true, 5, 99) && cov_covers(&vs, true, 5, 92) && !cov_covers(&vs, true, 5, 91) && !cov_covers(&vs, true, 5, 70));
+        CHECK(cov_set(&vs, 5, 50, seen, 2) == 0 && vs.cov[1].m == 60 && !cov_covers(&vs, true, 5, 70));          /* (an older snapshot changes nothing) */
+        CHECK(cov_set(&vs, 5, 60, NULL, 0) == 0 && vs.cov[1].nx == 0 && cv_is(&vs, "2:20,5:60,9:90"));
+    }
     cov_del(&vs, 3);                                                                       /* not there: nothing */
     cov_del(&vs, 5);
     CHECK(cv_is(&vs, "2:20,9:90") && !cov_covers(&vs, false, 5, 1));
@@ -3468,7 +3485,7 @@ static void test_signer_cover(void) {
     CHECK(vs.ncov == 0);
 
     /* the zones that are gone from the database lose their marks when the whole list is planned */
-    CHECK(cov_set(&vs, 1, 10) == 0 && cov_set(&vs, 2, 20) == 0 && cov_set(&vs, 3, 30) == 0 && cov_set(&vs, 4, 40) == 0);
+    CHECK(cov_set(&vs, 1, 10, NULL, 0) == 0 && cov_set(&vs, 2, 20, NULL, 0) == 0 && cov_set(&vs, 3, 30, NULL, 0) == 0 && cov_set(&vs, 4, 40, NULL, 0) == 0);
     zinfo_t zs[3];
     memset(zs, 0, sizeof(zs));
     zs[0].id = 2;
@@ -3483,7 +3500,7 @@ static void test_signer_cover(void) {
     x.nz = 0;
     cov_prune(&vs, &x);
     CHECK(vs.ncov == 0);
-    CHECK(cov_set(&vs, 1, 10) == 0);
+    CHECK(cov_set(&vs, 1, 10, NULL, 0) == 0);
     cov_clear(&vs);                                                                        /* the change log was reset */
     CHECK(vs.ncov == 0 && vs.cov == NULL);
 
@@ -3509,7 +3526,7 @@ static void test_signer_cover(void) {
     bool gap = false;
     CHECK(db_driver_sqlite3.begin_snapshot(c) == 0 && db_driver_sqlite3.changes_max(c, &mx) == 0 && mx == 4);
     CHECK(db_driver_sqlite3.changes_max(c, &mx) == 0 && mx == 4);                          /* the statement is kept between calls */
-    CHECK(cov_set(&io->vst[0], 1, mx) == 0);                                               /* a reload of zone 1 read the log up to seq 4 */
+    CHECK(cov_set(&io->vst[0], 1, mx, NULL, 0) == 0);                                               /* a reload of zone 1 read the log up to seq 4 */
     CHECK(db_driver_sqlite3.changes_since(c, 0, chg_cb, &x, &last, &gap) == 0);
     CHECK_MSG(x.nchg == 2 && x.chg[0] == 2 && x.chg[1] == 3, "%zu rows", x.nchg);        /* zone 2 and zone 3 changed; the rows of zone 1 are in what was read */
     CHECK(db_driver_sqlite3.end_snapshot(c) == 0);
@@ -3998,7 +4015,7 @@ static void test_store_loader(void) {
         CHECK(sqlite3_prepare_v2(db, "SELECT max(seq) FROM karidns_changes", -1, &st, NULL) == SQLITE_OK && sqlite3_step(st) == SQLITE_ROW);
         m = (uint64_t)sqlite3_column_int64(st, 0);
         sqlite3_finalize(st);
-        CHECK(cov_set(vs, 6, m) == 0);
+        CHECK(cov_set(vs, 6, m, NULL, 0) == 0);
         SL_BEGIN(KDB_BATCH_AUTO);
         CHECK(store_view(&x, &src, v) == EXIT_OK);
         SL_END();

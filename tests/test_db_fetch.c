@@ -2269,7 +2269,7 @@ int main(void) {
             dbreg_cache_test_pause(true);
             dbreg_cache_stats_t w0;
             uint64_t wlim = 0;
-            const char *WCONF = "fetch-concurrency 256; park-timeout 400;";
+            const char *WCONF = "fetch-concurrency 256; park-timeout 5000;";             /* (a long time: the case of park-timeout itself has its own 400 ms below) */
             /* a limit that the zones in memory are 5% over the hard line of (resident = 115% of it) */
             #define W8_OVER(conf, conc) do { dbreg_cache_stats(&w0); wlim = w0.resident * 100 / 115; gate_cfg((conf), (conc), 0, wlim); \
                                              CHECK(dbreg_cache_over_limit()); } while (0)
@@ -2300,6 +2300,7 @@ int main(void) {
                 dbreg_cache_test_room_pause(true);
                 unsigned long long sh0 = ST("cache", "shed"), wt0 = ST("cache", "room_waits"), to0 = ST("cache", "room_timeouts");
                 uint64_t key13 = park_claim_key("default", cz[13]);
+                const int64_t t13 = mono_ms();
                 CHECK(worker_ask(0, COLD_EL(13), "default", cz[13], KDB_FETCH_FULL) == 1);
                 usleep(150000);
                 CHECK(!ch_next(&fetch5, &m2, 100));
@@ -2309,8 +2310,15 @@ int main(void) {
                 usleep(100000);
                 CHECK(ST("cache", "room_waiting") == 1 && ST("cache", "room_waits") == wt0 + 1 && ST("fetchq", "queued") == 1);   /* (a duplicate, dropped) */
                 CHECK(!park_wake_pending(park_wake_ring(0)) && !park_wake_pending(park_wake_ring(1)) && ST("cache", "shed") == sh0);
+                const int64_t dt13 = mono_ms() - t13;
                 dbreg_cache_test_room_pause(false);
-                CHECK(req_next(&fetch5, &m, 5000) && strcmp(m.u.fetch_req.name, cz[13]) == 0);
+                {
+                    const bool sent = req_next(&fetch5, &m, 5000) && strcmp(m.u.fetch_req.name, cz[13]) == 0;
+                    CHECK(sent);
+                    if (!sent || ST("cache", "room_timeouts") != to0)              /* (CI flake row 22: under TSan and -j 8 the steps above took more than the 400 ms of park-timeout) */
+                        printf("  cz[13]: %lld ms from the ask to the room (park-timeout 5000 ms), room_timeouts %llu (before %llu), room_waiting %llu, queued %llu\n",
+                               (long long)dt13, ST("cache", "room_timeouts"), to0, ST("cache", "room_waiting"), ST("fetchq", "queued"));
+                }
                 CHECK(!dbreg_cache_over_limit() && ST("cache", "room_waiting") == 0 && ST("fetchq", "queued") == 0 && park_places_used() == 1 && NOT_CLAIMED(key13));
                 CHECK(ST("cache", "room_timeouts") == to0);
                 int zi = 0;
@@ -2324,7 +2332,7 @@ int main(void) {
 
             /* no room before park-timeout (400 ms): the request is dropped (the mark goes, nothing is fetched, it is not counted as shed, the workers are woken, not failed) */
             {
-                W8_OVER(WCONF, 256);
+                W8_OVER("fetch-concurrency 256; park-timeout 400;", 256);
                 dbreg_cache_test_room_pause(true);
                 unsigned long long sh0 = ST("cache", "shed"), to0 = ST("cache", "room_timeouts"), d0 = ST("fetchq", "queue_dropped");
                 uint64_t key14 = park_claim_key("default", cz[14]);

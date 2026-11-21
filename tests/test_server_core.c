@@ -27,6 +27,7 @@
 #include <sys/capsicum.h>
 #include <sys/param.h>
 #include <sys/procctl.h>
+#include <sys/sysctl.h>
 #endif
 
 #include "dns_server_internal.h"
@@ -5185,6 +5186,123 @@ static void test_klog_aux_state(void) {
     printf("  -> the level and the runtime in the other processes passed.\n");
 }
 
+/* A KLS1 record longer than one unix datagram (net.local.dgram.maxdgram, 8192 on FreeBSD 15.1, below KLS_MAX): the kernel refuses it with EMSGSIZE whatever
+ * the buffers are, so it stayed owed to the manager and the routers for ever (sent again every second, never taken).  It goes as the level alone now, capped by
+ * the maxdgram that setup_ipc_tables() reads before the fork (g_ipc_pack_max), with the WARNING; a send that EMSGSIZE refuses later is not owed any more. */
+static void test_klog_aux_maxdgram(void) {
+    printf("[TEST] Logging: a KLS1 record above net.local.dgram.maxdgram goes as the level alone (not owed for ever)...\n");
+    unsigned long md = 0;
+    size_t ml = sizeof(md);
+    if (sysctlbyname("net.local.dgram.maxdgram", &md, &ml, NULL, 0) != 0 || ml != sizeof(md) || md < 1024) {
+        printf("  SKIP: net.local.dgram.maxdgram cannot be read\n");
+        return;
+    }
+    enum { PATHLEN = 900 };
+    const unsigned nch = (unsigned)(md / (PATHLEN + 8)) + 2;      /* (a record of about maxdgram + 1.8 KB: channels of 8 bytes and a path each) */
+    if (nch > 3 * KLS_ROUTE_MAX || nch * (PATHLEN + 8) + 200 > KLS_MAX) {
+        printf("  SKIP: net.local.dgram.maxdgram=%lu: no record below KLS_MAX is longer than it\n", md);
+        return;
+    }
+    char dir[] = "/tmp/karidns_kaux_md_XXXXXX";
+    assert(mkdtemp(dir));
+    static char paths[3 * KLS_ROUTE_MAX][PATHLEN + 32];
+    static char conf[3 * KLS_ROUTE_MAX * (PATHLEN + 128) + 512];
+    size_t cl = (size_t)snprintf(conf, sizeof(conf), "logging {");
+    for (unsigned i = 0; i < nch; i++) {
+        int k = snprintf(paths[i], sizeof(paths[i]), "%s", dir);
+        while (k < PATHLEN - 12) k += snprintf(paths[i] + k, sizeof(paths[i]) - (size_t)k, "/.");    /* (the same directory: a long spelling of it) */
+        snprintf(paths[i] + k, sizeof(paths[i]) - (size_t)k, "/c%02u.log", i);
+        cl += (size_t)snprintf(conf + cl, sizeof(conf) - cl, " channel c%02u { file \"%s\"; severity info; };", i, paths[i]);
+    }
+    static const char *const cats[3] = { "general", "database", "xfer-in" };
+    for (unsigned c = 0; c * KLS_ROUTE_MAX < nch; c++) {
+        cl += (size_t)snprintf(conf + cl, sizeof(conf) - cl, " category %s {", cats[c]);
+        for (unsigned i = c * KLS_ROUTE_MAX; i < nch && i < (c + 1) * KLS_ROUTE_MAX; i++) cl += (size_t)snprintf(conf + cl, sizeof(conf) - cl, " c%02u;", i);
+        cl += (size_t)snprintf(conf + cl, sizeof(conf) - cl, " };");
+    }
+    snprintf(conf + cl, sizeof(conf) - cl, " };");
+    assert(cl + 4 < sizeof(conf));
+    klog_install_conf(conf);
+    klog_set_debug_level(3);
+    static uint8_t rec[KLS_MAX];
+    bool dropped = true;
+    const size_t full = klog_state_encode(rec, sizeof(rec), &dropped);
+    assert(full > md && !dropped);                                          /* (the whole record fits KLS_MAX, not a datagram) */
+
+    int mgr[2], rtr[2];
+    assert(socketpair(AF_UNIX, SOCK_DGRAM, 0, mgr) == 0 && socketpair(AF_UNIX, SOCK_DGRAM, 0, rtr) == 0);
+    int big = 4 << 20;                                                        /* (the buffers of the server's pairs: they do not raise the limit of one datagram) */
+    (void)setsockopt(rtr[0], SOL_SOCKET, SO_SNDBUF, &big, sizeof(big));
+    (void)setsockopt(rtr[1], SOL_SOCKET, SO_RCVBUF, &big, sizeof(big));
+    assert(send(mgr[0], rec, full, MSG_DONTWAIT) < 0 && errno == EMSGSIZE);  /* (what the old code sent) */
+    const size_t saved_max = g_ipc_pack_max;
+    int saved_plug = g_plug_ctrl_fd, saved_broker = g_broker_sock, saved_routers = g_num_frontend_routers, saved_workers = g_num_workers;
+    int saved_ipc = g_ipc_fds[0][0][1];
+    g_ipc_pack_max = md < 65536 ? (size_t)md : 65536;                     /* (as setup_ipc_tables() sets it) */
+    assert(auxlog_rec_cap() == g_ipc_pack_max - sizeof(udp_ipc_t));
+    g_plug_ctrl_fd = mgr[0];
+    g_ipc_fds[0][0][1] = rtr[0];
+    g_broker_sock = -1;
+    g_num_frontend_routers = 1;
+    g_num_workers = 1;
+    g_auxlog_ready = true;
+    auxlog_changed();
+    assert(g_auxlog_owed == 0);                                              /* (the old code: AUXLOG_MANAGER | AUXLOG_ROUTER(0), EMSGSIZE at every push) */
+    static uint8_t got[KLS_MAX + 200];
+    kls_state_t s;
+    ssize_t k = recv(mgr[1], got, sizeof(got), MSG_DONTWAIT);
+    assert(k > 0 && kls_parse(got, (size_t)k, &s) == NULL && !s.has_spec && s.debug_level == 3);
+    k = recv(rtr[1], got, sizeof(got), MSG_DONTWAIT);
+    assert(k > (ssize_t)sizeof(udp_ipc_t));
+    {
+        udp_ipc_t h;
+        memcpy(&h, got, sizeof(h));
+        assert(h.sock_fd_idx == UDP_IPC_LOGSTATE && h.payload_len == (size_t)k - sizeof(h));
+        assert(kls_parse(got + sizeof(h), h.payload_len, &s) == NULL && !s.has_spec && s.debug_level == 3);
+    }
+    /* a limit lowered after the start: EMSGSIZE is not owed for ever (a cap above the kernel's limit stands for it) */
+    g_ipc_pack_max = KLS_MAX + sizeof(udp_ipc_t);
+    auxlog_changed();
+    assert(g_auxlog_owed == 0);
+    assert(recv(mgr[1], got, sizeof(got), MSG_DONTWAIT) < 0 && recv(rtr[1], got, sizeof(got), MSG_DONTWAIT) < 0);
+    close(mgr[0]);
+    close(mgr[1]);
+    close(rtr[0]);
+    close(rtr[1]);
+    g_ipc_pack_max = saved_max;
+    g_plug_ctrl_fd = saved_plug;
+    g_broker_sock = saved_broker;
+    g_ipc_fds[0][0][1] = saved_ipc;
+    g_num_frontend_routers = saved_routers;
+    g_num_workers = saved_workers;
+    g_auxlog_ready = false;
+    klog_set_debug_level(0);
+    test_retire_runtime(NULL);
+    for (unsigned i = 0; i < nch; i++) unlink(paths[i]);
+    rmdir(dir);
+    printf("  -> a record above net.local.dgram.maxdgram passed.\n");
+}
+
+/* log_rl_ok(): at most one line a second; the events held back are added up and said in the next one */
+static void test_log_rl_ok(void) {
+    printf("[TEST] log_rl_ok: one line a second, the rest counted...\n");
+    log_rl_t rl;
+    memset(&rl, 0, sizeof(rl));
+    unsigned long held = 99;
+    time_t t0 = time(NULL);
+    while (time(NULL) == t0) usleep(1000);                                  /* (the start of a second: the calls below are in it) */
+    assert(log_rl_ok(&rl, 1, &held) && held == 0);
+    int yes = 0;
+    for (int i = 0; i < 1000; i++) yes += log_rl_ok(&rl, 2, &held) ? 1 : 0;
+    const time_t t1 = time(NULL);
+    if (t1 == rl.last) {
+        assert(yes == 0 && rl.held == 2000);
+        while (time(NULL) == t1) usleep(1000);
+        assert(log_rl_ok(&rl, 1, &held) && held == 2000 && rl.held == 0);
+    }
+    printf("  -> log_rl_ok passed.\n");
+}
+
 /* a record of file channels (severity dynamic) for the categories general and database, at debug level dl; a path "*name" is a default_debug
  * channel (KLS_CF_DEBUG_ONLY), "=name" a syslog channel of facility local5 */
 static size_t klog_forge(uint8_t *rec, size_t cap, const char *const *paths, int n, int dl) {
@@ -9455,6 +9573,8 @@ int main(void) {
         test_klog_routing();
         test_klog_debug_level();
         test_klog_aux_state();
+        test_klog_aux_maxdgram();
+        test_log_rl_ok();
         test_klog_aux_limits();
         test_klog_destinations_and_batches();
         test_klog_rolling();
@@ -9556,6 +9676,8 @@ int main(void) {
     test_klog_routing();
     test_klog_debug_level();
     test_klog_aux_state();
+    test_klog_aux_maxdgram();
+    test_log_rl_ok();
     test_klog_aux_limits();
     test_klog_destinations_and_batches();
     test_klog_rolling();

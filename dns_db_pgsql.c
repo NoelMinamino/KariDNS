@@ -1282,6 +1282,33 @@ static int pg_changes_max(db_conn_t *c, uint64_t *seq) {
     return snapshot_xmin(c, seq);
 }
 
+/* What the open snapshot sees of one zone's change log (dns_db_driver.h changes_cover): the xmin, and the transactions at or above it whose rows of the
+ * zone are visible.  A transaction that committed before the snapshot is above its xmin when an older one was still running (the second worker of the
+ * signer, any long transaction): the xmin alone left such a zone on the list of the zones that wait for the signer until its next reload (CI flake row 19).
+ * The rows the snapshot does not see (a transaction still open) are not listed: their zone is a change.  karidns_changes_xid_idx keeps it to the rows
+ * since the xmin. */
+static int pg_changes_cover(db_conn_t *c, int64_t domain_id, uint64_t *cursor, uint64_t *xids, unsigned max, unsigned *n) {
+    *n = 0;
+    int ret = pg_changes_max(c, cursor);
+    if (ret != 0) return ret;
+    char p1[32], p2[32], p3[16];
+    snprintf(p1, sizeof(p1), "%lld", (long long)domain_id);
+    snprintf(p2, sizeof(p2), "%llu", (unsigned long long)*cursor);
+    snprintf(p3, sizeof(p3), "%u", max + 1);
+    const char *pv[3] = { p1, p2, p3 };
+    PGresult *r = NULL;
+    ret = exec_rows(c, "SELECT DISTINCT xid::text::bigint AS x FROM karidns_changes WHERE xid >= $2::xid8 AND domain_id = $1::bigint ORDER BY x DESC LIMIT $3::bigint",
+                    3, pv, &r, "changes_cover");
+    if (ret != 0) return ret;
+    const int nt = PQntuples(r);
+    for (int i = 0; i < nt; i++) {
+        if ((unsigned)i < max) xids[i] = strtoull(PQgetvalue(r, i, 0), NULL, 10);
+        (*n)++;
+    }
+    PQclear(r);
+    return 0;
+}
+
 typedef struct { db_change_cb cb; void *ud; } cl_t;
 
 static int cl_row(db_conn_t *c, PGresult *r, int i, void *ud) {
@@ -1470,13 +1497,13 @@ static int pg_changes_page(db_conn_t *c, db_change_pos_t *pos, unsigned limit, d
     if (!c->has_changes) return need_schema3(c, "changes_page", "karidns_changes");
     /* The window: `limit` log rows of the transactions at or above the drain's floor (xid >= cursor) with seq above the drain's progress, one entry per
      * domain (its highest seq), the domain's existence and the snapshot's xmin from the same statement (x is always one row, so the xmin comes even
-     * when the window is empty); mn, mx and cnt describe the whole window. */
+     * when the window is empty); mn, mx and cnt describe the whole window; xl and xh are the lowest and highest xid of the domain's rows in the window (the loader's cover marks, cov_range()). */
     static const char sql[] =
-        "WITH w AS (SELECT seq, domain_id FROM karidns_changes WHERE xid >= $1::xid8 AND seq > $2::bigint ORDER BY seq LIMIT $3::bigint), "
+        "WITH w AS (SELECT seq, domain_id, xid::text::bigint AS xi FROM karidns_changes WHERE xid >= $1::xid8 AND seq > $2::bigint ORDER BY seq LIMIT $3::bigint), "
         "a AS (SELECT domain_id, seq, min(seq) OVER () AS mn, max(seq) OVER () AS mx, count(*) OVER () AS cnt, "
-        "max(seq) OVER (PARTITION BY domain_id) AS dm FROM w), "
+        "max(seq) OVER (PARTITION BY domain_id) AS dm, min(xi) OVER (PARTITION BY domain_id) AS xl, max(xi) OVER (PARTITION BY domain_id) AS xh FROM w), "
         "x AS (SELECT pg_snapshot_xmin(pg_current_snapshot())::text AS xm) "
-        "SELECT a.domain_id, a.seq, EXISTS (SELECT 1 FROM domains d WHERE d.id = a.domain_id), a.mn, a.mx, a.cnt, x.xm "
+        "SELECT a.domain_id, a.seq, EXISTS (SELECT 1 FROM domains d WHERE d.id = a.domain_id), a.mn, a.mx, a.cnt, x.xm, a.xl, a.xh "
         "FROM x LEFT JOIN a ON a.seq = a.dm ORDER BY a.seq";
     char p1[32], p2[32], p3[32];
     snprintf(p1, sizeof(p1), "%llu", (unsigned long long)pos->cursor);
@@ -1499,6 +1526,8 @@ static int pg_changes_page(db_conn_t *c, db_change_pos_t *pos, unsigned limit, d
         e.seq = strtoull(PQgetvalue(r, i, 1), NULL, 10);
         e.domain_id = cell_i64(r, i, 0);
         e.op = cell_true(r, i, 2) ? DB_CHANGE_UPSERT : DB_CHANGE_DELETE;
+        e.pos_lo = strtoull(PQgetvalue(r, i, 7), NULL, 10);
+        e.pos_hi = strtoull(PQgetvalue(r, i, 8), NULL, 10);
         if (cb(ud, &e) != 0) {
             ret = DB_STOPPED;
             break;
@@ -2427,7 +2456,7 @@ const db_driver_t db_driver_postgresql = {
     .begin_snapshot = pg_begin_snapshot, .end_snapshot = pg_end_snapshot, .list_zones = pg_list_zones,
     .scan_records = pg_scan_records, .scan_metadata = pg_scan_metadata, .zones_with_keys = pg_zones_with_keys,
     .changes_since = pg_changes_since, .wait_fd = pg_wait_fd, .drain_notifications = pg_drain_notifications,
-    .report_status = pg_report_status, .changes_max = pg_changes_max, .scan_records_range = pg_scan_records_range,
+    .report_status = pg_report_status, .changes_max = pg_changes_max, .changes_cover = pg_changes_cover, .scan_records_range = pg_scan_records_range,
     .scan_domain_views = pg_scan_domain_views, .scan_profiles = pg_scan_profiles, .scan_ext = pg_scan_ext,
     .poll_version = pg_poll_version,
     .changes_unsettled = true,

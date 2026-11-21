@@ -1924,23 +1924,31 @@ static uint32_t tcp_ms_until(int64_t deadline_ms, int64_t now_ms) {
   return deadline_ms > now_ms ? (uint32_t)(deadline_ms - now_ms) : 1;
 }
 
+/* A log line about what can come at the rate of the packets (a full queue, a datagram of a hostile Backend): at most one a second per thread (the
+ * caller's log_rl_t is _Thread_local); the events held back meanwhile are added up and *held says how many in the next line. */
+STATIC_TEST bool log_rl_ok(log_rl_t *rl, unsigned long n, unsigned long *held) {
+  const time_t now = time(NULL);
+  if (now == rl->last) {
+    rl->held += n;
+    return false;
+  }
+  rl->last = now;
+  *held = rl->held;
+  rl->held = 0;
+  return true;
+}
+
 // UDP / IPC 送信失敗のログ。ホットパスで syslog が溢れないよう、スレッドごとに
-// 1 秒 1 回へ間引き、間引いた件数を次のログにまとめて出す。
+// 1 秒 1 回へ間引き、間引いた件数を次のログにまとめて出す (log_rl_ok)。
 // is_ipc: Frontend/Backend 間の AF_UNIX SOCK_DGRAM (EMSGSIZE は net.local.dgram.maxdgram 超過)
 static void log_udp_send_drop(const char *path, bool is_ipc, int err, int dropped) {
-  static _Thread_local time_t last_log;
-  static _Thread_local unsigned long suppressed;
-  time_t now = time(NULL);
-  if (now == last_log) {
-    suppressed += (unsigned long)dropped;
-    return;
-  }
-  last_log = now;
+  static _Thread_local log_rl_t rl;
+  unsigned long suppressed = 0;
+  if (!log_rl_ok(&rl, (unsigned long)dropped, &suppressed)) return;
   syslog(LOG_WARNING, "[%s] dropped %d UDP message(s): %s%s (+%lu suppressed in the last second)",
          path, dropped, strerror(err),
          (is_ipc && err == EMSGSIZE) ? "; reply exceeds net.local.dgram.maxdgram - IPC header" : "",
          suppressed);
-  suppressed = 0;
 }
 
 /* ---- the size of a socket buffer (SO_RCVBUF / SO_SNDBUF): one helper for the IPC queues and the UDP sockets (0.7) ----
@@ -4885,23 +4893,45 @@ STATIC_TEST bool auxlog_send_router(int r, const uint8_t *rec, size_t n) {
   return sendmsg(g_ipc_fds[r][0][1], &mh, MSG_DONTWAIT | MSG_NOSIGNAL) == (ssize_t)(sizeof(hdr) + n);
 }
 
+/* The most bytes of a record: the manager and the routers get it as one unix datagram, and the kernel refuses a datagram above net.local.dgram.maxdgram
+ * whatever the buffers are (EMSGSIZE; 8192 on FreeBSD 15.1, below KLS_MAX).  g_ipc_pack_max is that sysctl, read by setup_ipc_tables() before the fork (the
+ * Backend cannot read it in capability mode); a router's datagram has the udp_ipc_t header in front.  A larger record would stay owed for ever and be sent
+ * again every second: it goes as the level alone instead (klog_state_encode(), the WARNING below). */
+STATIC_TEST size_t auxlog_rec_cap(void) {
+  const size_t c = g_ipc_pack_max > sizeof(udp_ipc_t) ? g_ipc_pack_max - sizeof(udp_ipc_t) : 0;
+  return c < KLS_MAX ? c : KLS_MAX;
+}
+
+/* a send that failed: EMSGSIZE never goes (net.local.dgram.maxdgram was lowered since the start), so it is not owed any more; anything else (a full queue) is
+ * sent again by the timer */
+static bool auxlog_gave_up(const char *who, int err) {
+  if (err != EMSGSIZE) return false;
+  syslog(LOG_WARNING, "[Logging] The debug level and the logging configuration do not fit one datagram to the %s (net.local.dgram.maxdgram is smaller than "
+                      "at the start); it keeps what it has", who);
+  return true;
+}
+
 STATIC_TEST void auxlog_push(void) {
   if (!g_auxlog_ready || g_auxlog_owed == 0) return;
   static uint8_t rec[KLS_MAX];
   bool dropped = false;
-  size_t n = klog_state_encode(rec, sizeof(rec), &dropped);
+  const size_t cap = auxlog_rec_cap();
+  size_t n = klog_state_encode(rec, cap, &dropped);
   if (n == 0) return;
   if (dropped && !g_auxlog_spec_warned) {
     g_auxlog_spec_warned = true;
-    syslog(LOG_WARNING, "[Logging] The logging configuration does not fit the record for the manager, the routers and the broker (more than %d "
-                        "bytes, or a file path longer than %d bytes); they follow the debug level but keep the channels of the start-up",
-           KLS_MAX, KLS_PATH_MAX);
+    syslog(LOG_WARNING, "[Logging] The logging configuration does not fit the record for the manager, the routers and the broker (more than %zu "
+                        "bytes: one datagram of net.local.dgram.maxdgram, or a file path longer than %d bytes); they follow the debug level but keep the "
+                        "channels of the start-up",
+           cap, KLS_PATH_MAX);
   }
   if (g_auxlog_owed & AUXLOG_MANAGER) {
-    if (g_plug_ctrl_fd < 0 || send(g_plug_ctrl_fd, rec, n, MSG_DONTWAIT | MSG_NOSIGNAL) == (ssize_t)n) g_auxlog_owed &= ~AUXLOG_MANAGER;
+    if (g_plug_ctrl_fd < 0 || send(g_plug_ctrl_fd, rec, n, MSG_DONTWAIT | MSG_NOSIGNAL) == (ssize_t)n || auxlog_gave_up("manager", errno))
+      g_auxlog_owed &= ~AUXLOG_MANAGER;
   }
   for (int r = 0; r < g_num_frontend_routers && r < MAX_FRONTEND_ROUTERS; r++)
-    if ((g_auxlog_owed & AUXLOG_ROUTER(r)) && (g_num_workers <= 0 || auxlog_send_router(r, rec, n))) g_auxlog_owed &= ~AUXLOG_ROUTER(r);
+    if ((g_auxlog_owed & AUXLOG_ROUTER(r)) && (g_num_workers <= 0 || auxlog_send_router(r, rec, n) || auxlog_gave_up("router", errno)))
+      g_auxlog_owed &= ~AUXLOG_ROUTER(r);
   if (g_auxlog_owed & AUXLOG_BROKER) {
     if (!broker_send_logstate(rec, n) && g_broker_sock >= 0)
       syslog(LOG_WARNING, "[Logging] The connect broker did not take the debug level and the logging configuration");
@@ -7462,8 +7492,11 @@ STATIC_TEST void run_frontend_router(pid_t backend_pid, int router_id) {
           udp_ipc_t *msg = (udp_ipc_t *)buffer;
           ssize_t max_valid_payload = len - (ssize_t)sizeof(udp_ipc_t);
           if (msg->payload_len > max_valid_payload) {
-            syslog(LOG_WARNING, "[Frontend %d] Dropping NOTIFY message with inconsistent payload_len (%u > %zd)",
-                   router_id, msg->payload_len, max_valid_payload);
+            static _Thread_local log_rl_t rl_notify;
+            unsigned long held = 0;
+            if (log_rl_ok(&rl_notify, 1, &held))
+              syslog(LOG_WARNING, "[Frontend %d] Dropping NOTIFY message with inconsistent payload_len (%u > %zd; +%lu suppressed in the last second)",
+                     router_id, msg->payload_len, max_valid_payload, held);
             continue;
           }
           if (msg->sock_fd_idx == -2) {
@@ -7660,8 +7693,11 @@ STATIC_TEST void run_frontend_router(pid_t backend_pid, int router_id) {
             if (frc != UDP_IPC_FRAME_OK) {
               ipcd_add(frc == UDP_IPC_FRAME_SHORT ? IPCD_RREP_SHORT : IPCD_RREP_BADLEN, 1);
               if (fstart > 0) ipcd_add(IPCD_RREP_CUT, 1);
-              if (frc == UDP_IPC_FRAME_BADLEN)
-                syslog(LOG_WARNING, "[Frontend %d] Dropping backend reply with inconsistent payload_len", router_id);
+              static _Thread_local log_rl_t rl_badlen;
+              unsigned long held = 0;
+              if (frc == UDP_IPC_FRAME_BADLEN && log_rl_ok(&rl_badlen, 1, &held))
+                syslog(LOG_WARNING, "[Frontend %d] Dropping backend reply with inconsistent payload_len (+%lu suppressed in the last second; "
+                                    "counted: karictl ipcstats router.reply.bad_length)", router_id, held);
               break;
             }
             uint8_t *const payload = dg + (fstart + sizeof(udp_ipc_t));   /* (the frame's payload: inside dg, checked by udp_ipc_frame_next()) */

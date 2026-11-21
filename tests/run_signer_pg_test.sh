@@ -105,7 +105,6 @@ if [ "$(id -u)" = "0" ] && [ -n "$PG_AS" ] && [ -x ./karidns ] && [ -x ./dag ] &
 SG_SERVER=$SERVER
 PORT=$(kari_port 0 $((20000 + $$ % 20000)))
 SECRET="dGVzdC1zZWNyZXQtMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3"
-qa_dnssec() { ./dag @127.0.0.1 -p "$PORT" "$1" "$2" +dnssec +nohexdump +time=3 +tries=1 2>&1; }
 sg_dbstatus() { ./karictl -c "$T/main-karictl.conf" dbstatus 2>&1; }
 if [ $SERVER = 1 ]; then
     install -o root -g wheel -m 755 ./karidns-dbloader "$T/karidns-dbloader" 2>/dev/null || { cp ./karidns-dbloader "$T/karidns-dbloader"; chown 0:0 "$T/karidns-dbloader"; chmod 755 "$T/karidns-dbloader"; }

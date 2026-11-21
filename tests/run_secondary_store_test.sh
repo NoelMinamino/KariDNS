@@ -153,6 +153,7 @@ ctl() { "$KARICTL" -f "$W/karictl.conf" "$@" 2>&1; }
 STORE="zone-store \"$W/store\";"
 
 start_primary() {
+    port_free "$PPORT" "$W/primary.conf"
     "$KARIDNS" -f "$W/primary.conf" > "$W/p.log" 2>&1 &
     PPID_=$!
     kari_wait_answer "$DAG" "$PPORT" sec.test. 15 || { cat "$W/p.log"; fail "the primary did not start"; }
@@ -177,9 +178,20 @@ proc_state() {
     echo "sockets named ctl.sock (the server binds it by its directory: sockstat shows the name only):"
     sockstat -u 2>/dev/null | grep -F " ctl.sock" || true
 }
+# port_free PORT CONF: no socket is bound to 127.0.0.1:PORT/udp any more; else the holders and the processes of CONF are printed and the test fails.  A start beside a
+# server of the previous step that is still there shares its port (SO_REUSEPORT): queries and karictl could reach the old one.  Rows 5 and 6 of the CI flakes
+# (check 8 served the serial the old instance had in memory, check 12 read the counters of the old one) are read as that, before #231 made wait_gone() see the
+# karidns-evict processes; this says so if it happens again.
+port_free() {
+    _pf=$(sockstat -4 -P udp -p "$1" 2>/dev/null | awk -v a="127.0.0.1:$1" 'NR > 1 && $6 == a')
+    [ -z "$_pf" ] && return 0
+    echo "port $1/udp is still held:"; printf '%s\n' "$_pf"; proc_state "$2"
+    fail "a server of the previous step still holds port $1"
+}
 stop_primary() { _sp=$PPID_; [ -n "$PPID_" ] && kari_kill_tree "$PPID_"; PPID_=""; kari_kill_conf "$W/primary.conf"; wait_gone "$_sp" "$W/primary.conf"; }
 # start_secondary [env...]: the log of this run is $W/s.log (the one before is appended to $W/s.all)
 start_secondary() {
+    port_free "$SPORT" "$W/secondary.conf"
     [ -f "$W/s.log" ] && cat "$W/s.log" >> "$W/s.all"
     env "$@" "$KARIDNS" -f "$W/secondary.conf" > "$W/s.log" 2>&1 &
     SPID=$!
