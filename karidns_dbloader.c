@@ -427,6 +427,7 @@ typedef struct { inv_ent_t **tab; size_t nb, count; } inv_t;
 
 /* per source (view name): the change log position of the last complete load, and (B9) the state of its auto reload */
 #define AUTO_ERRLEN 160
+#define COV_XIDS 8                           /* vstate_t.cov: the transactions above the cursor one entry keeps; more are not covered (the zone may be listed) */
 typedef struct {
     uint64_t seq;
     bool seq_valid;
@@ -450,8 +451,10 @@ typedef struct {
     size_t nsigw;
     /* A one-zone reload (a reload request, karictl reload <zone>) reads a signer zone as it is, up to the change log position m (the cursor of changes_max() in its
      * snapshot).  The rows of that zone up to m are in what it read; when the poll of the auto reload reaches them later they are not a change of the zone, and the
-     * zone must not go back on the list above.  One entry per zone of the signer that was reloaded so; sorted by domain id. */
-    struct cov { int64_t id; uint64_t m; } *cov;
+     * zone must not go back on the list above.  One entry per zone of the signer that was reloaded so; sorted by domain id.  PostgreSQL (0.7, CI flake row 19): m is the
+     * xmin of the snapshot, and the snapshot also saw transactions above it that committed after an older one began (the other worker of the signer): x[0 .. nx)
+     * are those of the zone (changes_cover()), the rows of the zone it read above m. */
+    struct cov { int64_t id; uint64_t m; uint8_t nx; uint64_t x[COV_XIDS]; } *cov;
     size_t ncov;
     /* 0.7 WP7a (the store protocol): the identity of the database `seq` belongs to; whether the Backend's cursor (CONFIG) was looked at; a source without a change log
      * that is listed again at every change is not listed before hold_until (decision D3: ten times the last pass above 100,000 zones) */
@@ -1122,27 +1125,55 @@ static size_t cov_find(const vstate_t *vs, int64_t id) {
     return lo;
 }
 
-static bool cov_covers(const vstate_t *vs, bool unsettled, int64_t id, uint64_t pos) {
-    if (!vs->ncov) return false;
-    size_t i = cov_find(vs, id);
-    if (i >= vs->ncov || vs->cov[i].id != id) return false;
-    return unsettled ? pos < vs->cov[i].m : pos <= vs->cov[i].m;
+/* is the row at pos (cursor units) settled below the entry's cursor, or a transaction above it that the reload saw (PostgreSQL) */
+static bool cov_pos(const struct cov *c, bool unsettled, uint64_t pos) {
+    if (unsettled ? pos < c->m : pos <= c->m) return true;
+    for (unsigned k = 0; k < c->nx; k++)
+        if (c->x[k] == pos) return true;
+    return false;
 }
 
-/* remember (or move forward) the position the zone was read up to; -1 on out of memory */
-static int cov_set(vstate_t *vs, int64_t id, uint64_t m) {
+static const struct cov *cov_of(const vstate_t *vs, int64_t id) {
+    if (!vs->ncov) return NULL;
     size_t i = cov_find(vs, id);
-    if (i < vs->ncov && vs->cov[i].id == id) {
-        if (m > vs->cov[i].m) vs->cov[i].m = m;
+    return i < vs->ncov && vs->cov[i].id == id ? &vs->cov[i] : NULL;
+}
+
+static bool cov_covers(const vstate_t *vs, bool unsettled, int64_t id, uint64_t pos) {
+    const struct cov *c = cov_of(vs, id);
+    return c && cov_pos(c, unsettled, pos);
+}
+
+/* the store protocol: an entry of changes_page() stands for the domain's rows of a page, whose positions are lo .. hi.  Covered when every one of them is:
+ * all below the cursor (hi is), or one transaction the reload saw (lo == hi); rows of several transactions above the cursor are a change (the ones between
+ * lo and hi are not known: the zone may be listed, as before) */
+static bool cov_range(const vstate_t *vs, bool unsettled, int64_t id, uint64_t lo, uint64_t hi) {
+    const struct cov *c = cov_of(vs, id);
+    if (!c) return false;
+    if (unsettled ? hi < c->m : hi <= c->m) return true;
+    return lo == hi && cov_pos(c, unsettled, hi);
+}
+
+/* remember (or move forward) what the zone was read up to: the cursor m and the transactions above it that the reload saw (x[0 .. nx), PostgreSQL); a later
+ * reload (m not lower) replaces both, its snapshot sees what the earlier one saw.  -1 on out of memory */
+static int cov_set(vstate_t *vs, int64_t id, uint64_t m, const uint64_t *x, unsigned nx) {
+    if (nx > COV_XIDS) nx = COV_XIDS;
+    size_t i = cov_find(vs, id);
+    if (!(i < vs->ncov && vs->cov[i].id == id)) {
+        struct cov *n = realloc(vs->cov, (vs->ncov + 1) * sizeof(*n));
+        if (!n) return -1;
+        vs->cov = n;
+        memmove(&n[i + 1], &n[i], (vs->ncov - i) * sizeof(*n));
+        n[i].id = id;
+        n[i].m = 0;
+        n[i].nx = 0;
+        vs->ncov++;
+    } else if (m < vs->cov[i].m) {
         return 0;
     }
-    struct cov *n = realloc(vs->cov, (vs->ncov + 1) * sizeof(*n));
-    if (!n) return -1;
-    vs->cov = n;
-    memmove(&n[i + 1], &n[i], (vs->ncov - i) * sizeof(*n));
-    n[i].id = id;
-    n[i].m = m;
-    vs->ncov++;
+    vs->cov[i].m = m;
+    vs->cov[i].nx = (uint8_t)nx;
+    if (nx) memcpy(vs->cov[i].x, x, nx * sizeof(*x));
     return 0;
 }
 
@@ -1158,6 +1189,13 @@ static void cov_clear(vstate_t *vs) {
     free(vs->cov);
     vs->cov = NULL;
     vs->ncov = 0;
+}
+
+/* what the open snapshot of a one-zone reload has read of the change log of domain id: the cursor, and (PostgreSQL) the transactions above it whose rows of
+ * the zone it saw (dns_db_driver.h changes_cover).  0, or the driver's error */
+static int cov_read(const ctx_t *x, int64_t id, uint64_t *m, uint64_t *xs, unsigned *nx) {
+    *nx = 0;
+    return x->drv->changes_cover ? x->drv->changes_cover(x->conn, id, m, xs, COV_XIDS, nx) : x->drv->changes_max(x->conn, m);
 }
 
 static int chg_cb(void *ud, const db_change_row_t *r) {
@@ -2843,10 +2881,12 @@ static int plan_diff(ctx_t *x, const db_schema_info_t *si, const char *only_zone
         uint64_t m = 0;
         int64_t zero = 0;
         bool yes = false;
-        if (x->drv->changes_max(x->conn, &m) == 0) {
+        uint64_t xs[COV_XIDS];
+        unsigned nx = 0;
+        if (cov_read(x, x->zones[0].id, &m, xs, &nx) == 0) {
             zones_are_signers(x, &zero, 1, &yes);
             if (yes) {
-                if (cov_set(vs, x->zones[0].id, m) != 0) return -1;
+                if (cov_set(vs, x->zones[0].id, m, xs, nx) != 0) return -1;
             } else {
                 cov_del(vs, x->zones[0].id);
             }
@@ -3515,13 +3555,15 @@ static int st_pass(ctx_t *x, uint64_t cursor, bool cursor_valid) {
 }
 
 /* ---- a drain ---- */
-typedef struct { uint64_t seq; int64_t id; uint8_t op; } st_item_t;
+typedef struct { uint64_t seq, lo, hi; int64_t id; uint8_t op; } st_item_t;
 typedef struct { st_item_t *v; size_t n, cap; } st_items_t;
 
 static int st_item_cb(void *ud, const db_change_entry_t *e) {
     st_items_t *it = ud;
     if (it->n >= it->cap) return 1;
     it->v[it->n].seq = e->seq;
+    it->v[it->n].lo = e->pos_lo;
+    it->v[it->n].hi = e->pos_hi;
     it->v[it->n].id = e->domain_id;
     it->v[it->n].op = e->op == DB_CHANGE_DELETE ? KDB_CH_DELETE : KDB_CH_UPSERT;
     it->n++;
@@ -3707,7 +3749,7 @@ static int st_drain(ctx_t *x, const db_schema_info_t *si, uint64_t *cursor, bool
         /* the entries of a one-zone reload that read the zone as it was (signer zones) are not changes any more */
         size_t w = 0;
         for (size_t i = 0; i < it.n; i++)
-            if (!(vs->ncov && cov_covers(vs, x->drv->changes_unsettled, it.v[i].id, it.v[i].seq))) it.v[w++] = it.v[i];
+            if (!(vs->ncov && cov_range(vs, x->drv->changes_unsettled, it.v[i].id, it.v[i].lo, it.v[i].hi))) it.v[w++] = it.v[i];
         it.n = w;
         qsort(it.v, it.n, sizeof(*it.v), cmp_item_id);       /* (one entry per domain in a page: the order of the entries does not matter, the runs of ids do) */
         memset(held, 0, it.n * sizeof(bool));
@@ -3942,10 +3984,12 @@ static int st_emit_listed(ctx_t *x, const db_schema_info_t *si, const char *only
         if (si->has_changes && io->cfg.signer_wait && x->drv->changes_max) {
             uint64_t m = 0;
             bool yes = false;
-            if (x->drv->changes_max(x->conn, &m) == 0) {
+            uint64_t xs[COV_XIDS];
+            unsigned nx = 0;
+            if (cov_read(x, z->id, &m, xs, &nx) == 0) {
                 ids_are_signers(x, &z->id, 1, &yes);
                 if (yes) {
-                    if (cov_set(vs, z->id, m) != 0) return EXIT_ERROR;
+                    if (cov_set(vs, z->id, m, xs, nx) != 0) return EXIT_ERROR;
                 } else {
                     cov_del(vs, z->id);
                 }

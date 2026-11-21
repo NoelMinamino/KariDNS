@@ -2367,6 +2367,28 @@ static void test_growth_sync_fails(void) {
   tdir_free(&d);
 }
 
+/* New zones (from *next, below limit) until a build of the next index begins (3/8 of the slots in use), then a wait for at_hook() (the build is at
+ * the hook of its step 1) with no more zones.  The writers used to go on putting meanwhile, and the old index reached one half while the build was
+ * still being made on a loaded runner (its files, the pass over zt: no CPU for it): the growth was then made inside the mutex and the build dropped,
+ * which is not what these tests look at (CI flake row 11, test_store regrow got[6]).  0: at the hook; 1: no build, or it did not get there in 20 s;
+ * -1: a put failed. */
+static int fill_to_build(store_t *s, uint32_t *next, uint32_t limit, bool (*at_hook)(void)) {
+  store_stats_t st;
+  for (;;) {
+    if (at_hook()) return 0;
+    if (*next >= limit) return 1;
+    store_stats(s, &st);
+    if (st.ix_used * 8 > st.ix_slots * 3) {
+      for (int w = 0; w < 20000; w++) {
+        if (at_hook()) return 0;
+        usleep(1000);
+      }
+      return 1;
+    }
+    if (put_i(s, 0, (*next)++, 1, NULL) != 0) return -1;
+  }
+}
+
 /* A growth built outside the mutex is put in after a clean checkpoint was made meanwhile (the stop of a server that a straggler follows): its record is a change after the clean flag,
  * so the flag is cleared on disk first, as for any writer (the open after a reboot then rebuilds, as after every unclean stop). */
 static store_t *g_cg_store;
@@ -2378,6 +2400,7 @@ static void cg_hook(int step) {
     atomic_store(&g_cg_done, store_checkpoint_clean(g_cg_store) == 0 ? 1 : -1);
   }
 }
+static bool cg_wants(void) { return atomic_load(&g_cg_want) != 0; }
 static void test_clean_then_growth(void) {
   printf("[a growth built outside the mutex after a clean checkpoint]\n");
   tdir_t d;
@@ -2393,10 +2416,7 @@ static void test_clean_then_growth(void) {
     g_cg_store = s;
     atomic_store(&store_test_regrow_hook, cg_hook);
     uint32_t i = 0;
-    while (!atomic_load(&g_cg_want) && i < 20000) {                    /* (until a build begins and its hook asks for the clean checkpoint) */
-      if (put_i(s, 0, i++, 1, NULL) != 0) _exit(3);
-      usleep(200);
-    }
+    if (fill_to_build(s, &i, 20000, cg_wants) < 0) _exit(3);           /* (until a build begins and its hook asks for the clean checkpoint) */
     atomic_store(&g_cg_idle, 1);
     for (int w = 0; w < 10000 && atomic_load(&g_cg_done) == 0; w++) usleep(1000);
     if (atomic_load(&g_cg_done) != 1) _exit(4);
@@ -2442,6 +2462,7 @@ static void slow_at(int step) {
 }
 static void slow_ckpt(int step) { slow_at(step); }
 static void slow_regrow(int step) { slow_at(10 + step); }
+static bool in_slow(void) { return atomic_load(&g_in_slow); }
 static void *ckpt_call(void *arg) {
   (void)store_checkpoint(arg);
   return NULL;
@@ -2510,13 +2531,15 @@ static void test_no_wait_in_lock(int mode) {
     store_stats(s, &st);
     const uint64_t bg0 = st.growths_background, g0 = st.growths;
     uint32_t next = 300;
-    while (!atomic_load(&g_in_slow) && next < 90000) {
-      if (put_i(s, 0, next, 1, NULL) != 0) _exit(8);
-      next++;
+    const int fr = fill_to_build(s, &next, 90000, in_slow);
+    if (fr < 0) _exit(8);
+    if (fr > 0) {
       store_stats(s, &st);
-      if (st.ix_used * 8 > st.ix_slots * 3) usleep(2000);             /* (the build began: give it the time to reach its wait before the old index is half full) */
+      printf("  regrow: no build at its hook: growths %" PRIu64 " (before %" PRIu64 "), background %" PRIu64 ", ix_used %" PRIu64 " of %" PRIu64 " slots, %u zones\n", (uint64_t)st.growths, g0,
+             (uint64_t)st.growths_background, (uint64_t)st.ix_used, (uint64_t)st.ix_slots, next);
+      fflush(stdout);
+      _exit(9);
     }
-    if (!atomic_load(&g_in_slow)) _exit(9);
     store_stats(s, &st);
     const uint64_t room = (st.ix_slots / 2 - st.ix_used) / 3;          /* (stay below one half of the old index: no growth inside the mutex) */
     worst = 0;
@@ -2540,7 +2563,10 @@ static void test_no_wait_in_lock(int mode) {
     out[4] = worst;
     out[5] = ops;
     out[6] = st.growths_background > bg0 && st.growths == g0 + (st.growths_background - bg0);
-    if (!out[6]) printf("  regrow: growths %" PRIu64 " (before %" PRIu64 "), background %" PRIu64 " (before %" PRIu64 "), ix_used %" PRIu64 " of %" PRIu64 " slots, %" PRIu64 " puts in the wait\n", (uint64_t)st.growths, g0, (uint64_t)st.growths_background, bg0, (uint64_t)st.ix_used, (uint64_t)st.ix_slots, ops);
+    if (!out[6]) {
+      printf("  regrow: growths %" PRIu64 " (before %" PRIu64 "), background %" PRIu64 " (before %" PRIu64 "), ix_used %" PRIu64 " of %" PRIu64 " slots, %" PRIu64 " puts in the wait\n", (uint64_t)st.growths, g0, (uint64_t)st.growths_background, bg0, (uint64_t)st.ix_used, (uint64_t)st.ix_slots, ops);
+      fflush(stdout);                                                    /* (the child ends with _exit(): a line left in the buffer of a redirected stdout was never printed) */
+    }
     atomic_store(&store_test_regrow_hook, NULL);
     /* every zone is where the model says: by name and by source id */
     bool ok = true;
@@ -2794,6 +2820,7 @@ static void gc_hook(int step) {
     if (gc_delete(s, 7) != 0 || put_src(s, 8, 3, 778) != 0) atomic_store(&g_gc_bad, 4);
   }
 }
+static bool gc_go(void) { return atomic_load(&g_gc_go) != 0; }
 static bool gc_model_ok(store_t *s, uint32_t next, bool round_writes) {      /* (round_writes: the hook after the first round made its changes) */
   for (uint32_t i = 0; i < next; i++) {
     const bool gone = i == 5 || (round_writes && i == 7);
@@ -2825,10 +2852,10 @@ static void test_growth_catchup(void) {
     atomic_store(&store_test_rg_tail, run == 0 ? 0 : -1);
     atomic_store(&store_test_regrow_hook, gc_hook);
     store_stats_t st;
-    while (!atomic_load(&g_gc_go) && atomic_load(&g_gc_next) < 5000) {
-      CHECK_EQ(put_i(s, 0, atomic_fetch_add(&g_gc_next, 1), 1, NULL), 0);
-      store_stats(s, &st);
-      if (st.ix_used * 8 > st.ix_slots * 3) usleep(2000);               /* (the build began: it reaches its hook long before the old index is half full) */
+    {
+      uint32_t nx = 0;
+      CHECK_EQ(fill_to_build(s, &nx, 5000, gc_go), 0);                 /* (the main thread stops at the build: the changes of the test are the hook's alone) */
+      atomic_store(&g_gc_next, nx);
     }
     atomic_store(&g_gc_idle, 1);
     store_stats(s, &st);
@@ -4183,13 +4210,24 @@ static void test_space(int mode) {
   }
   CHECK(after_known >= 20);                                               /* (most of them: the disk stays full) */
   /* a changed zone that is stored loses its image (its old record is released) and gets the new version as a record */
+  /* (the "disk" is made full again first: room may have come back meanwhile, as said above, and the put would store the image: CI flake row 20, free 304872 of a
+   * reserve of 262144 when the put was made.  Half of the reserve free, and the estimate read now) */
+  g_fake_cap = dir_usage(d.path) + (int64_t)(256u << 10) / 2;
+  store_test_probe(s);
   store_stats_t before;
   store_stats(s, &before);
   CHECK_EQ(put_i(s, 0, 1005, 7, NULL), 0);
   {
     store_zone_t zi;
+    memset(&zi, 0, sizeof(zi));
     uint32_t z = find_i(s, 0, 1005);
-    CHECK(z != STORE_NONE && store_zone_get(s, z, &zi) == 0 && zi.state == STORE_STATE_KNOWN && zi.stamp_gen == 7 && zi.serial == 7);
+    const bool got = z != STORE_NONE && store_zone_get(s, z, &zi) == 0;
+    CHECK(got && zi.state == STORE_STATE_KNOWN && zi.stamp_gen == 7 && zi.serial == 7);
+    if (!got || zi.state != STORE_STATE_KNOWN) {
+      store_stats(s, &st);
+      printf("  zone 1005 after the put of version 7: %s, state %u, img_len %u, stamp_gen %" PRIu64 ", serial %u; free %" PRIu64 " of reserve %" PRIu64 ", degraded puts %" PRIu64 "\n",
+             got ? "found" : "not found", (unsigned)zi.state, (unsigned)zi.img_len, (uint64_t)zi.stamp_gen, (unsigned)zi.serial, st.fs_free_bytes, st.reserve_bytes, st.degraded_puts);
+    }
   }
   store_stats(s, &st);
   CHECK(st.seg_live_bytes < before.seg_live_bytes);

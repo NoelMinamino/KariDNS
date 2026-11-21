@@ -1238,6 +1238,7 @@ static int sq_changes_page(db_conn_t *c, db_change_pos_t *pos, unsigned limit, d
         e.seq = (uint64_t)sqlite3_column_int64(st, 1);
         e.domain_id = sqlite3_column_int64(st, 0);
         e.op = sqlite3_column_int64(st, 2) ? DB_CHANGE_UPSERT : DB_CHANGE_DELETE;
+        e.pos_lo = e.pos_hi = e.seq;                                 /* (one writer: the highest seq of the domain stands for its rows) */
         if (cb(ud, &e) != 0) {
             ret = DB_STOPPED;
             break;

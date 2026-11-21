@@ -15,8 +15,8 @@
 #       - a waiting zone that loses the metadata X-KARIDNS-SIGNER is read as it is at the next batch and leaves the list;
 #   S2  signer-wait no: the same change is served by auto reload, nothing waits; karictl reconfig switches between the two;
 #   S4  the cover marks: a reload request that comes inside the coalesce window, before the batch has read the change rows: the zone does not go on the list when the
-#       batch reaches the rows; a change made after the reload does; a transaction that is open while the reload is made (its xid is above the xmin of the reload's
-#       snapshot is not covered: PostgreSQL leaves such a zone listed until the next reload, documented) is checked as well.
+#       batch reaches the rows; a change made after the reload does; an older transaction that is open while the reload is made: the rows the reload read are above
+#       the xmin of its snapshot and are still covered (0.7: the mark keeps the transactions above the xmin that the snapshot saw), a change after it is not.
 #
 # Needs root (the server starts as root and drops to nobody, the loader must be root-owned and runs as the unprivileged user that can connect to PostgreSQL).  SKIP
 # otherwise, and when PostgreSQL is not reachable (tests/db/pg_lib.sh) or a binary is missing.
@@ -261,10 +261,12 @@ nowait && pass "...and then the list is empty again" || { fail "the list is not 
 setwww sg4b.test 192.0.2.31
 wait_dbst "^    waiting for the signer: 1 zone(s): sg4b.test$" 12 && pass "the mark of one zone does not cover another: sg4b.test waits" || { fail "sg4b.test does not wait"; dbst | sed 's/^/         /'; }
 
-# An old transaction that is still open keeps the xmin of every snapshot low: a row written after it began has a transaction id above the xmin of the reload's snapshot, so
-# the reload does not cover it, and the next batch lists the zone again (the limit written in docs/karidns-signer.md).  The reload that follows the end of that
-# transaction clears the list for good.
-echo "== S4: an open old transaction (the documented limit)"
+# An old transaction that is still open keeps the xmin of every snapshot low: a row written after it began has a transaction id above the xmin of the reload's
+# snapshot.  The reload saw that transaction (it committed before the snapshot), so its cover mark keeps it (changes_cover(): the xids above the xmin): the next
+# batch must not list the zone again.  Until 0.7 the mark was the xmin alone and the zone stayed listed until its next reload (a documented limit), which the
+# second worker of the signer hit in CI (row 19 of the flake record: a zone signed by one worker while the other one's import was open).  A change made after the
+# reload, still behind the open transaction, is not covered and is listed.
+echo "== S4: an open old transaction"
 $KCTL reload > /dev/null 2>&1
 wait_ans www.sg4b.test 192.0.2.31 5 && pass "reload of every zone" || fail "reload of every zone"
 sleep 5
@@ -276,12 +278,17 @@ setwww sg4.test 192.0.2.23
 $KCTL reload sg4.test > /dev/null 2>&1
 wait_ans www.sg4.test 192.0.2.23 3 && pass "the reload serves the change" || fail "the reload did not serve the change"
 sleep 6
-if dbst | grep -q "waiting for the signer: 1 zone(s): sg4.test"; then pass "an open older transaction: the rows are above the xmin of the reload, the zone is listed again (documented)"; else pass "(the zone is not listed: the loader's cursor had passed the rows before the old transaction began)"; fi
+nowait && pass "an open older transaction: the rows the reload read are covered, sg4.test is not listed again" || {
+    fail "the rows the reload read (above the xmin, behind an open older transaction) listed sg4.test again"; dbst | sed 's/^/         /'; }
+setwww sg4.test 192.0.2.24
+wait_dbst "^    waiting for the signer: 1 zone(s): sg4.test$" 12 && pass "...a change after that reload, behind the same open transaction, is a change: sg4.test waits" || {
+    fail "a change after the reload is not noticed behind an open transaction"; dbst | sed 's/^/         /'; }
 kill "$HOLD" 2>/dev/null; wait "$HOLD" 2>/dev/null; HOLD=""
 sleep 1
 $KCTL reload sg4.test > /dev/null 2>&1
+wait_ans www.sg4.test 192.0.2.24 3 && pass "...served after its reload" || fail "the reload did not serve 192.0.2.24"
 sleep 6
-nowait && pass "...the next reload, with no old transaction, clears the list" || { fail "the list is not empty after the reload"; dbst | sed 's/^/         /'; }
+nowait && pass "...and the list is empty again" || { fail "the list is not empty after the reload"; dbst | sed 's/^/         /'; }
 stop_server
 
 if grep -q "killed by signal\|AddressSanitizer\|ThreadSanitizer" "$LOG"; then fail "the loader crashed"; grep -E "killed by signal|Sanitizer|#[0-9] " "$LOG" | head -12 | sed 's/^/         /'; fi

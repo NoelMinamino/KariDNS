@@ -204,11 +204,17 @@ sleep 1
 
 echo "== S1: coalescing: a burst of commits is one batch"
 B0=$(n_auto)
-n=1; while [ $n -le 8 ]; do pq "UPDATE records SET content = '192.0.2.1$n' WHERE name = 'www.z2.test'" > /dev/null; n=$((n + 1)); done
+# (one psql for the 8 commits: psql -f runs each statement in a transaction of its own.  One psql each took more than the 300 ms window twice on a loaded
+# host, and the window is not extended by later commits: "8 commits gave 3 auto batches", CI flake row 21)
+n=1; while [ $n -le 8 ]; do echo "UPDATE records SET content = '192.0.2.1$n' WHERE name = 'www.z2.test';"; n=$((n + 1)); done > "$T/burst.sql"
+t0=$(date +%s%N)
+pf "$T/burst.sql" > /dev/null
+BURST_MS=$((($(date +%s%N) - t0) / 1000000))
 if wait_ans www.z2.test 192.0.2.18 8000; then pass "the last value of the burst is served ($WAIT_MS ms after the burst)"; else fail "the burst: last value not served (got '$got')"; fi
 sleep 1.5
 B1=$(n_auto)
-[ $((B1 - B0)) -le 2 ] && [ $((B1 - B0)) -ge 1 ] && pass "8 commits gave $((B1 - B0)) auto batch(es), not 8" || fail "8 commits gave $((B1 - B0)) auto batches"
+[ $((B1 - B0)) -le 2 ] && [ $((B1 - B0)) -ge 1 ] && pass "8 commits in $BURST_MS ms gave $((B1 - B0)) auto batch(es), not 8" || {
+    fail "8 commits in $BURST_MS ms gave $((B1 - B0)) auto batches"; grep "\[DB\] batch [0-9]* (auto) sent" "$LOG" | tail -n 4 | sed 's/^/         /'; }
 
 echo "== S1: a transaction that stays open does not hide later commits, and loses nothing when it commits"
 # (a) T1 took the lower seq and stays open; an autocommit edit of another zone is served at once; T1's edit when it commits

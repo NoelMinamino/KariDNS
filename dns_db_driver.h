@@ -211,7 +211,8 @@ typedef enum {
  * `domains` table in the page's snapshot, not the logged operation (the log does not record one): upsert then delete is a delete,
  * delete then re-create is an upsert, so entries are idempotent and their order within a page does not matter for correctness
  * (they come in ascending seq). */
-typedef struct { uint64_t seq; int64_t domain_id; db_change_op_t op; } db_change_entry_t;
+typedef struct { uint64_t seq; int64_t domain_id; db_change_op_t op;
+                 uint64_t pos_lo, pos_hi; } db_change_entry_t;   /* 0.7: the lowest and highest position (cursor units: SQLite3 seq, PostgreSQL xid8) of the domain's rows in the page */
 typedef int (*db_change_entry_cb)(void *ud, const db_change_entry_t *e);
 
 /* The position of a change-log drain (a run of changes_page calls until `more` is false).  Initialise it with db_change_pos_init(cursor)
@@ -297,6 +298,12 @@ typedef struct db_driver {
     /* B6a: the highest seq in karidns_changes inside the open snapshot (0 = the table is empty); DB_ERR_UNAVAILABLE when
      * the table does not exist.  Used for the first reading of the change log (no need to list a million rows). */
     int (*changes_max)(db_conn_t *c, uint64_t *seq);
+    /* 0.7 (CI flake row 19): what a one-zone reload of a signer zone has read of the zone's change log, inside its snapshot.  *cursor = changes_max();
+     * xids[0 .. *n) = the positions at or above the cursor (PostgreSQL: the xid8 of the transactions) of the zone's rows that the snapshot sees, the
+     * highest first, at most max of them (*n may be max + 1: more than that).  The cursor alone does not say it on PostgreSQL: a transaction that
+     * committed before the snapshot but after an older one that was still running is above the xmin.  NULL (SQLite3): the cursor says it all
+     * (one writer: a row is in the snapshot when its seq is <= the highest seq). */
+    int (*changes_cover)(db_conn_t *c, int64_t domain_id, uint64_t *cursor, uint64_t *xids, unsigned max, unsigned *n);
     /* B6b: records of domain_id lo..hi (both included), ORDER BY domain_id, id: the bulk scan of one range, so that
      * loader workers with their own connections read disjoint sets of zones. */
     int (*scan_records_range)(db_conn_t *c, int64_t lo, int64_t hi, db_record_cb cb, void *ud);

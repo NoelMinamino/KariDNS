@@ -4180,17 +4180,20 @@ signs the zone and writes the signed data with its serial, then asks for the
 reload: on PostgreSQL a row in \fBkaridns_reload_requests\fR, anywhere with
 \fBkarictl reload <zone>\fR. A reload request reads the zone as it is, and the
 loader remembers, for each zone of the signer that a request read, the position
-of the change log up to which it read it (the highest seq with SQLite3, the xmin
-of the snapshot with PostgreSQL): the rows of that zone up to that position are
-in what the request read, so the poll of the auto reload that reaches them later
-does not put the zone on the list again; a change made after the request
-does. What is \fBnot\fR held back: a zone the Backend does not have yet (a new
-zone is loaded whole, also with the metadata), a full comparison (a loader that
-starts, restarts, finds its place in the change log gone, or sees the database
-file replaced; \fBkarictl reload\fR of every zone; a \fBforce\fR request) and a
-zone the Backend refused. In those moments an unsigned change can be served; the
-signer catches up within seconds. \fBkarictl dbstatus\fR shows the zones that
-wait, under the view: \fBwaiting for the signer: 2 zone(s): example.test,
+of the change log up to which it read it (the highest seq with SQLite3; with
+PostgreSQL the xmin of the snapshot and the transactions above it whose rows of
+the zone the snapshot saw, up to eight: a transaction that committed while an
+older one, such as the other worker of the signer, was still running is above
+the xmin): the rows of that zone up to that position are in what the request
+read, so the poll of the auto reload that reaches them later does not put the
+zone on the list again; a change made after the request does. What is \fBnot\fR
+held back: a zone the Backend does not have yet (a new zone is loaded whole,
+also with the metadata), a full comparison (a loader that starts, restarts,
+finds its place in the change log gone, or sees the database file replaced;
+\fBkarictl reload\fR of every zone; a \fBforce\fR request) and a zone the
+Backend refused. In those moments an unsigned change can be served; the signer
+catches up within seconds. \fBkarictl dbstatus\fR shows the zones that wait,
+under the view: \fBwaiting for the signer: 2 zone(s): example.test,
 example.net\fR (the first six names, then \fBand N more\fR); the line is absent
 when no zone waits, and a signer that stopped shows as a count that does not go
 down. PowerDNS on the same database reads the database live and serves a change

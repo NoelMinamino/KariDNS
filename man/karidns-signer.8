@@ -1,4 +1,4 @@
-.TH KARIDNS\-SIGNER 8 "2026-11-15" "KariDNS" "KariDNS Manual"
+.TH KARIDNS\-SIGNER 8 "2026-11-21" "KariDNS" "KariDNS Manual"
 .\" Generated from docs/karidns-signer.md by man/md2man.pl (make man): edit the Markdown manual, not this page.
 .SH NAME
 karidns\-signer \- keeps the zones of a KariDNS database (PostgreSQL or SQLite3)
@@ -752,8 +752,7 @@ signatures that are still good are kept.
 about 1 to 2 seconds of the last signature is found only at the next change of
 the zone or at expiry, not by the change log (it cannot be told from the
 signer's own rows by time). The hourly scan compares the SOA serial and finds
-the usual cases. On PostgreSQL a long-running transaction elsewhere (an old
-\fBxmin\fR) can leave a signed zone listed as waiting until its next reload.
+the usual cases.
 .IP \(bu 2
 \fBRetired keys\fR keep their old signatures until they expire (above).
 .IP \(bu 2

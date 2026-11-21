@@ -89,7 +89,6 @@ sg_write_conf
 
 # --- the server (root) ----------------------------------------------------------------------------------------------------------------------
 SG_SERVER=$SERVER
-qa_dnssec() { ./dag @127.0.0.1 -p "$PORT" "$1" "$2" +dnssec +nohexdump +time=3 +tries=1 2>&1; }
 sg_dbstatus() { ./karictl -c "$T/main-karictl.conf" dbstatus 2>&1; }
 if [ $SERVER = 1 ]; then
     install -o root -g wheel -m 755 ./karidns-dbloader "$T/karidns-dbloader" 2>/dev/null || { cp ./karidns-dbloader "$T/karidns-dbloader"; chown 0:0 "$T/karidns-dbloader"; chmod 755 "$T/karidns-dbloader"; }

@@ -1136,6 +1136,23 @@ static void test_changes(void) {
     CHECK_MSG(cur7 == cur6 || cur7 > cur6, "the cursor does not go back (%llu %llu)", (unsigned long long)cur6, (unsigned long long)cur7);
     snap_since(c, cur6, &a, &gap);
     CHECK_MSG(has_dom(&a, 3), "the commit behind the idle transaction is listed although the cursor did not grow");
+    /* changes_cover() (0.7, CI flake row 19): that commit is above the cursor, and a snapshot taken after it sees it: its xid is listed for zone 3 (a one-zone
+     * reload has read those rows); a write of the same zone that is still open is not (the reload did not see it) */
+    {
+        char xw[32] = "";
+        qv(g_admin, "SELECT max(xid)::text FROM karidns_changes WHERE domain_id = 3", xw, sizeof(xw));
+        const uint64_t want = strtoull(xw, NULL, 10);
+        CHECK(qx(t1, "BEGIN"));
+        CHECK(qx(t1, "INSERT INTO records (domain_id, name, type, content, ttl) VALUES (3, 'open.c.test', 'A', '192.0.2.9', 60)"));
+        uint64_t cm = 0, xs[4] = { 0 };
+        unsigned nx = 0;
+        CHECK(D->begin_snapshot(c) == 0);
+        const int rc = D->changes_cover(c, 3, &cm, xs, 4, &nx);
+        CHECK(D->end_snapshot(c) == 0);
+        CHECK_MSG(rc == 0 && cm <= want && nx >= 1 && nx <= 4 && xs[0] == want, "changes_cover: rc %d, cursor %llu, %u xid(s), the first %llu, the commit %llu", rc, (unsigned long long)cm, nx,
+                  (unsigned long long)xs[0], (unsigned long long)want);
+        CHECK(qx(t1, "ROLLBACK"));
+    }
     CHECK(qx(t3, "COMMIT"));
     wait_cluster_quiet();
     uint64_t cur8 = snap_max(c);
@@ -2370,7 +2387,7 @@ static void test_paged(void) {
             cpg_t cp = {0};
             CHECK(D->changes_page(c, &pos, 4, cpg_cb, &cp, &more, &gap) == 0 && !gap);
             CHECK(cp.n <= 4);
-            for (size_t k = 0; k < cp.n; k++) cpg_cb(&all, &(db_change_entry_t){ cp.seq[k], cp.dom[k], cp.op[k] });
+            for (size_t k = 0; k < cp.n; k++) cpg_cb(&all, &(db_change_entry_t){ cp.seq[k], cp.dom[k], cp.op[k], 0, 0 });
             cpg_free(&cp);
             pages++;
         }

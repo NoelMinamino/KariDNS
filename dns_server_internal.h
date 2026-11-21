@@ -1940,6 +1940,8 @@ uint64_t ipcd_wrecv(int worker);
 uint64_t ipcd_total(ipcd_t c);
 size_t ipcd_format(char *buf, size_t cap);
 enum { SOCKBUF_IPC = 0, SOCKBUF_UDP = 1 };   /* sockbuf_note(): the queues between the routers and the workers, the UDP sockets of the routers */
+/* dns_server_core.c log_rl_ok(): a log line about what comes at the rate of the packets, at most one a second per thread */
+typedef struct { time_t last; unsigned long held; } log_rl_t;
 
 #ifdef KARIDNS_UNIT_TEST
 extern const char *g_config_path;
@@ -1991,6 +1993,8 @@ int ipc_send_spill(int (*fds)[2], int nw, int *rr, struct mmsghdr *msgs, int n);
 void ipc_reply_failed(int err);
 int ipc_reply_flush(int fd, udp_batch_ctx_t *batch, int n);
 extern size_t g_ipc_pack_max;
+bool log_rl_ok(log_rl_t *rl, unsigned long n, unsigned long *held);
+size_t auxlog_rec_cap(void);
 int router_send_clients(int fd, struct mmsghdr *msgs, int n, bool *stuck);
 extern ssize_t (*g_sendmmsg_fn)(int, struct mmsghdr *, size_t, int);
 void ipcd_set_self(int slot);

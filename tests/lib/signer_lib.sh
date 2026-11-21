@@ -28,6 +28,22 @@ sg_eq() { if [ "$2" = "$3" ]; then pass "$1"; else fail "$1 (got '$2', wanted '$
 sg_has() { if printf '%s\n' "$2" | grep -q -- "$3"; then pass "$1"; else fail "$1 (no '$3' in: $(printf '%s' "$2" | head -c 300))"; fi; }
 sg_hasnt() { if printf '%s\n' "$2" | grep -q -- "$3"; then fail "$1 ('$3' found)"; else pass "$1"; fi; }
 sg_logtail() { tail -n 25 "$SG_LOG" | sed 's/^/         | /'; }
+# qa_dnssec NAME TYPE: one try of 3 s at the server of the test (SG_SERVER).  A try that times out is a lost query of a database zone (CI flakes rows 1, 2, 9,
+# 10: not explained yet): the server's IPC drop counters, its buffer lines, the UDP counters of the host and a query made now go to stderr, so that the
+# next CI failure says where it was lost; the output (stdout) is dag's, as before.
+qa_dnssec() {
+    _qa=$(./dag @127.0.0.1 -p "$PORT" "$1" "$2" +dnssec +nohexdump +time=3 +tries=1 2>&1)
+    case $_qa in
+        *"timed out"*)
+            {
+                echo "  [note] $1 $2: the try of 3 s timed out"
+                kari_ipc_diag "./karictl -c $T/main-karictl.conf" "$T/server.log"
+                echo "  [lost diag] netstat -s -p udp (drops):"; netstat -s -p udp 2>/dev/null | grep -i "drop\|full\|bad" | sed 's/^/    /'
+                printf '  [lost diag] a query now: %s\n' "$(./dag @127.0.0.1 -p "$PORT" "$1" "$2" +nohexdump +time=3 +tries=1 2>&1 | grep -E 'status:|timed out' | head -2 | tr '\n' ' ')"
+            } >&2 ;;
+    esac
+    printf '%s\n' "$_qa"
+}
 
 # sg_wait SECONDS DESCRIPTION CONDITION : poll the condition (evaluated by sh) every half second
 sg_wait() {
@@ -275,7 +291,15 @@ sg_phase_served() {
     sg_import ex.test "$T/z/ex.test.zone"
     sleep 4
     sg_hasnt "ex.test: the new record is NOT served while the signer is stopped" "$(qa_dnssec held.ex.test A)" '192.0.2.91'
-    sg_eq "karictl dbstatus: exactly one zone waits for the signer, ex.test" "$(sg_dbstatus | grep 'waiting for the signer' | sed 's/^ *//')" "waiting for the signer: 1 zone(s): ex.test"
+    # (the list is written by the auto batch that reads the change rows: the coalesce window and the batch after the import, which a loaded runner can take past
+    # the 4 s above; read with a bounded wait, not once: CI flake row 19, "got ''" on #233.  The other zones must not join it: the wait accepts only this line)
+    _w=0; _got=""
+    while [ $_w -lt 300 ]; do
+        _got=$(sg_dbstatus | grep 'waiting for the signer' | sed 's/^ *//')
+        [ "$_got" = "waiting for the signer: 1 zone(s): ex.test" ] && break
+        sleep 0.1; _w=$((_w + 1))
+    done
+    sg_eq "karictl dbstatus: exactly one zone waits for the signer, ex.test (after $((_w / 10)) s)" "$_got" "waiting for the signer: 1 zone(s): ex.test"
     sg_start
     sg_wait 60 "ex.test: after the signature the record is served" 'qa_dnssec held.ex.test A | grep -q 192.0.2.91'
     sg_has "ex.test: ...with its RRSIG" "$(qa_dnssec held.ex.test A)" 'RRSIG'
