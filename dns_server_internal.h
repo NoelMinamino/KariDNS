@@ -1181,6 +1181,9 @@ static inline const zone_config_t *zone_entry_config(server_config_t *cfg, const
  * version are built with them.  zone_rx_settings_refresh() redoes the merge when karidns.conf (or the settings block of a database
  * zone) changed under it (control thread, once per tick; skips the zone when a writer holds the entry). */
 zone_ext_shared_t *zone_rx_settings_parse(const char *zone, const char *text, size_t len);
+/* the same without the log line (err gets the reason); the result has the key of the text as settings.dat keeps it (0.7 P4, secondary store R1; dns_xfr_state.h), unless there was no
+ * memory for it */
+zone_ext_shared_t *zone_rx_settings_parse_ex(const char *text, size_t len, char *err, size_t errlen);
 zone_ext_shared_t *zone_rx_settings_apply_locked(zone_db_entry_t *entry, zone_ext_shared_t *sh);
 void zone_rx_settings_refresh(zone_db_entry_t *entry, server_config_t *cfg);
 /* are received settings in force for the zone?  note (cap octets, may be NULL) gets why not all of them are ("" if all are, or when a writer

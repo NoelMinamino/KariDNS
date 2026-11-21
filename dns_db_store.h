@@ -200,6 +200,17 @@ struct zone_db_entry_s;
 uint32_t db_store_settings_id_of(const struct zone_db_entry_s *e);
 /* the settings of an id of settings.dat (borrowed: the table keeps its reference for the life of the process); NULL: no such id, or its text could not be loaded */
 zone_ext_shared_t *db_store_settings_by_id(uint32_t id);
+/* ---- 0.7 P4 (secondary store R1, D5): the settings a primary sent with a secondary zone, kept in settings.dat as a second kind of text ----
+ * the id of sh (a zone_rx_settings_parse() result with its key): found, or appended and made durable; 0: none (no key, no settings.dat, the cap of received texts is reached: R2) */
+uint32_t db_store_rx_settings_id(zone_ext_shared_t *sh);
+/* the received text of an id, read from settings.dat and parsed again (hostile: checked as the start checks the file, then the restricted parser): a new reference (refs 1), or NULL
+ * (no such id, another kind, damaged, not accepted) */
+zone_ext_shared_t *db_store_rx_settings_get(uint32_t id);
+/* the received texts in settings.dat (ids, octets of their records) and the texts not kept because of the cap */
+void db_store_rx_stats(uint64_t *texts, uint64_t *bytes, uint64_t *capped);
+#if defined(KARIDNS_UNIT_TEST) || defined(KARIDNS_TEST_EVICT)
+extern int64_t db_store_test_rx_cap_ids;     /* the cap on the ids of received texts (-1: 1/8 of the ids); the test build (karidns-evict) takes it from KARIDNS_TEST_XFR_RX_CAP */
+#endif
 /* the domains.id of the reconcile's record of a secondary or catalog consumer (STORE_F_NONSTORE) of the database view; false: no such record */
 bool db_store_nonstore_sid(const char *view, const char *zone, int64_t *sid);
 /* can the store name the zone in a database view (not the root, not longer than STORE_NAME_MAX)?  A name it cannot is a zone of the heap directory only (un_apply()): its copy is not kept (W12) */

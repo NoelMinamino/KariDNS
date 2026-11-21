@@ -508,6 +508,177 @@ static uint32_t set_crc(const uint8_t *p, size_t n) {            /* CRC-32C, bit
   return ~c;
 }
 
+/* 0.7 P4 (secondary store R1, D5): the settings that primaries sent with secondary zones (Extended AXFR version 3) are records of settings.dat too, of a second kind (the key of
+ * dns_xfr_state.h xfr_rx_key_split()), whose ids the copies of the secondaries name in their state.  They take ids of the same space as the texts of the database zones, so they are
+ * capped: at most 1/8 of the ids and 16 MiB of records; beyond that a received text is not kept (xfr.rx_capped, a WARNING once) and the zone asks for the whole zone at the first refresh
+ * after a restart (R2).  Kept in memory: where each record is (24 octets a text) and a hash index of their keys, so that one text is written once; the text itself is read from the file
+ * and parsed when a restore asks for it (a text that the zones no longer use costs no memory).  The slot of such an id in SET.chunk stays empty: set_get() never returns one. */
+#define DBS_RX_IDS_MAX ((DBS_SET_CHUNKS * DBS_SET_CHUNK) / 8u)
+#define DBS_RX_BYTES_MAX (16ull << 20)
+typedef struct { off_t off; uint32_t len, id; uint64_t h; } rxrec_t;
+static struct {
+  rxrec_t *r;                                              /* the usable texts, in id order (appended) */
+  uint32_t n, cap;
+  uint32_t *ix;                                            /* open addressing by hash: index + 1 into r */
+  uint32_t ixcap;
+  uint32_t ids;                                            /* the ids of this kind in the file (an unusable record counts as well) */
+  uint64_t bytes;                                          /* ... and their octets */
+  _Atomic uint64_t capped;
+  _Atomic bool capped_logged;
+} RX;
+#if defined(KARIDNS_UNIT_TEST) || defined(KARIDNS_TEST_EVICT)
+int64_t db_store_test_rx_cap_ids = -1;                     /* the cap on the ids of received texts (-1: DBS_RX_IDS_MAX) */
+#endif
+
+static uint64_t rx_hash(const void *p, size_t n) {
+  const uint8_t *b = p;
+  uint64_t h = 0xcbf29ce484222325ull;
+  for (size_t i = 0; i < n; i++) { h ^= b[i]; h *= 0x100000001b3ull; }
+  return h;
+}
+/* SET.lock held (or the start, single threaded) */
+static bool rx_add(off_t off, uint32_t len, uint32_t id, uint64_t h) {
+  if (RX.n == RX.cap) {
+    const uint32_t nc = RX.cap ? RX.cap * 2 : 64;
+    rxrec_t *nr = realloc(RX.r, (size_t)nc * sizeof(*nr));
+    if (!nr) return false;
+    RX.r = nr;
+    RX.cap = nc;
+  }
+  if ((RX.n + 1) * 2 > RX.ixcap) {
+    const uint32_t nc = RX.ixcap ? RX.ixcap * 2 : 128;
+    uint32_t *ni = calloc(nc, sizeof(*ni));
+    if (!ni) return false;
+    for (uint32_t i = 0; i < RX.n; i++) {
+      uint32_t j = (uint32_t)(RX.r[i].h & (nc - 1));
+      while (ni[j]) j = (j + 1) & (nc - 1);
+      ni[j] = i + 1;
+    }
+    free(RX.ix);
+    RX.ix = ni;
+    RX.ixcap = nc;
+  }
+  RX.r[RX.n] = (rxrec_t){ off, len, id, h };
+  uint32_t j = (uint32_t)(h & (RX.ixcap - 1));
+  while (RX.ix[j]) j = (j + 1) & (RX.ixcap - 1);
+  RX.ix[j] = ++RX.n;
+  return true;
+}
+/* the key of record i read back (12 octets of header, then the key) and checked as the start checked it; a malloc'ed copy of the key, or NULL (gone, damaged, no memory) */
+static uint8_t *rx_read(const rxrec_t *r) {
+  uint8_t *buf = malloc(12 + (size_t)r->len);
+  if (!buf) return NULL;
+  uint32_t h[3] = { 0, 0, 0 };
+  const bool got = SET.fd >= 0 && pread(SET.fd, buf, 12 + (size_t)r->len, r->off) == (ssize_t)(12 + r->len);
+  if (got) memcpy(h, buf, 12);
+  if (!got || h[0] != DBS_SET_MAGIC || h[1] != r->len || set_crc(buf + 12, r->len) != h[2]) {
+    free(buf);
+    return NULL;
+  }
+  memmove(buf, buf + 12, r->len);
+  return buf;
+}
+/* the id of a received text already in the file (SET.lock held); 0: none */
+static uint32_t rx_find_key(const char *key, size_t klen, uint64_t h) {
+  if (!RX.ixcap) return 0;
+  for (uint32_t j = (uint32_t)(h & (RX.ixcap - 1)); RX.ix[j]; j = (j + 1) & (RX.ixcap - 1)) {
+    const rxrec_t *r = &RX.r[RX.ix[j] - 1];
+    if (r->h != h || r->len != klen) continue;
+    uint8_t *b = rx_read(r);
+    const bool same = b && memcmp(b, key, klen) == 0;
+    free(b);
+    if (same) return r->id;
+  }
+  return 0;
+}
+static uint64_t rx_cap_ids(void) {
+#if defined(KARIDNS_UNIT_TEST) || defined(KARIDNS_TEST_EVICT)
+  if (db_store_test_rx_cap_ids >= 0) return (uint64_t)db_store_test_rx_cap_ids;
+#endif
+  return DBS_RX_IDS_MAX;
+}
+
+uint32_t db_store_rx_settings_id(zone_ext_shared_t *sh) {
+  if (!sh) return 0;
+  uint32_t id = atomic_load_explicit(&sh->store_id, memory_order_acquire);
+  if (id || !sh->key || xfr_rx_key_split(sh->key, sh->key_len, NULL, NULL) != 1) return id;
+  const uint64_t h = rx_hash(sh->key, sh->key_len);
+  bool capped = false;
+  pthread_mutex_lock(&SET.lock);
+  id = atomic_load_explicit(&sh->store_id, memory_order_relaxed);
+  if (!id && SET.fd >= 0) id = rx_find_key(sh->key, sh->key_len, h);
+  if (!id && SET.fd >= 0) {
+    const uint64_t rl = 12 + (uint64_t)sh->key_len;
+    if ((uint64_t)RX.ids + 1 > rx_cap_ids() || RX.bytes + rl > DBS_RX_BYTES_MAX || SET.n + 1 >= DBS_SET_CHUNKS * DBS_SET_CHUNK) {
+      capped = true;
+    } else {
+      uint8_t *buf = malloc((size_t)rl);
+      if (buf) {
+        const uint32_t hd[3] = { DBS_SET_MAGIC, (uint32_t)sh->key_len, set_crc((const uint8_t *)sh->key, sh->key_len) };
+        memcpy(buf, hd, 12);
+        memcpy(buf + 12, sh->key, sh->key_len);
+        /* (made durable before a copy names it, as the texts of the database zones; the record is in the index only when it is on disk) */
+        if (pwrite(SET.fd, buf, (size_t)rl, SET.end) == (ssize_t)rl && fsync(SET.fd) == 0 && rx_add(SET.end, (uint32_t)sh->key_len, SET.n + 1, h)) {
+          SET.end += (off_t)rl;
+          SET.n++;
+          RX.ids++;
+          RX.bytes += rl;
+          id = SET.n;
+        } else if (ftruncate(SET.fd, SET.end) != 0) {
+          syslog(LOG_WARNING, "[Store] settings.dat: the failed record cannot be cut: %s", strerror(errno));
+        }
+        free(buf);
+      }
+    }
+  }
+  if (id) atomic_store_explicit(&sh->store_id, id, memory_order_release);
+  pthread_mutex_unlock(&SET.lock);
+  if (capped) {
+    atomic_fetch_add_explicit(&RX.capped, 1, memory_order_relaxed);
+    if (!atomic_exchange_explicit(&RX.capped_logged, true, memory_order_relaxed))
+      syslog(LOG_WARNING, "[Store] settings.dat holds as many settings received from primaries as it may (%u texts, %llu MiB; the rest of its ids are kept for the database zones): the settings "
+                          "of the secondaries that get new ones are not kept, and such a zone asks its primary for the whole zone at the first refresh after a restart (xfr.rx_capped)",
+             (unsigned)rx_cap_ids(), (unsigned long long)(DBS_RX_BYTES_MAX >> 20));
+  }
+  return id;
+}
+
+zone_ext_shared_t *db_store_rx_settings_get(uint32_t id) {
+  if (!id) return NULL;
+  rxrec_t r;
+  bool found = false;
+  pthread_mutex_lock(&SET.lock);
+  for (uint32_t lo = 0, hi = RX.n; lo < hi;) {            /* (in id order) */
+    const uint32_t mid = lo + (hi - lo) / 2;
+    if (RX.r[mid].id == id) {
+      r = RX.r[mid];
+      found = true;
+      break;
+    }
+    if (RX.r[mid].id < id) lo = mid + 1;
+    else hi = mid;
+  }
+  uint8_t *key = found ? rx_read(&r) : NULL;
+  pthread_mutex_unlock(&SET.lock);
+  if (!key) return NULL;
+  const char *text = NULL;
+  size_t tl = 0;
+  zone_ext_shared_t *sh = NULL;
+  char err[200];
+  if (xfr_rx_key_split(key, r.len, &text, &tl) == 1) sh = zone_rx_settings_parse_ex(text, tl, err, sizeof(err));
+  free(key);
+  if (sh) atomic_store_explicit(&sh->store_id, id, memory_order_release);   /* (the key is the same text: the next refresh's write finds the id without a lookup) */
+  return sh;
+}
+
+void db_store_rx_stats(uint64_t *texts, uint64_t *bytes, uint64_t *capped) {
+  pthread_mutex_lock(&SET.lock);
+  *texts = RX.ids;
+  *bytes = RX.bytes;
+  pthread_mutex_unlock(&SET.lock);
+  *capped = atomic_load_explicit(&RX.capped, memory_order_relaxed);
+}
+
 static zone_ext_shared_t *set_get(uint32_t id) {
   if (id == 0 || id > SET.n) return NULL;
   uint32_t c = (id - 1) / DBS_SET_CHUNK;
@@ -609,6 +780,16 @@ static void set_load(int dirfd) {
       free(buf);
       break;
     }
+    const int rk = xfr_rx_key_split(buf, h[1], NULL, NULL);
+    if (rk != 0) {                                 /* 0.7 P4 (R1): a text a primary sent; its place is kept, it is read when a restore names it.  Unusable (-1) or no memory: its id stays unused */
+      SET.n++;
+      RX.ids++;
+      RX.bytes += 12 + (uint64_t)h[1];
+      if (rk == 1) (void)rx_add(off, h[1], SET.n, rx_hash(buf, h[1]));
+      free(buf);
+      off += 12 + (off_t)h[1];
+      continue;
+    }
     zone_ext_shared_t *sh = set_rebuild(buf, h[1]);
     free(buf);
     SET.n++;
@@ -635,7 +816,10 @@ static uint32_t dir_settings_id(zone_ext_shared_t *sh) {
   if (id) return id;
   pthread_mutex_lock(&SET.lock);
   id = atomic_load_explicit(&sh->store_id, memory_order_relaxed);
-  if (!id && SET.fd >= 0 && sh->key && sh->key_len > 0 && sh->key_len <= (1u << 20) && SET.n + 1 < DBS_SET_CHUNKS * DBS_SET_CHUNK) {
+  /* (0.7 P4: a key of a database zone that reads as a received text, which a profile name beginning with a NUL could make, is not written: the next start would take it for the other
+   * kind; the zone is not stored with an id, as when none can be made) */
+  if (!id && SET.fd >= 0 && sh->key && sh->key_len > 0 && sh->key_len <= (1u << 20) && SET.n + 1 < DBS_SET_CHUNKS * DBS_SET_CHUNK &&
+      xfr_rx_key_split(sh->key, sh->key_len, NULL, NULL) == 0) {
     uint8_t *buf = malloc(12 + sh->key_len);
     if (buf) {
       uint32_t h[3] = { DBS_SET_MAGIC, (uint32_t)sh->key_len, set_crc((const uint8_t *)sh->key, sh->key_len) };

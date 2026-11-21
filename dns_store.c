@@ -732,7 +732,6 @@ _Atomic long store_test_fail_map = 0;      /* the n-th reservation of address sp
 int (*store_test_write_fault)(const char *op, uint32_t zid) = NULL;
 void (*store_test_in_stats)(void) = NULL;
 int64_t (*store_test_fs_free)(void) = NULL;
-int (*store_test_append_fault)(uint64_t reclen) = NULL;
 void (*store_test_cleaner_step)(store_t *s, uint32_t victim) = NULL;
 /* the blocks ahead and the segment ahead (0.7 round 15): called with no lock held by mtab_ahead() before its posix_fallocate() (site 1), by the segment thread before it makes the file (2), and by seg_create() inside the writer mutex before it makes one (3); a test makes the disk slow there */
 void (*_Atomic store_test_ahead_hook)(store_t *s, int site);
@@ -763,6 +762,9 @@ static bool st_fail_nth(_Atomic long *n) {
 #define AHEAD_HOOK(s, site) ((void)0)
 #define ST_FAULT(op, zid) ((void)0)
 #define ST_FAULT_RES(op, zid, res) ((void)0)
+#endif
+#if defined(KARIDNS_UNIT_TEST) || defined(KARIDNS_TEST_EVICT)
+int (*store_test_append_fault)(uint64_t reclen) = NULL;   /* (also in the server's test build, karidns-evict: dns_store.h) */
 #endif
 
 /* ------------------------------------------------------------------------------------------------------------------ */
@@ -4340,7 +4342,7 @@ static int seg_put_bytes(store_t *s, const struct iovec *iov, int niov, uint64_t
   if ((r = seg_place(s, rlen, &cur, &used)) < 0) return r;
   seg_t *g = seg_get(s, cur);
   if (!g) return -EIO;
-#ifdef KARIDNS_UNIT_TEST
+#if defined(KARIDNS_UNIT_TEST) || defined(KARIDNS_TEST_EVICT)
   if (store_test_append_fault) {
     int fe = store_test_append_fault(rlen);
     if (fe) return fe;
@@ -4450,7 +4452,7 @@ static int st_pwritev_all(int fd, const struct iovec *iov, int niov, uint64_t rl
 
 /* true: the record is written at p (io_hold is taken: the caller gives it back after the change); false: the change appends inside the mutex */
 static bool st_prewrite(store_t *s, uint16_t view, const char *name, size_t nlen, const store_meta_t *m, const void *image, size_t ilen, prew_t *p) {
-#ifdef KARIDNS_UNIT_TEST
+#if defined(KARIDNS_UNIT_TEST) || defined(KARIDNS_TEST_EVICT)
   if (store_test_append_fault) return false;          /* (the faults of an append are made by the append inside the mutex) */
 #endif
   uint8_t fn[256];

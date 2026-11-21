@@ -5280,7 +5280,7 @@ static bool db_zone_command(ctrl_client_t *c, const char *cmd, const char *zone,
     return true;
   }
   if (strcmp(cmd, "zonestatus") == 0) {
-    char m[600];
+    char m[1100];
     const char *res = zi->shadowed ? (zi->shadow_by == DBREG_SH_CATALOG ? "shadowed (hidden by a catalog member)"
                                                                          : "shadowed (hidden by a zone in karidns.conf)")
                                    : (zi->last_result == DBREG_REJECTED ? "rejected" : "applied");
@@ -5288,6 +5288,8 @@ static bool db_zone_command(ctrl_client_t *c, const char *cmd, const char *zone,
     bool rx_on = false;
     char rbtxt[160];
     rbtxt[0] = '\0';
+    char sttxt[480];                                 /* 0.7 P4 (secondary store 11): a database secondary's copy in the store, its refresh times and, when it is expired, how it answers */
+    sttxt[0] = '\0';
     {
       zone_db_snapshot_t *zsnap = acquire_retained_zone_snapshot();
       bool zheld = false;
@@ -5295,6 +5297,13 @@ static bool db_zone_command(ctrl_client_t *c, const char *cmd, const char *zone,
       if (ze) {
         rx_on = zone_rx_settings_status(ze, NULL, 0);
         zone_rollback_status(ze, rbtxt, sizeof(rbtxt));
+        if (ze->is_secondary) {
+          rcu_aux_read_lock();
+          server_config_t *zcfg = acquire_config_snapshot();
+          (void)xfr_store_zonestatus(ze, zcfg, sttxt, sizeof(sttxt));
+          release_config_snapshot(zcfg);
+          rcu_aux_read_unlock();
+        }
         if (zheld) xfr_entry_release(ze);
       }
       if (zsnap) release_zone_snapshot(zsnap);
@@ -5305,6 +5314,11 @@ static bool db_zone_command(ctrl_client_t *c, const char *cmd, const char *zone,
                      zi->refresh, zi->view, (long long)zi->source_id, res, where,
                      zi->error[0] ? " last-error: " : "", zi->error, rx_on ? " settings=primary" : "", rbtxt);
     if (l >= (int)sizeof(m)) l = (int)sizeof(m) - 1, m[l - 1] = '\n';
+    if (sttxt[0] && l > 0 && (size_t)l < sizeof(m) - 1) {
+      const int n = snprintf(m + l, sizeof(m) - (size_t)l, "%s", sttxt);
+      l = n < 0 ? l : (size_t)n >= sizeof(m) - (size_t)l ? (int)sizeof(m) - 1 : l + n;
+      if (m[l - 1] != '\n') m[l - 1] = '\n';
+    }
     (void)ctl_send_all(cfd, m, (size_t)l);
     return true;
   }
@@ -6256,6 +6270,8 @@ void *control_thread_func(void *arg) {
                 st.reclaim_zone_versions_waiting = gs.zone_retire_waiting;
                 st.reclaim_warnings = gs.warnings;
               }
+              /* (0.7: the gauges of the tick's last walk of the secondaries) */
+              xfr_store_expired(&st.secondaries_expired, &st.secondaries_expired_stale, &st.secondaries_expired_servfail);
               snprintf(st.version, sizeof(st.version), "%s", KARIDNS_VERSION);
               snprintf(st.hostname, sizeof(st.hostname), "%s", g_host_status_info.un.nodename);
               snprintf(st.os_name, sizeof(st.os_name), "%s", g_host_status_info.un.sysname);

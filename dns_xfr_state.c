@@ -220,6 +220,22 @@ bool xfr_failure_skip(const xfr_state_t *old, const xfr_state_t *upd, time_t now
   return old->last_attempt != 0 && now >= (time_t)old->last_attempt && now - (time_t)old->last_attempt < (time_t)retry;
 }
 
+int xfr_rx_key_split(const void *key, size_t klen, const char **text, size_t *tlen) {
+  static const char mark[] = XFR_RX_MARK;
+  const size_t ml = sizeof(mark) - 1;
+  const uint8_t *k = key;
+  if (text) *text = NULL;
+  if (tlen) *tlen = 0;
+  /* (a settings key of a database zone with no profile name has no profile text either, "" NUL "" NUL zone text: a key whose first byte is NUL and whose next ones are the
+   * mark and a NUL can only be one of these) */
+  if (!k || klen < 2 + ml || k[0] != 0 || memcmp(k + 1, mark, ml) != 0 || k[1 + ml] != 0) return 0;
+  const size_t n = klen - 2 - ml;
+  if (n == 0 || n > XFR_RX_TEXT_MAX) return -1;
+  if (text) *text = (const char *)k + 2 + ml;
+  if (tlen) *tlen = n;
+  return 1;
+}
+
 time_t xfr_restore_next_check(const xfr_state_t *s, uint32_t retry, time_t deadline, time_t now) {
   if (!(s->flags & XFR_SF_FAILED) || s->last_attempt == 0) return 0;
   time_t at = (time_t)s->last_attempt + (time_t)retry;

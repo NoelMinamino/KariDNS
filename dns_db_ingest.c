@@ -5669,6 +5669,18 @@ static void secondary_status(status_ctx_t *c, const zone_db_entry_t *e, const zo
   /* B8t-2: the settings the primary sent with the zone (Extended AXFR version 3); the statements of the zone's own metadata win */
   if (atomic_load_explicit(&zone_xr(e)->rxcfg, memory_order_acquire))
     st_append(c, "  settings from the primary: in force (what the zone's own metadata sets wins over them)\n");
+  /* 0.7 P4 (secondary store 11): the lines of `karictl zonestatus` about the copy in the store (Store:, Last-refresh:, Expired:), indented.  Under the registry's lock and in a read
+   * section: they read the store's index and the configuration only (no lock, no write) */
+  char sl[480];
+  if (xfr_store_zonestatus((zone_db_entry_t *)e, c->cfg, sl, sizeof(sl)) > 0)
+    for (char *p = sl, *nl; *p; p = nl + 1) {
+      nl = strchr(p, '\n');
+      if (!nl) {
+        st_append(c, "  %s\n", p);
+        break;
+      }
+      st_append(c, "  %.*s\n", (int)(nl - p), p);
+    }
 }
 
 /* B7a: where the settings of a DB zone come from and what acl-ceiling makes of its ACLs */

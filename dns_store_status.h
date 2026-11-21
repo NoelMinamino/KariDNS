@@ -167,6 +167,10 @@ typedef struct store_xfr {
   uint64_t records, image_bytes, puts, puts_uptodate, put_nospc, put_errors, state_writes, state_stale, state_skipped, orphans_deleted, unstorable;
   uint64_t restored, restored_expired, file_won, restore_bad, restore_identity, restore_pending, restore_ms, restore_timeouts, gc_deleted, stale_capped;
   uint64_t expired_zones, stale_answers, expire_events;
+  uint64_t expired_stale, expired_servfail;     /* the expired zones of the tick's last walk that answer from stale data (serve-stale) / SERVFAIL */
+  /* P4 (R1, D5): the settings received from primaries in settings.dat (texts, octets), the texts not kept because of the cap, the restores that put them in force again, the restores
+   * that asked for the whole zone because they were not kept */
+  uint64_t rx_texts, rx_bytes, rx_capped, rx_restored, rx_lost;
   int64_t vid;                   /* the store view of the copies (-1: none) */
 } store_xfr_t;
 void store_status_set_xfr_fn(bool (*fn)(store_xfr_t *out));

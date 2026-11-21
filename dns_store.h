@@ -706,8 +706,6 @@ extern int64_t (*store_test_fs_free)(void);
 /* ... and its size (NULL: 1 GiB at least); the floor the journal keeps free (-1: jr_floor(), the default; >= 0: that many bytes) */
 extern int64_t (*_Atomic store_test_fs_total)(void);
 extern _Atomic int64_t store_test_jr_floor;
-/* an append of an image record fails with the errno this returns (not 0) before it writes anything: the disk fills up between the free-space check and the write */
-extern int (*store_test_append_fault)(uint64_t reclen);
 /* called at the start of every slice of the cleaner (writer mutex held) with the segment it is emptying: a test takes a reference of an image there (store_image_read does not need the mutex) */
 extern void (*store_test_cleaner_step)(store_t *s, uint32_t victim);
 /* 0.7 round 15, the allocations ahead: called with no lock held before the posix_fallocate() of the blocks ahead of the tables (site 1), before the thread of the segment ahead makes its file (2), and
@@ -723,6 +721,11 @@ uint64_t store_test_sum64(const void *p, size_t n);
 uint64_t store_test_seg_bytes(store_t *s);
 /* the first back-off of the checkpoint that ends a bulk fill after a failure (0: 1 s; it doubles up to 5 min) */
 extern _Atomic uint32_t store_test_bulk_end_ms;
+#endif
+#if defined(KARIDNS_UNIT_TEST) || defined(KARIDNS_TEST_EVICT)
+/* an append of an image record fails with the errno this returns (not 0) before it writes anything: the disk fills up between the free-space check and the write.  Also in the test build
+ * of the server (karidns-evict: tests/run_secondary_store_test.sh check 8, KARIDNS_TEST_XFR_PUT_FAIL), never in a release build */
+extern int (*store_test_append_fault)(uint64_t reclen);
 #endif
 
 #endif /* DNS_STORE_H */

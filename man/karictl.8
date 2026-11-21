@@ -114,6 +114,14 @@ writes a warning in the category \fBgeneral\fR (\fB[GC] the oldest retired zone
 snapshot has waited N s ...: held by ...\fR, naming the kind of reader slot or
 the retained references), at most once a minute while it waits
 .IP \(bu 2
+Expired secondaries (0.7): \fBsecondaries expired: N (S serving stale, F
+SERVFAIL)\fR, the secondary zones past their expire deadline (the control
+thread's last walk of the secondaries), those answered from stale data
+(\fBserve\-stale\fR, EDE 3) and those answered SERVFAIL (EDE 24; karidns(8)
+"Secondary zones: the copies in the zone store"); \fBstats\fR has them as the
+gauge \fBkaridns_secondaries_expired{answer="stale"|"servfail"}\fR and, in JSON,
+\fBsecondaries_expired\fR \fB{total, stale, servfail}\fR in \fBserver\fR
+.IP \(bu 2
 Frontend process health status
 .IP \(bu 2
 Security counters: RRL dropped/slipped responses, Extended DNS Error counters
@@ -422,11 +430,14 @@ has not read from the database yet. A secondary that applies settings received
 from its primary (Extended AXFR version 3, see karidns(8)) adds
 \fBsettings=primary\fR (and \fBnote: ...\fR when part of them is not in force,
 e.g. a TSIG key the received \fBallow\-transfer\fR names is not defined here). A
-secondary of karidns.conf or a catalog member (0.7) adds lines: \fBStore: copy
-serial <n>, <bytes> bytes, saved <UTC>\fR (its copy in the zone store; or
-\fBStore: no copy\fR, \fBStore: off\fR without a store or for a database
-secondary, \fBStore: restore pending\fR while the start has not looked at the
-copy yet), \fBLast\-refresh: <UTC>  Last\-attempt: <UTC> [(failed)]  Expires:
+secondary (0.7: of karidns.conf, a catalog member, or a database secondary) adds
+lines: \fBStore: copy serial <n>, <bytes> bytes, saved <UTC>\fR (its copy in the
+zone store; when the primary sent settings with the zone, followed by \fB, the
+settings of the primary kept\fR or \fB, the settings of the primary not kept (a
+restart asks for the whole zone)\fR; or \fBStore: no copy\fR, \fBStore: off\fR
+without a store, \fBStore: restore pending\fR while the start has not looked at
+the copy yet, \fBStore: not kept (...)\fR for a zone whose copy cannot be
+named), \fBLast\-refresh: <UTC>  Last\-attempt: <UTC> [(failed)]  Expires:
 <UTC>\fR, and when the zone is expired \fBExpired: since <UTC> (<duration>),
 serving stale data (serve\-stale)\fR or \fBExpired: since <UTC> (<duration>),
 answering SERVFAIL (serve\-stale no | secondary\-stale\-max <d> reached)\fR
@@ -796,26 +807,27 @@ zone (B7b), its type, masters and TSIG key and the last successful transfer with
 the serial (with the zone store, 0.7, \fBa copy is kept in the zone store; a
 restart restores it\fR, without it \fBkept in memory only; a restart transfers
 it again\fR; \fBsettings from the primary: in force\fR when the primary sent
-settings, B8t-2), then (B7a) the settings it runs with: where they come from
-(\fBprofile 'name'\fR with the zone's own metadata overriding it, \fBthe zone's
-own metadata\fR, or \fBnone\fR), its \fBallow\-transfer\fR and
-\fBallow\-update\fR entries with their match mode, the entries
-\fBacl\-ceiling\fR cuts away (\fBlies outside acl\-ceiling\fR, \fBis narrowed by
-acl\-ceiling\fR, or \fBno acl\-ceiling is configured: these ACLs refuse
-everybody\fR) and a \fBsettings error\fR line when a TSIG key the settings name
-is no longer defined in \fBkaridns.conf\fR. The summary also counts the distinct
-settings (zones with the same settings share one block) and the zones that name
-an undefined key. A zone that was rejected keeps serving its last good version
-(its serial is shown). Without a \fBdatabase\fR block the server answers
-\fBERROR no database block is configured\fR. With the zone store (0.7) the
-\fBstore pass:\fR line shows the reconcile with the loader: the pass that runs
-or ran last (the entries it listed, new / changed / renamed / unchanged /
-already asked for / refused with this version), the sweep (zones the pass did
-not list, deleted), the bodies (records without one now, fetched, failed, in
-flight) and the changes applied; a \fBMASS\-DELETE GUARD HELD:\fR line says that
-a sweep was held back (more than 20 percent of a view's zones and more than
-1,000 are not in the database) and that \fBkarictl reload \-force\fR releases
-it.
+settings, B8t-2) and (0.7) the lines \fBStore:\fR, \fBLast\-refresh:\fR and
+\fBExpired:\fR of \fBzonestatus\fR, indented, then (B7a) the settings it runs
+with: where they come from (\fBprofile 'name'\fR with the zone's own metadata
+overriding it, \fBthe zone's own metadata\fR, or \fBnone\fR), its
+\fBallow\-transfer\fR and \fBallow\-update\fR entries with their match mode, the
+entries \fBacl\-ceiling\fR cuts away (\fBlies outside acl\-ceiling\fR, \fBis
+narrowed by acl\-ceiling\fR, or \fBno acl\-ceiling is configured: these ACLs
+refuse everybody\fR) and a \fBsettings error\fR line when a TSIG key the
+settings name is no longer defined in \fBkaridns.conf\fR. The summary also
+counts the distinct settings (zones with the same settings share one block) and
+the zones that name an undefined key. A zone that was rejected keeps serving its
+last good version (its serial is shown). Without a \fBdatabase\fR block the
+server answers \fBERROR no database block is configured\fR. With the zone store
+(0.7) the \fBstore pass:\fR line shows the reconcile with the loader: the pass
+that runs or ran last (the entries it listed, new / changed / renamed /
+unchanged / already asked for / refused with this version), the sweep (zones the
+pass did not list, deleted), the bodies (records without one now, fetched,
+failed, in flight) and the changes applied; a \fBMASS\-DELETE GUARD HELD:\fR
+line says that a sweep was held back (more than 20 percent of a view's zones and
+more than 1,000 are not in the database) and that \fBkarictl reload \-force\fR
+releases it.
 .RS 8
 .PP
 .RS 2
@@ -1560,6 +1572,26 @@ Images refused by that check (the zone is rejected, \fBkarictl dbstatus
 store as they are (a background fill: no entry, no registry change; the zone is
 attached from its record when the first query comes); images installed as the
 zone's version in memory
+.TP 8
+\fBxfr.view\fR, \fBxfr.records\fR, \fBxfr.image_bytes\fR, \fBxfr.puts\fR, \fBxfr.puts_uptodate\fR, \fBxfr.put_nospc\fR, \fBxfr.put_errors\fR, \fBxfr.state_writes\fR, \fBxfr.state_stale\fR, \fBxfr.state_skipped\fR, \fBxfr.orphans_deleted\fR, \fBxfr.unstorable\fR, \fBxfr.restored\fR, \fBxfr.restored_expired\fR, \fBxfr.file_won\fR, \fBxfr.restore_bad\fR, \fBxfr.restore_identity\fR, \fBxfr.restore_pending\fR, \fBxfr.restore_ms\fR, \fBxfr.restore_timeouts\fR, \fBxfr.gc_deleted\fR, \fBxfr.stale_capped\fR
+0.7, the \fBsecondaries:\fR part of the text form: the copies of the secondary
+zones in the store's view \fB_karidns\-xfr\fR (none: \fBxfr.view = none\fR) and
+what the writes after a refresh, the restore at the start and the GC did since
+the start; karidns(8) "Secondary zones: the copies in the zone store"
+.TP 8
+\fBxfr.rx_texts\fR, \fBxfr.rx_bytes\fR, \fBxfr.rx_capped\fR, \fBxfr.rx_restored\fR, \fBxfr.rx_lost\fR
+0.7: the settings that primaries sent (Extended AXFR version 3) kept in
+\fBsettings.dat\fR: the texts there and the octets of their records (at most
+131,072 texts and 16 MiB), the new texts not kept because that cap was reached,
+the restores that put a zone's received settings in force again, and the
+restores that found them not kept (the zone asks for the whole zone at its first
+refresh)
+.TP 8
+\fBsecondary.expired_zones\fR, \fB.expired_stale\fR, \fB.expired_servfail\fR, \fB.stale_answers\fR, \fB.expire_events\fR
+0.7: the secondaries past their expire deadline (the control thread's last walk
+of the secondaries), of them those answered from stale data (serve-stale, EDE 3)
+and those answered SERVFAIL (EDE 24); the answers given from stale data, and the
+\fBexpired\fR events since the start
 .TP 8
 \fBstore.recon.guard.held_views\fR
 Views whose sweep the mass-delete guard holds back (0 normally). With 1 or more:

@@ -81,10 +81,14 @@ void xfr_restore_note_timeouts(uint64_t n);
 /* ---- counters (karictl store: xfr.*, secondary.*) ---- */
 typedef store_xfr_t xfr_store_counters_t;           /* (dns_store_status.h) */
 void xfr_store_counters(xfr_store_counters_t *out);
+/* the gauges of the tick's last walk (karictl status): the expired secondaries, those answered from stale data, those answered SERVFAIL */
+void xfr_store_expired(uint64_t *expired, uint64_t *stale, uint64_t *servfail);
 
 #ifdef KARIDNS_UNIT_TEST
 /* tests: the restore thread calls this before every entry it restores (a test holds it there, or stops it); the queue's walk is asked for again */
 extern void (*_Atomic xfr_store_test_restore_hook)(struct zone_db_entry_s *e);
+/* tests: the time the item in work may take beyond the safety net's 30 s (what the restore thread sets from the size of the image it reads) */
+void xfr_store_test_item_allow(int64_t ms);
 #endif
 
 #endif /* DNS_XFR_STORE_H */

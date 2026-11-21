@@ -58,7 +58,7 @@ static struct {
   zbits_t zs;
   _Atomic bool zs_built;
 #ifdef KARIDNS_TEST_EVICT
-  /* the test knobs (KARIDNS_TEST_XFR_PUT_FAIL: the next n puts find no room; _KILL_BEFORE_PUT: the zone ('1' = any) whose put is preceded by a SIGKILL; _STALE_LOG_INTERVAL: the seconds between
+  /* the test knobs (KARIDNS_TEST_XFR_PUT_FAIL: the next n appends of an image find no room (test_append_fault()); KARIDNS_TEST_XFR_RX_CAP: the cap on received settings texts; _KILL_BEFORE_PUT: the zone ('1' = any) whose put is preceded by a SIGKILL; _STALE_LOG_INTERVAL: the seconds between
    * the still-expired lines; _RESTORE_HOLD_MS: the restore thread waits this long before its first pass, without progress; _RESTORE_NET_MS: the safety net's 30 s) */
   _Atomic long put_fail;
   char kill_zone[256];
@@ -79,10 +79,17 @@ static struct {
   /* P3 (R3): the restore jobs of the `d` copies the start gave the ingest thread, the ones that ran; dbj_hold: one could not be given (the `d` copies are kept this run) */
   _Atomic uint64_t dbj_posted, dbj_done;
   _Atomic bool dbj_hold;
+  /* P4 (R1): restores that put the settings of the primary in force again; restores whose settings were not kept, or are not in settings.dat any more (the whole zone is asked for) */
+  _Atomic uint64_t rx_restored, rx_lost;
+  /* the expired zones of the tick's last walk: answered from stale data, answered SERVFAIL (karictl status) */
+  _Atomic uint64_t expired_stale, expired_servfail;
+  /* #203 review (R2'): the time the item the restore thread works on may take beyond the 30 s (a big image is read and checked in one step) */
+  _Atomic int64_t item_allow_ms;
 } X = { .mu = PTHREAD_MUTEX_INITIALIZER, .cv = PTHREAD_COND_INITIALIZER, .zmu = PTHREAD_MUTEX_INITIALIZER, .vid = -1 };
 
 #ifdef KARIDNS_UNIT_TEST
 void (*_Atomic xfr_store_test_restore_hook)(zone_db_entry_t *e);
+void xfr_store_test_item_allow(int64_t ms) { atomic_store_explicit(&X.item_allow_ms, ms, memory_order_relaxed); }
 #endif
 
 int xfr_store_vid(void) { return atomic_load_explicit(&X.vid, memory_order_acquire); }
@@ -400,6 +407,7 @@ typedef struct {
   time_t last_ok, expire_at;
   uint8_t origin;
   bool rx;
+  zone_ext_shared_t *rxsh;                            /* P4 (R1): the settings the primary sent (a reference; NULL: none) */
 } pin_t;
 
 /* R2 (D5): settings the primary sent are in force for the zone (rxcfg; with primary-settings no they are kept aside and not used: nothing is lost by not persisting them) */
@@ -409,17 +417,27 @@ static bool rx_in_force(const zone_db_entry_t *e) {
   return x && (atomic_load_explicit(&x->rxcfg, memory_order_acquire) != NULL || atomic_load_explicit(&x->xfr_axfr_once, memory_order_relaxed));
 }
 
+/* the values of a state write, under the writer lock (rx_sh belongs to the writers) */
+static void collect_locked(zone_db_entry_t *e, pin_t *p) {
+  p->serial = atomic_load_explicit(&e->serial, memory_order_relaxed);
+  p->last_ok = atomic_load_explicit(&e->last_successful_transfer, memory_order_relaxed);
+  p->expire_at = atomic_load_explicit(&e->expire_at, memory_order_relaxed);
+  p->origin = e->xfr_origin;
+  p->rx = rx_in_force(e);
+  const zone_x_t *x = zone_x(e);
+  p->rxsh = x && x->rx_sh ? zone_ext_shared_ref(x->rx_sh) : NULL;
+}
+
+/* P4 (R1, D5): the id in settings.dat of the settings the primary sent (written once per text; outside every lock and read section: it may append to the file); 0: none, or not kept */
+static uint32_t rx_id_of(const pin_t *p) { return p->rxsh ? db_store_rx_settings_id(p->rxsh) : 0; }
+
 /* Values under the writer lock into locals; the version pinned with xfr_refs inside a read section (as dir_put_locked() does); both are left before the store is called (2.5) */
 static bool pin_active(zone_db_entry_t *e, pin_t *p) {
   memset(p, 0, sizeof(*p));
   pthread_mutex_lock(&e->writer_lock);
   rcu_aux_read_lock();
   zone_version_t *v = atomic_load_explicit(&e->rcu.active, memory_order_acquire);
-  p->serial = atomic_load_explicit(&e->serial, memory_order_relaxed);
-  p->last_ok = atomic_load_explicit(&e->last_successful_transfer, memory_order_relaxed);
-  p->expire_at = atomic_load_explicit(&e->expire_at, memory_order_relaxed);
-  p->origin = e->xfr_origin;
-  p->rx = rx_in_force(e);
+  collect_locked(e, p);
   if (v && v->image && v->image->n_rrs > 0) {
     zone_image_soa_t nums;
     const uint32_t soa = zone_image_apex_soa(v->image);
@@ -435,16 +453,20 @@ static bool pin_active(zone_db_entry_t *e, pin_t *p) {
 static void pin_release(pin_t *p) {
   if (p->v) atomic_fetch_sub_explicit(&p->v->xfr_refs, 1, memory_order_acq_rel);
   p->v = NULL;
+  zone_ext_shared_unref(p->rxsh);
+  p->rxsh = NULL;
 }
 
-static void state_of(const xinfo_t *xi, const pin_t *p, time_t attempt_at, xfr_state_t *s) {
+/* rx_id: the id of the primary's settings in settings.dat (R1); settings in force that have none are lost at a restart (R2: the state says so, the restore asks for the whole zone) */
+static void state_of(const xinfo_t *xi, const pin_t *p, uint32_t rx_id, time_t attempt_at, xfr_state_t *s) {
   memset(s, 0, sizeof(*s));
   s->kind = (uint8_t)xi->kind;
   s->identity = xi->identity;
   s->primaries = xi->primaries;
   xfr_state_set_times(s, p->last_ok, p->expire_at);
   if (p->origin == XFR_ORIGIN_FILE || p->origin == XFR_ORIGIN_STORE_FILE) s->flags |= XFR_SF_FROM_FILE;
-  if (p->rx) s->flags |= XFR_SF_RX_LOST;
+  s->rx_settings = rx_id;
+  if (p->rx && !rx_id) s->flags |= XFR_SF_RX_LOST;
   s->last_attempt = attempt_at <= 0 ? 0 : attempt_at > (time_t)UINT32_MAX ? UINT32_MAX : (uint32_t)attempt_at;
 }
 
@@ -455,10 +477,13 @@ static int put_image(store_t *st, uint16_t vid, zone_db_entry_t *e, const xinfo_
     const int ur = xs_unbulk(st);
     if (ur < 0) return ur;
   }
-  if (!pin_active(e, &p)) return -ENOENT;
+  if (!pin_active(e, &p)) {
+    pin_release(&p);
+    return -ENOENT;
+  }
   if (p.last_ok <= 0) p.last_ok = attempt_at;           /* (a version from a file without mtime: the refresh just confirmed it) */
   xfr_state_t s;
-  state_of(xi, &p, attempt_at, &s);
+  state_of(xi, &p, rx_id_of(&p), attempt_at, &s);
   store_meta_t m;
   memset(&m, 0, sizeof(m));
   m.flags = img_flags(p.v->image);
@@ -471,14 +496,9 @@ static int put_image(store_t *st, uint16_t vid, zone_db_entry_t *e, const xinfo_
     syslog(LOG_WARNING, "[Store] KARIDNS_TEST_XFR_KILL_BEFORE_PUT: the process is killed between the install of '%s' (serial %u) and its put", e->domain, p.serial);
     kill(getpid(), SIGKILL);
   }
-  long pf = atomic_load_explicit(&X.put_fail, memory_order_relaxed);
-  const bool no_room = pf > 0 && atomic_compare_exchange_strong_explicit(&X.put_fail, &pf, pf - 1, memory_order_relaxed, memory_order_relaxed);   /* (KARIDNS_TEST_XFR_PUT_FAIL) */
-#else
-  const bool no_room = false;
 #endif
   int r;
-  if (no_room) r = -ENOSPC;
-  else if ((uint64_t)p.v->image->total_size > 0x7fffffffu) r = -EFBIG;
+  if ((uint64_t)p.v->image->total_size > 0x7fffffffu) r = -EFBIG;
   else {
     uint32_t zid = STORE_NONE;
     r = store_put_ex(st, vid, xi->key, (size_t)xi->klen, &m, p.v->image, p.v->image->total_size, STORE_PUT_NO_DEGRADE, &zid);
@@ -557,14 +577,11 @@ static void after_refresh_pinned(store_t *st, uint16_t vid16, zone_db_entry_t *e
       pin_t p;
       memset(&p, 0, sizeof(p));
       pthread_mutex_lock(&e->writer_lock);
-      p.serial = atomic_load_explicit(&e->serial, memory_order_relaxed);
-      p.last_ok = atomic_load_explicit(&e->last_successful_transfer, memory_order_relaxed);
-      p.expire_at = atomic_load_explicit(&e->expire_at, memory_order_relaxed);
-      p.origin = e->xfr_origin;
-      p.rx = rx_in_force(e);
+      collect_locked(e, &p);
       pthread_mutex_unlock(&e->writer_lock);
       xfr_state_t s;
-      state_of(&xi, &p, attempt_at, &s);
+      state_of(&xi, &p, rx_id_of(&p), attempt_at, &s);
+      pin_release(&p);
       wrote = put_state(st, (uint16_t)vid, &xi, p.serial, &s) == 0;
     } else {
       /* M2: no record, a KNOWN one (a scrub, the cleaner, a bad image at the restore), another serial (a put that found no room), a zone from `file` never transferred, a GC race:
@@ -629,7 +646,17 @@ static void log_expired(zone_db_entry_t *e, time_t deadline, time_t last_ok, boo
             restart ? "while stopped " : "", a, b, serving ? "serving stale data (serve-stale, RFC 8767, EDE 3)" : "answering SERVFAIL (EDE 24)");
 }
 
-static int restore_do(zone_db_entry_t *e) {
+/* #203 review (design 2.5): a state write of the restore (the KNOWN marking of a copy that cannot be used) is made only by the holder of the entry's is_transferring, so that it cannot
+ * interleave with the write at the end of a refresh (one that runs after the safety net gave up on the entry).  When a refresh holds it, the restore leaves the record alone: that
+ * refresh writes the record, and the scrub of the store finds a damaged image that is still there.  Deletes need no CAS (a delete wins, 2.5). */
+static void make_known_cas(zone_db_entry_t *e, store_t *st, uint16_t vid, const xinfo_t *xi, const store_zone_t *z) {
+  bool idle = false;
+  if (!atomic_compare_exchange_strong_explicit(&e->is_transferring, &idle, true, memory_order_acq_rel, memory_order_relaxed)) return;
+  make_known(st, vid, xi, z);
+  atomic_store_explicit(&e->is_transferring, false, memory_order_release);
+}
+
+static int restore_do(zone_db_entry_t *e, bool own) {
   store_t *st = atomic_load_explicit(&X.st, memory_order_acquire);
   const int vidi = xfr_store_vid();
   if (!st || vidi < 0) return RS_OFF;
@@ -652,7 +679,12 @@ static int restore_do(zone_db_entry_t *e) {
            e->domain, zone_vname(e));
     return RS_IDENTITY;
   }
-  /* step 3: the image, read and checked as an attach checks it; a heap copy (W8: MAP would pin its segment for ever, COPY's buffer is the store's) */
+  /* step 3: the image, read and checked as an attach checks it; a heap copy (W8: MAP would pin its segment for ever, COPY's buffer is the store's).  #203 review (R2'): this is one
+   * step of the restore thread however big the image is: the safety net gives it the time to read and check it at 10 MB/s on top of its 30 s */
+  if (own) {
+    atomic_store_explicit(&X.item_allow_ms, (int64_t)(z.img_len / 10000u), memory_order_relaxed);
+    progress_stamp();
+  }
   store_img_t img;
   store_read_lock();
   int r = store_image_read(st, z.zid, &img);
@@ -681,7 +713,7 @@ static int restore_do(zone_db_entry_t *e) {
   const size_t ilen = r == 0 ? img.len : 0;
   if (r == 0) store_img_release(st, &img);
   if (!ok) {
-    make_known(st, vid, &xi, &z);                    /* (the next refresh stores the zone again: the up-to-date rule puts the image) */
+    make_known_cas(e, st, vid, &xi, &z);             /* (the next refresh stores the zone again: the up-to-date rule puts the image) */
     atomic_fetch_add_explicit(&X.restore_bad, 1, memory_order_relaxed);
     atomic_fetch_add_explicit(&X.s_none, 1, memory_order_relaxed);
     syslog(LOG_WARNING, "[Store] the secondary's stored copy of '%s' (view '%s') cannot be used (%s); it is stored again by the next refresh", e->domain, zone_vname(e), why);
@@ -693,6 +725,10 @@ static int restore_do(zone_db_entry_t *e) {
     free(copy);
     return RS_MEMORY;
   }
+  /* P4 (R1, D5): the settings the primary sent with this copy, read back from settings.dat (hostile: checked and parsed again; file I/O, so before the writer lock).  A copy whose
+   * settings were not kept (R2: XFR_SF_RX_LOST), or whose id names no usable text, asks for the whole zone at its first refresh */
+  zone_ext_shared_t *rxsh = s.rx_settings ? db_store_rx_settings_get(s.rx_settings) : NULL;
+  const bool rx_lost = (s.flags & XFR_SF_RX_LOST) || (s.rx_settings && !rxsh);
   /* steps 4 and 5: under the writer lock, the install rule (4.1): no version, or the version of the `file` that the copy beats (D7); never over a transferred version */
   const time_t now = time(NULL);
   pthread_mutex_lock(&e->writer_lock);
@@ -703,6 +739,7 @@ static int restore_do(zone_db_entry_t *e) {
     const bool file_wins = file_ver && xfr_file_wins(zone_xr(e)->last_loaded_mtime, atomic_load_explicit(&e->serial, memory_order_relaxed), z.stamp_time, z.serial);
     if (!file_ver || file_wins) {
       pthread_mutex_unlock(&e->writer_lock);
+      zone_ext_shared_unref(rxsh);
       zone_version_free(ver);
       if (file_wins) {
         atomic_fetch_add_explicit(&X.file_won, 1, memory_order_relaxed);
@@ -728,11 +765,15 @@ static int restore_do(zone_db_entry_t *e) {
   /* design 4.3 step 5: no difference is computed against the version it replaces (NULL, not `cur`): that version is the `file`'s, and a file -> store difference is no history of
    * the zone (RFC 1995 §4: the IXFR sequences are changes the primary made), it costs compute_ixfr_diff() under the writer lock, and when the stored serial is the lower one (the
    * D7 case: a retransfer to a lower serial) it would put a reversed difference into the history.  The first IXFR a downstream secondary asks of this serial gets the whole zone.
-   * (No NOTIFY: the downstream secondaries have this serial, or ask for it at their refresh.) */
+   * (No NOTIFY: the downstream secondaries have this serial, or ask for it at their refresh.)
+   * The settings of the primary are in force before the data is installed, as a transfer puts them (handle_axfr_event(): the glue and the response cache of the version read them). */
+  zone_ext_shared_t *rxold = rxsh ? zone_rx_settings_apply_locked(e, rxsh) : NULL;
   zone_install_version(e, ver, NULL, false);
   const time_t deadline = zone_expire_deadline(e);
   atomic_store_explicit(&e->next_check, xfr_restore_next_check(&s, rt, deadline, now), memory_order_release);
   pthread_mutex_unlock(&e->writer_lock);
+  zone_ext_shared_unref(rxold);                       /* (no settings before a restore installs: NULL; or the object itself when there was no memory to keep it) */
+  if (rxsh) atomic_fetch_add_explicit(&X.rx_restored, 1, memory_order_relaxed);
   if (tm.clamped)
     syslog(LOG_WARNING, "[Store] secondary zone '%s' (view '%s'): the times of the stored copy are ahead of the clock (the clock went back?): taken as now in memory, not written back",
            e->domain, zone_vname(e));
@@ -742,7 +783,8 @@ static int restore_do(zone_db_entry_t *e) {
     syslog(LOG_INFO, "[Store] secondary zone '%s' (view '%s'): the primaries changed since the copy was stored; the copy is served and the zone is refreshed now", e->domain, zone_vname(e));
   }
   zone_x_t *x = zone_x_need(e);
-  if ((s.flags & XFR_SF_RX_LOST) && x) atomic_store_explicit(&x->xfr_axfr_once, true, memory_order_relaxed);
+  if (rx_lost && x) atomic_store_explicit(&x->xfr_axfr_once, true, memory_order_relaxed);
+  if (rx_lost) atomic_fetch_add_explicit(&X.rx_lost, 1, memory_order_relaxed);
   atomic_fetch_add_explicit(&X.restored, 1, memory_order_relaxed);
   atomic_fetch_add_explicit(&X.s_restored, 1, memory_order_relaxed);
   if (deadline > 0 && now > deadline) {
@@ -771,8 +813,9 @@ static int restore_one(zone_db_entry_t *e) {
   if (h) h(e);
 #endif
   if (!atomic_load_explicit(&e->restore_pending, memory_order_acquire)) return RS_NOT_PENDING;   /* (the tick's safety net gave up on it meanwhile: the zone refreshes without its copy) */
-  const int r = restore_do(e);
+  const int r = restore_do(e, true);
   (void)zone_restore_pending_clear(e);              /* R2: every way out clears it */
+  atomic_store_explicit(&X.item_allow_ms, 0, memory_order_relaxed);
   progress_stamp();
   return r;
 }
@@ -1075,8 +1118,10 @@ static void *restore_thread(void *arg) {
 
 /* M4 d: the hook of a rebuild only asks for a pass */
 static void ask_pass(void) {
-  progress_stamp();                                   /* (R2': the new pending entries are counted from now, not from the thread's last step) */
   pthread_mutex_lock(&X.mu);
+  /* (R2': the new pending entries are counted from now, not from the thread's last step; but only when the thread has done every pass asked so far: a thread stalled inside a pass is
+   * not hidden by rebuilds that keep coming, #203 review) */
+  if (X.req_gen == X.done_gen) progress_stamp();
   X.req_gen++;
   pthread_cond_broadcast(&X.cv);
   pthread_mutex_unlock(&X.mu);
@@ -1204,7 +1249,7 @@ void xfr_store_db_copy_drop(const char *view, const char *zone, uint64_t identit
  * restore_pending).  The caller is the ingest thread (pinned in the auxiliary RCU, holding no lock); xfr_db_sid of the entry is set.  true: the copy is installed */
 bool xfr_store_db_restore(zone_db_entry_t *e) {
   if (!e || e->source != ZONE_SRC_DB || !e->is_secondary || !xfr_store_active()) return false;
-  return restore_do(e) == RS_RESTORED;
+  return restore_do(e, false) == RS_RESTORED;
 }
 
 /* ------------------------------------------------------------------------------------------------------------- */
@@ -1238,9 +1283,20 @@ void xfr_store_core_off(void) {
 }
 
 #ifdef KARIDNS_TEST_EVICT
+/* KARIDNS_TEST_XFR_PUT_FAIL: the next n appends of an image record find the disk full inside the store (store_put_ex() runs: its cleaner pass, its retry and NO_DEGRADE are what is tested,
+ * #203 review; before, the knob returned -ENOSPC without calling the store).  The server of this test has no database: every image record it appends is a secondary's copy */
+static int test_append_fault(uint64_t reclen) {
+  (void)reclen;
+  long pf = atomic_load_explicit(&X.put_fail, memory_order_relaxed);
+  while (pf > 0 && !atomic_compare_exchange_weak_explicit(&X.put_fail, &pf, pf - 1, memory_order_relaxed, memory_order_relaxed)) {}
+  return pf > 0 ? -ENOSPC : 0;
+}
 static void read_test_knobs(void) {
   const char *pf = getenv("KARIDNS_TEST_XFR_PUT_FAIL");
   atomic_store_explicit(&X.put_fail, pf ? strtol(pf, NULL, 10) : 0, memory_order_relaxed);
+  if (pf) store_test_append_fault = test_append_fault;
+  const char *rc = getenv("KARIDNS_TEST_XFR_RX_CAP");      /* (the cap on the settings received from primaries in settings.dat, R1: 0 keeps none, the R2 way) */
+  if (rc && *rc) db_store_test_rx_cap_ids = strtoll(rc, NULL, 10);
   const char *kz = getenv("KARIDNS_TEST_XFR_KILL_BEFORE_PUT");
   snprintf(X.kill_zone, sizeof(X.kill_zone), "%s", kz ? kz : "");
   const char *li = getenv("KARIDNS_TEST_STALE_LOG_INTERVAL");
@@ -1331,10 +1387,11 @@ void xfr_store_stop(void) {
 bool xfr_restore_stuck(void) {
   if (atomic_load_explicit(&g_xfr_pending, memory_order_relaxed) == 0) return false;
   const int64_t p = atomic_load_explicit(&g_xfr_restore_progress_ms, memory_order_acquire);
+  const int64_t allow = atomic_load_explicit(&X.item_allow_ms, memory_order_relaxed);   /* (the item in work: a big image) */
 #ifdef KARIDNS_TEST_EVICT
-  if (X.net_ms) return mono_ms() - p > (int64_t)X.net_ms;
+  if (X.net_ms) return mono_ms() - p > (int64_t)X.net_ms + allow;
 #endif
-  return mono_ms() - p > XFR_RESTORE_NET_MS;
+  return mono_ms() - p > XFR_RESTORE_NET_MS + allow;
 }
 
 void xfr_restore_note_timeouts(uint64_t n) {
@@ -1367,7 +1424,11 @@ size_t xfr_store_zonestatus(zone_db_entry_t *e, const server_config_t *cfg, char
     else if (rec_get(st, (uint16_t)vid, &xi, &z) != 0 || z.state != STORE_STATE_STORED) APP("Store: no copy\n");
     else {
       fmt_utc((time_t)z.stamp_time, ts, sizeof(ts));
-      APP("Store: copy serial %u, %u bytes, saved %s\n", z.serial, z.img_len, ts);
+      /* P4 (R1): whether the settings the primary sent are kept with the copy (settings.dat), or a restart asks for the whole zone to get them again (R2) */
+      xfr_state_t rs;
+      const bool sok = xfr_state_decode(z.digest, sizeof(z.digest), &rs) == 0;
+      const char *rx = !sok ? "" : rs.rx_settings ? ", the settings of the primary kept" : (rs.flags & XFR_SF_RX_LOST) ? ", the settings of the primary not kept (a restart asks for the whole zone)" : "";
+      APP("Store: copy serial %u, %u bytes, saved %s%s\n", z.serial, z.img_len, ts, rx);
     }
   }
   char a[40], b[40], c[40];
@@ -1406,6 +1467,12 @@ size_t xfr_store_zonestatus(zone_db_entry_t *e, const server_config_t *cfg, char
   return o;
 }
 
+void xfr_store_expired(uint64_t *expired, uint64_t *stale, uint64_t *servfail) {
+  *expired = atomic_load_explicit(&X.expired_zones, memory_order_relaxed);
+  *stale = atomic_load_explicit(&X.expired_stale, memory_order_relaxed);
+  *servfail = atomic_load_explicit(&X.expired_servfail, memory_order_relaxed);
+}
+
 void xfr_store_counters(xfr_store_counters_t *o) {
   memset(o, 0, sizeof(*o));
   store_t *st = atomic_load_explicit(&X.st, memory_order_acquire);
@@ -1437,8 +1504,13 @@ void xfr_store_counters(xfr_store_counters_t *o) {
   o->gc_deleted = atomic_load(&X.gc_deleted);
   o->stale_capped = atomic_load(&X.stale_capped);
   o->expired_zones = atomic_load(&X.expired_zones);
+  o->expired_stale = atomic_load(&X.expired_stale);
+  o->expired_servfail = atomic_load(&X.expired_servfail);
   o->stale_answers = atomic_load(&g_secondary_stale_answers);
   o->expire_events = atomic_load(&X.expire_events);
+  db_store_rx_stats(&o->rx_texts, &o->rx_bytes, &o->rx_capped);
+  o->rx_restored = atomic_load(&X.rx_restored);
+  o->rx_lost = atomic_load(&X.rx_lost);
 }
 
 /* ------------------------------------------------------------------------------------------------------------- */
@@ -1548,6 +1620,8 @@ void xfr_expiry_entry(zone_db_entry_t *e, const server_config_t *cfg, time_t now
 
 void xfr_expiry_end(time_t now) {
   atomic_store_explicit(&X.expired_zones, E.expired, memory_order_relaxed);
+  atomic_store_explicit(&X.expired_stale, E.stale, memory_order_relaxed);
+  atomic_store_explicit(&X.expired_servfail, E.servfail, memory_order_relaxed);
   const bool many = E.expired > XFR_SUMMARY_ABOVE;
   if (many || (E.suppressed > 0 && (!E.summary_at || now - E.summary_at >= (time_t)hourly_s()))) {
     if (E.summary_at && now - E.summary_at < (time_t)hourly_s()) return;

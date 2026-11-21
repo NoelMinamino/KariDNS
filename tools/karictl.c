@@ -722,6 +722,9 @@ static void prom_server(const karidns_status_t *st, const karidns_stats_total_t 
     printf("karidns_reclaim_zone_versions_waiting %llu\n", ULL(st->reclaim_zone_versions_waiting));
     prom_family("karidns_reclaim_warnings_total", "counter", "Warnings written because a retired zone snapshot waited longer than 60 s.");
     printf("karidns_reclaim_warnings_total %llu\n", ULL(st->reclaim_warnings));
+    prom_family("karidns_secondaries_expired", "gauge", "Secondary zones past their expire deadline, by how they answer (stale: serve-stale with EDE 3; servfail: EDE 24).");
+    printf("karidns_secondaries_expired{answer=\"stale\"} %llu\n", ULL(st->secondaries_expired_stale));
+    printf("karidns_secondaries_expired{answer=\"servfail\"} %llu\n", ULL(st->secondaries_expired_servfail));
     prom_family("karidns_queries_total", "counter", "Queries answered for a zone, by transport (queries no zone answered are in karidns_unzoned_responses_total).");
     printf("karidns_queries_total{proto=\"udp\"} %llu\n", ULL(t->queries_total - t->tcp_queries));
     printf("karidns_queries_total{proto=\"tcp\"} %llu\n", ULL(t->tcp_queries));
@@ -802,6 +805,8 @@ static void json_server(const karidns_status_t *st, const karidns_stats_total_t 
            ULL(st->other_bytes_retired), ULL(st->other_bytes_previous));
     printf(",\"reclaim\":{\"snapshots_waiting\":%llu,\"oldest_snapshot_age_ms\":%llu,\"zone_versions_waiting\":%llu,\"warnings\":%llu}",
            ULL(st->reclaim_snapshots_waiting), ULL(st->reclaim_oldest_age_ms), ULL(st->reclaim_zone_versions_waiting), ULL(st->reclaim_warnings));
+    printf(",\"secondaries_expired\":{\"total\":%llu,\"stale\":%llu,\"servfail\":%llu}", ULL(st->secondaries_expired), ULL(st->secondaries_expired_stale),
+           ULL(st->secondaries_expired_servfail));
     printf(",\"queries\":{\"udp\":%llu,\"tcp\":%llu}", ULL(t->queries_total - t->tcp_queries), ULL(t->tcp_queries));
     printf(",\"responses\":{\"NOERROR\":%llu,\"FORMERR\":%llu,\"SERVFAIL\":%llu,\"NXDOMAIN\":%llu,\"NOTIMP\":%llu,\"REFUSED\":%llu",
            ULL(t->responses_noerror + t->responses_nodata + t->unzoned_responses[0]), ULL(t->unzoned_responses[1]),
@@ -1410,6 +1415,9 @@ int main(int argc, char **argv) {
                    (unsigned long long)st.reclaim_oldest_age_ms);
             printf("retired zone versions waiting: %llu\n", (unsigned long long)st.reclaim_zone_versions_waiting);
             printf("reclaim warnings (snapshot held over 60 s): %llu\n", (unsigned long long)st.reclaim_warnings);
+            /* 0.7 (secondary store 4.5): secondaries past their expire deadline (the gauges of the control thread's last walk of the secondaries) */
+            printf("secondaries expired: %llu (%llu serving stale, %llu SERVFAIL)\n", (unsigned long long)st.secondaries_expired,
+                   (unsigned long long)st.secondaries_expired_stale, (unsigned long long)st.secondaries_expired_servfail);
             printf("server is up and running%s\n", st.frontend_alive ? "" : " (Frontend is down)");
             
             printf("\n--- Security & Rate Limit Stats ---\n");

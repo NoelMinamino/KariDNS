@@ -4529,6 +4529,118 @@ static void test_xfr_writers(void) {
   CHECK(olds > 0 && news > 0);
 }
 
+/* 0.7 (#203 review; planing_0.7.x_secondary_store.md 3.1 W1, 13 tests 9 and 13): a secondary's image that is larger than a segment gets a segment of its own (seg_place()), is stored with
+ * store_put_ex(NO_DEGRADE) between small ones, read back whole and after a reopen; and kill -9 at every crash point of the put of its next version (as large) leaves the old version or the
+ * new one, whole, with a consistent store.  (The 2 GiB limit is the caller's, dns_xfr_store.c put_image(): test_xfr_store.) */
+static int put_big(store_t *s, uint32_t i, uint64_t ver, size_t n) {
+  char nm[160];
+  name_of(i, nm, sizeof(nm));
+  uint8_t *img = malloc(n);
+  if (!img) return -ENOMEM;
+  img_fill(img, n, i, ver);
+  store_meta_t m = meta_of(i, ver);
+  m.source_id = 0;
+  m.flags |= STORE_F_XFR;
+  const int r = store_put_ex(s, 0, nm, strlen(nm), &m, img, n, STORE_PUT_NO_DEGRADE, NULL);
+  free(img);
+  return r;
+}
+/* 1: zone i holds version ver of n octets; 0: another version (of its own length); -1: neither (damaged, missing) */
+static int big_is(store_t *s, uint32_t i, uint64_t ver, size_t n) {
+  const uint32_t z = find_i(s, 0, i);
+  store_img_t im;
+  int res = -1;
+  store_read_lock();
+  if (z != STORE_NONE && store_image_read(s, z, &im) == 0) {
+    uint64_t v = 0;
+    if (im.len >= 16) memcpy(&v, (const uint8_t *)im.data + 8, 8);
+    const size_t want = v == ver ? n : v == ver - 1 ? n - 4096 : 0;
+    uint8_t *ref = want && want == im.len ? malloc(want) : NULL;
+    if (ref) {
+      img_fill(ref, want, i, v);
+      if (memcmp(ref, im.data, want) == 0) res = v == ver ? 1 : 0;
+      free(ref);
+    }
+    store_img_release(s, &im);
+  }
+  store_read_unlock();
+  return res;
+}
+static void test_xfr_big(void) {
+  printf("[0.7 secondaries: an image larger than a segment (a segment of its own); kill -9 at every crash point of the put of its next version]\n");
+  tdir_t d;
+  tdir_new(&d, "xfrbig");
+  store_opts_t o;
+  small_opts(&o);                                                          /* (segments of 1 MiB) */
+  o.scrub_interval_s = UINT32_MAX;
+  store_t *s = NULL;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (!s) { tdir_free(&d); return; }
+  store_view_add(s, "default");
+  const size_t big = (3u << 20) + 4096;
+  CHECK_EQ(put_ex_i(s, 0, 1, 1, STORE_PUT_NO_DEGRADE, NULL), 0);
+  CHECK_EQ(put_big(s, 2, 2, big), 0);
+  CHECK_EQ(put_ex_i(s, 0, 3, 1, STORE_PUT_NO_DEGRADE, NULL), 0);
+  CHECK(verify_i(s, 0, 1, 1) && verify_i(s, 0, 3, 1));
+  CHECK_EQ(big_is(s, 2, 2, big), 1);
+  store_stats_t st;
+  store_stats(s, &st);
+  CHECK(st.seg_count >= 2);                                                /* (the small ones' segment and the big one's own) */
+  check_consistent(s, "big");
+  CHECK_EQ(store_close(s), 0);
+  o.create = false;
+  s = NULL;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (s) {
+    CHECK_EQ(big_is(s, 2, 2, big), 1);
+    CHECK(verify_i(s, 0, 1, 1) && verify_i(s, 0, 3, 1));
+    check_consistent(s, "big reopen");
+    CHECK_EQ(store_close(s), 0);
+  }
+  tdir_free(&d);
+  int runs = 0, olds = 0, news = 0, bad = 0;
+  for (long c = 1; c < 400 && !bad; c++) {
+    tdir_t kd;
+    tdir_new(&kd, "xfrbk");
+    store_opts_t ko;
+    small_opts(&ko);
+    ko.sync_policy = STORE_SYNC_EVERY;
+    fflush(stdout);
+    pid_t pid = fork();
+    if (pid == 0) {
+      store_t *ks = NULL;
+      if (store_open(kd.fd, &ko, &ks) != 0) _exit(3);
+      store_view_add(ks, "default");
+      if (put_big(ks, 2, 2, big - 4096) != 0) _exit(4);                    /* (version 1 of the test's pattern is ver - 1: 4 KiB shorter) */
+      store_test_crash_countdown = c;
+      const int r = put_big(ks, 2, 3, big);
+      store_test_crash_countdown = 0;
+      _exit(r == 0 ? 0 : 5);
+    }
+    int stt = 0;
+    waitpid(pid, &stt, 0);
+    const bool killed = WIFSIGNALED(stt);
+    if (!killed) CHECK(WIFEXITED(stt) && WEXITSTATUS(stt) == 0);
+    ko.create = false;
+    store_t *ks = NULL;
+    CHECK_EQ(store_open(kd.fd, &ko, &ks), 0);
+    if (ks) {
+      const int b = big_is(ks, 2, 3, big);
+      if (b == 1) news++;
+      else if (b == 0) olds++;
+      else bad++;
+      check_consistent(ks, "xfr big kill");
+      CHECK_EQ(store_close(ks), 0);
+    }
+    tdir_free(&kd);
+    runs++;
+    if (!killed) break;
+  }
+  printf("  kill -9 at each crash point of the put of a %zu-octet image: %d runs, %d old, %d new\n", big, runs, olds, news);
+  CHECK_EQ(bad, 0);
+  CHECK(olds > 0 && news > 0);
+}
+
 /* a file system that really is small: KARIDNS_STORE_SMALLFS names a directory on one (a quota dataset, a tmpfs of a few megabytes) */
 static void test_smallfs(const char *base) {
   printf("[space: a real small file system (%s)]\n", base);
@@ -8642,6 +8754,7 @@ int main(void) {
   if (WANT("compact")) { test_compact(STORE_MODE_MAP); test_compact(STORE_MODE_COPY); test_compact_pinned(); test_compact_tick(); test_compact_open_segment(); test_nx_reclaim(); }
   if (WANT("space")) { test_space(STORE_MODE_MAP); test_space(STORE_MODE_COPY); test_append_fault(); }
   if (WANT("xfrw")) test_xfr_writers();
+  if (WANT("xfrbig")) test_xfr_big();
   if (WANT("scrub")) { test_scrub(STORE_MODE_MAP); test_scrub(STORE_MODE_COPY); test_scrub_tick(); }
   if (WANT("opendef")) test_open_defaults();
   if (WANT("errring")) { test_err_ring(); test_err_index(); }

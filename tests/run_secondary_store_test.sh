@@ -15,7 +15,7 @@
 #  6. slave -> master + reconfig: the copy is deleted by the GC; master -> slave starts without a copy
 #  7. file vs store (D7): a retransfer to a lower serial, then a restart with the older high-serial file: the store wins; a newer file
 #     with a greater serial wins
-#  8. disk full (KARIDNS_TEST_XFR_PUT_FAIL): the put fails, a restart serves the previous copy
+#  8. disk full (KARIDNS_TEST_XFR_PUT_FAIL: the appends of the store fail, store_put_ex(NO_DEGRADE) runs): the put fails, a restart serves the previous copy
 #  9. a kill between the install and the put (KARIDNS_TEST_XFR_KILL_BEFORE_PUT): the previous copy, then a refresh
 # 10. an unclean stop and a start under another boot id (store_repair): the copy is restored
 # 11. quarantine (damaged superblocks): the ERROR line, the server starts, the zone transfers again
@@ -24,6 +24,7 @@
 #     unique-id across a restart keeps the copy; a unique-id change while stopped resets that member
 # 16. zone-store none: no store; a config-only server: the store is made, Capsicum on, no ECAPMODE
 # 17. secondary-stale-max: EDE 3 up to the limit, then SERVFAIL + EDE 24 and the stale-limit ERROR
+# R1. (P4) the settings the primary sent are kept in settings.dat: in force at once after a restart, no whole transfer; R2 when the cap is reached (KARIDNS_TEST_XFR_RX_CAP)
 # D9. the `[Zone] secondary-expired:` lines (expired, still-expired, refreshed, summary above 20 zones)
 set -eu
 
@@ -256,6 +257,7 @@ write_secondary "$STORE serve-stale no;" "$(szone sec.test '')" "$(szone exp.tes
 # file.test: the secondary's own file, of the primary's serial, two days old: never transferred, only up to date (M2)
 sed 's/^www .*/www  IN A   192.0.2.6/' "$W/p/file.test.zone" > "$W/s/file.test.zone"
 touch -t "$(date -v-2d +%Y%m%d%H%M 2>/dev/null || date -d '2 days ago' +%Y%m%d%H%M)" "$W/s/file.test.zone"
+TSTART=$(date +%s)                                          # (2b: every refresh of sec.test comes after this)
 start_secondary
 wait_serial sec.test 1 10 || fail "sec.test was not transferred"
 wait_serial exp.test 1 10 || fail "exp.test was not transferred"
@@ -281,11 +283,19 @@ kari_wait_log "$W/s.log" "secondaries: [0-9]* restored (1 expired while stopped)
 ctl zonestatus sec.test > "$W/zs.txt"
 grep -q "^Store: copy serial 1" "$W/zs.txt" || { cat "$W/zs.txt"; fail "1: zonestatus after the restart"; }
 pass "1: restart with the primary down: the copy is answered at once, no transfer"
+# R1 (P4): exp.test took the settings of its primary (Extended AXFR v3); they were kept in settings.dat with the copy and are in force at once, the primary down
+ctl zonestatus exp.test > "$W/zs.txt"
+grep -q "settings=primary" "$W/zs.txt" && grep -q "^Store: copy serial 1, .*, the settings of the primary kept$" "$W/zs.txt" || { cat "$W/zs.txt"; fail "R1: the settings of the primary of exp.test are not in force after the restart"; }
+[ "$(xfr xfr.rx_restored)" -ge 1 ] || fail "R1: xfr.rx_restored $(xfr xfr.rx_restored)"
+pass "R1: the settings the primary sent are restored with the copy (in force with the primary down)"
 q exp.test SOA
 grep -q "status: SERVFAIL" "$W/q.txt" && grep -q "EDE: 24" "$W/q.txt" || fail "2a: exp.test expired while stopped is not SERVFAIL + EDE 24 at once"
 # (the line is the tick's, not the restore thread's: it comes at the first tick after the restore, through the rate limit of the event lines)
 kari_wait_log "$W/s.log" "\[Zone\] secondary-expired: expired zone 'exp.test.' view '[^']*' expired while stopped at" 5 || fail "D9: no 'expired while stopped' line"
 pass "2a: a zone that expired while stopped answers SERVFAIL + EDE 24 from the first query"
+# (P4, 4.5) karictl status counts it (the gauge of the tick's walk: waited for)
+i=0; until ctl status | grep -q "^secondaries expired: 1 (0 serving stale, 1 SERVFAIL)$"; do i=$((i + 1)); [ "$i" -lt 50 ] || { ctl status | grep "secondaries expired"; fail "status: no 'secondaries expired: 1 (0 serving stale, 1 SERVFAIL)'"; }; sleep 0.2; done
+pass "status: secondaries expired: 1 (0 serving stale, 1 SERVFAIL)"
 q file.test SOA
 grep -q "status: NOERROR" "$W/q.txt" || fail "3: the up-to-date-only zone lost its expire clock (its file is two days old)"
 pass "3: the up-to-date-only zone keeps its expire clock across the restart"
@@ -306,12 +316,12 @@ while :; do
 done
 T1=$(date +%s)
 [ $((T1 - TKILLP)) -le 23 ] || fail "2b: sec.test expired $((T1 - TKILLP)) s after the last refresh (EXPIRE 20): the restart reset the clock"
-pass "2b: a zone not yet expired at the restart expires on its original schedule ($((T1 - TKILLP)) s after the primary went away)"
+# (the lower bound, #203 review: no expiry before the deadline of the last successful refresh, which came after the first start: EXPIRE 20 from then at the earliest, a second of rounding)
+[ $((T1 - TSTART)) -ge 19 ] || fail "2b: sec.test expired $((T1 - TSTART)) s after the first start (EXPIRE 20 after its last refresh): too early"
+pass "2b: a zone not yet expired at the restart expires on its original schedule ($((T1 - TKILLP)) s after the primary went away, $((T1 - TSTART)) s after the first start)"
 start_primary
 wait_serial exp.test 1 10 || fail "exp.test was not refreshed when the primary came back"
 kari_wait_log "$W/s.log" "secondary-expired: refreshed zone 'exp.test.' view '[^']*' serving again, serial 1" 10 || fail "D9: no refreshed line"
-kari_wait_log "$W/p.log" "transfer of .exp.test/IN.: Extended AXFR started (serial 1)" 5 || fail "R2: the restored copy whose primary settings were not kept did not ask for the whole zone"
-pass "R2: a restored copy with received settings asks for the whole zone once (serial unchanged)"
 pass "D9: expired / still-expired / refreshed lines with the fixed prefix"
 # 4: IXFR on the stored base
 zone sec.test 2 20 "new IN A 192.0.2.99"
@@ -357,17 +367,41 @@ start_secondary KARIDNS_TEST_STORE_BOOT_ID=4242
 pass "10: an unclean stop and another boot id: the tables are rebuilt, the copy is restored"
 stop_secondary
 
-# =========================================================================================================== R2 with request-ixfr no
-# A zone with request-ixfr no asks the SOA first and the transfer only when the primary is ahead: a restored copy whose received settings were not kept asks for the whole zone once all the same
-# (the SOA check's "same serial" must not end the refresh as up to date, and the state of the copy keeps its XFR_SF_RX_LOST bit meanwhile)
+# =========================================================================================================== R1, and R2 with request-ixfr no
+# R1 (P4): the settings the primary sent are kept in settings.dat with the copy: a restart puts them in force at once and asks for nothing more (with request-ixfr no the refresh is a SOA
+# query that finds the same serial: up to date, no transfer).  R2: the cap of received texts reached (KARIDNS_TEST_XFR_RX_CAP=0 keeps none): the copy says its settings are not kept, and
+# after a restart a zone with request-ixfr no asks for the whole zone once all the same (the SOA check's "same serial" must not end the refresh as up to date, and the state of the copy keeps
+# its XFR_SF_RX_LOST bit meanwhile)
+rix() { grep -c "transfer of .ri.test/IN.: Extended AXFR started (serial 1)" "$W/p.log" || true; }
 [ -n "$PPID_" ] || start_primary
 write_secondary "$STORE" "$(szone ri.test 'request-ixfr no;')"
 start_secondary
 wait_serial ri.test 1 10 || fail "R2/ri: ri.test was not transferred"
 i=0; until ctl zonestatus ri.test | grep -q "settings=primary"; do i=$((i + 1)); [ "$i" -lt 50 ] || fail "R2/ri: the settings of the primary are not in force after the transfer"; sleep 0.2; done
-i=0; until ctl zonestatus ri.test | grep -q "^Store: copy serial 1"; do i=$((i + 1)); [ "$i" -lt 50 ] || fail "R2/ri: the copy was not stored"; sleep 0.2; done
+i=0; until ctl zonestatus ri.test | grep -q "^Store: copy serial 1, .*, the settings of the primary kept$"; do i=$((i + 1)); [ "$i" -lt 50 ] || { ctl zonestatus ri.test; fail "R1/ri: the copy and its settings were not stored"; }; sleep 0.2; done
 stop_secondary
-RI0=$(grep -c "transfer of .ri.test/IN.: Extended AXFR started (serial 1)" "$W/p.log" || true)
+RI0=$(rix)
+start_secondary
+wait_serial ri.test 1 10 || fail "R1/ri: the restored copy is not answered"
+ctl zonestatus ri.test | grep -q "settings=primary" || { ctl zonestatus ri.test; fail "R1/ri: the settings of the primary are not in force at once after the restart"; }
+SW0=$(xfr xfr.state_writes)
+wait_xfr_ge xfr.state_writes $((SW0 + 2)) 15 || fail "R1/ri: no up-to-date refresh after the restart (xfr.state_writes $(xfr xfr.state_writes))"
+[ "$(rix)" = "$RI0" ] || { grep "ri.test" "$W/p.log" | tail -5; fail "R1/ri: the restored copy asked for the whole zone although its settings were kept"; }
+[ "$(xfr xfr.rx_restored)" = 1 ] && [ "$(xfr xfr.rx_lost)" = 0 ] || fail "R1/ri: xfr.rx_restored $(xfr xfr.rx_restored) xfr.rx_lost $(xfr xfr.rx_lost)"
+pass "R1: the settings of the primary come back from settings.dat with the copy; the refreshes after the restart are SOA checks, no whole transfer"
+stop_secondary
+# (a new settings text: one that settings.dat has already is found there whatever the cap; the cap is on new texts)
+sed -i.bak '/"ri.test"/s/allow-transfer { 127.0.0.1; }/allow-transfer { 127.0.0.1; 192.0.2.99; }/' "$W/primary.conf"
+grep -q '"ri.test".*192.0.2.99' "$W/primary.conf" || fail "R2/ri: the primary's configuration was not changed"
+stop_primary
+start_primary
+start_secondary KARIDNS_TEST_XFR_RX_CAP=0
+ctl retransfer ri.test > "$W/rc.txt" || { cat "$W/rc.txt"; fail "karictl retransfer ri.test"; }
+i=0; until ctl zonestatus ri.test | grep -q "^Store: copy serial 1, .*, the settings of the primary not kept (a restart asks for the whole zone)$"; do i=$((i + 1)); [ "$i" -lt 50 ] || { ctl zonestatus ri.test; fail "R2/ri: the copy without its settings was not stored"; }; sleep 0.2; done
+[ "$(xfr xfr.rx_capped)" -ge 1 ] || fail "R2/ri: xfr.rx_capped $(xfr xfr.rx_capped)"
+kari_wait_log "$W/s.log" "settings.dat holds as many settings received from primaries as it may" 5 || fail "R2/ri: no WARNING for the cap"
+stop_secondary
+RI0=$(rix)
 start_secondary
 wait_serial ri.test 1 10 || fail "R2/ri: the restored copy is not answered"
 i=0
@@ -376,8 +410,10 @@ while [ "$(grep -c "transfer of .ri.test/IN.: Extended AXFR started (serial 1)" 
     sleep 0.2
 done
 i=0; until ctl zonestatus ri.test | grep -q "settings=primary"; do i=$((i + 1)); [ "$i" -lt 50 ] || fail "R2/ri: the settings of the primary are not in force after the restart's whole transfer"; sleep 0.2; done
+[ "$(xfr xfr.rx_lost)" = 1 ] || fail "R2/ri: xfr.rx_lost $(xfr xfr.rx_lost)"
+i=0; until ctl zonestatus ri.test | grep -q "^Store: copy serial 1, .*, the settings of the primary kept$"; do i=$((i + 1)); [ "$i" -lt 50 ] || { ctl zonestatus ri.test; fail "R2/ri: the whole transfer (no cap now) did not keep the settings"; }; sleep 0.2; done
 stop_secondary
-pass "R2: request-ixfr no: the restored copy asks for the whole zone (the SOA check is skipped) and the settings of the primary are in force again"
+pass "R2: the cap reached: request-ixfr no: the restored copy asks for the whole zone (the SOA check is skipped) and the settings of the primary are in force again (and kept from then on)"
 
 # =========================================================================================================== the tick skips what waits for its restore; the safety net
 # KARIDNS_TEST_XFR_RESTORE_HOLD_MS: the restore thread is stalled (no progress) before its first pass.  The workers start after the budget of 5 s (D4) with the entry still pending:
