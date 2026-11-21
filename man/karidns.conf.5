@@ -867,7 +867,17 @@ than the limit (\fBRLIMIT_NOFILE\fR, about twice the sockets plus the IPC
 pairs), refuses the start with the reason. A small server (1 router, 1 worker)
 has one socket per listen address either way. Any other value is a configuration
 error (\fBkaricheck conf\fR shows it with the file and line). Changing it needs
-a restart (\fBOK reloaded (restart needed for: udp\-receive)\fR).
+a restart (\fBOK reloaded (restart needed for: udp\-receive)\fR). In both modes
+a worker hands its replies to the router in frames (0.7 B3 phase 3): the replies
+of one batch of queries go in as few IPC datagrams as fit under the kernel's
+limit of one unix datagram (\fBnet.local.dgram.maxdgram\fR, read at start, 8192
+on FreeBSD 15.1; at most 64 KiB), each frame the reply's header and the reply,
+so the worker makes one \fBsendmsg(2)\fR and the router one \fBrecvmsg(2)\fR per
+batch instead of per reply (FreeBSD's \fBsendmmsg\fR and \fBrecvmmsg\fR are
+loops of those). The router checks every frame as it checked a whole message
+(lengths, socket number); a bad frame ends that datagram and is counted
+(\fBipc.router.reply.short\fR, \fB.bad_length\fR, and \fBipc.router.reply.cut\fR
+when it was not the first, see \fBkarictl ipcstats\fR in \fBkarictl(8)\fR).
 .TP 8
 \fBresponse\-cache\-size <size>;\fR
 \fIDefault:\fR \fB32M\fR

@@ -66,8 +66,10 @@ _Static_assert(sizeof(udp_ipc_t) == 80, "udp_ipc_t: 16 octets of header and two 
 
 #define UDP_IPC_FRAME_ALIGN 8
 _Static_assert(alignof(udp_ipc_t) == UDP_IPC_FRAME_ALIGN && sizeof(udp_ipc_t) % UDP_IPC_FRAME_ALIGN == 0, "frames start at aligned offsets");
-/* the shortest payload of a reply frame: a DNS header (RFC 1035 4.1.1, DNS_HEADER_SIZE).  A KLS1 frame is checked by klog_state_apply(). */
-#define UDP_IPC_REPLY_MIN 12
+/* the shortest payload of a reply frame: one octet.  Not a DNS header: a type program zone may answer with a message of any length and the router has
+ * always sent it to the client as it is (tests/run_dag_discarded_hexdump_test.sh: a 6-octet reply); only a reply of no octet is refused.  A KLS1 frame
+ * is checked by klog_state_apply(). */
+#define UDP_IPC_REPLY_MIN 1
 /* The limit of one packed datagram while the kernel's is not known (a unit test, or a sysctl that cannot be read): small on purpose; FreeBSD 15.1 has
  * net.local.dgram.maxdgram = 8192 (setup_ipc_tables() reads it) */
 #define UDP_IPC_PACK_DEFAULT 2048
@@ -78,7 +80,7 @@ static inline size_t udp_ipc_frame_padded(size_t len) {
 }
 
 typedef enum {
-  UDP_IPC_FRAME_BADLEN = -2,   /* payload_len past the end of the datagram, or a reply shorter than a DNS header */
+  UDP_IPC_FRAME_BADLEN = -2,   /* payload_len past the end of the datagram, or a reply of no octet */
   UDP_IPC_FRAME_SHORT = -1,    /* fewer octets left than a header (or a buffer that is not aligned) */
   UDP_IPC_FRAME_END = 0,       /* no frame left */
   UDP_IPC_FRAME_OK = 1,        /* *hdr is a frame whose payload_len octets follow it in the datagram */

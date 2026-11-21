@@ -85,7 +85,6 @@ _Static_assert(IXFR_HISTORY_MAX <= UINT8_MAX, "ixfr_history and the history ring
 
 /* ipc_sockaddr_t, udp_ipc_t, UDP_IPC_LOGSTATE and the framing of the worker -> router replies (B3 phase 3) */
 #include "dns_ipc_frame.h"
-_Static_assert(UDP_IPC_REPLY_MIN == DNS_HEADER_SIZE, "a reply frame holds at least a DNS header");
 
 /* What the router knows of the destination address of the queries that come in on one of its UDP sockets (run_frontend_router()): a socket
  * bound to a specific address always receives its queries at that address, so the address is taken from the bind() once, at start-up, and the socket

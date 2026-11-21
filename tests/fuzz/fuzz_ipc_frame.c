@@ -3,7 +3,7 @@
  *
  * The router reads what a worker of the Backend sends as hostile input.  Properties:
  *   1. udp_ipc_frame_next() over any bytes (in an aligned buffer, as the router's) never reads past them: every frame it returns has its header and
- *      its payload_len octets inside the datagram, a reply frame holds at least a DNS header, the offsets only grow and stay aligned, and a result
+ *      its payload_len octets inside the datagram, a reply frame holds at least one octet, the offsets only grow and stay aligned, and a result
  *      other than a frame leaves the offset at the end (the loop ends);
  *   2. udp_ipc_pack() of frames whose lengths and limit come from the input groups them in order, every frame once, no group over the limit but a
  *      frame alone; each group gathered into one datagram parses back into exactly its frames, header and payload unchanged, with zero padding.

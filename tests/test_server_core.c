@@ -2552,12 +2552,17 @@ static void test_ipc_frame_parse_pack(void) {
     off = 0;
     assert(udp_ipc_frame_next(d, o1 + sizeof(udp_ipc_t) - 1, &off, &h) == UDP_IPC_FRAME_OK && off == o1);
     assert(udp_ipc_frame_next(d, o1 + sizeof(udp_ipc_t) - 1, &off, &h) == UDP_IPC_FRAME_SHORT && off == o1 + sizeof(udp_ipc_t) - 1);
-    /* a reply of zero octets, or shorter than a DNS header: bad (the router would send an empty or broken datagram to the client) */
+    /* a reply of zero octets is bad (the router would send an empty datagram to the client); a short one (a program zone's 6 octets) is a frame as before */
     for (uint16_t pl = 0; pl < UDP_IPC_REPLY_MIN; pl++) {
         size_t fl = ipcf_put(d, 0, 4, pl);
         ipcf_put(d, udp_ipc_frame_padded(fl), 5, 20);
         off = 0;
         assert(udp_ipc_frame_next(d, udp_ipc_frame_padded(fl) + 100, &off, &h) == UDP_IPC_FRAME_BADLEN && off == udp_ipc_frame_padded(fl) + 100);
+    }
+    {
+        size_t sl = ipcf_put(d, 0, 4, 6);
+        off = 0;
+        assert(udp_ipc_frame_next(d, sl, &off, &h) == UDP_IPC_FRAME_OK && h->payload_len == 6 && off == sl);
     }
     /* ... but a KLS1 record of the logging state is not a reply: any length (klog_state_apply() checks it) */
     size_t fl = ipcf_put(d, 0, UDP_IPC_LOGSTATE, 3);
