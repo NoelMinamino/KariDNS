@@ -955,9 +955,12 @@ static void test_agent_msgs(void) {
     }
     /* too many lines, too long */
     char *big = malloc(DQ_MSG_MAX + 2);
-    size_t bl = 0;
-    bl += (size_t)sprintf(big + bl, "X\n");
-    for (int i = 0; i < DQ_MSG_MAXKV + 1; i++) bl += (size_t)sprintf(big + bl, "a=%d\n", i);
+    CHECK(big != NULL);
+    if (!big) return;
+    memset(big, 'a', DQ_MSG_MAX + 2); /* the over-long parse below reads past bl */
+    size_t bl = (size_t)snprintf(big, DQ_MSG_MAX + 2, "X\n");
+    for (int i = 0; i < DQ_MSG_MAXKV + 1 && bl < DQ_MSG_MAX; i++)
+        bl += (size_t)snprintf(big + bl, DQ_MSG_MAX + 2 - bl, "a=%d\n", i);
     CHECK(dq_msg_parse(big, bl, &m, err, sizeof err) == -1);
     CHECK(dq_msg_parse(big, DQ_MSG_MAX + 1, &m, err, sizeof err) == -1);
     free(big);
