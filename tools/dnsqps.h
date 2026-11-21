@@ -314,7 +314,7 @@ typedef struct {
     void (*close)(dq_io_t *io);
     /* the raw paths: send pre-built frames instead of send() (NULL on the socket paths) */
     int (*send_frames)(dq_io_t *io, unsigned chan, const dq_fsend_t *p, unsigned n);
-    /* what the kernel gave the path (xdp: the attach mode and copy or zero-copy), for the status line; false when it is not what was asked (NULL: nothing to say) */
+    /* what the kernel gave the path (xdp: the attach mode and copy or zero-copy; netmap: the rings and slots), for the status line; false when it is not what was asked (NULL: nothing to say) */
     bool (*describe)(dq_io_t *io, char *buf, size_t len);
 } dq_io_ops_t;
 

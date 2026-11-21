@@ -562,8 +562,8 @@ raw_failed:
     if (cfg->null_target) fprintf(st, ", null target (%s)", cfg->null_sink ? "sink" : "reflector");
     if (cfg->srcpfx.on) { char pb[80]; dq_prefix_format(&cfg->srcpfx, pb, sizeof pb); fprintf(st, ", source %s", pb); }
     fprintf(st, "%s\n", frame_note);
-    if (ops->describe && nopen) {   /* what the kernel gave (the first thread's socket: the threads share the interface and its driver) */
-        char given[64];
+    if (ops->describe && nopen) {   /* what the kernel gave (the first thread's: the threads share the interface and its driver) */
+        char given[192];
         if (ops->describe(ws[0].io, given, sizeof given)) fprintf(st, "[Status] %s\n", given);
         else fprintf(st, "[Status] warning: --xdp-mode %s was asked, the kernel gave %s: the rates are not those of the driver mode\n", cfg->xdp_mode, given);
     }

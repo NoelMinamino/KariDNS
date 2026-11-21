@@ -25,6 +25,7 @@ typedef struct {
     uint8_t our_ip[16], srv_ip[16], pfx_mask[16];   /* our_ip: our address, or the base of the source prefix (then pfx_mask: its network bits) */
     bool pfx;
     uint16_t sport0, dport;
+    char name[96];                                    /* what nm_open() was given */
 } nmio_t;
 
 /* "vale0:a" is used as it is; an interface becomes "netmap:IFNAME-RING" */
@@ -69,8 +70,8 @@ static void nm_close_io(dq_io_t *p) {
 static int nm_open_io(dq_io_t **out, const dq_cfg_t *c, dq_target_t *tg, unsigned worker, unsigned nchan, char *err, size_t errlen) {
     nmio_t *x = calloc(1, sizeof *x);
     if (!x) { snprintf(err, errlen, "out of memory"); return -1; }
-    char name[96];
-    nm_name(name, sizeof name, tg->ifname, c->queue + worker);
+    char *name = x->name;
+    nm_name(name, sizeof x->name, tg->ifname, c->queue + worker);
     x->d = nm_open(name, NULL, 0, NULL);
     if (!x->d) {
         snprintf(err, errlen, "nm_open(%.60s) failed: %s (needs root and the netmap module: kldload netmap; the interface must exist)", name, strerror(errno));
@@ -156,7 +157,17 @@ static int nm_recv(dq_io_t *p, dq_rx_t *out, unsigned max, unsigned wait_us) {
     return (int)got;
 }
 
-const dq_io_ops_t dq_io_netmap = { "netmap", nm_open_io, NULL, nm_recv, nm_close_io, nm_send_frames, NULL };
+/* The rings the descriptor got (netmap(4)): the transmit rings this thread fills of the interface's own, and their slots.  A NIC with one queue has one ring pair, so one
+ * thread; the depth of a NIC's rings is the driver's (iflib: the dev.IF.N.iflib.override_ntxds / override_nrxds loader tunables), not something nm_open() can ask for. */
+static bool nm_describe(dq_io_t *p, char *buf, size_t len) {
+    const struct nm_desc *d = ((nmio_t *)p)->d;
+    const struct netmap_if *ni = d->nifp;
+    snprintf(buf, len, "netmap %s: tx ring %u-%u of %u (%u slots), rx rings %u", ((nmio_t *)p)->name, (unsigned)d->first_tx_ring, (unsigned)d->last_tx_ring, (unsigned)ni->ni_tx_rings,
+             (unsigned)NETMAP_TXRING(ni, d->first_tx_ring)->num_slots, (unsigned)ni->ni_rx_rings);
+    return true;
+}
+
+const dq_io_ops_t dq_io_netmap = { "netmap", nm_open_io, NULL, nm_recv, nm_close_io, nm_send_frames, nm_describe };
 
 /* the raw reflector of the tests: --reflect ADDR:PORT --io=netmap --iface vale0:r --src-mac MAC */
 int dq_netmap_reflect(const dq_cfg_t *c, const atomic_bool *stop, char *err, size_t errlen) {

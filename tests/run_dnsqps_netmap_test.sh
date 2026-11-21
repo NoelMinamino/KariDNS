@@ -68,6 +68,7 @@ COMMON="-s 10.88.0.2 -p 5300 -b 10.88.0.1 --io netmap --iface vale0:c --src-mac 
 run "netmap, --next-hop-mac" 4900 $COMMON --next-hop-mac "$RMAC" -d "$T/q.txt" -N 5000 -T 1
 # the next hop resolved by an ARP request that the reflector answers
 run "netmap, ARP" 19000 $COMMON -d "$T/q.txt" -N 20000 -T 1 -c 2
+grep -q '^\[Status\] netmap vale0:c: tx ring 0-0 of 1 (' "$T/out.err" || { fail "netmap: no status line with the rings"; grep Status "$T/out.err"; }
 # generated queries, an open loop
 run "netmap generated, open loop" 1900 $COMMON --next-hop-mac "$RMAC" -z "$T/q.txt" --miss 0.2 -Q 2000 -l 1.5 -T 1
 # pre-built frames with a source prefix and a cookie per query: the raw reflector drops a frame whose IPv4 or UDP checksum is wrong, so every answer proves
