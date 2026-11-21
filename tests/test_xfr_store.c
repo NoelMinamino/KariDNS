@@ -282,6 +282,57 @@ static void test_rules(void) {
   CHECK_EQ(xfr_restore_next_check(&s, 60, 999, 1000), 0);
 }
 
+/* P4 (R1, D5): the key of a received settings text in settings.dat, against the keys of the database zones; the form a build that does not know the kind reads (14, downgrade) */
+static void test_rxkey(void) {
+  printf("[R1: the key of a received settings text (settings.dat)]\n");
+  static const char t[] = "allow-transfer { 192.0.2.7; };";
+  char k[256];
+  const size_t kl = xfr_rx_key_make(t, sizeof(t) - 1, k, sizeof(k));
+  CHECK(kl == xfr_rx_key_len(sizeof(t) - 1) && k[0] == '\0');
+  const char *tx = NULL;
+  size_t tl = 0;
+  CHECK_EQ(xfr_rx_key_split(k, kl, &tx, &tl), 1);
+  CHECK(tl == sizeof(t) - 1 && tx == k + kl - tl && memcmp(tx, t, tl) == 0);
+  /* a database zone's keys: "<profile> NUL <profile text> NUL <zone text>"; with no profile the profile text is empty too */
+  static const char d1[] = "\0\0allow-transfer { 192.0.2.7; };", d2[] = "p\0allow-update { none; };\0x";
+  CHECK_EQ(xfr_rx_key_split(d1, sizeof(d1) - 1, &tx, &tl), 0);
+  CHECK(tx == NULL && tl == 0);
+  CHECK_EQ(xfr_rx_key_split(d2, sizeof(d2) - 1, NULL, NULL), 0);
+  CHECK_EQ(xfr_rx_key_split(k, 3, NULL, NULL), 0);                         /* (cut inside the mark) */
+  CHECK_EQ(xfr_rx_key_split(k, kl - (sizeof(t) - 1), NULL, NULL), -1);                  /* (the mark and no text) */
+  char k2[256];
+  memcpy(k2, k, kl);
+  k2[5] ^= 1;
+  CHECK_EQ(xfr_rx_key_split(k2, kl, NULL, NULL), 0);                       /* (another mark) */
+  k2[5] ^= 1;
+  k2[kl - (sizeof(t) - 1) - 1] = 'x';
+  CHECK_EQ(xfr_rx_key_split(k2, kl, NULL, NULL), 0);                       /* (no NUL after the mark) */
+  CHECK_EQ(xfr_rx_key_split(NULL, 0, NULL, NULL), 0);
+  char *huge = malloc(XFR_RX_TEXT_MAX + 200);
+  if (huge) {
+    memset(huge, ' ', XFR_RX_TEXT_MAX + 200);
+    CHECK_EQ(xfr_rx_key_make(huge, XFR_RX_TEXT_MAX + 1, huge, XFR_RX_TEXT_MAX + 200), 0);   /* (longer than a SETTINGS record) */
+    memcpy(huge, k, kl - (sizeof(t) - 1));
+    CHECK_EQ(xfr_rx_key_split(huge, kl - (sizeof(t) - 1) + XFR_RX_TEXT_MAX + 1, NULL, NULL), -1);
+    CHECK_EQ(xfr_rx_key_split(huge, kl - (sizeof(t) - 1) + XFR_RX_TEXT_MAX, NULL, NULL), 1);
+    free(huge);
+  }
+  CHECK_EQ(xfr_rx_key_make(t, 0, k, sizeof(k)), 0);
+  CHECK_EQ(xfr_rx_key_make(t, sizeof(t) - 1, k, 10), 0);
+  /* an earlier 0.7 reads the record as a profile's text and the zone's: "<mark>\n<text>", a comment and the text; it parses, and no zone has that key (14) */
+  char merged[256];
+  const int ml = snprintf(merged, sizeof(merged), "%s\n%s", XFR_RX_MARK, t);
+  char err[200];
+  zone_ext_shared_t *sh = db_settings_parse(merged, (size_t)ml, err, sizeof(err));
+  CHECK(sh != NULL && sh->ext.allow_transfer_count == 1);
+  zone_ext_shared_unref(sh);
+  /* the parsed object of a transfer carries the key settings.dat keeps */
+  sh = zone_rx_settings_parse("r.test.", t, sizeof(t) - 1);
+  CHECK(sh && sh->key && sh->key_len == kl && memcmp(sh->key, k, kl) == 0 && !sh->ext.db_acl_ceiling);
+  zone_ext_shared_unref(sh);
+  CHECK(zone_rx_settings_parse("r.test.", "file \"/etc/passwd\";", 19) == NULL);
+}
+
 /* ======================================================================================================================= 2. lifetimes */
 
 static char g_dir[256], g_store[300], g_sdir[300];
@@ -651,6 +702,10 @@ static int life2(void) {
   /* the restore thread is held at its first entry: every secondary is pending, the tick would not refresh one (M4) */
   for (int i = 0; i < 500 && !atomic_load(&g_hook_seen); i++) usleep(2000);
   CHECK(atomic_load(&g_hook_seen) == 1);
+  /* #203 review (2.5): e.test's is_transferring is held (a refresh that runs after the safety net gave up on it): the restore does not make its record KNOWN, it leaves the record to that refresh */
+  zone_db_entry_t *ee = ent("e.test.");
+  CHECK(ee != NULL);
+  if (ee) atomic_store(&ee->is_transferring, true);
   zone_db_entry_t *a = ent("a.test.");
   CHECK(a && atomic_load(&a->restore_pending));
   CHECK(atomic_load(&g_xfr_pending) >= 10);
@@ -682,9 +737,11 @@ static int life2(void) {
   zone_db_entry_t *ce = ent("c.test.");
   store_zone_t z;
   CHECK(ce && atomic_load(&ce->serial) == 0 && !rec("c.test.", XFR_K_CONFIG, &z));
-  /* d: a bad checksum: KNOWN, empty; e: a serial mismatch: KNOWN, empty */
+  /* d: a bad checksum: KNOWN, empty; e: a serial mismatch, empty, and its record left STORED (its is_transferring was held: no KNOWN marking without it, 2.5) */
   CHECK(rec("d.test.", XFR_K_CONFIG, &z) && z.state == STORE_STATE_KNOWN && atomic_load(&ent("d.test.")->serial) == 0);
-  CHECK(rec("e.test.", XFR_K_CONFIG, &z) && z.state == STORE_STATE_KNOWN && atomic_load(&ent("e.test.")->serial) == 0);
+  CHECK(rec("e.test.", XFR_K_CONFIG, &z) && z.state == STORE_STATE_STORED && atomic_load(&ent("e.test.")->serial) == 0);
+  CHECK(ee && atomic_load(&ee->is_transferring));                          /* (the restore did not take it, nor give it back) */
+  if (ee) atomic_store(&ee->is_transferring, false);
   /* f: the old file of a higher serial loses (D7); g: the newer file of a greater serial wins */
   CHECK(atomic_load(&ent("f.test.")->serial) == 50 && ent("f.test.")->xfr_origin == XFR_ORIGIN_STORE);
   CHECK(atomic_load(&ent("g.test.")->serial) == 200 && ent("g.test.")->xfr_origin == XFR_ORIGIN_FILE);
@@ -708,6 +765,11 @@ static int life2(void) {
   CHECK(hx && !hx->exp_stopped && hx->exp_state == 1);
   CHECK_EQ(ctr().expire_events, ev0 + 1);
   CHECK(ctr().expired_zones >= 1);
+  {
+    uint64_t ne = 0, ns = 0, nf = 0;                                       /* (karictl status: the same gauges; h.test answers SERVFAIL without serve-stale... or stale with it) */
+    xfr_store_expired(&ne, &ns, &nf);
+    CHECK(ne >= 1 && ne == ns + nf);
+  }
   zone_x_t *lx2 = ent("l.test.") ? zone_x(ent("l.test.")) : NULL;
   CHECK(lx2 && atomic_load(&lx2->xfr_axfr_once));                         /* (R2: the bit of life 1's state) */
   zone_x_t *ax2 = a ? zone_x(a) : NULL;
@@ -837,6 +899,12 @@ static int life4(void) {
   rebuild_zone_db_from_config(&c2, false);
   zone_db_entry_t *n = ent("new.test.");
   CHECK(n && !atomic_load(&n->restore_pending));
+  /* (#203 review, test 19) a catalog member gained by a transfer of its catalog with the store off: not held either */
+  const char *mn[1] = { "gm.test." }, *mu[1] = { "ugm" };
+  catalog_members(mn, mu, 1);
+  zone_db_entry_t *gm = ent("gm.test.");
+  CHECK(gm && gm->is_catalog_member && !atomic_load(&gm->restore_pending));
+  CHECK_EQ(atomic_load(&g_xfr_pending), 0);
   g_extra_zones = "";
   return g_failed;
 }
@@ -878,6 +946,14 @@ static int life5(void) {
   CHECK(atomic_load(&g_xfr_pending) == 2);
   CHECK(!xfr_restore_stuck());
   atomic_store(&g_xfr_restore_progress_ms, atomic_load(&g_xfr_restore_progress_ms) - 31000);
+  CHECK(xfr_restore_stuck());
+  /* (#203 review) a rebuild that comes while the thread is stalled inside its pass asks for another pass and does not hide the stall: no progress is stamped for it */
+  rebuild_zone_db_from_config(&c2, false);
+  CHECK(xfr_restore_stuck());
+  /* (#203 review) the item in work may take its image's read and check beyond the 30 s (a big image is one step) */
+  xfr_store_test_item_allow(60000);
+  CHECK(!xfr_restore_stuck());
+  xfr_store_test_item_allow(0);
   CHECK(xfr_restore_stuck());
   uint64_t n = 0;
   zone_db_entry_t *s1 = ent("s1.test."), *s2 = ent("s2.test.");
@@ -1120,6 +1196,169 @@ static int life9(void) {
   release_config_snapshot(cfg);
   rcu_aux_read_unlock();
   CHECK(zl > 0 && strstr(zs, "Store: not kept (the name is too long)") != NULL);
+  g_extra_zones = "";
+  db_store_stop();
+  return g_failed;
+}
+
+/* ---- P4 (R1, D5): the settings the primaries sent are kept in settings.dat with the copies ----
+ * life R1: r.test and r2.test get one text (written once), r3.test another one past the cap (not kept: XFR_SF_RX_LOST, xfr.rx_capped); an up-to-date refresh keeps the id; zonestatus; an image
+ * over 2 GiB is not stored (a fake length).  Between the lives the test makes r2's state name an id settings.dat does not have, and appends hostile records of the kind (no text, a text the
+ * restricted parser refuses).  Life R1b, the restart: r.test's settings are in force again from settings.dat (no whole transfer asked), r2 and r3 ask for the whole zone (R2), the hostile
+ * records take ids and are never used, and a refresh writes no new text. */
+static const char g_rx_extra[] =
+    "  zone \"r.test\" { type slave; masters { 192.0.2.1; }; };\n"
+    "  zone \"r2.test\" { type slave; masters { 192.0.2.1; }; };\n"
+    "  zone \"r3.test\" { type slave; masters { 192.0.2.1; }; };\n"
+    "  zone \"big.test\" { type slave; masters { 192.0.2.1; }; primary-settings no; };\n";
+static const char g_rx_t1[] = "allow-transfer { 192.0.2.7; };", g_rx_t2[] = "allow-transfer { 192.0.2.8; };";
+static void rx_apply(zone_db_entry_t *e, const char *text) {
+  zone_ext_shared_t *sh = zone_rx_settings_parse(e->domain, text, strlen(text));
+  CHECK(sh != NULL);
+  pthread_mutex_lock(&e->writer_lock);
+  zone_ext_shared_t *old = zone_rx_settings_apply_locked(e, sh);
+  pthread_mutex_unlock(&e->writer_lock);
+  zone_ext_shared_unref(old);
+}
+static int lifer1(void) {
+  printf("[life R1: the settings of the primaries kept in settings.dat]\n");
+  rcu_aux_thread_pin();
+  g_extra_zones = g_rx_extra;
+  if (life_start(g_store, true) != 0) return 1;
+  wait_pass();
+  const time_t now = time(NULL);
+  zone_db_entry_t *r = ent("r.test."), *r2 = ent("r2.test."), *r3 = ent("r3.test."), *big = ent("big.test.");
+  CHECK(r && r2 && r3 && big);
+  if (!r || !r2 || !r3 || !big) return 1;
+  install(r, 5, XFR_ORIGIN_XFR, now, 0);
+  rx_apply(r, g_rx_t1);
+  CHECK(zone_rx_settings_status(r, NULL, 0));
+  refresh_end(r, XFR_OUT_TRANSFERRED, now);
+  xfr_state_t s;
+  CHECK(rec_state("r.test.", XFR_K_CONFIG, &s, NULL) && s.rx_settings != 0 && !(s.flags & XFR_SF_RX_LOST));
+  const uint32_t id1 = s.rx_settings;
+  xfr_store_counters_t c = ctr();
+  CHECK_EQ(c.rx_texts, 1);
+  /* the same text for another zone: the same id, nothing appended */
+  install(r2, 6, XFR_ORIGIN_XFR, now, 0);
+  rx_apply(r2, g_rx_t1);
+  refresh_end(r2, XFR_OUT_TRANSFERRED, now);
+  CHECK(rec_state("r2.test.", XFR_K_CONFIG, &s, NULL) && s.rx_settings == id1);
+  CHECK_EQ(ctr().rx_texts, 1);
+  /* an up-to-date refresh writes the state with the id (the parsed object remembers it) */
+  refresh_end(r, XFR_OUT_UPTODATE, now + 1);
+  CHECK(rec_state("r.test.", XFR_K_CONFIG, &s, NULL) && s.rx_settings == id1 && s.last_attempt == (uint32_t)(now + 1));
+  /* the cap reached (1 text here): r3's text is not kept, R2 */
+  db_store_test_rx_cap_ids = 1;
+  install(r3, 7, XFR_ORIGIN_XFR, now, 0);
+  rx_apply(r3, g_rx_t2);
+  refresh_end(r3, XFR_OUT_TRANSFERRED, now);
+  db_store_test_rx_cap_ids = -1;
+  CHECK(rec_state("r3.test.", XFR_K_CONFIG, &s, NULL) && s.rx_settings == 0 && (s.flags & XFR_SF_RX_LOST));
+  c = ctr();
+  CHECK(c.rx_texts == 1 && c.rx_capped == 1 && c.rx_bytes > 0);
+  /* zonestatus says it */
+  char zs[1024];
+  rcu_aux_read_lock();
+  server_config_t *cfg = acquire_config_snapshot();
+  (void)xfr_store_zonestatus(r, cfg, zs, sizeof(zs));
+  CHECK(strstr(zs, "Store: copy serial 5, ") && strstr(zs, ", the settings of the primary kept\n"));
+  (void)xfr_store_zonestatus(r3, cfg, zs, sizeof(zs));
+  CHECK(strstr(zs, ", the settings of the primary not kept (a restart asks for the whole zone)\n") != NULL);
+  release_config_snapshot(cfg);
+  rcu_aux_read_unlock();
+  /* an image over 2 GiB is not stored (W1; the length is faked for the check, then put back) */
+  install(big, 3, XFR_ORIGIN_XFR, now, 0);
+  zone_version_t *bv = atomic_load(&big->rcu.active);
+  CHECK(bv && bv->image);
+  if (bv && bv->image) {
+    const xfr_store_counters_t b0 = ctr();
+    const uint64_t real = bv->image->total_size;
+    bv->image->total_size = 0x80000000u;
+    refresh_end(big, XFR_OUT_TRANSFERRED, now);
+    bv->image->total_size = real;
+    const xfr_store_counters_t b1 = ctr();
+    CHECK(b1.unstorable == b0.unstorable + 1 && b1.puts == b0.puts);
+    store_zone_t bz;
+    CHECK(!rec("big.test.", XFR_K_CONFIG, &bz));
+    refresh_end(big, XFR_OUT_UPTODATE, now);                                /* (at its real size: stored whole) */
+    CHECK(rec("big.test.", XFR_K_CONFIG, &bz) && bz.serial == 3);
+  }
+  /* for life R1b: r2's state names an id that settings.dat does not have */
+  store_zone_t z2;
+  CHECK(rec_state("r2.test.", XFR_K_CONFIG, &s, &z2));
+  s.rx_settings = 999999;
+  uint8_t dg[STORE_DIGEST_LEN];
+  xfr_state_encode(&s, dg);
+  char k[XFR_KEY_MAX + 1];
+  const int kn = xfr_key_make("v1", XFR_K_CONFIG, "r2.test.", k, sizeof(k));
+  CHECK_EQ(store_set_digest(db_store_handle(), (uint16_t)xfr_store_vid(), k, (size_t)kn, z2.serial, 0, dg, STORE_F_XFR, 0), 0);
+  store_check_report_t cr;
+  CHECK_EQ(store_check(db_store_handle(), &cr), 0);
+  db_store_stop();
+  /* hostile records of the kind at the end of settings.dat: no text; a text the restricted parser refuses */
+  char sp[512];
+  snprintf(sp, sizeof(sp), "%s/settings.dat", g_sdir);
+  int fd = open(sp, O_WRONLY | O_APPEND);
+  CHECK(fd >= 0);
+  if (fd >= 0) {
+    static const char bad[] = "file \"/etc/passwd\";";
+    char kb[256];
+    const size_t kl = xfr_rx_key_make(bad, sizeof(bad) - 1, kb, sizeof(kb));
+    const size_t ke = kl - (sizeof(bad) - 1);                              /* (the mark alone) */
+    const struct { const char *k; size_t n; } recs[2] = { { kb, ke }, { kb, kl } };
+    for (int i = 0; i < 2; i++) {
+      uint32_t h[3] = { 0x4B534554u, (uint32_t)recs[i].n, xfr_crc32c(0, recs[i].k, recs[i].n) };
+      CHECK(write(fd, h, 12) == 12 && write(fd, recs[i].k, recs[i].n) == (ssize_t)recs[i].n);
+    }
+    close(fd);
+  }
+  g_extra_zones = "";
+  return g_failed;
+}
+static int lifer1b(void) {
+  printf("[life R1b: the restart: the settings of the primaries from settings.dat]\n");
+  rcu_aux_thread_pin();
+  g_extra_zones = g_rx_extra;
+  if (life_start(g_store, true) != 0) return 1;
+  xfr_store_wait_start(5000);
+  wait_pass();
+  CHECK_EQ(atomic_load(&g_xfr_pending), 0);
+  zone_db_entry_t *r = ent("r.test."), *r2 = ent("r2.test."), *r3 = ent("r3.test.");
+  CHECK(r && r2 && r3);
+  if (!r || !r2 || !r3) return 1;
+  xfr_store_counters_t c = ctr();
+  printf("  rx: %llu texts, %llu restored, %llu lost\n", (unsigned long long)c.rx_texts, (unsigned long long)c.rx_restored, (unsigned long long)c.rx_lost);
+  /* r: restored with its settings in force, no whole transfer asked */
+  CHECK(atomic_load(&r->serial) == 5 && zone_rx_settings_status(r, NULL, 0));
+  zone_x_t *rx = zone_x(r);
+  CHECK(rx && !atomic_load(&rx->xfr_axfr_once) && rx->rx_sh && rx->rx_sh->ext.allow_transfer_count == 1 && !rx->rx_sh->ext.db_acl_ceiling);
+  /* r2 (an id settings.dat does not have) and r3 (not kept): served, and the whole zone is asked for */
+  zone_x_t *x2 = zone_x(r2), *x3 = zone_x(r3);
+  CHECK(atomic_load(&r2->serial) == 6 && x2 && atomic_load(&x2->xfr_axfr_once) && !zone_rx_settings_status(r2, NULL, 0));
+  CHECK(atomic_load(&r3->serial) == 7 && x3 && atomic_load(&x3->xfr_axfr_once));
+  CHECK(c.rx_restored == 1 && c.rx_lost == 2);
+  CHECK_EQ(c.rx_texts, 3);                                                 /* (the one text and the two hostile records: their ids are taken, unused) */
+  CHECK(db_store_rx_settings_get(c.rx_texts + 1) == NULL);                 /* (beyond them) */
+  CHECK(db_store_settings_by_id(2) == NULL && db_store_settings_by_id(3) == NULL);   /* (never a database zone's settings) */
+  CHECK(db_store_rx_settings_get(2) == NULL && db_store_rx_settings_get(3) == NULL);
+  /* a refresh of r writes the id it has, appends nothing */
+  const time_t now = time(NULL);
+  refresh_end(r, XFR_OUT_UPTODATE, now);
+  xfr_state_t s;
+  CHECK(rec_state("r.test.", XFR_K_CONFIG, &s, NULL) && s.rx_settings != 0 && !(s.flags & XFR_SF_RX_LOST));
+  CHECK_EQ(ctr().rx_texts, 3);
+  /* r2 refreshed up to date before its whole transfer: the state keeps saying that its settings are lost */
+  refresh_end(r2, XFR_OUT_UPTODATE, now);
+  CHECK(rec_state("r2.test.", XFR_K_CONFIG, &s, NULL) && s.rx_settings == 0 && (s.flags & XFR_SF_RX_LOST));
+  /* r2's whole transfer brings the text again: the id of the text settings.dat has */
+  install(r2, 8, XFR_ORIGIN_XFR, now, 0);
+  rx_apply(r2, g_rx_t1);
+  if (x2) atomic_store(&x2->xfr_axfr_once, false);                         /* (what handle_axfr_event() does after the install) */
+  refresh_end(r2, XFR_OUT_TRANSFERRED, now);
+  xfr_state_t sr;
+  CHECK(rec_state("r2.test.", XFR_K_CONFIG, &s, NULL) && rec_state("r.test.", XFR_K_CONFIG, &sr, NULL) && s.rx_settings == sr.rx_settings && !(s.flags & XFR_SF_RX_LOST));
+  CHECK_EQ(ctr().rx_texts, 3);
   g_extra_zones = "";
   db_store_stop();
   return g_failed;
@@ -1439,6 +1678,11 @@ static int lifed1(void) {
   release_config_snapshot(cfg);
   rcu_aux_read_unlock();
   CHECK(zl > 0 && strstr(zs, "Store: copy serial 10, ") != NULL);
+  /* P4 (11): dbstatus <zone> of a database secondary has the same lines, indented */
+  char ds[8192];
+  (void)db_ingest_status("s1.test.", "v1", ds, sizeof(ds));
+  CHECK(strstr(ds, "\n  Store: copy serial 10, ") != NULL && strstr(ds, "\n  Last-refresh: ") != NULL);
+  if (!strstr(ds, "\n  Store: copy serial 10, ")) printf("%s", ds);
   damage_d("v1", "bad.test.");                                           /* (a bad checksum for the restart) */
   db_store_stop();
   return g_failed;
@@ -1569,6 +1813,7 @@ int main(void) {
   test_identity();
   test_times();
   test_rules();
+  test_rxkey();
   snprintf(g_dir, sizeof(g_dir), "/tmp/test_xfr_store.XXXXXX");
   if (!mkdtemp(g_dir)) { perror("mkdtemp"); return 2; }
   snprintf(g_store, sizeof(g_store), "zone-store \"%s/store\";", g_dir);
@@ -1591,6 +1836,10 @@ int main(void) {
   run_child(life8);
   snprintf(g_store, sizeof(g_store), "zone-store \"%s/store9\";", g_dir);
   run_child(life9);
+  snprintf(g_store, sizeof(g_store), "zone-store \"%s/storer\";", g_dir);
+  snprintf(g_sdir, sizeof(g_sdir), "%s/storer", g_dir);
+  run_child(lifer1);
+  run_child(lifer1b);
   snprintf(g_dsdir, sizeof(g_dsdir), "%s/dbstore", g_dir);
   run_child(lifed1);
   run_child(lifed2);

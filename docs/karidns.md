@@ -1400,10 +1400,19 @@ SLAVE and CONSUMER, and the members of a CONSUMER; see "Database secondaries" be
   The first refresh after a restore happens at the first tick (NOTIFYs sent while the server was stopped are lost, RFC 1996), except
   after a recent failed attempt (then at the retry time). Primaries that changed since the copy was stored: the copy is served and the zone
   refreshed at once. A copy of another zone (another view of the same name tag, another kind, a member with a new unique-id, RFC 9432
-  §5.4) is deleted; a copy that is damaged is not used (it is stored again by the next refresh). Settings the primary sent with the zone
-  (Extended AXFR version 3) are not stored: the first refresh after a restore asks for the whole zone once, which brings them again.
+  §5.4) is deleted; a copy that is damaged is not used (it is stored again by the next refresh).
   The server lets the queries in after the restore, or after 5 s at the most (the rest goes on in the background); if the restore makes
-  no progress for 30 s the zones that still wait refresh without their copy (ERROR, `xfr.restore_timeouts`).
+  no progress for 30 s (plus the time to read and check a large copy at 10 MB/s) the zones that still wait refresh without their copy
+  (ERROR, `xfr.restore_timeouts`).
+- **The settings of the primary** (Extended AXFR version 3, "The settings of the primary" below). They are kept with the copy: the text
+  the primary sent is written once to `settings.dat` in the store directory, as a second kind of text beside the settings of the database
+  zones, and the copy's state names it. A restart puts them in force again before the copy is served, so the zone answers with them even
+  while the primary is down, and the first refresh is an ordinary one (an IXFR request, or the SOA query of `request-ixfr no`). The texts
+  are read back as untrusted input (the record's checksum, then the restricted parser of the settings, as a transfer does); a text that
+  fails is not used. `settings.dat` keeps every text it was given (it is only appended to), so the received texts may take at most an
+  eighth of its ids (131,072) and 16 MiB; beyond that a new text is not kept (WARNING once, `xfr.rx_capped`), and such a zone asks for the
+  whole zone at its first refresh after a restart, which brings the settings again, as when its text cannot be read. Moving the store
+  directory away (with its copies) starts `settings.dat` anew.
 - **Removal.** A zone that leaves the configuration, changes to another type or leaves its catalog loses its copy (the copies of a
   catalog's members are kept until every catalog zone of the view has refreshed once after a start, so that a catalog whose own copy
   could not be used does not take them with it). A change of ownership of a member with the same unique-id (RFC 9432 §5.5) keeps it.
@@ -1436,12 +1445,28 @@ SLAVE and CONSUMER, and the members of a CONSUMER; see "Database secondaries" be
   once, when `secondary-stale-max` is reached), `refreshed` (NOTICE, the first successful refresh after it), and `summary` (WARNING,
   hourly, instead of the per-zone hourly lines when more than 20 zones are expired). At most 20 event lines a minute; the others are
   counted in the next summary (`N event line(s) suppressed`).
-- **Status.** `karictl zonestatus <zone>` of a secondary adds `Store: copy serial N, B bytes, saved <UTC>` (or `no copy`, `off`,
-  `restore pending`), `Last-refresh: ... Last-attempt: ... (failed) Expires: ...`, and when it is expired `Expired: since <UTC> (<duration>),
-  serving stale data (serve-stale)` or `..., answering SERVFAIL (serve-stale no | secondary-stale-max <d> reached)`. `karictl store` has
-  the `xfr.*` keys (records, image bytes, puts, puts of up-to-date zones, puts without room, state writes, restores, file won, damaged,
-  identity mismatches, pending, the restore time, GC deletions, `xfr.stale_capped`) and `secondary.expired_zones`,
-  `secondary.stale_answers`, `secondary.expire_events`.
+- **Status.** `karictl zonestatus <zone>` of a secondary (of karidns.conf, a catalog member or a database secondary) adds `Store: copy
+  serial N, B bytes, saved <UTC>` (with `, the settings of the primary kept` or `, the settings of the primary not kept (a restart asks
+  for the whole zone)` when the primary sent settings; or `Store: no copy`, `off`, `restore pending`, `not kept (...)`), `Last-refresh:
+  ... Last-attempt: ... (failed) Expires: ...`, and when it is expired `Expired: since <UTC> (<duration>), serving stale data
+  (serve-stale)` or `..., answering SERVFAIL (serve-stale no | secondary-stale-max <d> reached)`; `karictl dbstatus <zone>` of a
+  database secondary has the same lines, indented. `karictl status` has `secondaries expired: N (S serving stale, F SERVFAIL)`.
+  `karictl store` has the `xfr.*` keys (records, image bytes, puts, puts of up-to-date zones, puts without room, state writes, restores,
+  file won, damaged, identity mismatches, pending, the restore time, GC deletions, `xfr.stale_capped`; the received settings:
+  `xfr.rx_texts`, `xfr.rx_bytes`, `xfr.rx_capped`, `xfr.rx_restored`, `xfr.rx_lost`) and `secondary.expired_zones`,
+  `secondary.expired_stale`, `secondary.expired_servfail`, `secondary.stale_answers`, `secondary.expire_events` (docs/karictl.md).
+- **Upgrade and downgrade.** From 0.6.x: a server with secondary zones and no `zone-store` makes the default store directory
+  (`/var/db/karidns/store`, when `/var/db/karidns` exists; a NOTICE says the store was created new) and its copies appear with the first
+  refresh of each zone (an up-to-date answer stores the whole zone, so a zone that does not change is stored too); the first start after
+  the upgrade transfers or checks every secondary as before. `zone-store none;` keeps 0.6's behaviour. No store format changes (the store
+  of a 0.7 server with a database keeps its zones; the view `_karidns-xfr` is added at the first start and needs one of the 32 view
+  ids). Downgrade to an earlier 0.7 build: the copies are records of a view no configuration of that build names, so its reconcile, its
+  inventory and its query path never use them, and the zones transfer as they did; a copy left without an image (a damaged one) makes
+  that build ask its loader once per pass for a zone of a view it does not have (logged, harmless); a received settings text in
+  `settings.dat` is read by that build as the settings of a profile that no zone names (its first line is a comment of the settings
+  syntax) and never used, so the ids after it stay the same. Downgrade to 0.6: no store is read; the directory can be removed. An
+  upgrade to a release that changes the store's format, or a store that is quarantined, drops every copy (see "The store is the only
+  copy" above); the release notes of such a release say so.
 
 ### Secondary zones: Extended AXFR version 3 and the settings of the primary (milestone B8t-2)
 
@@ -1496,7 +1521,8 @@ the received `allow-transfer` is valid only if the secondary defines that key; o
 shown by `zonestatus`) while the rest of the settings apply. `primary-settings no;` in the zone ignores the received settings
 altogether. The received settings are replaced by every successful transfer (a transfer without a `SETTINGS` record clears them), are
 kept when a refresh fails or the primary is down, follow a changed `karidns.conf` (the secondary's own statements are re-read), and
-live in memory only, like the data; a catalog member zone and a database secondary use them in the same way (for a database zone
+are kept with the zone's copy in the zone store like the data (0.7: a restart puts them in force again; see "Secondary zones: the
+copies in the zone store"); a catalog member zone and a database secondary use them in the same way (for a database zone
 the settings of its database row take the place of the `zone {}` block). `karictl zonestatus` shows `settings=primary` while
 received settings are in force. A change of the settings alone (no new serial) reaches the secondary with its next transfer.
 

@@ -8,7 +8,9 @@
  *      option at most now + SOA EXPIRE, never 0 for an EXPIRE option;
  *   3. xfr_key_parse() of any bytes never reads past them; a key it accepts is made again by xfr_key_make() from its parts, byte for byte, when the tag is the one of
  *      some view (checked with the tag of the empty view name through a rebuilt key whose tag field is replaced);
- *   4. the decisions (the up-to-date rule, the failure skip, next_check, D7) take any values without fault.
+ *   4. the decisions (the up-to-date rule, the failure skip, next_check, D7) take any values without fault;
+ *   5. (P4, R1) the same key bytes as a key of settings.dat: xfr_rx_key_split() never reads past them, and a received text it accepts makes the key again (xfr_rx_key_make()).
+ *      The text itself goes to the restricted parser db_settings_parse(), which fuzz_conf_parser and fuzz_db_stream cover.
  */
 #include <stdint.h>
 #include <stddef.h>
@@ -68,6 +70,23 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         if ((key[i] >= 'A' && key[i] <= 'Z') || key[i] == '\\') plain = 0;
       if (kl > 10 && key[kl - 1] == '.') plain = 0;
       if (plain && ((size_t)n != kl || memcmp(re + 8, key + 8, kl - 8) != 0)) abort();
+    }
+  }
+  /* 5 (P4, R1): the key of a received settings text read back from settings.dat: xfr_rx_key_split() of any bytes never reads past them; a text it accepts lies inside the key, is
+   * 1..XFR_RX_TEXT_MAX octets, and makes the same key again with xfr_rx_key_make() */
+  {
+    const char *tx = NULL;
+    size_t tl = 0;
+    const int rk = xfr_rx_key_split(key, kl, &tx, &tl);
+    if (rk == 1) {
+      if (!tx || tl == 0 || tl > XFR_RX_TEXT_MAX || tx < key || tx + tl != key + kl) abort();
+      char *re = malloc(xfr_rx_key_len(tl));
+      if (re) {
+        if (xfr_rx_key_make(tx, tl, re, xfr_rx_key_len(tl)) != kl || memcmp(re, key, kl) != 0) abort();
+        free(re);
+      }
+    } else if (tx || tl) {
+      abort();
     }
   }
   free(key);

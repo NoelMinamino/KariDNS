@@ -20,12 +20,13 @@
  *   20   4   the expire deadline as a delta from the last successful refresh, seconds.  XFR_SF_EXPIRE_OPT clear: 0 = last refresh + SOA EXPIRE (RFC 1034 §4.3.5);
  *            set: the deadline the EXPIRE option gave (RFC 7314 §4), and 0 = expired at once (an EXPIRE option of 0)
  *   24   4   last attempt, unix seconds (0 = none)
- *   28   4   rx settings id (0 = none; R1 is P4)
+ *   28   4   the id in settings.dat of the settings the primary sent (0 = none; R1, see xfr_rx_key_split())
  */
 
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 #include <time.h>
 
 #define XFR_STATE_VERSION 2
@@ -82,5 +83,27 @@ int  xfr_uptodate_action(bool have_rec, uint8_t rec_state, uint16_t rec_flags, u
 bool xfr_failure_skip(const xfr_state_t *old, const xfr_state_t *upd, time_t now, uint32_t retry);
 /* next_check after a restore (4.5, D3): 0 (at the first tick), or after a recent failed attempt last_attempt + retry, never later than the deadline (0: none) */
 time_t xfr_restore_next_check(const xfr_state_t *s, uint32_t retry, time_t deadline, time_t now);
+
+/* R1 (D5, P4): the settings a primary sent with a zone (Extended AXFR version 3) are kept in the store's settings.dat as a second kind of text, beside the settings of the database
+ * zones.  A record of settings.dat holds a key; a database zone's key is "<profile name> NUL <profile text> NUL <zone text>", and one without a profile name has an empty profile text
+ * as well.  The key of a received text is "NUL XFR_RX_MARK NUL <text>": an empty profile name with a profile text, which no database key has.  The mark is a comment of the settings
+ * syntax, so a build that does not know this kind (an earlier 0.7) reads the record as the settings text "<mark> \n <text>" of a profile no zone names, and never uses it: the ids
+ * after it stay where they are (14, downgrade).  The text is at most XFR_RX_TEXT_MAX octets (KARIDNS_SETTINGS_MAX, the longest SETTINGS record a transfer takes). */
+#define XFR_RX_MARK     "# karidns: settings received from the primary (Extended AXFR v3) 1"
+#define XFR_RX_TEXT_MAX 32768u
+/* the key of a received text into out (cap at least xfr_rx_key_len(len)); its length, or 0 (no text, too long, no room) */
+static inline size_t xfr_rx_key_len(size_t len) { return 2 + sizeof(XFR_RX_MARK) - 1 + len; }
+static inline size_t xfr_rx_key_make(const char *text, size_t len, char *out, size_t cap) {
+  const size_t ml = sizeof(XFR_RX_MARK) - 1;
+  if (!text || len == 0 || len > XFR_RX_TEXT_MAX || !out || cap < xfr_rx_key_len(len)) return 0;
+  out[0] = '\0';
+  memcpy(out + 1, XFR_RX_MARK, ml);
+  out[1 + ml] = '\0';
+  memcpy(out + 2 + ml, text, len);
+  return xfr_rx_key_len(len);
+}
+/* the text of a key read back from settings.dat (hostile: every byte may come): 1, a received text (text, tlen inside the key, 1..XFR_RX_TEXT_MAX octets); 0, not of this kind
+ * (a database zone's key); -1, of this kind but unusable (no text, or too long) */
+int xfr_rx_key_split(const void *key, size_t klen, const char **text, size_t *tlen);
 
 #endif /* DNS_XFR_STATE_H */

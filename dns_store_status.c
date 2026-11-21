@@ -454,7 +454,14 @@ static void add_xfr(list_t *l) {
   U("xfr.restore_timeouts", x.restore_timeouts);
   U("xfr.gc_deleted", x.gc_deleted);
   U("xfr.stale_capped", x.stale_capped);
+  U("xfr.rx_texts", x.rx_texts);
+  U("xfr.rx_bytes", x.rx_bytes);
+  U("xfr.rx_capped", x.rx_capped);
+  U("xfr.rx_restored", x.rx_restored);
+  U("xfr.rx_lost", x.rx_lost);
   U("secondary.expired_zones", x.expired_zones);
+  U("secondary.expired_stale", x.expired_stale);
+  U("secondary.expired_servfail", x.expired_servfail);
   U("secondary.stale_answers", x.stale_answers);
   U("secondary.expire_events", x.expire_events);
 }

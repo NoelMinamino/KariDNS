@@ -114,6 +114,11 @@ typedef struct {
     uint64_t reclaim_oldest_age_ms;
     uint64_t reclaim_zone_versions_waiting;
     uint64_t reclaim_warnings;
+    /* 0.7 (secondary store 4.5): the secondaries whose expire deadline has passed (the tick's last walk), and of them the ones answered from stale data (serve-stale, EDE 3) and the ones
+     * answered SERVFAIL (EDE 24).  Appended (24 bytes) */
+    uint64_t secondaries_expired;
+    uint64_t secondaries_expired_stale;
+    uint64_t secondaries_expired_servfail;
 } karidns_status_t;
 
 #define KARIDNS_DNSTAP_LINK_OFF  0   /* no dnstap block */

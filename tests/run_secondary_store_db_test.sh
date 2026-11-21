@@ -4,7 +4,7 @@
 # planing_0.7.x_secondary_store.md 3.3, 4.4, 5 and section 13, integration test 15.  A primary P1 (zone files) and the server under test S whose zones
 # come from a SQLite3 database (tests/db/pdns_schema.sqlite3.sql + db/karidns_ext.sqlite3.sql) with `database { store "<dir>"; }`.  The SLAVE and CONSUMER
 # zones of the database are transferred from P1; their copies are records of the store's reserved view.  Checked:
-#   1. the copies are written (xfr.records, dbstatus says a copy is kept; the `Store:` line of zonestatus and dbstatus is P4);
+#   1. the copies are written (xfr.records, dbstatus says a copy is kept; P4: the `Store:` lines of zonestatus and dbstatus);
 #   2. a restart with the database file moved away (the loader cannot read it) and P1 down: the SLAVE zones and the catalog consumer's member are answered from
 #      their copies at once (the restore jobs of the ingest thread, without the loader);
 #   3. a restart with the database back and P1 up: the restore jobs and the loader's jobs of the same zones make one entry per zone (dbstatus `status applied`,
@@ -176,6 +176,10 @@ wait_ans 192.0.2.30 www.prim.test A 20 && pass "the NATIVE zone prim.test answer
 # slv del ren nat cat (database kinds 4 and 5) and the member m1 (kind 3)
 wait_xfr xfr.records -ge 6 20 && pass "xfr.records: the six copies are stored ($(xfr xfr.records))" || fail "xfr.records $(xfr xfr.records), want 6"
 dbst slv.test | grep -q "transfer: last successful .*serial 10 (a copy is kept in the zone store" && pass "dbstatus: a copy is kept in the zone store" || { fail "dbstatus slv.test"; dbst slv.test | sed 's/^/         /'; }
+# P4 (11): the `Store:` lines of a database secondary, in zonestatus and (indented) in dbstatus; the copy is written after the install, so it is waited for
+i=0; until $KCTL zonestatus slv.test 2>&1 | grep -q "^Store: copy serial 10, "; do i=$((i + 1)); [ "$i" -lt 50 ] || break; sleep 0.2; done
+$KCTL zonestatus slv.test 2>&1 | grep -q "^Store: copy serial 10, " && $KCTL zonestatus slv.test 2>&1 | grep -q "^Last-refresh: 20" && pass "zonestatus: the Store: and Last-refresh: lines of a database secondary" || { fail "zonestatus slv.test"; $KCTL zonestatus slv.test 2>&1 | sed 's/^/         /'; }
+dbst slv.test | grep -q "^  Store: copy serial 10, " && pass "dbstatus: the Store: line of a database secondary" || { fail "dbstatus slv.test Store:"; dbst slv.test | sed 's/^/         /'; }
 # the store's figures for the database are not the copies' (a copy is no zone of a database view)
 OUT=$(dbst)
 printf '%s\n' "$OUT" | grep -q "^ *store pass:" && pass "dbstatus has its store pass line" || true

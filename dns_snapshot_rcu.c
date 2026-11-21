@@ -14,6 +14,7 @@
 #include "dns_query_engine.h"
 #include "dns_alias.h"
 #include "dns_store.h"          /* (the constants of the store's records; the lookup reaches the store through g_dbdir) */
+#include "dns_xfr_state.h"      /* (0.7 P4: the key of a received settings text, inline: no object of it is linked) */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -6855,16 +6856,31 @@ static void rx_merge_locked(zone_db_entry_t *entry, server_config_t *cfg) {
         syslog(LOG_ERR, "[AXFR] zone '%s': out of memory retiring the previous received settings; they are leaked", entry->domain);
 }
 
-zone_ext_shared_t *zone_rx_settings_parse(const char *zone, const char *text, size_t len) {
+zone_ext_shared_t *zone_rx_settings_parse_ex(const char *text, size_t len, char *err, size_t errlen) {
+    if (err && errlen) err[0] = '\0';
     if (!text || len == 0) return NULL;
+    zone_ext_shared_t *sh = db_settings_parse(text, len, err, errlen);
+    if (!sh) return NULL;
+    sh->ext.db_acl_ceiling = false;      /* the ceiling is a rule for the settings of the secondary's own database zones */
+    /* 0.7 P4 (secondary store R1): the key of the text as the zone store keeps it (dns_xfr_state.h); no memory, or a text longer than a SETTINGS record: no key, the text is not
+     * kept and a restart asks for the whole zone (R2) */
+    const size_t kl = xfr_rx_key_len(len);
+    char *key = len <= XFR_RX_TEXT_MAX ? malloc(kl) : NULL;
+    if (key && xfr_rx_key_make(text, len, key, kl) == kl) {
+        sh->key = key;
+        sh->key_len = kl;
+    } else {
+        free(key);
+    }
+    return sh;
+}
+
+zone_ext_shared_t *zone_rx_settings_parse(const char *zone, const char *text, size_t len) {
     char err[200];
-    zone_ext_shared_t *sh = db_settings_parse(text, len, err, sizeof(err));
-    if (!sh) {
+    zone_ext_shared_t *sh = zone_rx_settings_parse_ex(text, len, err, sizeof(err));
+    if (!sh && text && len > 0)
         syslog(LOG_WARNING, "[AXFR] zone '%s': the settings received from the primary are not accepted (%s); the zone keeps its own settings",
                zone, err);
-        return NULL;
-    }
-    sh->ext.db_acl_ceiling = false;      /* the ceiling is a rule for the settings of the secondary's own database zones */
     return sh;
 }
 
