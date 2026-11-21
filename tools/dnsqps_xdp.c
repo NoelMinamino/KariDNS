@@ -1,6 +1,6 @@
 /* dnsqps: the AF_XDP path (Linux, libxdp; built when pkg-config finds libxdp, -DHAVE_XDP).
  * One XDP socket per worker on NIC queue (--queue + worker), with its own UMEM: the first half of the frames feeds the fill ring (receive), the second half is
- * the pool of transmit frames.  The queries are wrapped in Ethernet / IP / UDP by dq_frame_build() into the transmit frame, and the answers are read from the
+ * the pool of transmit frames.  The queries are copied from the pre-built frames (dq_frame_emit: patched with the ID, port, source address and cookie) into the transmit frame, and the answers are read from the
  * receive ring and matched on the source address and port and the destination port (one source port per channel).  The kernel's own stack never sees
  * the traffic of that queue: use an interface (or a queue) the host does not need, and steer the answers to the queues the workers use (ethtool -N / -X, docs/dnsqps.md).
  * XDP_USE_NEED_WAKEUP is set; --xdp-mode skb forces the generic mode (veth, a NIC without native XDP). */
@@ -28,7 +28,6 @@ typedef struct {
     struct xsk_ring_cons cq, rx;
     uint8_t *area;
     size_t area_len;
-    dq_frame_tpl_t tpl[DQ_MAXCHAN];
     unsigned nchan;
     uint64_t txfree[XNTX];
     unsigned ntxfree;
@@ -36,7 +35,8 @@ typedef struct {
     unsigned nheld;
     int fd;
     bool v6;
-    uint8_t our_ip[16], srv_ip[16];
+    uint8_t our_ip[16], srv_ip[16], pfx_mask[16];   /* our_ip: our address, or the base of the source prefix (then pfx_mask: its network bits) */
+    bool pfx;
     uint16_t sport0, dport;
 } xdpio_t;
 
@@ -122,6 +122,8 @@ static int xdp_open(dq_io_t **out, const dq_cfg_t *c, dq_target_t *tg, unsigned 
     x->dport = tg->dport;
     memcpy(x->our_ip, tg->src_ip, 16);
     memcpy(x->srv_ip, tg->dst_ip, 16);
+    x->pfx = tg->pfx.on;
+    memcpy(x->pfx_mask, tg->pfx.mask, 16);
     x->area_len = (size_t)(XNRX + XNTX) * XFRAME;
     x->area = mmap(NULL, x->area_len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (x->area == MAP_FAILED) { x->area = NULL; snprintf(err, errlen, "cannot map the UMEM"); goto fail; }
@@ -160,8 +162,6 @@ static int xdp_open(dq_io_t **out, const dq_cfg_t *c, dq_target_t *tg, unsigned 
         dq_rawif_t rif = { xdp_tx_raw, xdp_rx_raw, x };
         if (dq_raw_resolve_mac(&rif, tg, err, errlen) < 0) goto fail;
     }
-    for (unsigned i = 0; i < nchan; i++)
-        dq_frame_tpl_init(&x->tpl[i], tg->src_mac, tg->dst_mac, tg->v6, tg->src_ip, tg->dst_ip, (uint16_t)(x->sport0 + i), tg->dport);
     *out = (dq_io_t *)x;
     return 0;
 fail:
@@ -169,7 +169,7 @@ fail:
     return -1;
 }
 
-static int xdp_send(dq_io_t *p, unsigned chan, const dq_tx_t *pk, unsigned n) {
+static int xdp_send_frames(dq_io_t *p, unsigned chan, const dq_fsend_t *pk, unsigned n) {
     xdpio_t *x = (xdpio_t *)p;
     xdp_reclaim(x);
     unsigned want = n < x->ntxfree ? n : x->ntxfree;
@@ -180,7 +180,7 @@ static int xdp_send(dq_io_t *p, unsigned chan, const dq_tx_t *pk, unsigned n) {
     }
     for (unsigned i = 0; i < want; i++) {
         uint64_t a = x->txfree[--x->ntxfree];
-        size_t fl = dq_frame_build(&x->tpl[chan], xsk_umem__get_data(x->area, a), XFRAME, pk[i].buf, pk[i].len);
+        size_t fl = dq_frame_emit(xsk_umem__get_data(x->area, a), XFRAME, &pk[i], x->v6, (uint16_t)(x->sport0 + chan));
         struct xdp_desc *d = xsk_ring_prod__tx_desc(&x->tx, idx + i);
         d->addr = a;
         d->len = (uint32_t)fl;
@@ -208,7 +208,7 @@ static int xdp_recv(dq_io_t *p, dq_rx_t *out, unsigned max, unsigned wait_us) {
         const uint8_t *data = xsk_umem__get_data(x->area, d->addr);
         dq_udp_view_t v;
         x->held[x->nheld++] = d->addr & ~(uint64_t)(XFRAME - 1);
-        if (dq_frame_parse_udp(data, d->len, x->v6, x->our_ip, &v) < 0 || v.sport != x->dport || memcmp(v.sip, x->srv_ip, x->v6 ? 16 : 4) != 0) continue;
+        if (dq_frame_parse_udp_pfx(data, d->len, x->v6, x->our_ip, x->pfx ? x->pfx_mask : NULL, &v) < 0 || v.sport != x->dport || memcmp(v.sip, x->srv_ip, x->v6 ? 16 : 4) != 0) continue;
         unsigned ch = (unsigned)(uint16_t)(v.dport - x->sport0);
         if (v.dport < x->sport0 || ch >= x->nchan) continue;
         out[got].buf = v.payload;
@@ -220,7 +220,7 @@ static int xdp_recv(dq_io_t *p, dq_rx_t *out, unsigned max, unsigned wait_us) {
     return (int)got;
 }
 
-const dq_io_ops_t dq_io_xdp = { "xdp", xdp_open, xdp_send, xdp_recv, xdp_close };
+const dq_io_ops_t dq_io_xdp = { "xdp", xdp_open, NULL, xdp_recv, xdp_close, xdp_send_frames };
 #else
 typedef int dq_xdp_not_built;
 #endif

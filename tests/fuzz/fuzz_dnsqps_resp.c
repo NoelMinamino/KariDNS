@@ -16,5 +16,18 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     dq_nd_adv_parse(data, size, ip6, m);
     dq_frame_reflect(data, size, false, ip4, mac, 5300, out, sizeof out);
     dq_frame_reflect(data, size, true, ip6, mac, 5300, out, sizeof out);
+    /* a pre-built frame from the input patched in place: any length, any cookie offset, either family */
+    if (size > 3) {
+        dq_fsend_t s;
+        memset(&s, 0, sizeof s);
+        s.frame = data + 3;
+        s.flen = (uint16_t)(size - 3);
+        s.id = (uint16_t)(data[0] << 8);
+        s.cookie_off = (uint16_t)(data[1] & 0x7F);
+        s.set_sip = (data[2] & 1) != 0;
+        memcpy(s.cookie, data, 3);
+        dq_frame_emit(out, sizeof out, &s, (data[2] & 2) != 0, 40000);
+        dq_frame_parse_udp_pfx(data, size, false, ip4, mac, &v);
+    }
     return 0;
 }

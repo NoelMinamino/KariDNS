@@ -71,7 +71,18 @@ size_t dq_frame_build(const dq_frame_tpl_t *t, uint8_t *out, size_t cap, const u
     return t->hlen + plen;
 }
 
+/* a destination address is ours: all of it, or only the network bits of mask (a source prefix: -b ADDR/LEN) */
+static bool ip_ours(const uint8_t *a, const uint8_t *ours, const uint8_t *mask, size_t n) {
+    for (size_t i = 0; i < n; i++)
+        if ((a[i] ^ ours[i]) & (mask ? mask[i] : 0xFF)) return false;
+    return true;
+}
+
 int dq_frame_parse_udp(const uint8_t *f, size_t n, bool v6, const uint8_t *our_ip, dq_udp_view_t *v) {
+    return dq_frame_parse_udp_pfx(f, n, v6, our_ip, NULL, v);
+}
+
+int dq_frame_parse_udp_pfx(const uint8_t *f, size_t n, bool v6, const uint8_t *our_ip, const uint8_t *mask, dq_udp_view_t *v) {
     if (n < 14) return -1;
     size_t off = 14;
     unsigned et = get16(f + 12);
@@ -89,7 +100,7 @@ int dq_frame_parse_udp(const uint8_t *f, size_t n, bool v6, const uint8_t *our_i
         size_t ihl = (size_t)(ip[0] & 15) * 4, tot = get16(ip + 2);
         if ((ip[0] >> 4) != 4 || ihl < 20 || ip[9] != 17) return -1;
         if ((ip[6] & 0x20) || (get16(ip + 6) & 0x1FFF)) return -1;   /* a fragment */
-        if (tot < ihl + 8 || off + tot > n || memcmp(ip + 16, our_ip, 4) != 0) return -1;
+        if (tot < ihl + 8 || off + tot > n || !ip_ours(ip + 16, our_ip, mask, 4)) return -1;
         udp = ip + ihl;
         ulen = get16(udp + 4);
         if (ulen < 8 || ihl + ulen > tot) return -1;
@@ -98,7 +109,7 @@ int dq_frame_parse_udp(const uint8_t *f, size_t n, bool v6, const uint8_t *our_i
         if (et != 0x86DD || n < off + 40 + 8) return -1;
         const uint8_t *ip = f + off;
         size_t pl = get16(ip + 4);
-        if ((ip[0] >> 4) != 6 || ip[6] != 17 || pl < 8 || off + 40 + pl > n || memcmp(ip + 24, our_ip, 16) != 0) return -1;
+        if ((ip[0] >> 4) != 6 || ip[6] != 17 || pl < 8 || off + 40 + pl > n || !ip_ours(ip + 24, our_ip, mask, 16)) return -1;
         udp = ip + 40;
         ulen = get16(udp + 4);
         if (ulen < 8 || ulen > pl) return -1;
@@ -111,6 +122,68 @@ int dq_frame_parse_udp(const uint8_t *f, size_t n, bool v6, const uint8_t *our_i
     v->plen = (unsigned)(ulen - 8);
     memcpy(v->smac, f + 6, 6);
     return 0;
+}
+
+/* ---------------------------------------------------------------- patching a pre-built frame
+ * RFC 1624 3, eqn. 3: HC' = ~(~HC + ~m + m') for a 16-bit word m of the data that becomes m'.  Every changed word adds ~m + m' to one accumulator (at most
+ * 14 words of 17 bits: no overflow of 32 bits); one fold and one complement per checksum.  The IPv4 header checksum covers the source address only (the ID
+ * stays 0, RFC 6864); IPv6 has no header checksum.  The UDP checksum covers the pseudo header (the source address, RFC 768; RFC 8200 8.1 for IPv6), the
+ * source port, the DNS ID and the cookie.  RFC 768: a computed zero is sent as 0xFFFF; a stored 0xFFFF is the same value in ones' complement, so
+ * ~HC = 0 starts the sum correctly, and eqn. 3 itself never produces 0xFFFF from a valid checksum. */
+static uint32_t word_swap(uint8_t *p, unsigned neww) {   /* write the word, return ~old + new */
+    unsigned old = get16(p);
+    put16(p, neww);
+    return (uint32_t)(uint16_t)~old + neww;
+}
+
+static uint16_t csum_update(unsigned hc, uint32_t acc) { return (uint16_t)~dq_csum_fold((uint32_t)(uint16_t)~hc + acc); }
+
+size_t dq_frame_emit(uint8_t *dst, size_t cap, const dq_fsend_t *s, bool v6, uint16_t sport) {
+    unsigned hlen = v6 ? 62 : 42;
+    if (cap < s->flen || s->flen < hlen + 12) return 0;
+    memcpy(dst, s->frame, s->flen);
+    uint8_t *ip = dst + 14, *udp = dst + hlen - 8;
+    uint32_t acc = word_swap(udp, sport), ipacc = 0;
+    acc += word_swap(dst + hlen, s->id);
+    if (s->set_sip) {
+        uint8_t *a = v6 ? ip + 8 : ip + 12;
+        for (unsigned i = 0; i < (v6 ? 8u : 2u); i++) {
+            uint32_t d = word_swap(a + 2 * i, (unsigned)((s->sip[2 * i] << 8) | s->sip[2 * i + 1]));
+            acc += d;
+            ipacc += d;
+        }
+        if (!v6) put16(ip + 10, csum_update(get16(ip + 10), ipacc));
+    }
+    if (s->cookie_off && (size_t)s->cookie_off + 8 <= s->flen && s->cookie_off >= hlen + 12) {
+        /* the cookie is 8 octets at any offset of the message: the checksum adds up 16-bit words counted from the UDP header, so with an odd offset the
+         * first and the last word hold one octet of the neighbours too; an odd last octet of the datagram counts as followed by a zero (RFC 768) */
+        size_t u = (size_t)s->cookie_off - (hlen - 8), ulen = s->flen - (hlen - 8), start = u & ~(size_t)1, avail = ulen - start;
+        uint8_t was[10] = { 0 }, now[10] = { 0 };
+        if (avail > 10) avail = 10;
+        memcpy(was, udp + start, avail);
+        memcpy(now, was, sizeof now);
+        memcpy(now + (u & 1), s->cookie, 8);
+        memcpy(udp + start, now, avail);
+        for (unsigned i = 0; i < 10; i += 2) acc += (uint32_t)(uint16_t)~get16(was + i) + get16(now + i);
+    }
+    uint16_t c = csum_update(get16(udp + 6), acc);
+    put16(udp + 6, c ? c : 0xFFFF);
+    return s->flen;
+}
+
+/* the checksums of a UDP frame that dq_frame_parse_udp() accepted are right (the raw reflector drops a frame whose checksum is wrong, as a host would) */
+static bool frame_csums_ok(const uint8_t *f, bool v6, const dq_udp_view_t *v) {
+    const uint8_t *udp = v->payload - 8, *ip = f + (get16(f + 12) == 0x8100 ? 18 : 14);
+    size_t ulen = 8 + (size_t)v->plen;
+    uint32_t s = 17 + (uint32_t)ulen;
+    if (!v6) {
+        if (dq_csum_fold(dq_csum_add(0, ip, (size_t)(udp - ip))) != 0xFFFF) return false;
+        if (get16(udp + 6) == 0) return true;   /* RFC 768: no checksum */
+        s = dq_csum_add(s, ip + 12, 8);
+    } else {
+        s = dq_csum_add(s, ip + 8, 32);
+    }
+    return dq_csum_fold(dq_csum_add(s, udp, ulen)) == 0xFFFF;
 }
 
 /* ---------------------------------------------------------------- ARP */
@@ -208,7 +281,7 @@ size_t dq_frame_reflect(const uint8_t *f, size_t n, bool v6, const uint8_t *our_
         return arp_frame(out, cap, sha, our_mac, 2, our_mac, our_ip, sha, spa);
     }
     dq_udp_view_t v;
-    if (dq_frame_parse_udp(f, n, v6, our_ip, &v) < 0 || v.dport != port || v.plen < 12 || v.plen > DQ_RXMAX) return 0;
+    if (dq_frame_parse_udp(f, n, v6, our_ip, &v) < 0 || v.dport != port || v.plen < 12 || v.plen > DQ_RXMAX || !frame_csums_ok(f, v6, &v)) return 0;
     uint8_t tmp[DQ_RXMAX];
     memcpy(tmp, v.payload, v.plen);
     tmp[2] |= 0x80;   /* QR */
@@ -222,7 +295,7 @@ int dq_raw_resolve_mac(const dq_rawif_t *r, dq_target_t *tg, char *err, size_t e
     if (tg->have_dst_mac) return 0;
     uint8_t fr[128];
     for (int attempt = 0; attempt < 5; attempt++) {
-        size_t fl = tg->v6 ? dq_nd_solicit(fr, sizeof fr, tg->src_mac, tg->src_ip, tg->hop_ip) : dq_arp_request(fr, sizeof fr, tg->src_mac, tg->src_ip, tg->hop_ip);
+        size_t fl = tg->v6 ? dq_nd_solicit(fr, sizeof fr, tg->src_mac, tg->arp_ip, tg->hop_ip) : dq_arp_request(fr, sizeof fr, tg->src_mac, tg->arp_ip, tg->hop_ip);
         if (fl == 0 || r->tx(r->ctx, fr, (unsigned)fl) < 0) { snprintf(err, errlen, "cannot send the ARP / neighbor request"); return -1; }
         uint64_t deadline = dq_now_ns() + 400000000ull;
         while (dq_now_ns() < deadline) {

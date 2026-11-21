@@ -164,3 +164,47 @@ void dq_print_interval(FILE *f, double t, double dt, uint64_t sent, uint64_t don
             dt > 0 ? (double)done / dt : 0.0, lat_cnt ? (double)lat_sum / (double)lat_cnt / 1e9 : 0.0);
     fflush(f);
 }
+
+/* ---------------------------------------------------------------- the histogram as text (the result of an agent: dnsqps_agent.c) */
+size_t dq_hist_encode(const dq_hist_t *h, char *out, size_t cap) {
+    size_t n = 0;
+    if (cap) out[0] = 0;
+    for (size_t i = 0; i < DQ_HBUCKETS; i++) {
+        if (!h->b[i]) continue;
+        int w = snprintf(out + n, cap - n, "%s%zu:%" PRIu64, n ? "," : "", i, h->b[i]);
+        if (w < 0 || (size_t)w >= cap - n) return (size_t)-1;
+        n += (size_t)w;
+    }
+    return n;
+}
+
+static const char *num_u64(const char *s, uint64_t *v) {   /* decimal digits only; NULL on a bad number or an overflow */
+    if (*s < '0' || *s > '9') return NULL;
+    uint64_t x = 0;
+    for (; *s >= '0' && *s <= '9'; s++) {
+        if (x > (UINT64_MAX - (uint64_t)(*s - '0')) / 10) return NULL;
+        x = x * 10 + (uint64_t)(*s - '0');
+    }
+    *v = x;
+    return s;
+}
+
+/* the inverse; false on anything but "i:n,i:n" with i < DQ_HBUCKETS in rising order, or when the counts add up to more than a count of 2^62 */
+bool dq_hist_decode(dq_hist_t *h, const char *s) {
+    uint64_t total = 0;
+    long last = -1;
+    while (*s) {
+        uint64_t i, n;
+        s = num_u64(s, &i);
+        if (!s || *s != ':' || i >= DQ_HBUCKETS || (long)i <= last) return false;
+        s = num_u64(s + 1, &n);
+        if (!s || n == 0 || n > ((uint64_t)1 << 62) || total + n > ((uint64_t)1 << 62)) return false;
+        h->b[i] = n;
+        total += n;
+        last = (long)i;
+        if (*s == ',') { s++; if (!*s) return false; }
+        else if (*s) return false;
+    }
+    h->count = total;
+    return true;
+}
