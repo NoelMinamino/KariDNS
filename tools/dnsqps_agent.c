@@ -608,7 +608,7 @@ int dq_agent_serve(const dq_cfg_t *c, dq_run_fn run, const atomic_bool *quit, at
 
 /* ---------------------------------------------------------------- the controller */
 typedef struct {
-    char name[160];
+    char name[512];   /* one entry of --agents (char agents[512]) */
     dq_conn_t conn;
     bool ready, got_result, failed;
     dq_livesum_t prog;
