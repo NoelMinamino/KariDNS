@@ -137,7 +137,9 @@
  *                     which the Backend may make durable once the entries are recorded) | 5 db_ident bytes<=64 O | 6 ENTRY nested, repeatable (<= KDB_MANIFEST_PAGE_MAX):
  *                     1 source_id i64 R | 2 op u8 R (1 upsert: the domain exists and the view serves it; 2 delete: it is gone, or the view no longer serves it, or its type
  *                     cannot be loaded) | 3 name name (an upsert needs it; a delete has it when the loader knows it) | 4 kind u8 (an upsert needs it) | 5 stamp_gen u64 |
- *                     6 stamp_time u64 | 7 flags u8 O (bit0 KDB_EF_STAMPED, bit1 KDB_EF_FORCE: read the body whatever the stamp says: a reload request) | 8 serial u32 O.
+ *                     6 stamp_time u64 | 7 flags u8 O (bit0 KDB_EF_STAMPED, bit1 KDB_EF_FORCE: read the body whatever the stamp says: a reload request; bit2 KDB_EF_HOLD (0.7,
+ *                     signer-wait): a zone the store has an image of keeps it and the version waits for the signer; one it has not, or the version it has, is answered with a
+ *                     ZONE_RESULT that carries the source id) | 8 serial u32 O.
  *                     A domain can be in two pages of a drain; the entries are idempotent.
  *   LOOKUP_RESULT (19) 0.7, fetch stream only (the answer to FETCH_REQ mode 2): 1 request_id u64 R | 2 view view R | 3 found u8 R (0/1) | and, with found = 1: 4 source_id i64 R |
  *                     5 name name R (the zone: canonical, the entry of a MANIFEST) | 6 kind u8 R (KDB_ZK_*) | 7 stamp_gen u64 R | 8 stamp_time u64 R | 9 flags u8 O (bit0 KDB_EF_STAMPED) |
@@ -174,7 +176,8 @@
  *                     INVENTORY_END ends it and its n_zones is the total of the entries of all of them.
  *   INVENTORY_END (0x8004) 1 last_change_seq u64 R | 2 n_zones u64 R
  *   ZONE_RESULT (0x8005) 1 view view R | 2 zone name R | 3 status u8 R (0 applied,1 unchanged,2 rejected,
- *                     3 shadowed,4 deleted) | 4 reason str<=255 O
+ *                     3 shadowed,4 deleted) | 4 reason str<=255 O | 5 source_id i64 O (0.7: the answer to a CHANGES upsert with KDB_EF_HOLD that
+ *                     was not held: the zone does not wait for the signer; such a ZONE_RESULT is not a result of the batch)
  *   BATCH_RESULT (0x8006) 1 batch_id u64 R | 2 request_ids bytes O (n * u64, <= 2048 bytes) | 3 n_applied u32 R |
  *                     4 n_unchanged u32 R | 5 n_rejected u32 R | 6 n_deleted u32 R | 7 store_error u32 O (0.7, only to a loader whose HELLO features have
  *                     KDB_FEAT_BATCH_STATUS: the errno for which the store could not make the batch durable; the loader then reads the changes of the batch
@@ -225,6 +228,7 @@
 #define KDB_MF_PLAIN 0x2u            /* ... a plain PowerDNS schema: no stamps, serials */
 #define KDB_EF_STAMPED 0x1u          /* MANIFEST / CHANGES entry flags: the stamp (generation, changed_at) is real */
 #define KDB_EF_FORCE 0x2u            /* CHANGES entry: read the body whatever the stamp says */
+#define KDB_EF_HOLD 0x4u             /* CHANGES upsert (signer-wait, 0.7): a zone the Backend has keeps the version it has; one it does not have is read as it is */
 #define KDB_MANIFEST_PAGE_MAX 16384  /* entries of one MANIFEST / CHANGES message */
 #define KDB_IDENT_MAX 64             /* database identity, bytes */
 #define KDB_FETCH_BUSY_REASON "busy: too many fetch requests are waiting"   /* the loader's ZONE_FAILED reason when its fetch queue is full (the Backend counts these) */
@@ -397,7 +401,7 @@ typedef struct {
 } kdb_reload_req_t;
 typedef struct { uint32_t n_entries; const uint8_t *body; uint32_t body_len; } kdb_inventory_t;
 typedef struct { uint64_t last_change_seq, n_zones; } kdb_inventory_end_t;
-typedef struct { uint16_t view; char name[DNS_NAME_TEXT_SIZE]; uint8_t status; kdb_str_t reason; } kdb_zone_result_t;
+typedef struct { uint16_t view; char name[DNS_NAME_TEXT_SIZE]; uint8_t status; kdb_str_t reason; bool has_source_id; int64_t source_id; } kdb_zone_result_t;   /* source_id: tag 5 (0.7, the answer to a CHANGES upsert with KDB_EF_HOLD) */
 typedef struct {
     uint64_t batch_id; const uint8_t *request_ids; uint32_t n_request_ids;   /* big-endian u64 each */
     uint32_t n_applied, n_unchanged, n_rejected, n_deleted;
@@ -498,7 +502,7 @@ typedef struct {
 } kdb_manifest_entry_t;
 typedef struct {
     int64_t source_id; uint8_t op;          /* 1 upsert, 2 delete (KDB_CH_*) */
-    bool has_name; char name[DNS_NAME_TEXT_SIZE]; uint8_t kind; uint64_t stamp_gen, stamp_time; bool stamped, force; bool has_serial; uint32_t serial;
+    bool has_name; char name[DNS_NAME_TEXT_SIZE]; uint8_t kind; uint64_t stamp_gen, stamp_time; bool stamped, force, hold; bool has_serial; uint32_t serial;
 } kdb_changes_entry_t;
 enum { KDB_CH_UPSERT = 1, KDB_CH_DELETE = 2 };
 void kdb_manifest_entries(const kdb_msg_t *m, kdb_iter_t *it);

@@ -3700,7 +3700,7 @@ static void test_fetch_keep(void) {
 /* ---------------------------------------------------------------- the store protocol of the loader (0.7 WP7a) */
 typedef struct {
     int bb, mb, mp, me, ch, zd, zf;
-    uint64_t entries, ups, dels, skipped;
+    uint64_t entries, ups, dels, skipped, holds;
     bool complete, last, bad;
     uint64_t me_cursor, mb_cursor, ch_cursor;
     uint32_t mb_flags;
@@ -3753,6 +3753,7 @@ static void sc_read(int fd, kdb_framer_t *f, kdb_sm_t *sm, sc_t *c) {
                 while (kdb_changes_entries_next(&it, &e)) {
                     if (e.op == KDB_CH_UPSERT) c->ups++;
                     else c->dels++;
+                    if (e.hold) c->holds++;
                 }
                 break;
             }
@@ -3765,6 +3766,25 @@ static void sc_read(int fd, kdb_framer_t *f, kdb_sm_t *sm, sc_t *c) {
 }
 
 static int g_sf_manifest, g_sf_gap, g_sf_chg, g_sf_cursor, g_sf_count, g_sf_schema;
+/* signer-wait on the store path: the metadata is read in a snapshot of its own (PostgreSQL refuses a scan outside one: the wrapped driver does the same), and a read that fails fails the drain */
+static int g_sf_snap, g_sf_meta_nosnap, g_sf_meta;
+static int sf_begin_snapshot(db_conn_t *c) {
+    const int r = db_driver_sqlite3.begin_snapshot(c);
+    if (r == 0) g_sf_snap++;
+    return r;
+}
+static int sf_end_snapshot(db_conn_t *c) {
+    if (g_sf_snap > 0) g_sf_snap--;
+    return db_driver_sqlite3.end_snapshot(c);
+}
+static int sf_scan_metadata_in(db_conn_t *c, const int64_t *ids, size_t n, db_meta_cb cb, void *ud) {
+    if (g_sf_snap == 0) {
+        g_sf_meta_nosnap++;
+        return -1;
+    }
+    if (g_sf_meta > 0 && --g_sf_meta == 0) return -1;
+    return db_driver_sqlite3.scan_metadata_in(c, ids, n, cb, ud);
+}
 static int sf_manifest_page(db_conn_t *c, int64_t after, unsigned limit, db_manifest_cb cb, void *ud, int64_t *last, unsigned *n) {
     if (g_sf_manifest > 0 && --g_sf_manifest == 0) {
         *last = after;
@@ -3818,6 +3838,9 @@ static void test_store_loader(void) {
     sd.current_cursor = sf_current_cursor;
     sd.count_domains = sf_count;
     sd.check_schema = sf_check_schema;
+    sd.begin_snapshot = sf_begin_snapshot;
+    sd.end_snapshot = sf_end_snapshot;
+    sd.scan_metadata_in = sf_scan_metadata_in;
     int sv[2];
     CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
     struct lio *io = calloc(1, sizeof(*io));
@@ -3885,23 +3908,73 @@ static void test_store_loader(void) {
     SL_END();
     CHECK(!c.bad && c.bb == 1 && c.mb == 0 && c.ch >= 1 && c.last && c.ups == 2 && c.dels == 3 && vs->seq > before && vs->seq == c.ch_cursor);
     CHECK(sm.n_zones == 2 && sm.n_deleted == 3);
-    /* signer-wait: a zone of the signer that changed is held back in an auto batch, and goes out with a reload of everything */
+    /* signer-wait: a zone of the signer that changed is sent with KDB_EF_HOLD in an auto batch (the Backend keeps the version it has; a zone it does not have is read as it is), the
+     * zone is on the list by the name the database has, and a reload of everything sends it without the flag.  The metadata is read in a snapshot of its own (0.7: outside one PostgreSQL
+     * refused the scan and every changed zone of the signer was sent without the flag) */
+    g_sf_meta_nosnap = 0;
     raw_exec(db, "INSERT INTO domainmetadata (domain_id, kind, content) VALUES (1, 'X-KARIDNS-SIGNER', '1')");
     SL_BEGIN(KDB_BATCH_AUTO);
     CHECK(store_view(&x, &src, v) == EXIT_OK);                       /* the metadata row is a change of zone 1: held */
     SL_END();
-    CHECK(!c.bad && c.ups == 0 && vs->nsigw == 1 && vs->sigw[0].id == 1);
+    CHECK(!c.bad && c.ups == 1 && c.holds == 1 && vs->nsigw == 1 && vs->sigw[0].id == 1 && strcmp(vs->sigw[0].name, "a.test") == 0 && g_sf_meta_nosnap == 0 && g_sf_snap == 0);
     SL_BEGIN(KDB_BATCH_AUTO);
     raw_exec(db, "UPDATE records SET ttl = 3602 WHERE id = 10");
     CHECK(store_view(&x, &src, v) == EXIT_OK);
     SL_END();
-    CHECK(!c.bad && c.ups == 0 && vs->nsigw == 1);                    /* still held */
+    CHECK(!c.bad && c.ups == 1 && c.holds == 1 && vs->nsigw == 1);    /* still held */
+    /* the metadata cannot be read: the drain fails, nothing goes out, the cursor stays (the zone is not sent without the flag) */
+    {
+        const uint64_t s0 = vs->seq;
+        raw_exec(db, "UPDATE records SET ttl = 3612 WHERE id = 10");
+        g_sf_meta = 1;
+        SL_BEGIN(KDB_BATCH_AUTO);
+        CHECK(store_view(&x, &src, v) == EXIT_ERROR);
+        SL_END();
+        CHECK(!c.bad && c.ups == 0 && vs->seq == s0 && vs->nsigw == 1 && g_sf_snap == 0);
+        g_sf_meta = 0;
+        SL_BEGIN(KDB_BATCH_AUTO);
+        CHECK(store_view(&x, &src, v) == EXIT_OK);                   /* (read again: held) */
+        SL_END();
+        CHECK(!c.bad && c.ups == 1 && c.holds == 1 && vs->seq > s0 && vs->nsigw == 1);
+    }
     SL_BEGIN(KDB_BATCH_DIFF);
     CHECK(store_view(&x, &src, v) == EXIT_OK);                       /* a reload: the held zone goes out */
     SL_END();
-    CHECK(!c.bad && c.ups == 1 && vs->nsigw == 0 && c.ch == 1 && c.last);
+    CHECK(!c.bad && c.ups == 1 && c.holds == 0 && vs->nsigw == 0 && c.ch == 1 && c.last);
     /* a zone that was held and is deleted leaves the set; a one-zone reload covers the change rows it has read */
     raw_exec(db, "UPDATE records SET ttl = 3603 WHERE id = 10");
+    SL_BEGIN(KDB_BATCH_AUTO);
+    CHECK(store_view(&x, &src, v) == EXIT_OK);
+    SL_END();
+    CHECK(vs->nsigw == 1);
+    /* the Backend's answer to a held upsert it did not hold (ZONE_RESULT with the source id: it had no image of the zone): the zone leaves the list; another view's answer does not touch it */
+    {
+        int32_t *slots = malloc(IDX_SLOTS * sizeof(int32_t));
+        CHECK(slots != NULL);
+        if (slots) {
+            for (size_t i = 0; i < IDX_SLOTS; i++) slots[i] = -1;
+            slots[0] = 0;
+            io->idx_slot = slots;
+            kdb_enc_t re;
+            kdb_enc_init(&re);
+            for (int k = 0; k < 2; k++) {
+                kdb_enc_reset(&re);
+                kdb_enc_begin(&re, KDB_T_ZONE_RESULT);
+                kdb_enc_u16(&re, 1, k == 0 ? 1 : 0);
+                kdb_enc_name(&re, 2, "a.test.");
+                kdb_enc_u8(&re, 3, KDB_ST_APPLIED);
+                kdb_enc_i64(&re, 5, 1);
+                kdb_enc_end(&re);
+                kdb_frame_t zf = { KDB_T_ZONE_RESULT, re.buf + KDB_HEADER_LEN, (uint32_t)(re.len - KDB_HEADER_LEN) };
+                const uint64_t nr = io->n_results;
+                io_dispatch(io, &zf);
+                CHECK(io->n_results == nr && !io->failed);           /* (not a result of the batch) */
+                CHECK(vs->nsigw == (k == 0 ? 1u : 0u));
+            }
+            kdb_enc_free(&re);
+        }
+    }
+    raw_exec(db, "UPDATE records SET ttl = 3606 WHERE id = 10");
     SL_BEGIN(KDB_BATCH_AUTO);
     CHECK(store_view(&x, &src, v) == EXIT_OK);
     SL_END();

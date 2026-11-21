@@ -1,4 +1,4 @@
-.TH KARIDNS\-SIGNER 8 "2026-11-21" "KariDNS" "KariDNS Manual"
+.TH KARIDNS\-SIGNER 8 "2026-11-22" "KariDNS" "KariDNS Manual"
 .\" Generated from docs/karidns-signer.md by man/md2man.pl (make man): edit the Markdown manual, not this page.
 .SH NAME
 karidns\-signer \- keeps the zones of a KariDNS database (PostgreSQL or SQLite3)
@@ -552,8 +552,9 @@ changes at once, unsigned.
 .IP \(bu 2
 \fBNot held back:\fR a zone the server does not have yet, a full comparison
 (start, restart, \fBkarictl reload\fR of every zone, a replaced database file)
-and a refused zone. In those moments an unsigned change can be served; the
-signer catches up within seconds.
+and a refused zone. With the zone store a version held across a restart of the
+server or the loader is read in the background after the start. In those moments
+an unsigned change can be served; the signer catches up within seconds.
 .IP \(bu 2
 \fBPowerDNS\fR on the same database reads it live and serves a change at once,
 signed or not. Keep it apart from the zones the signer signs.

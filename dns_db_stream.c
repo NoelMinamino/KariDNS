@@ -108,7 +108,7 @@ TDEF(td_inventory, "INVENTORY", sp_inventory);
 static const kdb_tspec_t sp_inventory_end[] = { S(KT_U64, KS_REQ, 0), S(KT_U64, KS_REQ, 0) };
 TDEF(td_inventory_end, "INVENTORY_END", sp_inventory_end);
 static const kdb_tspec_t sp_zone_result[] = {
-    S(KT_U16, KS_REQ | KS_VIEW, 0), S(KT_NAME, KS_REQ, 0), S(KT_U8, KS_REQ | KS_MAXV, KDB_ST_NOT_RESIDENT), S(KT_STR, 0, 255) };
+    S(KT_U16, KS_REQ | KS_VIEW, 0), S(KT_NAME, KS_REQ, 0), S(KT_U8, KS_REQ | KS_MAXV, KDB_ST_NOT_RESIDENT), S(KT_STR, 0, 255), S(KT_I64, 0, 0) };
 TDEF(td_zone_result, "ZONE_RESULT", sp_zone_result);
 static const kdb_tspec_t sp_batch_result[] = {
     S(KT_U64, KS_REQ, 0), S(KT_BYTES, KS_MUL8, 2048), S(KT_U32, KS_REQ, 0), S(KT_U32, KS_REQ, 0), S(KT_U32, KS_REQ, 0),
@@ -149,7 +149,7 @@ static const kdb_tspec_t sp_manifest_end[] = {
 TDEF(td_manifest_end, "MANIFEST_END", sp_manifest_end);
 static const kdb_tspec_t sp_ch_entry[] = {
     S(KT_I64, KS_REQ, 0), S(KT_U8, KS_REQ | KS_MAXV, KDB_CH_DELETE), S(KT_NAME, 0, 0), S(KT_U8, KS_MAXV, KDB_ZK_CATALOG), S(KT_U64, 0, 0), S(KT_U64, 0, 0),
-    S(KT_U8, KS_MAXV, KDB_EF_STAMPED | KDB_EF_FORCE), S(KT_U32, 0, 0) };
+    S(KT_U8, KS_MAXV, KDB_EF_STAMPED | KDB_EF_FORCE | KDB_EF_HOLD), S(KT_U32, 0, 0) };
 TDEF(td_ch_entry, "CHANGES.ENTRY", sp_ch_entry);
 static const kdb_tspec_t sp_changes[] = {
     S(KT_U64, KS_REQ, 0), S(KT_U16, KS_REQ | KS_VIEW, 0), S(KT_U64, KS_REQ, 0), S(KT_U8, KS_REQ | KS_MAXV, 1), S(KT_BYTES, 0, KDB_IDENT_MAX),
@@ -707,6 +707,8 @@ kdb_rc_t kdb_decode(const kdb_frame_t *fr, uint32_t vc, kdb_msg_t *m, char *why,
         gname(m->u.zone_result.name, &V(2));
         m->u.zone_result.status = (uint8_t)V(3).u;
         m->u.zone_result.reason = gstr(&V(4));
+        m->u.zone_result.has_source_id = V(5).present;
+        m->u.zone_result.source_id = V(5).present ? (int64_t)V(5).u : 0;
         break;
     case KDB_T_BATCH_RESULT:
         m->u.batch_result.batch_id = V(1).u;
@@ -866,6 +868,7 @@ bool kdb_changes_entries_next(kdb_iter_t *it, kdb_changes_entry_t *o) {
     o->stamp_time = V(6).present ? V(6).u : 0;
     o->stamped = V(7).present && (V(7).u & KDB_EF_STAMPED) != 0;
     o->force = V(7).present && (V(7).u & KDB_EF_FORCE) != 0;
+    o->hold = V(7).present && (V(7).u & KDB_EF_HOLD) != 0;
     o->has_serial = V(8).present;
     o->serial = V(8).present ? (uint32_t)V(8).u : 0;
     return true;

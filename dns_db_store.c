@@ -1352,7 +1352,7 @@ static int dir_put_img_locked(const char *view, const char *zone, const zone_ima
   store_read_unlock();
   if (same) {
     atomic_fetch_add(&G.wt_skipped, 1);
-    if (cflags & (STORE_F_STALE | STORE_F_REJECTED_NEW)) (void)store_set_flags(st, zid, 0, STORE_F_STALE | STORE_F_REJECTED_NEW);       /* (the body that was asked for is this version) */
+    if (cflags & (STORE_F_STALE | STORE_F_REJECTED_NEW | STORE_F_SIGNER_HELD)) (void)store_set_flags(st, zid, 0, STORE_F_STALE | STORE_F_REJECTED_NEW | STORE_F_SIGNER_HELD);       /* (the body that was asked for is this version) */
     *zid_out = zid;
     return 0;
   }
@@ -2783,6 +2783,8 @@ static struct {
   int64_t t0_ns;
   /* the secondary and catalog records that the scan has asked for since the start (the zone loads once a run unless it changes) */
   bits_t np_done;
+  /* signer-wait: the records held for the signer (DBR_HELD) since the loader connected (db_recon_held_reset()) */
+  bits_t sig_held;
   /* the mass-delete guard: the views whose sweep is held back */
   bool held[STORE_MAX_VIEWS];
   /* the zones the store cannot name (the root zone, a text name over 255 bytes): no record, a list of their own (under mu) */
@@ -3103,6 +3105,26 @@ static void np_clear(uint32_t zid) {
   rc_unlock();
 }
 
+/* sig_held: the records that an entry with KDB_EF_HOLD held for the signer since the loader connected (the reconcile thread, under RC.mu).  The scan of the wanted bodies passes them.  A record
+ * with STORE_F_SIGNER_HELD whose bit is not set was held for a loader before this one (the loader or the server was started again): the scan asks for its body, so the version is read as it is,
+ * as the full comparison of a start does without the store.  (Out of memory for a bit: the zone is read as it is.) */
+static void sig_held_mark(uint32_t zid) {
+  rc_lock();
+  (void)bits_set(&RC.sig_held, zid);
+  rc_unlock();
+}
+static bool sig_held_has(uint32_t zid) {
+  rc_lock();
+  const bool b = bits_get(&RC.sig_held, zid);
+  rc_unlock();
+  return b;
+}
+void db_recon_held_reset(void) {
+  rc_lock();
+  bits_free(&RC.sig_held);
+  rc_unlock();
+}
+
 /* The reconcile thread applies the entries of a pass (db_recon_entry_n()) while the ingest thread applies the answers of the lookups (db_recon_lookup()): an entry of the pass was read by the loader some time before it
  * is applied, an answer is read by the loader when it is asked for, so an answer that was applied during the pass is the newer.  The records the answers made are marked (RC.lk); the entry of the pass leaves such a record as it is,
  * and the sweep does not take it for unlisted (the zone exists in the database: the loader found it). */
@@ -3160,6 +3182,7 @@ static int recon_decide_locked(store_t *st, const char *view, const db_recon_ent
     const bool known = rs.state == STORE_STATE_KNOWN, stale = (rs.flags & STORE_F_STALE) != 0, rej = (rs.flags & STORE_F_REJECTED_NEW) != 0;
     const bool kind_eq = ((rs.flags & STORE_F_NONSTORE) != 0) == np;
     const bool stamp_eq = e->stamped && rs.stamp_gen == e->gen && rs.stamp_time == e->time;
+    const bool held = (rs.flags & STORE_F_SIGNER_HELD) != 0;
     if (t_pass_apply && lk_has(zid)) {                      /* the record is what a lookup's answer made during this pass: newer than this entry's page, which stays unapplied */
       res = DBR_SAME;
     } else if (!kind_eq) {                                         /* a primary became a secondary or the other way: the zone is made again (its image is not the new kind's) */
@@ -3172,14 +3195,25 @@ static int recon_decide_locked(store_t *st, const char *view, const db_recon_ent
         r = store_set_stamp(st, zid, m.stamp_gen, m.stamp_time, 0, STORE_F_REJECTED_NEW);
         res = DBR_CHANGED;
       }
-    } else if (!e->force && e->stamped && stamp_eq) {
+    } else if (e->hold && !e->force && rs.state == STORE_STATE_STORED && !rej && !stale) {
+      /* signer-wait (KDB_EF_HOLD): the image keeps serving.  Another version is recorded (its stamp, STORE_F_SIGNER_HELD) but not asked for: the loader sends the zone again
+       * without the flag when the signer has signed it (a reload) or the zone is no longer the signer's, and a loader that connects again releases every held record
+       * (db_recon_held_reset(): the version is read as it is, as a full comparison of a start does).  The same version as the image (not held) is nothing to wait for. */
+      if (!held && stamp_eq) {
+        res = DBR_SAME;
+      } else {
+        if (!(held && stamp_eq)) r = store_set_stamp(st, zid, m.stamp_gen, m.stamp_time, STORE_F_SIGNER_HELD, 0);
+        res = DBR_HELD;
+        if (r == 0) sig_held_mark(zid);
+      }
+    } else if (!e->force && e->stamped && stamp_eq && !held) {
       res = rej ? DBR_KEPT : (known || stale) ? DBR_PENDING : DBR_SAME;
-    } else if (!e->force && !e->stamped && e->has_serial && rs.state == STORE_STATE_STORED && rs.serial == e->serial) {
+    } else if (!e->force && !e->stamped && e->has_serial && rs.state == STORE_STATE_STORED && rs.serial == e->serial && !held) {
       res = (stale && !rej) ? DBR_PENDING : DBR_SAME;
     } else if (!e->force && !e->stamped && !e->has_serial && (known || stale) && !rej) {          /* (a zone without a version stamp is always asked for: it already is) */
       res = DBR_PENDING;
-    } else {                                                /* another version: the stamp is recorded, the body is asked for; the image (if any) keeps serving until then */
-      r = store_set_stamp(st, zid, m.stamp_gen, m.stamp_time, known ? 0 : STORE_F_STALE, STORE_F_REJECTED_NEW);
+    } else {                                                /* another version: the stamp is recorded, the body is asked for; the image (if any) keeps serving until then (a held version too: the loader released it) */
+      r = store_set_stamp(st, zid, m.stamp_gen, m.stamp_time, known ? 0 : STORE_F_STALE, STORE_F_REJECTED_NEW | STORE_F_SIGNER_HELD);
       res = DBR_CHANGED;
     }
   }
@@ -3739,7 +3773,7 @@ int db_recon_scan(uint32_t *cursor, unsigned budget, db_scan_item_t *out) {
       }
     }
     else if (z.flags & STORE_F_REJECTED_NEW) want = false;
-    else want = z.state == STORE_STATE_KNOWN || (z.flags & STORE_F_STALE) != 0;
+    else want = z.state == STORE_STATE_KNOWN || (z.flags & STORE_F_STALE) != 0 || ((z.flags & STORE_F_SIGNER_HELD) && !sig_held_has(z.zid));
     if (!want || !vn) continue;
     snprintf(out->view, sizeof(out->view), "%s", vn);
     snprintf(out->zone, sizeof(out->zone), "%s.", z.name);

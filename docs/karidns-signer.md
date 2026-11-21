@@ -162,7 +162,7 @@ A change to a signed zone (by the WebAdmin, a script, `karidns-zone import`) put
 
 * **Latency.** A change is served `debounce` + the signing time + the reload later. The signing time of a small zone is a fraction of a second; see the measurements.
 * **A stopped or failing signer** keeps changes from being served. `karictl dbstatus` shows `waiting for the signer: N zone(s): ...`; a count that does not go down means the signer is not working. `signer-wait no;` serves changes at once, unsigned.
-* **Not held back:** a zone the server does not have yet, a full comparison (start, restart, `karictl reload` of every zone, a replaced database file) and a refused zone. In those moments an unsigned change can be served; the signer catches up within seconds.
+* **Not held back:** a zone the server does not have yet, a full comparison (start, restart, `karictl reload` of every zone, a replaced database file) and a refused zone. With the zone store a version held across a restart of the server or the loader is read in the background after the start. In those moments an unsigned change can be served; the signer catches up within seconds.
 * **PowerDNS** on the same database reads it live and serves a change at once, signed or not. Keep it apart from the zones the signer signs.
 
 ## DATABASE ROLES, AND RELOADS WITH SQLITE3

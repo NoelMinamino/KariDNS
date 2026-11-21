@@ -1427,6 +1427,17 @@ static void send_zone_result(ing_t *g, uint16_t view, const char *zone, uint8_t 
   send_enc(g);
 }
 
+/* 0.7 signer-wait: the answer to a CHANGES upsert with KDB_EF_HOLD that the Backend did not hold (a zone it had no image of, a version it refused, the version it has): the loader stops
+ * listing the zone as waiting for the signer (tag 5, the source id the loader keys its list by) */
+static void send_hold_result(ing_t *g, uint16_t view, const char *zone, int64_t source_id, uint8_t status) {
+  kdb_enc_reset(&g->enc);
+  if (kdb_enc_begin(&g->enc, KDB_T_ZONE_RESULT) != 0 || kdb_enc_u16(&g->enc, 1, view) != 0 || kdb_enc_name(&g->enc, 2, zone) != 0 || kdb_enc_u8(&g->enc, 3, status) != 0 ||
+      kdb_enc_i64(&g->enc, 5, source_id) != 0 || kdb_enc_end(&g->enc) != 0) {
+    g->enc.err = true;
+  }
+  send_enc(g);
+}
+
 static void apply_delta(ing_t *g);
 static void wake_flush(ing_t *g) {
   if (g->delta_wake) {
@@ -1995,7 +2006,8 @@ static void on_hello(ing_t *g, const kdb_msg_t *m) {
   atomic_store_explicit(&g_lookup_hold, g->store_proto && (h->features & KDB_FEAT_LOOKUP) != 0, memory_order_release);       /* (a loader that does not look up ends the hold: the queries are refused as before) */
   g->debug_sent = -1;                                  /* 0.7 M2: a new loader learns the level in force after its CONFIG */
   send_debug(g);
-  if (g->store_proto) {                                /* 0.7 WP7b: the records the store holds that have no body (an interrupted fill, a changed zone, a secondary zone: they are heap zones) are fetched once now */
+  if (g->store_proto) {                                /* 0.7 WP7b: the records the store holds that have no body (an interrupted fill, a changed zone, a secondary zone: they are heap zones) are fetched once now; a zone held for the signer by the loader before this one is read as it is */
+    db_recon_held_reset();
     scan_set(g, true);
     g->bg_zid = 0;
     g->bg_again = false;
@@ -2656,6 +2668,7 @@ static void changes_flush(ing_t *g, const kdb_changes_t *c, const char *vname, c
     const bool w = entry_note(g, res[i], ents[i].name, unst);
     *wanted |= w;
     if (w && is_req[i]) req_fetch_start(g, c->view, vname, ents[i].name, ents[i].source_id, ents[i].kind != KDB_ZK_PRIMARY);
+    if (re[i].hold && res[i] != DBR_HELD) send_hold_result(g, c->view, ents[i].name, ents[i].source_id, w ? KDB_ST_APPLIED : KDB_ST_UNCHANGED);
   }
 }
 
@@ -2717,6 +2730,7 @@ static void on_changes(ing_t *g, const kdb_msg_t *m) {
      * a zone that did not change is "unchanged" and is not read, whether or not its data is in memory */
     is_req[nq] = g->cur_req >= 0 && g->reqs[g->cur_req].view == c->view && domain_names_match_ci(g->reqs[g->cur_req].zone, e->name);
     r->force = e->force && (!is_req[nq] || g->reqs[g->cur_req].force);
+    r->hold = e->hold && !r->force;                      /* (signer-wait: a zone the Backend has keeps its version, db_recon_change_n()) */
     if (++nq == ING_CHG_GROUP) {
       changes_flush(g, c, vname, ents, re, is_req, nq, &wanted, &unst);
       nq = 0;
@@ -5651,7 +5665,7 @@ size_t db_ingest_status(const char *zone, const char *view, char *out, size_t ca
                     (long long)info[i].source_id, (rr.flags & STORE_F_REJECTED_NEW) ? "refused: the loader cannot read it or the Backend rejected it; asked for again when the database says another version" : "asked for");
         else
           st_append(&c, "zone %s view %s: source id %lld, serial %u, status %s (in the zone store, not in memory: it is attached when a query needs it)%s%s%s\n", canon, info[i].view,
-                    (long long)info[i].source_id, (unsigned)info[i].serial, info[i].last_result == DBREG_REJECTED ? "rejected" : "applied", has_rr && (rr.flags & STORE_F_STALE) ? "; the database has another version, its body is fetched in the background" : "",
+                    (long long)info[i].source_id, (unsigned)info[i].serial, info[i].last_result == DBREG_REJECTED ? "rejected" : "applied", has_rr && (rr.flags & STORE_F_STALE) ? "; the database has another version, its body is fetched in the background" : has_rr && (rr.flags & STORE_F_SIGNER_HELD) ? "; the database has another version, which waits for the signer (signer-wait)" : "",
                     info[i].error[0] ? ", last error: " : "", info[i].error);
       }
     }
