@@ -480,7 +480,8 @@ start_secondary KARIDNS_TEST_STALE_LOG_INTERVAL=2
 wait_serial exp.test 1 10 || fail "D9: exp.test was not transferred"
 wait_serial s21.test 1 20 || fail "D9: s21.test was not transferred"
 stop_primary
-kari_wait_log "$W/s.log" "secondary-expired: summary: 22 zone(s) expired (21 serving stale, 1 SERVFAIL), oldest '" 20 || fail "D9: no summary line above 20 expired zones"
+kari_wait_log "$W/s.log" "secondary-expired: summary: 22 zone(s) expired (21 serving stale, 1 SERVFAIL), oldest '" 20 || {
+    grep "secondary-expired:" "$W/s.log" | tail -n 4; echo "secondary.expired_zones=$(xfr secondary.expired_zones)"; fail "D9: no summary line above 20 expired zones"; }
 [ "$(xfr secondary.expired_zones)" = 22 ] || fail "D9: secondary.expired_zones"
 q www.s01.test A
 grep -q "EDE: 3" "$W/q.txt" || fail "D9: a stale answer of s01.test"
