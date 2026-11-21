@@ -83,6 +83,7 @@ enum { STORE_STATE_FREE = 0, STORE_STATE_KNOWN = 1, STORE_STATE_STORED = 2 };
 #define STORE_F_STALE         0x0080u   /* 0.7 WP7b: the database has another version of the zone than the image (the record's stamp is the wanted one): the body is fetched in the background; the image keeps serving meanwhile */
 #define STORE_F_XFR           0x0100u   /* 0.7: a secondary's copy (the reserved view `_karidns-xfr`); the digest is the secondary state (dns_xfr_store.h) */
 #define STORE_F_SIGNER_HELD   0x0200u   /* 0.7: signer-wait: the database has another version (the record's stamp) that waits for karidns-signer; the image keeps serving and the body is not asked for until the loader releases the zone, or a loader connects again (dns_db_store.c) */
+#define STORE_F_SIGNER_UNSIGNED 0x0400u /* 0.7: signer-wait: the version of the record came to be held for karidns-signer (KDB_EF_HOLD) but the Backend had no signed version of the zone to keep (no image, nothing in memory): it is served as it is (availability first) and said so (a WARNING, karictl dbstatus, store.recon.signer.unsigned); cleared by the next version that is not held (dns_db_store.c) */
 
 /* access mode of the images */
 enum { STORE_MODE_AUTO = 0, STORE_MODE_MAP = 1, STORE_MODE_COPY = 2 };

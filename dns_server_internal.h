@@ -805,7 +805,8 @@ struct zdir_elem {
   uint32_t hash;               /* calc_fnv1a_strn(name, klen): the index hash */
   uint32_t zid;                /* ZDIR_K_STORED: the zone id in the store (dns_store.h) */
   uint16_t sview;              /* ... and the id of its view in the store */
-  _Atomic uint32_t freq;      /* D1a step 5: how often the zone is asked for (GDSF, cache admission).  Non-resident zone: +1 per query that parks; the cache manager folds the queries of a resident zone in (observatory counter) and halves it at each round */
+  uint8_t sig_hold;            /* 0.7 signer-wait: a newer version waits for karidns-signer and this one keeps serving (dbreg_signer_hold()): not taken out of memory, as a pinned zone; cleared when a version is registered (under g_zone_db_rebuild_lock; in the padding after sview) */
+  _Atomic uint32_t freq;     /* D1a step 5: how often the zone is asked for (GDSF, cache admission).  Non-resident zone: +1 per query that parks; the cache manager folds the queries of a resident zone in (observatory counter) and halves it at each round */
   uint32_t qseen;              /* D1a step 5: the zone entry's query counter (low 32 bits) when the cache manager last folded it into freq */
   uint32_t t_load;             /* D1a step 5: when the data came into memory (ms of a monotonic clock, 32 bits): a zone is not taken out again before its queries are answered */
   uint32_t t_age;              /* 0.7 store S5: the time (ms, 32 bits) up to which the frequency is aged: the sampler halves it once for every CACHE_AGE_MS since then */
@@ -1436,6 +1437,10 @@ void dbreg_err_sink_clear(uint32_t zid);
 int dbreg_store_image_lost(uint32_t zid, bool (*backed)(const zone_version_t *v));
 /* 0.7 store S5: a dynamic UPDATE or a rollback changed the zone of the entry (it is pinned in memory from now on) or it grew: the pinned total of the store counts the bytes it holds now.  The entry's writer lock must not be held. */
 void dbreg_pin_changed(zone_db_entry_t *e);
+/* 0.7 signer-wait (dns_db_store.c, a CHANGES upsert with KDB_EF_HOLD): on: does the zone (view, name: canonical, with the trailing dot) have a version in memory that is served (a primary
+ * of the database, not hidden, not on its way out)?  When it has, the element is held (sig_hold): the cache manager and room on demand do not take it out, as for a pinned zone, until the next version is
+ * registered or the hold is let go (on false: the loader released the zone).  Returns whether the zone is held now.  Takes the registry lock (the records lock may be held: it comes first). */
+bool dbreg_signer_hold(const char *view, const char *name, bool on);
 void dbreg_err_stats(size_t *n, uint64_t *noted, uint64_t *dropped);
 #ifdef KARIDNS_UNIT_TEST
 void dbreg_err_reset_for_test(void);

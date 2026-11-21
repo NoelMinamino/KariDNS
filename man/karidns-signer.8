@@ -553,8 +553,20 @@ changes at once, unsigned.
 \fBNot held back:\fR a zone the server does not have yet, a full comparison
 (start, restart, \fBkarictl reload\fR of every zone, a replaced database file)
 and a refused zone. With the zone store a version held across a restart of the
-server or the loader is read in the background after the start. In those moments
-an unsigned change can be served; the signer catches up within seconds.
+server or the loader is read in the background after the start, and without the
+store (\fBstore none\fR) a zone that \fBmemory\-limit\fR took out of memory is
+read from the database as it is when a query needs it. In those moments an
+unsigned change can be served; the signer catches up within seconds.
+.IP \(bu 2
+\fBWith the zone store\fR a change waits while any signed version is here: the
+image, or the version in memory when the store lost the image (a damaged image
+in \fBstore\-mode copy\fR, a degraded store), which is then held in memory; also
+when a newer body was asked for and has not come, or the last version was
+refused. When no signed version is here (a zone new to the server) the change is
+served as it is and the server says so: a WARNING in the log, \fBkarictl
+dbstatus <zone>\fR "serving a version the signer has not signed yet", and
+\fBstore.recon.signer.unsigned\fR in \fBkarictl store\fR (\fBkaridns(8)\fR, "The
+signer's zones").
 .IP \(bu 2
 \fBPowerDNS\fR on the same database reads it live and serves a change at once,
 signed or not. Keep it apart from the zones the signer signs.

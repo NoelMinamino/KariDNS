@@ -1292,6 +1292,7 @@ static void job_execute(ing_job_t *j) {
     db_stamp_t swant = { j->iv_st_gen, j->iv_st_time };
     const int sgd = db_store_commit_begin(j->view_name, j->zone, j->iv_st_valid ? &swant : NULL);
     int so = DBREG_STORE_ENTRY;
+    if (sgd == DBC_OK) db_store_signer_commit(j->view_name, j->zone);      /* (signer-wait: a held version that nothing signed here kept is served as it is, and said so) */
     if (sgd == DBC_OK) so = dbreg_commit_store_only(j->view_name, j->zone, (const zone_image_t *)(const void *)j->img, j->source_id, j->serial, j->digest, j->shared);
     db_store_commit_end();
     if (sgd != DBC_OK) {                                 /* the body is for another stamp than the record has now, or the zone is gone: nothing is taken from it */
@@ -1309,6 +1310,14 @@ static void job_execute(ing_job_t *j) {
   zone_db_entry_t *entry = dbreg_lookup_entry_busy(j->view_name, j->zone);
   bool created = false;
   if (entry && entry->is_secondary) entry = NULL;          /* B7b: the zone was a SLAVE / CONSUMER; a new primary entry replaces it */
+  if (entry && j->fetch_id && dbdir() && db_store_signer_keeps(j->view_name, j->zone)) {
+    /* 0.7 signer-wait: the version in memory is the one a hold keeps serving (its record waits for the signer, dns_db_store.c recon_hold_keeps()): a body of the held version does not replace it.  The
+     * loader's release (the zone sent again without KDB_EF_HOLD, or a reload) lets go of the hold first, and that body is installed. */
+    dbreg_busy_clear(j->view_name, j->zone);
+    j->status = KDB_ST_UNCHANGED;
+    job_drop_image(j);
+    return;
+  }
   if (!entry) {
     entry = new_db_entry(j->view_name, j->zone, j->shared, KDB_ZK_PRIMARY);
     if (!entry) {
@@ -1364,6 +1373,7 @@ static void job_execute(ing_job_t *j) {
     job_drop_image(j);
     return;
   }
+  if (gd == DBC_OK && j->fetch_id && dbdir()) db_store_signer_commit(j->view_name, j->zone);      /* (signer-wait: a held version that nothing signed here kept is served as it is, and said so) */
   const int cr = dbreg_commit(j->view_name, j->zone, entry, created, j->source_id, serial_now, j->digest, &shadowed);
   db_store_commit_end();
   if (cr != 0) {
@@ -5718,6 +5728,15 @@ static void settings_status(status_ctx_t *c, const zone_db_entry_t *e) {
   }
 }
 
+/* 0.7 signer-wait: what the store's record of the zone says about karidns-signer (flags: STORE_F_*); in_memory: the version in memory is held (dbreg_signer_hold()) */
+static void signer_status(status_ctx_t *c, uint16_t flags, bool in_memory) {
+  if (flags & STORE_F_SIGNER_HELD)
+    st_append(c, "  signer-wait: the database has another version, which waits for the signer; %s keeps serving until the signer has signed it\n",
+              in_memory ? "the version in memory (held there)" : "the version here");
+  if (flags & STORE_F_SIGNER_UNSIGNED)
+    st_append(c, "  signer-wait: serving a version the signer has not signed yet (no signed version was here to keep; it is served as it is until the signer signs it)\n");
+}
+
 static bool status_cb(void *ud, const char *view, const dbreg_zone_t *z) {
   status_ctx_t *c = ud;
   if (c->view && strcasecmp(c->view, view) != 0) return true;
@@ -5739,6 +5758,10 @@ static bool status_cb(void *ud, const char *view, const dbreg_zone_t *z) {
               atomic_load_explicit(&zone_xr(zdir_entry(z))->rb_from, memory_order_relaxed));
   else if (zdir_entry(z) && atomic_load_explicit(&zdir_entry(z)->updated, memory_order_relaxed)) st_append(c, " (changed by a dynamic UPDATE: pinned in memory until the next load from the database)");
   st_append(c, "\n");
+  {
+    dbdir_rec_t rr;                                      /* 0.7 signer-wait: what the store's record says (the registry lock is held: a read that never sleeps) */
+    if (dbdir() && dbdir()->rec_get_nb(view, z->name, &rr) == 1) signer_status(c, rr.flags, z->sig_hold != 0);
+  }
   /* a line of its own: the zone line above keeps its form (it ends with the status) */
   if (zdir_entry(z) && atomic_load_explicit(&zone_xr(zdir_entry(z))->prev_bytes, memory_order_relaxed))
     st_append(c, "  previous version kept for rollback: serial %u, %llu bytes\n", atomic_load_explicit(&zone_xr(zdir_entry(z))->prev_serial, memory_order_relaxed),
@@ -5811,6 +5834,7 @@ size_t db_ingest_status(const char *zone, const char *view, char *out, size_t ca
           st_append(&c, "zone %s view %s: source id %lld, serial %u, status %s (in the zone store, not in memory: it is attached when a query needs it)%s%s%s\n", canon, info[i].view,
                     (long long)info[i].source_id, (unsigned)info[i].serial, info[i].last_result == DBREG_REJECTED ? "rejected" : "applied", has_rr && (rr.flags & STORE_F_STALE) ? "; the database has another version, its body is fetched in the background" : has_rr && (rr.flags & STORE_F_SIGNER_HELD) ? "; the database has another version, which waits for the signer (signer-wait)" : "",
                     info[i].error[0] ? ", last error: " : "", info[i].error);
+        if (has_rr) signer_status(&c, rr.state == STORE_STATE_KNOWN ? rr.flags : (uint16_t)(rr.flags & STORE_F_SIGNER_UNSIGNED), false);      /* (the stored line says the hold already) */
       }
     }
     if (c.matches == 0) st_append(&c, "zone %s: not in the database registry\n", zone);
@@ -5956,6 +5980,10 @@ size_t db_ingest_status(const char *zone, const char *view, char *out, size_t ca
                 (unsigned long long)rs.skipped, (unsigned long long)rs.unlisted, (unsigned long long)rs.total, (unsigned long long)rs.swept, (unsigned long long)rs.known_now,
                 (unsigned long long)rs.fetched, (unsigned long long)rs.fetch_failed, (unsigned long long)rs.in_flight, (unsigned long long)rs.wanted,
                 (unsigned long long)rs.change_upserts, (unsigned long long)rs.change_deletes, (unsigned long long)rs.cursors, (unsigned long long)rs.passes);
+      if (rs.signer_held || rs.signer_unsigned)                 /* 0.7 signer-wait */
+        st_append(&c, "signer-wait: since the start %llu version(s) waited for the signer while a signed one kept serving (%llu kept by the version in memory alone), %llu version(s) served that the "
+                      "signer has not signed yet (nothing signed was here to keep; `karictl dbstatus <zone>` and the log name them)\n",
+                  (unsigned long long)rs.signer_held, (unsigned long long)rs.signer_held_mem, (unsigned long long)rs.signer_unsigned);
       if (rs.nonstore)
         st_append(&c, "store: %llu zone(s) have a name the store cannot hold (the root zone): zones of the heap directory, read from the database at every start\n", (unsigned long long)rs.nonstore);
       if (rs.guard_views) {

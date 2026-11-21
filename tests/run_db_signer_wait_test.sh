@@ -10,12 +10,16 @@
 #       - a change that keeps the serial waits as well; two zones wait; the list says "and N more" beyond the first few names (cap);
 #       - `karictl reload <zone>` and `karictl reload` read the zone as it is: the new answer is served and dbstatus stops naming the zone;
 #       - a zone that is new to the Backend is read as it is (also with the metadata); a deleted zone leaves the list of waiting zones;
+#         with the zone store (DB_STORE=on) it is said: a WARNING in the log, `karictl dbstatus <zone>` ("serving a version the signer has not signed yet"), store.recon.signer.unsigned;
 #       - a restart reads the changed zone as it is (the full comparison of the start);
 #       - a waiting zone that loses the metadata X-KARIDNS-SIGNER is read as it is at the next batch and leaves the list;
 #   S2  signer-wait no: the same change is served by auto reload, nothing waits; karictl reconfig switches between the two;
 #   S4  a reload request that comes before the poll of the loader has read the change rows: the zone does not go on the list afterwards; a later change does;
 #   S3  two views (loopback aliases 127.0.0.2 and 127.0.0.3): every view has its own set of waiting zones; a zone of view a that waits does not hold back the
 #       same name in view b, an ordinary zone follows in both, and `karictl reload <zone>` clears only the view that has the zone.
+#   S5  (the zone store, DB_STORE=on, store-mode copy) the image of a signer's zone is found damaged by the scrub while its copy is in memory (the record is KNOWN):
+#       a change that waits for the signer leaves the copy in memory serving (dbstatus: "held there", store.recon.signer.held_in_memory), also after a later batch,
+#       until `karictl reload <zone>`.  Before the fix (0.7) the Backend fetched the body of the KNOWN record and served the version the signer had not signed.
 #
 # Needs root (the server starts as root and drops to nobody, the loader must be root-owned; S3 adds loopback aliases).  SKIP otherwise, and
 # when karidns, dag, karictl, karidns-dbloader (SQLite3 driver), zone2sql or the sqlite3 CLI is missing.
@@ -159,6 +163,21 @@ wait_dbst() {   # wait_dbst PATTERN SECONDS
     return 1
 }
 nowait() { ! dbst | grep -q "waiting for the signer"; }
+setwww() { sq "UPDATE records SET content = '$2' WHERE name = 'www.$1' AND type = 'A'"; }   # setwww ZONE ADDRESS
+sfk() { $KCTL store -k 2>/dev/null | sed -n "s/^$1=//p" | head -1; }   # sfk KEY: a value of `karictl store -k`
+# 0.7 signer-wait with the zone store: a zone of the signer that has no signed version here (new to the Backend) is served as it is, and that is said (a WARNING, dbstatus, the counter)
+check_unsigned() {   # check_unsigned ZONE
+    [ "${DB_STORE:-}" = on ] || return 0
+    if kari_wait_log "$LOG" "zone '$1\.' .*signer-wait: .*a version the signer has not signed yet" 5; then pass "store: a WARNING says that $1 is served with a version the signer has not signed yet"
+    else fail "store: no WARNING about the unsigned version of $1"; grep -i "signer" "$LOG" | tail -5 | sed 's/^/         /'; fi
+    dbst "$1" | grep -q "serving a version the signer has not signed yet" && pass "store: karictl dbstatus $1 says so" || { fail "store: karictl dbstatus $1 does not say so"; dbst "$1" | sed 's/^/         /'; }
+    n=$(sfk store.recon.signer.unsigned)
+    [ "${n:-0}" -ge 1 ] 2>/dev/null && pass "store: store.recon.signer.unsigned=$n" || fail "store: store.recon.signer.unsigned='$n'"
+}
+# damage_image DIR ZONE: one byte of the image of ZONE in the segment files of the zone store DIR (the scrub finds it)
+damage_image() {
+    perl -e 'my ($d, $z) = @ARGV; for my $seg (glob("$d/seg.*")) { open(my $h, "+<:raw", $seg) or next; local $/; my $b = <$h>; my $p = index($b, "www.$z"); next if $p < 0; seek($h, $p + 3, 0); print $h "#"; close $h; exit 0; } exit 1;' "$1" "$2"
+}
 
 # ================================================================ S1
 echo "== S1: signer-wait yes (the default)"
@@ -202,6 +221,7 @@ echo "== S1: new zones, deleted zones, a restart"
 addsigned sg3.test 1 192.0.2.40
 if wait_ans www.sg3.test 192.0.2.40 8; then pass "a signer's zone that is new to the Backend is read as it is"; else fail "the new signed zone is not served"; fi
 nowait && pass "...and nothing waits" || fail "a new zone waits"
+check_unsigned sg3.test
 sq "UPDATE records SET content = '192.0.2.41' WHERE name = 'www.sg3.test' AND type = 'A'"
 wait_dbst "^    waiting for the signer: 1 zone(s): sg3.test$" 6 && pass "a change of it waits" || { fail "sg3.test does not wait"; dbst | sed 's/^/         /'; }
 sq "DELETE FROM records WHERE domain_id = (SELECT id FROM domains WHERE name = 'sg3.test'); DELETE FROM domainmetadata WHERE domain_id = (SELECT id FROM domains WHERE name = 'sg3.test'); DELETE FROM domains WHERE name = 'sg3.test'"
@@ -333,6 +353,43 @@ sleep 8
 nowait && pass "a deleted zone is not on the list" || fail "a deleted zone is on the list"
 POLL=1
 stop_server
+
+
+# ================================================================ S5 (the zone store)
+# 0.7: the image of a signer's zone is lost (the scrub finds it damaged) while its copy is in memory (store-mode copy): the record is KNOWN.  A change of the zone
+# that waits for the signer must leave the copy in memory serving; before the fix the Backend asked for the body of a KNOWN record and served the version the
+# signer had not signed.
+if [ "${DB_STORE:-}" = on ]; then
+    echo "== S5 (the zone store): a signer's zone whose image is lost while its copy is in memory"
+    stop_server
+    rm -rf "$T/store"
+    COALESCE=300
+    newdb
+    addz plain.test 10 192.0.2.10
+    addsigned sl.test 1 192.0.2.70
+    conf "store-mode copy; store-scrub-interval off;"
+    start_server
+    wait_ans www.sl.test 192.0.2.70 10 && pass "sl.test is served (a copy of its image is in memory)" || fail "sl.test is not served (got '$(qa www.sl.test)')"
+    damage_image "$T/store" sl.test && pass "a byte of the image of sl.test was damaged" || fail "no image of sl.test in the segments"
+    $KCTL store scrub start 2>&1 | grep -q '^OK' && pass "karictl store scrub start" || fail "karictl store scrub start failed"
+    i=0; while [ $i -lt 300 ] && ! [ "$(sfk store.scrub.bad_images)" -ge 1 ] 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
+    [ "$(sfk store.scrub.bad_images)" -ge 1 ] 2>/dev/null && pass "the scrub found the damaged image (store.scrub.bad_images=$(sfk store.scrub.bad_images))" || fail "the scrub did not find the damage: bad_images='$(sfk store.scrub.bad_images)' passes='$(sfk store.scrub.passes)'"
+    check_ans "the copy in memory keeps serving" "192.0.2.70" www.sl.test
+    setwww sl.test 192.0.2.71
+    wait_dbst "^    waiting for the signer: 1 zone(s): sl.test$" 10 && pass "the change of sl.test waits for the signer" || { fail "sl.test does not wait"; dbst | sed 's/^/         /'; }
+    sleep 2
+    check_ans "the signer's zone whose image is gone keeps serving the version in memory, not the one the signer has not signed" "192.0.2.70" www.sl.test
+    dbst sl.test | grep -q "the version in memory (held there) keeps serving" && pass "karictl dbstatus sl.test: the version in memory is held" || { fail "dbstatus sl.test"; dbst sl.test | sed 's/^/         /'; }
+    n=$(sfk store.recon.signer.held_in_memory); [ "${n:-0}" -ge 1 ] 2>/dev/null && pass "store.recon.signer.held_in_memory=$n" || fail "store.recon.signer.held_in_memory='$n'"
+    setwww plain.test 192.0.2.14
+    wait_ans www.plain.test 192.0.2.14 8 && pass "a later batch runs (an ordinary zone follows)" || fail "no later batch"
+    check_ans "...and sl.test still keeps the version in memory" "192.0.2.70" www.sl.test
+    OUT=$($KCTL reload sl.test 2>&1)
+    wait_ans www.sl.test 192.0.2.71 8 && pass "karictl reload sl.test (the signer's release): the new version is served" || { fail "reload sl.test: got '$(qa www.sl.test)' ($OUT)"; dbst sl.test | sed 's/^/         /'; }
+    i=0; while [ $i -lt 50 ] && dbst sl.test | grep -q "signer-wait"; do sleep 0.1; i=$((i + 1)); done
+    dbst sl.test | grep -q "signer-wait" && { fail "dbstatus sl.test still names signer-wait after the release"; dbst sl.test | sed 's/^/         /'; } || pass "...and dbstatus sl.test has nothing about signer-wait any more"
+    stop_server
+fi
 
 
 if grep -q "killed by signal\|AddressSanitizer\|ThreadSanitizer" "$LOG"; then fail "the loader crashed"; grep -E "killed by signal|Sanitizer|#[0-9] " "$LOG" | head -12 | sed 's/^/         /'; fi

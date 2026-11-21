@@ -112,6 +112,9 @@ typedef struct store_recon {
   uint64_t settle_errors;        /* 0.7: settles after the records lock that found the journal full or failed (the calls had returned 0) */
   uint64_t batch_store_errors;   /* batch ends whose commit failed (the cursor stays where it was durable) */
   int      batch_store_last;     /* the result of the last batch end's commit (0, -errno) */
+  /* 0.7 signer-wait, since the start: versions that waited for karidns-signer while a signed one kept serving (held), of those the ones only the version in memory kept (the store had no image of the
+   * zone), and versions served although the signer has not signed them (no signed version was here to keep: STORE_F_SIGNER_UNSIGNED) */
+  uint64_t signer_held, signer_held_mem, signer_unsigned;
 } store_recon_t;
 /* fills *out and returns true, or returns false when the server has none (no loader) */
 void store_status_set_recon_fn(bool (*fn)(store_recon_t *out));

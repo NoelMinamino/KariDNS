@@ -3671,6 +3671,7 @@ static void zdir_elem_sync(zdir_elem_t *z, zone_db_entry_t *entry) {
     }
     if (zone_entry_ticks(entry)) f |= ZDIR_F_TICK;
     z->flags = f;
+    z->sig_hold = 0;                                               /* (a version is registered: what signer-wait held is no longer the one served) */
     atomic_store_explicit(&z->state, ZDIR_ST_RESIDENT, memory_order_release);
     z->refresh = atomic_load_explicit(&entry->refresh, memory_order_relaxed);
     z->retry = atomic_load_explicit(&entry->retry, memory_order_relaxed);
@@ -3797,7 +3798,7 @@ static zone_ext_shared_t *store_entry_settings(const zone_db_entry_t *e) {
 static void pin_charge_set_locked(dbreg_zone_t *z, const zone_db_entry_t *e) {
     const zone_version_t *cv = e ? atomic_load_explicit(&e->rcu.active, memory_order_acquire) : NULL;
     const uint64_t cb = e ? (cv && cv->counted ? cv->bytes : 0) + atomic_load_explicit(&e->fixed_charged, memory_order_relaxed) : 0;
-    const bool pinned = e && ((z->flags & ZDIR_F_PIN) || atomic_load_explicit(&e->updated, memory_order_relaxed));
+    const bool pinned = e && ((z->flags & ZDIR_F_PIN) || z->sig_hold || atomic_load_explicit(&e->updated, memory_order_relaxed));
     const uint32_t np = pinned ? (cb > UINT32_MAX ? UINT32_MAX : (uint32_t)cb) : 0;
     g_stored_pinned = g_stored_pinned - z->pin_charge + np;
     z->pin_charge = np;
@@ -3814,6 +3815,28 @@ void dbreg_pin_changed(zone_db_entry_t *e) {
     if (z && (z->kind & ZDIR_K_STORED) && zdir_entry(z) == e) pin_charge_set_locked(z, e);
     pthread_mutex_unlock(&g_zone_db_rebuild_lock);
     rcu_aux_read_unlock();
+}
+
+/* 0.7 signer-wait: hold (or let go of) the version of the zone that is in memory (dns_server_internal.h).  A zone of the store and a zone of the heap directory alike: the store may have no image of it
+ * (the scrub or the cleaner found it damaged in COPY mode, a degraded store kept only its record), and then the entry is the only signed version there is. */
+bool dbreg_signer_hold(const char *view, const char *name, bool on) {
+    bool held = false;
+    rcu_aux_read_lock();                                      /* (the version of the entry is read for the pinned total) */
+    pthread_mutex_lock(&g_zone_db_rebuild_lock);
+    dbreg_view_t *rv = dbreg_view_get(view, false);
+    dbreg_zone_t *z = rv ? dbreg_find(rv, name, zdir_name_hash(name)) : NULL;
+    zone_db_entry_t *e = z ? zdir_entry(z) : NULL;
+    if (z && on) {
+        held = e && e->source == ZONE_SRC_DB && !e->is_secondary && !e->evicted && !z->shadowed && !(z->flags & (ZDIR_F_DELETED | ZDIR_F_GARB)) &&
+               atomic_load_explicit(&z->state, memory_order_relaxed) == ZDIR_ST_RESIDENT && atomic_load_explicit(&e->rcu.active, memory_order_acquire) != NULL;
+        if (held) z->sig_hold = 1;
+    } else if (z) {
+        z->sig_hold = 0;
+    }
+    if (z && (z->kind & ZDIR_K_STORED) && e) pin_charge_set_locked(z, e);
+    pthread_mutex_unlock(&g_zone_db_rebuild_lock);
+    rcu_aux_read_unlock();
+    return held;
 }
 
 /* an element of the registry in the LOADING state for a record of the store: a fetch or an attach is on its way (the lock is held).  NULL: out of memory. */
@@ -4928,7 +4951,7 @@ static uint64_t dbreg_evict_locked(dbreg_view_t *rv, dbreg_zone_t *z) {
     if (z->kind & ZDIR_K_STORED) return store_detach_locked(rv, z);          /* 0.7 S3: a zone of the store leaves memory: the record stays, the element goes (no snapshot is published) */
     zone_db_entry_t *e = zdir_entry(z);
     if (!e || e->source != ZONE_SRC_DB || e->is_secondary || e->is_catalog_member || zone_xr(e)->catalog_member_count > 0 || z->shadowed ||
-        (z->kind & (ZDIR_K_SHARED | ZDIR_K_STATIC | ZDIR_K_BORROWED)) || (z->flags & (ZDIR_F_PIN | ZDIR_F_DELETED | ZDIR_F_GARB | ZDIR_F_BUSY | ZDIR_F_NOTIFY_DEFER)) ||      /* (NOTIFY_DEFER: the ring was full, the sweep has not queued its NOTIFY yet; the apex made from the image would lack the NS addresses of the loader) */
+        (z->kind & (ZDIR_K_SHARED | ZDIR_K_STATIC | ZDIR_K_BORROWED)) || (z->flags & (ZDIR_F_PIN | ZDIR_F_DELETED | ZDIR_F_GARB | ZDIR_F_BUSY | ZDIR_F_NOTIFY_DEFER)) || z->sig_hold ||      /* (sig_hold: signer-wait keeps the version; NOTIFY_DEFER: the ring was full, the sweep has not queued its NOTIFY yet; the apex made from the image would lack the NS addresses of the loader) */
         atomic_load_explicit(&z->state, memory_order_relaxed) != ZDIR_ST_RESIDENT || e->evicted_bytes)
         return 0;
     if (zdir_lookup(dbreg_active_dir_locked(rv->name), z->name) != z) return 0;
@@ -5019,7 +5042,7 @@ static uint64_t store_detach_locked(dbreg_view_t *rv, dbreg_zone_t *z) { return 
 static uint64_t store_detach_x_locked(dbreg_view_t *rv, dbreg_zone_t *z, bool force) {
     const dbdir_ops_t *ops = dbdir();
     zone_db_entry_t *e = zdir_entry(z);
-    if (!ops || !e || !store_zone_entry(e) || zone_xr(e)->catalog_member_count > 0 || z->shadowed || (z->flags & ((force ? 0 : ZDIR_F_PIN) | ZDIR_F_DELETED | ZDIR_F_GARB | ZDIR_F_BUSY | ZDIR_F_NOTIFY_DEFER)) ||
+    if (!ops || !e || !store_zone_entry(e) || zone_xr(e)->catalog_member_count > 0 || z->shadowed || (z->flags & ((force ? 0 : ZDIR_F_PIN) | ZDIR_F_DELETED | ZDIR_F_GARB | ZDIR_F_BUSY | ZDIR_F_NOTIFY_DEFER)) || (!force && z->sig_hold) ||
         atomic_load_explicit(&z->state, memory_order_relaxed) != ZDIR_ST_RESIDENT || e->evicted_bytes)
         return 0;
     if (ops->attach_get(z->zid) != z) return 0;
@@ -5429,7 +5452,7 @@ static bool sample_eval_locked(dbreg_zone_t *z, uint32_t now32, cache_cand_t *c)
     z->qseen = q32;
     f = f > UINT32_MAX - dq ? UINT32_MAX : f + dq;
     atomic_store_explicit(&z->freq, f, memory_order_relaxed);
-    if ((z->flags & ZDIR_F_PIN) || atomic_load_explicit(&e->updated, memory_order_relaxed)) return false;
+    if ((z->flags & ZDIR_F_PIN) || z->sig_hold || atomic_load_explicit(&e->updated, memory_order_relaxed)) return false;
     if ((z->flags & (ZDIR_F_XFRLOAD | ZDIR_F_BGLOAD)) && dq > 0) z->flags &= (uint16_t)~(ZDIR_F_EVICT_NEXT | ZDIR_F_XFRLOAD | ZDIR_F_BGLOAD);
     dbreg_view_t *rv = dbreg_view_get(zone_vname(e), false);
     if (!rv) return false;
@@ -5589,7 +5612,7 @@ uint32_t dbreg_cache_round(void) {
             z->qseen = q32;
             f = f > UINT32_MAX - dq ? UINT32_MAX : f + dq;
             atomic_store_explicit(&z->freq, f, memory_order_relaxed);
-            if ((z->flags & ZDIR_F_PIN) || atomic_load_explicit(&e->updated, memory_order_relaxed)) {        /* (a zone that a dynamic UPDATE changed is never taken out until the database replaces it: it is as good as pinned) */
+            if ((z->flags & ZDIR_F_PIN) || z->sig_hold || atomic_load_explicit(&e->updated, memory_order_relaxed)) {        /* (signer-wait holds it, or a zone that a dynamic UPDATE changed is never taken out until the database replaces it: it is as good as pinned) */
                 g_cycle_pinned += bytes;
                 pinned_now += bytes;
                 continue;
@@ -5778,7 +5801,7 @@ uint32_t dbreg_cache_make_room(uint32_t nwant, uint32_t *relaxed_out) {
                 if (!e || e->source != ZONE_SRC_DB || e->evicted_bytes) continue;
                 zone_version_t *a = atomic_load_explicit(&e->rcu.active, memory_order_acquire);
                 uint64_t bytes = (a && a->counted) ? a->bytes + atomic_load_explicit(&e->fixed_charged, memory_order_relaxed) : 0;
-                if (bytes == 0 || (z->flags & ZDIR_F_PIN) || atomic_load_explicit(&e->updated, memory_order_relaxed)) continue;
+                if (bytes == 0 || (z->flags & ZDIR_F_PIN) || z->sig_hold || atomic_load_explicit(&e->updated, memory_order_relaxed)) continue;
                 sumb += bytes;
                 nres++;
                 if (nc == s_room_cap) {

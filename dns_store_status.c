@@ -524,6 +524,9 @@ static void add_recon(list_t *l) {
   U("store.recon.batch_store_errors", r->batch_store_errors);
   U("store.recon.batch_store_last_error", r->batch_store_last < 0 ? -r->batch_store_last : 0);
   U("store.lock.records_wait_max_us", r->rec_wait_max_us);
+  U("store.recon.signer.held", r->signer_held);
+  U("store.recon.signer.held_in_memory", r->signer_held_mem);
+  U("store.recon.signer.unsigned", r->signer_unsigned);
   U("store.recon.guard.held_views", r->guard_views);
   if (r->guard_views) {
     add_s(l, "store.recon.guard.view", r->guard_view);
