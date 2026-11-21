@@ -2618,6 +2618,96 @@ static void test_ipc_frame_parse_pack(void) {
     printf("  -> the IPC frames passed.\n");
 }
 
+/* a client socket for router_send_clients(): it takes up to fk_chunk messages a call, refuses fk_refuse calls in a row (errno fk_errno) after
+ * the first fk_first messages, and refuses for good when fk_refuse < 0; fk_bad is a message it refuses on its own (EMSGSIZE).  The order of what
+ * it took is in fk_order (the index of the message: its iov_len). */
+static int fk_first, fk_refuse, fk_errno, fk_chunk, fk_calls, fk_bad, fk_taken;
+static int fk_order[64];
+static ssize_t fk_sendmmsg(int fd, struct mmsghdr *m, size_t n, int flags) {
+    (void)fd; (void)flags;
+    fk_calls++;
+    if (fk_taken >= fk_first && fk_refuse != 0) {
+        if (fk_refuse > 0) fk_refuse--;
+        errno = fk_errno;
+        return -1;
+    }
+    size_t k = 0;
+    for (; k < n && (int)k < fk_chunk; k++) {
+        const int idx = (int)m[k].msg_hdr.msg_iov->iov_len;
+        if (idx == fk_bad) {
+            if (k == 0) { errno = EMSGSIZE; return -1; }
+            break;
+        }
+        if (fk_taken < 64) fk_order[fk_taken] = idx;
+        fk_taken++;
+        if (fk_taken == fk_first && fk_refuse != 0) { k++; break; }
+    }
+    return (ssize_t)k;
+}
+
+static int64_t fk_us(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (int64_t)t.tv_sec * 1000000 + t.tv_nsec / 1000;
+}
+
+/* router_send_clients(): a reply the client socket refuses for a moment (ENOBUFS / EAGAIN) is sent again, in order, within a bounded time; what never goes
+ * is dropped and counted once; a socket that used its budget is not waited for again until a batch goes out whole */
+static void test_router_send_clients(void) {
+    printf("[TEST] Server Core: router_send_clients retries a full client queue within its budget, in order, and counts what is finally dropped...\n");
+    struct iovec iov[16];
+    struct mmsghdr m[16];
+    memset(m, 0, sizeof(m));
+    for (int i = 0; i < 16; i++) {
+        iov[i].iov_base = NULL;
+        iov[i].iov_len = (size_t)i;              /* (the index: fk_sendmmsg records the order) */
+        m[i].msg_hdr.msg_iov = &iov[i];
+        m[i].msg_hdr.msg_iovlen = 1;
+    }
+    ssize_t (*saved)(int, struct mmsghdr *, size_t, int) = g_sendmmsg_fn;
+    g_sendmmsg_fn = fk_sendmmsg;
+    const uint64_t full0 = ipcd_total(IPCD_RCLI_FULL), err0 = ipcd_total(IPCD_RCLI_ERR), re0 = ipcd_total(IPCD_RCLI_RETRIED);
+    bool stuck = false;
+    /* ENOBUFS 3 times after 4 replies, then the queue takes the rest: nothing dropped, the order kept, 6 counted as retried */
+    fk_first = 4; fk_refuse = 3; fk_errno = ENOBUFS; fk_chunk = 16; fk_calls = 0; fk_bad = -1; fk_taken = 0;
+    int64_t t = fk_us();
+    assert(router_send_clients(7, m, 10, &stuck) == 0);
+    t = fk_us() - t;
+    assert(fk_taken == 10 && fk_calls == 5 && !stuck);
+    for (int i = 0; i < 10; i++) assert(fk_order[i] == i);
+    assert(ipcd_total(IPCD_RCLI_FULL) == full0 && ipcd_total(IPCD_RCLI_ERR) == err0 && ipcd_total(IPCD_RCLI_RETRIED) == re0 + 6);
+    /* EAGAIN (the socket's own queue) the same way, one message a call */
+    fk_first = 2; fk_refuse = 1; fk_errno = EAGAIN; fk_chunk = 1; fk_calls = 0; fk_taken = 0;
+    assert(router_send_clients(7, m, 5, &stuck) == 0 && fk_taken == 5 && !stuck);
+    for (int i = 0; i < 5; i++) assert(fk_order[i] == i);
+    assert(ipcd_total(IPCD_RCLI_RETRIED) == re0 + 6 + 3);
+    /* a queue that never takes again: bounded (the budget, 300 us, plus a pause; far under 50 ms), the 8 left dropped and counted once, the socket marked */
+    fk_first = 8; fk_refuse = -1; fk_errno = ENOBUFS; fk_chunk = 16; fk_calls = 0; fk_taken = 0;
+    t = fk_us();
+    assert(router_send_clients(7, m, 16, &stuck) == 8);
+    t = fk_us() - t;
+    if (t < 300 || t > 50000) printf("  [state] the budget took %lld us, %d calls\n", (long long)t, fk_calls);
+    assert(t >= 300 && t < 50000 && stuck && fk_taken == 8 && fk_calls >= 3);
+    assert(ipcd_total(IPCD_RCLI_FULL) == full0 + 8 && ipcd_total(IPCD_RCLI_ERR) == err0);
+    /* the next batch of that socket: tried once, not waited for (still full: all 16 dropped at once) */
+    fk_first = 0; fk_calls = 0; fk_taken = 0;
+    t = fk_us();
+    assert(router_send_clients(7, m, 16, &stuck) == 16);
+    t = fk_us() - t;
+    assert(fk_calls == 1 && stuck && t < 300 && ipcd_total(IPCD_RCLI_FULL) == full0 + 24);
+    /* a batch that goes out whole clears the mark */
+    fk_refuse = 0; fk_calls = 0; fk_taken = 0;
+    assert(router_send_clients(7, m, 3, &stuck) == 0 && !stuck && fk_taken == 3);
+    /* a reply refused for its own reason (EMSGSIZE) is skipped and counted as an error, with no wait; the others go */
+    fk_bad = 2; fk_calls = 0; fk_taken = 0;
+    assert(router_send_clients(7, m, 5, &stuck) == 1 && fk_taken == 4 && !stuck);
+    assert(fk_order[0] == 0 && fk_order[1] == 1 && fk_order[2] == 3 && fk_order[3] == 4);
+    assert(ipcd_total(IPCD_RCLI_ERR) == err0 + 1 && ipcd_total(IPCD_RCLI_FULL) == full0 + 24);
+    assert(router_send_clients(7, m, 0, &stuck) == 0);
+    g_sendmmsg_fn = saved;
+    printf("  -> router_send_clients passed.\n");
+}
+
 /* ipc_reply_flush(): the replies of one batch through a real unix datagram pair: packed under g_ipc_pack_max, the losses counted in replies */
 static void test_ipc_reply_flush(void) {
     printf("[TEST] Server Core: ipc_reply_flush packs a batch of replies and counts what is lost in replies...\n");
@@ -2894,7 +2984,7 @@ static void test_ipcd_counters(void) {
     assert(dt != NULL);
     uint64_t sum = 0;
     for (int i = 0; i < IPCD_COUNT; i++)
-        if (i != IPCD_RTW_SPILLED && i != IPCD_RREP_CUT) sum += ipcd_total((ipcd_t)i);
+        if (i != IPCD_RTW_SPILLED && i != IPCD_RREP_CUT && i != IPCD_RCLI_RETRIED) sum += ipcd_total((ipcd_t)i);
     assert(strtoull(dt + strlen("ipc.dropped.total="), NULL, 10) == sum);   // the spills are not losses
     // a buffer that is too small is cut at a line: no overflow
     for (size_t cap = 1; cap < 80; cap += 7) {
@@ -2941,7 +3031,7 @@ static void test_ipcd_counters(void) {
     dt = strstr(buf, "ipc.dropped.total=");
     sum = 0;
     for (int i = 0; i < IPCD_COUNT; i++)
-        if (i != IPCD_RTW_SPILLED && i != IPCD_RREP_CUT) sum += ipcd_total((ipcd_t)i);
+        if (i != IPCD_RTW_SPILLED && i != IPCD_RREP_CUT && i != IPCD_RCLI_RETRIED) sum += ipcd_total((ipcd_t)i);
     assert(dt != NULL && strtoull(dt + strlen("ipc.dropped.total="), NULL, 10) == sum);   // (the routed queries are not drops)
     g_num_frontend_routers = saved_routers;
     for (size_t cap = 1; cap < 1500; cap += 37) {   // (the router lines are cut at a line as well)
@@ -3359,7 +3449,7 @@ static void test_router_reply_fd_and_budget(void) {
     const char *dt = strstr(fb, "ipc.dropped.total=");
     uint64_t sum = 0;
     for (int i = 0; i < IPCD_COUNT; i++)
-        if (i != IPCD_RTW_SPILLED && i != IPCD_RREP_CUT) sum += ipcd_total((ipcd_t)i);
+        if (i != IPCD_RTW_SPILLED && i != IPCD_RREP_CUT && i != IPCD_RCLI_RETRIED) sum += ipcd_total((ipcd_t)i);
     assert(dt && strtoull(dt + strlen("ipc.dropped.total="), NULL, 10) == sum);   /* (the worker queries are not drops; the new drops are) */
     g_num_workers = KARIDNS_WORKER_THREADS_MAX;                                 /* (the reply of 128 workers fits the control thread's buffer) */
     fl = ipcd_format(fb, sizeof(fb));
@@ -9417,6 +9507,7 @@ int main(void) {
     test_sendmmsg_skip_failed();
     test_ipc_frame_parse_pack();
     test_ipc_reply_flush();
+    test_router_send_clients();
     test_ipc_send_spill();
     test_sockbuf_set();
     test_ipcd_counters();

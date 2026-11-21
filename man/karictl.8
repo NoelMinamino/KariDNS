@@ -563,7 +563,15 @@ the frames: a reply of no octet is a bad length too
 .TP 8
 \fBipc.router.client.dropped_full\fR, \fB.dropped_error\fR
 replies that the router could not send to the client: the UDP send buffer was
-full, or another error
+full, or another error. A full queue (\fBENOBUFS\fR: the network interface's
+transmit queue; \fBEAGAIN\fR) is waited for first: the router sends the rest of
+the batch again, in order, for at most 300 microseconds, and only what is still
+refused then is dropped and counted here; a socket that used up that time is
+tried once per batch, without waiting, until a batch goes out whole
+.TP 8
+\fBipc.router.client.retried\fR
+replies that the client socket refused for a moment and took when the router
+sent them again: not a loss, not in \fBipc.dropped.total\fR
 .TP 8
 \fBipc.worker.rx.short\fR, \fBipc.worker.rx.bad_length\fR
 messages of a router that a worker dropped as malformed
@@ -591,7 +599,7 @@ datagram, not a reply, so not in \fBipc.dropped.total\fR. It stays 0 unless the
 Backend sends something broken
 .TP 8
 \fBipc.dropped.total\fR
-the sum of all of them but \fBspilled\fR and \fBcut\fR
+the sum of all of them but \fBspilled\fR, \fBcut\fR and \fBretried\fR
 .PP
 After the totals come the queries that each Frontend router read from its UDP
 sockets and handed to the workers, as lines \fBipcrouter.<n>.queries=<number>\fR

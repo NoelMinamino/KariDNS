@@ -1924,6 +1924,7 @@ typedef enum {
   IPCD_WURX_TRUNC,      /* worker (udp-receive backend): datagrams of its own UDP socket larger than the receive buffer (MSG_TRUNC) */
   IPCD_WURX_SHORT,      /* worker (udp-receive backend): datagrams of its own UDP socket shorter than a DNS header */
   IPCD_RREP_CUT,        /* router (B3 phase 3): datagrams of a worker whose frames it stopped reading at a bad frame that was not the first (the bad frame is counted by RREP_SHORT / RREP_BADLEN; the replies behind it are lost, their number unknown: not in ipc.dropped.total) */
+  IPCD_RCLI_RETRIED,    /* router (B3 phase 3): replies the client socket refused for a moment (ENOBUFS / EAGAIN) and took when sent again (router_send_clients()): not a loss, not in ipc.dropped.total */
   IPCD_COUNT
 } ipcd_t;
 typedef struct {
@@ -1990,6 +1991,8 @@ int ipc_send_spill(int (*fds)[2], int nw, int *rr, struct mmsghdr *msgs, int n);
 void ipc_reply_failed(int err);
 int ipc_reply_flush(int fd, udp_batch_ctx_t *batch, int n);
 extern size_t g_ipc_pack_max;
+int router_send_clients(int fd, struct mmsghdr *msgs, int n, bool *stuck);
+extern ssize_t (*g_sendmmsg_fn)(int, struct mmsghdr *, size_t, int);
 void ipcd_set_self(int slot);
 void ipcd_init(void);
 unsigned long sockbuf_limit_for(unsigned long maxsockbuf);

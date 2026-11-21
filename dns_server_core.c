@@ -2024,7 +2024,7 @@ static const char *const g_ipcd_names[IPCD_COUNT] = {
   "router.worker.spilled", "router.worker.dropped_full", "router.worker.dropped_error", "router.rx.truncated", "router.rx.short",
   "router.reply.short", "router.reply.bad_length", "router.reply.bad_socket", "router.client.dropped_full", "router.client.dropped_error",
   "worker.rx.short", "worker.rx.bad_length", "worker.reply.dropped_full", "worker.reply.dropped_error", "worker.async.dropped_full",
-  "worker.udp.truncated", "worker.udp.short", "router.reply.cut",
+  "worker.udp.truncated", "worker.udp.short", "router.reply.cut", "router.client.retried",
 };
 _Static_assert(sizeof(g_ipcd_names) / sizeof(g_ipcd_names[0]) == IPCD_COUNT, "a name for every IPC counter");
 /* udp-receive backend: the queries each worker read from its own UDP sockets (ipcworker.<w>.queries).  The workers are threads of the Backend, which
@@ -2084,7 +2084,7 @@ size_t ipcd_format(char *buf, size_t cap) {
   uint64_t dropped = 0;
   for (int i = 0; i < IPCD_COUNT; i++) {
     const uint64_t v = ipcd_total((ipcd_t)i);
-    if (i != IPCD_RTW_SPILLED && i != IPCD_RREP_CUT) dropped += v;   /* (a spill is served; a cut is a datagram, its bad frame is counted) */
+    if (i != IPCD_RTW_SPILLED && i != IPCD_RREP_CUT && i != IPCD_RCLI_RETRIED) dropped += v;   /* (a spill and a retry are served; a cut is a datagram, its bad frame is counted) */
     int w = snprintf(buf + len, cap - len, "ipc.%s=%llu\n", g_ipcd_names[i], (unsigned long long)v);
     if (w < 0 || (size_t)w >= cap - len) return len;
     len += (size_t)w;
@@ -2118,6 +2118,9 @@ size_t ipcd_format(char *buf, size_t cap) {
   return len;
 }
 
+/* the send of sendmmsg_run(): sendmmsg(2); a unit test puts a socket in its place that refuses a number of times (router_send_clients()) */
+STATIC_TEST ssize_t (*g_sendmmsg_fn)(int, struct mmsghdr *, size_t, int) = sendmmsg;
+
 /* sendmmsg() は途中の 1 通が失敗するとそこで止まり、送れた件数だけを返す
  * (失敗した 1 通以降は送られない)。戻り値を無視すると、過大な応答 (EMSGSIZE) や
  * 到達不能な宛先 (EHOSTUNREACH 等) 1 通のために同じバッチの他クライアント宛て応答まで
@@ -2130,7 +2133,7 @@ static int sendmmsg_run(int fd, struct mmsghdr *msgs, int n, int *rest, int *las
   int hard = 0;
   *rest = 0;
   while (off < n) {
-    int r = sendmmsg(fd, msgs + off, (unsigned int)(n - off), MSG_DONTWAIT);
+    int r = (int)g_sendmmsg_fn(fd, msgs + off, (size_t)(n - off), MSG_DONTWAIT);
     if (r > 0) {
       off += r;
       continue;
@@ -2159,6 +2162,51 @@ STATIC_TEST int sendmmsg_skip_failed(int fd, struct mmsghdr *msgs, int n, const 
   if (hard + rest > 0)
     log_udp_send_drop(path, is_ipc, last_err, hard + rest);
   return hard + rest;
+}
+
+/* Router -> clients (B3 phase 3 fix): the replies msgs[0 .. n) on the client UDP socket fd.  A full queue (ENOBUFS: the interface's transmit
+ * queue, as em0's one queue under 600k+ replies a second; EAGAIN: the socket) is a moment's state, not a reason to drop the rest of the batch
+ * at once as sendmmsg_skip_failed() does: measured on pc31 at 700k offered, 225 ENOBUFS a second cost 980 replies a second, about 4.4 replies
+ * dropped per refusal.  The unsent tail is sent again, in order (so the replies of one socket keep their order): at once, then after pauses of
+ * ROUTER_TX_PAUSE_US, until it has gone or ROUTER_TX_BUDGET_US have passed since the first refusal; what is still left is dropped and counted
+ * (IPCD_RCLI_FULL: replies finally dropped; IPCD_RCLI_ERR: a reply that failed for its own reason, skipped as before).  The bound: one batch
+ * holds the router at most ROUTER_TX_BUDGET_US plus one pause (nanosleep may overshoot by the timer's resolution, tens of microseconds).  A
+ * socket that used up its budget is marked *stuck: its next batches are tried once without waiting (as before the fix) until one goes out
+ * whole, so a socket that stays full costs the router one budget per episode, not one per batch, and the other sockets are not held.  The
+ * replies that went out after a wait are counted as IPCD_RCLI_RETRIED (not a loss).  No allocation.  Returns the number dropped. */
+#define ROUTER_TX_BUDGET_US 300
+#define ROUTER_TX_PAUSE_US 20
+STATIC_TEST int router_send_clients(int fd, struct mmsghdr *msgs, int n, bool *stuck) {
+  int off = 0, hard = 0, last_err = 0, retried = 0, tries = 0;
+  struct timespec t0 = { 0, 0 };
+  while (off < n) {
+    int rest = 0;
+    const int h = sendmmsg_run(fd, msgs + off, n - off, &rest, &last_err);
+    hard += h;
+    if (tries > 0) retried += (n - off) - rest - h;   /* (sent in this round, after a refusal) */
+    off = n - rest;
+    if (rest == 0) break;
+    if (*stuck) break;                            /* (this socket used its budget and has not sent a whole batch since) */
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    if (tries == 0) t0 = now;
+    else if ((now.tv_sec - t0.tv_sec) * 1000000L + (now.tv_nsec - t0.tv_nsec) / 1000 >= ROUTER_TX_BUDGET_US) {
+      *stuck = true;
+      break;
+    }
+    if (tries > 0) {
+      const struct timespec pause = { 0, ROUTER_TX_PAUSE_US * 1000L };
+      nanosleep(&pause, NULL);
+    }
+    tries++;
+  }
+  const int full = n - off;
+  if (full == 0) *stuck = false;
+  ipcd_add(IPCD_RCLI_FULL, (uint64_t)full);
+  ipcd_add(IPCD_RCLI_ERR, (uint64_t)hard);
+  ipcd_add(IPCD_RCLI_RETRIED, (uint64_t)retried);
+  if (hard + full > 0) log_udp_send_drop("Frontend UDP", false, last_err, hard + full);
+  return hard + full;
 }
 
 /* A reply of a worker that a plain send() to the router could not hand over (the asynchronous resolution threads): counted as the batches are. */
@@ -7175,6 +7223,8 @@ STATIC_TEST void run_frontend_router(pid_t backend_pid, int router_id) {
   // 特権破棄前に、外部UDPソケットをSO_REUSEPORT_LBでオープン・バインド (指示1: インデックス整合性の完全統一)
   int local_udp_fds[MAX_BIND_ADDRS];
   bool local_udp_is_wildcard[MAX_BIND_ADDRS];
+  bool tx_stuck[MAX_BIND_ADDRS];                       /* per socket index: used its send budget (router_send_clients()) */
+  memset(tx_stuck, 0, sizeof(tx_stuck));
   router_src_t local_udp_src[MAX_BIND_ADDRS];
   int local_num_udp_fds;
   /* udp-receive backend (B3 phase 2): the listen addresses are the workers' sockets, which the manager made; this router keeps the descriptors of the
@@ -7630,7 +7680,7 @@ STATIC_TEST void run_frontend_router(pid_t backend_pid, int router_id) {
 
             /* (a batch of client sends is one socket's, and at most UDP_BATCH_SIZE: one datagram of a worker can hold more replies than that) */
             if (tx_count > 0 && (msg->sock_fd_idx != cur_sock_idx || tx_count == UDP_BATCH_SIZE)) {
-              sendmmsg_skip_failed(cur_fd, fctx->cli_tx_msgs, tx_count, "Frontend UDP", false, IPCD_RCLI_FULL);
+              router_send_clients(cur_fd, fctx->cli_tx_msgs, tx_count, &tx_stuck[cur_sock_idx]);
               tx_count = 0;
             }
             cur_sock_idx = msg->sock_fd_idx;
@@ -7695,7 +7745,7 @@ STATIC_TEST void run_frontend_router(pid_t backend_pid, int router_id) {
           }
           }
           if (tx_count > 0 && cur_fd >= 0) {
-            sendmmsg_skip_failed(cur_fd, fctx->cli_tx_msgs, tx_count, "Frontend UDP", false, IPCD_RCLI_FULL);
+            router_send_clients(cur_fd, fctx->cli_tx_msgs, tx_count, &tx_stuck[cur_sock_idx]);
             tx_count = 0;
           }
           if (udp_batch_drained(n_recv))
