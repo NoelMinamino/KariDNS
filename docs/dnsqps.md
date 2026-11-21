@@ -173,10 +173,12 @@ Statistics:
   I/O path: mmsg, 4 thread(s) x 1 socket(s), server 192.0.2.53:53
 ```
 
+A line `Truncated (TC=1): N (P%)` follows the response codes when answers had TC set (an answer too big for UDP without EDNS, or a slip of response rate limiting: RRL answers a share of the limited queries with an empty TC=1 answer); such an answer still counts as completed and under its RCODE, and `"truncated"` in the JSON always holds the number. dnsqps does not ask again over TCP.
+
 The percentiles come from a log histogram (16 steps per power of two, about 6 % wide): they are the upper edge of the bucket, never above the maximum. `-S SEC` prints a line `[Interval] t=... sent=... completed=... lost=... qps=... avg_latency=...` every SEC seconds. `--json` prints one JSON object instead of the text report (the status and interval lines then go to standard error):
 
 ```
-{"tool":"dnsqps","io":"mmsg","server":"192.0.2.53:53","threads":4,"sockets":1,"null_sink":false,"run_s":10.002,"sent":3181200,"completed":3181200,"lost":0,"qps":318056.5,"sent_qps":318056.5,"malformed":0,"unmatched":0,"foreign":0,"send_errors":0,"recv_errors":0,"sent_bytes":130429200,"recv_bytes":308576400,"latency_s":{"avg":0.000812,"min":0.000041,"p50":0.00072,"p90":0.00124,"p99":0.0031,"p999":0.0079,"max":0.012339},"rcodes":{"NOERROR":2863080,"NXDOMAIN":318120}}
+{"tool":"dnsqps","io":"mmsg","server":"192.0.2.53:53","threads":4,"sockets":1,"null_sink":false,"run_s":10.002,"sent":3181200,"completed":3181200,"lost":0,"qps":318056.5,"sent_qps":318056.5,"malformed":0,"unmatched":0,"foreign":0,"send_errors":0,"recv_errors":0,"truncated":0,"sent_bytes":130429200,"recv_bytes":308576400,"latency_s":{"avg":0.000812,"min":0.000041,"p50":0.00072,"p90":0.00124,"p99":0.0031,"p999":0.0079,"max":0.012339},"rcodes":{"NOERROR":2863080,"NXDOMAIN":318120}}
 ```
 
 Exit status: 0 when the run was done and at least one answer came, 1 when queries were sent and none was answered, 2 for a usage or setup error (a controller: also an agent that failed before GO), 3 an agent lost during the run. Interrupt (Ctrl-C) stops the sending and waits for the outstanding queries (at most the timeout).
