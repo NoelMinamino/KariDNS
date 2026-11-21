@@ -82,6 +82,10 @@ typedef enum { NOTIFY_MODE_INHERIT = 0, NOTIFY_MODE_YES = 1, NOTIFY_MODE_NO = 2,
 
 /* B9a: the most alias-resolver addresses of a zone, of options, or of the database block */
 #define KARIDNS_ALIAS_RESOLVERS_MAX 8
+/* 0.7: alias-max-refresh-time <duration>; (options, zone, options { database { } }): bounds and default, seconds */
+#define KARIDNS_ALIAS_MAX_REFRESH_MIN 5
+#define KARIDNS_ALIAS_MAX_REFRESH_MAX 86400
+#define KARIDNS_ALIAS_MAX_REFRESH_DEFAULT 3600
 
 typedef struct {
   bool configured;
@@ -474,6 +478,7 @@ typedef struct zone_ext {
    * of this server's own network). --- */
   ip_port_t *alias_resolvers;
   int alias_resolvers_count;
+  uint32_t alias_max_refresh;   /* 0.7: alias-max-refresh-time, seconds (KARIDNS_ALIAS_MAX_REFRESH_MIN..MAX); 0 = not set here (options, then the database block, then the default) */
   /* zone { in-view "v"; }: the stub of a zone shared with an earlier view (view_config_t.in_view_zones); NULL for every ordinary zone */
   zone_inview_t *iv;
 } zone_ext_t;
@@ -763,6 +768,7 @@ typedef struct {
   char *server_id;             /* postgresql only (B11) */
   char **alias_resolver;       /* stored only (B9a): IP address literals */
   int alias_resolver_count;
+  uint32_t alias_max_refresh;  /* 0.7: alias-max-refresh-time of the database zones, seconds; 0 = not set */
 } database_config_t;
 
 #define KARIDNS_DB_POLL_MIN 1
@@ -974,6 +980,7 @@ typedef struct server_config_s {
   int location_tag_count;
   ip_port_t *alias_resolvers;   /* B9a: options { alias-resolver { ip [port n]; ... }; }: the default of every zone (dns_alias.h) */
   int alias_resolvers_count;
+  uint32_t alias_max_refresh;    /* 0.7: options { alias-max-refresh-time }: the longest time between two refreshes of an ALIAS target, seconds; 0 = not set */
   _Atomic int reader_count;
 } server_config_t;
 

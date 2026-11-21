@@ -478,6 +478,17 @@ name has RRSIG records, a single RRset is returned instead (RFC 8482
 and transferred and A / AAAA at an ALIAS name are NODATA. Can be overridden per
 zone. See POWERDNS ALIAS AND LUA RECORDS.
 .TP 8
+\fBalias\-max\-refresh\-time <duration>;\fR
+\fIDefault:\fR \fB3600\fR
+.br
+\fIDescription:\fR The longest time between two lookups of an ALIAS target,
+whatever the TTL of the resolver's answer (0.7): seconds, or a time with the
+units \fBs\fR, \fBm\fR, \fBh\fR, \fBd\fR, \fBw\fR (\fB30m\fR), from 5 seconds to
+1 day; another value is a configuration error (\fBkaricheck conf\fR:
+\fBconf.alias\-max\-refresh\-time\fR). It bounds how long a forged answer with a
+long TTL could be served. The TTL given to clients is not changed. Can be
+overridden per zone. See POWERDNS ALIAS AND LUA RECORDS.
+.TP 8
 \fBadditional\-from\-auth yes|in\-domain|no;\fR
 \fIDefault:\fR \fByes\fR
 .br
@@ -3959,6 +3970,11 @@ records of the zones of the database when neither the zone's settings nor
 \fBoptions { alias\-resolver }\fR name any (port 53; see POWERDNS ALIAS AND LUA
 RECORDS). |
 .PP
+| \fBalias\-max\-refresh\-time <duration>;\fR | \fB3600\fR |
+\fBalias\-max\-refresh\-time\fR (5 s to 1 day) of the zones of the database when
+neither the zone's settings nor \fBoptions\fR set it (0.7; see POWERDNS ALIAS
+AND LUA RECORDS). |
+.PP
 In a \fBview\fR: \fBdatabase\-file "<path>";\fR (sqlite3) or \fBdatabase\-schema
 "<name>";\fR (postgresql) gives the view its own source; \fBdatabase none;\fR
 makes it take no DB zones. A view without these uses the global source.
@@ -5986,6 +6002,13 @@ tinydns zones in the database".
 resolvers of the zone, see POWERDNS ALIAS AND LUA RECORDS. Not sent with
 Extended AXFR.
 .TP 8
+(a profile text or the loader's own text, no metadata kind)
+\fISettings statement:\fR \fBalias\-max\-refresh\-time <duration>;\fR
+.br
+\fINotes:\fR May be written in a profile; the longest time between two lookups
+of the zone's ALIAS targets (0.7, 5 s to 1 day), see POWERDNS ALIAS AND LUA
+RECORDS. Not sent with Extended AXFR.
+.TP 8
 \fBPRESIGNED\fR, \fBNSEC3PARAM\fR, \fBX\-KARIDNS\-FORMAT\fR
 \fISettings statement:\fR (zone flags, not settings)
 .br
@@ -6780,6 +6803,14 @@ Extended AXFR version 3 and the settings of the primary".
 .br
 \fIDescription:\fR The resolvers that expand the ALIAS records of this zone;
 replaces the \fBoptions\fR value. See POWERDNS ALIAS AND LUA RECORDS.
+.TP 8
+\fBalias\-max\-refresh\-time <duration>;\fR
+\fIApplies to:\fR master, slave
+.br
+\fIDescription:\fR The longest time between two lookups of the ALIAS targets of
+this zone (0.7, 5 s to 1 day); replaces the \fBoptions\fR value. A target that
+several zones share is looked up at the smallest of their values. See POWERDNS
+ALIAS AND LUA RECORDS.
 .TP 8
 \fBforwarders [ port <n> ] { <addr> [port <n>]; ... };\fR
 \fIApplies to:\fR forward

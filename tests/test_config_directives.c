@@ -2822,6 +2822,48 @@ static void test_alias_resolver_option(void) {
     expect_db_reject("alias-resolver { example.test; };", NULL);
 }
 
+/* 0.7: alias-max-refresh-time <duration>; in options, in a zone, in options { database { } } and in the settings text of a database zone */
+static void test_alias_max_refresh_option(void) {
+    printf("[TEST] alias-max-refresh-time in options, zones, the database block and database settings (0.7)...\n");
+    server_config_t cfg;
+    if (parse_ok("options { alias-max-refresh-time 30m; database { driver sqlite3; database-file \"/x.db\"; alias-max-refresh-time 1h; }; };\n"
+                 "zone \"z.test.\" { type primary; file \"z.zone\"; alias-max-refresh-time 5; };\n"
+                 "zone \"y.test.\" { type primary; file \"y.zone\"; };", &cfg)) {
+        CHECK(cfg.alias_max_refresh == 1800 && cfg.database.alias_max_refresh == 3600);
+        const zone_config_t *z = cfg.views ? view_find_zone_config(cfg.views, "z.test.") : NULL;
+        const zone_config_t *y = cfg.views ? view_find_zone_config(cfg.views, "y.test.") : NULL;
+        CHECK(z && zext(z)->alias_max_refresh == 5);                                /* the order zone > options > database is tested with dns_alias.c (test_query_engine_expanded) */
+        CHECK(y && zext(y)->alias_max_refresh == 0);
+        free_server_config_fields(&cfg);
+    }
+    if (parse_ok("options { alias-max-refresh-time 86400; };", &cfg)) {           /* the bounds themselves */
+        CHECK(cfg.alias_max_refresh == 86400);
+        free_server_config_fields(&cfg);
+    }
+    if (parse_ok("options { alias-max-refresh-time 1d; };", &cfg)) {
+        CHECK(cfg.alias_max_refresh == 86400);
+        free_server_config_fields(&cfg);
+    }
+    expect_reject("alias-max-refresh-time 4 (below 5)", "options { alias-max-refresh-time 4; };");
+    expect_reject("alias-max-refresh-time 0", "options { alias-max-refresh-time 0; };");
+    expect_reject("alias-max-refresh-time 86401", "options { alias-max-refresh-time 86401; };");
+    expect_reject("alias-max-refresh-time 2d", "options { alias-max-refresh-time 2d; };");
+    expect_reject("alias-max-refresh-time junk", "options { alias-max-refresh-time soon; };");
+    expect_reject("alias-max-refresh-time without a value", "options { alias-max-refresh-time; };");
+    expect_reject("alias-max-refresh-time without ';'", "options { alias-max-refresh-time 60 };");
+    expect_reject("zone alias-max-refresh-time 90000", "zone \"z.test.\" { type primary; file \"z\"; alias-max-refresh-time 90000; };");
+    expect_reject("database alias-max-refresh-time 3", "options { database { driver sqlite3; database-file \"/x\"; alias-max-refresh-time 3; }; };");
+    expect_an_error("the message names the range", "options { alias-max-refresh-time 3; };", "invalid alias-max-refresh-time value '3'|5..86400");
+    char err[200];
+    zone_ext_shared_t *sh = db_parse_quiet("alias-max-refresh-time 2m;", err, sizeof(err));
+    CHECK(sh != NULL);
+    if (sh) {
+        CHECK(sh->ext.alias_max_refresh == 120);
+        zone_ext_shared_unref(sh);
+    }
+    expect_db_reject("alias-max-refresh-time 1;", NULL);
+}
+
 /* refusals that free what was built so far, values that are ignored with a warning, the size limit of a settings text */
 static void test_refusals_and_limits(void) {
     printf("[TEST] config: refusals, ignored values, settings text limit...\n");
@@ -3332,7 +3374,7 @@ static void test_strict_options_and_key(void) {
         {"additional-from-auth", "additional-from-auth yes;"}, {"query-log-max-qps", "query-log-max-qps 10;"},
         {"query-log-buffer-size", "query-log-buffer-size 4096;"}, {"allow-program-zones", "allow-program-zones yes;"},
         {"max-mqtypes", "max-mqtypes 3;"}, {"querylog", "querylog yes;"}, {"minimal-any-ttl", "minimal-any-ttl 300;"},
-        {"wire-cache-max-records", "wire-cache-max-records 100;"}, {"alias-resolver", "alias-resolver { 192.0.2.53; };"},
+        {"wire-cache-max-records", "wire-cache-max-records 100;"}, {"alias-resolver", "alias-resolver { 192.0.2.53; };"}, {"alias-max-refresh-time", "alias-max-refresh-time 10m;"},
         {"ixfr-history", "ixfr-history 10;"}, {"max-zone-records", "max-zone-records 100000;"},
         {"max-zone-bytes", "max-zone-bytes 1m;"}, {"tcp-mss", "tcp-mss 1220;"}, {"tcp-window", "tcp-window 65536;"},
         {"udp-bufsize", "udp-bufsize 1232;"}, {"udp-recvbuf-size", "udp-recvbuf-size 1m;"},
@@ -5382,6 +5424,7 @@ int main(void) {
     test_zone_type_case();
     test_named_acls();
     test_alias_resolver_option();
+    test_alias_max_refresh_option();
     test_zone_config_index();
     test_zone_ext_layout();
     test_zone_flat_list_removed();

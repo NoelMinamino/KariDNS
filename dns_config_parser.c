@@ -3045,6 +3045,47 @@ static int parse_alias_resolvers(token_ctx_t *ctx, const char *where, ip_port_t 
   return 0;
 }
 
+/* 0.7: alias-max-refresh-time <duration>;  the longest time between two refreshes of an ALIAS target (dns_alias.c), whatever the upstream
+ * TTL: it bounds how long a forged answer with a long TTL can be served.  A number of seconds or a TTL with the units s, m, h, d, w (as
+ * max-zone-ttl), KARIDNS_ALIAS_MAX_REFRESH_MIN..MAX seconds.  `where` is "options", "database" or the zone.  -1 with a message on a bad value
+ * (in the settings text of a database zone the value is not echoed: hostile input, see report_bad_value()). */
+static int parse_alias_max_refresh(token_ctx_t *ctx, const char *where, uint32_t *out) {
+  conf_token_t tok = get_next_token(ctx);
+  uint32_t v = 0;
+  bool ok = tok.type == TOKEN_STRING && tok.value && parse_ttl_strict(tok.value, UINT32_MAX, &v) &&
+            v >= KARIDNS_ALIAS_MAX_REFRESH_MIN && v <= KARIDNS_ALIAS_MAX_REFRESH_MAX;
+  if (!ok) {
+    if (ctx && ctx->restricted) {
+      report_bad_value(ctx, NULL, "alias-max-refresh-time", NULL, "5..86400 seconds");
+    } else {
+      char loc[300] = "";
+      if (ctx) {
+        ctx_location(ctx, loc, sizeof(loc) - 2);
+        strlcat(loc, ": ", sizeof(loc));
+      }
+      const char *val = tok.type == TOKEN_STRING && tok.value ? tok.value : "";
+      syslog(LOG_ERR, "[Config] %s%s: invalid alias-max-refresh-time value '%.64s' (expected %d..%d seconds, or a time with the units s, m, h, d, w such as 30m)",
+             loc, where, val, KARIDNS_ALIAS_MAX_REFRESH_MIN, KARIDNS_ALIAS_MAX_REFRESH_MAX);
+      cfg_diag(ctx, DIAG_ERROR, DC_CONF_ALIAS_MAX_REFRESH_TIME,
+               "%s%s: invalid alias-max-refresh-time value '%.64s' (expected %d..%d seconds, or a time with the units s, m, h, d, w such as 30m)\n", loc, where, val,
+               KARIDNS_ALIAS_MAX_REFRESH_MIN, KARIDNS_ALIAS_MAX_REFRESH_MAX);
+      if (ctx) ctx->error_occurred = true;
+    }
+    free_token(&tok);
+    return -1;
+  }
+  free_token(&tok);
+  tok = get_next_token(ctx);
+  bool semi = tok.type == TOKEN_SEMICOLON;
+  free_token(&tok);
+  if (!semi) {
+    conf_error(ctx, where, "alias-max-refresh-time: missing ';'");
+    return -1;
+  }
+  *out = v;
+  return 0;
+}
+
 /* A rate-limit option that is ignored: the server's log and karicheck (a warning; the parse goes on).  fmt has no final line feed. */
 static void rrl_ignored(token_ctx_t *ctx, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 static void rrl_ignored(token_ctx_t *ctx, const char *fmt, ...) {
@@ -5271,7 +5312,7 @@ static const char *const k_db_zone_statements[] = {
   "allow-transfer", "allow-update", "also-notify", "tsig-key", "notify-retries", "notify-retry-interval",
   "notify-retry-backoff", "notify-tcp-timeout", "ixfr-history", "additional-from-auth", "disable-auto-tc-flag", "zone-udp-bufsize",
   "zone-tcp-mss", "zone-tcp-window", "zone-tcp-sndbuf", "transfer-acl-match", "update-acl-match", "masters", "primaries",
-  "ecs-trusted-resolvers", "alias-resolver", "cache", NULL
+  "ecs-trusted-resolvers", "alias-resolver", "alias-max-refresh-time", "cache", NULL
 };
 
 /* The statement `key` is about to be read in restricted mode: refuse it unless it is on the list, and forget what an
@@ -5766,6 +5807,8 @@ static int parse_zone_body(token_ctx_t *ctx, zone_config_t *zone, zone_config_t 
       if (parse_alias_resolvers(ctx, zone->domain ? zone->domain : "zone", &x->alias_resolvers, &x->alias_resolvers_count) != 0) {
         free(key); free_zone_config(zone); return -1;
       }
+    } else if (strcmp(key, "alias-max-refresh-time") == 0) {   /* 0.7 */
+      if (parse_alias_max_refresh(ctx, zone->domain ? zone->domain : "zone", &x->alias_max_refresh) != 0) { free(key); free_zone_config(zone); return -1; }
     } else if (strcmp(key, "forwarders") == 0) {
       if (parse_ip_port_list(ctx, "forwarders", &x->forwarders, &x->forwarders_count, 0, true) != 0) {
         free(key); free_zone_config(zone); return -1;
@@ -6723,6 +6766,7 @@ static int parse_database_option(token_ctx_t *ctx, database_config_t *db, const 
     }
     return 0;
   }
+  if (strcmp(key, "alias-max-refresh-time") == 0) return parse_alias_max_refresh(ctx, "database", &db->alias_max_refresh);   /* 0.7 */
   db_cfg_error(ctx, "database: unknown option '%.64s'", key);
   return -1;
 }
@@ -8946,6 +8990,11 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
           free_token(&tok);
         } else if (strcmp(key, "alias-resolver") == 0) {
           if (parse_alias_resolvers(ctx, "options", &config->alias_resolvers, &config->alias_resolvers_count) != 0) {
+            free(key);
+            return -1;
+          }
+        } else if (strcmp(key, "alias-max-refresh-time") == 0) {   /* 0.7 */
+          if (parse_alias_max_refresh(ctx, "options", &config->alias_max_refresh) != 0) {
             free(key);
             return -1;
           }
