@@ -156,7 +156,7 @@ static int nm_recv(dq_io_t *p, dq_rx_t *out, unsigned max, unsigned wait_us) {
     return (int)got;
 }
 
-const dq_io_ops_t dq_io_netmap = { "netmap", nm_open_io, NULL, nm_recv, nm_close_io, nm_send_frames };
+const dq_io_ops_t dq_io_netmap = { "netmap", nm_open_io, NULL, nm_recv, nm_close_io, nm_send_frames, NULL };
 
 /* the raw reflector of the tests: --reflect ADDR:PORT --io=netmap --iface vale0:r --src-mac MAC */
 int dq_netmap_reflect(const dq_cfg_t *c, const atomic_bool *stop, char *err, size_t errlen) {

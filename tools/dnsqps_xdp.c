@@ -3,18 +3,24 @@
  * the pool of transmit frames.  The queries are copied from the pre-built frames (dq_frame_emit: patched with the ID, port, source address and cookie) into the transmit frame, and the answers are read from the
  * receive ring and matched on the source address and port and the destination port (one source port per channel).  The kernel's own stack never sees
  * the traffic of that queue: use an interface (or a queue) the host does not need, and steer the answers to the queues the workers use (ethtool -N / -X, docs/dnsqps.md).
- * XDP_USE_NEED_WAKEUP is set; --xdp-mode skb forces the generic mode (veth, a NIC without native XDP). */
+ * XDP_USE_NEED_WAKEUP is set; --xdp-mode skb forces the generic mode (veth, a NIC without native XDP).  The kernel may give a mode other than the one asked (auto: generic on a driver without
+ * native XDP; copy instead of zero-copy): xdp_describe() reads what it gave and the status line shows it. */
 #include "dnsqps.h"
 
 #ifdef HAVE_XDP
 #include <errno.h>
 #include <poll.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <net/if.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
+#include <sys/socket.h>
 #include <unistd.h>
 #include <linux/if_link.h>
+#include <linux/if_xdp.h>
+#include <bpf/libbpf.h>
 #include <xdp/xsk.h>
 
 #define XFRAME  2048u
@@ -38,6 +44,8 @@ typedef struct {
     uint8_t our_ip[16], srv_ip[16], pfx_mask[16];   /* our_ip: our address, or the base of the source prefix (then pfx_mask: its network bits) */
     bool pfx;
     uint16_t sport0, dport;
+    unsigned ifindex;
+    bool want_drv;                                    /* --xdp-mode drv */
 } xdpio_t;
 
 static void xdp_kick_tx(xdpio_t *x) {
@@ -153,6 +161,8 @@ static int xdp_open(dq_io_t **out, const dq_cfg_t *c, dq_target_t *tg, unsigned 
         goto fail;
     }
     x->fd = xsk_socket__fd(x->xsk);
+    x->ifindex = if_nametoindex(tg->ifname);
+    x->want_drv = !strcmp(c->xdp_mode, "drv");
     uint32_t idx;
     if (xsk_ring_prod__reserve(&x->fq, XNRX, &idx) != XNRX) { snprintf(err, errlen, "cannot fill the fill ring"); goto fail; }
     for (unsigned i = 0; i < XNRX; i++) *xsk_ring_prod__fill_addr(&x->fq, idx + i) = (uint64_t)i * XFRAME;
@@ -220,7 +230,24 @@ static int xdp_recv(dq_io_t *p, dq_rx_t *out, unsigned max, unsigned wait_us) {
     return (int)got;
 }
 
-const dq_io_ops_t dq_io_xdp = { "xdp", xdp_open, NULL, xdp_recv, xdp_close, xdp_send_frames };
+/* What the kernel gave: the XDP program of the interface in hardware, driver (native) or generic (skb) mode (IFLA_XDP_*_PROG_ID through bpf_xdp_query()), and whether this socket is zero-copy
+ * (getsockopt XDP_OPTIONS, XDP_OPTIONS_ZEROCOPY, Linux 5.3; Documentation/networking/af_xdp.rst).  False when --xdp-mode drv was asked and the program is not in driver mode. */
+static bool xdp_describe(dq_io_t *p, char *buf, size_t len) {
+    xdpio_t *x = (xdpio_t *)p;
+    const char *attach = "unknown", *copy = "unknown";
+    LIBBPF_OPTS(bpf_xdp_query_opts, q);
+    if (x->ifindex && bpf_xdp_query((int)x->ifindex, 0, &q) == 0)
+        attach = q.hw_prog_id ? "hw" : q.drv_prog_id ? "drv" : q.skb_prog_id ? "skb" : "none";
+#if defined(SOL_XDP) && defined(XDP_OPTIONS)
+    struct xdp_options o;
+    socklen_t ol = sizeof o;
+    if (getsockopt(x->fd, SOL_XDP, XDP_OPTIONS, &o, &ol) == 0) copy = (o.flags & XDP_OPTIONS_ZEROCOPY) ? "zero-copy" : "copy";
+#endif
+    snprintf(buf, len, "xdp %s, %s", attach, copy);
+    return !x->want_drv || !strcmp(attach, "drv");
+}
+
+const dq_io_ops_t dq_io_xdp = { "xdp", xdp_open, NULL, xdp_recv, xdp_close, xdp_send_frames, xdp_describe };
 #else
 typedef int dq_xdp_not_built;
 #endif

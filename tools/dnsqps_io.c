@@ -329,9 +329,9 @@ static int mmsg_open(dq_io_t **io, const dq_cfg_t *c, dq_target_t *tg, unsigned 
 }
 #endif
 
-const dq_io_ops_t dq_io_sendto = { "sendto", sendto_open, sendto_send, sock_recv, sock_close, NULL };
+const dq_io_ops_t dq_io_sendto = { "sendto", sendto_open, sendto_send, sock_recv, sock_close, NULL, NULL };
 #ifdef DQ_HAVE_MMSG
-const dq_io_ops_t dq_io_mmsg = { "mmsg", mmsg_open, mmsg_send, sock_recv, sock_close, NULL };
+const dq_io_ops_t dq_io_mmsg = { "mmsg", mmsg_open, mmsg_send, sock_recv, sock_close, NULL, NULL };
 #endif
 
 const dq_io_ops_t *dq_io_for(int mode, const char **why) {
