@@ -1409,12 +1409,13 @@ uint64_t park_lookup_take_fails(void) { return atomic_load_explicit(&g_lookup_ta
  * word sees a slot as it was before or after a write (one atomic word), and a name that is not told held, or is held a moment too long, costs one more ask or one more drop, never a wrong answer.  A name is
  * looked for in PARK_SHED_WIN slots from where its key points.  The key's high half is a hash of the name, 32 bits of it: two names that share it and a window are told held for each other, which drops one
  * query for the time of the entry, at a chance of about 2^-29 per query, and no more than the shed drops it already.  The table is 2 MB of address space; its pages are touched as names are remembered.
- * An entry is live while its age is under the ttl and it was remembered after the last release (g_shed_floor).  The time compare is modulo 2^32 and a stamp a few ms ahead of the reader's clock (another
- * thread's reading) is age 0. */
+ * An entry is live while its age is under the ttl and its stamp is not older than the millisecond of the last release (g_shed_floor).  The time compare is modulo 2^32 and a stamp a few ms ahead of the reader's
+ * clock (another thread's reading) is age 0.  A release keeps the names stamped with its own millisecond: the stamp cannot tell a name remembered just before the release from one remembered just after it in
+ * the same millisecond, and the one after it must be held (its lookup was shed after the catch-up); the writer does not release in a millisecond it remembered a name in (shed_release_check()). */
 #define PARK_SHED_SLOTS 262144u                          /* (a power of two) */
 #define PARK_SHED_WIN 8u
 static _Atomic uint64_t g_shed[PARK_SHED_SLOTS];
-static _Atomic int64_t g_shed_floor;                     /* the names remembered before this time (ms) are released */
+static _Atomic int64_t g_shed_floor;                     /* the names stamped before this millisecond are released */
 static _Atomic uint32_t g_shed_ttl;                      /* ms, 0: nothing is remembered */
 static _Atomic uint64_t g_shed_n, g_shed_rel, g_shed_since;
 
@@ -1475,7 +1476,7 @@ void park_shed_remember(uint64_t key, int64_t now_ms) {
 }
 
 void park_shed_release(int64_t now_ms) {
-  atomic_store_explicit(&g_shed_floor, now_ms + 1, memory_order_relaxed);
+  atomic_store_explicit(&g_shed_floor, now_ms, memory_order_relaxed);
   if (atomic_exchange_explicit(&g_shed_since, 0, memory_order_relaxed) != 0) atomic_fetch_add_explicit(&g_shed_rel, 1, memory_order_relaxed);
 }
 
