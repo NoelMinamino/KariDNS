@@ -184,6 +184,25 @@ static void test_hist(void) {
         CHECK(strstr(buf, "\"sent\":1100") && strstr(buf, "\"qps\":500.000") && strstr(buf, "\"NXDOMAIN\":100"));
         CHECK(strstr(buf, "\"server\":\"192.0.2.1:53 \\\"x\\\"\""));
         CHECK(strstr(buf, "[Interval] t=1.0s sent=10"));
+        CHECK(!strstr(buf, "Truncated") && strstr(buf, "\"truncated\":0"));   /* the text line only when there are any */
+    }
+    /* TC=1 answers (an RRL slip): counted, merged, in the text and the JSON */
+    rep.c.truncated = 250;
+    dq_counts_t sum;
+    memset(&sum, 0, sizeof sum);
+    dq_counts_add(&sum, &rep.c);
+    dq_counts_add(&sum, &rep.c);
+    CHECK(sum.truncated == 500 && sum.completed == 2000);
+    f = tmpfile();
+    if (f) {
+        dq_print_text(f, &rep);
+        dq_print_json(f, &rep);
+        rewind(f);
+        char buf[8192];
+        size_t got = fread(buf, 1, sizeof buf - 1, f);
+        buf[got] = '\0';
+        fclose(f);
+        CHECK(strstr(buf, "Truncated (TC=1):     250 (25.00%)") && strstr(buf, "\"truncated\":250"));
     }
 }
 
@@ -1159,6 +1178,7 @@ static void test_result_msgs(void) {
     r.c.rcode[0] = 4000;
     r.c.rcode[3] = 1000;
     r.c.recv_bytes = 123456;
+    r.c.truncated = 700;
     r.run_s = 1.5;
     r.threads = 2;
     r.sockets = 1;
@@ -1171,7 +1191,17 @@ static void test_result_msgs(void) {
     char err[100];
     CHECK(dq_msg_parse(copy, b.len - 4, &m, err, sizeof err) == 0 && !strcmp(m.verb, "RESULT"));
     CHECK(dq_result_get(&m, &r2, err, sizeof err) == 0);
-    CHECK(r2.c.sent == 6000 && r2.c.completed == 5000 && r2.c.rcode[3] == 1000 && r2.threads == 2 && !strcmp(r2.io_name, "netmap") && r2.run_s == 1.5);
+    CHECK(r2.c.sent == 6000 && r2.c.completed == 5000 && r2.c.rcode[3] == 1000 && r2.c.truncated == 700 && r2.threads == 2 && !strcmp(r2.io_name, "netmap") && r2.run_s == 1.5);
+    /* an agent built before the truncated field: the field is absent, read as 0 */
+    {
+        dq_msg_t mo = m;
+        unsigned w = 0;
+        for (unsigned k = 0; k < mo.n; k++)
+            if (strcmp(mo.k[k], "truncated")) { mo.k[w] = mo.k[k]; mo.v[w] = mo.v[k]; w++; }
+        CHECK(w == m.n - 1);
+        mo.n = w;
+        CHECK(dq_result_get(&mo, &r2, err, sizeof err) == 0 && r2.c.truncated == 0 && r2.c.completed == 5000);
+    }
     CHECK(r2.h.count == 5000 && r2.h.min_ns == r.h.min_ns && r2.h.max_ns == r.h.max_ns && r2.h.sum_ns == r.h.sum_ns &&
           !memcmp(r2.h.b, r.h.b, sizeof r.h.b));   /* exact */
     CHECK(dq_hist_pct(&r2.h, 99) == dq_hist_pct(&r.h, 99));
@@ -1179,7 +1209,7 @@ static void test_result_msgs(void) {
     struct { const char *key, *val; } tam[] = {
         { "completed", "6001" }, { "lost", "6001" }, { "rc", "1,2,3" }, { "rc", "4000,0,0,1000,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0" }, { "hcount", "4999" },
         { "hb", "5:1,3:2" }, { "hb", "5000:1" }, { "hb", "x" }, { "hb", "1:2," }, { "sent", "-1" }, { "hmin", "999999999" },
-        { "io", "an-io-path-name-that-is-far-too-long" }, { "run_ns", "99999999999999999999" },
+        { "io", "an-io-path-name-that-is-far-too-long" }, { "run_ns", "99999999999999999999" }, { "truncated", "5001" }, { "truncated", "x" },
     };
     for (size_t i = 0; i < sizeof tam / sizeof tam[0]; i++) {
         dq_msg_t m2 = m;
@@ -1195,6 +1225,7 @@ static void test_result_msgs(void) {
     /* an empty histogram */
     dq_hist_init(&r.h);
     r.c.completed = 0;
+    r.c.truncated = 0;   /* (never more than completed) */
     r.c.rcode[0] = r.c.rcode[3] = 0;
     CHECK(dq_msgb_init(&b, "RESULT") && dq_result_put(&b, &r) == 0);
     copy = malloc(b.len + 1);

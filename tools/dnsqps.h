@@ -194,7 +194,7 @@ typedef struct {
 } dq_hist_t;
 
 typedef struct {
-    uint64_t sent, completed, lost, malformed, unmatched, foreign, send_errs, recv_errs, sent_bytes, recv_bytes;
+    uint64_t sent, completed, lost, malformed, unmatched, foreign, send_errs, recv_errs, sent_bytes, recv_bytes, truncated;   /* truncated: completed answers with TC=1 (an RRL slip, an answer too big for UDP) */
     uint64_t rcode[DQ_NRCODE];
 } dq_counts_t;
 
