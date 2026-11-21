@@ -47,6 +47,8 @@ check() {   # check DESCRIPTION EXPECTED ACTUAL
 
 BASE=$(kari_port 0 $((20000 + $$ % 20000)))
 P_K=$BASE; P_CK=$((BASE + 1)); P_NC=$((BASE + 2))
+USER_OPT=""
+[ "$(id -u)" = "0" ] && USER_OPT='user "nobody"; group "nobody";'   # root: the server refuses to run without a user to drop to
 
 # ---------------------------------------------------------------- fixtures
 cat > "$T/ck.data" <<'EOF'
@@ -81,7 +83,7 @@ mkzone def.test 'r ALIAS lo.target.test.'
 
 conf_file() {   # conf_file [statements of zone def.test]
     cat > "$T/k.conf" <<EOF
-options { pid-file "none"; bind-address { 127.0.0.1; }; port $P_K; alias-resolver { 127.0.0.1 port $P_NC; }; };
+options { pid-file "none"; bind-address { 127.0.0.1; }; port $P_K; $USER_OPT alias-resolver { 127.0.0.1 port $P_NC; }; };
 zone "ck.test." { type primary; file "$T/ck.test.zone"; alias-resolver { 127.0.0.1 port $P_CK; }; };
 zone "nc.test." { type primary; file "$T/nc.test.zone"; };
 zone "cap.test." { type primary; file "$T/cap.test.zone"; alias-max-refresh-time 5; };
