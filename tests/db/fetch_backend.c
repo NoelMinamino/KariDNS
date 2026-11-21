@@ -252,9 +252,9 @@ static void store_msg(const kdb_msg_t *m) {
             if (e.op == KDB_CH_UPSERT) up++;
             else del++;
             if (g_log)
-                fprintf(g_log, "C %u %s %lld %s %u %d %d %llu %llu %lld\n", c->view, e.op == KDB_CH_UPSERT ? "up" : "del", (long long)e.source_id,
+                fprintf(g_log, "C %u %s %lld %s %u %d %d %llu %llu %lld%s\n", c->view, e.op == KDB_CH_UPSERT ? "up" : "del", (long long)e.source_id,
                         e.has_name ? e.name : "-", e.kind, e.stamped ? 1 : 0, e.force ? 1 : 0, (unsigned long long)e.stamp_gen,
-                        (unsigned long long)e.stamp_time, e.has_serial ? (long long)e.serial : -1ll);
+                        (unsigned long long)e.stamp_time, e.has_serial ? (long long)e.serial : -1ll, e.hold ? " hold" : "");    /* (" hold": KDB_EF_HOLD, signer-wait) */
         }
         printf("CH view=%u cursor=%llu last=%d up=%u del=%u\n", c->view, (unsigned long long)c->cursor, c->last ? 1 : 0, up, del);
         if (c->last) keep_cursor(c->view, c->cursor, true, c->ident, c->ident_len);
