@@ -61,6 +61,7 @@ void dq_counts_add(dq_counts_t *d, const dq_counts_t *s) {
     d->completed += s->completed;
     d->lost += s->lost;
     d->malformed += s->malformed;
+    d->truncated += s->truncated;
     d->unmatched += s->unmatched;
     d->foreign += s->foreign;
     d->send_errs += s->send_errs;
@@ -100,6 +101,7 @@ void dq_print_text(FILE *f, const dq_report_t *r) {
             sep = ", ";
         }
         fprintf(f, "\n");
+        if (c->truncated) fprintf(f, "  Truncated (TC=1):     %" PRIu64 " (%.2f%%)\n", c->truncated, pct_of(c->truncated, c->completed));
     }
     if (c->malformed || c->unmatched || c->foreign || c->send_errs || c->recv_errs)
         fprintf(f, "  Malformed answers:    %" PRIu64 ", unmatched (late or duplicate): %" PRIu64 ", not ours: %" PRIu64 ", send errors: %" PRIu64
@@ -143,6 +145,7 @@ void dq_print_json(FILE *f, const dq_report_t *r) {
     fprintf(f, ",\"qps\":%.3f,\"sent_qps\":%.3f", r->run_s > 0 ? (double)c->completed / r->run_s : 0.0, r->run_s > 0 ? (double)c->sent / r->run_s : 0.0);
     fprintf(f, ",\"malformed\":%" PRIu64 ",\"unmatched\":%" PRIu64 ",\"foreign\":%" PRIu64 ",\"send_errors\":%" PRIu64 ",\"recv_errors\":%" PRIu64,
             c->malformed, c->unmatched, c->foreign, c->send_errs, c->recv_errs);
+    fprintf(f, ",\"truncated\":%" PRIu64, c->truncated);
     fprintf(f, ",\"sent_bytes\":%" PRIu64 ",\"recv_bytes\":%" PRIu64, c->sent_bytes, c->recv_bytes);
     fprintf(f, ",\"latency_s\":{");
     if (h->count)

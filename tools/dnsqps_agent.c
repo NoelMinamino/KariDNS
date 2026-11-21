@@ -216,6 +216,7 @@ int dq_result_put(dq_msgb_t *b, const dq_report_t *r) {
     dq_msgb_u64(b, "malformed", c->malformed); dq_msgb_u64(b, "unmatched", c->unmatched); dq_msgb_u64(b, "foreign", c->foreign);
     dq_msgb_u64(b, "send_errs", c->send_errs); dq_msgb_u64(b, "recv_errs", c->recv_errs);
     dq_msgb_u64(b, "sent_bytes", c->sent_bytes); dq_msgb_u64(b, "recv_bytes", c->recv_bytes);
+    dq_msgb_u64(b, "truncated", c->truncated);
     char rc[DQ_NRCODE * 21];
     size_t n = 0;
     for (int i = 0; i < DQ_NRCODE; i++) n += (size_t)snprintf(rc + n, sizeof rc - n, "%s%" PRIu64, i ? "," : "", c->rcode[i]);
@@ -271,7 +272,9 @@ int dq_result_get(const dq_msg_t *m, dq_report_t *r, char *err, size_t errlen) {
     if (!dq_hist_decode(&r->h, hb) || r->h.count != hcount) { mset(err, errlen, "bad histogram"); return -1; }
     r->h.sum_ns = 0;
     dq_msg_u64(m, "hsum", &r->h.sum_ns);
-    if (c->completed > c->sent || c->lost > c->sent || rsum != c->completed || hcount > c->completed || (hcount && hmin > hmax)) {
+    /* "truncated" is newer than the other fields: an agent built before it does not send it (0); one that does must send a number */
+    if (dq_msg_get(m, "truncated") && !dq_msg_u64(m, "truncated", &c->truncated)) { mset(err, errlen, "a result field is not a number"); return -1; }
+    if (c->completed > c->sent || c->lost > c->sent || rsum != c->completed || c->truncated > c->completed || hcount > c->completed || (hcount && hmin > hmax)) {
         mset(err, errlen, "the counts of a result do not add up");
         return -1;
     }

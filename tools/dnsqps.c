@@ -116,6 +116,7 @@ static void handle_answers(worker_t *w, int g, uint64_t now) {
         w->cnt.completed++;
         w->cnt.recv_bytes += r->len;
         if (pr == 1) w->cnt.malformed++;
+        if (rp.tc) w->cnt.truncated++;   /* still a completed answer (its RCODE counted too); an RRL slip is one of these (TC=1, nothing else) */
         w->cnt.rcode[rp.rcode <= 15 ? rp.rcode : 16]++;
         dq_hist_add(&w->hist, lat);
         w->t_last = now;
