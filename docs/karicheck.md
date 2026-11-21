@@ -351,6 +351,7 @@ Severity is the usual one of the code; a check whose severity the configuration 
 | `conf.control-channel.placement` | error | control-channel is written inside options { } |
 | `conf.control-channel.option` | error | an unknown option in control-channel { } |
 | `conf.view.name-length` | error | a view name is too long |
+| `conf.view.name-reserved` | error | a view has the name the zone store keeps the secondaries' copies under (_karidns-xfr) |
 | `conf.view.duplicate` | error | a view is defined twice |
 | `conf.loading` | info | the configuration file that is being checked |
 | `conf.parse-failed` | error | the configuration file could not be parsed (the reason is in the messages before it) |

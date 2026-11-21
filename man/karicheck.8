@@ -1,4 +1,4 @@
-.TH KARICHECK 8 "2026-11-21" "KariDNS" "KariDNS Manual"
+.TH KARICHECK 8 "2026-11-22" "KariDNS" "KariDNS Manual"
 .\" Generated from docs/karicheck.md by man/md2man.pl (make man): edit the Markdown manual, not this page.
 .SH NAME
 karicheck \- Configuration and Zone File Validation Utility for KariDNS
@@ -1225,6 +1225,12 @@ server uses
 \fISeverity:\fR error
 .br
 \fIMeaning:\fR a view name is too long
+.TP 8
+\fBconf.view.name\-reserved\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR a view has the name the zone store keeps the secondaries' copies
+under (_karidns-xfr)
 .TP 8
 \fBconf.view.duplicate\fR
 \fISeverity:\fR error

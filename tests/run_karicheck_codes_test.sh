@@ -102,6 +102,7 @@ cfix conf.key.view-clash "key \"k\" { algorithm hmac-sha256; secret \"$SEC\"; };
 cfix conf.view.duplicate 'view "v" { match-clients { any; }; }; view "v" { match-clients { any; }; };'
 cfix conf.view.key-duplicate "view \"v\" { key \"k\" { algorithm hmac-sha256; secret \"$SEC\"; }; key \"k\" { algorithm hmac-sha256; secret \"$SEC\"; }; };"
 cfix conf.view.name-length "view \"$(printf 'a%.0s' $(seq 1 250))\" { match-clients { any; }; };"
+cfix conf.view.name-reserved 'view "_karidns-xfr" { match-clients { any; }; };'
 cfix conf.server.key-unknown 'server 192.0.2.1 { keys "nosuchkey"; };'
 cfix conf.zone.file-format 'zone "a.test" { type master; file "/x"; file-format foo; };'
 cfix conf.zone.name 'zone "a..b" { type master; file "/x"; };'

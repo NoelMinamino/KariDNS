@@ -96,6 +96,14 @@ zone_db_entry_t *db_ingest_xfr_await(zdir_elem_t *el, const char *view);
 /* 0.7 store S3: the same for a zone of the store that is not in memory (the zone with its trailing dot): the entry held with xfr_entry_hold(), or NULL when it did not come in time */
 zone_db_entry_t *db_ingest_xfr_await_zone(const char *zone, const char *view);
 
+/* 0.7 P3 (planing_0.7.x_secondary_store.md 4.4): the restore of the stored copy of a database secondary (zone with its trailing dot) as a job of the ingest thread, serialized with the
+ * loader's jobs of the same zone (no zone gets two entries).  Any thread; the job may be posted before the ingest thread runs (it runs them at its start).  false: no memory */
+bool db_ingest_xfr_restore_post(const char *view, const char *zone);
+#ifdef KARIDNS_UNIT_TEST
+/* tests: called by the ingest thread before every restore job (a test holds the jobs there: R3) */
+extern void (*_Atomic db_ingest_test_xfr_job_hook)(const char *zone);
+#endif
+
 /* Which view a command about the zone means: view_arg if given, else the only view that takes zones from the database.
  * Several views and none named: true with an empty out (B6b: `reload <zone>` then asks every view that takes database
  * zones, and the answer names each).  false with a reason in err otherwise. */

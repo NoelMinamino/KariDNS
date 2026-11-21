@@ -194,6 +194,17 @@ bool db_store_wanted_again(const char *view, const char *zone, const db_stamp_t 
 extern void (*db_store_test_commit_hook)(int where, const char *zone);
 #endif
 
+/* ---- 0.7 P3 (planing_0.7.x_secondary_store.md 3.3, 4.4): what dns_xfr_store.c needs of the database for the copies of the database secondaries ---- */
+struct zone_db_entry_s;
+/* the id in settings.dat of the settings of a database zone's entry (made durable when it has none yet); 0: no settings, no id could be made, or not a database zone */
+uint32_t db_store_settings_id_of(const struct zone_db_entry_s *e);
+/* the settings of an id of settings.dat (borrowed: the table keeps its reference for the life of the process); NULL: no such id, or its text could not be loaded */
+zone_ext_shared_t *db_store_settings_by_id(uint32_t id);
+/* the domains.id of the reconcile's record of a secondary or catalog consumer (STORE_F_NONSTORE) of the database view; false: no such record */
+bool db_store_nonstore_sid(const char *view, const char *zone, int64_t *sid);
+/* can the store name the zone in a database view (not the root, not longer than STORE_NAME_MAX)?  A name it cannot is a zone of the heap directory only (un_apply()): its copy is not kept (W12) */
+bool db_store_name_ok(const char *zone);
+
 /* ---- attach (the store threads) ---- */
 
 /* the attach of one request, on the calling thread (what a store thread does with every request; a test calls it too; the zone with its trailing dot) */
