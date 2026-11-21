@@ -288,7 +288,7 @@ static bool tok_is(const char *t, const char *name) {   /* --name or --name=valu
 }
 
 int dq_agent_check_tokens(char **t, int n, char *err, size_t errlen) {
-    static const char *const banned[] = { "--agent", "--agents", "--agent-key", "--no-local", "--reflect", "--help", "--version" };
+    static const char *const banned[] = { "--agent", "--agents", "--agent-key", "--agent-no-key", "--no-local", "--reflect", "--help", "--version" };
     for (int i = 0; i < n; i++) {
         for (size_t k = 0; k < sizeof banned / sizeof banned[0]; k++)
             if (tok_is(t[i], banned[k])) { snprintf(err, errlen, "the option %.40s is not taken from a controller", t[i]); return -1; }

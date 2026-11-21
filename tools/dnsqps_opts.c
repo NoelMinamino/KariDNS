@@ -13,7 +13,7 @@
 
 enum { O_SERVER = 1, O_PORT, O_BIND, O_FILE, O_ZONES, O_TIME, O_RUNS, O_COUNT, O_THREADS, O_SOCKETS, O_INFLIGHT, O_RATE, O_TIMEOUT, O_INTERVAL,
        O_BATCH, O_IO, O_JSON, O_NULL, O_REFLECT, O_ZIPF, O_MISS, O_MISSPOOL, O_QTYPES, O_SEED, O_NOPIN, O_CPUBASE, O_IFACE, O_SRCMAC, O_HOPMAC,
-       O_HOP, O_QUEUE, O_SPORT, O_XDPMODE, O_VERBOSE, O_HELP, O_VERSION, O_NORC, O_ALLOWANY, O_FRAMEMEM, O_AGENT, O_AGENTS, O_AGENTKEY, O_AGENTTO, O_NOLOCAL };
+       O_HOP, O_QUEUE, O_SPORT, O_XDPMODE, O_VERBOSE, O_HELP, O_VERSION, O_NORC, O_ALLOWANY, O_FRAMEMEM, O_AGENT, O_AGENTS, O_AGENTKEY, O_AGENTTO, O_NOLOCAL, O_AGENTNOKEY };
 
 typedef struct { const char *lname; char sname; int has_arg; int id; } optdef_t;   /* has_arg: 0 none, 1 required, 2 only as --name=value */
 
@@ -28,7 +28,7 @@ static const optdef_t OPTS[] = {
     {"xdp-mode", 0, 1, O_XDPMODE}, {"verbose", 'v', 0, O_VERBOSE}, {"help", 'h', 0, O_HELP}, {"version", 'V', 0, O_VERSION},
     {"ignore-rc", 'r', 0, O_NORC},
     {"allow-any-source", 0, 0, O_ALLOWANY}, {"frame-mem", 0, 1, O_FRAMEMEM}, {"agent", 0, 1, O_AGENT}, {"agents", 0, 1, O_AGENTS},
-    {"agent-key", 0, 1, O_AGENTKEY}, {"agent-timeout", 0, 1, O_AGENTTO}, {"no-local", 0, 0, O_NOLOCAL},
+    {"agent-key", 0, 1, O_AGENTKEY}, {"agent-timeout", 0, 1, O_AGENTTO}, {"no-local", 0, 0, O_NOLOCAL}, {"agent-no-key", 0, 0, O_AGENTNOKEY},
 };
 
 /* ---------------------------------------------------------------- small parsers */
@@ -333,6 +333,7 @@ static int apply(dq_cfg_t *c, const optdef_t *d, const char *val, char *err, siz
     case O_AGENTKEY: if (!*val || !cpy(c->agent_key, sizeof c->agent_key, val)) return bad(err, errlen, d->lname, val); break;
     case O_AGENTTO: if (!dq_parse_dbl(val, &x, 0.1, 3600)) return bad(err, errlen, d->lname, val); c->agent_timeout = x; break;
     case O_NOLOCAL: c->no_local = true; break;
+    case O_AGENTNOKEY: c->agent_no_key = true; break;
     case O_VERBOSE: c->verbose = true; break;
     case O_HELP: c->help = true; break;
     case O_VERSION: c->version = true; break;
@@ -453,6 +454,11 @@ int dq_cfg_check(dq_cfg_t *c, char *err, size_t errlen) {
     if (c->agent[0]) {   /* an agent takes its work from the controller */
         if (c->agents[0] || c->no_local || !dq_hostport_strict(c->agent, hb, sizeof hb, &hp)) { snprintf(err, errlen, "--agent needs ADDR:PORT and cannot be combined with --agents or --no-local"); return -1; }
         if (!strcmp(hb, "0.0.0.0") || !strcmp(hb, "::") || !strcmp(hb, "*")) { snprintf(err, errlen, "--agent: bind to one address of this host, not a wildcard"); return -1; }
+        /* a controller can make an agent send a load anywhere and read the files the agent can read: off loopback a key is the default */
+        if (!c->agent_key[0] && !c->agent_no_key && strncmp(hb, "127.", 4) && strcmp(hb, "::1")) {
+            snprintf(err, errlen, "--agent on %s needs --agent-key FILE (or --agent-no-key, on a private network where every host may control this one)", hb);
+            return -1;
+        }
         return 0;
     }
     if (c->agents[0]) {
@@ -472,6 +478,7 @@ int dq_cfg_check(dq_cfg_t *c, char *err, size_t errlen) {
         return -1;
     }
     if (c->agent_key[0] && !c->agents[0]) { snprintf(err, errlen, "--agent-key needs --agent or --agents"); return -1; }
+    if (c->agent_no_key) { snprintf(err, errlen, "--agent-no-key belongs to --agent"); return -1; }
     if (c->qfile[0] && c->zfile[0]) { snprintf(err, errlen, "-d (query file) and -z (name list) cannot be used together"); return -1; }
     if (!c->qfile[0] && !c->zfile[0]) { snprintf(err, errlen, "no queries: give a query file (-d FILE) or a name list (-z FILE)"); return -1; }
     if (c->zfile[0] && c->runs) { snprintf(err, errlen, "-n counts passes over a query file; with -z use -l or -N"); return -1; }

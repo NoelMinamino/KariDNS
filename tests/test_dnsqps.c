@@ -1054,6 +1054,21 @@ static void test_agent_msgs(void) {
         snprintf(c.agent, sizeof c.agent, "%s", agbad[i]);
         CHECK(dq_cfg_check(&c, err, sizeof err) < 0);
     }
+    /* off loopback an agent needs a key, or --agent-no-key; --agent-no-key alone, or on a controller, is refused */
+    dq_cfg_default(&c);
+    snprintf(c.agent, sizeof c.agent, "192.0.2.41:5301");
+    CHECK(dq_cfg_check(&c, err, sizeof err) < 0 && strstr(err, "--agent-key") != NULL);
+    c.agent_no_key = true;
+    CHECK(dq_cfg_check(&c, err, sizeof err) == 0);
+    c.agent_no_key = false;
+    snprintf(c.agent_key, sizeof c.agent_key, "k.txt");
+    CHECK(dq_cfg_check(&c, err, sizeof err) == 0);
+    dq_cfg_default(&c);
+    char *ag2[] = { "--agent-no-key", "-d", "q" };
+    CHECK(dq_parse_args(&c, 3, ag2, err, sizeof err) == 0 && dq_cfg_check(&c, err, sizeof err) < 0);
+    char nk0[] = "--agent-no-key";
+    char *nk[] = { nk0 };
+    CHECK(dq_agent_check_tokens(nk, 1, err, sizeof err) < 0);   /* a controller cannot send it */
     dq_cfg_default(&c);
     snprintf(c.agent, sizeof c.agent, "[::1]:5301");
     CHECK(dq_cfg_check(&c, err, sizeof err) == 0);

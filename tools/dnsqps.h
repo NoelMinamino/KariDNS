@@ -103,6 +103,7 @@ typedef struct {
     char agent[128], agents[512], agent_key[512];   /* --agent ADDR:PORT, --agents H:P,H:P, --agent-key FILE */
     double agent_timeout;
     bool no_local;
+    bool agent_no_key;   /* --agent-no-key: an agent on a non-loopback address without --agent-key */
     int io;
     bool json, null_target, null_sink, no_pin, help, version, ignore_rc, verbose;
     dq_qopts_t qo;
