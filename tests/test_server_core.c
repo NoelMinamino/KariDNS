@@ -2680,7 +2680,10 @@ static void test_router_send_clients(void) {
     g_sendmmsg_fn = fk_sendmmsg;
     const uint64_t full0 = ipcd_total(IPCD_RCLI_FULL), err0 = ipcd_total(IPCD_RCLI_ERR), re0 = ipcd_total(IPCD_RCLI_RETRIED);
     bool stuck = false;
-    /* ENOBUFS 3 times after 4 replies, then the queue takes the rest: nothing dropped, the order kept, 6 counted as retried */
+    /* ENOBUFS 3 times after 4 replies, then the queue takes the rest: nothing dropped, the order kept, 6 counted as retried.  The cases that must
+     * succeed run with a wide budget: two pauses of 20 us can take more than 300 us on a loaded CI VM (FreeBSD 14.4, #248) */
+    const long budget0 = g_router_tx_budget_us;
+    g_router_tx_budget_us = 5000000;
     fk_first = 4; fk_refuse = 3; fk_errno = ENOBUFS; fk_chunk = 16; fk_calls = 0; fk_bad = -1; fk_taken = 0;
     int64_t t = fk_us();
     assert(router_send_clients(7, m, 10, &stuck) == 0);
@@ -2694,6 +2697,7 @@ static void test_router_send_clients(void) {
     for (int i = 0; i < 5; i++) assert(fk_order[i] == i);
     assert(ipcd_total(IPCD_RCLI_RETRIED) == re0 + 6 + 3);
     /* a queue that never takes again: bounded (the budget, 300 us, plus a pause; far under 50 ms), the 8 left dropped and counted once, the socket marked */
+    g_router_tx_budget_us = budget0;
     fk_first = 8; fk_refuse = -1; fk_errno = ENOBUFS; fk_chunk = 16; fk_calls = 0; fk_taken = 0;
     t = fk_us();
     assert(router_send_clients(7, m, 16, &stuck) == 8);
@@ -2706,7 +2710,7 @@ static void test_router_send_clients(void) {
     t = fk_us();
     assert(router_send_clients(7, m, 16, &stuck) == 16);
     t = fk_us() - t;
-    assert(fk_calls == 1 && stuck && t < 300 && ipcd_total(IPCD_RCLI_FULL) == full0 + 24);
+    assert(fk_calls == 1 && stuck && ipcd_total(IPCD_RCLI_FULL) == full0 + 24);   /* (one call: not waited for; a time bound here would only measure the VM) */
     /* a batch that goes out whole clears the mark */
     fk_refuse = 0; fk_calls = 0; fk_taken = 0;
     assert(router_send_clients(7, m, 3, &stuck) == 0 && !stuck && fk_taken == 3);

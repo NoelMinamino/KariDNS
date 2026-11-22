@@ -2212,6 +2212,8 @@ STATIC_TEST int sendmmsg_skip_failed(int fd, struct mmsghdr *msgs, int n, const 
  * replies that went out after a wait are counted as IPCD_RCLI_RETRIED (not a loss).  No allocation.  Returns the number dropped. */
 #define ROUTER_TX_BUDGET_US 300
 #define ROUTER_TX_PAUSE_US 20
+/* the budget in force (a unit test widens it for the cases that must succeed: a loaded VM's nanosleep can overshoot 300 us; read only after a refusal) */
+STATIC_TEST long g_router_tx_budget_us = ROUTER_TX_BUDGET_US;
 STATIC_TEST int router_send_clients(int fd, struct mmsghdr *msgs, int n, bool *stuck) {
   int off = 0, hard = 0, last_err = 0, retried = 0, tries = 0;
   struct timespec t0 = { 0, 0 };
@@ -2226,7 +2228,7 @@ STATIC_TEST int router_send_clients(int fd, struct mmsghdr *msgs, int n, bool *s
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
     if (tries == 0) t0 = now;
-    else if ((now.tv_sec - t0.tv_sec) * 1000000L + (now.tv_nsec - t0.tv_nsec) / 1000 >= ROUTER_TX_BUDGET_US) {
+    else if ((now.tv_sec - t0.tv_sec) * 1000000L + (now.tv_nsec - t0.tv_nsec) / 1000 >= g_router_tx_budget_us) {
       *stuck = true;
       break;
     }

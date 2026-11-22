@@ -2015,6 +2015,7 @@ extern size_t g_ipc_pack_max;
 bool log_rl_ok(log_rl_t *rl, unsigned long n, unsigned long *held);
 size_t auxlog_rec_cap(void);
 int router_send_clients(int fd, struct mmsghdr *msgs, int n, bool *stuck);
+extern long g_router_tx_budget_us;
 extern ssize_t (*g_sendmmsg_fn)(int, struct mmsghdr *, size_t, int);
 void ipcd_set_self(int slot);
 void ipcd_init(void);
