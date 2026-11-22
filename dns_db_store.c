@@ -559,6 +559,9 @@ static uint32_t set_crc(const uint8_t *p, size_t n) {            /* CRC-32C, bit
  * capped: at most 1/8 of the ids and 16 MiB of records; beyond that a received text is not kept (xfr.rx_capped, a WARNING once) and the zone asks for the whole zone at the first refresh
  * after a restart (R2).  Kept in memory: where each record is (24 octets a text) and a hash index of their keys, so that one text is written once; the text itself is read from the file
  * and parsed when a restore asks for it (a text that the zones no longer use costs no memory).  The slot of such an id in SET.chunk stays empty: set_get() never returns one. */
+#define DBS_SET_REC_MAX (1u << 20)       /* the longest key a record of settings.dat has: the start reads no longer one (and cuts the file there), so neither writer writes one */
+/* (review D-4: db_store_rx_settings_id() writes only keys that xfr_rx_key_split() takes, a text of at most XFR_RX_TEXT_MAX octets, so its records are within the cap; dir_settings_id() checks it) */
+_Static_assert(2 + sizeof(XFR_RX_MARK) - 1 + XFR_RX_TEXT_MAX <= DBS_SET_REC_MAX, "a received settings text must fit a record that the start of settings.dat reads");
 #define DBS_RX_IDS_MAX ((DBS_SET_CHUNKS * DBS_SET_CHUNK) / 8u)
 #define DBS_RX_BYTES_MAX (16ull << 20)
 typedef struct { off_t off; uint32_t len, id; uint64_t h; } rxrec_t;
@@ -810,7 +813,7 @@ static void set_load(int dirfd) {
     uint32_t h[3];
     ssize_t hr = pread(SET.fd, h, sizeof(h), off);
     if (hr < 0) goto io_error;
-    if (hr != (ssize_t)sizeof(h) || h[0] != DBS_SET_MAGIC || h[1] == 0 || h[1] > (1u << 20) || off + 12 + (off_t)h[1] > st.st_size) break;
+    if (hr != (ssize_t)sizeof(h) || h[0] != DBS_SET_MAGIC || h[1] == 0 || h[1] > DBS_SET_REC_MAX || off + 12 + (off_t)h[1] > st.st_size) break;
     uint8_t *buf = malloc(h[1]);
     if (!buf) {                                    /* no memory for this text: its id stays unused */
       SET.n++;
@@ -864,7 +867,7 @@ static uint32_t dir_settings_id(zone_ext_shared_t *sh) {
   id = atomic_load_explicit(&sh->store_id, memory_order_relaxed);
   /* (0.7 P4: a key of a database zone that reads as a received text, which a profile name beginning with a NUL could make, is not written: the next start would take it for the other
    * kind; the zone is not stored with an id, as when none can be made) */
-  if (!id && SET.fd >= 0 && sh->key && sh->key_len > 0 && sh->key_len <= (1u << 20) && SET.n + 1 < DBS_SET_CHUNKS * DBS_SET_CHUNK &&
+  if (!id && SET.fd >= 0 && sh->key && sh->key_len > 0 && sh->key_len <= DBS_SET_REC_MAX && SET.n + 1 < DBS_SET_CHUNKS * DBS_SET_CHUNK &&
       xfr_rx_key_split(sh->key, sh->key_len, NULL, NULL) == 0) {
     uint8_t *buf = malloc(12 + sh->key_len);
     if (buf) {
@@ -3131,26 +3134,51 @@ static void un_mark(const char *view) {
   rc_unlock();
 }
 
-/* the end of a complete pass: the zones the pass did not list are gone from the database */
-static uint64_t un_sweep(const char *view) {
+_Atomic int db_store_test_un_delete_fail;
+
+/* the end of a complete pass: the zones the pass did not list are gone from the database.  As the sweep of the records (db_recon_end()): a zone is forgotten only once the registry
+ * has deleted it (or had nothing of it: a zone that was never served); a delete that fails (no memory for the registry's queue) keeps the entry and counts in *nfail, and the caller
+ * keeps no cursor, so that the next pass tries again.  The entries are taken in the order of their ids, each once (a failed one is not taken again by this sweep); the registry is
+ * called under the mutex of the records' existence, as the sweep of the records does, and not under RC.mu. */
+static uint64_t un_sweep(const char *view, uint64_t *nfail) {
   uint64_t n = 0;
-  for (;;) {
+  for (uint32_t next = 0;;) {                               /* (next: the lowest id not looked at yet) */
     char old[1026];
     int64_t sid = 0;
+    uint32_t id = 0;
     bool got = false;
     rec_lock();
     rc_lock();
-    for (size_t i = 0; i < RC.un_n && !got; i++)
-      if (!RC.un[i].seen && strcmp(RC.un[i].view, view) == 0) {
+    for (size_t i = 0; i < RC.un_n; i++)
+      if (!RC.un[i].seen && RC.un[i].id >= next && (!got || RC.un[i].id < id) && strcmp(RC.un[i].view, view) == 0) {
         snprintf(old, sizeof(old), "%s", RC.un[i].name);
         sid = RC.un[i].sid;
-        un_drop_locked(i);
+        id = RC.un[i].id;
         got = true;
       }
     rc_unlock();
+    if (!got) {
+      rec_unlock();
+      break;
+    }
+    int dr = -1;                                            /* (tests: the n-th delete of a sweep fails, as the registry's does without memory) */
+    if (atomic_load_explicit(&db_store_test_un_delete_fail, memory_order_relaxed) <= 0 || atomic_fetch_sub_explicit(&db_store_test_un_delete_fail, 1, memory_order_relaxed) != 1)
+      dr = dbreg_delete(view, old, sid);
+    if (dr >= 0) {
+      rc_lock();
+      for (size_t i = 0; i < RC.un_n; i++)
+        if (RC.un[i].id == id) {
+          un_drop_locked(i);
+          break;
+        }
+      rc_unlock();
+      if (dr > 0) n++;
+    } else {
+      (*nfail)++;
+    }
     rec_unlock();
-    if (!got) break;
-    if (dbreg_delete(view, old, sid) > 0) n++;
+    if (id == UINT32_MAX) break;
+    next = id + 1;
   }
   return n;
 }
@@ -4039,7 +4067,13 @@ void db_recon_end(bool complete, uint64_t n_skipped, bool cursor_valid, uint64_t
     dmax_refresh(st, vid);
   }
   {                                                         /* the zones the store cannot name that the pass did not list */
-    uint64_t ud = un_sweep(view);
+    uint64_t ufail = 0;
+    uint64_t ud = un_sweep(view, &ufail);
+    if (ufail) {
+      out->failed = true;
+      syslog(LOG_ERR, "[Store] view '%s': %llu zone(s) of the heap directory (names the store cannot hold) that the database no longer lists could not be deleted (no memory): they stay, "
+                      "and the cursor is not kept so that the next pass deletes them", view, (unsigned long long)ufail);
+    }
     if (ud) {
       out->swept = true;
       out->deleted += ud;

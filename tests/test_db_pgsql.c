@@ -2518,6 +2518,29 @@ static void test_paged(void) {
         CHECK(D->manifest_page(c, 100001, 10, mp_cb, &a, &last, &n) == 0 && n == 1 && last == 100003);
         mp_free(&a);
     }
+
+    /* review D-3: the view rows of a domain are bounded in the statement (the result is held in memory whole): a domain with 40 rows brings 33 of them (one more than a row carries,
+     * so that the error still names it), a domain with 32 brings 32.  D-5: a negative generation (the CHECK dropped, as an edited table could have it) is stamp 0, as with SQLite3 */
+    {
+        Q("INSERT INTO domains (id, name, type) VALUES (200001, 'manyv.pg.test', 'NATIVE'), (200003, 'neg.pg.test', 'NATIVE'), (200005, 'v32.pg.test', 'NATIVE')");
+        Q("INSERT INTO karidns_domain_views (domain_id, view_name) SELECT 200001, 'v' || i FROM generate_series(1, 40) i");
+        Q("INSERT INTO karidns_domain_views (domain_id, view_name) SELECT 200005, 'w' || i FROM generate_series(1, 32) i");
+        Q("ALTER TABLE karidns_zone_state DROP CONSTRAINT IF EXISTS karidns_zone_state_generation_check");
+        Q("UPDATE karidns_zone_state SET generation = -5, changed_at = -7 WHERE domain_id = 200003");
+        mp_t a = { .ordered = true };
+        int64_t last;
+        unsigned n;
+        pg_test_manifest_rows = 0;
+        CHECK(D->manifest_page(c, 200000, 10, mp_cb, &a, &last, &n) == -1);
+        CHECK_HAS(D->errmsg(c), "domain 200001");
+        CHECK_HAS(D->errmsg(c), "(32)");
+        CHECK_MSG(pg_test_manifest_rows == 33 + 1 + 32, "the page brought %u rows (33 + 1 + 32 expected)", pg_test_manifest_rows);
+        mp_free(&a);
+        CHECK(D->manifest_page(c, 200002, 10, mp_cb, &a, &last, &n) == 0 && n == 2 && a.n == 2);
+        CHECK_MSG(a.n == 2 && a.id[0] == 200003 && a.has_state[0] && a.gen[0] == 0, "generation -5: stamp %llu", a.n ? (unsigned long long)a.gen[0] : 0ull);
+        CHECK(a.n == 2 && a.id[1] == 200005 && a.nviews[1] == 32);
+        mp_free(&a);
+    }
     D->close(c);
     Q("RESET search_path");
     Q("DROP SCHEMA karidns_test_wp3 CASCADE");

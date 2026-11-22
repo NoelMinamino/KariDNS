@@ -166,7 +166,15 @@ BATCH_END) to the file \fBOUT\fR (\fB\-\fR = standard output). Zones come in
 \fBdomains.id\fR order and the HELLO of a dump carries pid 0, so two runs on one
 database state write the same bytes, whatever the number of
 \fB\-\-loader\-threads\fR. It reads the database in one snapshot and does not
-start a server. The output file is removed on an error.
+start a server. A regular file (or one that does not exist yet) is written under
+a temporary name beside it, \fBOUT.tmp.<pid>\fR, and renamed over it when the
+dump is complete: on an error the earlier file is left as it was and no new one
+is made. A symbolic link is followed and the file it names is replaced the same
+way (the link stays); a link to nothing is an error. The new file gets the mode,
+and where the user may set them the owner and group, of the file it replaces; a
+new file is made with mode 0644 (less the umask). A path whose temporary name
+would be longer than \fBPATH_MAX\fR is an error, never written in place. A
+device or a FIFO is written as it is and is not removed on an error.
 .TP 8
 \fB\-\-check\fR
 Check mode, what \fBkaricheck db\fR runs. It reads the same tables through the

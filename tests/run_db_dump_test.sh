@@ -191,6 +191,48 @@ ls "$T"/keep.kdb.tmp.* > /dev/null 2>&1 && bad "a temporary dump file was left b
 expect 0 "a dump over an earlier file" "$LOADER" --dump "$T/keep.kdb" --driver sqlite3 --database-file "$T/z.db"
 [ "$(head -c 4 "$T/keep.kdb")" = "KDB1" ] && ok "the earlier file was replaced by the dump" || bad "the earlier file was not replaced"
 rm -f "$T/keep.kdb"
+# review Z-5: never written in place.  A symbolic link: the file it names is replaced through a temporary file, the link stays; a failure leaves both
+printf 'earlier dump' > "$T/real.kdb"
+ln -s real.kdb "$T/link.kdb"
+expect 3 "unknown zone, through a symbolic link to an earlier dump" "$LOADER" --dump "$T/link.kdb" --driver sqlite3 --database-file "$T/z.db" --zone nothere.test
+[ -L "$T/link.kdb" ] && [ "$(cat "$T/real.kdb")" = "earlier dump" ] && ok "a failed dump through a link leaves the link and the file it names as they were" || bad "the link or the file it names was changed or removed"
+ls "$T"/real.kdb.tmp.* "$T"/link.kdb.tmp.* > /dev/null 2>&1 && bad "a temporary dump file was left behind (link)" || ok "no temporary dump file is left behind (link)"
+expect 0 "a dump through a symbolic link" "$LOADER" --dump "$T/link.kdb" --driver sqlite3 --database-file "$T/z.db"
+[ -L "$T/link.kdb" ] && [ "$(head -c 4 "$T/real.kdb")" = "KDB1" ] && ok "the dump replaced the file the link names, the link stays" || bad "the link was replaced, or the file it names was not"
+rm -f "$T/link.kdb" "$T/real.kdb"
+ln -s nothere.kdb "$T/dangle.kdb"
+expect 3 "a symbolic link to nothing" "$LOADER" --dump "$T/dangle.kdb" --driver sqlite3 --database-file "$T/z.db"
+grep -q "symbolic link to a file that does not exist" "$T/e.out" && [ ! -e "$T/nothere.kdb" ] && ok "a link to nothing is refused, nothing is made" || bad "a link to nothing: $(head -1 "$T/e.out")"
+rm -f "$T/dangle.kdb"
+# the mode of the file that is replaced is kept; a new file is 0644 whatever the umask
+printf 'earlier dump' > "$T/mode.kdb"
+chmod 640 "$T/mode.kdb"
+expect 0 "a dump over a file of mode 0640" "$LOADER" --dump "$T/mode.kdb" --driver sqlite3 --database-file "$T/z.db"
+m=$(stat -f %Lp "$T/mode.kdb" 2>/dev/null || stat -c %a "$T/mode.kdb")
+[ "$m" = "640" ] && ok "the replaced file keeps mode 0640" || bad "the replaced file has mode $m, 640 expected"
+rm -f "$T/mode.kdb"
+(umask 000; "$LOADER" --dump "$T/new.kdb" --driver sqlite3 --database-file "$T/z.db" > "$T/e.out" 2>&1)
+m=$(stat -f %Lp "$T/new.kdb" 2>/dev/null || stat -c %a "$T/new.kdb")
+[ "$m" = "644" ] && ok "a new dump file is 0644 with umask 000" || bad "a new dump file has mode $m with umask 000, 644 expected"
+rm -f "$T/new.kdb"
+# a path whose temporary name does not fit PATH_MAX (1024): an error, the earlier file stays (before: written and removed in place)
+LD="$T"
+while [ ${#LD} -lt 900 ]; do LD="$LD/dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"; done
+mkdir -p "$LD"
+LF="$LD/$(printf '%*s' $((1020 - ${#LD} - 1)) '' | tr ' ' f)"
+printf 'earlier dump' > "$LF"
+expect 3 "an output path of ${#LF} bytes, too long for its temporary name" "$LOADER" --dump "$LF" --driver sqlite3 --database-file "$T/z.db" --zone nothere.test
+grep -q "too long for the temporary name" "$T/e.out" && [ "$(cat "$LF")" = "earlier dump" ] && ok "a path too long for the temporary name is refused, the earlier file stays" || bad "the long path: $(head -1 "$T/e.out"); file: $(cat "$LF" 2>/dev/null | head -c 20)"
+rm -rf "$T/dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+# a FIFO is written as it is and not removed when the dump fails (before: removed)
+mkfifo "$T/out.fifo"
+cat "$T/out.fifo" > /dev/null &
+FPID=$!
+expect 3 "unknown zone, into a FIFO" "$LOADER" --dump "$T/out.fifo" --driver sqlite3 --database-file "$T/z.db" --zone nothere.test
+kill "$FPID" 2>/dev/null
+wait "$FPID" 2>/dev/null
+[ -p "$T/out.fifo" ] && ok "a failed dump does not remove the FIFO it wrote to" || bad "the FIFO was removed"
+rm -f "$T/out.fifo"
 expect 3 "output in a directory that does not exist" "$LOADER" --dump "$T/no/such/dir/x.kdb" --driver sqlite3 --database-file "$T/z.db"
 # not in WAL mode
 sqlite3 "$T/nowal.db" "CREATE TABLE t (a)" > /dev/null

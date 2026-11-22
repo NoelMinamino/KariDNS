@@ -238,8 +238,10 @@ typedef struct {
     char name[DB_MANIFEST_NAME_MAX + 1], type[DB_MANIFEST_TYPE_MAX + 1];
     char vbuf[DB_MANIFEST_MAX_VIEWS][DB_MANIFEST_VIEW_MAX + 1];
 } db_mgroup_t;
-/* NULL = ok, else the reason (the driver adds table and id): name NULL is "name is NULL" */
-static inline const char *db_mgroup_start(db_mgroup_t *g, int64_t id, const char *name, const char *type, bool has_state, uint64_t gen, uint64_t at) {
+/* NULL = ok, else the reason (the driver adds table and id): name NULL is "name is NULL".  gen and at are the columns as the database has them: a negative value (the schema's CHECK
+ * forbids one for the generation; an older or edited table can have one) is 0 for both drivers (review D-5: PostgreSQL made it a huge stamp, SQLite3 0) */
+static inline const char *db_mgroup_start(db_mgroup_t *g, int64_t id, const char *name, const char *type, bool has_state, int64_t gen_col, int64_t at_col) {
+    const uint64_t gen = gen_col < 0 ? 0 : (uint64_t)gen_col, at = at_col < 0 ? 0 : (uint64_t)at_col;
     if (!name) return "column name is NULL";
     size_t n = strlen(name);
     if (n > DB_MANIFEST_NAME_MAX) return "column name is too long";
