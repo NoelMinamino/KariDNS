@@ -191,7 +191,7 @@ if kill -0 "$WEB" 2>/dev/null; then bad "the API did not stop after SIGTERM" "$(
 WEB=""
 grep -q "(a bug)" "$T/server.log" && bad "row level security refused what the API had allowed" "$(grep '(a bug)' "$T/server.log" | head -3)" || ok "row level security never disagreed with the API"
 grep -Eq '^[^ ]+ error ' "$T/server.log" && bad "the API logged an error" "$(grep ' error ' "$T/server.log" | head -3)" || ok "the API logged no error"
-if grep -Eq 'Sunrise-Harbor|Maple-Anchor|karidns_session=|\$scrypt\$|kdt_|zone_text|192\.0\.2\.250' "$T/server.log" || grep -Fq "$PW" "$T/server.log"; then bad "the log holds a password, cookie, hash, token or request data"; else ok "the log holds no password, cookie, hash, token or record data"; fi
+if grep -Eq 'Sunrise-Harbor|Maple-Anchor|karidns_session=|\$scrypt\$|kdt_|zone_text|192\.0\.2\.250' "$T/server.log" || grep -Fq -e "$PW" "$T/server.log"; then bad "the log holds a password, cookie, hash, token or request data"; else ok "the log holds no password, cookie, hash, token or record data"; fi
 grep -q "ERROR\|assertion\|Assertion" "$T/karidns.log" && bad "karidns logged an error" "$(grep 'ERROR\|ssertion' "$T/karidns.log" | head -3)" || ok "karidns logged no error"
 
 echo
