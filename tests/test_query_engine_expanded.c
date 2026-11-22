@@ -530,6 +530,35 @@ static int soa_set_query(zone_db_snapshot_t *snap, server_config_t *cfg, const c
     return process_dns_query_impl(req, req_len, res, res_cap, qname, qtype, client, &comp_ctx, false, &rrl_out, snap, cfg, &matched);
 }
 
+static size_t gr_build_cookie_query(uint8_t *req, const char *qname, uint16_t qtype, const uint8_t *cookie, size_t cookie_len);
+
+/* 0.7: the RCODE of a response whose only RR right after the question is an OPT RR: the header RCODE with the upper 8 bits from the
+ * OPT TTL (RFC 6891 s6.1.3); -1 when there is no such OPT RR */
+static int ck_wire_rcode(const uint8_t *res, int n) {
+    size_t q = 12;
+    while (n > 0 && q < (size_t)n && res[q]) q += 1u + res[q];
+    q += 5;
+    if (n < 0 || (size_t)n < q + 11 || res[q] != 0 || res[q + 1] != 0 || res[q + 2] != 41) return -1;
+    return (res[q + 5] << 4) | (res[3] & 0x0F);
+}
+
+/* 0.7: a UDP query with an invalid server cookie (RFC 7873 s5.2.4) through process_dns_query_impl(); the wire RCODE of the answer */
+static int ck_bad_cookie_rcode(zone_db_snapshot_t *snap, server_config_t *cfg, const char *qname, uint16_t qtype, const char *client, bool tcp) {
+    static const uint8_t ck[24] = { 1, 2, 3, 4, 5, 6, 7, 8, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+                                    0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff };
+    uint8_t req[512], res[4096];
+    size_t req_len = gr_build_cookie_query(req, qname, qtype, ck, sizeof(ck));
+    compress_ctx_t comp_ctx;
+    memset(&comp_ctx, 0, sizeof(comp_ctx));
+    compress_ctx_init_packet(&comp_ctx);
+    const rate_limit_config_t *rrl_out = NULL;
+    zone_db_entry_t *matched = NULL;
+    int n = process_dns_query_impl(req, req_len, res, sizeof(res), qname, qtype, client, &comp_ctx, tcp, &rrl_out, snap, cfg, &matched);
+    assert(n >= DNS_HEADER_SIZE);
+    if ((res[3] & 0x0F) == 7) assert(!(res[2] & 0x04) && res[6] == 0 && res[7] == 0);   /* BADCOOKIE: AA=0, no answer (s5.2.3) */
+    return ck_wire_rcode(res, n);
+}
+
 static void test_soa_set_per_client(void) {
     printf("[TEST] Query Engine: several restricted SOA records (B8t-1)...\n");
     char data[] =
@@ -601,6 +630,10 @@ static void test_soa_set_per_client(void) {
     assert(soa_set_has_ede18(res, n));
     n = soa_set_query(&snap, &cfg, "soa.example.", 2, "203.0.113.200", res, sizeof(res));
     assert((res[3] & 0x0F) == 5 && !(res[2] & 0x04) && soa_set_has_ede18(res, n));
+    /* 0.7: an invalid server cookie over UDP from that client: BADCOOKIE (23) first, not REFUSED with BADCOOKIE's upper bits (21);
+     * over TCP the REFUSED, extended RCODE 0 (RFC 7873 s5.2.3, s5.2.4; RFC 6891 s6.1.3) */
+    assert(ck_bad_cookie_rcode(&snap, &cfg, "www.soa.example.", 1, "203.0.113.200", false) == 23);
+    assert(ck_bad_cookie_rcode(&snap, &cfg, "www.soa.example.", 1, "203.0.113.200", true) == 5);
     /* without extended errors the status is the same and no EDE is sent */
     cfg.send_extended_errors = false;
     n = soa_set_query(&snap, &cfg, "soa.example.", 6, "203.0.113.200", res, sizeof(res));
@@ -1963,6 +1996,26 @@ static void test_dns_cookie_engine_rfc9018(void) {
     build_dns_query(plain, &pn, 0x4592, "host1.example.", 1, false);
     gr_query_raw(plain, pn, "host1.example.", 1, ip, false, &r);
     assert(r.rcode == 0 && gr_find_cookie(&r, &clen, &opt_ttl) == NULL);
+
+    // 10. 0.7: the answers that do not come from the zone's data: a name in no zone (REFUSED) and an empty zone (SERVFAIL).  An invalid
+    //     server cookie over UDP gets BADCOOKIE (23) first, as an authoritative answer does; they used to put BADCOOKIE's upper RCODE bits
+    //     on their own RCODE (21 / 18, RFC 6891 s6.1.3).  Over TCP, and with a valid cookie, the REFUSED / SERVFAIL with extended RCODE 0
+    printf("  [Cookie] Step 10: bad cookie to a name in no zone and to an empty zone\n"); fflush(stdout);
+    assert(ck_bad_cookie_rcode(&g_gr.snap, &g_gr.cfg, "www.other.test.", 1, ip, false) == 23);
+    assert(ck_bad_cookie_rcode(&g_gr.snap, &g_gr.cfg, "www.other.test.", 1, ip, true) == 5);
+    assert(generate_server_cookie(&g_gr.cfg, ip, cc, sc, now - 10));
+    memcpy(opt + 8, sc, 16);
+    n = gr_build_cookie_query(req, "www.other.test.", 1, opt, 24);
+    gr_query_raw(req, n, "www.other.test.", 1, ip, false, &r);
+    assert(ck_wire_rcode(r.msg, (int)r.len) == 5);
+    static zone_version_t empty_ver;                         // a zone without data (not loaded yet): "Zone not ready (empty)"
+    zone_version_t *loaded = atomic_load_explicit(&g_gr.entry.rcu.active, memory_order_acquire);
+    atomic_store_explicit(&g_gr.entry.rcu.active, &empty_ver, memory_order_release);
+    assert(ck_bad_cookie_rcode(&g_gr.snap, &g_gr.cfg, "host1.example.", 1, ip, false) == 23);
+    assert(ck_bad_cookie_rcode(&g_gr.snap, &g_gr.cfg, "host1.example.", 1, ip, true) == 2);
+    gr_query_raw(req, gr_build_cookie_query(req, "host1.example.", 1, opt, 24), "host1.example.", 1, ip, false, &r);
+    assert(ck_wire_rcode(r.msg, (int)r.len) == 2);
+    atomic_store_explicit(&g_gr.entry.rcu.active, loaded, memory_order_release);
 
     memset(&g_gr.cfg, 0, sizeof(g_gr.cfg));
     zone_arena_destroy(&g_gr.arena);

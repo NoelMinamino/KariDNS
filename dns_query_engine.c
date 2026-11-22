@@ -4342,8 +4342,18 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
         if (zone_image_rrs(cimg)[ck].class_val == 3) { ch_zone_here = true; break; }
     }
   }
+  /* 0.7: this server's own cookie policy, once for every answer that follows (RFC 7873 §5.2.3 / §5.2.4: BADCOOKIE over UDP to an invalid
+   * server cookie, and to a client cookie alone with require-server-cookie; AA=0, a fresh server cookie, nothing else).  It comes before
+   * the zone's own answer, as BIND makes the check in ns__query_start() before the zone is looked up, and the client gets the cookie to ask
+   * again with: then the REFUSED (a name in no zone, a class without a zone, a zone not served to it), the SERVFAIL (an empty zone), the
+   * program and forward zones (their transfer refusals too) and the authoritative answers.  A query refused here never reaches a
+   * program zone's plugin or a forward zone's forwarders (they used to get it whatever the cookie was; over TCP it is answered, §5.2.3:
+   * TCP authenticates the source, and a forward zone's reply carries a fresh server cookie, fwd_reply()).  The REFUSED / SERVFAIL paths
+   * used to come first and put BADCOOKIE's upper RCODE bits (ext_rcode_out, RFC 6891 §6.1.3) on their own RCODE: wire RCODE 21 / 18.
+   * (Only a built-in CHAOS zone is answered first, after its ACL and the UDP AXFR FORMERR, above.)  Below this, every OPT RR carries
+   * extended RCODE 0. */
+  if (is_badcookie) return build_badcookie_response(res, max_res_len, (uint16_t)q_offset, &edns, ext_rcode_out, is_tcp, cfg);
   if (qclass == 3 && !ch_zone_here) {
-    if (is_badcookie) return build_badcookie_response(res, max_res_len, (uint16_t)q_offset, &edns, ext_rcode_out, is_tcp, cfg);
     add_ede(&edns, send_ede, 20, "This server is not authoritative for the queried zone");
     return dns_build_error_response(req, req_len, res, max_res_len, 5, 0, 1, &edns, is_tcp, cfg);
   }
@@ -4373,13 +4383,6 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
         return dns_build_error_response(req, req_len, res, max_res_len, 1, 0, dns_error_qd_echo(req, req_len), &edns, is_tcp, cfg);
       }
     }
-    /* 0.7: this server's own cookie policy (RFC 7873 §5.2.3 / §5.2.4: BADCOOKIE over UDP to a client cookie without a valid server cookie
-     * when require-server-cookie is set, and to an invalid server cookie) holds for the answers of program and forward zones as for the
-     * authoritative ones (below), and before the query is handed on: a query refused here never reaches the plugin or the forwarders.
-     * Over TCP the query is answered (§5.2.3: TCP authenticates the source; a forward zone's reply carries a fresh server cookie,
-     * fwd_reply()).  They used to be relayed whatever the cookie was. */
-    if (is_badcookie && (fwd_zone || prog_zone))
-      return build_badcookie_response(res, max_res_len, (uint16_t)q_offset, &edns, ext_rcode_out, is_tcp, cfg);
     if (prog_zone) {
       const rate_limit_config_t *rrl = zext(zcfg)->rrl.configured ? &zext(zcfg)->rrl : (cfg ? &cfg->rrl : NULL);
       if (!is_tcp && rrl && rrl->configured && rrl->early_drop) {
@@ -4426,7 +4429,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
     uint16_t offset = q_offset;
     uint16_t arcount = 0;
     if (edns.present) {
-      assemble_edns_opt(res, max_res_len, &offset, &arcount, &edns, ext_rcode_out, is_tcp, cfg);
+      assemble_edns_opt(res, max_res_len, &offset, &arcount, &edns, 0, is_tcp, cfg);
       res[10] = (uint8_t)(arcount >> 8);
       res[11] = (uint8_t)(arcount & 0xFF);
     }
@@ -4440,7 +4443,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
     uint16_t offset = q_offset;
     uint16_t arcount = 0;
     if (edns.present) {
-      assemble_edns_opt(res, max_res_len, &offset, &arcount, &edns, ext_rcode_out, is_tcp, cfg);
+      assemble_edns_opt(res, max_res_len, &offset, &arcount, &edns, 0, is_tcp, cfg);
       res[10] = (uint8_t)(arcount >> 8);
       res[11] = (uint8_t)(arcount & 0xFF);
     }
@@ -4476,7 +4479,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
       uint16_t roff = q_offset;
       uint16_t rar = 0;
       if (edns.present) {
-        assemble_edns_opt(res, max_res_len, &roff, &rar, &edns, ext_rcode_out, is_tcp, cfg);
+        assemble_edns_opt(res, max_res_len, &roff, &rar, &edns, 0, is_tcp, cfg);
         res[10] = (uint8_t)(rar >> 8);
         res[11] = (uint8_t)(rar & 0xFF);
       }
@@ -4487,14 +4490,12 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
   /* RFC 7314 §3: 権威を持つゾーンへの EXPIRE 付き問い合わせには、SOA EXPIRE (プライマリ)
    * または expire タイマーの残り (セカンダリ) を返す。権威が無い応答 (上の REFUSED) には
    * 付けない (§3.3)。値は本体に依存しないので wire キャッシュのヒット時も同じく付く。 */
-  if (edns.present && edns.has_expire_query && db_entry && !is_badcookie) {
+  if (edns.present && edns.has_expire_query && db_entry) {   /* (a BADCOOKIE was answered above, without it) */
     edns.send_expire = true;
     edns.send_expire_value = zone_expire_option_value(db_entry, time(NULL));
   }
 
   uint16_t offset = q_offset, ancount = 0, nscount = 0, arcount = 0;
-
-  if (is_badcookie) return build_badcookie_response(res, max_res_len, q_offset, &edns, ext_rcode_out, is_tcp, cfg);
 
   // UDP IXFR (RFC 1995 §4.2):
   // If client's SOA serial matches server's current serial (up-to-date), send single SOA response (NOERROR).
@@ -4576,7 +4577,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
     res[7] = (uint8_t)(ancount & 0xFF);
     res[8] = 0; res[9] = 0;
     if (edns.present) {
-      assemble_edns_opt(res, max_res_len, &offset, &arcount, &edns, ext_rcode_out, is_tcp, cfg);
+      assemble_edns_opt(res, max_res_len, &offset, &arcount, &edns, 0, is_tcp, cfg);
     }
     res[10] = (uint8_t)(arcount >> 8);
     res[11] = (uint8_t)(arcount & 0xFF);
@@ -4593,7 +4594,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
     res[7] = (uint8_t)(ancount & 0xFF);
     res[8] = 0; res[9] = 0;
     if (edns.present) {
-      assemble_edns_opt(res, max_res_len, &offset, &arcount, &edns, ext_rcode_out, is_tcp, cfg);
+      assemble_edns_opt(res, max_res_len, &offset, &arcount, &edns, 0, is_tcp, cfg);
     }
     res[10] = (uint8_t)(arcount >> 8);
     res[11] = (uint8_t)(arcount & 0xFF);
@@ -4630,7 +4631,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
    * in nor stored into the cache (an entry stored for the owner view's clients would also lack, or carry, the other view's glue). */
   bool rc_view_dependent = current_zone && current_zone->glue && db_entry && view && !view_owns_entry(view, db_entry);
   uint64_t rc_tag = 0, rc_gen = 0;
-  if (g_rcache && edns_safe_for_cache && !is_badcookie && opcode == 0 && qdcount == 1 && qclass == 1 && !rc_view_dependent &&
+  if (g_rcache && edns_safe_for_cache && opcode == 0 && qdcount == 1 && qclass == 1 && !rc_view_dependent &&
       current_zone && current_zone->rcache_ok && max_res_len >= 512 && q_offset < body_max_len) {
     rc_gen = zone_arena_data_generation(current_zone);
     /* The key has no view in it: the cache is shared by every view (a zone that two views share, in-view, has one set of entries) and the
@@ -4735,7 +4736,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
   }
 
   if (edns.present) {
-    assemble_edns_opt(res, max_res_len, &offset, &arcount, &edns, ext_rcode_out, is_tcp, cfg);
+    assemble_edns_opt(res, max_res_len, &offset, &arcount, &edns, 0, is_tcp, cfg);
   }
 
   res[6] = (uint8_t)(ancount >> 8);

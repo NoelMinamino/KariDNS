@@ -13,7 +13,8 @@
 #   6. a forwarder without cookies still works and is not marked.
 #   7. this server's own cookies (RFC 7873 section 5.2) come before forwarding, as for an authoritative zone: over UDP an invalid server
 #      cookie gets BADCOOKIE and the forwarder sees no query; over TCP it is forwarded with a fresh server cookie in the reply; a valid
-#      server cookie is forwarded.  A second server with require-server-cookie: a client cookie alone over UDP gets BADCOOKIE (as for its
+#      server cookie is forwarded; a name in no zone and a secondary without data get BADCOOKIE too over UDP (REFUSED / SERVFAIL over
+#      TCP), not their RCODE with BADCOOKIE's upper bits.  A second server with require-server-cookie: a client cookie alone over UDP gets BADCOOKIE (as for its
 #      primary zone) and is not forwarded; the server cookie of that BADCOOKIE is then forwarded; over TCP, and without a cookie, forwarded.
 #   8. BADCOOKIE to the retry with the new server cookie: the same query over TCP (RFC 7873 section 5.3), answered.
 set -u
@@ -50,7 +51,7 @@ check() {   # check DESCRIPTION EXPECTED ACTUAL
 count() { grep -c -- "$2" "$1" 2>/dev/null || true; }
 
 BASE=$(kari_port 0 $((20000 + $$ % 20000)))
-P_K=$BASE; P_CK=$((BASE + 1)); P_NC=$((BASE + 2)); P_K2=$((BASE + 3))
+P_K=$BASE; P_CK=$((BASE + 1)); P_NC=$((BASE + 2)); P_K2=$((BASE + 3)); P_DEAD=$((BASE + 4))   # P_DEAD: the primary of sec.test, where nothing listens
 USER_OPT=""
 [ "$(id -u)" = "0" ] && USER_OPT='user "nobody"; group "nobody";'   # root: the server refuses to run without a user to drop to
 
@@ -82,6 +83,7 @@ cat > "$T/k.conf" <<EOF
 options { pid-file "none"; bind-address { 127.0.0.1; }; port $P_K; $USER_OPT };
 zone "fw.test." { type forward; forwarders { 127.0.0.1 port $P_CK; }; forward-timeout 3000; };
 zone "nc.test." { type forward; forwarders { 127.0.0.1 port $P_NC; }; forward-timeout 3000; };
+zone "sec.test." { type secondary; primaries { 127.0.0.1 port $P_DEAD; }; };
 EOF
 # the second server: require-server-cookie, the same forwarder, and a primary zone to compare with
 printf '$ORIGIN au.test.\n$TTL 300\n@ SOA ns hostmaster 1 3600 600 86400 300\n@ NS ns\nns A 192.0.2.1\nwww A 192.0.2.2\n' > "$T/au.test.zone"
@@ -207,6 +209,15 @@ r=$(qc "$P_K" iv.fw.test +cookie=$CC$BAD_SC +tcp)
 case $r in 'NOERROR|192.0.2.56|'$CC*) pass "over TCP the same query is forwarded and answered (section 5.2.3)" ;; *) fail "invalid server cookie over TCP: $r" ;; esac
 case $r in *"|$CC$BAD_SC") fail "the TCP reply carries the invalid server cookie back" ;; *"|$CC"????????????????*) pass "... with a fresh server cookie" ;; *) fail "no server cookie in the TCP reply: $r" ;; esac
 check "... and the forwarder got it once" "1" "$(fwd_n iv.fw.test)"
+# the answers that are not from a zone's data come after the cookie check too: a name in no zone (REFUSED) and a secondary that has no
+# data yet (SERVFAIL, "Zone not ready").  They used to carry BADCOOKIE's upper RCODE bits on their own RCODE (RFC 6891 section 6.1.3):
+# dag showed "status: ?21" / "?18"
+check "a name in no zone with an invalid server cookie over UDP gets BADCOOKIE" "BADCOOKIE" "$(qc "$P_K" www.none.test +cookie=$CC$BAD_SC | cut -d'|' -f1)"
+check "... over TCP REFUSED" "REFUSED" "$(qc "$P_K" www.none.test +cookie=$CC$BAD_SC +tcp | cut -d'|' -f1)"
+check "... without a cookie REFUSED" "REFUSED" "$(qc "$P_K" www.none.test +nocookie | cut -d'|' -f1)"
+check "a secondary without data, invalid server cookie over UDP: BADCOOKIE" "BADCOOKIE" "$(qc "$P_K" sec.test +cookie=$CC$BAD_SC | cut -d'|' -f1)"
+check "... over TCP SERVFAIL" "SERVFAIL" "$(qc "$P_K" sec.test +cookie=$CC$BAD_SC +tcp | cut -d'|' -f1)"
+check "... without a cookie SERVFAIL" "SERVFAIL" "$(qc "$P_K" sec.test +nocookie | cut -d'|' -f1)"
 GOOD=$(qc "$P_K" ok.fw.test +cookie=$CC | cut -d'|' -f3)
 r=$(qc "$P_K" ok.fw.test +cookie=$GOOD)
 check "a valid server cookie over UDP is forwarded and answered" "NOERROR|192.0.2.57" "$(printf '%s\n' "$r" | cut -d'|' -f1-2)"
