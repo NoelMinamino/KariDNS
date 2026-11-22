@@ -74,6 +74,13 @@ _Static_assert(alignof(udp_ipc_t) == UDP_IPC_FRAME_ALIGN && sizeof(udp_ipc_t) % 
  * net.local.dgram.maxdgram = 8192 (setup_ipc_tables() reads it) */
 #define UDP_IPC_PACK_DEFAULT 2048
 
+/* The length of the client address of a frame that the router hands to the kernel: addr_len comes from the Backend (hostile input) and is at most
+ * the header's client_addr; a larger one would make the kernel read past client_addr into the payload (review 2026-11-22: the NOTIFY sends of
+ * the router passed it as it came).  Every use of addr_len on the router side goes through this. */
+static inline socklen_t udp_ipc_addr_len(const udp_ipc_t *m) {
+  return (socklen_t)(m->addr_len <= sizeof(m->client_addr) ? m->addr_len : sizeof(m->client_addr));
+}
+
 /* the offset of the frame after one of len octets (len counts the header) */
 static inline size_t udp_ipc_frame_padded(size_t len) {
   return (len + (UDP_IPC_FRAME_ALIGN - 1)) & ~(size_t)(UDP_IPC_FRAME_ALIGN - 1);

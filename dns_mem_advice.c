@@ -13,6 +13,7 @@
  * in the zone's bytes), which is the safe side for a size to buy memory by.
  */
 #include "dns_mem_advice.h"
+#include "dns_utils.h"
 
 #include <inttypes.h>
 #include <stdio.h>
@@ -95,7 +96,7 @@ size_t ma_fmt_limit(char *buf, size_t n, uint64_t bytes) {
     if (bytes >= (1ull << 30) && bytes % (1ull << 30) == 0) w = snprintf(buf, n, "%" PRIu64 "G", bytes >> 30);
     else if (bytes % (1ull << 20) == 0) w = snprintf(buf, n, "%" PRIu64 "M", bytes >> 20);
     else w = snprintf(buf, n, "%" PRIu64 "K", (uint64_t)((bytes + 1023) >> 10));
-    return w < 0 ? 0 : (size_t)w < n ? (size_t)w : n ? n - 1 : 0;
+    return snprintf_len(w, n);
 }
 
 size_t ma_fmt_size(char *buf, size_t n, uint64_t bytes) {
@@ -110,7 +111,7 @@ size_t ma_fmt_size(char *buf, size_t n, uint64_t bytes) {
     } else {
         w = snprintf(buf, n, "%" PRIu64 " B", bytes);
     }
-    return w < 0 ? 0 : (size_t)w < n ? (size_t)w : n ? n - 1 : 0;
+    return snprintf_len(w, n);
 }
 
 static const char *basis_text(const ma_est_t *e, char *b, size_t n) {
@@ -141,7 +142,7 @@ size_t ma_text_estimate(char *buf, size_t n, const ma_est_t *e) {
                              "memory-limit %s keeps %u%% of the zones in memory, the Backend then needs about %s (fixed part 70 MB, directory %s, zone data up to the limit) and the loader about %s",
                      e->zones, basis_text(e, basis, sizeof(basis)), rec, data, be, ld, lim, e->fit_pct, bl, dir, ll);
     }
-    return w < 0 ? 0 : (size_t)w < n ? (size_t)w : n ? n - 1 : 0;
+    return snprintf_len(w, n);
 }
 
 size_t ma_text_advice(char *buf, size_t n, const ma_est_t *e) {
@@ -169,7 +170,7 @@ size_t ma_text_advice(char *buf, size_t n, const ma_est_t *e) {
         w = snprintf(buf, n, "memory-limit %s is below what every zone needs (%s of zone data): %u%% of the zones fit, and queries for the others wait for a read of the database; "
                              "recommended memory-limit %s (every zone in memory), at least %s keeps half of the zones",
                      lim, data, e->fit_pct, rec, wm);
-    return w < 0 ? 0 : (size_t)w < n ? (size_t)w : n ? n - 1 : 0;
+    return snprintf_len(w, n);
 }
 
 size_t ma_text_status(char *buf, size_t n, const ma_est_t *e) {
@@ -180,7 +181,7 @@ size_t ma_text_status(char *buf, size_t n, const ma_est_t *e) {
     ma_fmt_limit(rec, sizeof(rec), e->recommended);
     ma_fmt_limit(wm, sizeof(wm), e->working_min);
     int w = snprintf(buf, n, "zones=%" PRIu64 " (%s) all_resident: zone_data=%s backend=%s loader=%s | ", e->zones, basis_text(e, basis, sizeof(basis)), data, be, ld);
-    size_t l = w < 0 ? 0 : (size_t)w < n ? (size_t)w : n ? n - 1 : 0;
+    size_t l = snprintf_len(w, n);
     if (e->limit) {
         ma_fmt_limit(lim, sizeof(lim), e->limit);
         ma_fmt_size(bl, sizeof(bl), e->backend_limit);
@@ -190,7 +191,7 @@ size_t ma_text_status(char *buf, size_t n, const ma_est_t *e) {
     } else {
         w = snprintf(buf + l, n - l, "no memory-limit | recommended=%s | status=%s", rec, ma_level_name(e->level));
     }
-    return w < 0 ? l : l + ((size_t)w < n - l ? (size_t)w : n - l - 1);
+    return l + snprintf_len(w, n - l);   /* F-2: n == 0 (n - l - 1 underflowed) */
 }
 
 /* ---------------------------------------------------------------- ZFS */
@@ -220,14 +221,14 @@ size_t ma_text_arc(char *buf, size_t n, const ma_arc_t *a) {
     ma_fmt_size(ram, sizeof(ram), a->ram);
     ma_fmt_size(fit, sizeof(fit), a->arc_fit);
     int w = snprintf(buf, n, "memory on ZFS: Backend heap %s + ARC (vfs.zfs.arc.max) %s + loader %s + %s for the system = %s of the %s of RAM (%u%%)", be, arc, ld, ot, tot, ram, a->pct);
-    size_t l = w < 0 ? 0 : (size_t)w < n ? (size_t)w : n ? n - 1 : 0;
+    size_t l = snprintf_len(w, n);
     if (a->level == MA_LEVEL_WARNING)
         w = snprintf(buf + l, n - l, "; that is more than the host has: under load the ARC and the heap compete and the system pages out or kills processes; lower vfs.zfs.arc.max to at most %s, or lower memory-limit", fit);
     else if (a->level == MA_LEVEL_NOTICE)
         w = snprintf(buf + l, n - l, "; little is left over: at most %s of ARC leaves the rest of the host its room", fit);
     else
         w = 0;
-    return w <= 0 ? l : l + ((size_t)w < n - l ? (size_t)w : n - l - 1);
+    return l + snprintf_len(w, n - l);
 }
 
 /* ---------------------------------------------------------------- at run time */
@@ -292,15 +293,15 @@ int ma_rt_tick(ma_rt_t *st, const ma_rt_in_t *in, const ma_est_t *e, char *buf, 
     ma_fmt_limit(wm, sizeof(wm), e->working_min);
     int w = snprintf(buf, n, "memory-limit %s is too small for the traffic: in the last %" PRId64 " s %" PRIu64 " queries (%" PRIu64 "/s) had to wait for a zone that was not in memory and %" PRIu64
                              " zones (%" PRIu64 "/s) were read from the database", lim, dt / 1000, misses, misses * 1000 / (uint64_t)dt, inst, inst_s);
-    size_t l = w < 0 ? 0 : (size_t)w < n ? (size_t)w : n ? n - 1 : 0;
+    size_t l = snprintf_len(w, n);
     if (cap) {
         w = snprintf(buf + l, n - l, ", %u%% of the fetch capacity of about %" PRIu64 "/s (fetch-concurrency %u, ingest thread busy %u%%%s)", util, cap, in->concurrency, in->busy_pct,
                      in->fetch_rate ? ", fetch-rate set" : "");
-        l += w < 0 ? 0 : (size_t)w < n - l ? (size_t)w : n - l - 1;
+        l += snprintf_len(w, n - l);
     }
     if (over) {
         w = snprintf(buf + l, n - l, "; %" PRIu64 " queries were answered SERVFAIL + EDE 14 for overload (park table full %" PRIu64 ", park-timeout %" PRIu64 ", refused %" PRIu64 ")", over, pfull, ptime, refused);
-        l += w < 0 ? 0 : (size_t)w < n - l ? (size_t)w : n - l - 1;
+        l += snprintf_len(w, n - l);
     }
     snprintf(buf + l, n - l, "; the zones that are asked for do not fit: set memory-limit to at least %s (half of the zones), recommended %s (every zone in memory, %u%% fit now)", wm, rec, e->fit_pct);
     return LOG_WARNING;

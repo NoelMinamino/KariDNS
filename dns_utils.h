@@ -117,6 +117,13 @@ static inline bool dns_char_is_escaped(const char *s, size_t pos) {
     return (bs % 2) == 1;
 }
 
+/* The length of what snprintf(buf, cap, ...) put in buf, from its return value n: n is the length the text needed, so a cut text is cap - 1
+ * bytes, and an error is 0 (D-1: a write()/send() of n bytes read past the buffer). */
+static inline size_t snprintf_len(int n, size_t cap) {
+    if (n < 0 || cap == 0) return 0;
+    return (size_t)n < cap ? (size_t)n : cap - 1;
+}
+
 /* 名前 (正規形, dns_wire.h) の長さから、末尾のエスケープされない '.' を除いたもの。
  * "." と "" は 0。 */
 static inline size_t dns_name_len_no_root(const char *name, size_t len) {

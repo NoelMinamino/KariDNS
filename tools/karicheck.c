@@ -594,13 +594,13 @@ KARIDNS_TOOL_FN pid_t kc_loader_spawn(const char *lp, const char *const *argv, b
     int xfd = exec_file_open_checked(lp, geteuid(), "database loader", "this user", err, sizeof(err));
     if (xfd < 0) {
         int n = snprintf(msg, sizeof(msg), "%s\n", err);
-        if (n > 0) (void)!write(2, msg, (size_t)n);
+        (void)!write(2, msg, snprintf_len(n, sizeof(msg)));
         _exit(126);
     }
     if (drop) {
         if (setgroups(0, NULL) != 0 || setgid(gid) != 0 || setuid(uid) != 0 || getuid() != uid || geteuid() != uid) {
             int n = snprintf(msg, sizeof(msg), "cannot drop to the loader user: %s\n", strerror(errno));
-            if (n > 0) (void)!write(2, msg, (size_t)n);
+            (void)!write(2, msg, snprintf_len(n, sizeof(msg)));
             _exit(126);
         }
     }
@@ -609,7 +609,7 @@ KARIDNS_TOOL_FN pid_t kc_loader_spawn(const char *lp, const char *const *argv, b
     if (chdir("/") != 0) _exit(126);
     exec_file_exec_fd(xfd, lp, (char *const *)argv, empty_env);
     int n = snprintf(msg, sizeof(msg), "cannot execute '%s': %s\n", lp, strerror(errno));
-    if (n > 0) (void)!write(2, msg, (size_t)n);
+    (void)!write(2, msg, snprintf_len(n, sizeof(msg)));
     _exit(127);
 }
 

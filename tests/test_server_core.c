@@ -2513,6 +2513,17 @@ static void test_ipc_frame_parse_pack(void) {
     static alignas(8) uint8_t d[4096];
     const udp_ipc_t *h;
     size_t off;
+    /* review 2026-11-22: the addr_len of a frame (from the Backend) is clamped to client_addr before the router hands it to the kernel */
+    {
+        udp_ipc_t m;
+        memset(&m, 0, sizeof(m));
+        m.addr_len = 16;
+        assert(udp_ipc_addr_len(&m) == 16);
+        m.addr_len = (uint16_t)sizeof(m.client_addr);
+        assert(udp_ipc_addr_len(&m) == sizeof(m.client_addr));
+        m.addr_len = 65535;
+        assert(udp_ipc_addr_len(&m) == sizeof(m.client_addr));
+    }
     /* an empty datagram and one shorter than a header: short, as before the framing; the offset goes to the end */
     off = 0;
     assert(udp_ipc_frame_next(d, 0, &off, &h) == UDP_IPC_FRAME_SHORT && off == 0 && h == NULL);

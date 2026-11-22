@@ -13,6 +13,7 @@
 #      few seconds), transfers-in 1 starts one inbound transfer at a time
 #   O  transfers-out refuses a transfer over the limit, max-transfer-idle-out frees the slot of a client that does not read
 #   Q  serial-query-rate 1 starts one refresh check a second
+#   Z  serial 0 is a serial (RFC 1982): a secondary at serial 0 does not take a primary that is behind it (review X-1)
 # No root is needed (everything is on 127.0.0.1).
 set -u
 
@@ -37,6 +38,7 @@ M="perl $DIR/mock_xfr_notify.pl"
 P1=$(kari_port 0) P2=$(kari_port 1) P3=$(kari_port 2) PQ=$(kari_port 12)      # primaries
 SA=$(kari_port 3) SB=$(kari_port 4) SC=$(kari_port 5)                           # secondaries: failover, multi-master, timers
 SR=$(kari_port 6) SG=$(kari_port 7) SQ=$(kari_port 8) SO=$(kari_port 9) SX=$(kari_port 10) SE=$(kari_port 11)
+PZ=$(kari_port 13) SZ=$(kari_port 14)
 MG1=$(kari_port 20) MG2=$(kari_port 21) MH=$(kari_port 22) MEA=$(kari_port 23) MEB=$(kari_port 24) MG3=$(kari_port 25) MG4=$(kari_port 26)
 
 PIDS=""
@@ -48,15 +50,15 @@ cleanup() {
     set +e
     kari_kill_tree $PIDS
     kari_kill_conf "$W/p1.conf" "$W/p2.conf" "$W/p3.conf" "$W/pq.conf" "$W/sa.conf" "$W/sb.conf" "$W/sc.conf" "$W/sr.conf" "$W/sg.conf" \
-        "$W/sq.conf" "$W/so.conf" "$W/sx.conf" "$W/se.conf"
+        "$W/sq.conf" "$W/so.conf" "$W/sx.conf" "$W/se.conf" "$W/pz.conf" "$W/sz.conf"
     if [ "$FAILS" -ne 0 ]; then
-        for f in p1 p2 p3 pq sa sb sc sr sg sq so sx se; do echo "--- $f.log (tail)"; tail -12 "$W/$f.log" 2>/dev/null; done
+        for f in p1 p2 p3 pq sa sb sc sr sg sq so sx se pz sz; do echo "--- $f.log (tail)"; tail -12 "$W/$f.log" 2>/dev/null; done
     fi
     rm -rf "$W"
 }
 trap cleanup EXIT INT TERM
 
-for p in $P1 $P2 $P3 $PQ $SA $SB $SC $SR $SG $SQ $SO $SX $SE $MG1 $MG2 $MH $MEA $MEB $MG3 $MG4; do
+for p in $P1 $P2 $P3 $PQ $PZ $SZ $SA $SB $SC $SR $SG $SQ $SO $SX $SE $MG1 $MG2 $MH $MEA $MEB $MG3 $MG4; do
     if sockstat -4 -l -p "$p" 2>/dev/null | grep -q ":$p "; then echo "SKIP: port $p is in use"; exit 0; fi
 done
 
@@ -283,6 +285,38 @@ sleep 1
 out=$("$DAG" @127.0.0.1 -p "$SO" big.test AXFR +nohexdump +time=3 2>&1 | head -40)
 if echo "$out" | grep -qi "refused\|Transfer failed"; then pass "O4: transfers-out 0: every transfer is refused (after a reload)"
 else fail "O4: transfers-out 0 did not refuse"; echo "$out" | head -8; fi
+
+# ------------------------------------------------------------------------------------------------ Z: serial 0 (review X-1)
+# 0 is a serial like any other (RFC 1982 §3): a secondary that serves serial 0 does not take a primary that is behind it.  2147483649
+# (2^31 + 1) is behind 0 and 0 is ahead of 2147483649 (RFC 1982 §3.2).  A secondary with no data yet takes any first serial.
+zone "$W/z.zone" z0.test 2147483649
+ZONES="z0.test:$W/z.zone"
+primary pz "$PZ"
+start pz
+kari_wait_answer "$DAG" "$PZ" z0.test. || true
+cat > "$W/sz.conf" <<EOF
+options { port $SZ; bind-address { 127.0.0.1; }; pid-file "none"; $USER_OPT min-refresh-time 1; min-retry-time 1; };
+control-channel { socket "$W/sz.sock"; algorithm hmac-sha256; secret "$SECRET"; };
+zone "z0.test" { type slave; primaries { 127.0.0.1 port $PZ; }; };
+EOF
+start sz
+if wait_serial "$SZ" z0.test 2147483649 20; then pass "Z1: a secondary with no data yet takes the first serial, also one that is behind 0 (2147483649)"
+else fail "Z1: z0.test is at serial '$(serial_of "$SZ" z0.test)', not 2147483649"; fi
+zone "$W/z.zone" z0.test 0
+ctl pz reload > /dev/null
+if wait_serial "$SZ" z0.test 0 20; then pass "Z2: the secondary follows to serial 0 (ahead of 2147483649)"
+else fail "Z2: z0.test is at serial '$(serial_of "$SZ" z0.test)', not 0"; fi
+zone "$W/z.zone" z0.test 2147483649
+ctl pz reload > /dev/null
+if wait_grep "serial number (2147483649) received from primary 127.0.0.1 < ours (0)" "$W/sz.log" 20; then
+    pass "Z3: at serial 0 the primary's 2147483649 is behind and is logged so"
+else fail "Z3: no 'serial number (2147483649) received from primary ... < ours (0)' line"; fi
+s=$(serial_of "$SZ" z0.test)
+[ "$s" = "0" ] && pass "Z4: the secondary stays at serial 0 (the older version is not installed)" || fail "Z4: the secondary at serial 0 took '$s'"
+zone "$W/z.zone" z0.test 5
+ctl pz reload > /dev/null
+if wait_serial "$SZ" z0.test 5 20; then pass "Z5: from serial 0 the secondary follows a newer primary (5)"
+else fail "Z5: z0.test is at serial '$(serial_of "$SZ" z0.test)', not 5"; fi
 
 # ------------------------------------------------------------------------------------------------ Q: serial-query-rate
 ZONES=""

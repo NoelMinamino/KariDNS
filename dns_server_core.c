@@ -1728,20 +1728,53 @@ void fill_observatory_snapshot(const zone_db_entry_t *e, server_config_t *cfg, z
 // 11. TCP & Worker Threads (サンドボックス内)
 // ============================================================================
 
+/* S-1: the longest one TCP message of this thread may take to leave once the client stops taking it at once (0 = none).  A worker sets it to
+ * tcp-idle-timeout (RFC 7766 §6.2.3): the worker that waits for a client to read serves nothing else (its other connections, its UDP), so a client
+ * that reads a few bytes now and then (each wait of poll() ends with some progress) cannot keep it there; the connection is closed after the
+ * failed send.  Nothing of this runs for a send that does not block: the clock is read on the first EAGAIN only. */
+static _Thread_local uint32_t g_tcp_send_limit_ms = 0;
+static int64_t park_now_ms(void);
+
+/* The wait of a TCP send for the client to read (only after EAGAIN).  *until: the absolute deadline (monotonic ms, 0 = none), set at the first
+ * wait of the message (*armed) from the per-message limit (a worker) and the deadline of the whole transfer (an AXFR/IXFR thread), whichever
+ * comes first.  wait_ms: the longest one wait may be (no progress for that long is a failure).  true: try the send again. */
+static bool tcp_send_wait(int fd, int64_t *until, bool *armed, int64_t wait_ms) {
+  int64_t now = park_now_ms();
+  if (!*armed) {
+    *armed = true;
+    *until = g_tcp_send_limit_ms ? now + g_tcp_send_limit_ms : 0;
+    if (g_tcp_send_deadline_ms && (!*until || g_tcp_send_deadline_ms < *until)) *until = g_tcp_send_deadline_ms;
+  }
+  int64_t ms = wait_ms;
+  if (*until) {
+    int64_t left = *until - now;
+    if (left <= 0) goto stalled;
+    if (left < ms) ms = left;
+  }
+  struct pollfd pfd = {.fd = fd, .events = POLLOUT};
+  int pr = poll(&pfd, 1, ms > INT_MAX ? INT_MAX : (int)ms);
+  if (pr > 0 || (pr < 0 && errno == EINTR)) return true;
+  if (pr < 0) return false;
+stalled:;
+  /* the client did not take the answer in time: the caller closes the connection, and the close resets it (SO_LINGER 0) instead of leaving
+   * the rest of the answer in the socket buffer for the kernel to trickle out to the same client (it would keep the connection, and the
+   * memory, for as long as the client goes on reading slowly) */
+  struct linger lg = {.l_onoff = 1, .l_linger = 0};
+  (void)setsockopt(fd, SOL_SOCKET, SO_LINGER, &lg, sizeof lg);
+  return false;
+}
+
 ssize_t send_tcp_robust(int fd, const uint8_t *buf, size_t len) {
+  int64_t until = 0;
+  bool armed = false;
   size_t sent = 0;
   while (sent < len) {
     ssize_t n = send(fd, buf + sent, len - sent, 0);
     if (n < 0) {
-      if (errno == EAGAIN || errno == EWOULDBLOCK) {
-        struct pollfd pfd = {.fd = fd, .events = POLLOUT};
-        int pr = poll(&pfd, 1, 30000);
-        if (pr < 0 && errno == EINTR)
-          continue;
-        if (pr <= 0)
-          return -1;
+      if (errno == EINTR)
         continue;
-      }
+      if ((errno == EAGAIN || errno == EWOULDBLOCK) && tcp_send_wait(fd, &until, &armed, 30000))
+        continue;
       return -1;
     }
     if (n == 0)
@@ -1760,27 +1793,22 @@ ssize_t send_tcp_dns_message(int fd, const uint8_t *msg, size_t len) {
   struct iovec *cur = iov;
   int cnt = 2;
   /* sendmsg(): クライアント fd の権限は CAP_SEND で、writev() の CAP_WRITE は無い */
-  /* max-transfer-time-out / max-transfer-idle-out (an outbound AXFR/IXFR thread sets them): the transfer is given up after the deadline, or when the
-   * client takes nothing for the idle time (the socket is blocking with SO_SNDTIMEO = idle, so EAGAIN here is the timeout) */
-  if (g_tcp_send_deadline_secs && time(NULL) > g_tcp_send_deadline_secs)
+  /* S-1: the socket is non-blocking; every wait for the client is bounded by one deadline for the whole message (tcp_send_wait()), so a client that
+   * reads a little at a time cannot stretch it.  max-transfer-idle-out (an outbound AXFR/IXFR thread): a wait with no progress for the idle time
+   * ends the transfer; otherwise one wait is at most 30 s.  max-transfer-time-out is also checked before each message (that thread only). */
+  if (g_tcp_send_deadline_ms && park_now_ms() >= g_tcp_send_deadline_ms)
     return -1;
+  int64_t until = 0;
+  bool armed = false;
   while (cnt > 0) {
     struct msghdr mh = {.msg_iov = cur, .msg_iovlen = cnt};
     ssize_t n = sendmsg(fd, &mh, 0);
     if (n < 0) {
       if (errno == EINTR)
         continue;
-      if (errno == EAGAIN || errno == EWOULDBLOCK) {
-        if (g_tcp_send_idle_secs)
-          return -1;
-        struct pollfd pfd = {.fd = fd, .events = POLLOUT};
-        int pr = poll(&pfd, 1, 30000);
-        if (pr < 0 && errno == EINTR)
-          continue;
-        if (pr <= 0)
-          return -1;
+      if ((errno == EAGAIN || errno == EWOULDBLOCK) &&
+          tcp_send_wait(fd, &until, &armed, g_tcp_send_idle_secs ? (int64_t)g_tcp_send_idle_secs * 1000 : 30000))
         continue;
-      }
       return -1;
     }
     if (n == 0)
@@ -2429,6 +2457,7 @@ STATIC_TEST void *async_io_worker_func(void *arg) {
           write_dnstap_event(NULL, 2 /*AUTH_RESPONSE*/, tcp_res, res_len,
                              &task.client_addr, task.client_len,
                              task.has_server_addr ? &task.server_addr : NULL, task.has_server_addr, IPPROTO_TCP);
+          g_tcp_send_limit_ms = task.tcp_send_limit_ms;   /* S-1: as the worker's own answers (a client that reads slowly does not keep this thread) */
           (void)send_tcp_dns_message(task.client_fd, tcp_res, (size_t)res_len); /* RFC 7766 §8 */
         }
         free(tcp_res);
@@ -3578,6 +3607,7 @@ worker_startup_success:;
     /* D-06 / RFC 7766 §6.2.3: 最初のメッセージまでの待ち時間と、メッセージ間の待ち時間 */
     uint32_t tcp_initial_ms = (active && active->tcp_initial_timeout > 0) ? active->tcp_initial_timeout : 10000;
     uint32_t tcp_idle_ms = (active && active->tcp_idle_timeout > 0) ? active->tcp_idle_timeout : 10000;
+    g_tcp_send_limit_ms = tcp_idle_ms;   /* S-1: an answer has tcp-idle-timeout to leave (send_tcp_dns_message()) */
     release_config_snapshot(active);
     rcu_reader_exit(ctx);
 
@@ -4065,8 +4095,8 @@ process_tcp_client: ;
                   args->time_out_secs = out_eff.xfer_time_out;
                   args->snap = snap;
                   retain_zone_snapshot(args->snap);
-                  int cflags = fcntl(client_fd, F_GETFL, 0);
-                  fcntl(client_fd, F_SETFL, cflags & ~O_NONBLOCK);
+                  /* the socket stays non-blocking: send_tcp_dns_message() waits with poll() up to the transfer's deadline (S-1; a blocking
+                   * send that the client keeps feeding a byte at a time would not come back to check it) */
 
                   // Item 1: AXFR UAF防止 - pthread_create直前にkqueueのEVFILT_READ / EVFILT_TIMERを削除
                   struct kevent ev_del_axfr[2];
@@ -4319,6 +4349,7 @@ process_tcp_client: ;
 
               async_io_task_t task = {0};
               task.is_tcp = true;
+              task.tcp_send_limit_ms = tcp_idle_ms;
               task.client_fd = client_fd;
               task.req_buf = heap_req;
               task.req_buf_cap = msg_len;
@@ -4378,7 +4409,7 @@ process_tcp_client: ;
             bool reuse = (cfg && cfg->tcp_connection_reuse);
             release_config_snapshot(cfg);
             /* H2: the answer is in this worker's tcp_res_buf and nothing below reads the zone data or the configuration: the send, which a client
-             * that does not read keeps waiting (up to 30 s), is outside the read section, so the grace period of the writers does not wait for it */
+             * that does not read keeps waiting (up to tcp-idle-timeout, S-1), is outside the read section, so the grace period of the writers does not wait for it */
             rcu_reader_exit(ctx);
             if (res_len > 0 && send_tcp_dns_message(client_fd, tcp_res_buf, (size_t)res_len) < 0) {
               tcp_client_close(kq, client_fd, ctx_tcp, ev_list, i, n_events);
@@ -5072,7 +5103,7 @@ static void control_db_results(void) {
     if (!c) continue; /* the client left or timed out: nothing to do */
     char reply[sizeof(r.text) + 16];
     int n = snprintf(reply, sizeof(reply), "%s %s\n", r.ok ? "OK" : "ERROR", r.text);
-    if (n > 0) (void)ctl_send_all(c->fd, reply, (size_t)n);
+    (void)ctl_send_all(c->fd, reply, snprintf_len(n, sizeof(reply)));
     syslog(LOG_NOTICE, "[Control] reload of a database zone answered: %s", r.text);
     c->state = CTRL_STATE_CMD_WAIT; /* it is no longer waiting: free_ctrl_client() must not cancel the finished request */
     g_ctrl_parked--;
@@ -5183,7 +5214,7 @@ STATIC_TEST void ctrl_rollback_zone(int cfd, zone_db_entry_t *e, const zone_conf
     else
       rl = snprintf(reply, sizeof(reply), "ERROR %s\n", zone_rollback_text(rr));
   }
-  if (rl > 0) (void)ctl_send_all(cfd, reply, (size_t)rl);
+  (void)ctl_send_all(cfd, reply, snprintf_len(rl, sizeof(reply)));
 }
 
 /* D17-2 / B6a: a command about a zone that is not in karidns.conf, which may be a zone of the database.  Returns true
@@ -5223,7 +5254,7 @@ static bool db_zone_command(ctrl_client_t *c, const char *cmd, const char *zone,
   if (n >= 2 && !all_views) {
     char m[160];
     int l = snprintf(m, sizeof(m), "ERROR zone exists in multiple views; specify view (e.g. '%s <zone> <view>')\n", cmd);
-    (void)ctl_send_all(cfd, m, (size_t)l);
+    (void)ctl_send_all(cfd, m, snprintf_len(l, sizeof(m)));
     return true;
   }
   if (n == 0 && !is_reload) return false;
@@ -5236,7 +5267,7 @@ static bool db_zone_command(ctrl_client_t *c, const char *cmd, const char *zone,
     if (!db_ingest_pick_view(view_arg, view, sizeof(view), why, sizeof(why))) {
       char m[300];
       int l = snprintf(m, sizeof(m), "ERROR zone not found (%s)\n", why);
-      (void)ctl_send_all(cfd, m, (size_t)l);
+      (void)ctl_send_all(cfd, m, snprintf_len(l, sizeof(m)));
       return true;
     }
   }
@@ -5975,7 +6006,7 @@ void *control_thread_func(void *arg) {
           
           char msg[128];
           int mlen = snprintf(msg, sizeof(msg), "CHALLENGE %s\n", c->challenge);
-          (void)ctl_send_all(cfd, msg, mlen);
+          (void)ctl_send_all(cfd, msg, snprintf_len(mlen, sizeof(msg)));
           c->state = CTRL_STATE_AUTH_WAIT;
         }
       } else if (ev_list[i].udata == (void*)1) {
@@ -6086,7 +6117,7 @@ void *control_thread_func(void *arg) {
               char deny[192];
               int dl = snprintf(deny, sizeof(deny), "ERROR command not allowed for key \"%.100s\"\n", c->key_name);
               syslog(LOG_NOTICE, "[Control] key \"%s\": refused: %s", c->key_name, logline);
-              (void)ctl_send_all(cfd, deny, (size_t)dl);
+              (void)ctl_send_all(cfd, deny, snprintf_len(dl, sizeof(deny)));
             }
 
             if (!allowed) {
@@ -6421,7 +6452,7 @@ void *control_thread_func(void *arg) {
                 char resp_hdr[64];
                 int hlen = snprintf(resp_hdr, sizeof(resp_hdr), "OK %zu\n", (size_t)match_count + obs_fold_n);
                 const int64_t obs_deadline = park_now_ms() + CTL_REPLY_MS;   // (one deadline for the header and every item)
-                bool obs_ok = ctl_send_until(cfd, resp_hdr, (size_t)hlen, obs_deadline);
+                bool obs_ok = ctl_send_until(cfd, resp_hdr, snprintf_len(hlen, sizeof(resp_hdr)), obs_deadline);
 
                 for (uint32_t k = 0; obs_ok && k < match_count; k++) {
                   zone_observatory_snapshot_t snap_item;
@@ -6525,7 +6556,7 @@ void *control_thread_func(void *arg) {
                   }
                   int hlen = snprintf(resp_hdr, sizeof(resp_hdr), "OK %zu %s\n", pn + fn, next[0] ? next : "-");
                   const int64_t pdeadline = park_now_ms() + CTL_REPLY_MS;
-                  bool pok = ctl_send_until(cfd, resp_hdr, (size_t)hlen, pdeadline);
+                  bool pok = ctl_send_until(cfd, resp_hdr, snprintf_len(hlen, sizeof(resp_hdr)), pdeadline);
                   for (size_t k = 0; pok && k < pn; k++) {
                     zone_observatory_snapshot_t snap_item;
                     memset(&snap_item, 0, sizeof(snap_item));
@@ -7594,7 +7625,7 @@ STATIC_TEST void run_frontend_router(pid_t backend_pid, int router_id) {
                 continue;
               }
               sendto(s, buffer + sizeof(udp_ipc_t), msg->payload_len, 0,
-                     (struct sockaddr *)&msg->client_addr, msg->addr_len);
+                     (struct sockaddr *)&msg->client_addr, udp_ipc_addr_len(msg));
               close(s);
               continue;
             }
@@ -7624,7 +7655,7 @@ STATIC_TEST void run_frontend_router(pid_t backend_pid, int router_id) {
             out_msg.msg_iov = &out_iov;
             out_msg.msg_iovlen = 1;
             out_msg.msg_name = &msg->client_addr;
-            out_msg.msg_namelen = (socklen_t)(msg->addr_len <= sizeof(msg->client_addr) ? msg->addr_len : sizeof(msg->client_addr));   /* (from the Backend: never past client_addr) */
+            out_msg.msg_namelen = udp_ipc_addr_len(msg);   /* (from the Backend: never past client_addr) */
 
             router_cmsg_buf_t cbuf;
             memset(&cbuf, 0, sizeof(cbuf));
@@ -7670,7 +7701,7 @@ STATIC_TEST void run_frontend_router(pid_t backend_pid, int router_id) {
               sendmsg(target_sock, &out_msg, 0);
             } else {
               sendto(target_sock, buffer + sizeof(udp_ipc_t), msg->payload_len, 0,
-                     (struct sockaddr *)&msg->client_addr, msg->addr_len);
+                     (struct sockaddr *)&msg->client_addr, udp_ipc_addr_len(msg));
             }
           } else {
             syslog(LOG_WARNING, "[Frontend %d] No suitable socket found to send NOTIFY (family=%d)",
@@ -7742,7 +7773,7 @@ STATIC_TEST void run_frontend_router(pid_t backend_pid, int router_id) {
             fctx->cli_tx_iov[tx_count].iov_len = msg->payload_len;
             /* addr_len comes from the Backend (hostile input): the address is at most the header's client_addr, and the length handed to the kernel is the
              * length copied (a larger one would read past client_addr into the payload) */
-            const size_t copy_len = msg->addr_len <= sizeof(msg->client_addr) ? msg->addr_len : sizeof(msg->client_addr);
+            const size_t copy_len = udp_ipc_addr_len(msg);
             memset(&fctx->cli_tx_addrs[tx_count], 0, sizeof(fctx->cli_tx_addrs[tx_count]));
             memcpy(&fctx->cli_tx_addrs[tx_count], &msg->client_addr, copy_len);
             fctx->cli_tx_msgs[tx_count].msg_hdr.msg_name = &fctx->cli_tx_addrs[tx_count];

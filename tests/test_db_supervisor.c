@@ -690,6 +690,54 @@ static void test_log_pipe(void) {
     unlink(path);
 }
 
+/* D-1 (review 2026-11-22): the exec of a loader with a path longer than the child's message buffer fails.  The message is cut to the buffer:
+ * the length snprintf() returned (what the whole text needed) was written, which sent the bytes of the stack after the buffer down the pipe
+ * (a NUL, logged as \x00, and what followed it). */
+static void test_exec_failure_long_path(void) {
+    printf("an exec failure with a long loader-path (D-1)\n");
+    char dir[PATH_MAX], path[PATH_MAX], err[300], comp[201];
+    memset(comp, 'd', 200);
+    comp[200] = '\0';
+    snprintf(dir, sizeof(dir), "%s/%s", g_dir, comp);
+    CHECK(mkdir(dir, 0755) == 0);
+    snprintf(path, sizeof(path), "%s/%s", dir, comp);           /* about 450 bytes: more than the 300 of the child's buffer */
+    FILE *f = fopen(path, "w");
+    if (f) {
+        fputs("\x01\x02 not a program\n", f);                    /* executable mode, no format: the exec fails (ENOEXEC) after the checks */
+        fclose(f);
+    }
+    chmod(path, 0755);
+    server_config_t cfg;
+    make_cfg(&cfg, path);
+    db_sup_t s;
+    CHECK(db_sup_init(&s, &cfg, err, sizeof(err)));
+    CHECK_MSG(db_sup_open_pairs(&s, err, sizeof(err)), "%s", err);
+    klog_set_hook(test_hook);
+    memset(&g_logged, 0, sizeof(g_logged));
+    CHECK(db_sup_spawn(&s));
+    pid_t pid = s.pid;
+    int st = reap(pid);
+    CHECK_MSG(WIFEXITED(st) && WEXITSTATUS(st) == 127, "the child's status %d", st);
+    CHECK(db_sup_child_exited(&s, pid, st));
+    int found = 0;
+    for (int i = 0; i < g_logged.n && i < 400; i++) {
+        if (!strstr(g_logged.text[i], "cannot execute")) continue;
+        found++;
+        CHECK_MSG(!strstr(g_logged.text[i], "\\x"), "only the message, no byte after the buffer: %s", g_logged.text[i]);
+        CHECK_MSG(strlen(g_logged.text[i]) < 300, "the message is cut to the buffer: %zu bytes", strlen(g_logged.text[i]));
+    }
+    CHECK_MSG(found == 1, "%d \"cannot execute\" line(s) among %d", found, g_logged.n);
+    klog_set_hook(NULL);
+    int ffd = -1;
+    int fd = recv_fds(g_db_ctrl_fd, &ffd);                       /* (a restart's pairs, if any: taken and closed) */
+    if (fd >= 0) close(fd);
+    if (ffd >= 0) close(ffd);
+    db_sup_after_fork_supervisor(&s);
+    db_sup_close_supervisor_ends(&s);
+    unlink(path);
+    rmdir(dir);
+}
+
 /* P5 (a checked file is the file that runs), P1 (a file that fails the checks is not executed), P4 (root by another name) */
 static bool copy_file(const char *from, const char *to, mode_t mode) {
     FILE *in = fopen(from, "rb"), *out = fopen(to, "wb");
@@ -905,6 +953,7 @@ int main(void) {
     test_log_reader();
     test_spawn_and_restart();
     test_log_pipe();
+    test_exec_failure_long_path();
     test_exec_file();
     test_identity_names_root();
     test_recv_take_rights();

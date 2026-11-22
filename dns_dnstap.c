@@ -74,6 +74,24 @@ static bool dnstap_recv_all(int fd, void *buf, size_t n) {
     return true;
 }
 
+/* C-2: the rights of a dnstap socket (the startup one and a reconnected one), cut as soon as it is connected and before the handshake (which
+ * needs only these), by the thread that owns the descriptor at that moment: the Backend's main thread before the sender thread exists, or the
+ * sender thread itself.  No other thread limits a descriptor that the sender may have closed (or whose number another open reused).
+ * CAP_READ / CAP_RECV: the FINISH of Frame Streams at the end (O-03).  false: the socket would keep wider rights and is not used. */
+static bool dnstap_limit_rights(int sock) {
+#ifdef __FreeBSD__
+    cap_rights_t rights;
+    cap_rights_init(&rights, CAP_READ, CAP_RECV, CAP_WRITE, CAP_SEND, CAP_EVENT, CAP_GETSOCKOPT, CAP_SETSOCKOPT, CAP_FCNTL, CAP_SHUTDOWN);
+    if (cap_rights_limit(sock, &rights) != 0 && errno != ENOSYS) {
+        syslog(LOG_ERR, "[dnstap] cap_rights_limit on the dnstap socket failed: %s", strerror(errno));
+        return false;
+    }
+#else
+    (void)sock;
+#endif
+    return true;
+}
+
 int dnstap_connect_and_handshake(const char *socket_path, const char *identity, const char *version) {
     if (!socket_path || !*socket_path) return -1;
     if (identity) {
@@ -97,6 +115,10 @@ int dnstap_connect_and_handshake(const char *socket_path, const char *identity, 
     strncpy(sun.sun_path, socket_path, sizeof(sun.sun_path) - 1);
 
     if (connect(sock, (struct sockaddr *)&sun, sizeof(sun)) < 0) {
+        close(sock);
+        return -1;
+    }
+    if (!dnstap_limit_rights(sock)) {
         close(sock);
         return -1;
     }
@@ -620,17 +642,10 @@ static int dnstap_reconnect(void) {
     tcp_sockopts_t copts = { .connect_timeout_ms = 2000 };
     int sock = broker_connect_opts(AF_UNIX, SOCK_STREAM, (struct sockaddr *)&sun, sizeof(sun), &copts);
     if (sock < 0) return -1;
-#ifdef __FreeBSD__
-    /* the rights are cut before the handshake (it needs only these); a socket that keeps its wider rights is not used */
-    cap_rights_t rights;
-    cap_rights_init(&rights, CAP_READ, CAP_RECV, CAP_WRITE, CAP_SEND, CAP_EVENT, CAP_GETSOCKOPT,
-                    CAP_SETSOCKOPT, CAP_FCNTL, CAP_SHUTDOWN);
-    if (cap_rights_limit(sock, &rights) != 0 && errno != ENOSYS) {
-        syslog(LOG_ERR, "[dnstap] cap_rights_limit on the reconnected socket failed: %s", strerror(errno));
+    if (!dnstap_limit_rights(sock)) {
         close(sock);
         return -1;
     }
-#endif
     if (!dnstap_handshake(sock)) return -1;
     return sock;
 }

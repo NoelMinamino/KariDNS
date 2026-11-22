@@ -36,6 +36,7 @@ static void check_parse(const uint8_t *d, size_t len) {
     const size_t pl = h->payload_len;
     if (start + sizeof(udp_ipc_t) + pl > len) abort();
     if (pl < UDP_IPC_REPLY_MIN && h->sock_fd_idx != UDP_IPC_LOGSTATE) abort();
+    if (udp_ipc_addr_len(h) > sizeof(h->client_addr) || udp_ipc_addr_len(h) > h->addr_len) abort();   /* the address the router hands to the kernel stays in the header */
     if (off <= start || (off != len && off % UDP_IPC_FRAME_ALIGN != 0) || off < prev) abort();
     volatile uint8_t sink = 0;
     const uint8_t *p = (const uint8_t *)h + sizeof(udp_ipc_t);

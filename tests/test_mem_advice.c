@@ -265,6 +265,17 @@ static void test_texts(void) {
     CHECK(strlen(small) == l && l <= sizeof(small) - 1, "advice cut: %zu", l);
     l = ma_text_status(small, sizeof(small), &e);
     CHECK(strlen(small) == l && l <= sizeof(small) - 1, "status (limit) cut: %zu", l);
+    /* F-2 (review 2026-11-22): a buffer of no size gets nothing and the length is 0 (n - l - 1 underflowed to SIZE_MAX) */
+    small[0] = 'x';
+    l = ma_text_status(small, 0, &e);
+    CHECK(l == 0 && small[0] == 'x', "status into 0 bytes: %zu", l);
+    l = ma_text_advice(small, 0, &e);
+    CHECK(l == 0 && small[0] == 'x', "advice into 0 bytes: %zu", l);
+    l = ma_text_estimate(small, 0, &e);
+    CHECK(l == 0 && small[0] == 'x', "estimate into 0 bytes: %zu", l);
+    e.limit = 0;
+    l = ma_text_status(small, 0, &e);
+    CHECK(l == 0 && small[0] == 'x', "status (no limit) into 0 bytes: %zu", l);
 }
 
 static void test_report_due(void) {
@@ -483,7 +494,8 @@ static void test_arc(void) {
     CHECK(a.level == MA_LEVEL_NOTICE && ma_text_arc(t, sizeof(t), &a) > 0 && strstr(t, "little is left over"), "arc notice: %s", t);
     ma_arc_sum(2ull << 30, 16ull << 30, 20ull << 20, 16ull << 30, &a);
     CHECK(a.level == MA_LEVEL_WARNING && ma_text_arc(t, sizeof(t), &a) > 0 && strstr(t, "lower vfs.zfs.arc.max"), "arc warning: %s", t);
-    ma_arc_sum(2ull << 30, 16ull << 30, 20ull << 20, 0, &a);          /* the RAM is not known: nothing to compare with */
+    CHECK(ma_text_arc(t, 0, &a) == 0, "arc warning into 0 bytes (F-2)");
+    ma_arc_sum(2ull << 30, 16ull << 30, 20ull << 20, 0, &a);         /* the RAM is not known: nothing to compare with */
     CHECK(a.level == MA_LEVEL_INFO && a.pct == 0 && a.arc_fit == 0, "arc without ram");
     ma_arc_sum(20ull << 30, 16ull << 30, 20ull << 20, 1ull << 30, &a);   /* the rest alone does not fit */
     CHECK(a.arc_fit == 0 && a.level == MA_LEVEL_WARNING, "arc rest does not fit");

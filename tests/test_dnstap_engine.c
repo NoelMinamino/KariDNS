@@ -12,6 +12,9 @@
 #include <pthread.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#ifdef __FreeBSD__
+#include <sys/capsicum.h>
+#endif
 #include <arpa/inet.h>
 #include <netinet/in.h>
 
@@ -497,6 +500,18 @@ static void test_dnstap_handshake(void) {
 
     int sock = dnstap_connect_and_handshake(sock_path, "karidns-test-id", "1.0.0");
     assert(sock >= 0);
+#ifdef __FreeBSD__
+    /* C-2 (review 2026-11-22): the socket comes back with its rights cut already, before any sender thread can see it (the sandbox entry no
+     * longer limits a descriptor the sender may have closed or replaced meanwhile): what dnstap needs, no CAP_CONNECT / CAP_BIND / CAP_ACCEPT */
+    {
+        cap_rights_t got;
+        assert(cap_rights_get(sock, &got) == 0);
+        assert(cap_rights_is_set(&got, CAP_WRITE, CAP_SEND, CAP_RECV, CAP_EVENT));
+        assert(!cap_rights_is_set(&got, CAP_CONNECT));
+        assert(!cap_rights_is_set(&got, CAP_BIND));
+        assert(!cap_rights_is_set(&got, CAP_ACCEPT));
+    }
+#endif
 
     pthread_join(th, NULL);
     close(sock);

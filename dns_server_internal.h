@@ -201,10 +201,12 @@ tcp_stream_ctx_t *tcp_ctx_alloc(void);
 void tcp_ctx_free(tcp_stream_ctx_t *ctx);
 
 /* DNS メッセージを 2 バイトの長さと一緒に1回の sendmsg() で送る (RFC 7766 §8)。
- * 送り切れなければ書き込み可能になるのを待って続ける。戻り値は送ったメッセージ長、失敗時 -1。 */
+ * 送り切れなければ書き込み可能になるのを待って続ける。戻り値は送ったメッセージ長、失敗時 -1。
+ * S-1: one deadline for the whole message (a worker: tcp-idle-timeout; an outbound transfer: max-transfer-time-out and max-transfer-idle-out). */
 ssize_t send_tcp_dns_message(int fd, const uint8_t *msg, size_t len);
-/* max-transfer-time-out / max-transfer-idle-out of the outbound AXFR/IXFR this thread serves (0 = none); defined in dns_axfr_ixfr.c */
-extern _Thread_local time_t g_tcp_send_deadline_secs;
+/* max-transfer-time-out (its absolute deadline, CLOCK_MONOTONIC ms) / max-transfer-idle-out of the outbound AXFR/IXFR this thread serves (0 = none);
+ * defined in dns_axfr_ixfr.c */
+extern _Thread_local int64_t g_tcp_send_deadline_ms;
 extern _Thread_local uint32_t g_tcp_send_idle_secs;
 
 typedef struct {
@@ -214,6 +216,9 @@ typedef struct {
   int soa_count;
   uint32_t initial_soa_serial;
   uint32_t client_serial;
+  /* X-1: the client serves a version, so client_serial is its serial even when that is 0 (a valid serial: RFC 1982 §3 defines the arithmetic over every value); without it a client_serial of 0
+   * means "no data yet" and any first SOA is taken (a new secondary).  A client_serial other than 0 implies a version. */
+  bool client_has_version;
   /* I1 (RFC 1995 §4): the serial the next deletion sequence must start from: the client's serial for the first
    * sequence, then the serial of the SOA that ended the previous (addition) sequence */
   uint32_t ixfr_expected_serial;
@@ -1881,6 +1886,7 @@ typedef struct {
   bool dnssec_ok;
   size_t question_end;
   zone_db_snapshot_t *snap;
+  uint32_t tcp_send_limit_ms;   /* TCP: how long the answer has to leave (tcp-idle-timeout of the worker, S-1) */
 } async_io_task_t;
 
 typedef struct {

@@ -3171,33 +3171,37 @@ static int parse_rate_limit_config(token_ctx_t *ctx, rate_limit_config_t *rrl) {
     long num_val = strtol(val, &endptr, 10);
     /* 0.6.2 (audit): an empty value, or one above INT_MAX that the (int) below would have wrapped, is invalid too */
     bool valid = (endptr != val && *endptr == '\0' && errno == 0 && num_val >= 0 && num_val <= INT_MAX);
+    /* F-1 (review 2026-11-22): an invalid number is a configuration error, as for every other numeric option (it was a warning, and the
+     * default stayed in force) */
+    bool bad = false;
+    const char *range = "0-2147483647";
 
     if (strcmp(key, "responses-per-second") == 0) {
       if (valid) rrl->responses_per_second = (int)num_val;
-      else rrl_ignored(ctx, "Invalid value '%s' for rate-limit option '%s', ignoring", val, key);
+      else bad = true;
     } else if (strcmp(key, "nodata-per-second") == 0) {
       if (valid) {
         rrl->nodata_per_second = (int)num_val;
         rrl->nodata_per_second_set = true;
       } else {
-        rrl_ignored(ctx, "Invalid value '%s' for rate-limit option '%s', ignoring", val, key);
+        bad = true;
       }
     } else if (strcmp(key, "nxdomains-per-second") == 0) {
       if (valid) rrl->nxdomains_per_second = (int)num_val;
-      else rrl_ignored(ctx, "Invalid value '%s' for rate-limit option '%s', ignoring", val, key);
+      else bad = true;
     } else if (strcmp(key, "errors-per-second") == 0) {
       if (valid) rrl->errors_per_second = (int)num_val;
-      else rrl_ignored(ctx, "Invalid value '%s' for rate-limit option '%s', ignoring", val, key);
+      else bad = true;
     } else if (strcmp(key, "referrals-per-second") == 0) {
       if (valid) {
         rrl->referrals_per_second = (int)num_val;
         rrl->referrals_per_second_set = true;
       } else {
-        rrl_ignored(ctx, "Invalid value '%s' for rate-limit option '%s', ignoring", val, key);
+        bad = true;
       }
     } else if (strcmp(key, "all-per-second") == 0) {
       if (valid) rrl->all_per_second = (int)num_val;
-      else rrl_ignored(ctx, "Invalid value '%s' for rate-limit option '%s', ignoring", val, key);
+      else bad = true;
     } else if (strcmp(key, "ipv4-prefix-length") == 0 || strcmp(key, "ipv6-prefix-length") == 0) {
       /* D-05: BIND と同じ名前と範囲 (IPv4 0-32、IPv6 0-128) */
       bool v4 = (key[3] == '4');
@@ -3211,19 +3215,23 @@ static int parse_rate_limit_config(token_ctx_t *ctx, rate_limit_config_t *rrl) {
           rrl->ipv6_prefix_length_set = true;
         }
       } else {
-        rrl_ignored(ctx, "Invalid value '%s' for rate-limit option '%s' (0-%ld), ignoring",
-               val, key, max_len);
+        bad = true;
+        range = v4 ? "0-32" : "0-128";
       }
     } else if (strcmp(key, "qps-scale") == 0 || strcmp(key, "min-table-size") == 0 ||
                strcmp(key, "max-table-size") == 0) {
       /* BIND の設定をそのまま読めるように受け付けるが、表は固定長でこれらは効かない (D-05) */
       rrl_ignored(ctx, "rate-limit option '%s' is accepted for BIND compatibility but has no effect", key);
     } else if (strcmp(key, "window") == 0) {
-      if (*endptr == '\0' && num_val > 0) rrl->window_seconds = (int)num_val;
-      else rrl_ignored(ctx, "Invalid value '%s' for rate-limit option '%s', ignoring", val, key);
+      if (valid && num_val > 0) {
+        rrl->window_seconds = (int)num_val;
+      } else {
+        bad = true;
+        range = "1-2147483647";
+      }
     } else if (strcmp(key, "slip") == 0) {
       if (valid) rrl->slip = (int)num_val;
-      else rrl_ignored(ctx, "Invalid value '%s' for rate-limit option '%s', ignoring", val, key);
+      else bad = true;
     } else if (strcmp(key, "log-only") == 0 || strcmp(key, "early-drop") == 0) {
       bool *dst = (strcmp(key, "log-only") == 0) ? &rrl->log_only : &rrl->early_drop;
       if (!parse_config_bool(val, dst)) {
@@ -3234,6 +3242,12 @@ static int parse_rate_limit_config(token_ctx_t *ctx, rate_limit_config_t *rrl) {
       }
     } else {
       rrl_ignored(ctx, "Unknown rate-limit option '%s'", key);
+    }
+    if (bad) {
+      conf_error(ctx, "rate-limit", "invalid value '%s' for '%s' (an integer %s)", val, key, range);
+      free(key);
+      free(val);
+      return -1;
     }
     free(key);
     free(val);

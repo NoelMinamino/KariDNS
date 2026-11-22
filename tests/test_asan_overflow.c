@@ -1863,22 +1863,12 @@ int main() {
         char *copy_rrl = strdup(conf_invalid_rrl);
         int rrl_res = parse_named_conf(copy_rrl, &rrl_cfg);
         free(copy_rrl);
-        if (rrl_res != 0) {
-            printf("FAIL: parse_named_conf failed on rate-limit config with invalid values\n");
+        // F-1 (review 2026-11-22): an invalid value is a configuration error (it was ignored with a warning), freed without a leak
+        if (rrl_res == 0) {
+            printf("FAIL: parse_named_conf accepted rate-limit config with invalid values\n");
             return 1;
         }
-        // Invalid values should be ignored, leaving defaults:
-        // responses_per_second default = 0, nxdomains default = 0, window default = 15, slip default = 2
-        if (rrl_cfg.rrl.responses_per_second != 0 ||
-            rrl_cfg.rrl.nxdomains_per_second != 0 ||
-            rrl_cfg.rrl.window_seconds != 15 ||
-            rrl_cfg.rrl.slip != 2) {
-            printf("FAIL: Rate-limit invalid values were not properly ignored (res_ps=%u, win=%u, slip=%u)\n",
-                   rrl_cfg.rrl.responses_per_second,
-                   rrl_cfg.rrl.window_seconds,
-                   rrl_cfg.rrl.slip);
-            return 1;
-        }
+        memset(&rrl_cfg, 0, sizeof(rrl_cfg));
 
         // Test valid rate-limit values
         const char *conf_valid_rrl = 
