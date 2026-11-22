@@ -2559,7 +2559,13 @@ static void test_no_wait_in_lock(int mode) {
       ops++;
     }
     for (int w = 0; w < 5000 && atomic_load(&g_slow_step) != 0; w++) usleep(1000);
-    for (int w = 0; w < 5000; w++) { store_stats(s, &st); if (st.growths_background > bg0) break; usleep(1000); }
+    /* store_stats() reads growths (n_growths) before growths_background (n_growths_bg), and the build adds to them in that order under the mutex: a snapshot taken
+     * while it publishes can hold the new background count with the old growth count (CI 14.4: growths 0, background 1).  Wait (5 s) for both, not for the second only */
+    for (int w = 0; w < 5000; w++) {
+      store_stats(s, &st);
+      if (st.growths_background > bg0 && st.growths >= g0 + (st.growths_background - bg0)) break;
+      usleep(1000);
+    }
     out[4] = worst;
     out[5] = ops;
     out[6] = st.growths_background > bg0 && st.growths == g0 + (st.growths_background - bg0);
@@ -2859,7 +2865,7 @@ static void test_growth_catchup(void) {
     }
     atomic_store(&g_gc_idle, 1);
     store_stats(s, &st);
-    for (int w = 0; w < 5000 && st.growths_background == 0; w++) { usleep(1000); store_stats(s, &st); }
+    for (int w = 0; w < 5000 && (st.growths_background == 0 || st.growths < st.growths_background); w++) { usleep(1000); store_stats(s, &st); }   /* (both counters: see the regrow case) */
     atomic_store(&store_test_regrow_hook, NULL);
     atomic_store(&store_test_rg_tail, -1);
     CHECK_EQ(st.growths_background, 1);
@@ -3023,7 +3029,7 @@ static void test_index_wait(void) {
       atomic_store(&g_ix_state, 2);                                      /* (the build goes on: it is not dropped) */
       pthread_join(th, NULL);
       CHECK_EQ(atomic_load(&g_ix_ret), 1);
-      for (int w = 0; w < 5000; w++) { store_stats(s, &st); if (st.growths_background == 1) break; usleep(1000); }
+      for (int w = 0; w < 5000; w++) { store_stats(s, &st); if (st.growths_background == 1 && st.growths >= 1) break; usleep(1000); }
       CHECK_EQ(st.growths_background, 1);
       CHECK_EQ(st.growths, 1);                                           /* (no growth inside the mutex) */
       CHECK_EQ(st.index_waits, 1);
@@ -3041,7 +3047,7 @@ static void test_index_wait(void) {
       CHECK_EQ(put_i(s, 0, n++, 1, NULL), 0);
       CHECK_EQ(store_index_wait(s), 0);
       atomic_store(&g_ix_state, 2);
-      for (int w = 0; w < 5000; w++) { store_stats(s, &st); if (st.growths_background == 1) break; usleep(1000); }
+      for (int w = 0; w < 5000; w++) { store_stats(s, &st); if (st.growths_background == 1 && st.growths >= 1) break; usleep(1000); }
       CHECK_EQ(st.growths_background, 1);
       CHECK_EQ(st.growths, 1);
       CHECK_EQ(st.index_waits, 1);
