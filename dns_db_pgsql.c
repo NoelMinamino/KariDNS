@@ -1432,6 +1432,9 @@ static int pg_count_domains(db_conn_t *c, const char *view, uint64_t *n) {
     return 0;
 }
 
+#ifdef KARIDNS_UNIT_TEST
+static unsigned pg_test_manifest_rows;                  /* the rows of the last manifest_page result (tests: the view rows are bounded) */
+#endif
 static int pg_manifest_page(db_conn_t *c, int64_t after_id, unsigned limit, db_manifest_cb cb, void *ud, int64_t *last_id, unsigned *nrows) {
     *last_id = after_id;
     *nrows = 0;
@@ -1442,14 +1445,24 @@ static int pg_manifest_page(db_conn_t *c, int64_t after_id, unsigned limit, db_m
     if (!c->has_zone_state) return need_schema3(c, "manifest_page", "karidns_zone_state");
     /* the page of domains is cut first (an index scan on the primary key, LIMIT), then joined; the rows of one domain stay together.  Every joined
      * table carries the page's lower bound as well (S0, 10M rows): with the equality alone PostgreSQL merge-joins karidns_zone_state from its first row on
-     * every page (1.9 s for a page at id 5M); with the bound a page is ~10 ms. */
-    char sql[900];
-    snprintf(sql, sizeof(sql),
-             "SELECT d.id, d.name, d.type, s.generation, s.changed_at, %s FROM (SELECT id, name, type FROM domains WHERE id > $1::bigint ORDER BY id LIMIT $2::bigint) d "
-             "LEFT JOIN karidns_zone_state s ON s.domain_id = d.id AND s.domain_id > $1::bigint %s ORDER BY d.id%s",
-             c->has_domain_views ? "v.view_name" : "NULL::text",
-             c->has_domain_views ? "LEFT JOIN karidns_domain_views v ON v.domain_id = d.id AND v.domain_id > $1::bigint" : "",
-             c->has_domain_views ? ", v.view_name COLLATE \"C\"" : "");
+     * every page (1.9 s for a page at id 5M); with the bound a page is ~10 ms.
+     * The views of a domain are bounded in the statement as well (review D-3): PQexecPrepared() holds every row of the result in the loader's memory before the first is looked at, and a
+     * page of 100,000 domains with hundreds of karidns_domain_views rows each was unbounded.  The view rows are those of the page's id range (the lower bound as above, the upper bound the
+     * page's last id), numbered per domain, and only the first DB_MANIFEST_MAX_VIEWS + 1 of each are joined: one more than a row carries, so that db_mgroup_view() still names the domain. */
+    char sql[1200];
+    if (c->has_domain_views)
+        snprintf(sql, sizeof(sql),
+                 "WITH d AS (SELECT id, name, type FROM domains WHERE id > $1::bigint ORDER BY id LIMIT $2::bigint) "
+                 "SELECT d.id, d.name, d.type, s.generation, s.changed_at, v.view_name FROM d "
+                 "LEFT JOIN karidns_zone_state s ON s.domain_id = d.id AND s.domain_id > $1::bigint "
+                 "LEFT JOIN (SELECT domain_id, view_name, row_number() OVER (PARTITION BY domain_id ORDER BY view_name COLLATE \"C\") AS rn FROM karidns_domain_views "
+                 "WHERE domain_id > $1::bigint AND domain_id <= (SELECT max(id) FROM d)) v ON v.domain_id = d.id AND v.rn <= %d "
+                 "ORDER BY d.id, v.view_name COLLATE \"C\"",
+                 DB_MANIFEST_MAX_VIEWS + 1);
+    else
+        snprintf(sql, sizeof(sql),
+                 "SELECT d.id, d.name, d.type, s.generation, s.changed_at, NULL::text FROM (SELECT id, name, type FROM domains WHERE id > $1::bigint ORDER BY id LIMIT $2::bigint) d "
+                 "LEFT JOIN karidns_zone_state s ON s.domain_id = d.id AND s.domain_id > $1::bigint ORDER BY d.id");
     char p1[32], p2[32];
     snprintf(p1, sizeof(p1), "%lld", (long long)after_id);
     snprintf(p2, sizeof(p2), "%u", limit);
@@ -1457,6 +1470,9 @@ static int pg_manifest_page(db_conn_t *c, int64_t after_id, unsigned limit, db_m
     PGresult *r = NULL;
     int ret = rs_exec(c, RS_MANIFEST, sql, 2, pv, &r, "manifest_page");
     if (ret != 0) return ret;
+#ifdef KARIDNS_UNIT_TEST
+    pg_test_manifest_rows = (unsigned)PQntuples(r);
+#endif
     db_mgroup_t *g = &c->mg;
     g->open = false;
     for (int i = 0; i < PQntuples(r) && ret == 0; i++) {
@@ -1475,7 +1491,7 @@ static int pg_manifest_page(db_conn_t *c, int64_t after_id, unsigned limit, db_m
             const char *name = cell_text(c, r, i, 1, "domains", id, "name", &bad);
             const char *type = cell_text(c, r, i, 2, "domains", id, "type", &bad);
             bool has_state = !PQgetisnull(r, i, 3);
-            const char *why = bad ? NULL : db_mgroup_start(g, id, name, type, has_state, (uint64_t)cell_i64(r, i, 3), (uint64_t)cell_i64(r, i, 4));
+            const char *why = bad ? NULL : db_mgroup_start(g, id, name, type, has_state, cell_i64(r, i, 3), cell_i64(r, i, 4));
             if (why) {
                 set_err(c, "table domains id %lld: %s", (long long)id, why);
                 bad = true;
@@ -2351,7 +2367,8 @@ static int pg_w_zone_generation(db_conn_t *c, int64_t domain_id, uint64_t *gener
     const char *pv[1] = { did };
     PGresult *r = NULL;
     if ((ret = wq(c, W_ZGEN, pv, &r, PGRES_TUPLES_OK, "w_zone_generation")) != 0) return ret;
-    *generation = (uint64_t)cell_i64(r, 0, 0);
+    const int64_t g = cell_i64(r, 0, 0);
+    *generation = g < 0 ? 0 : (uint64_t)g;                  /* (a negative one, which the schema's CHECK forbids, is 0: as SQLite3 and the manifest, review D-5) */
     PQclear(r);
     return 0;
 }
