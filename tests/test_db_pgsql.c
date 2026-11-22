@@ -1049,6 +1049,60 @@ static void test_search_path(void) {
     Q("DROP SCHEMA karidns_test_s1 CASCADE");
 }
 
+/* review (the PostgreSQL sibling of D-7): an integer cell is read whole.  A column of another type than the PowerDNS schema's (here records.ttl as TEXT) gave the number its text began
+ * with ('300abc' was 300, '1.5' 1) and the limit for one out of range; it is an error now, and `karicheck db` warns about the column's type. */
+static void test_int_cells(void) {
+    printf("integer cells (strict)\n");
+    Q("CREATE SCHEMA karidns_test_s3");
+    char path[500];
+    snprintf(path, sizeof(path), "%s/pdns_schema.pgsql.sql", g_root);
+    char *sql = slurp(path);
+    CHECK(sql != NULL);
+    if (!sql) return;
+    Q("SET search_path TO karidns_test_s3");
+    Q(sql);
+    free(sql);
+    Q("ALTER TABLE records ALTER COLUMN ttl TYPE text");
+    Q("INSERT INTO domains (id, name, type) VALUES (5, 'int.test', 'NATIVE')");
+    Q("INSERT INTO records (id, domain_id, name, type, content, ttl) VALUES (51, 5, 'int.test', 'SOA', 'ns.int.test h.int.test 1 3600 600 86400 300', '300abc')");
+    Q("RESET search_path");
+    db_conn_t *c = open_drv("karidns_test_s3");
+    if (!c) return;
+    db_schema_info_t si;
+    CHECK(D->check_schema(c, &si) == 0);                                    /* (the type alone does not refuse the schema) */
+    fnd_t f;
+    memset(&f, 0, sizeof(f));
+    CHECK(D->schema_findings(c, NULL, fnd_sink, &f) == 0);
+    CHECK_HAS(f.text, "W:table records: column ttl is not of an integer type");
+    CHECK(strstr(f.text, "column id is not") == NULL && strstr(f.text, "table domains: column") == NULL);
+    static const char *const bad_vals[] = { "300abc", "1.5", " 300", "+300", "99999999999999999999", "-", "" };
+    for (size_t k = 0; k < sizeof(bad_vals) / sizeof(bad_vals[0]); k++) {
+        char upd[200];
+        snprintf(upd, sizeof(upd), "UPDATE karidns_test_s3.records SET ttl = '%s' WHERE id = 51", bad_vals[k]);
+        Q(upd);
+        racc_t *a = calloc(1, sizeof(*a));
+        CHECK(D->begin_snapshot(c) == 0);
+        const int rc = D->scan_records(c, NULL, cb_rec, a);
+        CHECK_MSG(rc == -1 && a->n == 0 && strstr(D->errmsg(c), "column ttl of the result: the value is not an integer"), "ttl '%s': rc %d, %d rows, %s", bad_vals[k], rc, a->n, D->errmsg(c));
+        D->end_snapshot(c);
+        free(a);
+    }
+    static const struct { const char *v; int64_t want; } good[] = { { "300", 300 }, { "-1", -1 }, { "9223372036854775807", INT64_MAX }, { "0", 0 } };
+    for (size_t k = 0; k < sizeof(good) / sizeof(good[0]); k++) {
+        char upd[200];
+        snprintf(upd, sizeof(upd), "UPDATE karidns_test_s3.records SET ttl = '%s' WHERE id = 51", good[k].v);
+        Q(upd);
+        racc_t *a = calloc(1, sizeof(*a));
+        CHECK(D->begin_snapshot(c) == 0);
+        const int rc = D->scan_records(c, NULL, cb_rec, a);
+        CHECK_MSG(rc == 0 && a->n == 1 && a->r[0].ttl == good[k].want && !a->r[0].ttl_null, "ttl '%s': rc %d, %d rows, %lld", good[k].v, rc, a->n, a->n ? (long long)a->r[0].ttl : 0);
+        D->end_snapshot(c);
+        free(a);
+    }
+    D->close(c);
+    Q("DROP SCHEMA karidns_test_s3 CASCADE");
+}
+
 /* the cursor protocol the loader uses: changes_max() inside a snapshot, changes_since(cursor) */
 static uint64_t snap_max(db_conn_t *c) {
     uint64_t m = 0;
@@ -2615,6 +2669,7 @@ int main(int argc, char **argv) {
     test_keys_in();
     test_signer_waiting();
     test_search_path();
+    test_int_cells();
     test_changes();
     test_notify();
     test_errors();
