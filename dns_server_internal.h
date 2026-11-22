@@ -731,6 +731,10 @@ enum { ZDIR_ST_ABSENT = 0, ZDIR_ST_RESIDENT, ZDIR_ST_LOADING, ZDIR_ST_ERROR };
 #define ZDIR_F_ALIAS     0x0002u   /* the image has an ALIAS RRset */
 #define ZDIR_F_WILDCARD  0x0004u   /* the image has a wildcard owner */
 #define ZDIR_F_PIN       0x0008u   /* never evicted (reserved: set by a later milestone) */
+/* zdir_elem.sig_hold (0.7 signer-wait) */
+#define ZDIR_SIG_MEM      0x01u   /* the version in memory is held (the database has a newer one that waits for the signer): not taken out, counted as pinned */
+#define ZDIR_SIG_OLD      0x02u   /* the hold was made for a loader before the one that connected last, which has not said it again yet (without the store: dbreg_signer_carry()) */
+#define ZDIR_SIG_UNSIGNED 0x04u   /* the zone waits for the signer but nothing of it is in memory: a fetch reads it as it is, and that is said (dbreg_signer_unsigned_take()) */
 #define ZDIR_F_NOCACHE   0x0010u   /* never kept resident after an answer (reserved) */
 #define ZDIR_F_NOTIFY_DEFER 0x0020u /* D1a step 7: the NOTIFY of this zone could not be queued (the ring was full): the control thread's sweep queues it later.  (D1b's "partly resident" bit, never used, gave the place; D1b takes another when it comes) */
 #define ZDIR_F_EVICT_NEXT 0x0040u  /* take out of memory first (as soon as the queries it was loaded for are answered): a zone that was admitted against the frequency order, or a no-cache zone */
@@ -805,7 +809,7 @@ struct zdir_elem {
   uint32_t hash;               /* calc_fnv1a_strn(name, klen): the index hash */
   uint32_t zid;                /* ZDIR_K_STORED: the zone id in the store (dns_store.h) */
   uint16_t sview;              /* ... and the id of its view in the store */
-  uint8_t sig_hold;            /* 0.7 signer-wait: a newer version waits for karidns-signer and this one keeps serving (dbreg_signer_hold()): not taken out of memory, as a pinned zone; cleared when a version is registered (under g_zone_db_rebuild_lock; in the padding after sview) */
+  uint8_t sig_hold;            /* 0.7 signer-wait, ZDIR_SIG_* (under g_zone_db_rebuild_lock; in the padding after sview): MEM, a newer version waits for karidns-signer and this one keeps serving (dbreg_signer_hold()): not taken out of memory, as a pinned zone; all cleared when a version is registered */
   _Atomic uint32_t freq;     /* D1a step 5: how often the zone is asked for (GDSF, cache admission).  Non-resident zone: +1 per query that parks; the cache manager folds the queries of a resident zone in (observatory counter) and halves it at each round */
   uint32_t qseen;              /* D1a step 5: the zone entry's query counter (low 32 bits) when the cache manager last folded it into freq */
   uint32_t t_load;             /* D1a step 5: when the data came into memory (ms of a monotonic clock, 32 bits): a zone is not taken out again before its queries are answered */
@@ -1441,6 +1445,18 @@ void dbreg_pin_changed(zone_db_entry_t *e);
  * of the database, not hidden, not on its way out)?  When it has, the element is held (sig_hold): the cache manager and room on demand do not take it out, as for a pinned zone, until the next version is
  * registered or the hold is let go (on false: the loader released the zone).  Returns whether the zone is held now.  Takes the registry lock (the records lock may be held: it comes first). */
 bool dbreg_signer_hold(const char *view, const char *name, bool on);
+/* 0.7 signer-wait without the store protocol (ZONE_HOLD, dns_db_ingest.c): the loader says that the zone (view, name with the trailing dot, its database id: another id is ignored)
+ * waits for the signer (keep: KDB_HOLD_KEEP), or no longer (KDB_HOLD_RELEASE).  keep holds the version in memory as dbreg_signer_hold() does (ZDIR_SIG_MEM), or, when the zone's data is out
+ * of memory, marks it ZDIR_SIG_UNSIGNED: the fetch that a query makes reads it as it is, and dbreg_signer_unsigned_take() says so.  Returns ZDIR_SIG_MEM, ZDIR_SIG_UNSIGNED or 0 (no such
+ * zone, another id, a secondary, a release), with ZDIR_SIG_OLD when the hold was one of an earlier loader that this one says again (dbreg_signer_carry()).  Takes the registry lock. */
+int dbreg_signer_mark(const char *view, const char *name, int64_t source_id, bool keep);
+/* the zone was marked ZDIR_SIG_UNSIGNED (above): true once, and the mark goes (a fetched body of it is installed now) */
+bool dbreg_signer_unsigned_take(const char *view, const char *name);
+/* 0.7 signer-wait (d), without the store: the holds of the elements live as long as the registry, across a restart of the loader.  end false (a loader connected): every hold is marked
+ * ZDIR_SIG_OLD; end true (its first batch said which zones wait, BATCH_END KDB_BEF_SIGNER_SET): the holds it did not confirm are let go.  Returns the zones let go.  Takes the registry lock; walks it. */
+size_t dbreg_signer_carry(bool end);
+/* 0.7 signer-wait: the zones held in memory for the signer now and their bytes (a walk of the registry under its lock: for karictl dbstatus) */
+void dbreg_signer_pinned(uint64_t *zones, uint64_t *bytes);
 void dbreg_err_stats(size_t *n, uint64_t *noted, uint64_t *dropped);
 #ifdef KARIDNS_UNIT_TEST
 void dbreg_err_reset_for_test(void);

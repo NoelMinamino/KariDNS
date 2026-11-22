@@ -2348,6 +2348,63 @@ static void test_bgload_cache(void) {
     zone_retire_process(true);
 }
 
+/* ---- 0.7 signer-wait without the store (ZONE_HOLD): a zone held for the signer stays in memory under memory-limit (c), its hold lives across a loader's restart until the
+ * loader's first batch says it again (d); a zone that is out of memory is marked, and the fetch that reads it says so ---- */
+static void test_signer_marks(void) {
+    printf("[TEST] signer-wait: ZONE_HOLD keeps the version in memory under memory-limit; the holds of a loader before the last one go unless said again...\n");
+    dbreg_reset();
+    rebuild(load_conf("view \"default\" { match-clients { any; }; };\n"));
+    gc_snapshot_wait_idle();
+    zone_retire_process(true);
+    const char *names[3] = { "sg0.test.", "pl1.test.", "pl2.test." };
+    zone_db_entry_t *z[3];
+    for (int i = 0; i < 3; i++) {
+        z[i] = add_zone("default", names[i], 1, 100, 9700 + i);
+        CHECK(z[i] != NULL && snapshot_apply_db_delta() == 1);
+    }
+    usleep(200 * 1000);                                                           /* (a zone is not taken out within 100 ms of its load) */
+    /* the claim of the loader is checked: another id, a zone that does not exist */
+    CHECK(dbreg_signer_mark("default", "sg0.test.", 1234, true) == 0);
+    CHECK(dbreg_signer_mark("default", "none.test.", 9700, true) == 0);
+    CHECK(dbreg_signer_mark("nosuchview", "sg0.test.", 9700, true) == 0);
+    CHECK(dbreg_signer_mark("default", "sg0.test.", 9700, true) == ZDIR_SIG_MEM);
+    uint64_t pz = 9, pb = 9;
+    /* memory-limit far below what is in memory: every zone but the held one goes; the held one is counted and does not hold back a fetch (dbreg_cache_over_limit()) */
+    dbreg_cache_set_limit(4096);
+    for (int r = 0; r < 4; r++) (void)dbreg_cache_round();
+    CHECK(dbreg_lookup_entry("default", "sg0.test.") == z[0]);
+    CHECK(dbreg_lookup_entry("default", "pl1.test.") == NULL && dbreg_lookup_entry("default", "pl2.test.") == NULL);
+    dbreg_signer_pinned(&pz, &pb);
+    CHECK(pz == 1 && pb > 4096);
+    CHECK(!dbreg_cache_over_limit());
+    /* a loader connects: the hold is carried; the end of its first batch keeps it when it was said again, lets it go otherwise */
+    CHECK(dbreg_signer_carry(false) == 0);
+    const int again = dbreg_signer_mark("default", "sg0.test.", 9700, true);
+    CHECK(again == (ZDIR_SIG_MEM | ZDIR_SIG_OLD));
+    CHECK(dbreg_signer_carry(true) == 0);
+    (void)dbreg_cache_round();
+    CHECK(dbreg_lookup_entry("default", "sg0.test.") == z[0]);
+    CHECK(dbreg_signer_carry(false) == 0);
+    CHECK(dbreg_signer_carry(true) == 1);                                         /* (not said again: let go) */
+    for (int r = 0; r < 4; r++) (void)dbreg_cache_round();
+    CHECK(dbreg_lookup_entry("default", "sg0.test.") == NULL);                    /* (no longer held: memory-limit takes it out) */
+    dbreg_signer_pinned(&pz, &pb);
+    CHECK(pz == 0 && pb == 0);
+    /* out of memory: a hold marks it, and the fetch that installs its body takes the mark once */
+    CHECK(dbreg_signer_mark("default", "pl1.test.", 9701, true) == ZDIR_SIG_UNSIGNED);
+    CHECK(dbreg_signer_unsigned_take("default", "pl1.test.") && !dbreg_signer_unsigned_take("default", "pl1.test."));
+    CHECK(!dbreg_signer_unsigned_take("default", "none.test."));
+    CHECK(dbreg_signer_mark("default", "pl2.test.", 9702, true) == ZDIR_SIG_UNSIGNED);
+    CHECK(dbreg_signer_mark("default", "pl2.test.", 9702, false) == 0);           /* (a release clears the mark) */
+    CHECK(!dbreg_signer_unsigned_take("default", "pl2.test."));
+    dbreg_cache_set_limit(0);
+    zone_retire_process(true);
+    dbreg_reset();
+    rebuild(load_conf("view \"default\" { match-clients { any; }; };\n"));
+    gc_snapshot_wait_idle();
+    zone_retire_process(true);
+}
+
 /* ---- 0.7 B2 W8: room on demand: dbreg_cache_make_room() ---- */
 static uint32_t room_mono32(void) {
     struct timespec ts;
@@ -3123,6 +3180,7 @@ int main(void) {
     test_zone_bytes();
     test_prev_db();
     test_bgload_cache();
+    test_signer_marks();
     test_room_on_demand();
     test_prev_concurrent();
     test_evict_drops_ixfr_history();

@@ -4966,7 +4966,52 @@ static int run_signer_hold(const char *dir) {
     CHECK(p_result_holds(&mainc, &m, 10000, hs, hst, 8) == 0);
     CHECK(zrec(st, rh, &z) && z.serial == 2 && z.stamp_gen == 3 && (z.flags & STORE_F_SIGNER_HELD));
     CHECK(!scan_wants(p_sid(ZH)));
-    db_recon_held_reset();                                              /* (what the HELLO of a loader does) */
+    db_recon_held_reset();                                              /* (what the HELLO of a loader did before 0.7 (d)) */
+    CHECK(scan_wants(p_sid(ZH)));
+
+    /* -- 0.7 (d): the HELLO of a new loader carries the holds of before it (db_recon_held_carry()).  H is held again for the loader before (a hold, then the bits of a new loader) */
+    p_batch_begin(a[0], &e, bid, KDB_BATCH_AUTO, 0);
+    p_changes(a[0], &e, bid, ++cur, true, c, 1);
+    p_batch_end(a[0], &e, bid++, 1, 0);
+    CHECK(p_result_holds(&mainc, &m, 10000, hs, hst, 8) == 0);
+    CHECK(zrec(st, rh, &z) && (z.flags & STORE_F_SIGNER_HELD) && z.stamp_gen == 3);
+    db_recon_held_carry();
+    CHECK(!scan_wants(p_sid(ZH)));                                      /* (carried: the scan passes it until the first batch has said which zones wait) */
+    /* an entry without the flag (the drain or the pass of a start) records the stamp and does not let go of the hold */
+    c[0].hold = false;
+    c[0].gen = 4;
+    c[0].time = 40;
+    p_batch_begin(a[0], &e, bid, KDB_BATCH_STARTUP, 0);
+    p_changes(a[0], &e, bid, ++cur, true, c, 1);
+    p_batch_end(a[0], &e, bid++, 1, 0);
+    CHECK(p_result_holds(&mainc, &m, 10000, hs, hst, 8) == 0);
+    CHECK(rq_collect(&fetchc, rq, 16, 1000) == 0);
+    CHECK(zrec(st, rh, &z) && z.serial == 2 && z.stamp_gen == 4 && (z.flags & STORE_F_SIGNER_HELD) && !(z.flags & STORE_F_STALE));
+    CHECK(!scan_wants(p_sid(ZH)));
+    /* the entry with the flag confirms it; the end of the batch (BATCH_END KDB_BEF_SIGNER_SET) ends the carry: H stays held for this loader */
+    db_recon_status_t rst;
+    db_recon_status(&rst);
+    const uint64_t carried0 = rst.signer_carried;
+    c[0].hold = true;
+    p_batch_begin(a[0], &e, bid, KDB_BATCH_STARTUP, 0);
+    p_changes(a[0], &e, bid, ++cur, true, c, 1);
+    kdb_enc_begin(&e, KDB_T_BATCH_END);
+    kdb_enc_u64(&e, 1, bid++); kdb_enc_u32(&e, 2, 1); kdb_enc_u32(&e, 3, 0); kdb_enc_u32(&e, 4, 0); kdb_enc_u8(&e, 5, KDB_BEF_SIGNER_SET);
+    kdb_enc_end(&e);
+    ch_send(a[0], &e);
+    CHECK(p_result_holds(&mainc, &m, 10000, hs, hst, 8) == 0);
+    db_recon_status(&rst);
+    CHECK(rst.signer_carried == carried0 + 1);
+    CHECK(db_recon_held_carry_end() == 0);                              /* (the batch end ended it already) */
+    CHECK(!scan_wants(p_sid(ZH)));
+    CHECK(rq_collect(&fetchc, rq, 16, 1000) == 0);
+    /* a carry that nobody confirms: its end lets go of the hold, the scan asks for the body (read as it is) */
+    db_recon_held_carry();
+    CHECK(!scan_wants(p_sid(ZH)));
+    CHECK(db_recon_held_carry_end() == 0);
+    CHECK(scan_wants(p_sid(ZH)));
+    db_recon_held_carry();
+    db_recon_held_reset();                                              /* (a reset ends a carry as well) */
     CHECK(scan_wants(p_sid(ZH)));
     gc_snapshot_wait_idle();
     db_store_batch_end();

@@ -11,7 +11,7 @@
 #       - `karictl reload <zone>` and `karictl reload` read the zone as it is: the new answer is served and dbstatus stops naming the zone;
 #       - a zone that is new to the Backend is read as it is (also with the metadata); a deleted zone leaves the list of waiting zones;
 #         with the zone store (DB_STORE=on) it is said: a WARNING in the log, `karictl dbstatus <zone>` ("serving a version the signer has not signed yet"), store.recon.signer.unsigned;
-#       - a restart reads the changed zone as it is (the full comparison of the start);
+#       - a restart reads the changed zone as it is (it has no state row of the signer; the holds across a restart: run_db_signer_restart_test.sh);
 #       - a waiting zone that loses the metadata X-KARIDNS-SIGNER is read as it is at the next batch and leaves the list;
 #   S2  signer-wait no: the same change is served by auto reload, nothing waits; karictl reconfig switches between the two;
 #   S4  a reload request that comes before the poll of the loader has read the change rows: the zone does not go on the list afterwards; a later change does;
@@ -233,7 +233,7 @@ sleep 3
 check_ans "waiting again" "192.0.2.21" www.sg.test
 stop_server
 start_server
-# (with the store the version is read in the background after the start: the Backend held it for the loader before, db_recon_held_reset(); bounded wait in both modes)
+# (the zone has no row in karidns_signer_state, so the loader does not take it for one that waits (0.7 (d): run_db_signer_restart_test.sh); with the store the held version is let go at the end of the first batch and read in the background; bounded wait in both modes)
 if wait_ans www.sg.test 192.0.2.22 10; then pass "a restart reads the changed zone as it is (the full comparison of the start; the store: the held version is fetched)"; else fail "a restart: got '$(qa www.sg.test)', want 192.0.2.22"; dbst | sed 's/^/         /'; fi
 nowait && pass "...and nothing waits after the restart" || fail "waiting zones after the restart"
 

@@ -115,6 +115,9 @@ typedef struct store_recon {
   /* 0.7 signer-wait, since the start: versions that waited for karidns-signer while a signed one kept serving (held), of those the ones only the version in memory kept (the store had no image of the
    * zone), and versions served although the signer has not signed them (no signed version was here to keep: STORE_F_SIGNER_UNSIGNED) */
   uint64_t signer_held, signer_held_mem, signer_unsigned;
+  /* 0.7 signer-wait (d): holds made before the loader (or the server) started again that its first batch said still wait (their signed version kept serving across the start).  Without the store
+   * the holds of the versions in memory (the heap directory, ZONE_HOLD) count in held_mem and carried too. */
+  uint64_t signer_carried;
 } store_recon_t;
 /* fills *out and returns true, or returns false when the server has none (no loader) */
 void store_status_set_recon_fn(bool (*fn)(store_recon_t *out));

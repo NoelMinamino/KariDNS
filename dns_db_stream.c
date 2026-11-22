@@ -38,6 +38,7 @@ enum { KT_U8, KT_U16, KT_U32, KT_U64, KT_I64, KT_STR, KT_TEXT, KT_BYTES, KT_NAME
 #define KS_EXACT 8u    /* bytes: length == max */
 #define KS_MUL8 16u    /* bytes: length a multiple of 8 */
 #define KS_VIEW 32u    /* u16: view index, < view count */
+#define KS_MASK 64u    /* integer: no bit outside max (0.7: the flags of a MANIFEST entry) */
 
 #define KDB_MAX_TAGS 24
 
@@ -67,7 +68,9 @@ static const kdb_tspec_t sp_zone_abort[] = { S(KT_STR, KS_REQ, 255) };
 static const kdb_tspec_t sp_zone_failed[] = { S(KT_U16, KS_REQ | KS_VIEW, 0), S(KT_NAME, KS_REQ, 0), S(KT_I64, KS_REQ, 0), S(KT_STR, KS_REQ, 255), S(KT_U64, 0, 0) };
 static const kdb_tspec_t sp_zone_delete[] = { S(KT_U16, KS_REQ | KS_VIEW, 0), S(KT_NAME, KS_REQ, 0), S(KT_I64, KS_REQ, 0) };
 static const kdb_tspec_t sp_profile[] = { S(KT_STR, KS_REQ | KS_NE, 255), S(KT_TEXT, KS_REQ, 65535) };
-static const kdb_tspec_t sp_batch_end[] = { S(KT_U64, KS_REQ, 0), S(KT_U32, KS_REQ, 0), S(KT_U32, KS_REQ, 0), S(KT_U32, KS_REQ, 0) };
+static const kdb_tspec_t sp_batch_end[] = { S(KT_U64, KS_REQ, 0), S(KT_U32, KS_REQ, 0), S(KT_U32, KS_REQ, 0), S(KT_U32, KS_REQ, 0), S(KT_U8, KS_MAXV, KDB_BEF_SIGNER_SET) };
+/* 0.7 signer-wait without the store protocol */
+static const kdb_tspec_t sp_zone_hold[] = { S(KT_U16, KS_REQ | KS_VIEW, 0), S(KT_NAME, KS_REQ, 0), S(KT_I64, KS_REQ, 0), S(KT_U8, KS_REQ | KS_MAXV, KDB_HOLD_UNSIGNED) };
 /* B11 adds the optional tags 6..11 (flags, server id, last reload request applied, ok, report error, time of the last report) */
 static const kdb_tspec_t sp_auto_entry[] = {
     S(KT_U16, KS_REQ | KS_VIEW, 0), S(KT_U64, KS_REQ, 0), S(KT_U64, KS_REQ, 0), S(KT_U32, KS_REQ, 0), S(KT_STR, 0, 255),
@@ -85,6 +88,7 @@ TDEF(td_zone_failed, "ZONE_FAILED", sp_zone_failed);
 TDEF(td_zone_delete, "ZONE_DELETE", sp_zone_delete);
 TDEF(td_profile, "PROFILE", sp_profile);
 TDEF(td_batch_end, "BATCH_END", sp_batch_end);
+TDEF(td_zone_hold, "ZONE_HOLD", sp_zone_hold);
 
 static const kdb_tspec_t sp_cfg_view[] = {
     S(KT_U16, KS_REQ, 0), S(KT_STR, KS_REQ | KS_NE, 255), S(KT_PATH, KS_NE, 1023), S(KT_PATH, KS_NE, 1023),
@@ -138,7 +142,7 @@ static const kdb_tspec_t sp_manifest_begin[] = {
 TDEF(td_manifest_begin, "MANIFEST_BEGIN", sp_manifest_begin);
 static const kdb_tspec_t sp_man_entry[] = {
     S(KT_I64, KS_REQ, 0), S(KT_NAME, KS_REQ, 0), S(KT_U8, KS_REQ | KS_MAXV, KDB_ZK_CATALOG), S(KT_U64, KS_REQ, 0), S(KT_U64, KS_REQ, 0),
-    S(KT_U8, KS_MAXV, KDB_EF_STAMPED), S(KT_U32, 0, 0), S(KT_BYTES, KS_EXACT, KDB_DIGEST_LEN) };
+    S(KT_U8, KS_MASK, KDB_EF_STAMPED | KDB_EF_HOLD), S(KT_U32, 0, 0), S(KT_BYTES, KS_EXACT, KDB_DIGEST_LEN) };      /* (KDB_EF_FORCE is refused) */
 TDEF(td_man_entry, "MANIFEST.ENTRY", sp_man_entry);
 static const kdb_tspec_t sp_manifest[] = {
     S(KT_U64, KS_REQ, 0), S(KT_U16, KS_REQ | KS_VIEW, 0), S(KT_U32, KS_REQ, 0), { KT_NEST, 0, KDB_MANIFEST_PAGE_MAX, &td_man_entry } };
@@ -189,6 +193,7 @@ static const kdb_mdef_t mdefs[] = {
     { KDB_T_CHANGES, "CHANGES", KDB_FROM_LOADER, false, KDB_MAX_BODY, &td_changes },
     { KDB_T_LOOKUP_RESULT, "LOOKUP_RESULT", KDB_FROM_LOADER, false, KDB_MAX_BODY, &td_lookup_result },
     { KDB_T_ZONE_IMAGE, "ZONE_IMAGE", KDB_FROM_LOADER, true, KDB_MAX_BODY, NULL },
+    { KDB_T_ZONE_HOLD, "ZONE_HOLD", KDB_FROM_LOADER, false, KDB_MAX_BODY, &td_zone_hold },
     { KDB_T_CONFIG, "CONFIG", KDB_FROM_BACKEND, false, KDB_MAX_BODY, &td_config },
     { KDB_T_RELOAD_REQ, "RELOAD_REQ", KDB_FROM_BACKEND, false, KDB_MAX_BODY, &td_reload_req },
     { KDB_T_INVENTORY, "INVENTORY", KDB_FROM_BACKEND, false, KDB_MAX_BODY, &td_inventory },
@@ -343,6 +348,7 @@ static kdb_rc_t tlv_parse(const kdb_tdef_t *d, const uint8_t *b, size_t n, uint3
             if (len != want[s->type]) FAIL(why, wl, KDB_E_TLV_LEN, "%s: tag %u length %u, want %u", d->name, tag, len, want[s->type]);
             x->u = (len == 1) ? v[0] : (len == 2) ? be16(v) : (len == 4) ? be32(v) : be64(v);
             if ((s->flags & KS_MAXV) && x->u > s->max) FAIL(why, wl, KDB_E_RANGE, "%s: tag %u value out of range", d->name, tag);
+            if ((s->flags & KS_MASK) && (x->u & ~(uint64_t)s->max)) FAIL(why, wl, KDB_E_RANGE, "%s: tag %u has a flag that is not defined", d->name, tag);
             if ((s->flags & KS_VIEW) && vc != KDB_VIEWS_ANY && x->u >= vc)
                 FAIL(why, wl, KDB_E_RANGE, "%s: view index %u >= %u views", d->name, (unsigned)x->u, vc);
             break;
@@ -539,6 +545,13 @@ kdb_rc_t kdb_decode(const kdb_frame_t *fr, uint32_t vc, kdb_msg_t *m, char *why,
         m->u.batch_end.n_zones = (uint32_t)V(2).u;
         m->u.batch_end.n_failed = (uint32_t)V(3).u;
         m->u.batch_end.n_deleted = (uint32_t)V(4).u;
+        m->u.batch_end.flags = V(5).present ? (uint8_t)V(5).u : 0;
+        break;
+    case KDB_T_ZONE_HOLD:
+        m->u.zone_hold.view = (uint16_t)V(1).u;
+        gname(m->u.zone_hold.name, &V(2));
+        m->u.zone_hold.source_id = (int64_t)V(3).u;
+        m->u.zone_hold.state = (uint8_t)V(4).u;
         break;
     case KDB_T_AUTO_STATUS:
         m->u.auto_status.n_entries = nrep;
@@ -838,6 +851,7 @@ bool kdb_manifest_entries_next(kdb_iter_t *it, kdb_manifest_entry_t *o) {
     o->stamp_gen = V(4).u;
     o->stamp_time = V(5).u;
     o->stamped = V(6).present && (V(6).u & KDB_EF_STAMPED) != 0;
+    o->hold = V(6).present && (V(6).u & KDB_EF_HOLD) != 0;
     o->has_serial = V(7).present;
     o->serial = V(7).present ? (uint32_t)V(7).u : 0;
     o->has_digest = V(8).present;
@@ -1073,7 +1087,7 @@ static bool sm_legal(const kdb_sm_t *sm, uint16_t t) {
     case KDB_S_IN_BATCH:
         if (sm->man_open) return t == KDB_T_MANIFEST || t == KDB_T_MANIFEST_END;       /* WP7a: inside a pass nothing but its pages and its end */
         return t == KDB_T_ZONE_BEGIN || t == KDB_T_ZONE_FAILED || t == KDB_T_ZONE_DELETE || t == KDB_T_PROFILE ||
-               t == KDB_T_BATCH_END || t == KDB_T_MANIFEST_BEGIN || t == KDB_T_CHANGES;
+               t == KDB_T_BATCH_END || t == KDB_T_MANIFEST_BEGIN || t == KDB_T_CHANGES || t == KDB_T_ZONE_HOLD;
     case KDB_S_IN_ZONE: return t == KDB_T_ZONE_IMAGE || t == KDB_T_ZONE_END || t == KDB_T_ZONE_ABORT;
     case KDB_S_ERROR: break;
     }
@@ -1185,6 +1199,7 @@ kdb_rc_t kdb_sm_accept(kdb_sm_t *sm, const kdb_frame_t *fr, kdb_msg_t *m) {
         sm->n_deleted++;
         break;
     case KDB_T_LOOKUP_RESULT:                   /* (only the fetch stream: sm_legal() allows it there and nowhere else) */
+    case KDB_T_ZONE_HOLD:                       /* (0.7 signer-wait: inside a batch, no state change, not counted) */
         break;
     case KDB_T_ZONE_BEGIN: {
         uint64_t n = m->u.zone_begin.rr_count;

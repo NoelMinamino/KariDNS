@@ -981,6 +981,36 @@ static void test_keys_in(void) {
     Q("DELETE FROM cryptokeys WHERE content = 'in-test'");
 }
 
+/* 0.7 signer-wait (d): the zones that wait for the signer, from karidns_signer_state (the rules of signer/lib/db_pg.js catchUp()) */
+static void test_signer_waiting(void) {
+    printf("signer_waiting\n");
+    for (int i = 1; i <= 6; i++) {
+        char sql[600];
+        snprintf(sql, sizeof(sql), "INSERT INTO domains (id, name, type) VALUES (%d, 'sw%d.test', 'NATIVE'); INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) "
+                 "VALUES (%d, 'sw%d.test', 'SOA', 'ns1.sw%d.test host.sw%d.test 7 3600 600 86400 300', 300, 0, false)", 9000 + i, i, 9000 + i, i, i, i);
+        Q(sql);
+    }
+    /* 1 signed and not changed since; 2 another serial; 3 failed before it ever signed; 4 changed after the signature; 5 no metadata; 6 metadata, no state row */
+    Q("INSERT INTO domainmetadata (domain_id, kind, content) VALUES (9001, 'X-KARIDNS-SIGNER', '1'), (9002, 'x-karidns-signer', '1'), (9003, 'X-KARIDNS-SIGNER', '1'), "
+      "(9004, 'X-KARIDNS-SIGNER', '1'), (9006, 'X-KARIDNS-SIGNER', '1')");
+    Q("INSERT INTO karidns_signer_state (domain_id, signed_at, signed_serial) VALUES (9001, to_timestamp(9999999999), 7), (9002, to_timestamp(9999999999), 6), (9003, NULL, NULL), "
+      "(9004, to_timestamp(0), 7), (9005, to_timestamp(0), 6)");
+    db_conn_t *c = open_drv(NULL);
+    if (!c) return;
+    CHECK(D->signer_waiting != NULL);
+    CHECK(D->check_schema(c, NULL) == 0);
+    keyset_t ks = { .n = 0 };
+    CHECK(D->signer_waiting(c, keyset_add, &ks) == -1 && strstr(D->errmsg(c), "no snapshot") != NULL);      /* (a cursor needs the snapshot) */
+    CHECK(D->begin_snapshot(c) == 0);
+    CHECK(D->signer_waiting(c, keyset_add, &ks) == 0);
+    CHECK_MSG(ks.n == 3 && ks.v[0] == 9002 && ks.v[1] == 9003 && ks.v[2] == 9004, "%zu zones", ks.n);
+    size_t cnt = 0;
+    CHECK(D->signer_waiting(c, stop_key, &cnt) == DB_STOPPED && cnt == 1);
+    D->end_snapshot(c);
+    D->close(c);
+    Q("DELETE FROM karidns_signer_state WHERE domain_id > 9000; DELETE FROM domainmetadata WHERE domain_id > 9000; DELETE FROM records WHERE domain_id > 9000; DELETE FROM domains WHERE id > 9000");
+}
+
 static void test_search_path(void) {
     printf("schema (search_path)\n");
     Q("CREATE SCHEMA karidns_test_s1");
@@ -2560,6 +2590,7 @@ int main(int argc, char **argv) {
     test_ext_and_profiles();
     test_scan_in();
     test_keys_in();
+    test_signer_waiting();
     test_search_path();
     test_changes();
     test_notify();

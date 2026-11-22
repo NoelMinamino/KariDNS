@@ -138,8 +138,19 @@ int db_recon_lookup(const char *view, const db_recon_entry_t *e, uint32_t *zid);
  * counters of a pass are counted once per call. */
 void db_recon_apply_n(const char *view, const db_recon_entry_t *e, size_t n, int *res, uint32_t *zid);
 void db_recon_change_n(const char *view, const db_recon_entry_t *e, size_t n, int *res, uint32_t *zid);
-/* signer-wait: a loader connected (HELLO): the records held for the signer by an earlier loader (STORE_F_SIGNER_HELD) are wanted by the scan again, so their version is read as it is */
+/* signer-wait: the records held for the signer by an earlier loader (STORE_F_SIGNER_HELD) are wanted by the scan again, so their version is read as it is (and the carry below ends) */
 void db_recon_held_reset(void);
+/* 0.7 signer-wait (d): a loader connected (HELLO).  The records held for the signer by an earlier loader (or before the server started again) keep their signed version serving: an entry
+ * without KDB_EF_HOLD (a manifest pass, the drain of a start) records its stamp but does not ask for the body, and the scan does not ask for it, until db_recon_held_carry_end() (the first batch
+ * of the loader said which zones still wait: an entry with KDB_EF_HOLD confirms a hold, BATCH_END KDB_BEF_SIGNER_SET ends it).  The end lets go of the holds that were not confirmed (the scan
+ * asks for their bodies: read as they are) and returns how many holds this loader confirmed. */
+void db_recon_held_carry(void);
+size_t db_recon_held_carry_end(void);
+/* 0.7 signer-wait without the store (the heap directory): a version that waits for the signer is served as it is (nothing signed was in memory: a fetch read it, or the loader sent it to a
+ * server that had none): counted in store.recon.signer.unsigned and said, rate-limited, as the store does it.  db_signer_count(): a version in memory was held (signer.held, .held_in_memory),
+ * a hold made before the loader started again was confirmed (signer.carried). */
+void db_signer_unsigned_note(const char *view, const char *zone);
+void db_signer_count(bool held_mem, bool carried);
 void db_recon_entry_n(const db_recon_entry_t *e, size_t n, int *res, uint32_t *zid);
 /* a pass over one view's source: false (why says why) when the store has no room for the view; force: the operator asked for this pass (the guard does not hold it back) */
 bool db_recon_begin(const char *view, uint64_t estimate, bool force, char *why, size_t whylen);

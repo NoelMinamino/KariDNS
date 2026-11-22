@@ -527,6 +527,7 @@ static void add_recon(list_t *l) {
   U("store.recon.signer.held", r->signer_held);
   U("store.recon.signer.held_in_memory", r->signer_held_mem);
   U("store.recon.signer.unsigned", r->signer_unsigned);
+  U("store.recon.signer.carried", r->signer_carried);
   U("store.recon.guard.held_views", r->guard_views);
   if (r->guard_views) {
     add_s(l, "store.recon.guard.view", r->guard_view);

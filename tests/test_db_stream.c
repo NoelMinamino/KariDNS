@@ -2781,6 +2781,41 @@ static void test_store_proto(void) {
     kdb_enc_reset(&e); ms_changes_hdr(&e, 7, 0, 1, 1, NULL); ms_entry(&e, 5, KDB_CH_UPSERT, "h.test.", 0, 0x8); kdb_enc_end(&e);
     CHECK_RC("entry flag bit 3 is reserved", dec_loader(&e, &m, why), KDB_E_RANGE);
 
+    /* 0.7 signer-wait (d): a MANIFEST entry with KDB_EF_HOLD (the first pass after a start); ZONE_HOLD (without the store protocol); BATCH_END flags */
+    kdb_enc_reset(&e); kdb_enc_begin(&e, KDB_T_MANIFEST); kdb_enc_u64(&e, 1, 7); kdb_enc_u16(&e, 2, 1); kdb_enc_u32(&e, 3, 0);
+    kdb_enc_nest_begin(&e, 4); kdb_enc_i64(&e, 1, 1); kdb_enc_name(&e, 2, "a.test."); kdb_enc_u8(&e, 3, 0); kdb_enc_u64(&e, 4, 3); kdb_enc_u64(&e, 5, 30); kdb_enc_u8(&e, 6, KDB_EF_STAMPED | KDB_EF_HOLD); kdb_enc_nest_end(&e); kdb_enc_end(&e);
+    CHECK_RC("a manifest entry with KDB_EF_HOLD", dec_loader(&e, &m, why), KDB_OK);
+    {
+        kdb_iter_t it;
+        kdb_manifest_entry_t en;
+        kdb_manifest_entries(&m, &it);
+        CHECK(kdb_manifest_entries_next(&it, &en) && en.hold && en.stamped && en.stamp_gen == 3);
+    }
+    kdb_enc_reset(&e); kdb_enc_begin(&e, KDB_T_MANIFEST); kdb_enc_u64(&e, 1, 7); kdb_enc_u16(&e, 2, 1); kdb_enc_u32(&e, 3, 0);
+    kdb_enc_nest_begin(&e, 4); kdb_enc_i64(&e, 1, 1); kdb_enc_name(&e, 2, "a.test."); kdb_enc_u8(&e, 3, 0); kdb_enc_u64(&e, 4, 0); kdb_enc_u64(&e, 5, 0); kdb_enc_u8(&e, 6, KDB_EF_HOLD | KDB_EF_FORCE); kdb_enc_nest_end(&e); kdb_enc_end(&e);
+    CHECK_RC("hold and force in a manifest entry", dec_loader(&e, &m, why), KDB_E_RANGE);
+    kdb_enc_reset(&e); kdb_enc_begin(&e, KDB_T_ZONE_HOLD); kdb_enc_u16(&e, 1, 1); kdb_enc_name(&e, 2, "h.test."); kdb_enc_i64(&e, 3, 42); kdb_enc_u8(&e, 4, KDB_HOLD_UNSIGNED); kdb_enc_end(&e);
+    CHECK_RC("ZONE_HOLD", dec_loader(&e, &m, why), KDB_OK);
+    CHECK(m.u.zone_hold.view == 1 && m.u.zone_hold.source_id == 42 && m.u.zone_hold.state == KDB_HOLD_UNSIGNED);
+    CHECK_STR(m.u.zone_hold.name, "h.test.");
+    CHECK_STR(kdb_type_name(KDB_T_ZONE_HOLD), "ZONE_HOLD");
+    kdb_enc_reset(&e); kdb_enc_begin(&e, KDB_T_ZONE_HOLD); kdb_enc_u16(&e, 1, 1); kdb_enc_name(&e, 2, "h.test."); kdb_enc_i64(&e, 3, 42); kdb_enc_u8(&e, 4, 3); kdb_enc_end(&e);
+    CHECK_RC("ZONE_HOLD state 3", dec_loader(&e, &m, why), KDB_E_RANGE);
+    kdb_enc_reset(&e); kdb_enc_begin(&e, KDB_T_ZONE_HOLD); kdb_enc_u16(&e, 1, 1); kdb_enc_name(&e, 2, "h.test."); kdb_enc_i64(&e, 3, 42); kdb_enc_end(&e);
+    CHECK_RC("ZONE_HOLD without a state", dec_loader(&e, &m, why), KDB_E_TLV_MISSING);
+    kdb_enc_reset(&e); kdb_enc_begin(&e, KDB_T_ZONE_HOLD); kdb_enc_u16(&e, 1, 1); kdb_enc_name(&e, 2, "h.test."); kdb_enc_i64(&e, 3, 42); kdb_enc_u8(&e, 4, KDB_HOLD_KEEP); kdb_enc_end(&e);
+    CHECK_RC("ZONE_HOLD outside a batch", send_enc(KDB_S_READY, &e), KDB_E_STATE);
+    m_batch_end(&e, 7, 0, 0, 0);
+    CHECK_RC("ZONE_HOLD in a batch: no count", send_enc(KDB_S_IN_BATCH, &e), KDB_OK);
+    kdb_enc_reset(&e); kdb_enc_begin(&e, KDB_T_BATCH_END); kdb_enc_u64(&e, 1, 7); kdb_enc_u32(&e, 2, 0); kdb_enc_u32(&e, 3, 0); kdb_enc_u32(&e, 4, 0); kdb_enc_u8(&e, 5, KDB_BEF_SIGNER_SET); kdb_enc_end(&e);
+    CHECK_RC("BATCH_END with KDB_BEF_SIGNER_SET", dec_loader(&e, &m, why), KDB_OK);
+    CHECK(m.u.batch_end.flags == KDB_BEF_SIGNER_SET);
+    kdb_enc_reset(&e); m_batch_end(&e, 7, 0, 0, 0);
+    CHECK_RC("BATCH_END without flags", dec_loader(&e, &m, why), KDB_OK);
+    CHECK(m.u.batch_end.flags == 0);
+    kdb_enc_reset(&e); kdb_enc_begin(&e, KDB_T_BATCH_END); kdb_enc_u64(&e, 1, 7); kdb_enc_u32(&e, 2, 0); kdb_enc_u32(&e, 3, 0); kdb_enc_u32(&e, 4, 0); kdb_enc_u8(&e, 5, 2); kdb_enc_end(&e);
+    CHECK_RC("BATCH_END flag 2", dec_loader(&e, &m, why), KDB_E_RANGE);
+
     /* the Backend's state machine: a pass and a drain in a batch (batch 7: sess_to() sends BATCH_BEGIN 7) */
     kdb_enc_reset(&e);
     ms_begin(&e, 7, 1, 10, 55, 1, 0, "sqlite3:1:2");

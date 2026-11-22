@@ -223,7 +223,7 @@ sleep 2
 check_ans "waiting again" "192.0.2.21" www.sg.test
 stop_server
 start_server
-# (with the store the version is read in the background after the start: the Backend held it for the loader before, db_recon_held_reset(); bounded wait in both modes)
+# (the zone has no row in karidns_signer_state, so the loader does not take it for one that waits (0.7 (d): run_db_signer_restart_test.sh); with the store the held version is let go at the end of the first batch and read in the background; bounded wait in both modes)
 if wait_ans www.sg.test 192.0.2.22 10; then pass "a restart reads the changed zone as it is (the full comparison of the start; the store: the held version is fetched)"; else fail "a restart: got '$(qa www.sg.test)', want 192.0.2.22"; dbst | sed 's/^/         /'; fi
 nowait && pass "...and nothing waits after the restart" || fail "waiting zones after the restart"
 
