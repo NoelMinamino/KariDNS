@@ -113,11 +113,13 @@ EOF
 # --- the signer process --------------------------------------------------------------------------------------------------------------------
 sg_start() {
     rm -f "$SG_PIDFILE"
+    # the log is appended to by every start: wait for one more "started" line than there was, not for any (an earlier start's line is already there)
+    SG_STARTS=$(grep -c "karidns-signer $(cat "$ROOT/VERSION") started" "$SG_LOG" 2>/dev/null || true); SG_STARTS=${SG_STARTS:-0}
     asu sh -c 'echo $$ > "$1"; shift; exec "$@"' sh "$SG_PIDFILE" "$NODE" "${SG_APP:-$ROOT/signer}/bin/karidns-signer.js" -c "$SG_CONF" >> "$SG_LOG" 2>&1 &
     SG_SHELL=$!
     sg_quiet_wait 10 '[ -s "$SG_PIDFILE" ]'
     SG_PID=$(cat "$SG_PIDFILE" 2>/dev/null)
-    if sg_quiet_wait 20 'grep -q "karidns-signer $(cat "$ROOT/VERSION") started" "$SG_LOG"'; then pass "the signer started (pid $SG_PID)"; else fail "the signer did not start"; sg_logtail; fi
+    if sg_quiet_wait 20 '[ "$(grep -c "karidns-signer $(cat "$ROOT/VERSION") started" "$SG_LOG" 2>/dev/null || true)" -gt "$SG_STARTS" ]'; then pass "the signer started (pid $SG_PID)"; else fail "the signer did not start"; sg_logtail; fi
 }
 # stop with SIGTERM and wait for the exit (a signer that is signing finishes the zone first)
 sg_stop() {
@@ -482,7 +484,7 @@ sg_phase_signals() {
     sleep 1
     sg_has "kill -9: the left-overs of the dead signer are there" "$(ls -A "$T/work")" 'ex.test'
     sg_start
-    sg_has "the next start wipes them and says so" "$(cat "$SG_LOG")" 'wiped [0-9]* work directory'
+    sg_wait 20 "the next start wipes them and says so" 'grep -q "wiped [0-9]* work directory" "$SG_LOG"'
     sg_wait 60 "ex.test: the interrupted zone is signed by the restarted signer" 'sg_try_export ex.test; [ "$(grep -c "^killed RRSIG A " "$T/out/ex.test.zone")" = 1 ]'
     sg_wait 20 "the work directory is empty again" 'sg_workdir_empty'
     sg_verify ex.test
