@@ -85,6 +85,8 @@ struct db_conn {
     bool have_actor, actor_has_pid, actor_has_pname, actor_has_cs;      /* w_set_actor(): the principal and the change set of the actor row */
     int64_t actor_pid;
     char actor_pname[260], actor_cs[80];
+    int bind_rc;                /* the first bind of a parameter that failed since the last step (bnote()); bind_failed: the step that reported it, for sql_fail() */
+    bool bind_failed;
 };
 
 /* M2: the statements kept for the per-row write functions */
@@ -109,8 +111,31 @@ static bool rc_is_busy(int rc) {
 
 /* error of a failed sqlite3 call: DB_ERR_RETRY for BUSY / LOCKED, else -1 */
 static int sql_fail(db_conn_t *c, int rc, const char *what) {
+    if (c->bind_failed) {
+        c->bind_failed = false;
+        set_err(c, "sqlite3 %s: a parameter cannot be bound: %s", what, sqlite3_errstr(rc));
+        return -1;
+    }
     set_err(c, "sqlite3 %s: %s%s", what, sqlite3_errmsg(c->db), rc_is_busy(rc) ? " (retry later)" : "");
     return rc_is_busy(rc) ? DB_ERR_RETRY : -1;
+}
+
+/* The parameters of a statement.  A bind that fails (SQLITE_TOOBIG, a text over the length limit of the connection; SQLITE_NOMEM; SQLITE_RANGE) leaves the parameter NULL, or as the
+ * last call bound it (review D-6: a read could then return the rows of another zone or view, a write store the text of the previous row).  The first failure is kept on the connection
+ * and the next step, bstep(), returns it instead of running the statement; the caller's error path (sql_fail()) says that a parameter could not be bound.  Every bind is followed by
+ * a step of its statement in the same call. */
+static void bnote(db_conn_t *c, int rc) {
+    if (rc != SQLITE_OK && c->bind_rc == SQLITE_OK) c->bind_rc = rc;
+}
+static void bi64(db_conn_t *c, sqlite3_stmt *st, int i, sqlite3_int64 v) { bnote(c, sqlite3_bind_int64(st, i, v)); }
+static void bnull(db_conn_t *c, sqlite3_stmt *st, int i) { bnote(c, sqlite3_bind_null(st, i)); }
+static void btext(db_conn_t *c, sqlite3_stmt *st, int i, const char *s, int n, sqlite3_destructor_type d) { bnote(c, sqlite3_bind_text(st, i, s, n, d)); }
+static int bstep(db_conn_t *c, sqlite3_stmt *st) {
+    if (c->bind_rc == SQLITE_OK) return sqlite3_step(st);
+    const int rc = c->bind_rc;
+    c->bind_rc = SQLITE_OK;
+    c->bind_failed = true;
+    return rc;
 }
 
 static int exec(db_conn_t *c, const char *sql) {
@@ -132,7 +157,7 @@ static int prep(db_conn_t *c, sqlite3_stmt **st, const char *sql) {
 static int step_once(db_conn_t *c, sqlite3_stmt **st, const char *sql) {
     int ret = prep(c, st, sql);
     if (ret != 0) return ret;
-    int rc = sqlite3_step(*st);
+    int rc = bstep(c, *st);
     ret = rc == SQLITE_DONE || rc == SQLITE_ROW ? 0 : sql_fail(c, rc, sql);
     sqlite3_reset(*st);
     return ret;
@@ -250,7 +275,7 @@ static int sq_open_mode(db_conn_t **out, const db_source_t *src, char *err, size
     if (ret == 0) {
         sqlite3_stmt *st = NULL;
         rc = sqlite3_prepare_v2(c->db, "PRAGMA journal_mode", -1, &st, NULL);
-        if (rc == SQLITE_OK) rc = sqlite3_step(st);
+        if (rc == SQLITE_OK) rc = bstep(c, st);
         if (rc == SQLITE_ROW) {
             const char *m = (const char *)sqlite3_column_text(st, 0);
             if (!m || strcasecmp(m, "wal") != 0) {
@@ -362,7 +387,7 @@ static int table_columns(db_conn_t *c, const char *table, const char *const *col
     if (rc != SQLITE_OK) return sql_fail(c, rc, "PRAGMA table_info");
     *found = 0;
     *rows = 0;
-    while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
+    while ((rc = bstep(c, st)) == SQLITE_ROW) {
         (*rows)++;
         const char *name = (const char *)sqlite3_column_text(st, 1);
         for (int i = 0; name && cols[i]; i++)
@@ -444,7 +469,7 @@ static int sq_check_schema(db_conn_t *c, db_schema_info_t *out) {
     if (rows > 0 && found == 1u) {
         sqlite3_stmt *st = NULL;
         rc = sqlite3_prepare_v2(c->db, "SELECT max(version) FROM karidns_schema_version", -1, &st, NULL);
-        if (rc == SQLITE_OK) rc = sqlite3_step(st);
+        if (rc == SQLITE_OK) rc = bstep(c, st);
         if (rc == SQLITE_ROW) {
             sqlite3_int64 v = sqlite3_column_type(st, 0) == SQLITE_NULL ? 0 : sqlite3_column_int64(st, 0);
             sqlite3_finalize(st);
@@ -519,7 +544,7 @@ static int sq_schema_findings(db_conn_t *c, const db_check_opts_t *o, db_finding
     if (have[0]) {
         sqlite3_stmt *st = NULL;
         int rc = sqlite3_prepare_v2(c->db, "SELECT max(version), count(*) FROM karidns_schema_version", -1, &st, NULL);
-        if (rc == SQLITE_OK) rc = sqlite3_step(st);
+        if (rc == SQLITE_OK) rc = bstep(c, st);
         if (rc != SQLITE_ROW) {
             sqlite3_finalize(st);
             return sql_fail(c, rc, "karidns_schema_version");
@@ -560,8 +585,8 @@ static int sq_schema_findings(db_conn_t *c, const db_check_opts_t *o, db_finding
                     snprintf(name, sizeof(name), "karidns_trg_%s_%s", k_trg[k].infix, sfx[(i - 1) % 3]);
                 }
                 sqlite3_reset(st);
-                sqlite3_bind_text(st, 1, name, -1, SQLITE_STATIC);
-                rc = sqlite3_step(st);
+                btext(c, st, 1, name, -1, SQLITE_STATIC);
+                rc = bstep(c, st);
                 if (rc == SQLITE_DONE) db_list_add(miss, sizeof(miss), &nm, name);
                 else if (rc != SQLITE_ROW) {
                     sqlite3_finalize(st);
@@ -592,7 +617,7 @@ static int sq_begin_snapshot(db_conn_t *c) {
     /* BEGIN is deferred: the WAL read transaction (the snapshot) starts with the first statement that reads */
     rc = prep(c, &c->st_snap, "SELECT 1 FROM sqlite_master LIMIT 1");
     if (rc == 0) {
-        int sr = sqlite3_step(c->st_snap);
+        int sr = bstep(c, c->st_snap);
         if (sr != SQLITE_ROW && sr != SQLITE_DONE) rc = sql_fail(c, sr, "begin snapshot");
         sqlite3_reset(c->st_snap);
     }
@@ -642,6 +667,8 @@ unsigned long sq_reprepares(db_conn_t *c) {
     each_read_stmt(c, reprepare_cb, &n);
     return n;
 }
+/* the handle of the connection (tests: sqlite3_limit() makes a bind fail, review D-6) */
+sqlite3 *sq_test_handle(db_conn_t *c) { return c->db; }
 #endif
 
 static int sq_end_snapshot(db_conn_t *c) {
@@ -662,17 +689,21 @@ static int sq_zone_loop(db_conn_t *c, sqlite3_stmt *st, db_zone_cb cb, void *ud)
     bool have_prev = false;
     int64_t prev = 0;
     for (;;) {
-        int rc = sqlite3_step(st);
+        int rc = bstep(c, st);
         if (rc == SQLITE_DONE) break;
         if (rc != SQLITE_ROW) {
             ret = sql_fail(c, rc, "list_zones");
             break;
         }
-        int64_t id = sqlite3_column_int64(st, 0);
+        bool bad = false;
+        int64_t id = col_int(c, st, 0, "domains", prev, "id", &bad);
+        if (bad) {
+            ret = -1;
+            break;
+        }
         if (have_prev && id == prev) continue;      /* more than one enabled apex SOA: the first is enough here */
         have_prev = true;
         prev = id;
-        bool bad = false;
         db_zone_row_t z;
         z.id = id;
         z.name = col_text(c, st, 1, "domains", id, "name", &bad);
@@ -724,8 +755,8 @@ static int sq_find_zone(db_conn_t *c, const char *name, db_zone_cb cb, void *ud)
     if (ret != 0) return ret;
     sqlite3_stmt *st = c->st_zone_one;
     rearm(st);
-    sqlite3_bind_text(st, 1, a, (int)n, SQLITE_TRANSIENT);
-    sqlite3_bind_text(st, 2, a, (int)n + 1, SQLITE_TRANSIENT);
+    btext(c, st, 1, a, (int)n, SQLITE_TRANSIENT);
+    btext(c, st, 2, a, (int)n + 1, SQLITE_TRANSIENT);
     return sq_zone_loop(c, st, cb, ud);
 }
 
@@ -761,14 +792,14 @@ static int sq_find_zones_in(db_conn_t *c, const char *const *names, size_t n, db
         size_t l = i < n ? strlen(names[i]) : 0;
         if (l > 1 && names[i][l - 1] == '.') l--;
         if (i >= n || l > sizeof(a) - 2) {                  /* an unused slot, or a name longer than any domain name: it matches nothing (NULL is never equal to a name; an empty text would match the root zone) */
-            sqlite3_bind_null(st, (int)(2 * i + 1));
-            sqlite3_bind_null(st, (int)(2 * i + 2));
+            bnull(c, st, (int)(2 * i + 1));
+            bnull(c, st, (int)(2 * i + 2));
             continue;
         }
         memcpy(a, names[i], l);
         a[l] = '.';
-        sqlite3_bind_text(st, (int)(2 * i + 1), a, (int)l, SQLITE_TRANSIENT);
-        sqlite3_bind_text(st, (int)(2 * i + 2), a, (int)l + 1, SQLITE_TRANSIENT);
+        btext(c, st, (int)(2 * i + 1), a, (int)l, SQLITE_TRANSIENT);
+        btext(c, st, (int)(2 * i + 2), a, (int)l + 1, SQLITE_TRANSIENT);
     }
     return sq_zone_loop(c, st, cb, ud);
 }
@@ -777,7 +808,7 @@ static int sq_find_zones_in(db_conn_t *c, const char *const *names, size_t n, db
 static int rec_loop(db_conn_t *c, sqlite3_stmt *st, db_record_cb cb, void *ud) {
     int ret = 0;
     for (;;) {
-        int rc = sqlite3_step(st);
+        int rc = bstep(c, st);
         if (rc == SQLITE_DONE) break;
         if (rc != SQLITE_ROW) {
             ret = sql_fail(c, rc, "scan_records");
@@ -786,7 +817,7 @@ static int rec_loop(db_conn_t *c, sqlite3_stmt *st, db_record_cb cb, void *ud) {
         bool bad = false;
         db_record_row_t r;
         memset(&r, 0, sizeof(r));
-        r.id = sqlite3_column_int64(st, 1);
+        r.id = col_int(c, st, 1, "records", 0, "id", &bad);
         int64_t did = col_int(c, st, 0, "records", r.id, "domain_id", &bad);
         r.name = col_text(c, st, 2, "records", r.id, "name", &bad);
         r.type = col_text(c, st, 3, "records", r.id, "type", &bad);
@@ -820,7 +851,7 @@ static int sq_scan_records(db_conn_t *c, const int64_t *domain_id, db_record_cb 
     if (ret != 0) return ret;
     sqlite3_stmt *st = *slot;
     rearm(st);
-    if (domain_id) sqlite3_bind_int64(st, 1, *domain_id);
+    if (domain_id) bi64(c, st, 1, *domain_id);
     return rec_loop(c, st, cb, ud);
 }
 
@@ -847,9 +878,9 @@ static int sq_scan_apex(db_conn_t *c, const int64_t *domain_id, db_apex_cb cb, v
     if (ret != 0) return ret;
     sqlite3_stmt *st = *slot;
     rearm(st);
-    if (domain_id) sqlite3_bind_int64(st, 1, *domain_id);
+    if (domain_id) bi64(c, st, 1, *domain_id);
     for (;;) {
-        int rc = sqlite3_step(st);
+        int rc = bstep(c, st);
         if (rc == SQLITE_DONE) break;
         if (rc != SQLITE_ROW) {
             ret = sql_fail(c, rc, "scan_apex");
@@ -884,8 +915,8 @@ static int sq_scan_records_range(db_conn_t *c, int64_t lo, int64_t hi, db_record
     if (ret != 0) return ret;
     sqlite3_stmt *st = c->st_rec_rng;
     rearm(st);
-    sqlite3_bind_int64(st, 1, lo);
-    sqlite3_bind_int64(st, 2, hi);
+    bi64(c, st, 1, lo);
+    bi64(c, st, 2, hi);
     return rec_loop(c, st, cb, ud);
 }
 
@@ -900,16 +931,16 @@ static int sq_scan_domain_views(db_conn_t *c, const int64_t *domain_id, db_domai
     if (ret != 0) return ret;
     sqlite3_stmt *st = *slot;
     rearm(st);
-    if (domain_id) sqlite3_bind_int64(st, 1, *domain_id);
+    if (domain_id) bi64(c, st, 1, *domain_id);
     for (;;) {
-        int rc = sqlite3_step(st);
+        int rc = bstep(c, st);
         if (rc == SQLITE_DONE) break;
         if (rc != SQLITE_ROW) {
             ret = sql_fail(c, rc, "scan_domain_views");
             break;
         }
         bool bad = false;
-        int64_t did = sqlite3_column_int64(st, 0);
+        int64_t did = col_int(c, st, 0, "karidns_domain_views", 0, "domain_id", &bad);
         const char *vn = col_text(c, st, 1, "karidns_domain_views", did, "view_name", &bad);
         if (bad) {
             ret = -1;
@@ -935,7 +966,7 @@ static int sq_scan_profiles(db_conn_t *c, db_profile_cb cb, void *ud) {
     sqlite3_stmt *st = c->st_prof;
     rearm(st);
     for (;;) {
-        int rc = sqlite3_step(st);
+        int rc = bstep(c, st);
         if (rc == SQLITE_DONE) break;
         if (rc != SQLITE_ROW) {
             ret = sql_fail(c, rc, "scan_profiles");
@@ -963,16 +994,16 @@ static int sq_scan_profiles(db_conn_t *c, db_profile_cb cb, void *ud) {
 static int meta_loop(db_conn_t *c, sqlite3_stmt *st, db_meta_cb cb, void *ud) {
     int ret = 0;
     for (;;) {
-        int rc = sqlite3_step(st);
+        int rc = bstep(c, st);
         if (rc == SQLITE_DONE) break;
         if (rc != SQLITE_ROW) {
             ret = sql_fail(c, rc, "scan_metadata");
             break;
         }
         bool bad = false;
-        int64_t id = sqlite3_column_int64(st, 3);
+        int64_t id = col_int(c, st, 3, "domainmetadata", 0, "id", &bad);
         db_meta_row_t m;
-        m.domain_id = sqlite3_column_int64(st, 0);
+        m.domain_id = col_int(c, st, 0, "domainmetadata", id, "domain_id", &bad);
         m.kind = col_text(c, st, 1, "domainmetadata", id, "kind", &bad);
         m.content = col_text(c, st, 2, "domainmetadata", id, "content", &bad);
         if (bad) {
@@ -995,21 +1026,27 @@ static int sq_scan_metadata(db_conn_t *c, const int64_t *domain_id, db_meta_cb c
     if (ret != 0) return ret;
     sqlite3_stmt *st = *slot;
     rearm(st);
-    if (domain_id) sqlite3_bind_int64(st, 1, *domain_id);
+    if (domain_id) bi64(c, st, 1, *domain_id);
     return meta_loop(c, st, cb, ud);
 }
 
 static int keys_loop(db_conn_t *c, sqlite3_stmt *st, db_key_cb cb, void *ud) {
     int ret = 0;
     for (;;) {
-        int rc = sqlite3_step(st);
+        int rc = bstep(c, st);
         if (rc == SQLITE_DONE) break;
         if (rc != SQLITE_ROW) {
             ret = sql_fail(c, rc, "zones_with_keys");
             break;
         }
         if (sqlite3_column_type(st, 0) == SQLITE_NULL) continue;
-        if (cb(ud, sqlite3_column_int64(st, 0)) != 0) {
+        bool bad = false;
+        const int64_t did = col_int(c, st, 0, "cryptokeys", 0, "domain_id", &bad);
+        if (bad) {
+            ret = -1;
+            break;
+        }
+        if (cb(ud, did) != 0) {
             ret = DB_STOPPED;
             break;
         }
@@ -1043,13 +1080,19 @@ static int sq_signer_waiting(db_conn_t *c, db_key_cb cb, void *ud) {
     if (rc != SQLITE_OK) return sql_fail(c, rc, "signer_waiting");
     int ret = 0;
     for (;;) {
-        rc = sqlite3_step(st);
+        rc = bstep(c, st);
         if (rc == SQLITE_DONE) break;
         if (rc != SQLITE_ROW) {
             ret = sql_fail(c, rc, "signer_waiting");
             break;
         }
-        if (cb(ud, sqlite3_column_int64(st, 0)) != 0) {
+        bool bad = false;
+        const int64_t did = col_int(c, st, 0, "karidns_signer_state", 0, "domain_id", &bad);
+        if (bad) {
+            ret = -1;
+            break;
+        }
+        if (cb(ud, did) != 0) {
             ret = DB_STOPPED;
             break;
         }
@@ -1074,20 +1117,25 @@ static int sq_changes_since(db_conn_t *c, uint64_t after, db_change_cb cb, void 
     if (ret != 0) return ret;
     sqlite3_stmt *st = c->st_changes;
     rearm(st);
-    sqlite3_bind_int64(st, 1, (sqlite3_int64)after);
+    bi64(c, st, 1, (sqlite3_int64)after);
     uint64_t last = after;
     bool g = false, first = true;
     for (;;) {
-        int rc = sqlite3_step(st);
+        int rc = bstep(c, st);
         if (rc == SQLITE_DONE) break;
         if (rc != SQLITE_ROW) {
             ret = sql_fail(c, rc, "changes_since");
             break;
         }
         db_change_row_t row;
-        row.seq = (uint64_t)sqlite3_column_int64(st, 0);
+        row.seq = (uint64_t)sqlite3_column_int64(st, 0);       /* (INTEGER PRIMARY KEY: the rowid, always an integer) */
         row.pos = row.seq;
-        row.domain_id = sqlite3_column_int64(st, 1);
+        bool bad = false;
+        row.domain_id = col_int(c, st, 1, "karidns_changes", (int64_t)row.seq, "domain_id", &bad);
+        if (bad) {
+            ret = -1;
+            break;
+        }
         if (first && after > 0 && row.seq > after + 1) g = true;      /* rows after `after` were pruned */
         first = false;
         last = row.seq;
@@ -1111,7 +1159,7 @@ static int sq_changes_max(db_conn_t *c, uint64_t *seq) {
     if (ret != 0) return ret;
     sqlite3_stmt *st = c->st_cmax;
     rearm(st);
-    int rc = sqlite3_step(st);
+    int rc = bstep(c, st);
     if (rc == SQLITE_ROW) {
         *seq = sqlite3_column_type(st, 0) == SQLITE_NULL ? 0 : (uint64_t)sqlite3_column_int64(st, 0);
     } else {
@@ -1141,8 +1189,8 @@ static int sq_count_domains(db_conn_t *c, const char *view, uint64_t *n) {
     if (ret != 0) return ret;
     sqlite3_stmt *st = *slot;
     rearm(st);
-    if (by_view) sqlite3_bind_text(st, 1, view, -1, SQLITE_TRANSIENT);
-    int rc = sqlite3_step(st);
+    if (by_view) btext(c, st, 1, view, -1, SQLITE_TRANSIENT);
+    int rc = bstep(c, st);
     if (rc == SQLITE_ROW) {
         sqlite3_int64 v = sqlite3_column_int64(st, 0);
         *n = v < 0 ? 0 : (uint64_t)v;
@@ -1181,12 +1229,12 @@ static int sq_manifest_page(db_conn_t *c, int64_t after_id, unsigned limit, db_m
     if (ret != 0) return ret;
     sqlite3_stmt *st = c->st_mpage;
     rearm(st);
-    sqlite3_bind_int64(st, 1, after_id);
-    sqlite3_bind_int64(st, 2, limit);
+    bi64(c, st, 1, after_id);
+    bi64(c, st, 2, limit);
     db_mgroup_t *g = &c->mg;
     g->open = false;
     for (;;) {
-        int rc = sqlite3_step(st);
+        int rc = bstep(c, st);
         if (rc == SQLITE_DONE) break;
         if (rc != SQLITE_ROW) {
             ret = sql_fail(c, rc, "manifest_page");
@@ -1205,7 +1253,7 @@ static int sq_manifest_page(db_conn_t *c, int64_t after_id, unsigned limit, db_m
             bool has_state = sqlite3_column_type(st, 3) != SQLITE_NULL;
             int64_t gen = has_state ? col_int(c, st, 3, "karidns_zone_state", id, "generation", &bad) : 0;
             int64_t at = has_state ? col_int(c, st, 4, "karidns_zone_state", id, "changed_at", &bad) : 0;
-            const char *why = bad ? NULL : db_mgroup_start(g, id, name, type, has_state, gen < 0 ? 0 : (uint64_t)gen, at < 0 ? 0 : (uint64_t)at);
+            const char *why = bad ? NULL : db_mgroup_start(g, id, name, type, has_state, gen, at);
             if (why) {
                 set_err(c, "table domains id %lld: %s", (long long)id, why);
                 bad = true;
@@ -1257,12 +1305,12 @@ static int sq_changes_page(db_conn_t *c, db_change_pos_t *pos, unsigned limit, d
     sqlite3_stmt *st = c->st_cpage;
     rearm(st);
     uint64_t after = pos->cursor, mx = after;
-    sqlite3_bind_int64(st, 1, (sqlite3_int64)after);
-    sqlite3_bind_int64(st, 2, limit);
+    bi64(c, st, 1, (sqlite3_int64)after);
+    bi64(c, st, 2, limit);
     int64_t cnt = 0;
     bool any = false;
     for (;;) {
-        int rc = sqlite3_step(st);
+        int rc = bstep(c, st);
         if (rc == SQLITE_DONE) break;
         if (rc != SQLITE_ROW) {
             ret = sql_fail(c, rc, "changes_page");
@@ -1275,8 +1323,13 @@ static int sq_changes_page(db_conn_t *c, db_change_pos_t *pos, unsigned limit, d
         mx = (uint64_t)sqlite3_column_int64(st, 4);
         cnt = sqlite3_column_int64(st, 5);
         db_change_entry_t e;
-        e.seq = (uint64_t)sqlite3_column_int64(st, 1);
-        e.domain_id = sqlite3_column_int64(st, 0);
+        e.seq = (uint64_t)sqlite3_column_int64(st, 1);              /* (the rowid and aggregates of it, and EXISTS: always integers) */
+        bool bad = false;
+        e.domain_id = col_int(c, st, 0, "karidns_changes", (int64_t)e.seq, "domain_id", &bad);
+        if (bad) {
+            ret = -1;
+            break;
+        }
         e.op = sqlite3_column_int64(st, 2) ? DB_CHANGE_UPSERT : DB_CHANGE_DELETE;
         e.pos_lo = e.pos_hi = e.seq;                                 /* (one writer: the highest seq of the domain stands for its rows) */
         if (cb(ud, &e) != 0) {
@@ -1322,16 +1375,16 @@ static int sq_report_status(db_conn_t *c, const db_status_t *st) {
 static int xt_loop(db_conn_t *c, sqlite3_stmt *st, const db_ext_sink_t *sink) {
     int ret = 0;
     for (;;) {
-        int rc = sqlite3_step(st);
+        int rc = bstep(c, st);
         if (rc == SQLITE_DONE) break;
         if (rc != SQLITE_ROW) {
             ret = sql_fail(c, rc, "scan_ext (karidns_record_tags)");
             break;
         }
         bool bad = false;
-        int64_t did = sqlite3_column_int64(st, 0);
         db_tag_row_t row;
-        row.record_id = sqlite3_column_int64(st, 1);
+        row.record_id = sqlite3_column_int64(st, 1);             /* (INTEGER PRIMARY KEY: always an integer) */
+        int64_t did = col_int(c, st, 0, "records", 0, "domain_id", &bad);
         row.location_tag = col_text(c, st, 2, "karidns_record_tags", row.record_id, "location_tag", &bad);
         row.ecs_tag = col_text(c, st, 3, "karidns_record_tags", row.record_id, "ecs_tag", &bad);
         if (bad) {
@@ -1350,20 +1403,20 @@ static int xt_loop(db_conn_t *c, sqlite3_stmt *st, const db_ext_sink_t *sink) {
 static int xd_loop(db_conn_t *c, sqlite3_stmt *st, const db_ext_sink_t *sink) {
     int ret = 0;
     for (;;) {
-        int rc = sqlite3_step(st);
+        int rc = bstep(c, st);
         if (rc == SQLITE_DONE) break;
         if (rc != SQLITE_ROW) {
             ret = sql_fail(c, rc, "scan_ext (karidns_record_tinydns)");
             break;
         }
         bool bad = false;
-        int64_t did = sqlite3_column_int64(st, 0);
         db_tinydns_row_t row;
-        row.record_id = sqlite3_column_int64(st, 1);
+        row.record_id = sqlite3_column_int64(st, 1);             /* (INTEGER PRIMARY KEY: always an integer) */
+        int64_t did = col_int(c, st, 0, "records", 0, "domain_id", &bad);
         row.ttd_null = sqlite3_column_type(st, 2) == SQLITE_NULL;
-        row.ttd = row.ttd_null ? 0 : sqlite3_column_int64(st, 2);
+        row.ttd = row.ttd_null ? 0 : col_int(c, st, 2, "karidns_record_tinydns", row.record_id, "ttd", &bad);
         row.loc = col_text(c, st, 3, "karidns_record_tinydns", row.record_id, "loc", &bad);
-        row.countdown = sqlite3_column_type(st, 4) != SQLITE_NULL && sqlite3_column_int64(st, 4) != 0;
+        row.countdown = sqlite3_column_type(st, 4) != SQLITE_NULL && col_int(c, st, 4, "karidns_record_tinydns", row.record_id, "countdown", &bad) != 0;
         if (bad) {
             ret = -1;
             break;
@@ -1380,14 +1433,14 @@ static int xd_loop(db_conn_t *c, sqlite3_stmt *st, const db_ext_sink_t *sink) {
 static int xg_loop(db_conn_t *c, sqlite3_stmt *st, const db_ext_sink_t *sink) {
     int ret = 0;
     for (;;) {
-        int rc = sqlite3_step(st);
+        int rc = bstep(c, st);
         if (rc == SQLITE_DONE) break;
         if (rc != SQLITE_ROW) {
             ret = sql_fail(c, rc, "scan_ext (karidns_zone_tagdefs)");
             break;
         }
         bool bad = false;
-        int64_t did = sqlite3_column_int64(st, 0);
+        int64_t did = col_int(c, st, 0, "karidns_zone_tagdefs", 0, "domain_id", &bad);
         db_tagdef_row_t row;
         row.kind = col_text(c, st, 1, "karidns_zone_tagdefs", did, "kind", &bad);
         row.tag = col_text(c, st, 2, "karidns_zone_tagdefs", did, "tag", &bad);
@@ -1419,7 +1472,7 @@ static int sq_scan_ext(db_conn_t *c, const int64_t *domain_id, const db_ext_sink
     if (ret != 0) return ret;
     sqlite3_stmt *st = c->st_xt[one];
     rearm(st);
-    if (one) sqlite3_bind_int64(st, 1, *domain_id);
+    if (one) bi64(c, st, 1, *domain_id);
     if ((ret = xt_loop(c, st, sink)) != 0) return ret;
 
     ret = prep(c, &c->st_xd[one],
@@ -1430,7 +1483,7 @@ static int sq_scan_ext(db_conn_t *c, const int64_t *domain_id, const db_ext_sink
     if (ret != 0) return ret;
     st = c->st_xd[one];
     rearm(st);
-    if (one) sqlite3_bind_int64(st, 1, *domain_id);
+    if (one) bi64(c, st, 1, *domain_id);
     if ((ret = xd_loop(c, st, sink)) != 0) return ret;
 
     ret = prep(c, &c->st_xg[one],
@@ -1439,7 +1492,7 @@ static int sq_scan_ext(db_conn_t *c, const int64_t *domain_id, const db_ext_sink
     if (ret != 0) return ret;
     st = c->st_xg[one];
     rearm(st);
-    if (one) sqlite3_bind_int64(st, 1, *domain_id);
+    if (one) bi64(c, st, 1, *domain_id);
     return xg_loop(c, st, sink);
 }
 
@@ -1483,8 +1536,8 @@ static sqlite3_stmt *in_stmt(db_conn_t *c, int kind, const int64_t *ids, size_t 
     sqlite3_stmt *st = *slot;
     rearm(st);
     for (size_t i = 0; i < cap; i++) {
-        if (i < n) sqlite3_bind_int64(st, (int)i + 1, ids[i]);
-        else sqlite3_bind_null(st, (int)i + 1);
+        if (i < n) bi64(c, st, (int)i + 1, ids[i]);
+        else bnull(c, st, (int)i + 1);
     }
     return st;
 }
@@ -1532,7 +1585,7 @@ static int sq_poll_version(db_conn_t *c, uint64_t *version, bool *replaced) {
     if (ret != 0) return ret;
     sqlite3_stmt *st = c->st_pv;
     rearm(st);
-    int rc = sqlite3_step(st);
+    int rc = bstep(c, st);
     if (rc == SQLITE_ROW) *version = (uint64_t)sqlite3_column_int64(st, 0);
     else ret = sql_fail(c, rc, "PRAGMA data_version");
     rearm(st);
@@ -1555,14 +1608,14 @@ static int wcheck(db_conn_t *c, const char *fn) {
     return 0;
 }
 
-static void bind_txt(sqlite3_stmt *st, int i, const char *s) {
-    if (s) sqlite3_bind_text(st, i, s, -1, SQLITE_STATIC);
-    else sqlite3_bind_null(st, i);
+static void bind_txt(db_conn_t *c, sqlite3_stmt *st, int i, const char *s) {
+    if (s) btext(c, st, i, s, -1, SQLITE_STATIC);
+    else bnull(c, st, i);
 }
 
 /* run a statement whose parameters are bound, once, and put it back to the start */
 static int wstep(db_conn_t *c, sqlite3_stmt *st, const char *what) {
-    int rc = sqlite3_step(st);
+    int rc = bstep(c, st);
     int ret = rc == SQLITE_DONE ? 0 : sql_fail(c, rc, what);
     wrearm(st);
     return ret;
@@ -1570,7 +1623,7 @@ static int wstep(db_conn_t *c, sqlite3_stmt *st, const char *what) {
 
 /* a statement that runs once: prepare, run (parameters bound by the caller before wstep1), finalize */
 static int wstep1(db_conn_t *c, sqlite3_stmt *st, const char *what) {
-    int rc = sqlite3_step(st);
+    int rc = bstep(c, st);
     int ret = rc == SQLITE_DONE ? 0 : sql_fail(c, rc, what);
     sqlite3_finalize(st);
     return ret;
@@ -1582,7 +1635,7 @@ static int wstep1(db_conn_t *c, sqlite3_stmt *st, const char *what) {
 static int put_actor(db_conn_t *c) {
     sqlite3_stmt *st = NULL;
     int rc = sqlite3_prepare_v2(c->db, "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'karidns_audit_actor'", -1, &st, NULL);
-    if (rc == SQLITE_OK) rc = sqlite3_step(st);
+    if (rc == SQLITE_OK) rc = bstep(c, st);
     sqlite3_finalize(st);
     if (rc == SQLITE_DONE) return 0;
     if (rc != SQLITE_ROW) return sql_fail(c, rc, "karidns_audit_actor");
@@ -1590,11 +1643,11 @@ static int put_actor(db_conn_t *c) {
     rc = sqlite3_prepare_v2(c->db, "INSERT OR REPLACE INTO karidns_audit_actor (id, principal_id, principal_name, change_set, db_role) "
                                    "VALUES (1, ?2, ?3, ?4, ?1)", -1, &st, NULL);
     if (rc != SQLITE_OK) return sql_fail(c, rc, "karidns_audit_actor");
-    bind_txt(st, 1, c->audit_actor);
-    if (c->actor_has_pid) sqlite3_bind_int64(st, 2, c->actor_pid);
-    else sqlite3_bind_null(st, 2);
-    bind_txt(st, 3, c->actor_has_pname ? c->actor_pname : NULL);
-    bind_txt(st, 4, c->actor_has_cs ? c->actor_cs : NULL);
+    bind_txt(c, st, 1, c->audit_actor);
+    if (c->actor_has_pid) bi64(c, st, 2, c->actor_pid);
+    else bnull(c, st, 2);
+    bind_txt(c, st, 3, c->actor_has_pname ? c->actor_pname : NULL);
+    bind_txt(c, st, 4, c->actor_has_cs ? c->actor_cs : NULL);
     int ret = wstep1(c, st, "karidns_audit_actor");
     c->actor_set = ret == 0;
     return ret;
@@ -1665,8 +1718,8 @@ static int sq_w_create_zone(db_conn_t *c, const char *name, const char *type, in
     sqlite3_stmt *st = NULL;
     ret = prep(c, &st, "INSERT INTO domains (name, type) VALUES (?1, ?2)");
     if (ret != 0) return ret;
-    sqlite3_bind_text(st, 1, name, -1, SQLITE_STATIC);
-    sqlite3_bind_text(st, 2, type ? type : "NATIVE", -1, SQLITE_STATIC);
+    btext(c, st, 1, name, -1, SQLITE_STATIC);
+    btext(c, st, 2, type ? type : "NATIVE", -1, SQLITE_STATIC);
     ret = wstep1(c, st, "w_create_zone");
     if (ret == 0) *id = (int64_t)sqlite3_last_insert_rowid(c->db);
     return ret;
@@ -1685,7 +1738,7 @@ static int sq_w_delete_records(db_conn_t *c, int64_t domain_id, const int64_t *i
         for (size_t i = c->has_ext ? 0 : 2; i < 3 && ret == 0; i++) {
             sqlite3_stmt *st = NULL;
             if ((ret = prep(c, &st, sql[i])) != 0) return ret;
-            sqlite3_bind_int64(st, 1, domain_id);
+            bi64(c, st, 1, domain_id);
             ret = wstep1(c, st, "w_delete_records");
         }
         return ret;
@@ -1700,8 +1753,8 @@ static int sq_w_delete_records(db_conn_t *c, int64_t domain_id, const int64_t *i
     for (size_t i = 0; i < n && ret == 0; i++) {
         for (int k = c->has_ext ? W_DEL_TAGS_ID : W_DEL_REC_ID; k <= W_DEL_REC_ID && ret == 0; k++) {
             sqlite3_stmt *st = c->st_w[k];
-            sqlite3_bind_int64(st, 1, ids[i]);
-            sqlite3_bind_int64(st, 2, domain_id);
+            bi64(c, st, 1, ids[i]);
+            bi64(c, st, 2, domain_id);
             ret = wstep(c, st, "w_delete_records");
         }
     }
@@ -1715,17 +1768,17 @@ static int sq_w_insert_record(db_conn_t *c, int64_t domain_id, const db_record_r
                "INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled, auth, ordername) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)");
     if (ret != 0) return ret;
     sqlite3_stmt *st = c->st_w[W_INS_REC];
-    sqlite3_bind_int64(st, 1, domain_id);
-    bind_txt(st, 2, row->name);
-    bind_txt(st, 3, row->type);
-    bind_txt(st, 4, row->content);
-    if (row->ttl_null) sqlite3_bind_null(st, 5);
-    else sqlite3_bind_int64(st, 5, row->ttl);
-    if (row->prio_null) sqlite3_bind_null(st, 6);
-    else sqlite3_bind_int64(st, 6, row->prio);
-    sqlite3_bind_int(st, 7, row->disabled ? 1 : 0);
-    sqlite3_bind_int(st, 8, auth ? 1 : 0);
-    bind_txt(st, 9, row->ordername);
+    bi64(c, st, 1, domain_id);
+    bind_txt(c, st, 2, row->name);
+    bind_txt(c, st, 3, row->type);
+    bind_txt(c, st, 4, row->content);
+    if (row->ttl_null) bnull(c, st, 5);
+    else bi64(c, st, 5, row->ttl);
+    if (row->prio_null) bnull(c, st, 6);
+    else bi64(c, st, 6, row->prio);
+    bi64(c, st, 7, row->disabled ? 1 : 0);
+    bi64(c, st, 8, auth ? 1 : 0);
+    bind_txt(c, st, 9, row->ordername);
     ret = wstep(c, st, "w_insert_record");
     if (ret == 0) *id = (int64_t)sqlite3_last_insert_rowid(c->db);
     return ret;
@@ -1742,9 +1795,9 @@ static int sq_w_insert_tags(db_conn_t *c, int64_t record_id, const char *loc, co
     if (!c->has_ext) return ext_missing(c);
     if ((ret = prep(c, &c->st_w[W_INS_TAGS], "INSERT INTO karidns_record_tags (record_id, location_tag, ecs_tag) VALUES (?1, ?2, ?3)")) != 0) return ret;
     sqlite3_stmt *st = c->st_w[W_INS_TAGS];
-    sqlite3_bind_int64(st, 1, record_id);
-    bind_txt(st, 2, loc);
-    bind_txt(st, 3, ecs);
+    bi64(c, st, 1, record_id);
+    bind_txt(c, st, 2, loc);
+    bind_txt(c, st, 3, ecs);
     return wstep(c, st, "w_insert_tags");
 }
 
@@ -1754,10 +1807,10 @@ static int sq_w_insert_tinydns(db_conn_t *c, int64_t record_id, int64_t ttd, con
     if (!c->has_ext) return ext_missing(c);
     if ((ret = prep(c, &c->st_w[W_INS_TD], "INSERT INTO karidns_record_tinydns (record_id, ttd, loc, countdown) VALUES (?1, ?2, ?3, ?4)")) != 0) return ret;
     sqlite3_stmt *st = c->st_w[W_INS_TD];
-    sqlite3_bind_int64(st, 1, record_id);
-    sqlite3_bind_int64(st, 2, ttd);
-    bind_txt(st, 3, loc);
-    sqlite3_bind_int(st, 4, countdown ? 1 : 0);
+    bi64(c, st, 1, record_id);
+    bi64(c, st, 2, ttd);
+    bind_txt(c, st, 3, loc);
+    bi64(c, st, 4, countdown ? 1 : 0);
     return wstep(c, st, "w_insert_tinydns");
 }
 
@@ -1768,9 +1821,9 @@ static int sq_w_delete_tagdefs(db_conn_t *c, int64_t domain_id, const char *kind
     sqlite3_stmt *st = NULL;
     if ((ret = prep(c, &st, "DELETE FROM karidns_zone_tagdefs WHERE domain_id = ?1 AND (?2 IS NULL OR kind = ?2) AND (?3 IS NULL OR lower(tag) = lower(?3))")) != 0)
         return ret;
-    sqlite3_bind_int64(st, 1, domain_id);
-    bind_txt(st, 2, kind);
-    bind_txt(st, 3, tag);
+    bi64(c, st, 1, domain_id);
+    bind_txt(c, st, 2, kind);
+    bind_txt(c, st, 3, tag);
     return wstep1(c, st, "w_delete_tagdefs");
 }
 
@@ -1780,10 +1833,10 @@ static int sq_w_insert_tagdef(db_conn_t *c, int64_t domain_id, const char *kind,
     if (!c->has_ext) return ext_missing(c);
     if ((ret = prep(c, &c->st_w[W_INS_TAGDEF], "INSERT INTO karidns_zone_tagdefs (domain_id, kind, tag, cidr) VALUES (?1, ?2, ?3, ?4)")) != 0) return ret;
     sqlite3_stmt *st = c->st_w[W_INS_TAGDEF];
-    sqlite3_bind_int64(st, 1, domain_id);
-    bind_txt(st, 2, kind);
-    bind_txt(st, 3, tag);
-    bind_txt(st, 4, cidr);
+    bi64(c, st, 1, domain_id);
+    bind_txt(c, st, 2, kind);
+    bind_txt(c, st, 3, tag);
+    bind_txt(c, st, 4, cidr);
     return wstep(c, st, "w_insert_tagdef");
 }
 
@@ -1792,8 +1845,8 @@ static int sq_w_delete_meta(db_conn_t *c, int64_t domain_id, const char *kind) {
     if (ret != 0) return ret;
     sqlite3_stmt *st = NULL;
     if ((ret = prep(c, &st, "DELETE FROM domainmetadata WHERE domain_id = ?1 AND upper(kind) = upper(?2)")) != 0) return ret;
-    sqlite3_bind_int64(st, 1, domain_id);
-    bind_txt(st, 2, kind);
+    bi64(c, st, 1, domain_id);
+    bind_txt(c, st, 2, kind);
     return wstep1(c, st, "w_delete_meta");
 }
 
@@ -1802,9 +1855,9 @@ static int sq_w_insert_meta(db_conn_t *c, int64_t domain_id, const char *kind, c
     if (ret != 0) return ret;
     if ((ret = prep(c, &c->st_w[W_INS_META], "INSERT INTO domainmetadata (domain_id, kind, content) VALUES (?1, ?2, ?3)")) != 0) return ret;
     sqlite3_stmt *st = c->st_w[W_INS_META];
-    sqlite3_bind_int64(st, 1, domain_id);
-    bind_txt(st, 2, kind);
-    bind_txt(st, 3, content);
+    bi64(c, st, 1, domain_id);
+    bind_txt(c, st, 2, kind);
+    bind_txt(c, st, 3, content);
     return wstep(c, st, "w_insert_meta");
 }
 
@@ -1818,8 +1871,8 @@ static int sq_w_set_view(db_conn_t *c, int64_t domain_id, const char *view_name)
     sqlite3_stmt *st = NULL;
     if ((ret = prep(c, &st, "INSERT INTO karidns_domain_views (domain_id, view_name) VALUES (?1, ?2) ON CONFLICT (domain_id, view_name) DO NOTHING")) != 0)
         return ret;
-    sqlite3_bind_int64(st, 1, domain_id);
-    bind_txt(st, 2, view_name);
+    bi64(c, st, 1, domain_id);
+    bind_txt(c, st, 2, view_name);
     return wstep1(c, st, "w_set_view");
 }
 
@@ -1835,8 +1888,8 @@ static int sq_w_zone_has_keys(db_conn_t *c, int64_t domain_id, bool *has) {
     if (ret != 0) return ret;
     sqlite3_stmt *st = NULL;
     if ((ret = prep(c, &st, "SELECT 1 FROM cryptokeys WHERE domain_id = ?1 LIMIT 1")) != 0) return ret;
-    sqlite3_bind_int64(st, 1, domain_id);
-    int rc = sqlite3_step(st);
+    bi64(c, st, 1, domain_id);
+    int rc = bstep(c, st);
     if (rc == SQLITE_ROW || rc == SQLITE_DONE) *has = rc == SQLITE_ROW;
     else ret = sql_fail(c, rc, "w_zone_has_keys");
     sqlite3_finalize(st);
@@ -1849,15 +1902,22 @@ static int sq_w_scan_auth(db_conn_t *c, int64_t domain_id, db_auth_cb cb, void *
     if (ret != 0) return ret;
     sqlite3_stmt *st = NULL;
     if ((ret = prep(c, &st, "SELECT id, auth FROM records WHERE domain_id = ?1 ORDER BY id")) != 0) return ret;
-    sqlite3_bind_int64(st, 1, domain_id);
+    bi64(c, st, 1, domain_id);
     for (;;) {
-        int rc = sqlite3_step(st);
+        int rc = bstep(c, st);
         if (rc == SQLITE_DONE) break;
         if (rc != SQLITE_ROW) {
             ret = sql_fail(c, rc, "w_scan_auth");
             break;
         }
-        if (cb(ud, sqlite3_column_int64(st, 0), sqlite3_column_type(st, 1) == SQLITE_NULL || sqlite3_column_int64(st, 1) != 0) != 0) {
+        bool bad = false;
+        const int64_t rid = col_int(c, st, 0, "records", 0, "id", &bad);
+        const bool auth = sqlite3_column_type(st, 1) == SQLITE_NULL || col_int(c, st, 1, "records", rid, "auth", &bad) != 0;
+        if (bad) {
+            ret = -1;
+            break;
+        }
+        if (cb(ud, rid, auth) != 0) {
             ret = DB_STOPPED;
             break;
         }
@@ -1871,11 +1931,11 @@ static int sq_w_update_record(db_conn_t *c, int64_t domain_id, int64_t id, const
     if (ret != 0) return ret;
     if ((ret = prep(c, &c->st_w[W_UPD_REC], "UPDATE records SET content = coalesce(?3, content), ordername = ?4, auth = ?5 WHERE id = ?1 AND domain_id = ?2")) != 0) return ret;
     sqlite3_stmt *st = c->st_w[W_UPD_REC];
-    sqlite3_bind_int64(st, 1, id);
-    sqlite3_bind_int64(st, 2, domain_id);
-    bind_txt(st, 3, content);
-    bind_txt(st, 4, ordername);
-    sqlite3_bind_int(st, 5, auth ? 1 : 0);
+    bi64(c, st, 1, id);
+    bi64(c, st, 2, domain_id);
+    bind_txt(c, st, 3, content);
+    bind_txt(c, st, 4, ordername);
+    bi64(c, st, 5, auth ? 1 : 0);
     ret = wstep(c, st, "w_update_record");
     if (ret == 0 && sqlite3_changes(c->db) != 1) {
         set_err(c, "w_update_record: record %lld is not in zone %lld", (long long)id, (long long)domain_id);
@@ -1914,8 +1974,8 @@ static int sq_w_delete_dnssec(db_conn_t *c, int64_t domain_id, const int64_t *id
     if ((ret = prep(c, &c->st_w[W_DEL_REC_ID], "DELETE FROM records WHERE id = ?1 AND domain_id = ?2")) != 0) return ret;
     for (size_t i = 0; i < n && ret == 0; i++) {
         sqlite3_stmt *st = c->st_w[W_DEL_REC_ID];
-        sqlite3_bind_int64(st, 1, ids[i]);
-        sqlite3_bind_int64(st, 2, domain_id);
+        bi64(c, st, 1, ids[i]);
+        bi64(c, st, 2, domain_id);
         ret = wstep(c, st, "w_delete_dnssec");
     }
     return ret;
@@ -1929,7 +1989,7 @@ static int change_max(db_conn_t *c, uint64_t *seq) {
     int rc = sqlite3_prepare_v2(c->db, "SELECT coalesce(max(seq), 0) FROM karidns_changes", -1, &st, NULL);
     if (rc != SQLITE_OK) return sql_fail(c, rc, "prepare");
     int ret = 0;
-    rc = sqlite3_step(st);
+    rc = bstep(c, st);
     if (rc == SQLITE_ROW) *seq = (uint64_t)sqlite3_column_int64(st, 0);
     else ret = sql_fail(c, rc, "w_mark");
     sqlite3_finalize(st);
@@ -1948,8 +2008,8 @@ static int sq_w_write_id(db_conn_t *c, uint64_t mark, db_write_id_t *id) {
     sqlite3_stmt *st = NULL;
     int rc = sqlite3_prepare_v2(c->db, "SELECT coalesce(min(seq), 0), coalesce(max(seq), 0) FROM karidns_changes WHERE seq > ?1", -1, &st, NULL);
     if (rc != SQLITE_OK) return sql_fail(c, rc, "prepare");
-    sqlite3_bind_int64(st, 1, (sqlite3_int64)mark);
-    rc = sqlite3_step(st);
+    bi64(c, st, 1, (sqlite3_int64)mark);
+    rc = bstep(c, st);
     if (rc == SQLITE_ROW) {
         id->seq_first = (uint64_t)sqlite3_column_int64(st, 0);
         id->seq_last = (uint64_t)sqlite3_column_int64(st, 1);
@@ -1986,10 +2046,16 @@ static int sq_w_zone_generation(db_conn_t *c, int64_t domain_id, uint64_t *gener
     }
     sqlite3_stmt *st = NULL;
     if ((ret = prep(c, &st, "SELECT generation FROM karidns_zone_state WHERE domain_id = ?1")) != 0) return ret;
-    sqlite3_bind_int64(st, 1, domain_id);
-    int rc = sqlite3_step(st);
-    if (rc == SQLITE_ROW) *generation = (uint64_t)sqlite3_column_int64(st, 0);
-    else if (rc != SQLITE_DONE) ret = sql_fail(c, rc, "w_zone_generation");
+    bi64(c, st, 1, domain_id);
+    int rc = bstep(c, st);
+    if (rc == SQLITE_ROW) {
+        bool bad = false;
+        const int64_t g = col_int(c, st, 0, "karidns_zone_state", domain_id, "generation", &bad);
+        if (bad) ret = -1;
+        else *generation = g < 0 ? 0 : (uint64_t)g;         /* (a negative one, which the schema's CHECK forbids, is 0: as PostgreSQL and the manifest, review D-5) */
+    } else if (rc != SQLITE_DONE) {
+        ret = sql_fail(c, rc, "w_zone_generation");
+    }
     sqlite3_finalize(st);
     return ret;
 }
@@ -2001,10 +2067,10 @@ static int sq_w_bump_serial(db_conn_t *c, int64_t domain_id, int64_t soa_id, con
     if (ret != 0) return ret;
     sqlite3_stmt *st = NULL;
     if ((ret = prep(c, &st, "UPDATE records SET content = ?3 WHERE id = ?1 AND domain_id = ?2")) != 0) return ret;
-    sqlite3_bind_int64(st, 1, soa_id);
-    sqlite3_bind_int64(st, 2, domain_id);
-    bind_txt(st, 3, new_content);
-    int rc = sqlite3_step(st);
+    bi64(c, st, 1, soa_id);
+    bi64(c, st, 2, domain_id);
+    bind_txt(c, st, 3, new_content);
+    int rc = bstep(c, st);
     if (rc != SQLITE_DONE) {
         ret = sql_fail(c, rc, "w_bump_serial");
     } else if (sqlite3_changes(c->db) != 1) {
@@ -2027,32 +2093,37 @@ static int sq_w_insert_version(db_conn_t *c, int64_t domain_id, const db_version
                        "generation_before, generation_after, rollback_of, delta_complete) "
                        "SELECT ?1, coalesce(max(version), 0) + 1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13 FROM karidns_zone_versions WHERE domain_id = ?1");
     if (ret != 0) return ret;
-    sqlite3_bind_int64(st, 1, domain_id);
-    bind_txt(st, 2, v->kind);
-    bind_txt(st, 3, v->change_set);
-    if (v->has_principal) sqlite3_bind_int64(st, 4, v->principal_id);
-    else sqlite3_bind_null(st, 4);
-    bind_txt(st, 5, v->principal_name);
-    bind_txt(st, 6, v->db_role);
-    bind_txt(st, 7, v->comment);
-    if (v->has_serial_before) sqlite3_bind_int64(st, 8, (sqlite3_int64)v->serial_before);
-    else sqlite3_bind_null(st, 8);
-    if (v->has_serial_after) sqlite3_bind_int64(st, 9, (sqlite3_int64)v->serial_after);
-    else sqlite3_bind_null(st, 9);
-    sqlite3_bind_int64(st, 10, (sqlite3_int64)v->generation_before);
-    sqlite3_bind_int64(st, 11, (sqlite3_int64)v->generation_after);
-    if (v->rollback_of) sqlite3_bind_int64(st, 12, (sqlite3_int64)v->rollback_of);
-    else sqlite3_bind_null(st, 12);
-    sqlite3_bind_int(st, 13, v->delta_complete ? 1 : 0);
+    bi64(c, st, 1, domain_id);
+    bind_txt(c, st, 2, v->kind);
+    bind_txt(c, st, 3, v->change_set);
+    if (v->has_principal) bi64(c, st, 4, v->principal_id);
+    else bnull(c, st, 4);
+    bind_txt(c, st, 5, v->principal_name);
+    bind_txt(c, st, 6, v->db_role);
+    bind_txt(c, st, 7, v->comment);
+    if (v->has_serial_before) bi64(c, st, 8, (sqlite3_int64)v->serial_before);
+    else bnull(c, st, 8);
+    if (v->has_serial_after) bi64(c, st, 9, (sqlite3_int64)v->serial_after);
+    else bnull(c, st, 9);
+    bi64(c, st, 10, (sqlite3_int64)v->generation_before);
+    bi64(c, st, 11, (sqlite3_int64)v->generation_after);
+    if (v->rollback_of) bi64(c, st, 12, (sqlite3_int64)v->rollback_of);
+    else bnull(c, st, 12);
+    bi64(c, st, 13, v->delta_complete ? 1 : 0);
     ret = wstep1(c, st, "w_insert_version");
     if (ret != 0) return ret;
     *id = (int64_t)sqlite3_last_insert_rowid(c->db);
     st = NULL;
     if ((ret = prep(c, &st, "SELECT version FROM karidns_zone_versions WHERE id = ?1")) != 0) return ret;
-    sqlite3_bind_int64(st, 1, *id);
-    int rc = sqlite3_step(st);
-    if (rc == SQLITE_ROW) *number = (uint32_t)sqlite3_column_int64(st, 0);
-    else ret = sql_fail(c, rc, "w_insert_version");
+    bi64(c, st, 1, *id);
+    int rc = bstep(c, st);
+    if (rc == SQLITE_ROW) {
+        bool bad = false;
+        *number = (uint32_t)col_int(c, st, 0, "karidns_zone_versions", *id, "version", &bad);
+        if (bad) ret = -1;
+    } else {
+        ret = sql_fail(c, rc, "w_insert_version");
+    }
     sqlite3_finalize(st);
     return ret;
 }
@@ -2062,11 +2133,11 @@ static int sq_w_insert_version_rrset(db_conn_t *c, int64_t version_id, const cha
     if (ret != 0) return ret;
     sqlite3_stmt *st = NULL;
     if ((ret = prep(c, &st, "INSERT INTO karidns_zone_version_rrsets (version_id, owner, type, before, after) VALUES (?1, ?2, ?3, ?4, ?5)")) != 0) return ret;
-    sqlite3_bind_int64(st, 1, version_id);
-    bind_txt(st, 2, owner);
-    bind_txt(st, 3, type);
-    bind_txt(st, 4, before);
-    bind_txt(st, 5, after);
+    bi64(c, st, 1, version_id);
+    bind_txt(c, st, 2, owner);
+    bind_txt(c, st, 3, type);
+    bind_txt(c, st, 4, before);
+    bind_txt(c, st, 5, after);
     return wstep1(c, st, "w_insert_version_rrset");
 }
 

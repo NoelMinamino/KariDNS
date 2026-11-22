@@ -3127,6 +3127,83 @@ static void test_paged(void) {
     sqlite3_close(db);
 }
 
+/* review D-5, D-6, D-7 (2026-11-22): a negative generation is stamp 0 (as PostgreSQL now); a parameter that cannot be bound fails the call instead of running the statement with the
+ * parameter NULL or as the last call bound it; an integer column of a secondary path that holds a TEXT is an error, as on the main paths, not the number its first digits make */
+extern sqlite3 *sq_test_handle(db_conn_t *c);
+static int rv_dv_cb(void *ud, int64_t d, const char *v) { (void)v; *(int64_t *)ud = d; return 0; }
+static int rv_meta_cb(void *ud, const db_meta_row_t *m) { *(int64_t *)ud = m->domain_id; return 0; }
+static int rv_chg_cb(void *ud, const db_change_entry_t *e) { *(int64_t *)ud = e->domain_id; return 0; }
+static void test_review_d567(void) {
+    printf("review D-5 / D-6 / D-7: negative generation, failed binds, column types of the secondary paths\n");
+    char path[600], err[DB_ERRLEN];
+    const db_driver_t *D = &db_driver_sqlite3;
+    sqlite3 *db = make_db("review_d567.db", path, sizeof(path));
+    char *ext = slurp(g_ext_path);
+    CHECK(ext != NULL);
+    if (ext) raw_exec(db, ext);
+    free(ext);
+    raw_exec(db, "INSERT INTO domains (id, name, type) VALUES (1, 'a.rv.test', 'NATIVE'), (2, 'b.rv.test', 'NATIVE')");
+    raw_exec(db, "INSERT INTO karidns_domain_views (domain_id, view_name) VALUES (1, 'alpha')");
+    raw_exec(db, "PRAGMA ignore_check_constraints = 1");
+    raw_exec(db, "UPDATE karidns_zone_state SET generation = -5, changed_at = -7 WHERE domain_id = 1");
+    raw_exec(db, "PRAGMA ignore_check_constraints = 0");
+    db_conn_t *c = open_driver(path, 0, err, sizeof(err), NULL);
+    CHECK(c != NULL);
+    if (!c) {
+        sqlite3_close(db);
+        return;
+    }
+    db_schema_info_t si;
+    CHECK(D->check_schema(c, &si) == 0 && si.has_zone_state && si.has_changes && si.has_domain_views);
+    {   /* D-5: the negative generation is stamp 0 */
+        mp_t a = { .ordered = true };
+        int64_t last;
+        unsigned n;
+        CHECK(D->manifest_page(c, 0, 10, mp_cb, &a, &last, &n) == 0 && n == 2);
+        CHECK_MSG(a.n == 2 && a.has_state[0] && a.gen[0] == 0, "generation -5: stamp %llu", a.n ? (unsigned long long)a.gen[0] : 0ull);
+        mp_free(&a);
+    }
+    {   /* D-6: a view name over the length limit of the connection (30 octets) cannot be bound: the count fails (before: the statement ran with the parameter NULL and counted
+         * the domains of no view) */
+        uint64_t cnt = 0;
+        CHECK(D->count_domains(c, "alpha", &cnt) == 0 && cnt == 2);
+        sqlite3 *h = sq_test_handle(c);
+        const int old = sqlite3_limit(h, SQLITE_LIMIT_LENGTH, 30);           /* (SQLite raises a lower limit to 30) */
+        cnt = 99;
+        const int r = D->count_domains(c, "a-view-name-longer-than-the-30-octets-of-the-limit-of-the-connection", &cnt);
+        CHECK_MSG(r != 0, "a parameter that cannot be bound: count_domains %d, count %llu", r, (unsigned long long)cnt);
+        CHECK_HAS(D->errmsg(c), "cannot be bound");
+        sqlite3_limit(h, SQLITE_LIMIT_LENGTH, old);
+        CHECK(D->count_domains(c, "alpha", &cnt) == 0 && cnt == 2);                     /* (the next call is not affected) */
+    }
+    /* D-7: TEXT in the integer columns of the secondary paths (FOREIGN KEYS are off on the test's own connection) */
+    raw_exec(db, "INSERT INTO karidns_domain_views (domain_id, view_name) VALUES ('2abc', 'beta')");
+    raw_exec(db, "INSERT INTO domainmetadata (domain_id, kind, content) VALUES ('2abc', 'X-TEST', '1')");
+    int64_t got = -1;
+    CHECK(D->scan_domain_views(c, NULL, rv_dv_cb, &got) == -1);
+    CHECK_HAS(D->errmsg(c), "domain_id is not an integer");
+    const int64_t two = 2;
+    got = -1;
+    CHECK(D->scan_metadata(c, NULL, rv_meta_cb, &got) == -1 && got == -1);
+    CHECK_HAS(D->errmsg(c), "domain_id is not an integer");
+    {
+        uint64_t top = 0;
+        CHECK(D->current_cursor(c, &top) == 0);
+        raw_exec(db, "INSERT INTO karidns_changes (domain_id, changed_at) VALUES ('2abc', 0)");
+        db_change_pos_t pos;
+        bool more, gap;
+        db_change_pos_init(&pos, top);
+        got = -1;
+        CHECK(D->changes_page(c, &pos, 10, rv_chg_cb, &got, &more, &gap) == -1 && got == -1);
+        CHECK_HAS(D->errmsg(c), "domain_id is not an integer");
+    }
+    raw_exec(db, "DELETE FROM karidns_domain_views WHERE view_name = 'beta'");
+    got = -1;
+    CHECK(D->scan_domain_views(c, &two, rv_dv_cb, &got) == 0 && got == -1);            /* (the good rows read as before) */
+    D->close(c);
+    sqlite3_close(db);
+}
+
 /* The rate of manifest_page at 1,000,000 generated rows (KARIDNS_TEST_MANIFEST_ROWS=1000000; off by default: the point is to confirm the
  * page is not pathological, not to compare).  No triggers: the domains, the state rows and the mapping are bulk inserted. */
 static void test_manifest_rate(void) {
@@ -5160,6 +5237,7 @@ int main(int argc, char **argv) {
     snprintf(g_audit_path, sizeof(g_audit_path), "%s/../../db/karidns_audit.sqlite3.sql", dir);
     test_writes();
     test_paged();
+    test_review_d567();
     test_store_loader();
     test_signer_waiting_set();
     test_lookup();
