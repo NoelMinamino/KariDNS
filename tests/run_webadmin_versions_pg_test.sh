@@ -128,6 +128,10 @@ options {
 control-channel { socket "$T/ctl.sock"; secret "$MAIN_SECRET"; };
 EOF
 chmod 644 "$T/karidns.conf"
+# CI flake rows 9, 34: when a query of it_versions.mjs gets no answer, IT_LOST_DIAG prints the counters that say where it was lost (tests/lib_proc.sh)
+printf 'socket "%s";\nkey "karictl" { algorithm hmac-sha256; secret "%s"; };\n' "$T/ctl.sock" "$MAIN_SECRET" > "$T/main-karictl.conf"
+chmod 600 "$T/main-karictl.conf"
+kari_noanswer_script "$T/noanswer.sh" "$T/noanswer" "$ROOT/karictl -c $T/main-karictl.conf" "$T/karidns.log" "$PORT"
 "$KARIDNS" -c "$T/karidns.conf" -f > "$T/karidns.log" 2>&1 &
 SRV=$!
 if kari_wait_log "$T/karidns.log" "\[DB\] initial load complete" 30; then ok "karidns is up, the startup batch is complete"; else bad "karidns did not load the zones" "$(tail -20 "$T/karidns.log")"; exit 1; fi
@@ -168,7 +172,7 @@ printf '#!/bin/sh\nexec su -m "%s" -c '"'"'exec psql -X -q -At -v ON_ERROR_STOP=
 chmod 755 "$T/sql.sh"
 
 echo "-- the scenarios (webadmin/test/it_versions.mjs)"
-IT_BASE="http://127.0.0.1:$WPORT/api/v1" IT_ORIGIN="http://127.0.0.1:$WPORT" IT_ADMIN_PASSWORD="$ADMIN_PW" IT_DNS_PORT=$PORT IT_DAG="$ROOT/dag" IT_SQL="$T/sql.sh" IT_DB=pg IT_API_ROLE="$RA" \
+IT_BASE="http://127.0.0.1:$WPORT/api/v1" IT_LOST_DIAG="$T/noanswer.sh" IT_ORIGIN="http://127.0.0.1:$WPORT" IT_ADMIN_PASSWORD="$ADMIN_PW" IT_DNS_PORT=$PORT IT_DAG="$ROOT/dag" IT_SQL="$T/sql.sh" IT_DB=pg IT_API_ROLE="$RA" \
     "$NODE" webadmin/test/it_versions.mjs > "$T/it.out" 2>&1
 IT_RC=$?
 cat "$T/it.out"

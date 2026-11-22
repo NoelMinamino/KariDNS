@@ -1337,6 +1337,9 @@ echo "${C_BOLD}=================================================================
 [ -n "${EXCLUDE_LIST}" ]       && echo "  Excluded        : ${C_CYAN}${EXCLUDE_LIST}${C_RESET}"
 [ "${QUICK_MODE}" -eq 1 ]      && echo "  Mode            : ${C_YELLOW}Quick Mode${C_RESET}"
 echo "  Jobs            : ${C_CYAN}${JOBS}${C_RESET}"
+# the kernel values that decide whether a datagram on loopback is lost under the load of the parallel tests (CI flake rows 9, 26, 34): printed once,
+# so that a log of the 14.4 and the 15.1 VMs can be compared (an empty value: no such sysctl on this system)
+command -v sysctl > /dev/null 2>&1 && echo "  Kernel (UDP)    : ${C_CYAN}$(uname -r 2>/dev/null) hw.ncpu=$(sysctl -n hw.ncpu 2>/dev/null) kern.ipc.maxsockbuf=$(sysctl -n kern.ipc.maxsockbuf 2>/dev/null) net.inet.udp.recvspace=$(sysctl -n net.inet.udp.recvspace 2>/dev/null) net.local.dgram.recvspace=$(sysctl -n net.local.dgram.recvspace 2>/dev/null) net.inet.ip.intr_queue_maxlen=$(sysctl -n net.inet.ip.intr_queue_maxlen 2>/dev/null) intr_queue_drops=$(sysctl -n net.inet.ip.intr_queue_drops 2>/dev/null) net.isr.dispatch=$(sysctl -n net.isr.dispatch 2>/dev/null) net.isr.maxthreads=$(sysctl -n net.isr.maxthreads 2>/dev/null) net.isr.defaultqlimit=$(sysctl -n net.isr.defaultqlimit 2>/dev/null)${C_RESET}"
 [ -n "${SHARD_NOTE}" ]         && echo "  Shard           : ${C_CYAN}${SHARD_NOTE}${C_RESET}"
 [ "${PG_CLUSTERS}" -eq 1 ]      && echo "  PostgreSQL      : ${C_CYAN}one cluster per slot (--pg-clusters; the group pg is dropped)${C_RESET}"
 echo ""

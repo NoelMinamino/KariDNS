@@ -18,6 +18,7 @@ const PORT = process.env.IT_DNS_PORT;
 const DAG = process.env.IT_DAG;
 const SQL = process.env.IT_SQL;
 const PG = process.env.IT_DB === 'pg';
+const LOST_DIAG = process.env.IT_LOST_DIAG;
 let pass = 0;
 let fails = 0;
 const ok = (name) => { pass++; console.log(`  [ OK ] ${name}`); };
@@ -63,10 +64,15 @@ function sql(text) {
 const dagArgs = (name, t) => ['@127.0.0.1', '-p', PORT, name, t, '+nohexdump', '+time=3', '+tries=3'];
 // (with +tries=3, a try that timed out prints ";; communications error ..." to stdout as dig does: not part of the answer)
 // A try that timed out is said on the log (not a failure: the next try was answered), so that the CI logs show how often a query to a database zone goes unanswered for 3 s
+// IT_LOST_DIAG (tests/lib_proc.sh kari_noanswer_script): a script that snapshots the host's and the server's counters before the query and, when a try got no
+// answer, prints where it may have been lost (a silent drop of the server, a late reply, a loss after the router; CI flake rows 9, 34): a diagnostic only
+const lostDiag = (...args) => (LOST_DIAG ? spawnSync('sh', [LOST_DIAG, ...args], { encoding: 'utf8' }).stdout || '' : '');
 const answer = (name, t = 'A') => {
+  lostDiag('snap');
   const lines = spawnSync(DAG, [...dagArgs(name, t), '+short'], { encoding: 'utf8' }).stdout.trim().split('\n');
   const lost = lines.filter((l) => l.startsWith(';; communications error')).length;
   if (lost) console.log(`  (note: ${lost} of the tries for ${name} ${t} got no answer within 3 s)`);
+  if (lost) process.stdout.write(lostDiag('diag', name, t));
   return lines.filter((l) => l && !l.startsWith(';;')).sort().join(',');
 };
 async function waitAnswer(what, name, want, secs = 15, t = 'A') {
