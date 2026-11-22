@@ -1,4 +1,4 @@
-.TH KARICTL 8 "2026-11-22" "KariDNS" "KariDNS Manual"
+.TH KARICTL 8 "2026-11-23" "KariDNS" "KariDNS Manual"
 .\" Generated from docs/karictl.md by man/md2man.pl (make man): edit the Markdown manual, not this page.
 .SH NAME
 karictl \- Remote Control and Management Utility for KariDNS
@@ -590,7 +590,18 @@ messages of a router that a worker dropped as malformed
 \fBipc.worker.reply.dropped_full\fR, \fB.dropped_error\fR
 replies that a worker had answered and the queue to the router did not take:
 full, or another error (counted in replies, also when several went in one
-datagram)
+datagram). A full queue is waited for first (0.7): the worker sends the refused
+datagram again, in order, at once and then after pauses of 1 millisecond that
+leave the CPU to the router, for at most 50 milliseconds per batch; only what is
+still refused then is dropped and counted here. Meanwhile new queries wait in
+the worker's UDP socket. A queue that used up that time (a router that is
+stopped or hung) is tried once per batch, without waiting, until a batch goes
+whole
+.TP 8
+\fBipc.worker.reply.retried\fR
+replies that the queue to the router refused for a moment and took when the
+worker sent them again: not a loss, not in \fBipc.dropped.total\fR. On a host
+with one CPU it counts the moments the worker had to give the CPU to the router
 .TP 8
 \fBipc.worker.async.dropped_full\fR
 queries that a worker dropped because the queue of the asynchronous resolution
@@ -610,7 +621,7 @@ datagram, not a reply, so not in \fBipc.dropped.total\fR. It stays 0 unless the
 Backend sends something broken
 .TP 8
 \fBipc.dropped.total\fR
-the sum of all of them but \fBspilled\fR, \fBcut\fR and \fBretried\fR
+the sum of all of them but \fBspilled\fR, \fBcut\fR and the two \fBretried\fR
 .PP
 After the totals come the queries that each Frontend router read from its UDP
 sockets and handed to the workers, as lines \fBipcrouter.<n>.queries=<number>\fR

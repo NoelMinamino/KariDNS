@@ -1,4 +1,4 @@
-.TH KARIDNS.CONF 5 "2026-11-22" "KariDNS" "KariDNS Manual"
+.TH KARIDNS.CONF 5 "2026-11-23" "KariDNS" "KariDNS Manual"
 .\" Generated from docs/karidns.md by man/md2man.pl (make man): edit the Markdown manual, not this page.
 .SH NAME
 karidns.conf \- the configuration file of karidns(8)
@@ -375,7 +375,13 @@ counted: \fBkarictl ipcstats\fR (\fBkarictl(8)\fR).
 .br
 \fIDescription:\fR \fBSO_SNDBUF\fR of the UDP sockets and of the queues between
 the routers and the workers (same syntax, same limits and same warning as
-\fBudp\-recvbuf\-size\fR).
+\fBudp\-recvbuf\-size\fR). On FreeBSD 15 the queue of a connected \fBAF_UNIX\fR
+datagram socket is held to the sender's \fBSO_SNDBUF\fR (measured on 15.1; the
+receiver's \fBSO_RCVBUF\fR does not limit it), so this is the size of the queue
+of the replies of each worker to its router (and of the queries of a router to a
+worker). A worker whose queue is full waits for its router (pauses of 1 ms) for
+at most 50 ms per batch before it drops (0.7; \fBipc.worker.reply.retried\fR in
+\fBkarictl ipcstats\fR).
 .TP 8
 \fBtcp\-mss <n>;\fR
 \fIDefault:\fR not set (OS default)
