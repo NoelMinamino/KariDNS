@@ -253,7 +253,7 @@ extern _Atomic bool db_store_test_adopt_noview;
 extern void (*_Atomic db_recon_test_entry_hook)(void);   /* called at every entry of a manifest pass (tests: an entry that takes time) */
 extern _Atomic int db_store_test_bits_fail;               /* the bit of the n-th entry of a pass cannot be set (0: off) */
 extern _Atomic int db_store_test_un_delete_fail;          /* the n-th delete of a sweep of the zones the store cannot name fails (0: off) */
-extern _Atomic int db_store_test_ren_delete_fail;         /* the n-th delete of the old name of a renamed zone (a pass's entry) fails (0: off) */
+extern _Atomic int db_store_test_ren_delete_fail;         /* the n-th registry delete of an old name (a renamed zone) or of a zone of the heap directory (an entry, a change's delete) fails (0: off) */
 extern _Atomic int db_store_test_plog_fail;                       /* the log of a growth of the attach table that is being prepared cannot grow (the number of times) */
 extern void (*_Atomic db_store_test_prep_hook)(int where);       /* the thread that prepares the growth of the attach table calls this (where 0) after it has copied the table and before it takes the lock */
 struct dbdir_rec;

@@ -6415,6 +6415,78 @@ static void recon_rename_delete_fail(store_t *st) {
     db_recon_end(true, 0, false, 0, NULL, 0, &o);
     CHECK(!o.failed && renv_record(st, 6201, &z) && strcmp(z.name, "r4.renv.test") == 0);
 }
+/* The same for the zones of the heap directory (names the store cannot hold): a rename to another such name, a rename to a name the store holds, and the delete of a change.  The
+ * heap zone is forgotten (or renamed) only once the registry has deleted its old element; a failure keeps it as it was and fails the entry (the pass) or the delete (-1, the
+ * caller keeps no cursor).  (Before: the entry was renamed or forgotten first and the failure ignored, a failed delete of a change counted as deleted: the old element stayed
+ * served and nothing knew of it.) */
+static uint64_t hepv_nonstore(void) {
+    db_recon_status_t rs;
+    db_recon_status(&rs);
+    return rs.nonstore;
+}
+static void recon_heap_delete_fail(void) {
+    printf("  [L-3 siblings: the zones of the heap directory whose old element cannot be deleted]\n");
+    char why[200], h1[260], h2[260];
+    for (int k = 0; k < 256; k++) h1[k] = h2[k] = (k % 50 == 49) ? '.' : 'h';    /* 256 octets of text, no final dot: longer than a name of the store */
+    h1[256] = h2[256] = '\0';
+    h2[0] = 'g';
+    db_recon_end_t o;
+    db_recon_entry_t e;
+    uint32_t zid = STORE_NONE;
+    memset(&e, 0, sizeof(e));
+    e.source_id = 6301; e.name = h1; e.kind = KDB_ZK_PRIMARY; e.stamped = true; e.gen = 1; e.time = 10;
+    CHECK(db_recon_begin("hepv", 1, true, why, sizeof(why)));
+    CHECK(db_recon_entry(&e, &zid) == DBR_NEW);
+    db_recon_end(true, 0, false, 0, NULL, 0, &o);
+    const uint64_t n0 = hepv_nonstore();
+    CHECK(!o.failed && n0 >= 1);
+    /* 1. a rename to another name the store cannot hold: the delete of the old element fails */
+    e.name = h2;
+    atomic_store(&db_store_test_ren_delete_fail, 1);
+    CHECK(db_recon_begin("hepv", 1, true, why, sizeof(why)));
+    int r = db_recon_entry(&e, &zid);
+    db_recon_end(true, 0, false, 0, NULL, 0, &o);
+    CHECK_MSG(r == DBR_ERROR && o.failed && hepv_nonstore() == n0 && atomic_load(&db_store_test_ren_delete_fail) == 0, "heap rename: result %d, failed %d", r, o.failed);
+    e.name = h1;                                                            /* the entry still has the old name: the old name is the same zone */
+    CHECK(db_recon_begin("hepv", 1, true, why, sizeof(why)));
+    r = db_recon_entry(&e, &zid);
+    db_recon_end(true, 0, false, 0, NULL, 0, &o);
+    CHECK_MSG((r == DBR_SAME || r == DBR_PENDING) && !o.failed, "the entry kept the old name: result %d, failed %d", r, o.failed);
+    e.name = h2;                                                            /* and the next pass renames it */
+    CHECK(db_recon_begin("hepv", 1, true, why, sizeof(why)));
+    r = db_recon_entry(&e, &zid);
+    db_recon_end(true, 0, false, 0, NULL, 0, &o);
+    CHECK_MSG(r == DBR_RENAMED && !o.failed && hepv_nonstore() == n0, "the next pass renames it: result %d, failed %d", r, o.failed);
+    /* 2. a rename to a name the store holds: the heap element goes first */
+    e.name = "s.hepv.test.";
+    atomic_store(&db_store_test_ren_delete_fail, 1);
+    CHECK(db_recon_begin("hepv", 1, true, why, sizeof(why)));
+    r = db_recon_entry(&e, &zid);
+    db_recon_end(true, 0, false, 0, NULL, 0, &o);
+    CHECK_MSG(r == DBR_ERROR && o.failed && hepv_nonstore() == n0, "heap to store: result %d, failed %d, %llu zones the store cannot name (were %llu)", r, o.failed,
+              (unsigned long long)hepv_nonstore(), (unsigned long long)n0);
+    e.name = h2;                                                            /* (back for case 3: the entry is as it was) */
+    CHECK(db_recon_begin("hepv", 1, true, why, sizeof(why)));
+    r = db_recon_entry(&e, &zid);
+    db_recon_end(true, 0, false, 0, NULL, 0, &o);
+    CHECK_MSG((r == DBR_SAME || r == DBR_PENDING) && !o.failed, "the heap zone stayed: result %d", r);
+    /* 3. the delete of a change: a failure is -1 and keeps the zone; the next delete takes it */
+    atomic_store(&db_store_test_ren_delete_fail, 1);
+    r = db_recon_delete("hepv", 6301, h2);
+    CHECK_MSG(r == -1 && hepv_nonstore() == n0, "change delete: %d, %llu (were %llu)", r, (unsigned long long)hepv_nonstore(), (unsigned long long)n0);
+    r = db_recon_delete("hepv", 6301, h2);
+    CHECK_MSG(r == 1 && hepv_nonstore() == n0 - 1, "the next delete: %d, %llu (were %llu)", r, (unsigned long long)hepv_nonstore(), (unsigned long long)n0);
+    /* 2b. heap to store once the delete works (a new heap zone first) */
+    e.source_id = 6302; e.name = h1;
+    CHECK(db_recon_begin("hepv", 1, true, why, sizeof(why)));
+    CHECK(db_recon_entry(&e, &zid) == DBR_NEW);
+    db_recon_end(true, 0, false, 0, NULL, 0, &o);
+    e.name = "s2.hepv.test.";
+    CHECK(db_recon_begin("hepv", 1, true, why, sizeof(why)));
+    r = db_recon_entry(&e, &zid);
+    db_recon_end(true, 0, false, 0, NULL, 0, &o);
+    CHECK_MSG(r == DBR_NEW && !o.failed && hepv_nonstore() == n0 - 1, "heap to store: result %d, failed %d", r, o.failed);
+}
 static void recon_equivalence(store_t *st) {
     printf("  [A: entries in groups against entries one at a time]\n");
     const unsigned pool = 700;
@@ -6555,6 +6627,7 @@ static int run_recon_thread(const char *dir) {
     recon_lookup_in_pass(st);
     recon_un_sweep_fail();
     recon_rename_delete_fail(st);
+    recon_heap_delete_fail();
 
     int a[2], f[2], cs[2];
     CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, a) == 0 && socketpair(AF_UNIX, SOCK_STREAM, 0, f) == 0 && socketpair(AF_UNIX, SOCK_SEQPACKET, 0, cs) == 0);

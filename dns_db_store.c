@@ -3100,19 +3100,38 @@ static void un_drop_locked(size_t i) {
   atomic_store_explicit(&UN_CNT, (uint32_t)RC.un_n, memory_order_relaxed);
 }
 
-/* forget the zone of the source id (or the name): true, and its name in old */
-static bool un_remove(const char *view, int64_t sid, const char *name, char *old, size_t cap) {
-  if (atomic_load_explicit(&UN_CNT, memory_order_relaxed) == 0) return false;
-  bool r = false;
+static bool ren_delete(const char *view, const char *old, int64_t sid);
+static int reg_delete(const char *view, const char *name, int64_t sid);
+
+/* The zone of the source id (or the name) leaves the heap directory: the registry deletes it (its element) and then it is forgotten.  1: it was there and is gone (its name in old);
+ * 0: there is none; -1: the registry's delete failed (no memory for its queue): the zone stays served and remembered, so that the next pass or change deletes it (review: it was
+ * forgotten first and the failure ignored, which left it served with no entry that knew of it, as D-2 in un_sweep()).  report: the failure is counted and logged here (ren_delete());
+ * else the caller reports it.  The registry is called under the mutex of the records' existence, not under RC.mu, as un_sweep() does. */
+static int un_remove(const char *view, int64_t sid, const char *name, char *old, size_t cap, bool report) {
+  if (atomic_load_explicit(&UN_CNT, memory_order_relaxed) == 0) return 0;
   rec_lock();
   rc_lock();
-  int i = un_find_locked(view, sid, name);
+  const int i = un_find_locked(view, sid, name);
+  uint32_t id = 0;
   if (i >= 0) {
     snprintf(old, cap, "%s", RC.un[i].name);
-    un_drop_locked((size_t)i);
-    r = true;
+    id = RC.un[i].id;
   }
   rc_unlock();
+  int r = 0;
+  if (i >= 0) {
+    const bool ok = report ? ren_delete(view, old, sid) : reg_delete(view, old, sid) >= 0;
+    if (ok) {
+      rc_lock();
+      for (size_t k = 0; k < RC.un_n; k++)
+        if (RC.un[k].id == id) {
+          un_drop_locked(k);
+          break;
+        }
+      rc_unlock();
+    }
+    r = ok ? 1 : -1;
+  }
   rec_unlock();
   return r;
 }
@@ -3143,8 +3162,13 @@ static bool test_fail_nth(_Atomic int *n) {
 /* review DB L-3: the old name of a zone that a pass's entry renames goes through the registry (its record and its element).  false: the delete failed (the store could not
  * delete the record, or the registry had no memory for its queue): the old record and its zone stay, the failure is counted with the store's errors and logged (at most
  * once in five seconds, as note_error()), and the caller fails the entry, so that the pass neither sweeps nor keeps a cursor and the next pass renames it again */
+/* the registry's delete of an old name or of a zone of the heap directory (dbreg_delete()); tests: the n-th fails (db_store_test_ren_delete_fail) */
+static int reg_delete(const char *view, const char *name, int64_t sid) {
+  return test_fail_nth(&db_store_test_ren_delete_fail) ? -1 : dbreg_delete(view, name, sid);
+}
+
 static bool ren_delete(const char *view, const char *old, int64_t sid) {
-  if (!test_fail_nth(&db_store_test_ren_delete_fail) && dbreg_delete(view, old, sid) >= 0) return true;
+  if (reg_delete(view, old, sid) >= 0) return true;
   atomic_fetch_add(&G.wt_errors, 1);
   const int64_t now = mono_ns();
   if (now - atomic_load_explicit(&G.last_err_log_ns, memory_order_relaxed) > 5000000000ll) {
@@ -3222,6 +3246,18 @@ static int un_apply(const char *view, const db_recon_entry_t *e) {
   /* review DB L-3: a delete that fails keeps the old record (and its zone); the entry fails (ren_delete(); recon_decide_locked() does the same for a rename between
    * names the store holds) */
   if (oldrec[0] && !ren_delete(view, oldrec, e->source_id)) return DBR_ERROR;
+  /* A zone of the heap directory renamed to another name of the heap directory: its old element goes before the entry takes the new name.  (Review: the entry was renamed
+   * first and the delete's result discarded: a failure left the old name served with no entry that knew of it.)  A failure keeps the entry as it is and fails this entry, so
+   * that the next pass renames it.  (The caller holds the mutex of the records' existence: nothing changes the entries between this look and the one below.) */
+  {
+    char prev[1026];
+    prev[0] = '\0';
+    rc_lock();
+    const int pi = un_find_locked(view, e->source_id, e->name);
+    if (pi >= 0 && strcasecmp(RC.un[pi].name, e->name) != 0) snprintf(prev, sizeof(prev), "%s", RC.un[pi].name);
+    rc_unlock();
+    if (prev[0] && !ren_delete(view, prev, e->source_id)) return DBR_ERROR;
+  }
   int res;
   bool is_new = false;
   char *nn = strdup(e->name);
@@ -3281,8 +3317,7 @@ static int un_apply(const char *view, const db_recon_entry_t *e) {
     }
   }
   rc_unlock();
-  free(nn);
-  if (old[0]) (void)dbreg_delete(view, old, e->source_id);
+  free(nn);                                                 /* (old: the name whose element went above) */
   if (is_new)
     syslog(LOG_NOTICE, "[Store] zone '%s' (view '%s') cannot be kept in the zone store (the root zone): it is a zone of the heap directory, like a secondary zone, read from "
                        "the database at every start (the cursor of the view is not kept while the view has such a zone)", e->name, view);
@@ -3406,7 +3441,8 @@ static int recon_look_locked(store_t *st, const char *view, int *vid, const db_r
   if (!store_name(e->name, lk->name, sizeof(lk->name), &lk->nlen)) return un_apply(view, e);        /* (a zone of the heap directory: see un_apply()) */
   if (e->source_id != 0) {                                  /* a zone that had a name the store could not hold: it is a zone of the store now (its heap element goes) */
     char uold[1026];
-    if (un_remove(view, e->source_id, NULL, uold, sizeof(uold))) (void)dbreg_delete(view, uold, e->source_id);
+    /* (review: a failed delete keeps the heap zone and its entry, and fails this entry: the next pass makes the change again) */
+    if (un_remove(view, e->source_id, NULL, uold, sizeof(uold), true) < 0) return DBR_ERROR;
   }
   if (*vid < 0) *vid = view_ensure(st, view);
   if (*vid < 0) return DBR_ERROR;
@@ -4125,11 +4161,17 @@ static int recon_delete_locked(const char *view, int64_t source_id, const char *
   if (!st || !view) return 0;
   char zone[1026], uold[1026];
   zone[0] = '\0';
-  bool un_gone = false;
-  if (un_remove(view, source_id, name && *name ? name : NULL, uold, sizeof(uold))) {
-    un_gone = true;          /* a zone of the heap directory (a name the store cannot hold) */
-    snprintf(zone, sizeof(zone), "%s", uold);
-  } else if (name && *name) {
+  /* a zone of the heap directory (a name the store cannot hold): un_remove() deletes it from the registry and forgets it only then; one that was never served is forgotten
+   * too and counts as deleted.  (Review: it was forgotten first and a failed delete counted as deleted: the zone stayed served and nothing knew of it.)  A failure keeps it and
+   * is -1: the caller logs it and keeps no cursor, so that the delete is made again. */
+  const int ur = un_remove(view, source_id, name && *name ? name : NULL, uold, sizeof(uold), false);
+  if (ur != 0) {
+    rc_lock();
+    if (ur > 0) RC.s.change_deletes++;
+    rc_unlock();
+    return ur;
+  }
+  if (name && *name) {
     snprintf(zone, sizeof(zone), "%s", name);
   } else if (source_id != 0) {                              /* the loader does not have the name (the row is gone): the source index has it */
     int vid = store_view_id(st, view);
@@ -4141,7 +4183,6 @@ static int recon_delete_locked(const char *view, int64_t source_id, const char *
     if (ok) snprintf(zone, sizeof(zone), "%s.", z.name);
   }
   int r = zone[0] ? dbreg_delete(view, zone, source_id) : 0;
-  if (r <= 0 && un_gone) r = 1;                                  /* (a zone of the heap directory that was never served is forgotten: it counts as deleted) */
   rc_lock();
   if (r > 0) RC.s.change_deletes++;
   rc_unlock();
