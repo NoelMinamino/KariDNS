@@ -32,14 +32,15 @@ sg_logtail() { tail -n 25 "$SG_LOG" | sed 's/^/         | /'; }
 # 10: not explained yet): the server's IPC drop counters, its buffer lines, the UDP counters of the host and a query made now go to stderr, so that the
 # next CI failure says where it was lost; the output (stdout) is dag's, as before.
 qa_dnssec() {
+    kari_try_snap "$T/noanswer" "./karictl -c $T/main-karictl.conf"
     _qa=$(./dag @127.0.0.1 -p "$PORT" "$1" "$2" +dnssec +nohexdump +time=3 +tries=1 2>&1)
     case $_qa in
         *"timed out"*)
             {
                 echo "  [note] $1 $2: the try of 3 s timed out"
-                kari_ipc_diag "./karictl -c $T/main-karictl.conf" "$T/server.log"
-                echo "  [lost diag] netstat -s -p udp (drops):"; netstat -s -p udp 2>/dev/null | grep -i "drop\|full\|bad" | sed 's/^/    /'
-                printf '  [lost diag] a query now: %s\n' "$(./dag @127.0.0.1 -p "$PORT" "$1" "$2" +nohexdump +time=3 +tries=1 2>&1 | grep -E 'status:|timed out' | head -2 | tr '\n' ' ')"
+                # (2026-11-22, row 34: the lost queries had been read by a worker; this tells a silent drop of the server, a late reply and a loss after the router apart)
+                kari_noanswer_diag "$T/noanswer" "./karictl -c $T/main-karictl.conf" "$T/server.log" "$PORT" "$1" "$2"
+                echo "    kern.ipc.maxsockbuf=$(sysctl -n kern.ipc.maxsockbuf 2>/dev/null); the first buffer warning of the server: $(grep -h '\[IPC\] WARNING' "$T/server.log" 2>/dev/null | head -1 | cut -c1-200)"
             } >&2 ;;
     esac
     printf '%s\n' "$_qa"
