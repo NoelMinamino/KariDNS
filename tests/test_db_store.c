@@ -6321,6 +6321,42 @@ static void recon_lookup_in_pass(store_t *st) {
     db_recon_end(true, 0, false, 0, NULL, 0, &o);
     CHECK_MSG(o.deleted == 1 && !lkv_record(st, 6003, &z), "the zone that no pass and no answer lists goes: deleted %llu", (unsigned long long)o.deleted);
 }
+/* review D-2: a zone the store cannot name (the root zone) that a complete pass does not list is forgotten only once the registry has deleted it, as the sweep of the records does: a delete
+ * that fails keeps the zone (and the pass is failed: no cursor), the next pass deletes it.  (Before: the zone was forgotten first and the failure ignored: it stayed served, and no later
+ * pass knew of it.) */
+static void recon_un_sweep_fail(void) {
+    printf("  [D-2: the sweep of a zone the store cannot name whose delete fails]\n");
+    char why[200];
+    db_recon_end_t o;
+    db_recon_status_t rs;
+    db_recon_entry_t e[2];
+    uint32_t zid = STORE_NONE;
+    memset(e, 0, sizeof(e));
+    e[0].source_id = 6101; e[0].name = "."; e[0].kind = KDB_ZK_PRIMARY; e[0].stamped = true; e[0].gen = 1; e[0].time = 10;
+    e[1].source_id = 6102; e[1].name = "p.unv.test."; e[1].kind = KDB_ZK_PRIMARY; e[1].stamped = true; e[1].gen = 1; e[1].time = 10;
+    CHECK(db_recon_begin("unv", 2, true, why, sizeof(why)));
+    CHECK(db_recon_entry(&e[0], &zid) == DBR_NEW);
+    CHECK(db_recon_entry(&e[1], &zid) == DBR_NEW);
+    db_recon_end(true, 0, false, 0, NULL, 0, &o);
+    CHECK(!o.failed);
+    db_recon_status(&rs);
+    const uint64_t n0 = rs.nonstore;                                        /* (the other views of the store have such zones too) */
+    CHECK(n0 >= 1);
+    /* the root zone is gone from the database; the delete of the registry fails */
+    atomic_store(&db_store_test_un_delete_fail, 1);
+    CHECK(db_recon_begin("unv", 1, true, why, sizeof(why)));
+    (void)db_recon_entry(&e[1], &zid);
+    db_recon_end(true, 0, false, 0, NULL, 0, &o);
+    db_recon_status(&rs);
+    CHECK_MSG(o.failed && rs.nonstore == n0 && atomic_load(&db_store_test_un_delete_fail) == 0,
+              "a failed delete keeps the zone and fails the pass: failed %d, zones the store cannot name %llu (were %llu)", o.failed, (unsigned long long)rs.nonstore, (unsigned long long)n0);
+    /* the next pass deletes it */
+    CHECK(db_recon_begin("unv", 1, true, why, sizeof(why)));
+    (void)db_recon_entry(&e[1], &zid);
+    db_recon_end(true, 0, false, 0, NULL, 0, &o);
+    db_recon_status(&rs);
+    CHECK_MSG(!o.failed && rs.nonstore == n0 - 1, "the next pass deletes it: failed %d, %llu (were %llu)", o.failed, (unsigned long long)rs.nonstore, (unsigned long long)n0);
+}
 static void recon_equivalence(store_t *st) {
     printf("  [A: entries in groups against entries one at a time]\n");
     const unsigned pool = 700;
@@ -6459,6 +6495,7 @@ static int run_recon_thread(const char *dir) {
     CHECK(st != NULL);
     recon_equivalence(st);
     recon_lookup_in_pass(st);
+    recon_un_sweep_fail();
 
     int a[2], f[2], cs[2];
     CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, a) == 0 && socketpair(AF_UNIX, SOCK_STREAM, 0, f) == 0 && socketpair(AF_UNIX, SOCK_SEQPACKET, 0, cs) == 0);
