@@ -186,6 +186,11 @@ enum { DBC_OK = 0, DBC_STALE /* the entry has another stamp than the body was as
  * commit a new entry, and does not commit anything for DBC_GONE). */
 int db_store_commit_begin(const char *view, const char *zone, const db_stamp_t *expect);
 void db_store_commit_end(void);
+/* 0.7 signer-wait.  db_store_signer_keeps(): the zone's record is held for the signer by this loader (STORE_F_SIGNER_HELD since the loader connected): the version in memory is the one the hold keeps,
+ * and a fetched body does not replace it.  db_store_signer_commit(), inside db_store_commit_begin() .. _end() after DBC_OK: the body is committed for a held record anyway (nothing signed was here to
+ * keep: a query asked for a zone that had no image and no version in memory): the record is marked STORE_F_SIGNER_UNSIGNED and a WARNING says so (rate-limited, once for a hold). */
+bool db_store_signer_keeps(const char *view, const char *zone);
+void db_store_signer_commit(const char *view, const char *zone);
 /* after a body was dropped (installed = NULL), or installed for the stamp `installed`: the zone is wanted (its record is KNOWN or STALE and not refused; for an installed body only when the record has another stamp
  * than the body was asked for), and the scan of the wanted bodies has to ask for it again */
 bool db_store_wanted_again(const char *view, const char *zone, const db_stamp_t *installed);

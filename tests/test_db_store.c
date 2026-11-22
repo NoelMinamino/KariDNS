@@ -4975,6 +4975,237 @@ static int run_signer_hold(const char *dir) {
     test_exit(g_failed ? 1 : 0);
 }
 
+/* signer-wait: a hold upsert for a zone, a batch of its own; the hold answers (ZONE_RESULT with a source id) up to BATCH_RESULT */
+static int p_hold_batch(int fd, ch_t *mainc, kdb_enc_t *e, uint64_t *bid, uint64_t *cur, const char *name, int64_t sid, uint64_t gen, bool hold, int64_t *hs, uint8_t *hst) {
+    pc_t c;
+    memset(&c, 0, sizeof(c));
+    c = (pc_t){ .sid = sid, .op = KDB_CH_UPSERT, .has_name = true, .stamped = true, .gen = gen, .time = gen * 10, .hold = hold };
+    snprintf(c.name, sizeof(c.name), "%s", name);
+    kdb_msg_t m;
+    p_batch_begin(fd, e, *bid, KDB_BATCH_AUTO, 0);
+    p_changes(fd, e, *bid, ++*cur, true, &c, 1);
+    p_batch_end(fd, e, (*bid)++, 1, 0);
+    return p_result_holds(mainc, &m, 10000, hs, hst, 8);
+}
+
+/* the zone is in the store with the stamp (1,10), serial 1, and in memory (attached by a worker; store-mode copy: the version is a copy of the image) */
+static bool p_stored_resident(int fd, ch_t *mainc, ch_t *fetchc, kdb_enc_t *e, store_t *st, uint64_t *bid, uint64_t *cur, int i) {
+    char n[64], r[64];
+    pn_name(n, sizeof(n), i);
+    snprintf(r, sizeof(r), "m%04d.test", i);
+    int64_t hs[8];
+    uint8_t hst[8];
+    if (p_hold_batch(fd, mainc, e, bid, cur, n, p_sid(i), 1, false, hs, hst) != 0) return false;
+    rq_t rq[4];
+    const int k = rq_collect(fetchc, rq, 4, 1500);
+    if (k != 1 || !rq_find(rq, k, n)) return false;
+    send_zone(fetchc->fd, e, n, 1, rq[0].id, p_sid(i));
+    if (!wait_rec(st, r, STORE_STATE_STORED, 1, 1, false, 10000)) return false;
+    park_key_t pk;
+    for (int t = 0; t < 50 && !in_memory(n); t++) (void)attach_by_worker(n, &pk);
+    return in_memory(n);
+}
+
+/* the scrub or the cleaner found the image damaged (dns_store.c zone_make_known_locked()): the record is KNOWN with what it had (stamp, flags, serial); the version in memory is a copy and stays */
+static bool p_image_lost(store_t *st, const char *r) {
+    store_zone_t z;
+    if (!zrec(st, r, &z) || z.state != STORE_STATE_STORED) return false;
+    store_meta_t m;
+    memset(&m, 0, sizeof(m));
+    m.source_id = z.source_id;
+    m.source = z.source;
+    m.flags = z.flags;
+    m.serial = z.serial;
+    m.settings = z.settings;
+    m.stamp_gen = z.stamp_gen;
+    m.stamp_time = z.stamp_time;
+    memcpy(m.digest, z.digest, STORE_DIGEST_LEN);
+    return store_set_known(st, z.view, r, strlen(r), &m, NULL) == 0 && zrec(st, r, &z) && z.state == STORE_STATE_KNOWN;
+}
+
+static bool p_backed_any(const zone_version_t *v) { (void)v; return true; }
+
+/* the serial the directory has for the zone (the version served) */
+static uint32_t p_served(const char *zone) {
+    int64_t sid = 0;
+    uint32_t sr = 0;
+    return dbreg_zone_version("default", zone, &sid, &sr) ? sr : 0;
+}
+
+/* phase 13 (0.7, signer-wait: what the signer has not signed is not served while a signed version is here; store-mode copy).  An upsert with KDB_EF_HOLD keeps the signed version whatever the
+ * record says: (a) a KNOWN record whose image was lost while the zone is in memory (the scrub, the cleaner, a degraded store): the version in memory is held (not evicted, a fetched body of the held
+ * version does not replace it) and nothing is asked for; (b) a STALE record (the newer body that was asked for is dropped when it comes) and a refused version (REJECTED_NEW).  Without a signed
+ * version (a new zone; a zone held in memory whose version was then taken out by force and that a query reads) the version is served as it is and marked STORE_F_SIGNER_UNSIGNED: the counters,
+ * karictl dbstatus.  Before the fix (a) and (b) asked for the held body (the hold answer APPLIED, a fetch request) and nothing was marked. */
+static int run_signer_presign(const char *dir) {
+    printf("[the store protocol: signer-wait keeps the signed version, says when there is none (phase 13)]\n");
+    char sdir[600];
+    snprintf(sdir, sizeof(sdir), "%s/s", dir);
+    static server_config_t cfg;
+    char conf[2048];
+    snprintf(conf, sizeof(conf),
+             "options { database { driver sqlite3; database-file \"/nonexistent/z.db\"; loader-user \"nobody\"; loader-path \"/bin/true\"; store \"%s\"; store-mode copy; "
+             "store-threads 2; }; };\n"
+             "view \"default\" { match-clients { any; }; zone \"static.test\" { type master; }; };\n", sdir);
+    CHECK(parse_named_conf(conf, &cfg) == 0);
+    atomic_store_explicit(&g_config_db.active, &cfg, memory_order_release);
+    rebuild_zone_db_from_config(&cfg, false);
+    char msg[400];
+    CHECK(db_store_frontend_open(&cfg.database, false, (uid_t)-1, (gid_t)-1, msg, sizeof(msg)) && db_store_dir_fd() >= 0);
+    CHECK(db_store_start(&cfg) && db_store_enabled());
+    store_t *st = db_store_handle();
+    CHECK(st != NULL);
+    int a[2], f[2], cs[2];
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, a) == 0 && socketpair(AF_UNIX, SOCK_STREAM, 0, f) == 0 && socketpair(AF_UNIX, SOCK_SEQPACKET, 0, cs) == 0);
+    int ends[3] = { a[1], f[1], cs[1] };
+    for (int i = 0; i < 3; i++) fcntl(ends[i], F_SETFL, fcntl(ends[i], F_GETFL, 0) | O_NONBLOCK);
+    park_register_worker(0, -1);
+    CHECK(db_ingest_start(a[1], cs[1], f[1]));
+    static ch_t mainc, fetchc;
+    ch_init(&mainc, a[0], KDB_FROM_BACKEND);
+    ch_init(&fetchc, f[0], KDB_FROM_BACKEND);
+    kdb_enc_t e;
+    kdb_enc_init(&e);
+    kdb_msg_t m;
+    memset(&g_wctx, 0, sizeof(g_wctx));
+    g_query_bg_fetch = no_bg_fetch;
+    g_query_bg_attach = no_bg_fetch;
+    kdb_enc_begin(&e, KDB_T_HELLO);
+    kdb_enc_u16(&e, 1, 1); kdb_enc_str(&e, 2, "test-loader"); kdb_enc_str(&e, 3, "sqlite3"); kdb_enc_u32(&e, 4, 4242); kdb_enc_u32(&e, 5, (KDB_FEAT_STORE) | KDB_FEAT_IMAGE); kdb_enc_u32(&e, 6, ZONE_IMAGE_VERSION);
+    kdb_enc_end(&e);
+    ch_send(a[0], &e);
+    CHECK(ch_next(&mainc, &m, 5000) && m.type == KDB_T_CONFIG && m.u.config.store_proto);
+    CHECK(ch_next(&mainc, &m, 5000) && m.type == KDB_T_DEBUG);
+    store_zone_t z;
+    rq_t rq[16];
+    int64_t hs[8];
+    uint8_t hst[8];
+    uint64_t bid = 1, cur = 100;
+    int n, nhs;
+    db_recon_status_t rs;
+    char sbuf[4096];
+    const int ZK = 2200, ZS = 2201, ZR = 2202, ZN = 2203, ZL = 2204;
+    char nk[64], ns[64], nr[64], nn[64], nl[64], rk[64], rs_[64], rr[64], rn[64], rl[64];
+    pn_name(nk, sizeof(nk), ZK); pn_name(ns, sizeof(ns), ZS); pn_name(nr, sizeof(nr), ZR); pn_name(nn, sizeof(nn), ZN); pn_name(nl, sizeof(nl), ZL);
+    snprintf(rk, sizeof(rk), "m%04d.test", ZK); snprintf(rs_, sizeof(rs_), "m%04d.test", ZS); snprintf(rr, sizeof(rr), "m%04d.test", ZR);
+    snprintf(rn, sizeof(rn), "m%04d.test", ZN); snprintf(rl, sizeof(rl), "m%04d.test", ZL);
+
+    /* -- (a) K: stored, in memory, its image lost (KNOWN); a held version (2,20) keeps the version in memory */
+    CHECK(p_stored_resident(a[0], &mainc, &fetchc, &e, st, &bid, &cur, ZK));
+    CHECK(p_image_lost(st, rk) && in_memory(nk) && p_served(nk) == 1);
+    nhs = p_hold_batch(a[0], &mainc, &e, &bid, &cur, nk, p_sid(ZK), 2, true, hs, hst);
+    CHECK_MSG(nhs == 0, "a KNOWN record whose version is in memory: %d hold answer(s) (the held body was asked for)", nhs);
+    n = rq_collect(&fetchc, rq, 16, 1000);
+    CHECK_MSG(n == 0, "a KNOWN record whose version is in memory: %d fetch request(s) for the held version", n);
+    CHECK(zrec(st, rk, &z) && z.state == STORE_STATE_KNOWN && z.stamp_gen == 2 && (z.flags & STORE_F_SIGNER_HELD) && !(z.flags & STORE_F_SIGNER_UNSIGNED));
+    CHECK(in_memory(nk) && p_served(nk) == 1 && !scan_wants(p_sid(ZK)));
+    CHECK_MSG(!dbreg_test_evict("default", nk), "the held version in memory was taken out");        /* (held as a pinned zone is) */
+    CHECK(in_memory(nk));
+    db_recon_status(&rs);
+    CHECK(rs.signer_held == 1 && rs.signer_held_mem == 1 && rs.signer_unsigned == 0);
+    CHECK(db_ingest_status(nk, "default", sbuf, sizeof(sbuf)) > 0 && strstr(sbuf, "the version in memory (held there) keeps serving") != NULL);
+    /* a body of the held version that comes anyway is not installed into the version in memory (job_execute(); a request made before the hold is dropped by its stamp already) */
+    CHECK(db_store_signer_keeps("default", nk));
+    CHECK(zrec(st, rk, &z) && z.state == STORE_STATE_KNOWN && (z.flags & STORE_F_SIGNER_HELD));
+    /* released (no flag, the stamp the record has): asked for, installed, the hold of the version in memory let go */
+    nhs = p_hold_batch(a[0], &mainc, &e, &bid, &cur, nk, p_sid(ZK), 2, false, hs, hst);
+    CHECK(nhs == 0);
+    n = rq_collect(&fetchc, rq, 16, 1500);
+    CHECK(n == 1 && rq_find(rq, n, nk));
+    if (n == 1) send_zone(f[0], &e, nk, 2, rq[0].id, p_sid(ZK));
+    CHECK(wait_rec(st, rk, STORE_STATE_STORED, 2, 2, false, 10000));
+    CHECK(zrec(st, rk, &z) && !(z.flags & (STORE_F_SIGNER_HELD | STORE_F_SIGNER_UNSIGNED)));
+    CHECK(!db_store_signer_keeps("default", nk));
+    for (int t = 0; t < 500 && p_served(nk) != 2; t++) usleep(10000);
+    CHECK(p_served(nk) == 2);
+
+    /* -- (b) S: STALE (the body of (2,20) asked for, not here yet); a held version (3,30) keeps the image, and the body of (2,20) that comes late is dropped */
+    CHECK(p_stored_resident(a[0], &mainc, &fetchc, &e, st, &bid, &cur, ZS));
+    nhs = p_hold_batch(a[0], &mainc, &e, &bid, &cur, ns, p_sid(ZS), 2, false, hs, hst);
+    n = rq_collect(&fetchc, rq, 16, 1500);
+    CHECK(nhs == 0 && n == 1 && rq_find(rq, n, ns));
+    const uint64_t late = n == 1 ? rq[0].id : 0;
+    CHECK(zrec(st, rs_, &z) && z.state == STORE_STATE_STORED && (z.flags & STORE_F_STALE));
+    nhs = p_hold_batch(a[0], &mainc, &e, &bid, &cur, ns, p_sid(ZS), 3, true, hs, hst);
+    CHECK_MSG(nhs == 0, "a STALE record: %d hold answer(s)", nhs);
+    n = rq_collect(&fetchc, rq, 16, 1000);
+    CHECK_MSG(n == 0, "a STALE record: %d fetch request(s) for the held version", n);
+    CHECK(zrec(st, rs_, &z) && z.state == STORE_STATE_STORED && z.serial == 1 && z.stamp_gen == 3 && (z.flags & STORE_F_SIGNER_HELD) && !(z.flags & STORE_F_STALE));
+    CHECK(!scan_wants(p_sid(ZS)));
+    if (late) send_zone(f[0], &e, ns, 2, late, p_sid(ZS));
+    for (int t = 0; t < 50; t++) usleep(10000);                        /* (a window: the late body must NOT be stored) */
+    CHECK(zrec(st, rs_, &z) && z.serial == 1 && (z.flags & STORE_F_SIGNER_HELD));
+
+    /* -- (b) R: the version (2,20) is refused (REJECTED_NEW); a held version (3,30) keeps the image */
+    CHECK(p_stored_resident(a[0], &mainc, &fetchc, &e, st, &bid, &cur, ZR));
+    nhs = p_hold_batch(a[0], &mainc, &e, &bid, &cur, nr, p_sid(ZR), 2, false, hs, hst);
+    n = rq_collect(&fetchc, rq, 16, 1500);
+    CHECK(nhs == 0 && n == 1 && rq_find(rq, n, nr));
+    if (n == 1) send_bad_zone(f[0], &e, nr, 2, rq[0].id, p_sid(ZR));
+    bool rej = false;
+    for (int t = 0; t < 1000 && !rej; t++) {
+        rej = zrec(st, rr, &z) && (z.flags & STORE_F_REJECTED_NEW);
+        if (!rej) usleep(10000);
+    }
+    CHECK(rej);
+    nhs = p_hold_batch(a[0], &mainc, &e, &bid, &cur, nr, p_sid(ZR), 3, true, hs, hst);
+    CHECK_MSG(nhs == 0, "a refused version: %d hold answer(s)", nhs);
+    n = rq_collect(&fetchc, rq, 16, 1000);
+    CHECK_MSG(n == 0, "a refused version: %d fetch request(s) for the held version", n);
+    CHECK(zrec(st, rr, &z) && z.state == STORE_STATE_STORED && z.serial == 1 && z.stamp_gen == 3 && (z.flags & STORE_F_SIGNER_HELD) && !(z.flags & STORE_F_REJECTED_NEW));
+    db_recon_status(&rs);
+    CHECK(rs.signer_held == 3 && rs.signer_held_mem == 1 && rs.signer_unsigned == 0);
+
+    /* -- B, N: new to the Backend: read as it is (answered, asked for), marked; the image keeps the mark; a held version of it later keeps that image (still marked: it is not signed either) */
+    nhs = p_hold_batch(a[0], &mainc, &e, &bid, &cur, nn, p_sid(ZN), 1, true, hs, hst);
+    CHECK(nhs == 1 && hs[0] == p_sid(ZN) && hst[0] == KDB_ST_APPLIED);
+    n = rq_collect(&fetchc, rq, 16, 1500);
+    CHECK(n == 1 && rq_find(rq, n, nn));
+    CHECK_MSG(zrec(st, rn, &z) && (z.flags & STORE_F_SIGNER_UNSIGNED), "a new zone of the signer is not marked (flags 0x%x)", (unsigned)z.flags);
+    if (n == 1) send_zone(f[0], &e, nn, 1, rq[0].id, p_sid(ZN));
+    CHECK(wait_rec(st, rn, STORE_STATE_STORED, 1, 1, false, 10000));
+    CHECK(zrec(st, rn, &z) && (z.flags & STORE_F_SIGNER_UNSIGNED));
+    db_recon_status(&rs);
+    CHECK(rs.signer_unsigned == 1);
+    CHECK(db_ingest_status(nn, "default", sbuf, sizeof(sbuf)) > 0 && strstr(sbuf, "serving a version the signer has not signed yet") != NULL);
+    nhs = p_hold_batch(a[0], &mainc, &e, &bid, &cur, nn, p_sid(ZN), 2, true, hs, hst);
+    CHECK(nhs == 0 && rq_collect(&fetchc, rq, 16, 1000) == 0);
+    CHECK(zrec(st, rn, &z) && z.serial == 1 && (z.flags & STORE_F_SIGNER_HELD) && (z.flags & STORE_F_SIGNER_UNSIGNED));
+    db_recon_status(&rs);
+    CHECK(rs.signer_unsigned == 1);                                    /* (said once for the zone) */
+    /* the signer signs it: the release clears the mark */
+    nhs = p_hold_batch(a[0], &mainc, &e, &bid, &cur, nn, p_sid(ZN), 3, false, hs, hst);
+    n = rq_collect(&fetchc, rq, 16, 1500);
+    CHECK(nhs == 0 && n == 1 && rq_find(rq, n, nn));
+    CHECK(zrec(st, rn, &z) && !(z.flags & (STORE_F_SIGNER_HELD | STORE_F_SIGNER_UNSIGNED)));
+    if (n == 1) send_zone(f[0], &e, nn, 3, rq[0].id, p_sid(ZN));
+    CHECK(wait_rec(st, rn, STORE_STATE_STORED, 3, 3, false, 10000));
+    CHECK(zrec(st, rn, &z) && !(z.flags & STORE_F_SIGNER_UNSIGNED));
+
+    /* -- B, L: held in memory (as K), then the version in memory is taken out by force (an image found damaged in MAP mode does that) and a query reads the zone: served as it is, marked */
+    CHECK(p_stored_resident(a[0], &mainc, &fetchc, &e, st, &bid, &cur, ZL));
+    CHECK(p_image_lost(st, rl));
+    nhs = p_hold_batch(a[0], &mainc, &e, &bid, &cur, nl, p_sid(ZL), 2, true, hs, hst);
+    CHECK(nhs == 0 && rq_collect(&fetchc, rq, 16, 1000) == 0);
+    CHECK(zrec(st, rl, &z) && (z.flags & STORE_F_SIGNER_HELD));
+    CHECK(dbreg_store_image_lost(z.zid, p_backed_any) == 0);
+    wait_retired();
+    CHECK(!in_memory(nl));
+    CHECK(park_fetch_request(0, "default", nl, KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL));
+    n = rq_collect(&fetchc, rq, 16, 1500);
+    CHECK(n == 1 && rq_find(rq, n, nl));
+    if (n == 1) send_zone(f[0], &e, nl, 2, rq[0].id, p_sid(ZL));
+    CHECK(wait_rec(st, rl, STORE_STATE_STORED, 2, 2, false, 10000));
+    CHECK(zrec(st, rl, &z) && (z.flags & STORE_F_SIGNER_UNSIGNED) && !(z.flags & STORE_F_SIGNER_HELD));
+    db_recon_status(&rs);
+    CHECK(rs.signer_unsigned == 2);
+    gc_snapshot_wait_idle();
+    db_store_batch_end();
+    printf("%d checks, %d failed\n", g_checks, g_failed);
+    fflush(stdout);
+    test_exit(g_failed ? 1 : 0);
+}
+
 /* phase 4: a legacy loader (no store protocol) installs three zones with three settings texts; the process ends without a clean stop.  Phase 5: the next start, with the second record of settings.dat made
  * unusable by the test (no room for its id): the file is not cut, the ids of the others are what they were, and a new text gets the next id */
 static int run_settings(int phase, const char *dir) {
@@ -6550,11 +6781,11 @@ static int proto_main(const char *self) {
     snprintf(dir, sizeof(dir), "%s/test_db_store_proto.XXXXXX", tmp && *tmp ? tmp : "/tmp");
     if (!mkdtemp(dir)) { perror("mkdtemp"); return 1; }
     int bad = 0;
-    for (int phase = 0; phase < 13; phase++) {
+    for (int phase = 0; phase < 14; phase++) {
         char cmd[900];
         snprintf(cmd, sizeof(cmd), "%s proto%d %s", self, phase, dir);
         if (run_part(cmd) != 0) bad++;
-        if (phase == 0 || phase == 2 || phase == 3 || phase == 5 || phase == 6 || phase == 7 || phase == 8 || phase == 11) {                   /* (phase 0 is the legacy loader on an empty store, phase 3 the fixes of the review, phase 4 the settings: the next phases start on a new store; phase 5 follows phase 4 on its store; phase 12, signer-wait, starts on a new store too) */
+        if (phase == 0 || phase == 2 || phase == 3 || phase == 5 || phase == 6 || phase == 7 || phase == 8 || phase == 11 || phase == 12) {                   /* (phase 0 is the legacy loader on an empty store, phase 3 the fixes of the review, phase 4 the settings: the next phases start on a new store; phase 5 follows phase 4 on its store; phase 12, signer-wait, starts on a new store too, and so does phase 13 (store-mode copy)) */
             char rm[700];
             snprintf(rm, sizeof(rm), "rm -rf %s/s", dir);
             (void)!system(rm);
@@ -6757,6 +6988,7 @@ int main(int argc, char **argv) {
     if (argc > 1 && strcmp(argv[1], "s5") == 0) return run_s5(argc > 2 ? argv[2] : "map");
     if (argc > 1 && strcmp(argv[1], "heap") == 0) return run_heap(argc > 2 ? atoi(argv[2]) : 100000, argc > 3 ? argv[3] : "map");
     if (argc > 2 && strcmp(argv[1], "proto12") == 0) return run_signer_hold(argv[2]);
+    if (argc > 2 && strcmp(argv[1], "proto13") == 0) return run_signer_presign(argv[2]);
     if (argc > 2 && strncmp(argv[1], "proto", 5) == 0 && argv[1][5] == '3') return run_fixes(argv[2]);
     if (argc > 2 && strncmp(argv[1], "proto", 5) == 0 && argv[1][5] == '6') return run_stamp_race(argv[2]);
     if (argc > 2 && strncmp(argv[1], "proto", 5) == 0 && argv[1][5] == '7') return run_lookup_body(argv[2]);

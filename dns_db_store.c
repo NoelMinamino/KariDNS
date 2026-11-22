@@ -402,6 +402,36 @@ static void rec_unlock(void) {
     (void)store_defer(st, false);
   }
 }
+
+/* 0.7 signer-wait, since the start (store.recon.signer.*): versions held for karidns-signer while a signed one keeps serving, of those the ones that only the version in memory keeps (the record has no
+ * image), and versions served although the signer has not signed them (STORE_F_SIGNER_UNSIGNED: no signed version was here) */
+static _Atomic uint64_t g_sig_held_n, g_sig_held_mem, g_sig_unsigned;
+/* A version that the loader sent to be held for the signer is served as it is: the Backend has no signed version of the zone (a zone new to it, or one whose image is gone and that is not in memory).
+ * Availability first: the zone is served, and the operator is told loudly, once a zone for a hold (the record's flag is set once; the next held version of a zone that is flagged already says nothing),
+ * at most SIG_WARN_MAX lines a minute (a batch of a thousand new zones of the signer names the first few, and the next line after the minute says how many it left out).  The caller holds g_rec_mu. */
+#define SIG_WARN_MAX 8
+static int64_t g_sig_warn_t0;                  /* (g_rec_mu) the start of the minute */
+static unsigned g_sig_warn_n;                  /* (g_rec_mu) lines in it */
+static uint64_t g_sig_warn_quiet;              /* (g_rec_mu) zones it did not name */
+static void sig_unsigned_note(const char *view, const char *zone) {
+  atomic_fetch_add_explicit(&g_sig_unsigned, 1, memory_order_relaxed);
+  const int64_t now = mono_ns();
+  if (g_sig_warn_t0 == 0 || now - g_sig_warn_t0 >= 60000000000ll) {
+    if (g_sig_warn_quiet)
+      syslog(LOG_WARNING, "[Store] signer-wait: %llu more zone(s) were served with a version karidns-signer has not signed yet in the last minute (not named; see store.recon.signer.unsigned)",
+             (unsigned long long)g_sig_warn_quiet);
+    g_sig_warn_t0 = now;
+    g_sig_warn_n = 0;
+    g_sig_warn_quiet = 0;
+  }
+  if (g_sig_warn_n >= SIG_WARN_MAX) {
+    g_sig_warn_quiet++;
+    return;
+  }
+  g_sig_warn_n++;
+  syslog(LOG_WARNING, "[Store] zone '%s' (view '%s'): signer-wait: the version the database has waits for karidns-signer, but no signed version of the zone is here to keep serving (none in memory, no image "
+         "in the zone store); it is served as it is, a version the signer has not signed yet", zone, view);
+}
 #ifdef KARIDNS_UNIT_TEST
 void (*db_store_test_commit_hook)(int where, const char *zone);
 #endif
@@ -1570,6 +1600,7 @@ static int dir_put_img_locked(const char *view, const char *zone, const zone_ima
     if (cur.source_id == source_id || cur.source_id == 0) {          /* 0.7 WP7b: the stamp the reconcile asked this version with stays with the record (the body carries none) */
       m.stamp_gen = cur.stamp_gen;
       m.stamp_time = cur.stamp_time;
+      m.flags |= cur.flags & STORE_F_SIGNER_UNSIGNED;       /* (signer-wait: the version is one the signer has not signed yet; the next version that is not held clears it) */
     }
     if (cur.state == STORE_STATE_STORED && cur.serial == serial && cur.source_id == source_id && cur.settings == settings && memcmp(cur.digest, digest, STORE_DIGEST_LEN) == 0 &&
         cur.stamp_gen == m.stamp_gen && cur.stamp_time == m.stamp_time)
@@ -3230,6 +3261,9 @@ void db_recon_status(db_recon_status_t *out) {
       free(ss);
     }
   }
+  out->signer_held = atomic_load_explicit(&g_sig_held_n, memory_order_relaxed);
+  out->signer_held_mem = atomic_load_explicit(&g_sig_held_mem, memory_order_relaxed);
+  out->signer_unsigned = atomic_load_explicit(&g_sig_unsigned, memory_order_relaxed);
   out->rec_holds = atomic_load_explicit(&g_rec_holds, memory_order_relaxed);
   out->rec_holds_slow = atomic_load_explicit(&g_rec_slow, memory_order_relaxed);
   out->rec_hold_max_us = atomic_load_explicit(&g_rec_hold_max_us, memory_order_relaxed);
@@ -3324,7 +3358,7 @@ static void recon_meta(store_meta_t *m, const db_recon_entry_t *e, int vid) {
   memset(m, 0, sizeof(*m));
   m->source_id = e->source_id;
   m->source = (uint16_t)vid;
-  m->flags = e->kind != KDB_ZK_PRIMARY ? STORE_F_NONSTORE : 0;
+  m->flags = e->kind != KDB_ZK_PRIMARY ? STORE_F_NONSTORE : e->hold ? STORE_F_SIGNER_UNSIGNED : 0;      /* (a record that is made for a held version: nothing signed is here, it is read as it is) */
   m->stamp_gen = e->stamped ? e->gen : 0;
   m->stamp_time = e->stamped ? e->time : 0;
 }
@@ -3373,6 +3407,16 @@ static void lk_mark(const char *view, uint32_t zid) {
   rc_unlock();
 }
 
+/* signer-wait: is a signed version here to keep serving while the held one waits for the signer?  The image of the record (it is attached again whenever the zone leaves memory, so nothing is pinned
+ * for it: a small server's memory-limit is not filled with the zones that wait), or else the version of the zone in memory, which is then held there (*mem, dbreg_signer_hold()).  Without either the
+ * held version is read as it is (recon_decide_locked()). */
+static bool recon_hold_keeps(const char *view, const char *dname, const store_zone_t *rs, bool *mem) {
+  *mem = false;
+  if (rs->state == STORE_STATE_STORED) return true;
+  *mem = dbreg_signer_hold(view, dname, true);
+  return *mem;
+}
+
 static int recon_decide_locked(store_t *st, const char *view, const db_recon_entry_t *e, rc_look_t *lk, uint32_t *zid_out) {
   const char *name = lk->name;
   const size_t nlen = lk->nlen;
@@ -3404,10 +3448,16 @@ static int recon_decide_locked(store_t *st, const char *view, const db_recon_ent
   uint32_t zid = STORE_NONE;
   int res = DBR_SAME;
   int r = 0;
+  char dname[DBS_NAME_MAX + 1];                             /* signer-wait: the name as the registry has it (with the trailing dot) */
+  dname[0] = '\0';
+  if (e->hold || (has_s && (rs.flags & STORE_F_SIGNER_HELD))) snprintf(dname, sizeof(dname), "%s.", name);
+  const bool was_unsigned = has_s && (rs.flags & STORE_F_SIGNER_UNSIGNED) != 0;
+  bool mark_unsigned = false, mem = false;
   if (!has_s) {                                             /* a zone that is new, or whose name another domain held: a record without an image */
     r = store_set_known(st, (uint16_t)vid, name, nlen, &m, &zid);
     res = renamed ? DBR_RENAMED : DBR_NEW;
     if (r == 0) dmax_raise(vid, store_name_labels(name, nlen));
+    mark_unsigned = r == 0 && e->hold && !np;               /* (recon_meta() marked the record: a held version with nothing signed here) */
   } else {
     zid = rs.zid;
     const bool known = rs.state == STORE_STATE_KNOWN, stale = (rs.flags & STORE_F_STALE) != 0, rej = (rs.flags & STORE_F_REJECTED_NEW) != 0;
@@ -3419,6 +3469,8 @@ static int recon_decide_locked(store_t *st, const char *view, const db_recon_ent
     } else if (!kind_eq) {                                         /* a primary became a secondary or the other way: the zone is made again (its image is not the new kind's) */
       r = store_set_known(st, (uint16_t)vid, name, nlen, &m, &zid);
       res = DBR_CHANGED;
+      mark_unsigned = r == 0 && e->hold && !np && !was_unsigned;
+      if (held) (void)dbreg_signer_hold(view, dname, false);      /* (the record is made again: nothing is held) */
     } else if (np) {                                        /* a secondary or catalog zone: the record is only the memory of it */
       if (!e->force && stamp_eq) {
         res = DBR_SAME;
@@ -3426,16 +3478,22 @@ static int recon_decide_locked(store_t *st, const char *view, const db_recon_ent
         r = store_set_stamp(st, zid, m.stamp_gen, m.stamp_time, 0, STORE_F_REJECTED_NEW);
         res = DBR_CHANGED;
       }
-    } else if (e->hold && !e->force && rs.state == STORE_STATE_STORED && !rej && !stale) {
-      /* signer-wait (KDB_EF_HOLD): the image keeps serving.  Another version is recorded (its stamp, STORE_F_SIGNER_HELD) but not asked for: the loader sends the zone again
-       * without the flag when the signer has signed it (a reload) or the zone is no longer the signer's, and a loader that connects again releases every held record
-       * (db_recon_held_reset(): the version is read as it is, as a full comparison of a start does).  The same version as the image (not held) is nothing to wait for. */
-      if (!held && stamp_eq) {
-        res = DBR_SAME;
-      } else {
-        if (!(held && stamp_eq)) r = store_set_stamp(st, zid, m.stamp_gen, m.stamp_time, STORE_F_SIGNER_HELD, 0);
-        res = DBR_HELD;
-        if (r == 0) sig_held_mark(zid);
+    } else if (e->hold && !e->force && !(stamp_eq && !held) && recon_hold_keeps(view, dname, &rs, &mem)) {
+      /* signer-wait (KDB_EF_HOLD): a signed version keeps serving, the image or the version in memory (whatever the record says: a KNOWN record whose image the scrub, the cleaner or a degraded
+       * store took while the zone is in memory, a STALE record whose newer body is not here yet, a refused version).  Another version is recorded (its stamp, STORE_F_SIGNER_HELD; the stale or refused
+       * mark is for a stamp the record no longer has) but not asked for, and the version in memory is held there (dbreg_signer_hold(): not taken out, and the scan and a fetch do not replace it): the
+       * loader sends the zone again without the flag when the signer has signed it (a reload) or the zone is no longer the signer's, and a loader that connects again releases every held record
+       * (db_recon_held_reset(): the version is read as it is, as a full comparison of a start does).  The same version as the record's (not held) is nothing to wait for: the branches below. */
+      if (!(held && stamp_eq)) r = store_set_stamp(st, zid, m.stamp_gen, m.stamp_time, STORE_F_SIGNER_HELD, STORE_F_STALE | STORE_F_REJECTED_NEW);
+      res = DBR_HELD;
+      if (r == 0) {
+        sig_held_mark(zid);
+        if (!(held && stamp_eq)) {
+          atomic_fetch_add_explicit(&g_sig_held_n, 1, memory_order_relaxed);
+          if (rs.state != STORE_STATE_STORED) atomic_fetch_add_explicit(&g_sig_held_mem, 1, memory_order_relaxed);
+        }
+      } else if (mem && !held) {
+        (void)dbreg_signer_hold(view, dname, false);    /* (the record is as it was: nothing is held) */
       }
     } else if (!e->force && e->stamped && stamp_eq && !held) {
       res = rej ? DBR_KEPT : (known || stale) ? DBR_PENDING : DBR_SAME;
@@ -3443,11 +3501,19 @@ static int recon_decide_locked(store_t *st, const char *view, const db_recon_ent
       res = (stale && !rej) ? DBR_PENDING : DBR_SAME;
     } else if (!e->force && !e->stamped && !e->has_serial && (known || stale) && !rej) {          /* (a zone without a version stamp is always asked for: it already is) */
       res = DBR_PENDING;
-    } else {                                                /* another version: the stamp is recorded, the body is asked for; the image (if any) keeps serving until then (a held version too: the loader released it) */
-      r = store_set_stamp(st, zid, m.stamp_gen, m.stamp_time, known ? 0 : STORE_F_STALE, STORE_F_REJECTED_NEW | STORE_F_SIGNER_HELD);
+      mark_unsigned = e->hold && !was_unsigned && store_set_flags(st, zid, STORE_F_SIGNER_UNSIGNED, 0) == 0;      /* (held, and nothing signed to keep: see below) */
+    } else {
+      /* another version: the stamp is recorded, the body is asked for; the image (if any) keeps serving until then (a held version too: the loader released it, and the version in memory is let go).
+       * A held version comes here when nothing signed is here to keep (no image, nothing in memory): it is read as it is and marked (STORE_F_SIGNER_UNSIGNED, said once: availability first); a
+       * version that is not held (the signer's, or no signer's) clears the mark. */
+      r = store_set_stamp(st, zid, m.stamp_gen, m.stamp_time, (known ? 0 : STORE_F_STALE) | (e->hold ? STORE_F_SIGNER_UNSIGNED : 0),
+                          STORE_F_REJECTED_NEW | STORE_F_SIGNER_HELD | (e->hold ? 0 : STORE_F_SIGNER_UNSIGNED));
       res = DBR_CHANGED;
+      if (held) (void)dbreg_signer_hold(view, dname, false);
+      mark_unsigned = e->hold && !was_unsigned && r == 0;
     }
   }
+  if (mark_unsigned) sig_unsigned_note(view, dname);
   if (r < 0) {
     note_error("the record of the reconcile", e->name, r);
     if (zid_out && zid != STORE_NONE) *zid_out = zid;       /* (a record that exists but could not be changed was listed by the database: the pass must not sweep it) */
@@ -3497,7 +3563,7 @@ static uint64_t rg_hash(const char *s) {
   return h;
 }
 
-static void rg_flush(store_t *st, rc_group_t *g, int *res, uint32_t *zid) {
+static void rg_flush(store_t *st, const char *view, rc_group_t *g, int *res, uint32_t *zid) {
   if (g->n == 0) return;
   int sr[RG_MAX];
   uint32_t sz[RG_MAX];
@@ -3513,6 +3579,11 @@ static void rg_flush(store_t *st, rc_group_t *g, int *res, uint32_t *zid) {
     }
     dmax_raise(g->vid, store_name_labels(g->name[i], g->in[i].len));
     if (g->meta[i].flags & STORE_F_NONSTORE) np_clear(sz[i]);
+    if (g->meta[i].flags & STORE_F_SIGNER_UNSIGNED) {           /* (a new zone of the signer: read as it is, recon_meta()) */
+      char dn[DBS_NAME_MAX + 1];
+      snprintf(dn, sizeof(dn), "%s.", g->name[i]);
+      sig_unsigned_note(view, dn);
+    }
     res[k] = DBR_NEW;
     zid[k] = sz[i];
   }
@@ -3555,7 +3626,7 @@ void db_recon_apply_n(const char *view, const db_recon_entry_t *e, size_t n, int
         res[i] = recon_apply_locked(view, &e[i], &zid[i]);
         continue;
       }
-      if (e[i].name && g->n && rg_clash(g, &e[i])) rg_flush(st, g, res, zid);
+      if (e[i].name && g->n && rg_clash(g, &e[i])) rg_flush(st, view, g, res, zid);
       rc_look_t lk;
       int r = recon_look_locked(st, view, &vid, &e[i], &zid[i], &lk);
       if (r != RC_CONT) {
@@ -3566,10 +3637,10 @@ void db_recon_apply_n(const char *view, const db_recon_entry_t *e, size_t n, int
         rg_add(g, &lk, &e[i], i);
         continue;
       }
-      rg_flush(st, g, res, zid);
+      rg_flush(st, view, g, res, zid);
       res[i] = recon_decide_locked(st, view, &e[i], &lk, &zid[i]);
     }
-    if (g && st) rg_flush(st, g, res, zid);
+    if (g && st) rg_flush(st, view, g, res, zid);
     rec_unlock();
     done = end;
     if (done < n && atomic_load_explicit(&g_rec_waiters, memory_order_relaxed) != 0) {
@@ -4004,7 +4075,8 @@ int db_recon_scan(uint32_t *cursor, unsigned budget, db_scan_item_t *out) {
       }
     }
     else if (z.flags & STORE_F_REJECTED_NEW) want = false;
-    else want = z.state == STORE_STATE_KNOWN || (z.flags & STORE_F_STALE) != 0 || ((z.flags & STORE_F_SIGNER_HELD) && !sig_held_has(z.zid));
+    else if ((z.flags & STORE_F_SIGNER_HELD) && sig_held_has(z.zid)) want = false;      /* (held for this loader: the image or the version in memory keeps serving, KNOWN or not; a query for a zone that has neither reads it, and says so: db_store_signer_commit()) */
+    else want = z.state == STORE_STATE_KNOWN || (z.flags & (STORE_F_STALE | STORE_F_SIGNER_HELD)) != 0;      /* (a held record of an earlier loader is read as it is) */
     if (!want || !vn) continue;
     snprintf(out->view, sizeof(out->view), "%s", vn);
     snprintf(out->zone, sizeof(out->zone), "%s.", z.name);
@@ -4092,6 +4164,20 @@ int db_store_commit_begin(const char *view, const char *zone, const db_stamp_t *
 
 void db_store_commit_end(void) {
   t_put_refuse = false;
+  rec_unlock();
+}
+
+bool db_store_signer_keeps(const char *view, const char *zone) {
+  dbdir_rec_t r;
+  return dir_rec_get(view, zone, &r) && (r.flags & STORE_F_SIGNER_HELD) && sig_held_has(r.zid);
+}
+
+void db_store_signer_commit(const char *view, const char *zone) {
+  store_t *st = atomic_load_explicit(&G.st, memory_order_acquire);
+  dbdir_rec_t r;
+  if (!st || !dir_rec_get(view, zone, &r) || !(r.flags & STORE_F_SIGNER_HELD) || (r.flags & STORE_F_SIGNER_UNSIGNED) || !sig_held_has(r.zid)) return;
+  rec_lock();                                               /* (the caller's commit holds it: a depth) */
+  if (store_set_flags(st, r.zid, STORE_F_SIGNER_UNSIGNED, 0) == 0) sig_unsigned_note(view, zone);
   rec_unlock();
 }
 
