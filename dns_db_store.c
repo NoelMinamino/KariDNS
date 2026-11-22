@@ -406,6 +406,7 @@ static void rec_unlock(void) {
 /* 0.7 signer-wait, since the start (store.recon.signer.*): versions held for karidns-signer while a signed one keeps serving, of those the ones that only the version in memory keeps (the record has no
  * image), and versions served although the signer has not signed them (STORE_F_SIGNER_UNSIGNED: no signed version was here) */
 static _Atomic uint64_t g_sig_held_n, g_sig_held_mem, g_sig_unsigned;
+static _Atomic uint64_t g_sig_carried;         /* 0.7 signer-wait (d): holds of before a start that the loader's first batch confirmed (store.recon.signer.carried) */
 /* A version that the loader sent to be held for the signer is served as it is: the Backend has no signed version of the zone (a zone new to it, or one whose image is gone and that is not in memory).
  * Availability first: the zone is served, and the operator is told loudly, once a zone for a hold (the record's flag is set once; the next held version of a zone that is flagged already says nothing),
  * at most SIG_WARN_MAX lines a minute (a batch of a thousand new zones of the signer names the first few, and the next line after the minute says how many it left out).  The caller holds g_rec_mu. */
@@ -431,6 +432,21 @@ static void sig_unsigned_note(const char *view, const char *zone) {
   g_sig_warn_n++;
   syslog(LOG_WARNING, "[Store] zone '%s' (view '%s'): signer-wait: the version the database has waits for karidns-signer, but no signed version of the zone is here to keep serving (none in memory, no image "
          "in the zone store); it is served as it is, a version the signer has not signed yet", zone, view);
+}
+
+/* (without the store the same counter and the same lines, under the same mutex: the store's rec_lock() works without a store) */
+void db_signer_unsigned_note(const char *view, const char *zone) {
+  rec_lock();
+  sig_unsigned_note(view, zone);
+  rec_unlock();
+}
+
+void db_signer_count(bool held_mem, bool carried) {
+  if (held_mem) {
+    atomic_fetch_add_explicit(&g_sig_held_n, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&g_sig_held_mem, 1, memory_order_relaxed);
+  }
+  if (carried) atomic_fetch_add_explicit(&g_sig_carried, 1, memory_order_relaxed);
 }
 #ifdef KARIDNS_UNIT_TEST
 void (*db_store_test_commit_hook)(int where, const char *zone);
@@ -3047,6 +3063,9 @@ static struct {
   bits_t np_done;
   /* signer-wait: the records held for the signer (DBR_HELD) since the loader connected (db_recon_held_reset()) */
   bits_t sig_held;
+  /* 0.7 signer-wait (d): the holds of an earlier loader are kept until this one's first batch said which zones wait (db_recon_held_carry() .. _end()); carry_n: the holds it confirmed */
+  bool carry;
+  size_t carry_n;
   /* the mass-delete guard: the views whose sweep is held back */
   bool held[STORE_MAX_VIEWS];
   /* the zones the store cannot name (the root zone, a text name over 255 bytes): no record, a list of their own (under mu) */
@@ -3264,6 +3283,7 @@ void db_recon_status(db_recon_status_t *out) {
   out->signer_held = atomic_load_explicit(&g_sig_held_n, memory_order_relaxed);
   out->signer_held_mem = atomic_load_explicit(&g_sig_held_mem, memory_order_relaxed);
   out->signer_unsigned = atomic_load_explicit(&g_sig_unsigned, memory_order_relaxed);
+  out->signer_carried = atomic_load_explicit(&g_sig_carried, memory_order_relaxed);
   out->rec_holds = atomic_load_explicit(&g_rec_holds, memory_order_relaxed);
   out->rec_holds_slow = atomic_load_explicit(&g_rec_slow, memory_order_relaxed);
   out->rec_hold_max_us = atomic_load_explicit(&g_rec_hold_max_us, memory_order_relaxed);
@@ -3371,23 +3391,60 @@ static void np_clear(uint32_t zid) {
 }
 
 /* sig_held: the records that an entry with KDB_EF_HOLD held for the signer since the loader connected (the reconcile thread, under RC.mu).  The scan of the wanted bodies passes them.  A record
- * with STORE_F_SIGNER_HELD whose bit is not set was held for a loader before this one (the loader or the server was started again): the scan asks for its body, so the version is read as it is,
- * as the full comparison of a start does without the store.  (Out of memory for a bit: the zone is read as it is.) */
+ * with STORE_F_SIGNER_HELD whose bit is not set was held for a loader before this one (the loader or the server was started again): it keeps its version while the carry is on (0.7, the first
+ * batch of the new loader says which zones still wait: sig_held_now()), and after it the scan asks for its body, so the version is read as it is.  (Out of memory for a bit: the zone is read as
+ * it is.) */
 static void sig_held_mark(uint32_t zid) {
   rc_lock();
   (void)bits_set(&RC.sig_held, zid);
   rc_unlock();
 }
-static bool sig_held_has(uint32_t zid) {
-  rc_lock();
-  const bool b = bits_get(&RC.sig_held, zid);
-  rc_unlock();
-  return b;
-}
 void db_recon_held_reset(void) {
   rc_lock();
   bits_free(&RC.sig_held);
+  RC.carry = false;
   rc_unlock();
+}
+
+void db_recon_held_carry(void) {
+  rc_lock();
+  bits_free(&RC.sig_held);
+  RC.carry = true;
+  RC.carry_n = 0;
+  rc_unlock();
+}
+
+size_t db_recon_held_carry_end(void) {
+  rc_lock();
+  const size_t n = RC.carry ? RC.carry_n : 0;
+  RC.carry = false;
+  rc_unlock();
+  return n;
+}
+
+/* is the record held for the signer now: by this loader (sig_held), or, until its first batch has said which zones wait, by the one before (the carry) */
+static bool sig_held_now(uint32_t zid) {
+  rc_lock();
+  const bool b = RC.carry || bits_get(&RC.sig_held, zid);
+  rc_unlock();
+  return b;
+}
+
+/* a record held before this loader connected that it has not held again yet, while the carry is on */
+static bool sig_carried(uint32_t zid) {
+  rc_lock();
+  const bool b = RC.carry && !bits_get(&RC.sig_held, zid);
+  rc_unlock();
+  return b;
+}
+
+/* a hold of this loader on a record that was held before it connected (the carry is on and the record's bit is not set yet): the hold is carried over the start */
+static void sig_carry_note(uint32_t zid) {
+  rc_lock();
+  const bool c = RC.carry && !bits_get(&RC.sig_held, zid);
+  if (c) RC.carry_n++;
+  rc_unlock();
+  if (c) atomic_fetch_add_explicit(&g_sig_carried, 1, memory_order_relaxed);
 }
 
 /* The reconcile thread applies the entries of a pass (db_recon_entry_n()) while the ingest thread applies the answers of the lookups (db_recon_lookup()): an entry of the pass was read by the loader some time before it
@@ -3478,15 +3535,23 @@ static int recon_decide_locked(store_t *st, const char *view, const db_recon_ent
         r = store_set_stamp(st, zid, m.stamp_gen, m.stamp_time, 0, STORE_F_REJECTED_NEW);
         res = DBR_CHANGED;
       }
+    } else if (held && !e->hold && !e->force && sig_carried(zid) && recon_hold_keeps(view, dname, &rs, &mem)) {
+      /* 0.7 signer-wait (d): held before this loader connected (or before the server started again), and its first batch has not said yet whether the zone still waits: an entry without the flag
+       * (a manifest pass, the drain of a start) does not let go of it.  Its stamp is recorded, the body is not asked for; the batch's entry with KDB_EF_HOLD confirms the hold, the end of the
+       * batch lets go of it otherwise (db_recon_held_carry_end(): the scan then asks for the body, which is read as it is). */
+      if (!stamp_eq) r = store_set_stamp(st, zid, m.stamp_gen, m.stamp_time, STORE_F_SIGNER_HELD, STORE_F_STALE | STORE_F_REJECTED_NEW);
+      res = DBR_HELD;
     } else if (e->hold && !e->force && !(stamp_eq && !held) && recon_hold_keeps(view, dname, &rs, &mem)) {
       /* signer-wait (KDB_EF_HOLD): a signed version keeps serving, the image or the version in memory (whatever the record says: a KNOWN record whose image the scrub, the cleaner or a degraded
        * store took while the zone is in memory, a STALE record whose newer body is not here yet, a refused version).  Another version is recorded (its stamp, STORE_F_SIGNER_HELD; the stale or refused
        * mark is for a stamp the record no longer has) but not asked for, and the version in memory is held there (dbreg_signer_hold(): not taken out, and the scan and a fetch do not replace it): the
-       * loader sends the zone again without the flag when the signer has signed it (a reload) or the zone is no longer the signer's, and a loader that connects again releases every held record
-       * (db_recon_held_reset(): the version is read as it is, as a full comparison of a start does).  The same version as the record's (not held) is nothing to wait for: the branches below. */
+       * loader sends the zone again without the flag when the signer has signed it (a reload) or the zone is no longer the signer's, and a loader that connects again keeps the holds until its
+       * first batch has said which zones still wait (0.7, db_recon_held_carry(): the database's signer state decides, the others are read as they are).  The same version as the record's (not
+       * held) is nothing to wait for: the branches below. */
       if (!(held && stamp_eq)) r = store_set_stamp(st, zid, m.stamp_gen, m.stamp_time, STORE_F_SIGNER_HELD, STORE_F_STALE | STORE_F_REJECTED_NEW);
       res = DBR_HELD;
       if (r == 0) {
+        if (held) sig_carry_note(zid);                     /* (a hold of before the start that this loader says again) */
         sig_held_mark(zid);
         if (!(held && stamp_eq)) {
           atomic_fetch_add_explicit(&g_sig_held_n, 1, memory_order_relaxed);
@@ -4075,7 +4140,7 @@ int db_recon_scan(uint32_t *cursor, unsigned budget, db_scan_item_t *out) {
       }
     }
     else if (z.flags & STORE_F_REJECTED_NEW) want = false;
-    else if ((z.flags & STORE_F_SIGNER_HELD) && sig_held_has(z.zid)) want = false;      /* (held for this loader: the image or the version in memory keeps serving, KNOWN or not; a query for a zone that has neither reads it, and says so: db_store_signer_commit()) */
+    else if ((z.flags & STORE_F_SIGNER_HELD) && sig_held_now(z.zid)) want = false;      /* (held for this loader, or for the one before until this one has said which zones wait: the image or the version in memory keeps serving, KNOWN or not; a query for a zone that has neither reads it, and says so: db_store_signer_commit()) */
     else want = z.state == STORE_STATE_KNOWN || (z.flags & (STORE_F_STALE | STORE_F_SIGNER_HELD)) != 0;      /* (a held record of an earlier loader is read as it is) */
     if (!want || !vn) continue;
     snprintf(out->view, sizeof(out->view), "%s", vn);
@@ -4169,13 +4234,13 @@ void db_store_commit_end(void) {
 
 bool db_store_signer_keeps(const char *view, const char *zone) {
   dbdir_rec_t r;
-  return dir_rec_get(view, zone, &r) && (r.flags & STORE_F_SIGNER_HELD) && sig_held_has(r.zid);
+  return dir_rec_get(view, zone, &r) && (r.flags & STORE_F_SIGNER_HELD) && sig_held_now(r.zid);
 }
 
 void db_store_signer_commit(const char *view, const char *zone) {
   store_t *st = atomic_load_explicit(&G.st, memory_order_acquire);
   dbdir_rec_t r;
-  if (!st || !dir_rec_get(view, zone, &r) || !(r.flags & STORE_F_SIGNER_HELD) || (r.flags & STORE_F_SIGNER_UNSIGNED) || !sig_held_has(r.zid)) return;
+  if (!st || !dir_rec_get(view, zone, &r) || !(r.flags & STORE_F_SIGNER_HELD) || (r.flags & STORE_F_SIGNER_UNSIGNED) || !sig_held_now(r.zid)) return;
   rec_lock();                                               /* (the caller's commit holds it: a depth) */
   if (store_set_flags(st, r.zid, STORE_F_SIGNER_UNSIGNED, 0) == 0) sig_unsigned_note(view, zone);
   rec_unlock();

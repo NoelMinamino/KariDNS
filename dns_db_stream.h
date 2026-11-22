@@ -89,7 +89,9 @@
  *   ZONE_FAILED (8)   1 view view R | 2 zone name R | 3 source_id i64 R | 4 reason str<=255 R | 5 request_id u64 O (D1a: fetch stream only, required there)
  *   ZONE_DELETE (9)   1 view view R | 2 zone name R | 3 source_id i64 R
  *   PROFILE (10)      1 name str ne <=255 R | 2 settings text<=65535 R
- *   BATCH_END (11)    1 batch_id u64 R | 2 n_zones u32 R | 3 n_failed u32 R | 4 n_deleted u32 R
+ *   BATCH_END (11)    1 batch_id u64 R | 2 n_zones u32 R | 3 n_failed u32 R | 4 n_deleted u32 R | 5 flags u8 O (0.7, bit0 KDB_BEF_SIGNER_SET: the batch said which
+ *                     zones of karidns-signer still wait for it (MANIFEST / CHANGES entries with KDB_EF_HOLD, or ZONE_HOLD): the holds of an earlier loader that it did not
+ *                     say again are let go; the loader sets it on the first batch after its start (or a change of the sources) in which every view was read)
  *   AUTO_STATUS (12)  B9; only between batches (state READY), no state change.  1 ENTRY nested, repeatable (<= 1024), one per view
  *                     that has auto reload on: 1 view view R | 2 last_poll u64 R (unix seconds, 0 = never) |
  *                     3 applied_seq u64 R (change log position of the last complete load) | 4 pending u32 R (changes seen, not yet
@@ -108,6 +110,12 @@
  *                     1 view str ne <=255 R (the NAME of the view, not an index: the file outlives a reconfiguration) | 2 zone name R |
  *                     6 file_state u8 O (KDB_HF_*: what the loader found in its state file at its start) | 7 file_zones u32 O (the zones the file held).
  *                     Tag 5 is not used by this message.  The Backend treats the entries as untrusted: a name that is not a zone of its directory is ignored.
+ *   ZONE_HOLD (21)    0.7 signer-wait without the store protocol (only then; inside a batch, IN_BATCH, no state change, not counted in BATCH_END): 1 view view R |
+ *                     2 zone name R | 3 source_id i64 R | 4 state u8 R (<= 2): 1 KDB_HOLD_KEEP: the database has a version of the zone that waits for karidns-signer and the loader does
+ *                     not send it: the Backend keeps the version it has in memory (memory-limit does not take it out) or, when it has none there, says so when a fetch reads the
+ *                     zone as it is; 0 KDB_HOLD_RELEASE: the zone does not wait any more (its version follows, or it is no longer the signer's); 2 KDB_HOLD_UNSIGNED: the zone waits,
+ *                     but the Backend has no version of it, so the loader sends it as it is (the Backend says so).  A claim of an untrusted loader: it can only keep a version that is
+ *                     already served in memory (as a pinned zone, against memory-limit) or make the Backend log a rate-limited line.
  *   HOT_ACK (14)      D1a step 7; only between batches, no state change.  The loader's answer to the last part of a HOT_LIST:
  *                     1 list_id u64 R | 2 status u8 R (KDB_HA_*) | 3 zones u32 R (the zones the state file holds now) | 4 error str<=255 O
  *
@@ -126,7 +134,8 @@
  *   MANIFEST (16)     One page of a pass: 1 batch_id u64 R | 2 view view R | 3 page u32 R (0, 1, ... in order) | 4 ENTRY nested, repeatable (<= KDB_MANIFEST_PAGE_MAX):
  *                     1 source_id i64 R (domains.id) | 2 name name R | 3 kind u8 R (0 primary, 1 secondary, 2 catalog) | 4 stamp_gen u64 R | 5 stamp_time u64 R
  *                     (karidns_zone_state.generation / changed_at) | 6 flags u8 O (bit0 KDB_EF_STAMPED: the stamp is real; absent / 0: the zone has no state row, and the
- *                     Backend compares the serial (tag 7) or wants the body) | 7 serial u32 O (plain schema) | 8 digest bytes<=32 exactly O (a verify pass).
+ *                     Backend compares the serial (tag 7) or wants the body; bit2 KDB_EF_HOLD (0.7, signer-wait): as in a CHANGES upsert, the first pass after a start for a zone that
+ *                     waits for karidns-signer; bit1 is refused) | 7 serial u32 O (plain schema) | 8 digest bytes<=32 exactly O (a verify pass).
  *                     Only zones the view serves are listed (the view mapping is applied by the loader) and only zones the loader can send (a canonical name, a loadable
  *                     type); the others are counted in MANIFEST_END n_skipped, and the Backend that sweeps a zone that is not listed deletes it.
  *   MANIFEST_END (17) 1 batch_id u64 R | 2 view view R | 3 n_entries u64 R (the sum of the pages) | 4 n_skipped u64 R | 5 cursor u64 R | 6 cursor_valid u8 R |
@@ -228,7 +237,9 @@
 #define KDB_MF_PLAIN 0x2u            /* ... a plain PowerDNS schema: no stamps, serials */
 #define KDB_EF_STAMPED 0x1u          /* MANIFEST / CHANGES entry flags: the stamp (generation, changed_at) is real */
 #define KDB_EF_FORCE 0x2u            /* CHANGES entry: read the body whatever the stamp says */
-#define KDB_EF_HOLD 0x4u             /* CHANGES upsert (signer-wait, 0.7): a zone the Backend has keeps the version it has; one it does not have is read as it is */
+#define KDB_EF_HOLD 0x4u             /* CHANGES upsert and MANIFEST entry (signer-wait, 0.7): a zone the Backend has keeps the version it has; one it does not have is read as it is */
+#define KDB_BEF_SIGNER_SET 0x1u      /* BATCH_END flags (0.7 signer-wait): the batch said which zones wait for the signer; the holds of an earlier loader it did not say again are let go */
+enum { KDB_HOLD_RELEASE = 0, KDB_HOLD_KEEP = 1, KDB_HOLD_UNSIGNED = 2 };      /* ZONE_HOLD state (0.7 signer-wait without the store protocol) */
 #define KDB_MANIFEST_PAGE_MAX 16384  /* entries of one MANIFEST / CHANGES message */
 #define KDB_IDENT_MAX 64             /* database identity, bytes */
 #define KDB_FETCH_BUSY_REASON "busy: too many fetch requests are waiting"   /* the loader's ZONE_FAILED reason when its fetch queue is full (the Backend counts these) */
@@ -254,6 +265,7 @@ enum {
     KDB_T_MANIFEST_BEGIN = 15, KDB_T_MANIFEST = 16, KDB_T_MANIFEST_END = 17, KDB_T_CHANGES = 18,      /* 0.7 WP7a: the store protocol */
     KDB_T_LOOKUP_RESULT = 19,           /* 0.7: the answer to FETCH_REQ mode KDB_FETCH_LOOKUP (fetch stream only) */
     KDB_T_ZONE_IMAGE = 20,              /* 0.7 M3: the next octets of a zone image (raw, up to KDB_MAX_BODY; ZONE_BEGIN with KDB_ZF_IMAGE, .. ZONE_END) */
+    KDB_T_ZONE_HOLD = 21,               /* 0.7 signer-wait without the store protocol: a zone waits for karidns-signer (KDB_HOLD_*) */
     /* Backend -> loader: high bit set */
     KDB_T_CONFIG = 0x8001, KDB_T_RELOAD_REQ = 0x8002, KDB_T_INVENTORY = 0x8003, KDB_T_INVENTORY_END = 0x8004,
     KDB_T_ZONE_RESULT = 0x8005, KDB_T_BATCH_RESULT = 0x8006,
@@ -382,7 +394,8 @@ typedef struct { kdb_str_t reason; } kdb_zone_abort_t;
 typedef struct { uint16_t view; char name[DNS_NAME_TEXT_SIZE]; int64_t source_id; kdb_str_t reason; uint64_t request_id; /* 0 = absent */ } kdb_zone_failed_t;
 typedef struct { uint16_t view; char name[DNS_NAME_TEXT_SIZE]; int64_t source_id; } kdb_zone_delete_t;
 typedef struct { kdb_str_t name, settings; } kdb_profile_t;
-typedef struct { uint64_t batch_id; uint32_t n_zones, n_failed, n_deleted; } kdb_batch_end_t;
+typedef struct { uint64_t batch_id; uint32_t n_zones, n_failed, n_deleted; uint8_t flags; /* tag 5 (KDB_BEF_*); 0 = absent */ } kdb_batch_end_t;
+typedef struct { uint16_t view; char name[DNS_NAME_TEXT_SIZE]; int64_t source_id; uint8_t state; /* KDB_HOLD_* */ } kdb_zone_hold_t;
 typedef struct { uint32_t n_entries; const uint8_t *body; uint32_t body_len; } kdb_auto_status_t;     /* entries: kdb_auto_status_entries() */
 
 typedef struct {
@@ -455,7 +468,7 @@ typedef struct {
         kdb_inventory_end_t inventory_end; kdb_zone_result_t zone_result; kdb_batch_result_t batch_result;
         kdb_fetch_req_t fetch_req; kdb_hot_list_t hot_list; kdb_hot_ack_t hot_ack; kdb_debug_t debug;
         kdb_manifest_begin_t manifest_begin; kdb_manifest_t manifest; kdb_manifest_end_t manifest_end; kdb_changes_t changes;
-        kdb_lookup_result_t lookup_result; kdb_zone_image_t zone_image;
+        kdb_lookup_result_t lookup_result; kdb_zone_image_t zone_image; kdb_zone_hold_t zone_hold;
     } u;
 } kdb_msg_t;
 
@@ -499,6 +512,7 @@ bool kdb_inventory_entries_next(kdb_iter_t *it, kdb_inventory_entry_t *out);
 typedef struct {
     int64_t source_id; char name[DNS_NAME_TEXT_SIZE]; uint8_t kind; uint64_t stamp_gen, stamp_time;
     bool stamped; bool has_serial; uint32_t serial; bool has_digest; uint8_t digest[KDB_DIGEST_LEN];
+    bool hold;                  /* 0.7 signer-wait: KDB_EF_HOLD */
 } kdb_manifest_entry_t;
 typedef struct {
     int64_t source_id; uint8_t op;          /* 1 upsert, 2 delete (KDB_CH_*) */

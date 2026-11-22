@@ -683,34 +683,37 @@ the last error; B9; under a view a line \fBwaiting for the signer: N zone(s): a,
 b, ...\fR when zones with the metadata \fBX\-KARIDNS\-SIGNER\fR = \fB1\fR
 changed and wait for \fBkaridns\-signer\fR to sign them and ask for a reload,
 see \fBsigner\-wait\fR in \fBkaridns(8)\fR; 0.7, the zone store: a line
-\fBsigner\-wait: since the start N version(s) waited for the signer ..., M
-version(s) served that the signer has not signed yet ...\fR once a version was
-held or served unsigned, and with a zone named, the lines \fBsigner\-wait: the
-database has another version, which waits for the signer; ... keeps
-serving ...\fR and \fBsigner\-wait: serving a version the signer has not signed
-yet ...\fR), for a PostgreSQL view whose schema has the multi-server tables
-(B11) one line \fBreload requests (view <name>): server\-id <id>, last applied
-generation <n>, ok yes|no, status written <time>|never, last error:
-<text>|none\fR (the id this server reports under in \fBkaridns_server_status\fR,
-the highest \fBkaridns_reload_requests\fR generation it has applied, whether
-every zone of that reload loaded, when its status row was last written, and why
-a read of the requests or a write of the status row failed; the server keeps
-serving when it cannot write the row), the size of the zone versions and IXFR
-deltas (the same numbers as in \fBstatus\fR), the fetches of whole zones from
-the database (\fBfetch: rate=unlimited|N/s refused_by_rate=N issued=N
-concurrency=N\fR; \fBrate=unlimited\fR is the default (\fBfetch\-rate\fR, 0.7);
-\fBrefused_by_rate\fR counts only the background requests that found the bucket
-short (a query waits for a token); \fBissued\fR counts the zones the Backend
-asked the loader for: a query, a transfer, the warm-up), then \fBfetchq:
-in_flight=N places=N peak=N table_full=N ring_dropped=N park_full=N
-park_timeout=N loader_busy=N ingest_busy=P% fill_busy=P% hist=A,B,C,D,E queued=N
-queue_peak=N waited=N queue_dropped=N queue_full=N\fR (0.7: where a fetch is
-held up; all counted since the start except \fBin_flight\fR, \fBqueued\fR and
-\fBingest_busy\fR: \fBin_flight\fR and \fBpeak\fR are the fetches on their way
-now and the most there have been at one time; \fBplaces\fR, the places of
-\fBfetch\-concurrency\fR in use now (whole-zone fetches in flight: 0 at rest);
-\fBqueued\fR, \fBqueue_peak\fR and \fBwaited\fR, the requests that wait now for
-a place of \fBfetch\-concurrency\fR, a token of \fBfetch\-rate\fR or room under
+\fBsigner\-wait: since the start N version(s) waited for the signer ... (K kept
+by the version in memory alone; C held across a start of the loader or the
+server), M version(s) served that the signer has not signed yet ...; held in
+memory now: Z zone(s), B bytes (counted against memory\-limit)\fR once a version
+was held or served unsigned (also without the store since 0.7), and with a zone
+named, the lines \fBsigner\-wait: the database has another version, which waits
+for the signer; ... keeps serving ...\fR and \fBsigner\-wait: serving a version
+the signer has not signed yet ...\fR), for a PostgreSQL view whose schema has
+the multi-server tables (B11) one line \fBreload requests (view <name>):
+server\-id <id>, last applied generation <n>, ok yes|no, status written
+<time>|never, last error: <text>|none\fR (the id this server reports under in
+\fBkaridns_server_status\fR, the highest \fBkaridns_reload_requests\fR
+generation it has applied, whether every zone of that reload loaded, when its
+status row was last written, and why a read of the requests or a write of the
+status row failed; the server keeps serving when it cannot write the row), the
+size of the zone versions and IXFR deltas (the same numbers as in \fBstatus\fR),
+the fetches of whole zones from the database (\fBfetch: rate=unlimited|N/s
+refused_by_rate=N issued=N concurrency=N\fR; \fBrate=unlimited\fR is the default
+(\fBfetch\-rate\fR, 0.7); \fBrefused_by_rate\fR counts only the background
+requests that found the bucket short (a query waits for a token); \fBissued\fR
+counts the zones the Backend asked the loader for: a query, a transfer, the
+warm-up), then \fBfetchq: in_flight=N places=N peak=N table_full=N
+ring_dropped=N park_full=N park_timeout=N loader_busy=N ingest_busy=P%
+fill_busy=P% hist=A,B,C,D,E queued=N queue_peak=N waited=N queue_dropped=N
+queue_full=N\fR (0.7: where a fetch is held up; all counted since the start
+except \fBin_flight\fR, \fBqueued\fR and \fBingest_busy\fR: \fBin_flight\fR and
+\fBpeak\fR are the fetches on their way now and the most there have been at one
+time; \fBplaces\fR, the places of \fBfetch\-concurrency\fR in use now
+(whole-zone fetches in flight: 0 at rest); \fBqueued\fR, \fBqueue_peak\fR and
+\fBwaited\fR, the requests that wait now for a place of
+\fBfetch\-concurrency\fR, a token of \fBfetch\-rate\fR or room under
 \fBmemory\-limit\fR (they are not refused: they wait in order, up to
 \fBpark\-timeout\fR), the most there have been, and how many had to wait;
 \fBqueue_dropped\fR, those that ran out of \fBpark\-timeout\fR;
@@ -1547,6 +1550,13 @@ signer has not signed them, because nothing signed was here to keep (a zone new
 to the server; a held version that had to leave memory): a WARNING names them
 and \fBkarictl dbstatus <zone>\fR says "serving a version the signer has not
 signed yet" (\fBkaridns(8)\fR, "The signer's zones")
+.TP 8
+\fBstore.recon.signer.carried\fR
+0.7 signer-wait, since the start: holds made before a start of the loader or the
+server that the first batch of the loader said again (the zone still waits for
+the signer by its state in the database, \fBkaridns_signer_state\fR): the signed
+version kept serving across the start (\fBkaridns(8)\fR, "The signer's zones",
+"Across a restart")
 .TP 8
 \fBstore.recon.thread\fR, \fB.busy_pct\fR, \fB.entries_per_s\fR, \fB.queued\fR, \fB.apply_ns_per_entry\fR
 0.7, the reconcile thread (the pages of a manifest pass are decoded and recorded

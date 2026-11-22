@@ -375,6 +375,13 @@ typedef struct db_driver {
     /* D1a step 6: the apex SOA and NS rows (db_apex_row_t) of one zone (domain_id) or of all, ORDER BY domain_id, id; as scan_records in a snapshot.
      * NULL = the driver cannot tell: no apex goes with the summaries. */
     int (*scan_apex)(db_conn_t *c, const int64_t *domain_id, db_apex_cb cb, void *ud);
+    /* 0.7 signer-wait: the zones that wait for karidns-signer, as the signer's state says it (db/karidns_ext.*.sql, karidns_signer_state; the rules of its catch-up
+     * scan, signer/lib/db_*.js catchUp()): a zone with the metadata kind X-KARIDNS-SIGNER (any case; the loader checks the value, ids_are_signers()) and a row
+     * in karidns_signer_state whose signed_serial is NULL (it failed before it ever signed), is not the serial of the zone's SOA now, or whose signed_at is
+     * before karidns_zone_state.changed_at (somebody wrote the zone after the signer).  A zone without a state row is not one: the signer never signed it (or
+     * does not run), and its data is what was imported.  Ascending domain ids, one callback each, in a snapshot (PostgreSQL: a cursor).  NULL, or
+     * DB_ERR_UNAVAILABLE without karidns_signer_state or karidns_zone_state: nothing waits.  0, DB_STOPPED, -1, DB_ERR_RETRY, DB_ERR_UNAVAILABLE. */
+    int (*signer_waiting)(db_conn_t *c, db_key_cb cb, void *ud);
 
     /* ---- 0.7 store, WP3: the paged calls (see the block above db_driver_t).  NULL = the driver has none. ---- */
     /* The number of domains, to size the index at a first fill.  view NULL: every row of `domains`.  view set: the zones the view mapping gives

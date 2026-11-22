@@ -1018,6 +1018,46 @@ static int keys_loop(db_conn_t *c, sqlite3_stmt *st, db_key_cb cb, void *ud) {
     return ret;
 }
 
+/* 0.7 signer-wait (dns_db_driver.h signer_waiting): once at a start of the loader, so the statement is not kept.  The serial is the third word of the SOA content, as
+ * the signer reads it (signer/lib/db_sqlite.js catchUp()); SQLite3 has no correlated subquery in FROM, so the words are cut in the expression. */
+#define SQ_SOA_T1 "substr(r.content, instr(r.content, ' ') + 1)"
+#define SQ_SOA_T2 "substr(" SQ_SOA_T1 ", instr(" SQ_SOA_T1 ", ' ') + 1)"
+static int sq_signer_waiting(db_conn_t *c, db_key_cb cb, void *ud) {
+    unsigned found;
+    int rows, rc = table_columns(c, "karidns_signer_state", (const char *const[]){ "domain_id", "signed_at", "signed_serial", NULL }, &found, &rows);
+    if (rc != 0) return rc;
+    if (rows == 0 || found != 7u || !c->has_zone_state) {
+        set_err(c, "karidns_signer_state or karidns_zone_state does not exist in this database");
+        return DB_ERR_UNAVAILABLE;
+    }
+    sqlite3_stmt *st = NULL;
+    rc = sqlite3_prepare_v2(c->db,
+                            "SELECT s.domain_id FROM karidns_signer_state s "
+                            "WHERE EXISTS (SELECT 1 FROM domainmetadata m WHERE m.domain_id = s.domain_id AND upper(m.kind) = 'X-KARIDNS-SIGNER') "
+                            "AND (s.signed_serial IS NULL "
+                            "OR EXISTS (SELECT 1 FROM karidns_zone_state z WHERE z.domain_id = s.domain_id AND z.changed_at > s.signed_at) "
+                            "OR EXISTS (SELECT 1 FROM records r WHERE r.domain_id = s.domain_id AND r.type = 'SOA' AND CAST(substr(" SQ_SOA_T2 ", 1, instr(" SQ_SOA_T2
+                            " || ' ', ' ') - 1) AS INTEGER) <> s.signed_serial)) "
+                            "ORDER BY s.domain_id",
+                            -1, &st, NULL);
+    if (rc != SQLITE_OK) return sql_fail(c, rc, "signer_waiting");
+    int ret = 0;
+    for (;;) {
+        rc = sqlite3_step(st);
+        if (rc == SQLITE_DONE) break;
+        if (rc != SQLITE_ROW) {
+            ret = sql_fail(c, rc, "signer_waiting");
+            break;
+        }
+        if (cb(ud, sqlite3_column_int64(st, 0)) != 0) {
+            ret = DB_STOPPED;
+            break;
+        }
+    }
+    sqlite3_finalize(st);
+    return ret;
+}
+
 static int sq_zones_with_keys(db_conn_t *c, db_key_cb cb, void *ud) {
     int ret = prep(c, &c->st_keys, "SELECT DISTINCT domain_id FROM cryptokeys ORDER BY domain_id");
     if (ret != 0) return ret;
@@ -2046,6 +2086,7 @@ const db_driver_t db_driver_sqlite3 = {
     .find_zones_in = sq_find_zones_in,          /* 0.7: the lookup of a name */
     .scan_records_in = sq_scan_records_in, .scan_metadata_in = sq_scan_metadata_in, .scan_ext_in = sq_scan_ext_in, .zones_with_keys_in = sq_zones_with_keys_in,      /* B13b; SQLite3 since 0.7: the statements of a fetch of many zones */
     .scan_apex = sq_scan_apex,                  /* D1a step 6 */
+    .signer_waiting = sq_signer_waiting,        /* 0.7 signer-wait: the zones that wait for the signer at a start */
     .count_domains = sq_count_domains, .manifest_page = sq_manifest_page, .current_cursor = sq_current_cursor, .changes_page = sq_changes_page,      /* 0.7 store, WP3 */
     /* M2, the ZoneImporter: write access (open_write connections only) */
     .open_write = sq_open_write, .w_begin = sq_w_begin, .w_commit = sq_w_commit, .w_rollback = sq_w_rollback,

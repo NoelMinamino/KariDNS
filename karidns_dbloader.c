@@ -447,8 +447,9 @@ typedef struct {
     char perr[AUTO_ERRLEN], lerr[AUTO_ERRLEN];   /* last poll error, last load error ("" = none) */
     /* 0.6.0 item C (signer-wait): the zones with the metadata X-KARIDNS-SIGNER=1 that changed (the change log, or a serial that moved) and were not reloaded
      * because of it; they wait for the signer's reload request.  Sorted by domain id; `dbstatus` shows how many and the first few names. */
-    struct sigw { int64_t id; char *name; } *sigw;
+    struct sigw { int64_t id; char *name; int64_t since; } *sigw;      /* since: when it began to wait (CLOCK_MONOTONIC ms; 0.7: a WARNING when the signer keeps a zone waiting, sigw_stuck_check()) */
     size_t nsigw;
+    int64_t sigw_warned;                 /* (CLOCK_MONOTONIC ms) the last of those warnings */
     /* A one-zone reload (a reload request, karictl reload <zone>) reads a signer zone as it is, up to the change log position m (the cursor of changes_max() in its
      * snapshot).  The rows of that zone up to m are in what it read; when the poll of the auto reload reaches them later they are not a change of the zone, and the
      * zone must not go back on the list above.  One entry per zone of the signer that was reloaded so; sorted by domain id.  PostgreSQL (0.7, CI flake row 19): m is the
@@ -464,6 +465,7 @@ typedef struct {
     int64_t hold_until;
 } vstate_t;
 
+struct idset;
 typedef struct {
     const db_driver_t *drv;
     db_conn_t *conn;
@@ -539,6 +541,7 @@ typedef struct {
         uint8_t ident_len;
         char skip_names[3][192];
         unsigned nskip_names;
+        const struct idset *w;        /* 0.7 signer-wait (d): the first load after a start, the zones the signer's state says wait (signer_wait_set()): their entries carry KDB_EF_HOLD */
     } st;
     uint64_t batch_id;
     uint8_t batch_kind;
@@ -548,6 +551,7 @@ typedef struct {
     uint64_t req_id;                  /* the RELOAD_REQ this batch answers, 0 = none (BATCH_BEGIN tag 4) */
     bool force;                       /* read and send the zone even when the Backend has this exact version */
     bool reconcile;                   /* compare every zone (digest) instead of trusting serials and the change log */
+    bool sig_set;                     /* 0.7 signer-wait (d): this load says which zones wait for the signer (a reconcile of every view): BATCH_END KDB_BEF_SIGNER_SET when every view was read */
     uint16_t vslot;                   /* the view being read (lio.vnames) */
     int bulk_threshold;               /* percent of the zones of a source above which one bulk scan beats one query per zone */
     int64_t *chg;                     /* ids listed in the change log since the last load, sorted */
@@ -1234,7 +1238,7 @@ static int signer_meta_cb(void *ud, const db_meta_row_t *r) {
 }
 
 /* the domain ids of the metadata rows X-KARIDNS-SIGNER=1 a scan goes over (a zone twice if it has two such rows) */
-typedef struct { int64_t *v; size_t n, cap; bool oom; } idset_t;
+typedef struct idset { int64_t *v; size_t n, cap; bool oom; } idset_t;
 
 static int signer_ids_cb(void *ud, const db_meta_row_t *r) {
     idset_t *s = ud;
@@ -1284,6 +1288,102 @@ static void zones_are_signers(const ctx_t *x, const int64_t *idx, size_t n, bool
             yes[k] = lo < s.n && s.v[lo] == id;
         }
     free(s.v);
+}
+
+static bool idset_has(const idset_t *s, int64_t id) {
+    size_t lo = 0, hi = s ? s->n : 0;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (s->v[mid] < id) lo = mid + 1;
+        else hi = mid;
+    }
+    return s && lo < s->n && s->v[lo] == id;
+}
+
+static int idset_add_cb(void *ud, int64_t id) {
+    idset_t *s = ud;
+    if (s->n == s->cap) {
+        size_t nc = s->cap ? s->cap * 2 : 64;
+        int64_t *nv = realloc(s->v, nc * sizeof(*nv));
+        if (!nv) return s->oom = true;
+        s->v = nv;
+        s->cap = nc;
+    }
+    s->v[s->n++] = id;
+    return 0;
+}
+
+static int64_t now_ms(void);
+static int ids_are_signers(const ctx_t *x, const int64_t *ids, size_t n, bool *yes, bool own_snap);
+
+/* 0.7 signer-wait (d): which zones wait for karidns-signer now, as the database says it (the signer's state, dns_db_driver.h signer_waiting(), and the metadata X-KARIDNS-SIGNER=1 as
+ * ids_are_signers() reads it), ascending ids in *w (the caller frees w->v).  The first load of a loader (a start of it or of the server, or new sources) holds them back as the auto batches
+ * do: the Backend keeps the signed version it has (its store, or its memory) instead of reading the version the signer has not signed.  A zone without a state row of the signer is not
+ * held (the signer never signed it, or does not run: what is in the database was imported as it is).  own_snap: the caller holds no snapshot.  0 (no driver function, no table: none
+ * waits), a database error (x->conn has the message), or SIGW_OOM (out of memory). */
+#define SIGW_OOM (-100)                     /* signer_wait_set(): out of memory (a driver error is its own code) */
+static int signer_wait_set(ctx_t *x, bool own_snap, idset_t *w) {
+    memset(w, 0, sizeof(*w));
+    if (!x->io || !x->io->cfg.signer_wait || !x->drv->signer_waiting) return 0;
+    int rc = own_snap ? x->drv->begin_snapshot(x->conn) : 0;
+    if (rc != 0) return rc;
+    rc = x->drv->signer_waiting(x->conn, idset_add_cb, w);
+    if (rc == DB_ERR_UNAVAILABLE) {
+        rc = 0;
+        w->n = 0;
+    }
+    if (rc == 0 && !w->oom && w->n) {
+        bool *yes = malloc(w->n * sizeof(*yes));
+        if (!yes) {
+            w->oom = true;
+        } else {
+            rc = ids_are_signers(x, w->v, w->n, yes, false);
+            size_t k = 0;
+            for (size_t i = 0; rc == 0 && i < w->n; i++)
+                if (yes[i]) w->v[k++] = w->v[i];
+            if (rc == 0) w->n = k;
+            free(yes);
+        }
+    }
+    if (own_snap) {
+        int ec = x->drv->end_snapshot(x->conn);
+        if (rc == 0) rc = ec;
+    }
+    if (rc == 0 && w->oom) rc = SIGW_OOM;
+    if (rc != 0) {
+        free(w->v);
+        memset(w, 0, sizeof(*w));
+        return rc == DB_STOPPED ? SIGW_OOM : rc;
+    }
+    if (w->n)
+        lg(LOG_WARNING, "view '%s': %zu zone(s) of karidns-signer have a version in the database that the signer has not signed yet (karidns_signer_state): they wait for it, and the Backend "
+                        "keeps serving the signed version it has (`karictl dbstatus` lists them)", x->io->vnames[x->vslot], w->n);
+    return 0;
+}
+
+/* 0.7 signer-wait: a zone waits for the signer longer than SIGW_STUCK_MS (a stopped or failing signer; the version it signed last keeps serving, also across restarts): a WARNING per view at
+ * most every SIGW_STUCK_MS.  KARIDNS_SIGNER_STUCK_MS (a test switch) sets the time. */
+#define SIGW_STUCK_MS (3600 * 1000)
+static int64_t g_sigw_stuck_ms = SIGW_STUCK_MS;
+static void sigw_stuck_check(struct lio *io) {
+    const int64_t now = now_ms();
+    for (size_t s = 0; s < io->nvn; s++) {
+        vstate_t *vs = &io->vst[s];
+        if (!vs->nsigw || (vs->sigw_warned && now - vs->sigw_warned < g_sigw_stuck_ms)) continue;
+        size_t old = 0, oi = 0;
+        for (size_t i = 0; i < vs->nsigw; i++)
+            if (now - vs->sigw[i].since >= g_sigw_stuck_ms) {
+                if (!old || vs->sigw[i].since < vs->sigw[oi].since) oi = i;
+                old++;
+            }
+        if (!old) continue;
+        vs->sigw_warned = now;
+        char shown[100];
+        clean_reason(vs->sigw[oi].name, shown, sizeof(shown));
+        lg(LOG_WARNING, "view '%s': %zu zone(s) have waited for karidns-signer for more than %lld s (the longest: %s, %lld s): the signer does not sign them; the version it signed last keeps "
+                        "serving (check the signer: karidns_signer_monitor, its log; `signer-wait no;` serves changes unsigned)",
+           io->vnames[s], old, (long long)(g_sigw_stuck_ms / 1000), shown, (long long)((now - vs->sigw[oi].since) / 1000));
+    }
 }
 
 static int meta_cb(void *ud, const db_meta_row_t *r) {
@@ -2381,7 +2481,8 @@ static int send_simple_header(ctx_t *x) {
 static int send_batch_end(ctx_t *x) {
     if (kdb_enc_begin(&x->enc, KDB_T_BATCH_END) != 0 || kdb_enc_u64(&x->enc, 1, x->io ? x->batch_id : 1) != 0 ||
         kdb_enc_u32(&x->enc, 2, x->n_zones) != 0 || kdb_enc_u32(&x->enc, 3, x->n_failed) != 0 ||
-        kdb_enc_u32(&x->enc, 4, x->n_deleted) != 0 || kdb_enc_end(&x->enc) != 0 || send_enc(x) != 0)
+        kdb_enc_u32(&x->enc, 4, x->n_deleted) != 0 || (x->sig_set && kdb_enc_u8(&x->enc, 5, KDB_BEF_SIGNER_SET) != 0) ||
+        kdb_enc_end(&x->enc) != 0 || send_enc(x) != 0)
         return -1;
     return 0;
 }
@@ -2732,10 +2833,22 @@ static bool sigw_has(const vstate_t *vs, int64_t id) {
     return lo < vs->nsigw && vs->sigw[lo].id == id;
 }
 
+/* 0.7 signer-wait without the store protocol: ZONE_HOLD for the zone (its database name, made canonical; one that cannot be is not the Backend's).  0, or -1 (the stream: x->io_error). */
+static int send_zone_hold(ctx_t *x, int64_t id, const char *name, uint8_t state) {
+    char canon[DNS_NAME_TEXT_SIZE];
+    if (!name || !pdns_canonical_zone_name(name, canon)) return 0;
+    if (send_simple_header(x) != 0 || kdb_enc_begin(&x->enc, KDB_T_ZONE_HOLD) != 0 || kdb_enc_u16(&x->enc, 1, x->view) != 0 || kdb_enc_name(&x->enc, 2, canon) != 0 ||
+        kdb_enc_i64(&x->enc, 3, id) != 0 || kdb_enc_u8(&x->enc, 4, state) != 0 || kdb_enc_end(&x->enc) != 0 || send_enc(x) != 0) {
+        x->io_error = true;
+        return -1;
+    }
+    return 0;
+}
+
 /* signer-wait: the set of zones that wait for the signer after a plan: the zones skipped now, and the zones that waited before and are still waiting (a
  * zone of the list that is not read now; for the plan of one zone only that zone is looked at; with the whole list a zone that is gone from the database
  * leaves the set).  io->status_dirty when the set changed.  0, or -1 on out of memory. */
-static int sigw_update(struct lio *io, vstate_t *vs, const ctx_t *x, bool one, const int64_t *skip, size_t nskip) {
+static int sigw_update(struct lio *io, vstate_t *vs, ctx_t *x, bool one, const int64_t *skip, size_t nskip) {
     if (nskip == 0 && vs->nsigw == 0) return 0;
     size_t cap = vs->nsigw + nskip;
     /* The new array is built first and the old one is not touched until it is complete: on out of memory the set is as it was (the names of the entries
@@ -2788,10 +2901,19 @@ static int sigw_update(struct lio *io, vstate_t *vs, const ctx_t *x, bool one, c
                 return -1;
             }
             isnew[n] = 1;
-            nw[n++] = (struct sigw){ nz->id, nm };
+            nw[n++] = (struct sigw){ nz->id, nm, now_ms() };
             b++;
             changed = true;
         }
+    }
+    /* 0.7 signer-wait without the store protocol: the Backend is told which zones wait (it keeps their version in memory, memory-limit does not take it out) and which do not any more
+     * (their version follows, or they are no longer the signer's): ZONE_HOLD */
+    int rc = 0;
+    if (!x->store_proto && x->io) {
+        for (size_t i = 0; i < vs->nsigw && rc == 0; i++)
+            if (!kept[i]) rc = send_zone_hold(x, vs->sigw[i].id, vs->sigw[i].name, KDB_HOLD_RELEASE);
+        for (size_t i = 0; i < n && rc == 0; i++)
+            if (isnew[i]) rc = send_zone_hold(x, nw[i].id, nw[i].name, KDB_HOLD_KEEP);
     }
     for (size_t i = 0; i < vs->nsigw; i++)
         if (!kept[i]) free(vs->sigw[i].name);
@@ -2801,7 +2923,7 @@ static int sigw_update(struct lio *io, vstate_t *vs, const ctx_t *x, bool one, c
     vs->sigw = nw;
     vs->nsigw = n;
     if (changed) io->status_dirty = true;
-    return 0;
+    return rc;
 }
 
 /* a plan of the whole list: the entries of the zones that are no longer listed (deleted from the database) go; x->zones is sorted by id */
@@ -2892,6 +3014,16 @@ static int plan_diff(ctx_t *x, const db_schema_info_t *si, const char *only_zone
             }
         }
     }
+    /* 0.7 signer-wait (d): the first load of this loader (a start of it or of the server, new sources) compares every zone; the zones that wait for the signer as the database says it are
+     * held back as an auto batch holds them, when the Backend has a version of them (its memory: it keeps it, ZONE_HOLD), else read as they are and said to be (KDB_HOLD_UNSIGNED) */
+    idset_t wset = { 0 };
+    if (x->reconcile && !x->force && !only_zone && !x->store_proto) {
+        const int wr = signer_wait_set(x, false, &wset);
+        if (wr != 0) {
+            x->st.dberr = wr;
+            return wr == SIGW_OOM ? -1 : -2;
+        }
+    }
     uint32_t gen = ++io->gen;
     fev_drain(io, false);
     int64_t *skip = NULL;                    /* signer-wait: the indexes (in x->zones) of the zones not read because the signer keeps them */
@@ -2928,12 +3060,20 @@ static int plan_diff(ctx_t *x, const db_schema_info_t *si, const char *only_zone
              * the change log or its serial (an auto batch): the Backend keeps the version it has until the signer has signed the change and asks for a
              * reload (a reload request, or karictl reload, which read the zone as it is).  A zone the Backend does not have, a full comparison and a zone
              * the Backend refused read it as it is. */
-            if (z->want && !base && x->batch_kind == KDB_BATCH_AUTO && x->io->cfg.signer_wait) {       /* a candidate: the metadata of all of them is read below, in one go */
+            const bool inw = idset_has(&wset, z->id);
+            const bool have = e && e->known && !e->dirty && e->source_id == z->id;
+            if (inw && !have && send_zone_hold(x, z->id, z->name, KDB_HOLD_UNSIGNED) != 0) {      /* (the Backend has nothing signed of it: read as it is, and said) */
+                free(skip);
+                free(wset.v);
+                return -1;
+            }
+            if ((z->want && !base && x->batch_kind == KDB_BATCH_AUTO && x->io->cfg.signer_wait) || (inw && have)) {       /* a candidate: the metadata of all of them is read below, in one go */
                 if (nskip == cskip) {
                     size_t nc = cskip ? cskip * 2 : 64;
                     int64_t *ns = realloc(skip, nc * sizeof(*ns));
                     if (!ns) {
                         free(skip);
+                        free(wset.v);
                         return -1;
                     }
                     skip = ns;
@@ -2948,6 +3088,7 @@ static int plan_diff(ctx_t *x, const db_schema_info_t *si, const char *only_zone
         z->summary = x->dir_only && z->want && z->canon && z->has_serial && !zone_type_reason(z->type) && zone_sec_kind(z->type) == KDB_ZK_PRIMARY &&
                      !(e && e->known && e->resident);
     }
+    free(wset.v);
     if (nskip) {                                         /* the candidates: those that are signed by the signer are not read now (skip keeps only them) */
         bool *yes = malloc(nskip * sizeof(*yes));
         if (!yes) {
@@ -3310,6 +3451,7 @@ static int sigw_add(struct lio *io, vstate_t *vs, int64_t id, const char *name) 
     memmove(&n[lo + 1], &n[lo], (vs->nsigw - lo) * sizeof(*n));
     n[lo].id = id;
     n[lo].name = nm;
+    n[lo].since = now_ms();
     vs->nsigw++;
     io->status_dirty = true;
     return 0;
@@ -3383,10 +3525,11 @@ static int st_man_flush(ctx_t *x) {
     return send_enc(x);
 }
 
-static int st_man_add(ctx_t *x, int64_t id, const char *canon, uint8_t kind, bool stamped, uint64_t gen, uint64_t at, bool has_serial, uint32_t serial) {
+static int st_man_add(ctx_t *x, int64_t id, const char *canon, uint8_t kind, bool stamped, uint64_t gen, uint64_t at, bool has_serial, uint32_t serial, uint8_t eflags) {
     if (st_man_open(x) != 0) return -1;
+    const uint8_t fl = (uint8_t)((stamped ? KDB_EF_STAMPED : 0) | eflags);          /* (eflags: KDB_EF_HOLD) */
     if (kdb_enc_nest_begin(&x->enc, 4) != 0 || kdb_enc_i64(&x->enc, 1, id) != 0 || kdb_enc_name(&x->enc, 2, canon) != 0 || kdb_enc_u8(&x->enc, 3, kind) != 0 ||
-        kdb_enc_u64(&x->enc, 4, gen) != 0 || kdb_enc_u64(&x->enc, 5, at) != 0 || (stamped && kdb_enc_u8(&x->enc, 6, KDB_EF_STAMPED) != 0) ||
+        kdb_enc_u64(&x->enc, 4, gen) != 0 || kdb_enc_u64(&x->enc, 5, at) != 0 || (fl && kdb_enc_u8(&x->enc, 6, fl) != 0) ||
         (has_serial && kdb_enc_u32(&x->enc, 7, serial) != 0) || kdb_enc_nest_end(&x->enc) != 0)
         return -1;
     x->st.entries++;
@@ -3498,7 +3641,9 @@ static int st_man_cb(void *ud, const db_manifest_row_t *r) {
         st_skip_note(x, r->name, "not a valid domain name");
         return 0;
     }
-    if (st_man_add(x, r->id, canon, zone_sec_kind(r->type), r->has_state, r->stamp_gen, r->stamp_time, false, 0) != 0) {
+    const bool held = idset_has(x->st.w, r->id);              /* (0.7 signer-wait (d): the first pass after a start holds the zones that wait for the signer) */
+    if ((held && sigw_add(x->io, &x->io->vst[x->vslot], r->id, r->name) != 0) ||
+        st_man_add(x, r->id, canon, zone_sec_kind(r->type), r->has_state, r->stamp_gen, r->stamp_time, false, 0, held ? KDB_EF_HOLD : 0) != 0) {
         x->st.fail = true;
         return 1;
     }
@@ -3701,7 +3846,7 @@ static int st_sigw_release(ctx_t *x, vstate_t *vs, bool all) {
         return -2;
     }
     for (size_t i = 0; i < n && rc == 0; i++)
-        if (all || !yes[i]) rc = st_entry_for(x, ids[i], false, false);
+        if ((all || !yes[i]) && !idset_has(x->st.w, ids[i])) rc = st_entry_for(x, ids[i], false, false);      /* (0.7: one that still waits after a start stays: st_drain()) */
     free(ids);
     free(yes);
     return rc;
@@ -3742,6 +3887,23 @@ static int st_drain(ctx_t *x, const db_schema_info_t *si, uint64_t *cursor, bool
             goto out;
         }
         if (rc != 0) {
+            status = EXIT_ERROR;
+            if (!x->io_error) {
+                lg(LOG_ERR, "out of memory");
+                x->oom = true;
+            }
+            goto out;
+        }
+    }
+    /* 0.7 signer-wait (d): the first load after a start says again which zones wait for the signer (x->st.w, the signer's state): an upsert with KDB_EF_HOLD each, so that the Backend keeps the
+     * signed version it has (it carried the holds of before the start until this batch ends) */
+    for (size_t i = 0; x->st.w && i < x->st.w->n; i++) {
+        const int rc = st_entry_for(x, x->st.w->v[i], true, false);
+        if (rc == -2) {
+            status = db_err(x, x->st.dberr, "reading the zone");
+            goto out;
+        }
+        if (rc != 0 || x->io_error) {
             status = EXIT_ERROR;
             if (!x->io_error) {
                 lg(LOG_ERR, "out of memory");
@@ -3791,6 +3953,8 @@ static int st_drain(ctx_t *x, const db_schema_info_t *si, uint64_t *cursor, bool
             for (size_t i = 0; i < it.n; i++)
                 if (it.v[i].op == KDB_CH_UPSERT) held[i] = yes[k++];
         }
+        for (size_t i = 0; x->st.w && i < it.n; i++)                 /* (0.7: the first load after a start: the zones that wait for the signer) */
+            if (it.v[i].op == KDB_CH_UPSERT && idset_has(x->st.w, it.v[i].id)) held[i] = true;
         for (size_t i = 0; i < it.n;) {
             int rc2 = 0;
             if (it.v[i].op == KDB_CH_DELETE) {
@@ -3877,6 +4041,7 @@ static int store_view(ctx_t *x, const db_source_t *src, const lview_t *v) {
     int rc = conn_for(x, src, &reused, &fdev, &fino);
     if (rc != 0) return rc;
     int status = EXIT_OK;
+    idset_t wset = { 0 };
     db_schema_info_t si;
     memset(&si, 0, sizeof(si));
     if ((rc = x->drv->check_schema(x->conn, &si)) != 0) {
@@ -3888,6 +4053,20 @@ static int store_view(ctx_t *x, const db_source_t *src, const lview_t *v) {
         goto out;
     }
     st_ident(src, x->st.ident, &x->st.ident_len);
+    if (x->reconcile && !x->store_full) {                  /* 0.7 signer-wait (d): the first load after a start holds the zones that wait for the signer (a `reload -force` reads every zone as it is) */
+        rc = signer_wait_set(x, true, &wset);
+        if (rc == SIGW_OOM) {
+            lg(LOG_ERR, "out of memory");
+            x->oom = true;
+            status = EXIT_ERROR;
+            goto out;
+        }
+        if (rc != 0) {
+            status = db_err(x, rc, "reading the signer's state (karidns_signer_state)");
+            goto out;
+        }
+        x->st.w = wset.n ? &wset : NULL;
+    }
     if (!vs->st_init) {                                    /* the first load of this process: the cursor the Backend kept (CONFIG) */
         vs->st_init = true;
         if (v->has_cursor && !vs->seq_valid) {
@@ -3967,6 +4146,8 @@ static int store_view(ctx_t *x, const db_source_t *src, const lview_t *v) {
         }
     }
 out:
+    x->st.w = NULL;
+    free(wset.v);
     if (x->conn) x->drv->close(x->conn);
     x->conn = NULL;
     return status;
@@ -4045,7 +4226,7 @@ static int st_emit_listed(ctx_t *x, const db_schema_info_t *si, const char *only
         const char *tr = zone_type_reason(z->type);
         if (tr || !z->canon) {
             st_skip_note(x, z->name ? z->name : "?", tr ? "type" : "not a valid domain name");
-        } else if (st_man_add(x, z->id, z->canon, zone_sec_kind(z->type), false, 0, 0, z->has_serial, z->serial) != 0) {
+        } else if (st_man_add(x, z->id, z->canon, zone_sec_kind(z->type), false, 0, 0, z->has_serial, z->serial, 0) != 0) {
             lg(LOG_ERR, "out of memory");
             x->oom = true;
             return EXIT_ERROR;
@@ -4368,8 +4549,13 @@ static int run_view_once(ctx_t *x, const db_source_t *src, const char *only_zone
         goto out_snap;
     }
     if (x->io && !x->fetch) {
-        if (plan_diff(x, &si, only_zone, &gone, &ngone, &have_seq, &new_seq) != 0) {
-            lg(LOG_ERR, "out of memory");
+        const int pr = plan_diff(x, &si, only_zone, &gone, &ngone, &have_seq, &new_seq);
+        if (pr == -2) {                                      /* (0.7 signer-wait: the signer's state could not be read; the zones are not sent without knowing) */
+            status = db_err(x, x->st.dberr, "reading the signer's state (karidns_signer_state)");
+            goto out_snap;
+        }
+        if (pr != 0) {
+            if (!x->io_error) lg(LOG_ERR, "out of memory");
             status = EXIT_ERROR;
             goto out_snap;
         }
@@ -5438,6 +5624,7 @@ static int do_load(ctx_t *x, struct lio *io, uint8_t kind, int only_view, const 
     x->req_id = req_id;
     x->force = force;
     x->reconcile = reconcile;
+    x->sig_set = reconcile && only_view < 0 && !only_zone && x->io;      /* (0.7 signer-wait: this load says which zones wait; not when a view failed, below) */
     x->bulk_threshold = c->bulk_threshold;
     x->nthreads = c->loader_threads >= 1 && c->loader_threads <= 16 ? c->loader_threads : 1;
     x->dir_only = c->dir_only;
@@ -5499,6 +5686,7 @@ static int do_load(ctx_t *x, struct lio *io, uint8_t kind, int only_view, const 
     }
     ctx_view_reset(x);
     x->map_view = NULL;
+    if (errs) x->sig_set = false;
     if (x->io_error) { free(vsave); return -1; }
     if (only_zone && !seen_view && send_request_failure(x, (uint16_t)only_view, only_zone, "the view takes no zones from the database") != 0) {
         free(vsave);
@@ -6850,6 +7038,7 @@ static int run_stream(int fd) {
         uint64_t load_req = 0;
         bool lforce = false;
         fev_drain(io, true);                   /* the zones the fetch thread served since the last turn (at most a second ago: the poll below times out) */
+        sigw_stuck_check(io);                  /* 0.7 signer-wait: a signer that keeps zones waiting is said */
         if (io->again) {                       /* D1a: zones the Backend wants whole (SEND_BODY) */
             io->again = false;
             need_load = true;
@@ -7162,6 +7351,11 @@ int main(int argc, char **argv) {
     if (aging_env) {
         unsigned long av;
         if (parse_uint(aging_env, 1, 3600000, &av)) g_fq_aging_ms = (int64_t)av;
+    }
+    const char *stuck_env = getenv("KARIDNS_SIGNER_STUCK_MS");                /* (a test switch, see SIGW_STUCK_MS) */
+    if (stuck_env) {
+        unsigned long sv;
+        if (parse_uint(stuck_env, 1, 86400000, &sv)) g_sigw_stuck_ms = (int64_t)sv;
     }
     int ch;
     while ((ch = getopt_long(argc, argv, "hs:", longopts, NULL)) != -1) {

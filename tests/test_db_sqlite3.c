@@ -3440,6 +3440,139 @@ static void test_signer_wait(void) {
     free(io);
 }
 
+/* ---------------------------------------------------------------- 0.7 signer-wait (d): the zones that wait for the signer at a start, from its state */
+static int sws_fail(db_conn_t *c, db_key_cb cb, void *ud) {
+    (void)c; (void)cb; (void)ud;
+    return -1;
+}
+
+static void test_signer_waiting_set(void) {
+    printf("signer-wait (0.7 (d)): the zones that wait for the signer at a start (karidns_signer_state), ZONE_HOLD, the warning of a signer that keeps zones waiting\n");
+    signal(SIGPIPE, SIG_IGN);
+    char path[600], ppath[600], err[DB_ERRLEN];
+    sqlite3 *db = make_db("sws.db", path, sizeof(path));
+    char *ext = slurp(g_ext_path);
+    CHECK(db != NULL && ext != NULL);
+    if (!db || !ext) {
+        free(ext);
+        return;
+    }
+    raw_exec(db, ext);
+    free(ext);
+    for (int i = 1; i <= 7; i++) {
+        char nm[32];
+        snprintf(nm, sizeof(nm), "w%d.test", i);
+        add_simple_zone(db, i, i * 10, nm);                              /* (serial 7; the triggers stamp karidns_zone_state.changed_at now) */
+    }
+    sqlf(db, "INSERT INTO domainmetadata (domain_id, kind, content) VALUES (1, 'X-KARIDNS-SIGNER', '1'), (2, 'x-karidns-signer', '1'), (3, 'X-KARIDNS-SIGNER', '1'), "
+             "(4, 'X-KARIDNS-SIGNER', '1'), (5, 'X-KARIDNS-SIGNER', '0'), (7, 'X-KARIDNS-SIGNER', '1')");
+    /* 1 signed and not changed since; 2 another serial; 3 failed before it ever signed; 4 changed after the signature; 5 not the signer's (0); 6 no metadata; 7 no state row */
+    sqlf(db, "INSERT INTO karidns_signer_state (domain_id, signed_at, signed_serial) VALUES (1, 9999999999, 7), (2, 9999999999, 6), (3, NULL, NULL), (4, 0, 7), (5, 0, 6), (6, 0, 6)");
+    sqlite3_close(db);
+    sqlite3 *pdb = make_db("sws_plain.db", ppath, sizeof(ppath));                 /* (a plain PowerDNS schema: no state table) */
+    if (pdb) sqlite3_close(pdb);
+    db_conn_t *c = open_driver(path, 0, err, sizeof(err), NULL);
+    CHECK(c != NULL && db_driver_sqlite3.check_schema(c, NULL) == 0);
+    if (!c) return;
+    int sv[2];
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    struct lio *io = calloc(1, sizeof(*io));
+    if (!io) return;
+    io->fd = sv[0];
+    io->cfg.signer_wait = true;
+    int slot = vslot_get(io, "default");
+    ctx_t x;
+    memset(&x, 0, sizeof(x));
+    x.io = io;
+    x.drv = &db_driver_sqlite3;
+    x.conn = c;
+    x.vslot = (uint16_t)slot;
+    x.batch_id = 1;
+    kdb_enc_init(&x.enc);
+    x.batch_kind = KDB_BATCH_STARTUP;
+    idset_t w;
+    CHECK(signer_wait_set(&x, true, &w) == 0);
+    CHECK_MSG(w.n == 3 && w.v[0] == 2 && w.v[1] == 3 && w.v[2] == 4, "%zu: %lld %lld %lld", w.n, w.n > 0 ? (long long)w.v[0] : -1LL, w.n > 1 ? (long long)w.v[1] : -1LL,
+              w.n > 2 ? (long long)w.v[2] : -1LL);
+    CHECK(idset_has(&w, 3) && !idset_has(&w, 1) && !idset_has(&w, 7) && !idset_has(NULL, 3));
+    free(w.v);
+    CHECK(db_driver_sqlite3.begin_snapshot(c) == 0);                  /* (inside the caller's snapshot, as plan_diff() asks) */
+    CHECK(signer_wait_set(&x, false, &w) == 0 && w.n == 3);
+    free(w.v);
+    CHECK(db_driver_sqlite3.end_snapshot(c) == 0);
+    io->cfg.signer_wait = false;                                       /* signer-wait no: nothing waits */
+    CHECK(signer_wait_set(&x, true, &w) == 0 && w.n == 0 && w.v == NULL);
+    io->cfg.signer_wait = true;
+    db_driver_t d2 = db_driver_sqlite3;
+    d2.signer_waiting = sws_fail;                                      /* a read that fails: the error */
+    x.drv = &d2;
+    CHECK(signer_wait_set(&x, true, &w) == -1 && w.n == 0 && w.v == NULL);
+    d2.signer_waiting = NULL;                                          /* a driver without it: nothing waits */
+    CHECK(signer_wait_set(&x, true, &w) == 0 && w.n == 0);
+    x.drv = &db_driver_sqlite3;
+    db_driver_sqlite3.close(c);
+    c = open_driver(ppath, 0, err, sizeof(err), NULL);                 /* no karidns_signer_state: nothing waits */
+    CHECK(c != NULL && db_driver_sqlite3.check_schema(c, NULL) == 0);
+    x.conn = c;
+    CHECK(c && signer_wait_set(&x, true, &w) == 0 && w.n == 0);
+    if (c) db_driver_sqlite3.close(c);
+    x.conn = NULL;
+
+    /* ZONE_HOLD on the stream (the batch is opened first); a name that cannot be made canonical is nobody's */
+    CHECK(send_zone_hold(&x, 2, "w2.test", KDB_HOLD_KEEP) == 0 && x.batch_open);
+    CHECK(send_zone_hold(&x, 2, NULL, KDB_HOLD_RELEASE) == 0);
+    uint8_t buf[4096];
+    ssize_t got = recv(sv[1], buf, sizeof(buf), MSG_DONTWAIT);
+    CHECK(got > 0);
+    if (got > 0) {
+        kdb_framer_t fr;
+        static uint8_t body[KDB_MAX_BODY];
+        kdb_framer_init(&fr, KDB_FROM_LOADER, body, sizeof(body));
+        kdb_framer_feed(&fr, buf, (size_t)got);
+        kdb_frame_t f;
+        kdb_msg_t m;
+        char why[KDB_REASON_LEN];
+        bool seen = false;
+        while (kdb_framer_next(&fr, &f) == KDB_OK)
+            if (f.type == KDB_T_ZONE_HOLD && kdb_decode(&f, KDB_VIEWS_ANY, &m, why, sizeof(why)) == KDB_OK)
+                seen = m.u.zone_hold.source_id == 2 && m.u.zone_hold.state == KDB_HOLD_KEEP && strcmp(m.u.zone_hold.name, "w2.test.") == 0;
+        CHECK(seen);
+    }
+    /* sigw_update() tells the Backend: new entries KEEP, dropped ones RELEASE (only without the store protocol) */
+    zinfo_t zs[2];
+    memset(zs, 0, sizeof(zs));
+    zs[0].id = 2; zs[0].name = (char *)"w2.test";
+    zs[1].id = 3; zs[1].name = (char *)"w3.test";
+    x.zones = zs;
+    x.nz = 2;
+    vstate_t *vs = &io->vst[slot];
+    int64_t skip[2] = { 0, 1 };
+    CHECK(sigw_update(io, vs, &x, false, skip, 2) == 0 && vs->nsigw == 2);
+    zs[0].want = true;
+    CHECK(sigw_update(io, vs, &x, false, NULL, 0) == 0 && vs->nsigw == 1);
+    got = recv(sv[1], buf, sizeof(buf), MSG_DONTWAIT);
+    CHECK(got > 0);
+    /* a zone that waits longer than the time of the warning: said once a period per view */
+    vs->sigw[0].since = now_ms() - 2 * g_sigw_stuck_ms;
+    vs->sigw_warned = 0;
+    sigw_stuck_check(io);
+    const int64_t w1 = vs->sigw_warned;
+    CHECK(w1 != 0);
+    sigw_stuck_check(io);
+    CHECK(vs->sigw_warned == w1);
+    sigw_free(vs);
+    vs->sigw_warned = 0;
+    sigw_stuck_check(io);                                              /* (nothing waits) */
+    CHECK(vs->sigw_warned == 0);
+    kdb_enc_free(&x.enc);
+    close(sv[0]);
+    close(sv[1]);
+    for (size_t i = 0; i < io->nvn; i++) free(io->vnames[i]);
+    free(io->vnames);
+    free(io->vst);
+    free(io);
+}
+
 /* ---------------------------------------------------------------- signer-wait: the rows a one-zone reload has read (vstate_t.cov) */
 
 static bool cv_is(const vstate_t *vs, const char *expect) {            /* "id:m,id:m" in id order */
@@ -5028,6 +5161,7 @@ int main(int argc, char **argv) {
     test_writes();
     test_paged();
     test_store_loader();
+    test_signer_waiting_set();
     test_lookup();
     test_scan_in();
     test_find_zones_classes();

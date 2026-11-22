@@ -280,6 +280,7 @@ typedef struct {
   uint32_t loader_feat;        /* HELLO features of this loader */
   int b_store_err;             /* 0.7: the errno for which the store could not record the batch (BATCH_RESULT tag 7); 0 = recorded */
   bool store_proto;
+  bool sig_carry;              /* 0.7 signer-wait (d): the holds of before this loader's HELLO are kept until a batch of it says which zones wait (BATCH_END KDB_BEF_SIGNER_SET) */
   /* 0.7 M2: the pages of a MANIFEST pass go to the reconcile thread (dns_db_recon.h).  A frame of the first stream that has to wait for it (a free slot of its ring, or everything before it applied) is kept here and the
    * stream is not read meanwhile (the read event of its descriptor is off): the pointers of the frame are into rbuf / body, which nothing touches while it waits */
   bool held_valid, hold_room, read_off;
@@ -1374,6 +1375,7 @@ static void job_execute(ing_job_t *j) {
     return;
   }
   if (gd == DBC_OK && j->fetch_id && dbdir()) db_store_signer_commit(j->view_name, j->zone);      /* (signer-wait: a held version that nothing signed here kept is served as it is, and said so) */
+  if (j->fetch_id && !dbdir() && dbreg_signer_unsigned_take(j->view_name, j->zone)) db_signer_unsigned_note(j->view_name, j->zone);      /* (0.7, the same without the store: ZONE_HOLD) */
   const int cr = dbreg_commit(j->view_name, j->zone, entry, created, j->source_id, serial_now, j->digest, &shadowed);
   db_store_commit_end();
   if (cr != 0) {
@@ -2027,8 +2029,12 @@ static void on_hello(ing_t *g, const kdb_msg_t *m) {
   atomic_store_explicit(&g_lookup_hold, g->store_proto && (h->features & KDB_FEAT_LOOKUP) != 0, memory_order_release);       /* (a loader that does not look up ends the hold: the queries are refused as before) */
   g->debug_sent = -1;                                  /* 0.7 M2: a new loader learns the level in force after its CONFIG */
   send_debug(g);
-  if (g->store_proto) {                                /* 0.7 WP7b: the records the store holds that have no body (an interrupted fill, a changed zone, a secondary zone: they are heap zones) are fetched once now; a zone held for the signer by the loader before this one is read as it is */
-    db_recon_held_reset();
+  /* 0.7 signer-wait (d): the versions held for the signer before this loader (or before the server started again: the store keeps the records) keep serving until its first batch has said which
+   * zones still wait, from the signer's state in the database (BATCH_END KDB_BEF_SIGNER_SET); the others are let go then */
+  g->sig_carry = true;
+  if (g->store_proto) db_recon_held_carry();
+  else (void)dbreg_signer_carry(false);
+  if (g->store_proto) {                                /* 0.7 WP7b: the records the store holds that have no body (an interrupted fill, a changed zone, a secondary zone: they are heap zones) are fetched once now (not one held for the signer, above) */
     scan_set(g, true);
     g->bg_zid = 0;
     g->bg_again = false;
@@ -2500,6 +2506,42 @@ static void batch_finish(ing_t *g, uint64_t batch_id) {
   send_enc(g);
 }
 
+static void bulk_kick(ing_t *g);
+
+/* 0.7 signer-wait (d): the loader's batch said which zones still wait for the signer (BATCH_END KDB_BEF_SIGNER_SET, its first after a start): the holds of before its HELLO that it said again
+ * keep their signed version serving, the others are let go (the store's scan asks for their bodies; without the store the version in memory may leave it, and the next fetch reads the zone) */
+static void signer_carry_end(ing_t *g) {
+  g->sig_carry = false;
+  if (g->store_proto) {
+    const size_t kept = db_recon_held_carry_end();
+    bulk_kick(g);
+    if (kept)
+      syslog(LOG_WARNING, "[DB] signer-wait: %zu zone(s) still wait for karidns-signer after the start (the database has a version the signer has not signed); their signed version keeps "
+                          "serving until the signer has signed them (`karictl dbstatus` lists them)", kept);
+  } else {
+    const size_t gone = dbreg_signer_carry(true);
+    if (gone) syslog(LOG_INFO, "[DB] signer-wait: %zu zone(s) held for the signer before the loader started again do not wait any more", gone);
+  }
+}
+
+/* 0.7 signer-wait without the store protocol (ZONE_HOLD): the loader holds a zone back for the signer, lets it go, or sends it as it is although it waits.  The loader is not trusted: the zone must
+ * be the one of that id in the registry (dbreg_signer_mark()), and what it can do is keep a version that is served now (as a pinned zone) or make the Backend say something, rate-limited. */
+static void on_zone_hold(ing_t *g, const kdb_msg_t *m) {
+  const kdb_zone_hold_t *h = &m->u.zone_hold;
+  if (g->store_proto) {
+    protocol_error(g, "ZONE_HOLD with the store protocol on");
+    return;
+  }
+  const char *vname = view_name_at(g, h->view, true);
+  if (!vname[0]) return;
+  if (h->state == KDB_HOLD_UNSIGNED) {                     /* (a zone the Backend has no version of: it is read as it is) */
+    db_signer_unsigned_note(vname, h->name);
+    return;
+  }
+  const int r = dbreg_signer_mark(vname, h->name, h->source_id, h->state == KDB_HOLD_KEEP);
+  if (r & (ZDIR_SIG_MEM | ZDIR_SIG_UNSIGNED)) db_signer_count((r & ZDIR_SIG_MEM) != 0, (r & ZDIR_SIG_OLD) != 0);
+}
+
 static void on_batch_end(ing_t *g, const kdb_msg_t *m) {
   const kdb_batch_end_t *b = &m->u.batch_end;
   sync_all(g);
@@ -2534,6 +2576,7 @@ static void on_batch_end(ing_t *g, const kdb_msg_t *m) {
       syslog(LOG_INFO, "[DB] initial load complete: %zu zone(s) served from the database", total);
     }
   }
+  if ((b->flags & KDB_BEF_SIGNER_SET) && g->sig_carry) signer_carry_end(g);
   if (g->batch_kind == KDB_BATCH_STARTUP || g->batch_kind == KDB_BATCH_FULL) {
     atomic_store_explicit(&g_ma_loaded, true, memory_order_relaxed);
     atomic_store_explicit(&g_ma_event, true, memory_order_relaxed);        /* 0.7 P-F: the cache thread says what the database needs */
@@ -2802,6 +2845,9 @@ static void handle_msg(ing_t *g, const kdb_msg_t *m) {
     break;
   case KDB_T_CHANGES:
     on_changes(g, m);
+    break;
+  case KDB_T_ZONE_HOLD:
+    on_zone_hold(g, m);
     break;
   case KDB_T_PROFILE:
     on_profile(g, m);
@@ -5760,7 +5806,10 @@ static bool status_cb(void *ud, const char *view, const dbreg_zone_t *z) {
   st_append(c, "\n");
   {
     dbdir_rec_t rr;                                      /* 0.7 signer-wait: what the store's record says (the registry lock is held: a read that never sleeps) */
-    if (dbdir() && dbdir()->rec_get_nb(view, z->name, &rr) == 1) signer_status(c, rr.flags, z->sig_hold != 0);
+    if (dbdir() && dbdir()->rec_get_nb(view, z->name, &rr) == 1) signer_status(c, rr.flags, (z->sig_hold & ZDIR_SIG_MEM) != 0);
+    else if (!dbdir() && (z->sig_hold & ZDIR_SIG_MEM)) signer_status(c, STORE_F_SIGNER_HELD, true);      /* (0.7, without the store: ZONE_HOLD) */
+    else if (!dbdir() && (z->sig_hold & ZDIR_SIG_UNSIGNED))
+      st_append(c, "  signer-wait: the database has another version, which waits for the signer; nothing of the zone is in memory, so the next query reads that version as it is (and the log says so)\n");
   }
   /* a line of its own: the zone line above keeps its form (it ends with the status) */
   if (zdir_entry(z) && atomic_load_explicit(&zone_xr(zdir_entry(z))->prev_bytes, memory_order_relaxed))
@@ -5980,10 +6029,6 @@ size_t db_ingest_status(const char *zone, const char *view, char *out, size_t ca
                 (unsigned long long)rs.skipped, (unsigned long long)rs.unlisted, (unsigned long long)rs.total, (unsigned long long)rs.swept, (unsigned long long)rs.known_now,
                 (unsigned long long)rs.fetched, (unsigned long long)rs.fetch_failed, (unsigned long long)rs.in_flight, (unsigned long long)rs.wanted,
                 (unsigned long long)rs.change_upserts, (unsigned long long)rs.change_deletes, (unsigned long long)rs.cursors, (unsigned long long)rs.passes);
-      if (rs.signer_held || rs.signer_unsigned)                 /* 0.7 signer-wait */
-        st_append(&c, "signer-wait: since the start %llu version(s) waited for the signer while a signed one kept serving (%llu kept by the version in memory alone), %llu version(s) served that the "
-                      "signer has not signed yet (nothing signed was here to keep; `karictl dbstatus <zone>` and the log name them)\n",
-                  (unsigned long long)rs.signer_held, (unsigned long long)rs.signer_held_mem, (unsigned long long)rs.signer_unsigned);
       if (rs.nonstore)
         st_append(&c, "store: %llu zone(s) have a name the store cannot hold (the root zone): zones of the heap directory, read from the database at every start\n", (unsigned long long)rs.nonstore);
       if (rs.guard_views) {
@@ -5992,6 +6037,18 @@ size_t db_ingest_status(const char *zone, const char *view, char *out, size_t ca
         st_append(&c, "MASS-DELETE GUARD HELD: view %s: the pass of %s did not list %llu of the %llu zone(s) the Backend holds (more than 20 percent and more than 1000), so none was deleted and the cursor was not advanced; "
                       "if the database is right, `karictl reload -force` deletes them\n", rs.guard_view, tg, (unsigned long long)rs.guard_unlisted, (unsigned long long)rs.guard_total);
       }
+    }
+    {
+      db_recon_status_t rs;                              /* 0.7 signer-wait (with the store and without it) */
+      db_recon_status(&rs);
+      uint64_t pz = 0, pb = 0;
+      dbreg_signer_pinned(&pz, &pb);
+      if (rs.signer_held || rs.signer_unsigned || rs.signer_carried || pz)
+        st_append(&c, "signer-wait: since the start %llu version(s) waited for the signer while a signed one kept serving (%llu kept by the version in memory alone; %llu held across a start of the "
+                      "loader or the server), %llu version(s) served that the signer has not signed yet (nothing signed was here to keep; `karictl dbstatus <zone>` and the log name them); held in memory "
+                      "now: %llu zone(s), %llu bytes (counted against memory-limit)\n",
+                  (unsigned long long)rs.signer_held, (unsigned long long)rs.signer_held_mem, (unsigned long long)rs.signer_carried, (unsigned long long)rs.signer_unsigned,
+                  (unsigned long long)pz, (unsigned long long)pb);
     }
     st_append(&c, "alias: scans=%llu (the alias thread's scans of the zones for ALIAS records: they follow ALIAS zones coming, changing and going and the configuration, not every zone a fetch brings)\n",
               (unsigned long long)alias_scan_count());

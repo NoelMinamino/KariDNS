@@ -1000,10 +1000,14 @@ zone the signer keeps signed. The server and the loader know it in one place:
 with \fBdatabase { signer\-wait yes; }\fR (the default) the loader does not
 reload such a zone because of the change log or a moved serial, only on a reload
 request or in a full comparison, so a change that is not signed yet is not
-served (\fBkaridns(8)\fR, "The signer's zones"). \fBPowerDNS\fR on the same
-database reads it live and serves a change at once, signed or not: there the
-zone is only as safe as the order of the writes; keep PowerDNS and the signer
-apart, or let the signer be the only writer of a signed zone's DNSSEC records.
+served; at its start (0.7) it reads the signer's state
+(\fBkaridns_signer_state\fR, which it needs SELECT on: the \fBkaridns_*\fR grant
+of \fBdb/karidns_loader_role.pgsql.sql\fR) to tell which zones still wait, and
+holds them back in its first batch as well (\fBkaridns(8)\fR, "The signer's
+zones"). \fBPowerDNS\fR on the same database reads it live and serves a change
+at once, signed or not: there the zone is only as safe as the order of the
+writes; keep PowerDNS and the signer apart, or let the signer be the only writer
+of a signed zone's DNSSEC records.
 .SS What version 3 adds
 .TP 8
 PostgreSQL (\fBdb/karidns_ext.pgsql.sql\fR)

@@ -1058,6 +1058,29 @@ static int kl_row(db_conn_t *c, PGresult *r, int i, void *ud) {
     return l->cb(l->ud, cell_i64(r, i, 0)) != 0 ? DB_STOPPED : 0;
 }
 
+/* 0.7 signer-wait (dns_db_driver.h signer_waiting): the rules of the signer's catch-up scan (signer/lib/db_pg.js catchUp()); once at a start of the loader */
+static int pg_signer_waiting(db_conn_t *c, db_key_cb cb, void *ud) {
+    PGresult *r = NULL;
+    int ret = exec_rows(c, "SELECT to_regclass('karidns_signer_state') IS NOT NULL", 0, NULL, &r, "signer_waiting");
+    if (ret != 0) return ret;
+    const bool have = cell_true(r, 0, 0);
+    PQclear(r);
+    if (!have || !c->has_zone_state) {
+        set_err(c, "karidns_signer_state or karidns_zone_state does not exist in this database");
+        return DB_ERR_UNAVAILABLE;
+    }
+    kl_t l = { cb, ud };
+    return pg_scan(c, "signer_waiting",
+                   "SELECT s.domain_id FROM karidns_signer_state s "
+                   "WHERE EXISTS (SELECT 1 FROM domainmetadata m WHERE m.domain_id = s.domain_id AND upper(m.kind) = 'X-KARIDNS-SIGNER') "
+                   "AND (s.signed_serial IS NULL "
+                   "OR EXISTS (SELECT 1 FROM karidns_zone_state z WHERE z.domain_id = s.domain_id AND z.changed_at > extract(epoch FROM s.signed_at)) "
+                   "OR EXISTS (SELECT 1 FROM records r WHERE r.domain_id = s.domain_id AND r.type = 'SOA' "
+                   "AND CASE WHEN split_part(r.content, ' ', 3) ~ '^[0-9]+$' THEN split_part(r.content, ' ', 3)::bigint END <> s.signed_serial)) "
+                   "ORDER BY s.domain_id",
+                   0, NULL, kl_row, &l);
+}
+
 static int pg_zones_with_keys(db_conn_t *c, db_key_cb cb, void *ud) {
     kl_t l = { cb, ud };
     return pg_scan(c, "zones_with_keys", "SELECT DISTINCT domain_id FROM cryptokeys ORDER BY domain_id", 0, NULL, kl_row, &l);
@@ -2466,6 +2489,7 @@ const db_driver_t db_driver_postgresql = {
     .find_zones_in = pg_find_zones_in,          /* 0.7: the lookup of a name */
     .scan_records_in = pg_scan_records_in, .scan_metadata_in = pg_scan_metadata_in, .scan_ext_in = pg_scan_ext_in, .zones_with_keys_in = pg_zones_with_keys_in,      /* B13b */
     .scan_apex = pg_scan_apex,                  /* D1a step 6 */
+    .signer_waiting = pg_signer_waiting,        /* 0.7 signer-wait: the zones that wait for the signer at a start */
     .count_domains = pg_count_domains, .manifest_page = pg_manifest_page, .current_cursor = pg_current_cursor, .changes_page = pg_changes_page,      /* 0.7 store, WP3 */
     /* M2, the ZoneImporter: write access (open_write connections only) */
     .open_write = pg_open_write, .w_begin = pg_w_begin, .w_commit = pg_w_commit, .w_rollback = pg_w_rollback,

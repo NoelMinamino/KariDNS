@@ -4195,45 +4195,78 @@ the xmin): the rows of that zone up to that position are in what the request
 read, so the poll of the auto reload that reaches them later does not put the
 zone on the list again; a change made after the request does. What is \fBnot\fR
 held back: a zone the Backend does not have yet (a new zone is loaded whole,
-also with the metadata), a full comparison (a loader that starts, restarts,
-finds its place in the change log gone, or sees the database file replaced;
-\fBkarictl reload\fR of every zone; a \fBforce\fR request) and a zone the
-Backend refused. In those moments an unsigned change can be served; the signer
-catches up within seconds. \fBkarictl dbstatus\fR shows the zones that wait,
-under the view: \fBwaiting for the signer: 2 zone(s): example.test,
-example.net\fR (the first six names, then \fBand N more\fR); the line is absent
-when no zone waits, and a signer that stopped shows as a count that does not go
-down. PowerDNS on the same database reads the database live and serves a change
-at once: documented in \fBkaridns\-dbloader(8)\fR. The setting is not used by a
-database without the metadata. The waiting set is per view (a zone that waits in
-one view does not hold the same name back in another), and a waiting zone that
-loses the metadata is read as it is at the next batch. With the zone store
-(\fBstore\fR, the default of a production server) the loader sends the change
-with a hold flag and the Backend keeps a signed version serving, whatever state
-the zone's record is in: the image in the store, or, when the record has none
-(the scrub or the cleaner found the image damaged while the zone is in memory in
-\fBstore\-mode copy\fR, a degraded store kept only the record), the version in
-memory, which is then held there (\fBmemory\-limit\fR does not take it out, and
-a body of the held version does not replace it). A newer version that was asked
-for and has not come yet, and a version the Backend refused, are held the same
-way. The record remembers the newer version (\fBkarictl dbstatus <zone>\fR: "the
-database has another version, which waits for the signer"; with the version in
-memory: "the version in memory (held there) keeps serving"). When nothing signed
-is here to keep (a zone that is new to the Backend; a held version in memory
-that had to leave it because its image was damaged in MAP mode, which the next
-query then reads) the version is served as it is, availability first, and that
-is said: a WARNING in the log once for the zone (at most 8 lines a minute; the
-next line says how many zones it did not name), \fBkarictl dbstatus <zone>\fR:
-"serving a version the signer has not signed yet" until the signer's version
-comes, and the counters \fBstore.recon.signer.unsigned\fR, \fB.held\fR,
-\fB.held_in_memory\fR of \fBkarictl store\fR. Still read as they are, without
-that warning: a held version at a start of the server or of the loader (it is
-read in the background, as a full comparison reads every zone), and, without the
-store (\fBstore none\fR), a zone of the signer that \fBmemory\-limit\fR took out
-of memory and a query reads again from the database. A plain \fBkaridns\-zone
-import\fR into such a zone replaces the data and keeps its DNSSEC records and
-the signer's metadata (\fBkaridns\-zone(8)\fR); the loader then holds the new
-data back until the signer has signed it.
+also with the metadata), a full comparison (a loader that finds its place in the
+change log gone, or sees the database file replaced; \fBkarictl reload\fR of
+every zone; a \fBforce\fR request; since 0.7 a start of the server or of the
+loader is not one, see "Across a restart" below) and a zone the Backend
+refused. In those moments an unsigned change can be served; the signer catches
+up within seconds. \fBkarictl dbstatus\fR shows the zones that wait, under the
+view: \fBwaiting for the signer: 2 zone(s): example.test, example.net\fR (the
+first six names, then \fBand N more\fR); the line is absent when no zone waits,
+and a signer that stopped shows as a count that does not go down. PowerDNS on
+the same database reads the database live and serves a change at once:
+documented in \fBkaridns\-dbloader(8)\fR. The setting is not used by a database
+without the metadata. The waiting set is per view (a zone that waits in one view
+does not hold the same name back in another), and a waiting zone that loses the
+metadata is read as it is at the next batch. With the zone store (\fBstore\fR,
+the default of a production server) the loader sends the change with a hold flag
+and the Backend keeps a signed version serving, whatever state the zone's record
+is in: the image in the store, or, when the record has none (the scrub or the
+cleaner found the image damaged while the zone is in memory in \fBstore\-mode
+copy\fR, a degraded store kept only the record), the version in memory, which is
+then held there (\fBmemory\-limit\fR does not take it out, and a body of the
+held version does not replace it). A newer version that was asked for and has
+not come yet, and a version the Backend refused, are held the same way. The
+record remembers the newer version (\fBkarictl dbstatus <zone>\fR: "the database
+has another version, which waits for the signer"; with the version in memory:
+"the version in memory (held there) keeps serving"). When nothing signed is here
+to keep (a zone that is new to the Backend; a held version in memory that had to
+leave it because its image was damaged in MAP mode, which the next query then
+reads) the version is served as it is, availability first, and that is said: a
+WARNING in the log once for the zone (at most 8 lines a minute; the next line
+says how many zones it did not name), \fBkarictl dbstatus <zone>\fR: "serving a
+version the signer has not signed yet" until the signer's version comes, and the
+counters \fBstore.recon.signer.unsigned\fR, \fB.held\fR, \fB.held_in_memory\fR
+of \fBkarictl store\fR. \fBAcross a restart\fR (0.7; before, the start of a
+loader released every hold and the version was read as it is): the start of the
+server or of the loader does not let go of what waits. The loader reads which
+zones of the signer wait from the signer's state in the database: a zone with
+the metadata and a row in \fBkaridns_signer_state\fR whose \fBsigned_serial\fR
+is empty, is not the SOA serial of the zone now, or whose \fBsigned_at\fR is
+before the zone's last change (\fBkaridns_zone_state.changed_at\fR), the rules
+of the signer's own catch-up scan. A zone without a state row is not held (the
+signer never signed it, or does not run). Its first batch holds those zones back
+as an auto batch does; the Backend keeps the signed version it has (the image in
+the store, or, without the store, the version in memory after a restart of the
+loader alone) until the signer has signed the zone and asked for the reload, and
+lets go of the holds of before the start that the loader did not name again (the
+signer signed the zone or lost its metadata while the server was down: the
+version is read as it is). The loader logs \fBN zone(s) of karidns\-signer have
+a version in the database that the signer has not signed yet\fR, the server \fBN
+zone(s) still wait for karidns\-signer after the start\fR, \fBkarictl
+dbstatus\fR names them under \fBwaiting for the signer\fR, and
+\fBstore.recon.signer.carried\fR counts them. Without the store a restart of the
+server has no signed version of the zone: it is served as it is and said as
+above (the WARNING, the counter, the \fBsigner\-wait:\fR line of \fBkarictl
+dbstatus\fR). A zone that waits longer than an hour (a stopped or failing
+signer: nothing is served unsigned, also across restarts) gets a WARNING every
+hour, \fBN zone(s) have waited for karidns\-signer for more than 3600 s (the
+longest: ...)\fR; \fBsigner\-wait no;\fR serves the changes unsigned. \fBWith
+\fBmemory\-limit\fB and without the store\fR (0.7) the loader tells the Backend
+which zones wait (the stream message \fBZONE_HOLD\fR): the version in memory is
+kept there (as a pinned zone; the other zones are taken out first, and
+\fBkarictl dbstatus\fR says \fBheld in memory now: N zone(s), B bytes\fR on the
+\fBsigner\-wait:\fR line and "the version in memory (held there) keeps serving"
+for the zone). The held bytes count against the limit but do not keep a query
+from fetching another zone: availability first, so the zones in memory may
+exceed \fBmemory\-limit\fR by what is held, and a WARNING says so once a minute
+(\fBsigner\-wait: the database zones (...) are above memory\-limit (...) and N
+zone(s) of karidns\-signer (...) are held in memory\fR). A zone whose data was
+out of memory when its change came has no signed version here: the next query
+reads it as it is, and that is said (the WARNING, the counter). A plain
+\fBkaridns\-zone import\fR into such a zone replaces the data and keeps its
+DNSSEC records and the signer's metadata (\fBkaridns\-zone(8)\fR); the loader
+then holds the new data back until the signer has signed it.
 .IP \(bu 2
 PostgreSQL does not poll: see "PostgreSQL" below (\fBLISTEN\fR);
 \fBpoll\-interval\fR is then only the interval of a liveness check and of the

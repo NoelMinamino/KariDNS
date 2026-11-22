@@ -551,12 +551,25 @@ does not go down means the signer is not working. \fBsigner\-wait no;\fR serves
 changes at once, unsigned.
 .IP \(bu 2
 \fBNot held back:\fR a zone the server does not have yet, a full comparison
-(start, restart, \fBkarictl reload\fR of every zone, a replaced database file)
-and a refused zone. With the zone store a version held across a restart of the
-server or the loader is read in the background after the start, and without the
-store (\fBstore none\fR) a zone that \fBmemory\-limit\fR took out of memory is
-read from the database as it is when a query needs it. In those moments an
-unsigned change can be served; the signer catches up within seconds.
+(\fBkarictl reload\fR of every zone, a replaced database file) and a refused
+zone. In those moments an unsigned change can be served; the signer catches up
+within seconds.
+.IP \(bu 2
+\fBAcross restarts\fR (0.7, a change of behaviour: before, the start of the
+server or the loader released every hold): the loader reads from this program's
+state (\fBkaridns_signer_state\fR: \fBsigned_serial\fR, \fBsigned_at\fR) which
+zones wait, and the server keeps their signed version (the image in the zone
+store; without the store the version in memory when only the loader started
+again) until the signer has signed them. A zone whose metadata was removed
+meanwhile, or that the signer signed while the server was down, is read as it
+is. Without the store a restart of the server has no signed version: the zone is
+served as it is and that is said. A zone that waits more than an hour gets a
+WARNING every hour.
+.IP \(bu 2
+\fB\fBmemory\-limit\fB without the store\fR (0.7): a zone that waits is kept in
+memory (as a pinned zone, counted against the limit, with a WARNING when the
+held zones keep the server above it); one whose data was already out of memory
+is read as it is when a query needs it, and that is said.
 .IP \(bu 2
 \fBWith the zone store\fR a change waits while any signed version is here: the
 image, or the version in memory when the store lost the image (a damaged image
