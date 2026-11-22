@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "dns_log.h"
+#include "dns_utils.h"
 #include <time.h>
 #include <unistd.h>
 #include <sys/socket.h>
@@ -386,12 +387,12 @@ static void child_exec(const db_sup_t *s, int stream_fd, int fetch_fd, int log_w
   int xfd = exec_file_open_checked(s->path, geteuid(), "database loader", "the user running karidns", err, sizeof(err));
   if (xfd < 0) {
     int n = snprintf(msg, sizeof(msg), "%s[Manager] %s\n", pri, err);
-    if (n > 0) (void)!write(2, msg, (size_t)n);
+    (void)!write(2, msg, snprintf_len(n, sizeof(msg)));
     _exit(127);
   }
   if (!apply_run_identity_id(&s->id, err, sizeof(err))) {
     int n = snprintf(msg, sizeof(msg), "%s[Manager] database loader: %s\n", pri, err);
-    if (n > 0) (void)!write(2, msg, (size_t)n);
+    (void)!write(2, msg, snprintf_len(n, sizeof(msg)));
     _exit(127);
   }
   /* Kept on purpose, although the server no longer leaves its own directory when it daemonizes: the loader runs as loader-user, which may
@@ -421,7 +422,7 @@ static void child_exec(const db_sup_t *s, int stream_fd, int fetch_fd, int log_w
   extern char **environ;
   exec_file_exec_fd(xfd, s->path, argv, environ);
   int n = snprintf(msg, sizeof(msg), "%s[Manager] cannot execute '%s': %s\n", pri, s->path, strerror(errno));
-  if (n > 0) (void)!write(2, msg, (size_t)n);
+  (void)!write(2, msg, snprintf_len(n, sizeof(msg)));
   _exit(127);
 }
 

@@ -424,7 +424,10 @@ arrived completely; same units and limits as \fBtcp\-initial\-timeout\fR (BIND
 minimum 1 = 100 ms). It is not extended while only part of a message has arrived
 (RFC 7766 \[u00A7]6.2.3), so a client that sends a message a few bytes at a time
 is disconnected. Also the value advertised in edns-tcp-keepalive (RFC 7828)
-unless \fBtcp\-advertised\-timeout\fR is written.
+unless \fBtcp\-advertised\-timeout\fR is written. It also bounds the send of an
+answer: once the client stops taking it at once, the whole answer must leave
+within this time, or the connection is reset (0.7; before, a client that read a
+few bytes at a time kept the worker, and the UDP it serves, waiting).
 .TP 8
 \fBtcp\-advertised\-timeout <n>;\fR
 \fIDefault:\fR the idle timeout
@@ -1211,6 +1214,12 @@ recently is taken over (BIND reuses the oldest entry of its table);
 \fBerrors\-per\-second\fR default to \fB0\fR (no limit) instead of
 \fBresponses\-per\-second\fR; responses that carry a valid server cookie are
 limited like any other.
+.PP
+Every value is an integer from 0 to 2147483647 (\fBwindow\fR from 1, the prefix
+lengths in their ranges); any other value is a configuration error with
+file:line, as for the other numeric options (\fBkaricheck conf\fR reports it;
+before 0.7 it was ignored with a warning and the default stayed). An unknown
+option in the block is a warning.
 .TP 8
 \fBresponses\-per\-second <n>;\fR
 \fIDefault:\fR \fB0\fR
@@ -3173,10 +3182,11 @@ BIND's: a secondary whose primary publishes REFRESH 60 checks every 300 s unless
 \fIMeaning:\fR Minutes, 0..40320 (28 days); 0 = no limit. an inbound transfer is
 given up after the total time (also in the middle of a message that arrives a
 few octets at a time), or when no message arrives for the idle time; an outbound
-one when it takes longer than the total time or a send waits the idle time for
-the client. While it waits, an outbound transfer holds only the zone version it
-sends (see "Outbound transfers: one version from start to end" below): a reload
-or an UPDATE does not wait for it. (The environment variable
+one when it takes longer than the total time (checked also in the middle of a
+message that the client takes a few octets at a time) or a send waits the idle
+time for the client. While it waits, an outbound transfer holds only the zone
+version it sends (see "Outbound transfers: one version from start to end"
+below): a reload or an UPDATE does not wait for it. (The environment variable
 \fBKARIDNS_XFER_MINUTE_SECS=n\fR, 1..60, makes a "minute" n seconds -- a test
 hook, like BIND's \fBnamed \-T transferinsecs\fR.)
 .TP 8

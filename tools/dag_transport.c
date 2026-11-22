@@ -1033,6 +1033,11 @@ ssize_t do_doh_exchange(const char *server, int port, const query_opts_t *qo,
             "Connection: %s\r\n\r\n",
             path, server, pkt_len, (qo && qo->keep_tcp_open) ? "keep-alive" : "close");
     }
+    /* snprintf() returns the length the request needed: a long +https path would have sent the bytes after req_hdr (review D-1, the same pattern) */
+    if (req_hdr_len < 0 || (size_t)req_hdr_len >= sizeof(req_hdr)) {
+        fprintf(stderr, ";; DoH request header too long (the path is %zu bytes)\n", strlen(path));
+        goto cleanup;
+    }
 
     if (ssl) {
         if (SSL_write(ssl, req_hdr, req_hdr_len) <= 0) goto cleanup;

@@ -198,7 +198,7 @@ if kill -0 "$SRV" 2>/dev/null; then bad "the server did not stop after SIGTERM";
 SRV=""
 grep -q "stopped" "$T/server.log" && ok "...and says so" || bad "no 'stopped' in the log"
 grep -q "(a bug)" "$T/server.log" && bad "row level security refused what the API had allowed (P3)" "$(grep '(a bug)' "$T/server.log" | head -3)" || ok "P3: row level security never disagreed with the API"
-if grep -Fq -e "$ADMIN_PW" "$T/server.log" || grep -Eq 'Sunrise-Harbor|Maple-Anchor|Violet-Lantern|Cobalt-Ranger|a new password|karidns_session=|\$scrypt\$|kdt_' "$T/server.log" || grep -Fq "$PW" "$T/server.log"; then bad "the log holds a password, token, cookie or hash"; else ok "the log holds no password, token, cookie or hash"; fi
+if grep -Fq -e "$ADMIN_PW" "$T/server.log" || grep -Eq 'Sunrise-Harbor|Maple-Anchor|Violet-Lantern|Cobalt-Ranger|a new password|karidns_session=|\$scrypt\$|kdt_' "$T/server.log" || grep -Fq -e "$PW" "$T/server.log"; then bad "the log holds a password, token, cookie or hash"; else ok "the log holds no password, token, cookie or hash"; fi
 grep -Eq '^[^ ]+ error ' "$T/server.log" && bad "the server logged an error" "$(grep ' error ' "$T/server.log" | head -3)" || ok "the server logged no error"
 same "no password hash in the audit log" "$(pq "SELECT count(*) FROM karidns_auth.audit_log WHERE before::text LIKE '%scrypt%' OR after::text LIKE '%scrypt%'")" 0
 [ "$(pq "SELECT count(*) FROM karidns_auth.audit_log WHERE principal_name = 'admin' AND db_role = '$RA'")" -gt 0 ] && ok "the administrator's changes are in the audit log under its name and the API role" || bad "no audit row names the administrator"

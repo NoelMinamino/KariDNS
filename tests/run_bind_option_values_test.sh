@@ -79,6 +79,11 @@ sed 's/tcp-idle-timeout 10000;/tcp-idle-timeout 10000ms; tcp-initial-timeout 100
 expect_check "tcp-idle-timeout 10000ms and tcp-initial-timeout 100 (10 s) are accepted" 0 "$W/e2.conf" "\[OK\] Config file"
 sed 's/tcp-idle-timeout 10000;/tcp-initial-timeout 10;/' "$W/e.conf" > "$W/e3.conf"
 expect_check "tcp-initial-timeout 10 is raised to 25 (2.5 s) with a warning, as BIND does" 0 "$W/e3.conf" "\[WARNING\] .*options tcp-initial-timeout: value is out of range: raising to 25"
+# review F-1: an invalid rate-limit value is an error with file:line, as for every other numeric option (it was a warning, the default stayed)
+sed 's/tcp-idle-timeout 10000;/rate-limit { responses-per-second -5; };/' "$W/e.conf" > "$W/e6.conf"
+expect_check "rate-limit responses-per-second -5 is an error" 1 "$W/e6.conf" "\[ERROR\] .*e6\.conf:1: rate-limit: invalid value '-5' for 'responses-per-second'"
+sed 's/tcp-idle-timeout 10000;/rate-limit { window 0; };/' "$W/e.conf" > "$W/e7.conf"
+expect_check "rate-limit window 0 is an error that names the range" 1 "$W/e7.conf" "\[ERROR\] .*rate-limit: invalid value '0' for 'window' \(an integer 1-2147483647\)"
 sed 's/tcp-idle-timeout 10000;/masterfile-format raw;/' "$W/e.conf" > "$W/e4.conf"
 expect_check "masterfile-format raw is an error" 1 "$W/e4.conf" "\[ERROR\] .*options: masterfile-format raw is not supported"
 sed 's/tcp-idle-timeout 10000;/masterfile-format text; serial-update-method unixtime; tcp-advertised-timeout 300; tcp-keepalive-timeout 300;/' "$W/e.conf" > "$W/e5.conf"

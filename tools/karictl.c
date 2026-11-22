@@ -523,7 +523,7 @@ static int karictl_open_session(const char *conf_path, const char *cli_sock_path
     expected[2 * md_len] = '\0';
     
     int mlen = snprintf(auth_msg, sizeof(auth_msg), "AUTH %s\n", expected);
-    send(sock, auth_msg, mlen, 0);
+    send(sock, auth_msg, snprintf_len(mlen, sizeof(auth_msg)), 0);
 
     r = ctl_recv(sock, buf, sizeof(buf) - 1);
     if (r <= 0) {

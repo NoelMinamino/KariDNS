@@ -1144,11 +1144,22 @@ static void test_zone_rate_limit(void) {
         CHECK(cfg.rrl.early_drop == true);
         free_server_config_fields(&cfg);
     }
-    /* invalid numbers are ignored (warning), the documented defaults stay: window 15 s, slip 2 */
-    if (parse_ok("options { rate-limit { window 0; slip -1; nodata-per-second x; some-future-knob 1; }; };", &cfg)) {
-        CHECK(cfg.rrl.window_seconds == 15);
-        CHECK(cfg.rrl.slip == 2);
-        CHECK(cfg.rrl.nodata_per_second_set == false);
+    /* F-1 (review 2026-11-22): an invalid number is a configuration error, as for every other numeric option (it was a warning and the
+     * default stayed); an unknown option is still a warning only */
+    expect_reject("rate-limit window 0", "options { rate-limit { window 0; }; };");
+    expect_reject("rate-limit slip -1", "options { rate-limit { slip -1; }; };");
+    expect_reject("rate-limit nodata-per-second x", "options { rate-limit { nodata-per-second x; }; };");
+    expect_reject("rate-limit responses-per-second -5", "options { rate-limit { responses-per-second -5; }; };");
+    expect_reject("rate-limit responses-per-second > INT_MAX", "options { rate-limit { responses-per-second 2147483648; }; };");
+    expect_reject("rate-limit window > INT_MAX", "options { rate-limit { window 4294967297; }; };");
+    expect_reject("rate-limit ipv4-prefix-length 33", "options { rate-limit { ipv4-prefix-length 33; }; };");
+    expect_reject("rate-limit ipv6-prefix-length 129", "options { rate-limit { ipv6-prefix-length 129; }; };");
+    expect_reject("rate-limit in a zone", "zone \"r.test\" { type master; file \"z\"; rate-limit { errors-per-second 1x; }; };");
+    expect_an_error("rate-limit: the message names the option and the range", "options { rate-limit { window 0; }; };",
+                    "rate-limit: invalid value '0' for 'window' (an integer 1-2147483647)");
+    if (parse_ok("options { rate-limit { window 7; slip 0; some-future-knob 1; }; };", &cfg)) {
+        CHECK(cfg.rrl.window_seconds == 7);
+        CHECK(cfg.rrl.slip == 0);
         free_server_config_fields(&cfg);
     }
     /* D-05: BIND options: prefix lengths, referrals-per-second (defaults to responses-per-second),
@@ -1162,11 +1173,11 @@ static void test_zone_rate_limit(void) {
         CHECK(cfg.rrl.ipv6_prefix_length == 64 && cfg.rrl.ipv6_prefix_length_set);
         free_server_config_fields(&cfg);
     }
-    if (parse_ok("options { rate-limit { responses-per-second 8; referrals-per-second 3; ipv4-prefix-length 33; "
-                 "ipv6-prefix-length 129; }; };", &cfg)) {
+    if (parse_ok("options { rate-limit { responses-per-second 8; referrals-per-second 3; ipv4-prefix-length 0; "
+                 "ipv6-prefix-length 128; }; };", &cfg)) {
         CHECK(cfg.rrl.referrals_per_second == 3 && cfg.rrl.referrals_per_second_set);
-        CHECK(cfg.rrl.ipv4_prefix_length == 24 && !cfg.rrl.ipv4_prefix_length_set);   /* out of range: ignored */
-        CHECK(cfg.rrl.ipv6_prefix_length == 56 && !cfg.rrl.ipv6_prefix_length_set);
+        CHECK(cfg.rrl.ipv4_prefix_length == 0 && cfg.rrl.ipv4_prefix_length_set);   /* the ends of the ranges */
+        CHECK(cfg.rrl.ipv6_prefix_length == 128 && cfg.rrl.ipv6_prefix_length_set);
         free_server_config_fields(&cfg);
     }
     expect_reject("rate-limit without braces", "options { rate-limit yes; };");
@@ -2870,9 +2881,15 @@ static void test_refusals_and_limits(void) {
     server_config_t cfg;
     expect_reject("zone name with an empty label", "zone \"a..b\" { type master; file \"z\"; };");
     expect_reject("zone name with a bad escape", "zone \"a\\999.test\" { type master; file \"z\"; };");
-    /* rate-limit values that are not numbers are ignored (the option keeps its default); the parse goes on */
-    if (parse_ok("zone \"r.test\" { type master; file \"z\"; rate-limit { responses-per-second 20; nodata-per-second abc; "
-                 "nxdomains-per-second abc; errors-per-second abc; referrals-per-second abc; all-per-second abc; }; };", &cfg)) {
+    /* F-1: rate-limit values that are not numbers are configuration errors (each option; the zone and what was built are freed) */
+    static const char *const rl_keys[] = { "nodata-per-second", "nxdomains-per-second", "errors-per-second", "referrals-per-second",
+                                           "all-per-second", "slip" };
+    for (size_t k = 0; k < sizeof(rl_keys) / sizeof(rl_keys[0]); k++) {
+        char txt[256];
+        snprintf(txt, sizeof(txt), "zone \"r.test\" { type master; file \"z\"; rate-limit { responses-per-second 20; %s abc; }; };", rl_keys[k]);
+        expect_reject(rl_keys[k], txt);
+    }
+    if (parse_ok("zone \"r.test\" { type master; file \"z\"; rate-limit { responses-per-second 20; }; };", &cfg)) {
         const zone_config_t *z = first_zone(&cfg);
         CHECK(z != NULL);
         if (z) {

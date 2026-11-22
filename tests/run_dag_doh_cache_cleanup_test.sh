@@ -123,6 +123,21 @@ else
     FAILED=$((FAILED + 1))
 fi
 
+# Test 2 (review D-1, the same pattern in dag): a request header longer than dag's buffer (a 20000-byte path) is refused before anything
+# is sent; the length snprintf() returned used to be sent from a 16 KiB buffer
+echo "=== 2. Testing a DoH path longer than the request buffer ==="
+echo -n "Test: a 20000-byte +http-plain path is refused ... "
+LONGP="/$(perl -e 'print "p" x 20000')"
+OUT=$("$DAG" @127.0.0.1 -p $PORT "+http-plain=$LONGP" +nohexdump +tries=1 +time=2 good.example.com A 2>&1 || true)
+if echo "$OUT" | grep -q "DoH request header too long (the path is 20001 bytes)"; then
+    echo "OK"
+else
+    echo "FAILED"
+    echo "  Output:"
+    echo "$OUT" | head -5 | cut -c1-200 | sed 's/^/    /'
+    FAILED=$((FAILED + 1))
+fi
+
 echo "========================================================="
 if [ "$FAILED" -eq 0 ]; then
     echo "🎉 ALL DOH CACHE CLEANUP TESTS PASSED!"

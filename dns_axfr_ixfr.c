@@ -38,7 +38,7 @@
 _Atomic int g_xfr_in_active = 0;
 _Atomic int g_xfr_out_active = 0;
 /* max-transfer-time-out / max-transfer-idle-out of the outbound transfer this thread serves (send_tcp_dns_message() reads them) */
-_Thread_local time_t g_tcp_send_deadline_secs = 0;
+_Thread_local int64_t g_tcp_send_deadline_ms = 0;   /* CLOCK_MONOTONIC ms */
 _Thread_local uint32_t g_tcp_send_idle_secs = 0;
 
 bool xfr_counter_acquire(_Atomic int *c, uint32_t limit) {
@@ -902,7 +902,7 @@ int parse_xfr_packet(const uint8_t *packet, size_t packet_len,
           return 0;
         }
 
-        if (session->client_serial != 0) {
+        if (session->client_has_version || session->client_serial != 0) {   /* X-1: a version at serial 0 is compared too (RFC 1982 §3.2) */
           if (current_serial == session->client_serial && !(session->take_same_serial && !session->is_ixfr)) {
             session->is_finished = true;
             standby->count = 0;
@@ -1708,6 +1708,10 @@ static int xfr_attempt(axfr_bg_ctx_t *ctx, const xfr_primary_t *p, struct sockad
   session->is_ixfr = ixfr_serial != 0;
   /* AXFR に切り替えたときも、手元より古い版は受け取らない (parse_xfr_packet() のロールバック検査) */
   session->client_serial = active_serial;
+  if (ctx->entry) {   /* X-1: a version that is served (not the empty one before the first publication, nor none) is compared even at serial 0 */
+    const zone_version_t *cur = atomic_load_explicit(&ctx->entry->rcu.active, memory_order_acquire);
+    session->client_has_version = cur && cur != &zone_version_empty;
+  }
   session->take_same_serial = ixfr_serial == 0 && ctx->entry && atomic_load_explicit(&zone_xr(ctx->entry)->xfr_axfr_once, memory_order_relaxed);
   session->max_records = ctx->max_records;         /* I2: the limits of the zone (max-zone-records / max-zone-bytes) */
   session->max_bytes = ctx->max_bytes;
@@ -2957,16 +2961,18 @@ static bool axfr_send_up_to_date_from_apex(axfr_worker_args_t *a, tsig_key_t *ts
   return true;
 }
 
-/* max-transfer-time-out / max-transfer-idle-out (BIND 9.20; 0 = no limit): send_tcp_dns_message() gives the transfer up after the deadline, and after a
- * send that waited the idle time for the client (the socket is blocking, so SO_SNDTIMEO makes the wait end).  Armed when the first message of the answer
- * is about to go out: the wait for a database zone before it is bounded by transfer-fetch-timeout only (a zone that comes late is still transferred, an
- * answer that it did not come is still sent: RFC 5936 4.1.2). */
+/* max-transfer-time-out / max-transfer-idle-out (BIND 9.20; 0 = no limit): send_tcp_dns_message() gives the transfer up after the deadline (it bounds
+ * every wait for the client, also inside a message, so a client that reads a little at a time cannot stretch a message past it: S-1), and after a
+ * wait of the idle time in which the client took nothing (the socket stays non-blocking).  Armed when the first message of the answer is about to go
+ * out: the wait for a database zone before it is bounded by transfer-fetch-timeout only (a zone that comes late is still transferred, an answer that
+ * it did not come is still sent: RFC 5936 4.1.2). */
 static void xfr_arm_out_limits(const axfr_worker_args_t *a) {
-  g_tcp_send_idle_secs = a->idle_out_secs;
-  g_tcp_send_deadline_secs = a->time_out_secs ? time(NULL) + (time_t)a->time_out_secs : 0;
-  if (a->idle_out_secs) {
-    struct timeval stv = { .tv_sec = (time_t)a->idle_out_secs, .tv_usec = 0 };
-    setsockopt(a->client_fd, SOL_SOCKET, SO_SNDTIMEO, (const char *)&stv, sizeof stv);
+  g_tcp_send_idle_secs = a->idle_out_secs ? a->idle_out_secs : UINT32_MAX;   /* (UINT32_MAX: no limit, each wait is INT_MAX ms) */
+  g_tcp_send_deadline_ms = 0;
+  if (a->time_out_secs) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    g_tcp_send_deadline_ms = (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000 + (int64_t)a->time_out_secs * 1000;
   }
 }
 
@@ -3056,7 +3062,7 @@ void *axfr_worker_thread(void *arg) {
                        args->has_server_addr ? &args->server_addr : NULL, args->has_server_addr);
   }
   g_tcp_send_idle_secs = 0;
-  g_tcp_send_deadline_secs = 0;
+  g_tcp_send_deadline_ms = 0;
 
   rcu_aux_read_lock();                    /* submit_response_log() reads the configuration */
   submit_response_log(LOG_ACT_SENT, args->client_ip, args->client_port, args->qname,

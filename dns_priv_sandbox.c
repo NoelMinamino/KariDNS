@@ -415,17 +415,8 @@ bool limit_udp_send_rights(int fd) {
 
 void enter_capsicum_sandbox(void) {
 #ifndef SANITIZER_BUILD
-  /* the sender thread may reconnect meanwhile (it limits its own socket): read the descriptor once */
-  int dtap = atomic_load_explicit(&g_dnstap_sock, memory_order_acquire);
-  if (dtap >= 0) {
-    cap_rights_t rights;
-    /* CAP_READ / CAP_RECV: 終了時に Frame Streams の FINISH を受け取る (O-03) */
-    cap_rights_init(&rights, CAP_READ, CAP_RECV, CAP_WRITE, CAP_SEND, CAP_EVENT, CAP_GETSOCKOPT, CAP_SETSOCKOPT, CAP_FCNTL, CAP_SHUTDOWN);
-    if (!limit_fd_rights(dtap, &rights, "dnstap socket")) {
-      fprintf(stderr, "[ERROR] [Backend] cannot limit the rights of the dnstap socket; aborting startup\n");
-      backend_exit(EXIT_FAILURE);
-    }
-  }
+  /* C-2: the dnstap socket is not limited here: the sender thread runs already and may close it (a write error) or replace it, so its rights
+   * are cut where it is connected, before the handshake and before the sender thread can see it (dnstap_limit_rights() in dns_dnstap.c) */
   /* strerror() and syslog's %m look up libc's message catalog on first use
    * (/usr/share/nls/<locale>/libc.cat). In capability mode that lookup is a
    * Capsicum violation, which PROC_TRAPCAP turns into SIGTRAP: e.g. the dnstap

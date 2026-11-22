@@ -281,7 +281,7 @@ EOF
     ZWEB=""
     grep -q "(a bug)" "$Z/server.log" && bad "row level security refused what the API had allowed" "$(grep '(a bug)' "$Z/server.log" | head -3)" || ok "the service never logged a disagreement with the database"
     grep -Eq '^[^ ]+ error ' "$Z/server.log" && bad "the service logged an error" "$(grep ' error ' "$Z/server.log" | head -3)" || ok "the service logged no error"
-    if grep -Eq 'karidns_session=|\$scrypt\$|kdt_|dora quartz lantern|sam granite pine|delta echo foxtrot|a new person 12345|wrong password 1234|hello from the web interface' "$Z/server.log" || grep -Fq "$ZADMIN_PW" "$Z/server.log"; then bad "the log holds a password, cookie, hash, token or record data"; else ok "the log holds no password, cookie, hash, token or record data"; fi
+    if grep -Eq 'karidns_session=|\$scrypt\$|kdt_|dora quartz lantern|sam granite pine|delta echo foxtrot|a new person 12345|wrong password 1234|hello from the web interface' "$Z/server.log" || grep -Fq -e "$ZADMIN_PW" "$Z/server.log"; then bad "the log holds a password, cookie, hash, token or record data"; else ok "the log holds no password, cookie, hash, token or record data"; fi
     kari_kill_tree "$ZSRV"; ZSRV=""
     grep -q "ERROR\|assertion\|Assertion" "$Z/karidns.log" && bad "karidns logged an error" "$(grep 'ERROR\|ssertion' "$Z/karidns.log" | head -3)" || ok "karidns logged no error"
     _w=0; while [ $_w -lt 50 ] && pgrep -f "$T" > /dev/null 2>&1; do sleep 0.1; _w=$((_w + 1)); done   # a process that was just killed may take a moment to go
