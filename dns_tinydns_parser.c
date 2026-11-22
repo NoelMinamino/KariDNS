@@ -26,6 +26,14 @@
 #define DEFAULT_SOA_EXPIRE  1048576UL
 #define DEFAULT_SOA_MINIMUM 2560UL
 
+/* the error of a field of the line: err_out points at the field */
+static void tinydns_field_error(parse_context_t *ctx, const char *buf, const char *field, size_t len, const char *msg) {
+    if (!ctx || !ctx->err_out) return;
+    ctx->err_out->error_message = msg;
+    ctx->err_out->error_offset = (size_t)(field - buf);
+    ctx->err_out->token_length = len;
+}
+
 /* ============================================================================
  * ゾーン振り分け・親子ゾーン重複登録防止判定
  * ============================================================================ */
@@ -198,9 +206,21 @@ static uint8_t *tinydns_decode_bytes(zone_arena_t *arena, const char *field, siz
 }
 
 /* ============================================================================
- * セクション3: 緩いIPv4パース
- * オクテット範囲チェックなし(下位8bitのみ採用)、末尾ゴミ文字許容。
+ * セクション3: IPv4 アドレス
+ * review Z-4 (user decision 2026-11-22: strict, not djbdns' looseness): djbdns ip4_scan() keeps the low 8 bits of an octet and stops at the
+ * first character that does not fit, so "999.1.1.1" became 231.1.1.1, "1.2.3.4junk" 1.2.3.4 and "not-an-ip" no record at all, without a
+ * word.  Here a non-empty field is exactly four decimal octets 0-255 (1-3 digits) and nothing else; anything else is an error of the line,
+ * and so of the file.  An empty field still means "no address" (djbdns).
  * ============================================================================ */
+static bool tinydns_octet_scan(const char *s, size_t len, size_t *pos, uint8_t *out) {
+    size_t start = *pos;
+    unsigned val = 0;
+    while (*pos < len && *pos - start < 3 && isdigit((unsigned char)s[*pos])) val = val * 10 + (unsigned)(s[(*pos)++] - '0');
+    if (*pos == start || val > 255 || (*pos < len && isdigit((unsigned char)s[*pos]))) return false;
+    *out = (uint8_t)val;
+    return true;
+}
+
 static bool tinydns_ip4_scan(const char *s, size_t len, uint8_t ip[4]) {
     size_t pos = 0;
     for (int oct = 0; oct < 4; oct++) {
@@ -208,30 +228,36 @@ static bool tinydns_ip4_scan(const char *s, size_t len, uint8_t ip[4]) {
             if (pos >= len || s[pos] != '.') return false;
             pos++;
         }
-        size_t start = pos;
-        unsigned long val = 0;
-        while (pos < len && isdigit((unsigned char)s[pos])) {
-            val = val * 10 + (s[pos] - '0');
-            pos++;
-        }
-        if (pos == start) return false; // 数字が1つもない
-        ip[oct] = (uint8_t)(val & 0xFF); // 範囲チェックなし、下位8bit採用
+        if (!tinydns_octet_scan(s, len, &pos, &ip[oct])) return false;
     }
-    return true;
+    return pos == len;
+}
+
+/* The ip field of a line: false (error set) when it is not empty and not an IPv4 address; *has = whether there is one */
+static bool tinydns_ip4_field(parse_context_t *ctx, const char *buf, const char *field, size_t len, uint8_t ip[4], bool *has) {
+    *has = len > 0;
+    if (len == 0 || tinydns_ip4_scan(field, len, ip)) return true;
+    tinydns_field_error(ctx, buf, field, len, "Invalid IPv4 address in tinydns record (expected four decimal octets 0-255, e.g. 192.0.2.1)");
+    return false;
 }
 
 /* ============================================================================
  * IPv6 ヘルパー: 32文字の生16進数デコード & 逆順ニブルPTRドメイン名生成
  * ============================================================================ */
-static bool tinydns_decode_ipv6_hex32(const char *field, size_t flen, uint8_t out[16]) {
-    if (flen != 32) return false;
-    for (int i = 0; i < 16; i++) {
+/* review Z-6: the ip6 field of a 3 / 6 line is 32 hex digits (no colons); one that was not left the AAAA and the PTRs out without a word.
+ * An empty field still means "no address", as an empty ip field does. */
+static bool tinydns_ip6_field(parse_context_t *ctx, const char *buf, const char *field, size_t flen, uint8_t out[16], bool *has) {
+    *has = flen > 0;
+    if (flen == 0) return true;
+    bool ok = flen == 32;
+    for (int i = 0; ok && i < 16; i++) {
         int hi = hex_char_to_val(field[i * 2]);
         int lo = hex_char_to_val(field[i * 2 + 1]);
-        if (hi < 0 || lo < 0) return false;
-        out[i] = (uint8_t)((hi << 4) | lo);
+        if (hi < 0 || lo < 0) ok = false;
+        else out[i] = (uint8_t)((hi << 4) | lo);
     }
-    return true;
+    if (!ok) tinydns_field_error(ctx, buf, field, flen, "Invalid IPv6 address in tinydns record (expected 32 hexadecimal digits without colons)");
+    return ok;
 }
 
 static void tinydns_ipv6_ptr_name(const uint8_t ip6[16], char *out, size_t out_size, const char *suffix) {
@@ -245,48 +271,25 @@ static void tinydns_ipv6_ptr_name(const uint8_t ip6[16], char *out, size_t out_s
 
 #define TAI64_UNIX_EPOCH_OFFSET 4611686018427387904ULL /* 0x4000000000000000 */
 
-/* timestampフィールド(0〜16桁の16進数)をUnix時刻へ変換する。
- * ttdparse()と同じ緩さ: 不正な文字は0として扱い、16桁未満なら
- * 残りをゼロ埋めする。エラーは返さない。
- * フィールドが完全に空(flen==0)の場合は *has_ts に false を設定する。 */
-static void tinydns_parse_timestamp(const char *field, size_t flen, bool *has_ts, time_t *out_unix) {
-    if (flen == 0) {
-        *has_ts = false;
-        *out_unix = 0;
-        return;
-    }
+/* timestampフィールド(0〜16桁の16進数)をUnix時刻へ変換する。16桁未満なら残りをゼロ埋めする (ttdparse() と同じ)。
+ * パーサー内ではスキップ判定を行わず、dns_record_t に ttd を持たせてクエリ時に評価する。
+ * review Z-6: ttdparse() reads a character that is not a hex digit as 0 (and ignores a 17th digit), so a mistyped time stamp became another
+ * time without a word; here it is an error (false).  Upper-case digits are accepted (ttdparse() takes lower case only).  An empty field:
+ * *has_ts = false. */
+static bool tinydns_parse_timestamp(const char *field, size_t flen, bool *has_ts, time_t *out_unix) {
+    *has_ts = false;
+    *out_unix = 0;
+    if (flen == 0) return true;
+    if (flen > 16) return false;
     uint64_t tai64 = 0;
     for (size_t i = 0; i < 16; i++) {
         int nibble = 0;
-        if (i < flen) {
-            char ch = field[i];
-            if (ch >= '0' && ch <= '9') nibble = ch - '0';
-            else if (ch >= 'a' && ch <= 'f') nibble = ch - 'a' + 10;
-            else if (ch >= 'A' && ch <= 'F') nibble = ch - 'A' + 10; /* ttdparse本体は大文字A-Fを
-                                                                        受け付けないが、実用上は
-                                                                        許容しておいて害はない */
-            else nibble = 0;
-        }
+        if (i < flen && (nibble = hex_char_to_val(field[i])) < 0) return false;
         tai64 = (tai64 << 4) | (uint64_t)nibble;
     }
     *has_ts = true;
-    if (tai64 < TAI64_UNIX_EPOCH_OFFSET) {
-        *out_unix = 0; /* 変換不能なほど小さい値。実運用ではまず起こらない */
-    } else {
-        *out_unix = (time_t)(tai64 - TAI64_UNIX_EPOCH_OFFSET);
-    }
-}
-
-/* timestampフィールドを解析し、ttdとcountdownフラグを格納する(案A: リアルタイム評価用)。
- * パーサー内ではスキップ判定を行わず、dns_record_tにttd情報を保持させてクエリ時に評価する。 */
-static void tinydns_parse_ttd_field(const char *ts_field, size_t ts_len,
-                                    bool *has_ttd, time_t *ttd_out, bool is_ttl_zero) {
-    bool has_ts = false;
-    time_t cutoff = 0;
-    tinydns_parse_timestamp(ts_field, ts_len, &has_ts, &cutoff);
-    *has_ttd = has_ts;
-    *ttd_out = cutoff;
-    (void)is_ttl_zero;
+    if (tai64 >= TAI64_UNIX_EPOCH_OFFSET) *out_unix = (time_t)(tai64 - TAI64_UNIX_EPOCH_OFFSET);   /* (before 1970: 0, 実運用ではまず起こらない) */
+    return true;
 }
 
 /* ============================================================================
@@ -346,6 +349,17 @@ static dns_record_t *tinydns_new_record(zone_arena_t *arena, parse_context_t *ct
                                         uint16_t type_code, unsigned long ttl,
                                         const char *ts_field, size_t ts_len,
                                         const char *lo_field, size_t lo_len) {
+    bool has_ttd = false;
+    time_t ttd = 0;
+    if (!tinydns_parse_timestamp(ts_field, ts_len, &has_ttd, &ttd)) {
+        tinydns_field_error(ctx, buf, ts_field, ts_len, "Invalid timestamp in tinydns record (expected at most 16 hexadecimal digits)");
+        return NULL;
+    }
+    /* review Z-6: a location code is 1 or 2 characters; djbdns keeps the first 2 of a longer one, so "abc" and "abd" were one location */
+    if (lo_len > 2) {
+        tinydns_field_error(ctx, buf, lo_field, lo_len, "Invalid location code in tinydns record (at most 2 characters)");
+        return NULL;
+    }
     dns_record_t *rec = arena_alloc_record(arena, ctx, line_start, buf);
     if (!rec) return NULL;
     rec->name = owner;
@@ -361,9 +375,6 @@ static dns_record_t *tinydns_new_record(zone_arena_t *arena, parse_context_t *ct
         rec->ttl = ttl_buf;
     }
 
-    bool has_ttd = false;
-    time_t ttd = 0;
-    tinydns_parse_ttd_field(ts_field, ts_len, &has_ttd, &ttd, ttl == 0);
     rec->tinydns_ttd = has_ttd ? ttd : 0;
     rec->tinydns_ttl_countdown = has_ttd && (ttl == 0);
 
@@ -499,7 +510,9 @@ static bool tinydns_process_line(zone_arena_t *arena, parse_context_t *ctx,
 
             // 連動 A レコード (ip有効時)
             uint8_t ip[4];
-            if (flen[1] > 0 && tinydns_ip4_scan(f[1], flen[1], ip)) {
+            bool has_ip;
+            if (!tinydns_ip4_field(ctx, buf, f[1], flen[1], ip, &has_ip)) return false;
+            if (has_ip) {
                 if (tinydns_owned(ctx, x, true)) {
                     char ipstr[16];
                     snprintf(ipstr, sizeof(ipstr), "%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
@@ -529,7 +542,9 @@ static bool tinydns_process_line(zone_arena_t *arena, parse_context_t *ctx,
             if (flen[2] > 0 && !tinydns_ttl_field(ctx, line_start, buf, f[2], flen[2], &ttl)) return false;
 
             uint8_t ip[4];
-            if (flen[1] > 0 && tinydns_ip4_scan(f[1], flen[1], ip)) {
+            bool has_ip;
+            if (!tinydns_ip4_field(ctx, buf, f[1], flen[1], ip, &has_ip)) return false;
+            if (has_ip) {
                 // A レコード生成
                 if (tinydns_owned(ctx, owner, true)) {
                     char ipstr[16];
@@ -600,7 +615,9 @@ static bool tinydns_process_line(zone_arena_t *arena, parse_context_t *ctx,
 
             // 連動 A レコード (ip有効時)
             uint8_t ip[4];
-            if (flen[1] > 0 && tinydns_ip4_scan(f[1], flen[1], ip)) {
+            bool has_ip;
+            if (!tinydns_ip4_field(ctx, buf, f[1], flen[1], ip, &has_ip)) return false;
+            if (has_ip) {
                 if (tinydns_owned(ctx, x, true)) {
                     char ipstr[16];
                     snprintf(ipstr, sizeof(ipstr), "%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
@@ -912,7 +929,9 @@ static bool tinydns_process_line(zone_arena_t *arena, parse_context_t *ctx,
             if (flen[2] > 0 && !tinydns_ttl_field(ctx, line_start, buf, f[2], flen[2], &ttl)) return false;
 
             uint8_t ip6[16];
-            if (tinydns_decode_ipv6_hex32(f[1], flen[1], ip6)) {
+            bool has_ip6;
+            if (!tinydns_ip6_field(ctx, buf, f[1], flen[1], ip6, &has_ip6)) return false;
+            if (has_ip6) {
                 if (tinydns_owned(ctx, owner, true)) {
                     struct in6_addr addr;
                     memcpy(&addr, ip6, 16);
@@ -984,7 +1003,9 @@ static bool tinydns_process_line(zone_arena_t *arena, parse_context_t *ctx,
             }
 
             uint8_t ip[4];
-            if (flen[1] > 0 && tinydns_ip4_scan(f[1], flen[1], ip)) {
+            bool has_ip;
+            if (!tinydns_ip4_field(ctx, buf, f[1], flen[1], ip, &has_ip)) return false;
+            if (has_ip) {
                 if (tinydns_owned(ctx, target, true)) {
                     char ipstr[16];
                     snprintf(ipstr, sizeof(ipstr), "%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
@@ -1041,6 +1062,16 @@ static bool tinydns_process_line(zone_arena_t *arena, parse_context_t *ctx,
                 if ((!flags_bytes && flen[3] > 0) ||
                     (!service_bytes && flen[4] > 0) ||
                     (!regexp_bytes && flen[5] > 0)) return false;
+                /* review Z-6: each is one <character-string> (RFC 3403 s4.1), kept as a C string: a \000 cut it there without a word, and one
+                 * longer than 255 octets cannot be written (RFC 1035 s3.3) */
+                const uint8_t *nstr[3] = { flags_bytes, service_bytes, regexp_bytes };
+                const size_t nlen[3] = { flags_len, service_len, regexp_len };
+                for (int s = 0; s < 3; s++)
+                    if (nlen[s] > 255 || (nlen[s] > 0 && memchr(nstr[s], 0, nlen[s]))) {
+                        tinydns_field_error(ctx, buf, f[3 + s], flen[3 + s], "Invalid NAPTR flags, service or regexp in tinydns record "
+                                            "(a NUL octet \\000, or longer than 255 octets)");
+                        return false;
+                    }
 
                 char *replacement = tinydns_decode_fqdn(arena, f[6], flen[6]);
                 if (!replacement) {
@@ -1095,16 +1126,15 @@ static bool tinydns_process_line(zone_arena_t *arena, parse_context_t *ctx,
                 memcpy(fp_hex, f[3], flen[3]);
                 fp_hex[flen[3]] = '\0';
 
-                // 16進数文字列の妥当性確認 (バイナリ変換可能性)
-                uint8_t dummy_fp[64];
-                size_t fp_len = hex_decode(fp_hex, dummy_fp, sizeof(dummy_fp));
-                if (flen[3] > 0 && (fp_len == 0 || fp_len == (size_t)-1)) {
-                    // デコード不能な不正な16進数の場合はレコード生成をスキップ (緩いパース哲学)
-                    // review dns_tinydns_parser.c [8]: counted in the context so that karicheck can warn once per file
-                    if (ctx) {
-                        if (ctx->skipped_data_count++ == 0) ctx->first_skipped_data = owner;
-                    }
-                    return true;
+                /* review Z-6: the fingerprint is hexadecimal, an even number of digits (RFC 4255 s3.2); a line with another one used to be
+                 * left out (only karicheck warned), and one of more than 64 octets as well.  Now it is an error of the line. */
+                bool fp_ok = flen[3] % 2 == 0 && flen[3] <= 2 * 65000;
+                for (size_t k = 0; fp_ok && k < flen[3]; k++)
+                    if (hex_char_to_val(fp_hex[k]) < 0) fp_ok = false;
+                if (!fp_ok) {
+                    tinydns_field_error(ctx, buf, f[3], flen[3], "Invalid SSHFP fingerprint in tinydns record (expected an even number of "
+                                        "hexadecimal digits)");
+                    return false;
                 }
 
                 dns_record_t *sshfp_rec = tinydns_new_record(arena, ctx, line_start, buf, owner,
@@ -1137,25 +1167,32 @@ static bool tinydns_process_line(zone_arena_t *arena, parse_context_t *ctx,
                 }
                 return false;
             }
+            if (flen[0] > 2) {   /* review Z-6: as the lo field of a record */
+                tinydns_field_error(ctx, buf, f[0], flen[0], "Invalid location code in tinydns % line (at most 2 characters)");
+                return false;
+            }
             tinydns_location_entry_t loc;
             memset(&loc, 0, sizeof(loc));
             loc.code[0] = flen[0] > 0 ? f[0][0] : 0;
             loc.code[1] = flen[0] > 1 ? f[0][1] : 0;
 
+            /* review Z-4: up to four decimal octets 0-255 separated by dots (djbdns kept the low 8 bits of an octet and ignored what
+             * followed the prefix); then nothing, or the "/n" below */
             uint8_t prefix[4] = {0};
             uint8_t octets = 0;
             size_t pos = 0;
-            while (octets < 4 && pos < flen[1]) {
-                unsigned long val = 0;
-                size_t start = pos;
-                while (pos < flen[1] && isdigit((unsigned char)f[1][pos])) {
-                    if (val < 1000) val = val * 10 + (f[1][pos] - '0');
-                    pos++;
+            while (octets < 4 && pos < flen[1] && f[1][pos] != '/') {
+                if (!tinydns_octet_scan(f[1], flen[1], &pos, &prefix[octets])) {
+                    tinydns_field_error(ctx, buf, f[1], flen[1], "Invalid IPv4 prefix in tinydns % line (expected decimal octets 0-255)");
+                    return false;
                 }
-                if (pos == start) break;
-                prefix[octets++] = (uint8_t)(val & 0xFF);   // djbdns 互換: オクテット値は検証しない
+                octets++;
                 if (pos < flen[1] && f[1][pos] == '.') pos++;
                 else break;
+            }
+            if (pos < flen[1] && f[1][pos] != '/') {
+                tinydns_field_error(ctx, buf, f[1], flen[1], "Invalid IPv4 prefix in tinydns % line (expected decimal octets 0-255)");
+                return false;
             }
             // djbdns の接頭辞長はオクテット数 x 8。KariDNS 拡張として "/n" (0..32) を CIDR 長として受け付ける。
             // 以前は "/n" を黙って無視していたため "10.0.0.0/8" が /32 として扱われていた。
@@ -1210,6 +1247,7 @@ static bool tinydns_process_line(zone_arena_t *arena, parse_context_t *ctx,
  * ============================================================================ */
 int parse_tinydns_data(char *buf, size_t len, zone_arena_t *arena, parse_context_t *ctx) {
     if (!buf || !arena) return -1;
+    if (zone_text_has_nul(buf, len, ctx)) return -1;   /* review Z-2: as parse_zone_fast() */
     arena->is_tinydns_format = true;
 
     // SOA serial はデータファイルの mtime (tinydns-data と同じ)。mtime は呼び出し側が開いた fd から

@@ -213,7 +213,9 @@ td_case gen_big     1 "Prohibited or invalid RR type in tinydns generic record" 
 td_case gen_ok      0 "0 error(s)" ':gen.example.com:16:\003abc'
 i=0
 : > "$TMP/loc4097.txt"
-while [ $i -lt 4097 ]; do printf '%%l%d:10.%d.%d.0/24\n' "$i" $((i / 256)) $((i % 256)) >> "$TMP/loc4097.txt"; i=$((i + 1)); done
+# (codes of 2 characters from 64: a code is 1-2 characters since review Z-6, "l1000" is an error; the 4097th repeats the first, a warning)
+awk 'BEGIN { a = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+             for (i = 0; i < 4097; i++) printf "%%%s%s:10.%d.%d.0/24\n", substr(a, int(i / 64) % 64 + 1, 1), substr(a, i % 64 + 1, 1), int(i / 256), i % 256 }' > "$TMP/loc4097.txt"
 td_case loc_4097    1 "Too many location lines" "$(cat "$TMP/loc4097.txt")"
 head -4096 "$TMP/loc4097.txt" > "$TMP/loc4096.txt"
 td_case loc_4096    0 "!Too many location lines" "$(cat "$TMP/loc4096.txt")"

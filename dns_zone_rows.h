@@ -80,6 +80,10 @@ typedef struct {
     size_t long_txt_line;
     size_t tinydns_out_of_zone;
     char first_tinydns_out_of_zone[DNS_NAME_TEXT_SIZE];
+    /* records dropped because their RDATA cannot be written in wire format (the server leaves them out with a warning; the importer
+     * refuses the zone: karicheck reports them as errors), and the owner and type of the first */
+    size_t unencodable;
+    char first_unencodable[DNS_NAME_TEXT_SIZE + 24];
     bool include_refused;
 } zrows_info_t;
 bool zrows_load_zone_text(const char *text, size_t len, const char *path, const char *apex_override, zone_arena_t *arena, char *apex_out,

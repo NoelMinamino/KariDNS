@@ -184,6 +184,18 @@ static void test_karicheck(void) {
         wfile(nm, CATALOG_ZONES[i]);
     }
     wfile("s.zone", HDR("s.test."));
+    {   /* review Z-2: a zone file with a NUL byte is refused (io.nul-byte; the parser stopped at the NUL and the check said OK) */
+        static const char nul_zone[] = HDR("a.test.") "\0www IN A 192.0.2.2\n";
+        char np[300];
+        snprintf(np, sizeof(np), "%s/nul.zone", g_tmp);
+        FILE *f = fopen(np, "wb");
+        assert(f);
+        size_t wrote = fwrite(nul_zone, 1, sizeof(nul_zone) - 1, f);
+        fclose(f);
+        assert(wrote == sizeof(nul_zone) - 1);
+        int rc = run_tool(karicheck_main, "karicheck", "zone", "a.test", np, NULL);
+        assert(rc != 0);
+    }
     /* configs that point at the tinydns and catalog files in turn */
     for (size_t t = 0; t < N(TINY_ZONES) || t < N(CATALOG_ZONES) || t < N(BIND_ZONES); t++) {
         snprintf(cfg, sizeof(cfg),
@@ -475,6 +487,26 @@ static void lint_zone(lint_out_t *o, const char *body, const char *raw, void (*f
     zone_arena_destroy(&a);
 }
 
+/* zone_lint_ttl() on the zone as parsed, before build_zone_index() harmonizes the TTLs (the order of karicheck zone) */
+static void lint_ttl_zone(lint_out_t *o, const char *body) {
+    memset(o, 0, sizeof(*o));
+    char text[4096];
+    snprintf(text, sizeof(text), "$ORIGIN a.test.\n$TTL 300\n@ IN SOA ns1.a.test. h.a.test. 1 7200 3600 1209600 300\n@ IN NS ns1.a.test.\n%s", body);
+    zone_arena_t a;
+    zone_arena_init(&a);
+    parse_error_t err;
+    memset(&err, 0, sizeof(err));
+    parse_context_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.default_origin = "a.test.";
+    ctx.err_out = &err;
+    char *buf = arena_strdup(&a, text);
+    assert(buf && parse_zone_fast(buf, strlen(buf), &a, &ctx) >= 0);
+    kc_tally_t t = { 0, 0, lint_sink, o };
+    zone_lint_ttl(&a, "zone file", &t);
+    zone_arena_destroy(&a);
+}
+
 static void lint_expect(const char *label, const lint_out_t *o, const char *needle) {
     if (!strstr(o->text, needle)) {
         fprintf(stderr, "lint: %s: no \"%s\" in\n%s", label, needle, o->text);
@@ -612,6 +644,22 @@ static void test_lint_messages(void) {
     }
     lint_zone(&o, "", "6x.a.test.:zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz:300\n", fix_tinydns);
     lint_expect("type 6, 32 characters that are not hexadecimal", &o, "type '6' requires a 32-character hexadecimal IPv6 address, got 'zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz'");
+    /* review Z-6: the TTLs of an RRset of more than 64 RRs are all compared (the pairs of the first 64 only were); and an unrestricted and a
+     * restricted RR with different TTLs past the 64th */
+    {
+        char body[3000];
+        size_t l = 0;
+        for (int i = 1; i <= 70; i++) l += (size_t)snprintf(body + l, sizeof(body) - l, "big %d IN A 192.0.2.%d\n", i == 70 ? 600 : 300, i);
+        lint_ttl_zone(&o, body);
+        lint_expect("TTL of the 70th RR", &o, "W RRset 'big.a.test.' type 1 has inconsistent TTLs (300 vs 600)");
+        l = 0;
+        for (int i = 1; i <= 69; i++) l += (size_t)snprintf(body + l, sizeof(body) - l, "big IN A 192.0.2.%d\n", i);
+        snprintf(body + l, sizeof(body) - l, "$LOCATION xx\nbig 600 IN A 192.0.2.70\n");
+        lint_ttl_zone(&o, body);
+        lint_expect("unrestricted / restricted TTL past the 64th", &o, "W RRset 'big.a.test.' type 1: an RR that every client sees and an RR with a "
+                    "location, time stamp or tag have different TTLs (300 vs 600)");
+        if (strstr(o.text, "has inconsistent TTLs")) { fprintf(stderr, "lint: different visibilities taken as one RRset:\n%s", o.text); assert(0); }
+    }
     printf("  -> zone check messages compared.\n");
 }
 

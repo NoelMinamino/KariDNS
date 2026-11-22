@@ -231,7 +231,8 @@ case "$out" in
 esac
 
 # ---- tinydns-data zones ------------------------------------------------------------------------------
-td_case hex3       1 "type '3' requires a 32-character hexadecimal IPv6 address" '3www.example.com:20010db8:300'
+# (review Z-6: a malformed IPv6 field is a syntax error of the parser now, before the line checks see it)
+td_case hex3       1 "Invalid IPv6 address in tinydns record" '3www.example.com:20010db8:300'
 td_case hex6_info  0 "type '6' generates deprecated PTR" '6www.example.com:20010db8000000000000000000000001:300'
 td_case srv_range  1 "Invalid SRV port in tinydns record (expected 0-65535)" 'Sexample.com:5.srv.example.com:5060:70000:20:300'
 td_case naptr_pref 1 "Invalid NAPTR preference in tinydns record (expected 0-65535)" 'Nexample.com:1:70000:u:E2U+sip:!^.*$!sip\072a@b!:.:300'

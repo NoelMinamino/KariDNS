@@ -602,6 +602,11 @@ char *zone_read_include_file(const char *path, size_t max, dev_t *out_dev, ino_t
         free(buf);
         return NULL;
     }
+    if (len > 0 && memchr(buf, '\0', len)) {   /* review Z-2: the parser would stop at it and lose the rest of the file */
+        free(buf);
+        errno = EILSEQ;
+        return NULL;
+    }
     buf[len] = '\0';
     if (out_dev) *out_dev = st.st_dev;
     if (out_ino) *out_ino = st.st_ino;
@@ -645,10 +650,12 @@ static int process_include(char **fields, int field_idx, zone_arena_t *arena,
 
     dev_t cur_dev = 0;
     ino_t cur_ino = 0;
+    errno = 0;
     char *file_content = ctx->load_file_cb ? ctx->load_file_cb(ctx, resolved, &cur_dev, &cur_ino) : NULL;
     if (!file_content) {
         if (ctx->err_out) {
-            ctx->err_out->error_message = "$INCLUDE file could not be read or fstat failed";
+            /* review Z-2: the readers refuse a file with a NUL byte (EILSEQ): the parser stops at the first NUL, and the rest was lost */
+            ctx->err_out->error_message = errno == EILSEQ ? "$INCLUDE file contains a NUL byte" : "$INCLUDE file could not be read or fstat failed";
             ctx->err_out->error_offset = (size_t)(fields[1] - cur_buf);
             ctx->err_out->token_length = strlen(fields[1]);
         }
@@ -716,6 +723,7 @@ static int process_include(char **fields, int field_idx, zone_arena_t *arena,
     ctx->first_long_txt_owner = child_ctx.first_long_txt_owner;
     ctx->first_long_txt_file = child_ctx.first_long_txt_file;
     ctx->first_long_txt_line = child_ctx.first_long_txt_line;
+    ctx->generated_count = child_ctx.generated_count;
 
     if (rc < 0 && ctx && ctx->err_out && !ctx->err_out->file_path) {
         ctx->err_out->file_path = resolved;
@@ -863,8 +871,6 @@ static int zone_txt_blob(parse_context_t *ctx, zone_arena_t *arena, dns_record_t
     return 0;
 }
 
-#define MAX_GENERATE_COUNT 100000
-
 typedef struct { uint64_t start, stop, step; } generate_range_t;
 
 static int parse_generate_range(const char *range_str, generate_range_t *out, parse_error_t *err_out) {
@@ -913,8 +919,8 @@ static int parse_generate_range(const char *range_str, generate_range_t *out, pa
     }
 
     uint64_t count = (stop - start) / step + 1;
-    if (count > MAX_GENERATE_COUNT) {
-        if (err_out) err_out->error_message = "$GENERATE range exceeds maximum record count";
+    if (count > ZONE_GENERATE_PER_DIRECTIVE_MAX) {
+        if (err_out) err_out->error_message = "$GENERATE range exceeds maximum record count (100000 per statement)";
         return -1;
     }
 
@@ -1105,6 +1111,24 @@ static int process_generate(char **fields, int field_idx, zone_arena_t *arena,
         return -1;
     }
 
+    /* review Z-1: the bound per statement left the zone unbounded (10,000 statements of 100,000 records fit in 350 KB).  The total of the
+     * zone and max-records are checked before the statement makes a record, so a zone over them fails at once, not after it ate the memory. */
+    uint64_t count = (range.stop - range.start) / range.step + 1;
+    if (ctx) {
+        if (ctx->generated_count + count > ZONE_GENERATE_TOTAL_MAX) {
+            generate_error(ctx, "$GENERATE: the zone asks for more than 1000000 generated records in all", fields[1], cur_buf);
+            return -1;
+        }
+        if (ctx->max_records && arena->count + count > ctx->max_records) {
+            if (ctx->err_out)
+                snprintf(ctx->err_out->detail, sizeof(ctx->err_out->detail), "$GENERATE: %llu more records would make the zone larger than "
+                         "max-records %zu", (unsigned long long)count, ctx->max_records);
+            generate_error(ctx, ctx->err_out ? ctx->err_out->detail : NULL, fields[1], cur_buf);
+            return -1;
+        }
+        ctx->generated_count += (size_t)count;
+    }
+
     char lhs_buf[DNS_NAME_TEXT_SIZE], rhs_buf[4096];
     for (uint64_t v = range.start; v <= range.stop; v += range.step) {
         size_t lhs_len = expand_generate_template(lhs_tmpl, v, lhs_buf, sizeof(lhs_buf), &local_err);
@@ -1159,7 +1183,19 @@ static int process_generate(char **fields, int field_idx, zone_arena_t *arena,
     return 0;
 }
 
+bool zone_text_has_nul(const char *buf, size_t size, parse_context_t *ctx) {
+  const char *nul = buf && size ? memchr(buf, '\0', size) : NULL;
+  if (!nul) return false;
+  if (ctx && ctx->err_out) {
+    ctx->err_out->error_message = "the zone file contains a NUL byte (the text after it would be lost)";
+    ctx->err_out->error_offset = (size_t)(nul - buf);
+    ctx->err_out->token_length = 1;
+  }
+  return true;
+}
+
 int parse_zone_fast(char *buf, size_t size, zone_arena_t *arena, parse_context_t *ctx) {
+  if (zone_text_has_nul(buf, size, ctx)) return -1;   /* review Z-2 */
   char *origin = ctx ? (char *)ctx->default_origin : NULL;
   char *local_ttl_storage = NULL;
   char *last_ttl = NULL;
@@ -1358,8 +1394,29 @@ STATE_FIND_TOKEN:
       continue;
     }
     if (*p == '"') {
+      /* review Z-6: a quoted string is a field of its own (RFC 1035 s5.1; BIND's lexer ends a token at a '"').  `"abc"def` was the field
+       * abc"def and `ab"c d"` one field with the quotes in it; both are an error now (BIND reads them as two fields).  The one quote that
+       * may open inside a field is the value of a key=value pair (RFC 9460 s2.1: alpn="h2,h3"; BIND's qvpair token) */
+      bool closing = in_quotes;
+      if (!in_quotes && p != token_start && p[-1] != '=') {
+        if (ctx && ctx->err_out) {
+          ctx->err_out->error_message = "a '\"' inside a field (a quoted string must be a field of its own: put a blank before it)";
+          ctx->err_out->error_offset = (size_t)(token_start - buf);
+          ctx->err_out->token_length = (size_t)(p - token_start) + 1;
+        }
+        return -1;
+      }
       in_quotes = !in_quotes;
       p++;
+      if (closing && p < end && !IS_SPACE(*p) && !IS_NEWLINE(*p) && *p != ';' && *p != '(' && *p != ')' &&
+          !(is_tag_def_line && (*p == '{' || *p == '}'))) {
+        if (ctx && ctx->err_out) {
+          ctx->err_out->error_message = "text right after a closing '\"' (a quoted string must be a field of its own: put a blank after it)";
+          ctx->err_out->error_offset = (size_t)(token_start - buf);
+          ctx->err_out->token_length = (size_t)(p - token_start) + 1;
+        }
+        return -1;
+      }
       continue;
     }
     if (!in_quotes) {
@@ -1542,6 +1599,15 @@ PROCESS_RECORD:
       goto STATE_START_LINE;
     goto DONE;
   }
+  if (fields[0][0] == '$' && (strcasecmp(fields[0], "$ECS-SUBNET") == 0 || strcasecmp(fields[0], "$LOCATION") == 0) && field_idx > 1 &&
+      strlen(fields[1]) > ZONE_TAG_NAME_MAX) {
+    if (ctx && ctx->err_out) {   /* review Z-6: no definition can have such a name (above) */
+      ctx->err_out->error_message = "tag name longer than 63 characters";
+      ctx->err_out->error_offset = (size_t)(fields[1] - buf);
+      ctx->err_out->token_length = strlen(fields[1]);
+    }
+    return -1;
+  }
   if (fields[0][0] == '$' && strcasecmp(fields[0], "$ECS-SUBNET") == 0) {
     if (field_idx > 1) {
       if (fields[1][0] == '\0' || strcasecmp(fields[1], "none") == 0 || strcasecmp(fields[1], "default") == 0) {
@@ -1583,13 +1649,21 @@ PROCESS_RECORD:
     }
     const char *raw_tag = fields[1];
     while (*raw_tag == '{' || *raw_tag == ' ' || *raw_tag == '\t') raw_tag++;
-    char clean_tag[64];
-    strncpy(clean_tag, raw_tag, sizeof(clean_tag) - 1);
-    clean_tag[sizeof(clean_tag) - 1] = '\0';
-    size_t ctlen = strlen(clean_tag);
-    while (ctlen > 0 && (clean_tag[ctlen-1] == '}' || clean_tag[ctlen-1] == ';' || clean_tag[ctlen-1] == ' ' || clean_tag[ctlen-1] == '\t')) {
-      clean_tag[--ctlen] = '\0';
+    /* review Z-6: a tag name is 1-63 characters (the database reader's rule, pdns_zone_add_tags()); a longer one was cut to 63 without a
+     * word, so two names that differ after it were one tag */
+    size_t ctlen = strlen(raw_tag);
+    while (ctlen > 0 && (raw_tag[ctlen-1] == '}' || raw_tag[ctlen-1] == ';' || raw_tag[ctlen-1] == ' ' || raw_tag[ctlen-1] == '\t')) ctlen--;
+    if (ctlen > ZONE_TAG_NAME_MAX) {
+      if (ctx && ctx->err_out) {
+        ctx->err_out->error_message = "tag name longer than 63 characters in tag definition";
+        ctx->err_out->error_offset = (size_t)(fields[1] - buf);
+        ctx->err_out->token_length = strlen(fields[1]);
+      }
+      return -1;
     }
+    char clean_tag[ZONE_TAG_NAME_MAX + 1];
+    memcpy(clean_tag, raw_tag, ctlen);
+    clean_tag[ctlen] = '\0';
     if (ctlen == 0) {
       if (ctx && ctx->err_out) {
         ctx->err_out->error_message = "Invalid empty tag name in tag definition";

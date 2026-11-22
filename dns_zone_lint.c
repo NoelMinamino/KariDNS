@@ -149,6 +149,24 @@ static int cmp_rec_by_name_type(const void *pa, const void *pb) {
     return 0;
 }
 
+static int cmp_tag_ci(const char *a, const char *b) {
+    if (!a || !b) return (a != NULL) - (b != NULL);
+    return strcasecmp(a, b);
+}
+
+/* the RRs of one RRset by visibility (the fields dns_record_same_visibility() compares), then TTL: RRs of one visibility are adjacent */
+static int cmp_rec_by_visibility_ttl(const void *pa, const void *pb) {
+    const dns_record_t *a = *(const dns_record_t **)pa, *b = *(const dns_record_t **)pb;
+    int c;
+    if (a->tinydns_loc[0] != b->tinydns_loc[0]) return (unsigned char)a->tinydns_loc[0] < (unsigned char)b->tinydns_loc[0] ? -1 : 1;
+    if (a->tinydns_loc[1] != b->tinydns_loc[1]) return (unsigned char)a->tinydns_loc[1] < (unsigned char)b->tinydns_loc[1] ? -1 : 1;
+    if (a->tinydns_ttd != b->tinydns_ttd) return a->tinydns_ttd < b->tinydns_ttd ? -1 : 1;
+    if (a->tinydns_ttl_countdown != b->tinydns_ttl_countdown) return a->tinydns_ttl_countdown ? 1 : -1;
+    if ((c = cmp_tag_ci(a->bind_location_tag, b->bind_location_tag)) != 0) return c;
+    if ((c = cmp_tag_ci(a->ecs_subnet_tag, b->ecs_subnet_tag)) != 0) return c;
+    return a->ttl_value < b->ttl_value ? -1 : a->ttl_value > b->ttl_value;
+}
+
 typedef struct { int alg_num; const char *name; const char *status; bool discouraged; } dnssec_alg_info_t;
 
 /* IANA "DNS Security Algorithm Numbers"; discouraged = RFC 8624 MUST NOT / NOT RECOMMENDED (the warning).  17 SM2SM3 (RFC 9563),
@@ -1058,30 +1076,42 @@ void zone_lint_ttl(const zone_arena_t *arena_in, const char *what, kc_tally_t *t
                     k = e;
                     continue;
                 }
-                size_t lim = e - k > 64 ? k + 64 : e;     /* a very large RRset: compare the first 64 */
-                bool warned_norm = false, warned_covis = false;
-                for (size_t a = k; a < lim; a++) {
-                    for (size_t b = a + 1; b < lim; b++) {
-                        if (sorted[a]->ttl_value == sorted[b]->ttl_value) continue;
-                        if (dns_record_same_visibility(sorted[a], sorted[b])) {
-                            if (warned_norm) continue;
-                            warned_norm = true;
-                            kc_warning(t, DC_ZONE_TTL_INCONSISTENT,
-                                "RRset '%s' type %d has inconsistent TTLs (%u vs %u) in the source "
-                                "%s; RFC 2181 §5.2 requires all RRs in an RRset to share the same TTL. "
-                                "KariDNS will normalize this to the minimum value at load time, "
-                                "but the %s should be corrected.\n",
-                                sorted[a]->name, sorted[a]->type_code, sorted[a]->ttl_value, sorted[b]->ttl_value, what, what);
-                        } else if (dns_record_is_restricted(sorted[a]) != dns_record_is_restricted(sorted[b])) {
-                            if (warned_covis) continue;
-                            warned_covis = true;
-                            kc_warning(t, DC_ZONE_TTL_INCONSISTENT_VISIBILITY,
-                                "RRset '%s' type %d: an RR that every client sees and an RR with a location, time stamp or tag have "
-                                "different TTLs (%u vs %u). A client that sees both gets an RRset with differing TTLs (RFC 2181 §5.2); "
-                                "KariDNS keeps the TTL written on each RR, as tinydns does.\n",
-                                sorted[a]->name, sorted[a]->type_code, sorted[a]->ttl_value, sorted[b]->ttl_value);
-                        }
+                /* review Z-6: the pairs of the first 64 RRs only were compared (O(n^2)), so a larger RRset was not checked past them.  Now the
+                 * RRset is sorted by visibility and TTL and read once: a group of one visibility whose first and last TTL differ, and the
+                 * lowest and highest TTL of the unrestricted and of the restricted RRs. */
+                qsort(sorted + k, e - k, sizeof(dns_record_t *), cmp_rec_by_visibility_ttl);
+                bool warned_norm = false;
+                bool have_u = false, have_r = false;
+                uint32_t umin = 0, umax = 0, rmin = 0, rmax = 0;
+                for (size_t g = k; g < e;) {
+                    size_t ge = g + 1;
+                    while (ge < e && dns_record_same_visibility(sorted[g], sorted[ge])) ge++;
+                    uint32_t lo = sorted[g]->ttl_value, hi = sorted[ge - 1]->ttl_value;
+                    if (lo != hi && !warned_norm) {
+                        warned_norm = true;
+                        kc_warning(t, DC_ZONE_TTL_INCONSISTENT,
+                            "RRset '%s' type %d has inconsistent TTLs (%u vs %u) in the source "
+                            "%s; RFC 2181 §5.2 requires all RRs in an RRset to share the same TTL. "
+                            "KariDNS will normalize this to the minimum value at load time, "
+                            "but the %s should be corrected.\n",
+                            sorted[g]->name, sorted[g]->type_code, lo, hi, what, what);
                     }
+                    bool restricted = dns_record_is_restricted(sorted[g]);
+                    bool *have = restricted ? &have_r : &have_u;
+                    uint32_t *mn = restricted ? &rmin : &umin, *mx = restricted ? &rmax : &umax;
+                    if (!*have || lo < *mn) *mn = lo;
+                    if (!*have || hi > *mx) *mx = hi;
+                    *have = true;
+                    g = ge;
+                }
+                if (have_u && have_r && !(umin == umax && rmin == rmax && umin == rmin)) {
+                    /* an unrestricted and a restricted TTL that differ */
+                    uint32_t u = umin != rmin ? umin : (umax != umin ? umax : umin), r = umin != rmin ? rmin : (umax != umin ? rmin : rmax);
+                    kc_warning(t, DC_ZONE_TTL_INCONSISTENT_VISIBILITY,
+                        "RRset '%s' type %d: an RR that every client sees and an RR with a location, time stamp or tag have "
+                        "different TTLs (%u vs %u). A client that sees both gets an RRset with differing TTLs (RFC 2181 §5.2); "
+                        "KariDNS keeps the TTL written on each RR, as tinydns does.\n",
+                        sorted[k]->name, sorted[k]->type_code, u, r);
                 }
                 k = e;
             }

@@ -1775,7 +1775,10 @@ The default `file-format` is the master file format of RFC 1035 §5 as BIND read
   is relative to the current origin (RFC 1035 §5.1). `$INCLUDE` does not change the origin of the including file.
 - **`$INCLUDE` paths** (BIND 9.20 ARM 3.5.5.3: "The filename can be an absolute path, or a relative path"): a relative name is read from `options { directory }` when it is set (BIND: named's working directory), otherwise from the directory of the zone file. The server reads files in capability mode and can open only directories that it opened when it started, so the file must lie inside one of two trees: the directory of the zone file, or `directory`. An absolute path, or a path that leaves the base through `..`, is accepted only when the normalized path (no symbolic link is looked at) stays inside one of those trees; any other is a zone file error, for example `$INCLUDE '/etc/hosts' is outside the directories opened at startup (zone file dir, directory): the sandboxed server can read only below them`. `karicheck zone` applies the same rules and gives the same message. A reload may bring in a file in a sub-directory that did not exist at start-up, as long as it is below one of those trees.
 - **`$GENERATE <range> <lhs> [<TTL>] [<class>] <type> <rhs>`** (BIND syntax): `<range>` is `start-stop[/step]`
-  (at most 100,000 records). For each value, `$` in `<lhs>` and `<rhs>` is replaced by the value,
+  (at most 100,000 records per statement, and at most 1,000,000 generated records in a zone, its `$INCLUDE` files
+  included; a statement that would go past the total, or make the zone larger than its `max-records`, is a zone file
+  error at that statement before it makes a record. BIND has neither bound; before 0.7 a 350 KB file of 10,000
+  statements asked for 10^9 records and the load ran out of memory). For each value, `$` in `<lhs>` and `<rhs>` is replaced by the value,
   `${offset[,width[,base]]}` with base `d`, `o`, `x`, `X`, `n` or `N` (`n`/`N`: nibbles in reverse order separated
   by dots, as for `ip6.arpa`; the width counts the dots), `$$` gives `$` and `\$` a literal `$`. Any RR type can be
   generated; the resulting line is read like any other record line, so `$ECS-SUBNET`/`$LOCATION` tags and the TTL
@@ -1783,6 +1786,16 @@ The default `file-format` is the master file format of RFC 1035 §5 as BIND read
   `$GENERATE 1-10 host$ MX "10 mail$"`. The quotes only keep the field together; the text inside is split on blanks
   again, so one TXT character-string that contains a blank cannot be generated (BIND keeps `TXT "a b"` as one string):
   put such records in the zone file itself.
+- **Quoted strings** are fields of their own (RFC 1035 §5.1): text right after a closing `"` (`"abc"def`) or a `"`
+  inside a field (`ab"c d"`) is a zone file error (BIND reads both as two fields; before 0.7 KariDNS kept one field
+  `abc"def`). The one exception is the value of a `key="value"` pair (RFC 9460 §2.1, `alpn="h2,h3"`). A `"` that
+  belongs to the text is written `\"`.
+- **Tag names** of `$LOCATION-TAG`, `$ECS-SUBNET-TAG`, `$LOCATION` and `$ECS-SUBNET` are at most 63 characters, as in
+  the database tables; a longer name is a zone file error (it used to be cut to 63, so two names that differ after
+  the 63rd character were one tag).
+- **A NUL byte** anywhere in a zone file, an `$INCLUDE` file or a tinydns data file is an error (`the zone file contains
+  a NUL byte`, `$INCLUDE file contains a NUL byte`): the parsers stop at a NUL, so the records after it used to be lost
+  while the load succeeded. `karicheck` (`io.nul-byte`) and `karidns-zone import` refuse such a file too.
 
 ---
 
@@ -1811,17 +1824,31 @@ correctly without duplicate records).
 > **Numeric fields and lines that cannot be kept:** the tinydns parser does not limit the 8-, 16- and 32-bit numeric
 > fields of the extension lines (`S`, `N`, `_`, ...). djbdns itself truncates such a value; KariDNS keeps it, and a record whose
 > value does not fit its field is left out with a warning when the zone is loaded (`karicheck` reports it as `zone.record.wire`).
-> An SSHFP line whose fingerprint is not hexadecimal is left out as well; `karicheck` reports it once per file
-> (`zone.tinydns.skipped`).
+
+> [!IMPORTANT]
+> **Malformed fields are errors (0.7).** djbdns reads several fields loosely and KariDNS used to do the same; a line with
+> such a field now fails the load of the data file (the version in service stays, `karicheck` reports `zone.syntax`, and
+> `karidns-zone import` writes nothing), with the field and its line:
+> - an IPv4 address (`+`, `=`, `.`, `&`, `@`, `S`): exactly four decimal octets 0-255 and nothing else. djbdns kept
+>   the low 8 bits of an octet (`999.1.1.1` became 231.1.1.1), ignored what followed the address (`1.2.3.4junk`)
+>   and made no record for text that is no address; an empty field still means "no address";
+> - the IPv4 prefix of a `%` line: up to four octets 0-255, then nothing or `/n`;
+> - an IPv6 address of a `3` / `6` line: 32 hex digits (an empty field: no address); a bad one used to leave the AAAA
+>   and the PTRs out without a word;
+> - a location code (the `%` line and the `lo` field of a record): 1 or 2 characters; a longer one was cut to 2;
+> - a time stamp: at most 16 hex digits (upper or lower case); a character that is no hex digit used to be read as 0;
+> - the flags, service and regexp of an `N` line: no `\000` (it cut the string) and at most 255 octets;
+> - the fingerprint of an `_` line: an even number of hex digits (such a line used to be left out, with the
+>   `karicheck` warning `zone.tinydns.skipped`, which is retired).
 
 > [!NOTE]
 > **tinydns Format Support Scope:**
 > - **Verified against djbdns 1.05 source**: Record types `.` `&` `+`
 >   `=` `-` `@` `'` `^` `C` `Z` `:` are supported, including exact
 >   default TTL values, the `x` (nameserver/MX target) expansion rules,
->   127-byte TXT character-string chunking, and the same lenient IPv4
->   octet parsing (no range validation, trailing garbage tolerated) as
->   the original `tinydns-data`.
+>   127-byte TXT character-string chunking. Unlike the original
+>   `tinydns-data`, malformed addresses, locations and time stamps are
+>   errors (see above).
 > - **Extensions** (not in djbdns 1.05). Empty numeric fields are 0; the
 >   default TTL is 86400; `timestamp` and `lo` work as for the other types:
 >   - `3fqdn:ip6:ttl:timestamp:lo`: AAAA. `ip6` is 32 hex digits without
@@ -1835,7 +1862,7 @@ correctly without duplicate records).
 >     NAPTR. `flags`, `service` and `regexp` take the octal escapes of `:`
 >     records.
 >   - `_fqdn:algorithm:fptype:fingerprint:ttl:timestamp:lo`: SSHFP with a
->     hex fingerprint; a line whose fingerprint is not valid hex is skipped.
+>     hex fingerprint (an even number of hex digits; anything else is an error).
 > - **`timestamp` field**: Supported with **real-time query evaluation**,
 >   identical to original djbdns behavior. A record whose `timestamp` is in
 >   the future is excluded dynamically on every query (not just at load time).

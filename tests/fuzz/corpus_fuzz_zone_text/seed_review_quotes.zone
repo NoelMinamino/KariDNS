@@ -1,0 +1,7 @@
+$ORIGIN fuzz.local.
+$TTL 60
+@ SOA ns h 1 2 3 4 5
+@ TXT "abc"def
+b TXT ab"c d"
+c SVCB 1 . alpn="h2,h3" port="53"
+d TXT "x" "y";c

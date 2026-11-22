@@ -1615,6 +1615,11 @@ static char *server_load_file_cb(parse_context_t *ctx, const char *rel_path, dev
         free(buf);
         return NULL;
     }
+    if (read_len > 0 && memchr(buf, '\0', read_len)) {   /* review Z-2: the parser would stop at it and lose the rest; it says why (EILSEQ) */
+        free(buf);
+        errno = EILSEQ;
+        return NULL;
+    }
     buf[read_len] = '\0';
     logev_post(LOGC_ZONELOAD, 2, NULL, 0, "[Zone] zone '%s': $INCLUDE '%s' read (%zu octets)", ctx && ctx->default_origin ? ctx->default_origin : "", rel_path, read_len);
     return buf;
@@ -2653,14 +2658,16 @@ reload_result_t reload_master_zone(zone_db_entry_t *entry, zone_config_t *zcfg) 
       ctx.zone_exists_ud = own_view;
   }
 
+  zone_limits_t limits;   /* max-records, max-records-per-type, max-types-per-name, max-zone-ttl (batch 7) */
+  zone_limits_effective(active_cfg, zcfg, zone_vname(entry), &limits);
+  ctx.max_records = (size_t)limits.max_records;   /* review Z-1: a $GENERATE over it fails while parsing */
   int count;
+  /* (read_entire_file_stat() refused a file with a NUL byte, so strlen() is the length of the file) */
   if (zext(zcfg)->file_format && strcasecmp(zext(zcfg)->file_format, "tinydns") == 0) {
       count = parse_tinydns_data(buf, strlen(buf), z_standby, &ctx);
   } else {
       count = parse_zone_fast(buf, strlen(buf), z_standby, &ctx);
   }
-  zone_limits_t limits;   /* max-records, max-records-per-type, max-types-per-name, max-zone-ttl (batch 7) */
-  zone_limits_effective(active_cfg, zcfg, zone_vname(entry), &limits);
   release_config_snapshot(active_cfg);
   free((void*)ctx.base_dir);
   free(root_path);
@@ -2695,11 +2702,6 @@ reload_result_t reload_master_zone(zone_db_entry_t *entry, zone_config_t *zcfg) 
       syslog(LOG_WARNING, "[Zone] zone '%s': ignored %zu tinydns record(s) that belong to no configured zone "
              "in view '%s' (first: '%s') in '%s'", entry->domain, ctx.out_of_zone_count, zone_vname(entry),
              ctx.first_out_of_zone ? ctx.first_out_of_zone : "", file);
-  }
-  if (ctx.skipped_data_count > 0) {   /* as karicheck reports it (DC_ZONE_TINYDNS_SKIPPED) */
-      syslog(LOG_WARNING, "[Zone] zone '%s': %zu tinydns line(s) have data that cannot be kept (an SSHFP fingerprint that is not hexadecimal) "
-             "and are left out (first: '%s') in '%s'", entry->domain, ctx.skipped_data_count,
-             ctx.first_skipped_data ? ctx.first_skipped_data : "", file);
   }
   /* X-32: 書けないレコードはその 1 件だけ警告して除く (応答や AXFR で他のレコードを巻き込まない) */
   {

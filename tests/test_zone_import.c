@@ -773,6 +773,33 @@ static void t_bad_input(void) {
     CHECK(imp_zone(&o, "example.test", 12, "a IN A 192.0.2.5\nelsewhere.example. 300 IN A 192.0.2.6\n", &r) == ZI_OK);
     LOG_HAS("zone.out-of-zone");
     CHECK(qn("SELECT count(*) FROM records WHERE name LIKE '%%elsewhere%%'") == 0);
+    /* review Z-2: a NUL byte in the text is an error, not the end of the zone (the records after it were lost) */
+    long before = nrec("example.test");
+    {
+        static const char nul_text[] = "$ORIGIN example.test.\n$TTL 3600\n@ IN SOA ns1 hostmaster 13 7200 3600 1209600 300\n@ IN NS ns1\nns1 IN A 192.0.2.1\n"
+                                       "\0www IN A 192.0.2.80\n";
+        zi_t *z = zi_open(&o);
+        CHECK(z != NULL);
+        if (z) {
+            zi_input_t in = { NULL, nul_text, sizeof(nul_text) - 1, 0 };
+            log_reset();
+            CHECK(zi_import_zone(z, &in, NULL, &r) == ZI_FAIL);
+            CHECK_HAS(g_log, "NUL byte");
+            zi_close(z);
+        }
+        /* (zi_get_text() refused it already; the zone rows loader that zone2sql and the file loaders use did not: it parsed up to the NUL) */
+        zone_arena_t za;
+        char ap[DNS_NAME_TEXT_SIZE], er[400] = "";
+        bool loaded = zrows_load_zone_text(nul_text, sizeof(nul_text) - 1, NULL, NULL, &za, ap, sizeof(ap), NULL, er, sizeof(er));
+        CHECK(!loaded);
+        CHECK_HAS(er, "NUL byte");
+        if (loaded) zone_arena_destroy(&za);
+    }
+    /* a record whose RDATA cannot be written in wire format: the zone checks refuse it (it was dropped without a word, the import went on) */
+    log_reset();
+    CHECK(imp_zone(&o, "example.test", 13, "wks IN WKS 192.0.2.1 TCP nosuchservice 25\n", &r) == ZI_FAIL);
+    LOG_HAS("zone.record.wire");
+    CHECK(nrec("example.test") == before && serial_of("example.test") == 12);
 }
 
 /* ---- a driver that fails on demand ---- */
@@ -1818,12 +1845,19 @@ static void t_verify(void) {
     po.n_loc_tags = 0;
     CHECK(imp(&po, "$ORIGIN mx.test.\n$TTL 300\nz IN A 192.0.2.5\n", "mx.test", &r) == ZI_OK);
 
-    /* a zone that is not a primary zone: the server does not serve its records, so they are not checked */
+    /* a zone that is not a primary zone: the server does not serve its records; review Z-6: they are read back all the same (a change of
+     * domains.type would serve them), so the CNAME beside the A of www is refused now (it was written unchecked) */
     be_exec("UPDATE domains SET type = 'SLAVE' WHERE name = 'example.test'");
     log_reset();
-    CHECK(imp(&o, "$ORIGIN example.test.\n$TTL 300\nwww IN CNAME mx\n", "example.test", &r) == ZI_OK);
+    CHECK(imp(&o, "$ORIGIN example.test.\n$TTL 300\nwww IN CNAME mx\n", "example.test", &r) == ZI_FAIL);
+    LOG_HAS("db.import.verify");
+    LOG_HAS("zone.cname.coexists-other");
+    CHECK(qn("SELECT count(*) FROM records WHERE name = 'www.example.test' AND type = 'CNAME'") == 0);
+    log_reset();
+    CHECK(imp(&o, "$ORIGIN example.test.\n$TTL 300\nnw IN A 192.0.2.9\n", "example.test", &r) == ZI_OK);
     LOG_HAS("db.import.not-primary");
     CHECK_HAS(g_log, "SLAVE");
+    CHECK_HAS(g_log, "checked as a primary zone");
 }
 
 /* ------------------------------------------------------------------------------------------------------------- */
@@ -2016,6 +2050,17 @@ static void t_export_signer(void) {
         free(chainless);
     }
     be_exec("DELETE FROM records WHERE name = '$x.example.test' OR name LIKE 'c_.example.test'");
+    /* review Z-6: a kept signature line with a TTL above 2^31 - 1 was written with "(int)ttl", a negative TTL; the row goes to the reader now, which refuses
+     * the zone with its reason (SQLite: PostgreSQL's records.ttl is an INT and cannot hold the value) */
+    if (g_be == BE_SQLITE) {
+        be_exec("INSERT INTO records (domain_id, name, type, content, ttl) SELECT id, 'big.example.test', 'RRSIG', 'NSEC3PARAM 8 3 3600 20300601000000 20200101000000 1 example.test. AAAA', 3000000000 FROM domains WHERE name = 'example.test'");
+        log_reset();
+        chainless = do_export_ex("example.test", ZX_PLAIN_CHAIN);
+        CHECK(chainless == NULL);
+        CHECK_HAS(g_log, "outside 0..2147483647");
+        free(chainless);
+        be_exec("DELETE FROM records WHERE name = 'big.example.test'");
+    }
     /* a zone with keys and no PRESIGNED is refused by the plain export, not by the signer's */
     be_exec("DELETE FROM domainmetadata WHERE kind IN ('PRESIGNED', 'NSEC3PARAM', 'X-KARIDNS-SIGNER')");
     be_exec("INSERT INTO cryptokeys (domain_id, flags, active, content) SELECT id, 257, true, 'k' FROM domains WHERE name = 'example.test'");
@@ -2102,6 +2147,17 @@ static void t_signer(void) {
             CHECK(strstr(u, " DNSKEY ") == NULL && strstr(u, " RRSIG ") == NULL);
             free(u);
         }
+    }
+
+    /* review Z-6: an RRSIG whose expiration is 31 February is refused (the zone parser's date rule, RFC 4034 3.2); the importer used to drop the
+     * record without a word, and its own date reader took any day 1-31 */
+    {
+        char *bad = signed_text(11, "20300231000000", "20300601000000", K_SOA_TAIL);
+        log_reset();
+        CHECK(imp_signed(&o, bad, &r) == ZI_FAIL);
+        LOG_HAS("zone.record.wire");
+        CHECK(meta_n("example.test", "PRESIGNED") == 0);
+        free(bad);
     }
 
     /* a real run: the unsigned zone becomes the signed one */

@@ -60,7 +60,7 @@ static void test_basic_records(void) {
         "Calias.example.com:www.example.com:1200\n" // CNAME
         "Zcustom.example.com:ns1.custom.example.com:admin.custom.example.com:2026090201:7200:3600:1209600:300:600\n" // Full SOA
         ":ssh.example.com:44:\\002\\001\\001\\012\\023\\045:3600\n" // Generic RR (SSHFP type 44)
-        "%loc1:192.168\n"; // location directive (phase 1: ignored)
+        "%l1:192.168\n"; // location directive (a code is 1-2 characters: "loc1" is an error since review Z-6)
 
     char buf[4096];
     strncpy(buf, data, sizeof(buf) - 1);
@@ -201,39 +201,108 @@ static void test_txt_127_byte_chunking(void) {
     }
 }
 
+/* one tinydns text: the parse result; *msg the error message (or NULL) */
+static int tdns_parse_text(const char *text, const char **msg, zone_arena_t *arena) {
+    static char buf[4096];
+    static parse_error_t err;
+    snprintf(buf, sizeof(buf), "%s", text);
+    zone_arena_init(arena);
+    memset(&err, 0, sizeof(err));
+    parse_context_t ctx = { .default_origin = "example.com.", .err_out = &err };
+    int rc = parse_tinydns_data(buf, strlen(buf), arena, &ctx);
+    if (msg) *msg = err.error_message;
+    return rc;
+}
+
+/* a line that must fail with a message that contains want */
+static void tdns_expect_error(const char *line, const char *want) {
+    zone_arena_t arena;
+    const char *msg = NULL;
+    int rc = tdns_parse_text(line, &msg, &arena);
+    bool ok = rc < 0 && msg && strstr(msg, want);
+    if (!ok) printf("  line '%s': rc %d, message '%s' (want '%s')\n", line, rc, msg ? msg : "(none)", want);
+    TEST_ASSERT(ok, "malformed tinydns field is an error of the file");
+    zone_arena_destroy(&arena);
+}
+
 /* ============================================================================
- * Test 3: 緩い IPv4 スキャナ検証 (オーバーフロー & ゴミ文字)
+ * Test 3: IPv4 フィールド (review Z-4, user decision 2026-11-22: strict, not djbdns' ip4_scan()).  djbdns kept the low 8 bits of an
+ * octet ("256.0.0.1" -> 0.0.0.1), ignored trailing junk ("1.2.3.4junk" -> 1.2.3.4) and made no record for text that is no address.
  * ============================================================================ */
 static void test_loose_ip4_scan(void) {
-    printf("--- Test 3: Loose IPv4 Scanning ---\n");
-
-    // "256.0.0.1" -> (256 & 0xFF) = 0 -> "0.0.0.1"
-    // "10.20.30.40garbage" -> "10.20.30.40"
-    const char *data =
-        "+overflow.example.com:256.0.0.1:300\n"
-        "+garbage.example.com:10.20.30.40trailingstuff:300\n";
-
-    char buf[512];
-    strcpy(buf, data);
-
+    printf("--- Test 3: IPv4 fields are strict ---\n");
+    static const char *const bad_ip[] = { "256.0.0.1", "999.1.1.1", "10.20.30.40trailingstuff", "not-an-ip", "1.2.3", "1.2.3.4.5",
+                                          "1..2.3", "0001.2.3.4", "1.2.3.4 ", "-1.2.3.4", ".1.2.3" };
+    static const char *const tmpl[] = { "+h.example.com:%s:300\n", "=h.example.com:%s:300\n", ".example.com:%s:a:300\n", "&example.com:%s:a:300\n",
+                                        "@example.com:%s:a:10:300\n", "Sexample.com:%s:t.example.com:5060:1:2:300\n" };
+    for (size_t i = 0; i < sizeof(bad_ip) / sizeof(bad_ip[0]); i++)
+        for (size_t t = 0; t < sizeof(tmpl) / sizeof(tmpl[0]); t++) {
+            char line[256];
+            snprintf(line, sizeof(line), tmpl[t], bad_ip[i]);
+            tdns_expect_error(line, "Invalid IPv4 address");
+        }
+    /* the edges, leading zeros (decimal, up to 3 digits) and an empty field ("no address", as in djbdns) */
     zone_arena_t arena;
-    zone_arena_init(&arena);
-    parse_error_t err = {0};
-    parse_context_t ctx = { .default_origin = "example.com.", .err_out = &err };
-
-    int count = parse_tinydns_data(buf, strlen(buf), &arena, &ctx);
-    TEST_ASSERT(count == 2, "Loose IPv4 records parsed");
-
+    TEST_ASSERT(tdns_parse_text("+a.example.com:0.0.0.0:300\n+b.example.com:255.255.255.255:300\n+c.example.com:010.001.000.009:300\n"
+                                "+d.example.com::300\n", NULL, &arena) == 3, "valid IPv4 fields and an empty one");
     for (size_t i = 0; i < arena.count; i++) {
         dns_record_t *r = &arena.records[i];
-        if (strcmp(r->name, "overflow.example.com.") == 0) {
-            TEST_ASSERT(strcmp(r->rdata[0], "0.0.0.1") == 0, "256 masked to 0");
-        }
-        if (strcmp(r->name, "garbage.example.com.") == 0) {
-            TEST_ASSERT(strcmp(r->rdata[0], "10.20.30.40") == 0, "Trailing garbage ignored");
-        }
+        if (strcmp(r->name, "a.example.com.") == 0) TEST_ASSERT(strcmp(r->rdata[0], "0.0.0.0") == 0, "0.0.0.0");
+        if (strcmp(r->name, "b.example.com.") == 0) TEST_ASSERT(strcmp(r->rdata[0], "255.255.255.255") == 0, "255.255.255.255");
+        if (strcmp(r->name, "c.example.com.") == 0) TEST_ASSERT(strcmp(r->rdata[0], "10.1.0.9") == 0, "leading zeros are decimal");
     }
+    zone_arena_destroy(&arena);
+    /* the location prefix of a % line: octets 0-255, nothing after them but "/n" */
+    tdns_expect_error("%in:192.300\n", "Invalid IPv4 prefix");
+    tdns_expect_error("%in:192.168x\n", "Invalid IPv4 prefix");
+    tdns_expect_error("%in:1.2.3.4.5\n", "Invalid IPv4 prefix");
+    tdns_expect_error("%in:abc\n", "Invalid IPv4 prefix");
+    TEST_ASSERT(tdns_parse_text("%in:192.168\n%ex:10.0.0.0/8\n%df:\n%dt:10.\n", NULL, &arena) == 0 && arena.location_count == 4, "valid prefixes");
+    if (arena.location_count == 4) {
+        TEST_ASSERT(arena.locations[0].prefix_bits == 16 && arena.locations[1].prefix_bits == 8 && arena.locations[2].prefix_bits == 0 &&
+                    arena.locations[3].prefix_bits == 8 && arena.locations[3].prefix[0] == 10, "prefix lengths");
+    }
+    zone_arena_destroy(&arena);
+}
 
+/* ============================================================================
+ * Test 3b: the other fields that djbdns reads loosely (review Z-6): IPv6, location code, time stamp, NAPTR strings, SSHFP fingerprint
+ * ============================================================================ */
+static void test_strict_fields(void) {
+    printf("--- Test 3b: IPv6, location, time stamp, NAPTR, SSHFP fields are strict ---\n");
+    tdns_expect_error("3h.example.com:20010db80000000000000000000000zz:3600\n", "Invalid IPv6 address");
+    tdns_expect_error("6h.example.com:20010db801:3600\n", "Invalid IPv6 address");
+    tdns_expect_error("3h.example.com:2001-0db8-0000-0000-0000-0000-0000-0001:3600\n", "Invalid IPv6 address");
+    tdns_expect_error("+h.example.com:192.0.2.1:300::abc\n", "Invalid location code");
+    tdns_expect_error("%abc:10.0.0.0/8\n", "Invalid location code");
+    tdns_expect_error("+h.example.com:192.0.2.1:300:400000003b9acZ00\n", "Invalid timestamp");
+    tdns_expect_error("+h.example.com:192.0.2.1:300:20260101T000000\n", "Invalid timestamp");
+    tdns_expect_error("+h.example.com:192.0.2.1:300:40000000000000000\n", "Invalid timestamp");   /* 17 digits */
+    tdns_expect_error("Nn.example.com:100:10:s\\000x:SIP+D2U:!^.*$!x!:.:3600\n", "Invalid NAPTR");
+    tdns_expect_error("Nn.example.com:100:10:s:SIP\\000D2U:!^.*$!x!:.:3600\n", "Invalid NAPTR");
+    {
+        char line[700];
+        int o = snprintf(line, sizeof(line), "Nn.example.com:100:10:s:SIP:");
+        for (int i = 0; i < 256; i++) line[o++] = 'r';
+        snprintf(line + o, sizeof(line) - (size_t)o, ":.:3600\n");
+        tdns_expect_error(line, "Invalid NAPTR");
+    }
+    tdns_expect_error("_s.example.com:1:1:nothex:3600\n", "Invalid SSHFP fingerprint");
+    tdns_expect_error("_s.example.com:1:1:abc:3600\n", "Invalid SSHFP fingerprint");   /* odd */
+    /* what stays valid: upper-case time stamp digits, a 1-2 character location, an SSHFP fingerprint longer than 64 octets */
+    zone_arena_t arena;
+    char fp[200];
+    for (int i = 0; i < 160; i++) fp[i] = "0123456789ABCDEF"[i % 16];
+    fp[160] = '\0';
+    char text[512];
+    snprintf(text, sizeof(text), "+h.example.com:192.0.2.1:300:400000003B9ACA00:i\n3h6.example.com:20010DB8000000000000000000000001:300::in\n"
+                                 "_s.example.com:1:2:%s:300\n", fp);
+    TEST_ASSERT(tdns_parse_text(text, NULL, &arena) == 3, "valid strict fields");
+    for (size_t i = 0; i < arena.count; i++) {
+        dns_record_t *r = &arena.records[i];
+        if (r->type_code == 1) TEST_ASSERT(r->tinydns_ttd == 1000000000 && r->tinydns_loc[0] == 'i' && r->tinydns_loc[1] == 0, "ttd and location");
+        if (r->type_code == 44) TEST_ASSERT(strlen(r->rdata[2]) == 160, "a long SSHFP fingerprint is kept");
+    }
     zone_arena_destroy(&arena);
 }
 
@@ -552,22 +621,8 @@ static void test_timestamp_evaluation(void) {
         zone_arena_destroy(&arena);
     }
 
-    // 3. 不正な16進数文字を含むタイムスタンプ (ttdparseの緩さ検証) -> エラーにならず継続
-    const char *invalid_hex_data =
-        "+badhex.example.com:192.168.1.5:300:400000003b9acZ00\n"; // 'Z' は0として扱われる
-    {
-        char buf[256]; strcpy(buf, invalid_hex_data);
-        zone_arena_t arena; zone_arena_init(&arena);
-        parse_error_t err = {0};
-        parse_context_t ctx = { .default_origin = "example.com.", .err_out = &err };
-
-        int count = parse_tinydns_data(buf, strlen(buf), &arena, &ctx);
-        TEST_ASSERT(count == 1, "Invalid hex chars in timestamp do not cause error");
-        if (arena.count == 1) {
-            TEST_ASSERT(arena.records[0].tinydns_ttd != 0, "Non-zero TTD parsed with loose hex");
-        }
-        zone_arena_destroy(&arena);
-    }
+    // 3. 不正な16進数文字を含むタイムスタンプ: review Z-6 からエラー (ttdparse() は 0 として読んでいた)
+    tdns_expect_error("+badhex.example.com:192.168.1.5:300:400000003b9acZ00\n", "Invalid timestamp");
 
     // 4. timestamp フィールドが空 -> 従来通りの TTL で生成、tinydns_ttd=0
     const char *empty_ts_data =
@@ -744,11 +799,8 @@ static void test_third_party_patch_records(void) {
         // Type N: NAPTR (note: colons inside fields must be escaped as \072 in tinydns)
         "Nnaptr.example.com:100:10:s:SIP+D2U:!^.*$!sip\\072info@example.com!:.:3600\n"
         // Type _: SSHFP (owner is ssh.example.com)
-        "_ssh.example.com:1:1:123456789abcdef67890123456789abcdef67890:3600\n"
-        // Negative / loose parsing cases: should be skipped without error
-        "3badhex.example.com:20010db80000000000000000000000zz:3600\n"
-        "3short.example.com:20010db801:3600\n"
-        "_badssh.example.com:1:1:nothex:3600\n";
+        "_ssh.example.com:1:1:123456789abcdef67890123456789abcdef67890:3600\n";
+    /* (the malformed 3 / _ lines that were left out here are errors since review Z-6: test_strict_fields) */
 
     char *buf = strdup(data);
     zone_arena_t arena;
@@ -1054,6 +1106,7 @@ int main(void) {
     test_basic_records();
     test_txt_127_byte_chunking();
     test_loose_ip4_scan();
+    test_strict_fields();
     test_generic_record_prohibited_types();
     test_zone_filtering_and_parent_child();
     test_config_file_format();

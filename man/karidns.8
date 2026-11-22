@@ -1025,19 +1025,41 @@ a file in a sub-directory that did not exist at start-up, as long as it is below
 one of those trees.
 .IP \(bu 2
 \fB\fB$GENERATE <range> <lhs> [<TTL>] [<class>] <type> <rhs>\fB\fR (BIND
-syntax): \fB<range>\fR is \fBstart\-stop[/step]\fR (at most 100,000
-records). For each value, \fB$\fR in \fB<lhs>\fR and \fB<rhs>\fR is replaced by
-the value, \fB${offset[,width[,base]]}\fR with base \fBd\fR, \fBo\fR, \fBx\fR,
-\fBX\fR, \fBn\fR or \fBN\fR (\fBn\fR/\fBN\fR: nibbles in reverse order separated
-by dots, as for \fBip6.arpa\fR; the width counts the dots), \fB$$\fR gives
-\fB$\fR and \fB\e$\fR a literal \fB$\fR. Any RR type can be generated; the
-resulting line is read like any other record line, so
-\fB$ECS\-SUBNET\fR/\fB$LOCATION\fR tags and the TTL rules apply. \fB<rhs>\fR is
-one field: quote RDATA that contains spaces, e.g. \fB$GENERATE 1\-10 host$ MX
-"10 mail$"\fR. The quotes only keep the field together; the text inside is split
-on blanks again, so one TXT character-string that contains a blank cannot be
-generated (BIND keeps \fBTXT "a b"\fR as one string): put such records in the
-zone file itself.
+syntax): \fB<range>\fR is \fBstart\-stop[/step]\fR (at most 100,000 records per
+statement, and at most 1,000,000 generated records in a zone, its \fB$INCLUDE\fR
+files included; a statement that would go past the total, or make the zone
+larger than its \fBmax\-records\fR, is a zone file error at that statement
+before it makes a record. BIND has neither bound; before 0.7 a 350 KB file of
+10,000 statements asked for 10^9 records and the load ran out of memory). For
+each value, \fB$\fR in \fB<lhs>\fR and \fB<rhs>\fR is replaced by the value,
+\fB${offset[,width[,base]]}\fR with base \fBd\fR, \fBo\fR, \fBx\fR, \fBX\fR,
+\fBn\fR or \fBN\fR (\fBn\fR/\fBN\fR: nibbles in reverse order separated by dots,
+as for \fBip6.arpa\fR; the width counts the dots), \fB$$\fR gives \fB$\fR and
+\fB\e$\fR a literal \fB$\fR. Any RR type can be generated; the resulting line is
+read like any other record line, so \fB$ECS\-SUBNET\fR/\fB$LOCATION\fR tags and
+the TTL rules apply. \fB<rhs>\fR is one field: quote RDATA that contains spaces,
+e.g. \fB$GENERATE 1\-10 host$ MX "10 mail$"\fR. The quotes only keep the field
+together; the text inside is split on blanks again, so one TXT character-string
+that contains a blank cannot be generated (BIND keeps \fBTXT "a b"\fR as one
+string): put such records in the zone file itself.
+.IP \(bu 2
+\fBQuoted strings\fR are fields of their own (RFC 1035 \[u00A7]5.1): text right
+after a closing \fB"\fR (\fB"abc"def\fR) or a \fB"\fR inside a field (\fBab"c
+d"\fR) is a zone file error (BIND reads both as two fields; before 0.7 KariDNS
+kept one field \fBabc"def\fR). The one exception is the value of a
+\fBkey="value"\fR pair (RFC 9460 \[u00A7]2.1, \fBalpn="h2,h3"\fR). A \fB"\fR
+that belongs to the text is written \fB\e"\fR.
+.IP \(bu 2
+\fBTag names\fR of \fB$LOCATION\-TAG\fR, \fB$ECS\-SUBNET\-TAG\fR,
+\fB$LOCATION\fR and \fB$ECS\-SUBNET\fR are at most 63 characters, as in the
+database tables; a longer name is a zone file error (it used to be cut to 63, so
+two names that differ after the 63rd character were one tag).
+.IP \(bu 2
+\fBA NUL byte\fR anywhere in a zone file, an \fB$INCLUDE\fR file or a tinydns
+data file is an error (\fBthe zone file contains a NUL byte\fR, \fB$INCLUDE file
+contains a NUL byte\fR): the parsers stop at a NUL, so the records after it used
+to be lost while the load succeeded. \fBkaricheck\fR (\fBio.nul\-byte\fR) and
+\fBkaridns\-zone import\fR refuse such a file too.
 .SH TINYDNS ZONE FORMAT
 KariDNS can load zone data directly from djbdns/tinydns-style plain-text
 \fBdata\fR files (not the compiled \fBdata.cdb\fR), in addition to standard
@@ -1065,9 +1087,40 @@ parser does not limit the 8-, 16- and 32-bit numeric fields of the extension
 lines (\fBS\fR, \fBN\fR, \fB_\fR, ...). djbdns itself truncates such a value;
 KariDNS keeps it, and a record whose value does not fit its field is left out
 with a warning when the zone is loaded (\fBkaricheck\fR reports it as
-\fBzone.record.wire\fR). An SSHFP line whose fingerprint is not hexadecimal is
-left out as well; \fBkaricheck\fR reports it once per file
-(\fBzone.tinydns.skipped\fR).
+\fBzone.record.wire\fR).
+.RE
+.PP
+.RS 4
+\fBImportant:\fR \fBMalformed fields are errors (0.7).\fR djbdns reads several
+fields loosely and KariDNS used to do the same; a line with such a field now
+fails the load of the data file (the version in service stays, \fBkaricheck\fR
+reports \fBzone.syntax\fR, and \fBkaridns\-zone import\fR writes nothing), with
+the field and its line:
+.IP \(bu 2
+an IPv4 address (\fB+\fR, \fB=\fR, \fB.\fR, \fB&\fR, \fB@\fR, \fBS\fR): exactly
+four decimal octets 0-255 and nothing else. djbdns kept the low 8 bits of an
+octet (\fB999.1.1.1\fR became 231.1.1.1), ignored what followed the address
+(\fB1.2.3.4junk\fR) and made no record for text that is no address; an empty
+field still means "no address";
+.IP \(bu 2
+the IPv4 prefix of a \fB%\fR line: up to four octets 0-255, then nothing or
+\fB/n\fR;
+.IP \(bu 2
+an IPv6 address of a \fB3\fR / \fB6\fR line: 32 hex digits (an empty field: no
+address); a bad one used to leave the AAAA and the PTRs out without a word;
+.IP \(bu 2
+a location code (the \fB%\fR line and the \fBlo\fR field of a record): 1 or 2
+characters; a longer one was cut to 2;
+.IP \(bu 2
+a time stamp: at most 16 hex digits (upper or lower case); a character that is
+no hex digit used to be read as 0;
+.IP \(bu 2
+the flags, service and regexp of an \fBN\fR line: no \fB\e000\fR (it cut the
+string) and at most 255 octets;
+.IP \(bu 2
+the fingerprint of an \fB_\fR line: an even number of hex digits (such a line
+used to be left out, with the \fBkaricheck\fR warning
+\fBzone.tinydns.skipped\fR, which is retired).
 .RE
 .PP
 .RS 4
@@ -1076,9 +1129,9 @@ left out as well; \fBkaricheck\fR reports it once per file
 \fBVerified against djbdns 1.05 source\fR: Record types \fB.\fR \fB&\fR \fB+\fR
 \fB=\fR \fB\-\fR \fB@\fR \fB'\fR \fB^\fR \fBC\fR \fBZ\fR \fB:\fR are supported,
 including exact default TTL values, the \fBx\fR (nameserver/MX target) expansion
-rules, 127-byte TXT character-string chunking, and the same lenient IPv4 octet
-parsing (no range validation, trailing garbage tolerated) as the original
-\fBtinydns\-data\fR.
+rules, 127-byte TXT character-string chunking. Unlike the original
+\fBtinydns\-data\fR, malformed addresses, locations and time stamps are errors
+(see above).
 .IP \(bu 2
 \fBExtensions\fR (not in djbdns 1.05). Empty numeric fields are 0; the default
 TTL is 86400; \fBtimestamp\fR and \fBlo\fR work as for the other types:
@@ -1099,7 +1152,7 @@ NAPTR. \fBflags\fR, \fBservice\fR and \fBregexp\fR take the octal escapes of
 \fB:\fR records.
 .IP \(bu 2
 \fB_fqdn:algorithm:fptype:fingerprint:ttl:timestamp:lo\fR: SSHFP with a hex
-fingerprint; a line whose fingerprint is not valid hex is skipped.
+fingerprint (an even number of hex digits; anything else is an error).
 .RE
 .IP \(bu 2
 \fB\fBtimestamp\fB field\fR: Supported with \fBreal-time query evaluation\fR,

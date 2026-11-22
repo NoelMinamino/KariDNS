@@ -51,10 +51,6 @@ typedef struct parse_context_s {
      * その最初のオーナー名 (arena 内の文字列)。all_zone_names が無ければ数えない。 */
     size_t out_of_zone_count;
     const char *first_out_of_zone;
-    /* tinydns: lines whose data cannot be kept and that the parser leaves out on purpose (an SSHFP fingerprint that is not hexadecimal): the
-     * count and the owner of the first (arena string), so that karicheck can warn (review dns_tinydns_parser.c [8]). */
-    size_t skipped_data_count;
-    const char *first_skipped_data;
     /* tinydns: SOA serial に使うデータファイルの mtime (0 = 不明、読み込み時刻を使う)。
      * パーサ自身はファイルを stat しない (X-13: サンドボックス内の再読み込みではパスを使えない)。 */
     time_t source_mtime;
@@ -79,6 +75,11 @@ typedef struct parse_context_s {
     const char *cur_file;
     size_t cur_line;
     bool in_generate;
+    /* max-records of the zone (0 = no limit): a $GENERATE that would take the zone past it is an error while parsing (zone_arena_check_limits()
+     * checks the built zone later).  parser-internal: generated_count, the records the $GENERATE statements of the zone asked for so far
+     * ($INCLUDE files too), at most ZONE_GENERATE_TOTAL_MAX. */
+    size_t max_records;
+    size_t generated_count;
 } parse_context_t;
 
 typedef struct {
@@ -210,6 +211,17 @@ static inline uint64_t zone_arena_data_generation(const zone_version_t *version)
   return atomic_load_explicit((_Atomic uint64_t *)&version->generation, memory_order_acquire);
 }
 
+/* $GENERATE: at most ZONE_GENERATE_PER_DIRECTIVE_MAX records per statement and ZONE_GENERATE_TOTAL_MAX for the whole zone (its $INCLUDE
+ * files too).  BIND 9.20 has neither bound (only max-records); without them a small file could ask for 10^9 records. */
+#define ZONE_GENERATE_PER_DIRECTIVE_MAX 100000u
+#define ZONE_GENERATE_TOTAL_MAX 1000000u
+/* the longest $LOCATION-TAG / $ECS-SUBNET-TAG name (and the name of $LOCATION / $ECS-SUBNET): 63 characters, as the database reader
+ * (pdns_zone_add_tags()) and the zone image take it; a longer one is a zone file error */
+#define ZONE_TAG_NAME_MAX 63
+/* parse_zone_fast() and parse_tinydns_data() refuse a buffer that holds a NUL byte in its first len bytes ("the zone file contains a NUL
+ * byte"): the text after it would otherwise be lost without a word.  Pass the length of the text as read, not strlen().
+ * zone_text_has_nul(): that check (true = a NUL, the error is in ctx->err_out). */
+bool zone_text_has_nul(const char *buf, size_t len, parse_context_t *ctx);
 int parse_zone_fast(char *buf, size_t len, zone_arena_t *arena, parse_context_t *ctx);
 int parse_tinydns_data(char *buf, size_t len, zone_arena_t *arena, parse_context_t *ctx);
 dns_record_t *arena_alloc_record(zone_arena_t *arena, parse_context_t *ctx, const char *err_pos, const char *buf);
@@ -312,7 +324,8 @@ ecs_tag_def_t *clone_ecs_tags_array(const ecs_tag_def_t *src, int count);
 #ifndef _WIN32
 /* The text of the file a tool's $INCLUDE names (karicheck, karidns-zone): the checks of the server's reader (server_load_file_cb in
  * dns_snapshot_rcu.c).  A symbolic link as the last component is not followed, a FIFO does not block, only a regular file of at most max
- * bytes is read, and a short read fails.  NULL on any failure, else malloc'ed text with a NUL after it. */
+ * bytes is read, and a short read fails.  A file that holds a NUL byte is refused too (errno EILSEQ; the parser
+ * says so).  NULL on any failure, else malloc'ed text with a NUL after it. */
 char *zone_read_include_file(const char *path, size_t max, dev_t *out_dev, ino_t *out_ino);
 #endif
 /* the size limit of an $INCLUDE file in the tools: the server's (KARIDNS_MAX_CONFIG_FILE_SIZE in dns_config_parser.h) */
