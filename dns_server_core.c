@@ -2060,7 +2060,7 @@ static const char *const g_ipcd_names[IPCD_COUNT] = {
   "router.worker.spilled", "router.worker.dropped_full", "router.worker.dropped_error", "router.rx.truncated", "router.rx.short",
   "router.reply.short", "router.reply.bad_length", "router.reply.bad_socket", "router.client.dropped_full", "router.client.dropped_error",
   "worker.rx.short", "worker.rx.bad_length", "worker.reply.dropped_full", "worker.reply.dropped_error", "worker.async.dropped_full",
-  "worker.udp.truncated", "worker.udp.short", "router.reply.cut", "router.client.retried",
+  "worker.udp.truncated", "worker.udp.short", "router.reply.cut", "router.client.retried", "worker.reply.retried",
 };
 _Static_assert(sizeof(g_ipcd_names) / sizeof(g_ipcd_names[0]) == IPCD_COUNT, "a name for every IPC counter");
 /* udp-receive backend: the queries each worker read from its own UDP sockets (ipcworker.<w>.queries).  The workers are threads of the Backend, which
@@ -2120,7 +2120,7 @@ size_t ipcd_format(char *buf, size_t cap) {
   uint64_t dropped = 0;
   for (int i = 0; i < IPCD_COUNT; i++) {
     const uint64_t v = ipcd_total((ipcd_t)i);
-    if (i != IPCD_RTW_SPILLED && i != IPCD_RREP_CUT && i != IPCD_RCLI_RETRIED) dropped += v;   /* (a spill and a retry are served; a cut is a datagram, its bad frame is counted) */
+    if (i != IPCD_RTW_SPILLED && i != IPCD_RREP_CUT && i != IPCD_RCLI_RETRIED && i != IPCD_WREP_RETRIED) dropped += v;   /* (a spill and a retry are served; a cut is a datagram, its bad frame is counted) */
     int w = snprintf(buf + len, cap - len, "ipc.%s=%llu\n", g_ipcd_names[i], (unsigned long long)v);
     if (w < 0 || (size_t)w >= cap - len) return len;
     len += (size_t)w;
@@ -2247,15 +2247,12 @@ STATIC_TEST int router_send_clients(int fd, struct mmsghdr *msgs, int n, bool *s
   return hard + full;
 }
 
-/* A reply of a worker that a plain send() to the router could not hand over (the asynchronous resolution threads): counted as the batches are. */
-STATIC_TEST void ipc_reply_failed(int err) {
-  ipcd_add((err == EAGAIN || err == EWOULDBLOCK || err == ENOBUFS) ? IPCD_WREP_FULL : IPCD_WREP_ERR, 1);
-  log_udp_send_drop("Backend->Frontend IPC", true, err, 1);
-}
-
 /* B3 phase 3: the most octets of one packed worker -> router datagram (dns_ipc_frame.h): net.local.dgram.maxdgram, read by setup_ipc_tables()
  * before the fork (the Backend cannot read a sysctl in capability mode).  Until then (unit tests) a small default. */
 STATIC_TEST size_t g_ipc_pack_max = UDP_IPC_PACK_DEFAULT;
+
+/* the send of ipc_send_frames(): sendmsg(2); a unit test puts a queue in its place that refuses a number of times (ipc_reply_flush()) */
+STATIC_TEST ssize_t (*g_ipc_sendmsg_fn)(int, const struct msghdr *, int) = sendmsg;
 
 /* One datagram of the frames iov[0 .. cnt): 0, or the errno (a datagram goes whole or not at all) */
 static int ipc_send_frames(int fd, struct iovec *iov, int cnt) {
@@ -2265,31 +2262,110 @@ static int ipc_send_frames(int fd, struct iovec *iov, int cnt) {
   mh.msg_iovlen = cnt;
   ssize_t r;
   do {
-    r = sendmsg(fd, &mh, MSG_DONTWAIT);
+    r = g_ipc_sendmsg_fn(fd, &mh, MSG_DONTWAIT);
   } while (r < 0 && errno == EINTR);
   return r < 0 ? errno : 0;
 }
 
-/* The replies batch->tx_buffers[0 .. n) of a worker (batch->tx_iov[i]: the udp_ipc_t header and the reply) to its router on fd, packed into as
- * few datagrams as fit under g_ipc_pack_max (udp_ipc_pack(): no copy, the iovecs are gathered).  What cannot go is dropped and counted in
- * replies, not datagrams, as sendmmsg_skip_failed() counts them: a full queue (EAGAIN / ENOBUFS) stops the batch and counts every reply not sent
- * as IPCD_WREP_FULL; another failure drops that datagram's replies (IPCD_WREP_ERR) and goes on.  A packed datagram the kernel refuses as too long
- * (EMSGSIZE: net.local.dgram.maxdgram lowered since the start) is sent again one reply per datagram.  No allocation.  Returns the number
- * dropped. */
-STATIC_TEST int ipc_reply_flush(int fd, udp_batch_ctx_t *batch, int n) {
+/* 0.7 (IPC backpressure): a worker -> router queue that is full is waited for, not dropped at once.  On 1 CPU the worker, woken by the network
+ * interrupt, keeps the CPU and the router that empties its queue does not run: measured on a 1 vCPU VM (2026-11-22), every reply lost at 35k qps
+ * was a reply this queue refused (ipc.worker.reply.dropped_full), and the router at nice -20 alone took the ceiling from 35k to 40-42.5k qps.
+ * The wait cannot be an event: a unix datagram socket of FreeBSD 15 reports itself writable (poll POLLOUT, kevent EVFILT_WRITE with the whole
+ * send buffer free) while its queue is full and sendmsg() fails with ENOBUFS (measured on 15.1; the queue of a connected pair is the
+ * sender's SO_SNDBUF).  So the refused datagram is sent again, in order (the replies of one worker keep their order): at once, then after
+ * pauses of IPC_REPLY_PAUSE_US, which give the CPU to the router,
+ * until it goes or IPC_REPLY_BUDGET_US have passed since the first refusal of the batch; only what is still refused then is dropped and counted
+ * (IPCD_WREP_FULL), as before.  Meanwhile the queries wait in the worker's UDP socket (the kernel drops there if it overflows, counted by netstat).
+ * A queue that used up its budget is marked for this thread (a router that is stopped or hung): its next batches are tried once without waiting,
+ * until one goes whole, so a dead router costs one budget per episode, not one per batch.  The replies that went out after a wait are counted as
+ * IPCD_WREP_RETRIED (not a loss).  Nothing of this runs when the send succeeds: the clock, the marks and the pauses are after a refusal only.
+ * Rule 2: no new descriptor and no new kind of I/O; the send is the one the worker always made, on the descriptor it holds.
+ * The values, measured on the 1 vCPU VM (2026-11-22, 30 s runs, 3 per rate; before: 35k 2 of 3, 37.5k 0 of 3): pauses of 50 us and a budget of
+ * 2 ms were no better (35k 2 of 3, 37.5k 0 of 3: the queue was still full after the budget), and 50 us with 20 ms collapsed (35k: 86-91 % lost,
+ * the worker woke every 50 us and the router could not catch up); pauses of 1 ms let the router empty much of the queue in one go, and with a
+ * budget of 50 ms no reply was dropped at the queue at 35k-45k qps (37.5k 3 of 3, 40k and 42.5k 3 of 6; what is lost above that is the worker's
+ * UDP socket overflowing).  A wait is rare on several CPUs (the router runs beside the worker). */
+#define IPC_REPLY_BUDGET_US 50000
+#define IPC_REPLY_PAUSE_US 1000
+/* the budget in force (a unit test sets it; read only after a refusal) */
+STATIC_TEST long g_ipc_reply_budget_us = IPC_REPLY_BUDGET_US;
+/* the router queues (descriptor + 1; 0 = a free slot) whose budget this thread used up and that have not taken a whole batch since.  A worker
+ * talks to one router (udp-receive backend) or to each (frontend), an asynchronous thread to each: at most KARIDNS_ROUTER_THREADS_MAX */
+static _Thread_local int t_ipc_marked[KARIDNS_ROUTER_THREADS_MAX];
+static _Thread_local int t_ipc_nmarked;
+typedef struct {
+  int tries;              /* (the refusals waited for in this batch) */
+  bool gave_up;           /* (the budget is used, or the queue was marked: no more waiting in this batch) */
+  struct timespec t0;     /* (the first refusal) */
+} ipc_wait_t;
+
+static int ipc_mark_slot(int fd) {
+  for (int i = 0; i < KARIDNS_ROUTER_THREADS_MAX; i++)
+    if (t_ipc_marked[i] == fd + 1) return i;
+  return -1;
+}
+
+/* After the refusal of a full queue: true = send again now (after a pause from the second refusal of the batch on), false = drop */
+static bool ipc_wait_more(int fd, ipc_wait_t *w) {
+  if (w->gave_up) return false;
+  struct timespec now;
+  clock_gettime(CLOCK_MONOTONIC, &now);
+  if (w->tries == 0) {
+    if (t_ipc_nmarked > 0 && ipc_mark_slot(fd) >= 0) {   /* (a queue that used its budget and has taken no whole batch since: not waited for) */
+      w->gave_up = true;
+      return false;
+    }
+    w->t0 = now;
+  } else if ((now.tv_sec - w->t0.tv_sec) * 1000000L + (now.tv_nsec - w->t0.tv_nsec) / 1000 >= g_ipc_reply_budget_us) {
+    w->gave_up = true;
+    const int s = fd >= 0 ? ipc_mark_slot(-1) : -1;          /* (a free slot, value 0: there is always one, see t_ipc_marked) */
+    if (s >= 0) {
+      t_ipc_marked[s] = fd + 1;
+      t_ipc_nmarked++;
+    }
+    return false;
+  } else {
+    const struct timespec pause = { 0, IPC_REPLY_PAUSE_US * 1000L };
+    nanosleep(&pause, NULL);
+  }
+  w->tries++;
+  return true;
+}
+
+/* ipc_send_frames(), waiting for a full queue within the batch's budget (ipc_wait_more()): 0, or the errno of the last refusal */
+static int ipc_send_frames_wait(int fd, struct iovec *iov, int cnt, ipc_wait_t *w) {
+  int e;
+  while ((e = ipc_send_frames(fd, iov, cnt)) != 0 && (e == EAGAIN || e == EWOULDBLOCK || e == ENOBUFS) && ipc_wait_more(fd, w)) {}
+  return e;
+}
+
+/* The replies iov[0 .. n) of a worker (iov[i]: the udp_ipc_t header and the reply, batch->tx_iov for a batch) to its router on fd, packed into as
+ * few datagrams as fit under g_ipc_pack_max (udp_ipc_pack(): no copy, the iovecs are gathered).  A full queue (EAGAIN / ENOBUFS) is waited for
+ * (above); what still cannot go is dropped and counted in replies, not datagrams, as sendmmsg_skip_failed() counts them: a queue still full after
+ * the wait stops the batch and counts every reply not sent as IPCD_WREP_FULL; another failure drops that datagram's replies (IPCD_WREP_ERR) and
+ * goes on.  A packed datagram the kernel refuses as too long (EMSGSIZE: net.local.dgram.maxdgram lowered since the start) is sent again one reply
+ * per datagram.  No allocation.  Returns the number dropped. */
+STATIC_TEST int ipc_reply_flush(int fd, struct iovec *iov, int n) {
   if (n <= 0) return 0;
   if (n > UDP_BATCH_SIZE) n = UDP_BATCH_SIZE;
   udp_ipc_group_t g[UDP_BATCH_SIZE];
-  const int ng = udp_ipc_pack(batch->tx_iov, n, g_ipc_pack_max, g);
-  int full = 0, hard = 0, last_err = 0;
+  const int ng = udp_ipc_pack(iov, n, g_ipc_pack_max, g);
+  int full = 0, hard = 0, last_err = 0, retried = 0;
+  ipc_wait_t w = { 0, false, { 0, 0 } };
   for (int k = 0; k < ng; k++) {
-    int e = ipc_send_frames(fd, &batch->tx_iov[g[k].first], g[k].count);
-    if (e == 0) continue;
+    int e = ipc_send_frames_wait(fd, &iov[g[k].first], g[k].count, &w);
+    if (e == 0) {
+      if (w.tries > 0) retried += g[k].count;
+      continue;
+    }
     if (e == EMSGSIZE && g[k].count > 1) {
       /* (a padded frame sent alone ends with its zero padding: the router reads it as one frame) */
       for (int i = 0; i < g[k].count; i++) {
-        e = ipc_send_frames(fd, &batch->tx_iov[g[k].first + i], 1);
-        if (e == 0) continue;
+        e = ipc_send_frames_wait(fd, &iov[g[k].first + i], 1, &w);
+        if (e == 0) {
+          if (w.tries > 0) retried++;
+          continue;
+        }
         last_err = e;
         if (e == EAGAIN || e == EWOULDBLOCK || e == ENOBUFS) {
           full += g[k].count - i;
@@ -2308,8 +2384,16 @@ STATIC_TEST int ipc_reply_flush(int fd, udp_batch_ctx_t *batch, int n) {
     hard += g[k].count;
   }
 done:
+  if (full == 0 && t_ipc_nmarked > 0 && fd >= 0) {          /* (a whole batch went: the queue is waited for again) */
+    const int s = ipc_mark_slot(fd);
+    if (s >= 0) {
+      t_ipc_marked[s] = 0;
+      t_ipc_nmarked--;
+    }
+  }
   ipcd_add(IPCD_WREP_FULL, (uint64_t)full);
   ipcd_add(IPCD_WREP_ERR, (uint64_t)hard);
+  ipcd_add(IPCD_WREP_RETRIED, (uint64_t)retried);
   if (full + hard > 0) log_udp_send_drop("Backend->Frontend IPC", true, last_err, full + hard);
   return full + hard;
 }
@@ -2392,7 +2476,7 @@ STATIC_TEST void *async_io_worker_func(void *arg) {
       free(task.req_buf);
 
       // rrl_cfg は設定の中を指し、submit_response_log() も設定を読むので、
-      // 応答の送出まで読み取り区間を保つ (IPC への send は非ブロッキング)。
+      // 応答の送出まで読み取り区間を保つ (IPC への send は非ブロッキング。満杯の待ちは IPC_REPLY_BUDGET_US まで)。
       if (res_len > 0) {
         bool slip_triggered = false;
         /* D-05: ワーカーの UDP 経路と同じキー */
@@ -2409,8 +2493,8 @@ STATIC_TEST void *async_io_worker_func(void *arg) {
           udp_ipc_t *res_msg = (udp_ipc_t *)res_buf_full;
           *res_msg = task.ipc_hdr;
           res_msg->payload_len = res_len;
-          if (send(task.active_fd, res_buf_full, sizeof(udp_ipc_t) + res_len, 0) < 0)
-            ipc_reply_failed(errno);
+          struct iovec rv = { res_buf_full, sizeof(udp_ipc_t) + (size_t)res_len };
+          (void)ipc_reply_flush(task.active_fd, &rv, 1);         /* (a full queue is waited for, as the workers' batches are) */
         } else if (slip_triggered) {
           submit_response_log(LOG_ACT_SENT, task.client_ip, task.client_port, task.qname, task.qclass, task.qtype,
                               res_buf[3] & 0x0F, task.has_edns, task.dnssec_ok);
@@ -2422,8 +2506,8 @@ STATIC_TEST void *async_io_worker_func(void *arg) {
           udp_ipc_t *res_msg = (udp_ipc_t *)res_buf_full;
           *res_msg = task.ipc_hdr;
           res_msg->payload_len = qlen;
-          if (send(task.active_fd, res_buf_full, sizeof(udp_ipc_t) + qlen, 0) < 0)
-            ipc_reply_failed(errno);
+          struct iovec rv = { res_buf_full, sizeof(udp_ipc_t) + (size_t)qlen };
+          (void)ipc_reply_flush(task.active_fd, &rv, 1);
         } else {
           submit_response_log(LOG_ACT_DROP_RRL, task.client_ip, task.client_port, task.qname,
                               task.qclass, task.qtype, res_buf[3] & 0x0F, task.has_edns, task.dnssec_ok);
@@ -3251,7 +3335,7 @@ STATIC_TEST void udp_one(udp_pass_t *w, udp_ipc_t *ipc_msg, uint8_t *req_buf, ss
               batch->tx_iov[w->n_tx].iov_base = batch->tx_buffers[w->n_tx];
               w->n_tx++;
               if (w->n_tx == UDP_BATCH_SIZE) {
-                ipc_reply_flush(active_fd, batch, w->n_tx);
+                ipc_reply_flush(active_fd, batch->tx_iov, w->n_tx);
                 w->n_tx = 0;
               }
               rcu_reader_exit(ctx);
@@ -3341,7 +3425,7 @@ STATIC_TEST void park_service(udp_pass_t *w, int kq) {
       w->n_tx = 0;
       udp_one(w, ipc, req, len);
       if (w->n_tx > 0) {
-        ipc_reply_flush(w->active_fd, w->batch, w->n_tx);
+        ipc_reply_flush(w->active_fd, w->batch->tx_iov, w->n_tx);
         w->n_tx = 0;
       }
       w->woken = false;
@@ -3411,7 +3495,7 @@ int worker_udp_rx(udp_pass_t *pass, int fd, int sock_idx, int reply_fd) {
     atomic_fetch_add_explicit(&pass->ctx->query_count, (uint64_t)n_served, memory_order_relaxed);
     ipcd_wrecv_add(pass->worker_idx, (uint64_t)n_served);
     if (pass->n_tx > 0) {
-      ipc_reply_flush(reply_fd, batch, pass->n_tx);
+      ipc_reply_flush(reply_fd, batch->tx_iov, pass->n_tx);
       pass->n_tx = 0;
     }
     total += n_served;
@@ -3682,7 +3766,7 @@ worker_startup_success:;
           }
           atomic_fetch_add_explicit(&ctx->query_count, (uint64_t)n_served, memory_order_relaxed);
           if (pass.n_tx > 0) {
-            ipc_reply_flush(active_fd, batch, pass.n_tx);
+            ipc_reply_flush(active_fd, batch->tx_iov, pass.n_tx);
             pass.n_tx = 0;
           }
           if (udp_batch_drained(n_recv))
@@ -8073,6 +8157,19 @@ STATIC_TEST void setup_ipc_tables(int num_workers) {
       ipc_set_buf(g_ipc_fds[f][w][1], SO_RCVBUF, rcvbuf_size, true);
       ipc_set_buf(g_ipc_fds[f][w][1], SO_SNDBUF, sndbuf_size, true);
     }
+  }
+  /* test switches (tests/run_ipc_drops_test.sh E): the wait of a worker for a full queue to its router (ipc_reply_flush(); 0 = drop at once, as
+   * before 0.7), and a small queue of the replies, so that a router held for a moment fills it: the send buffer of the worker's end (a connected unix datagram
+   * socket of FreeBSD 15 queues what one sender sent up to the sender's SO_SNDBUF; the receiver's SO_RCVBUF does not limit it, measured on 15.1) */
+  const char *tb = getenv("KARIDNS_TEST_IPC_REPLY_BUDGET_US"), *tq = getenv("KARIDNS_TEST_IPC_REPLY_QUEUE");
+  if (tb && *tb) g_ipc_reply_budget_us = atol(tb);
+  if (tq && atoi(tq) > 0) {
+    const int q = atoi(tq);
+    for (int f = 0; f < g_num_frontend_routers; f++)
+      for (int w = 0; w < num_workers; w++) {
+        (void)setsockopt(g_ipc_fds[f][w][1], SOL_SOCKET, SO_SNDBUF, &q, sizeof(q));
+        (void)setsockopt(g_ipc_fds[f][w][0], SOL_SOCKET, SO_RCVBUF, &q, sizeof(q));   /* (the router's end too: another kernel may count it there) */
+      }
   }
 
   if (socketpair(AF_UNIX, SOCK_DGRAM, 0, g_notify_ipc) < 0) {
