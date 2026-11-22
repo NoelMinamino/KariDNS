@@ -718,9 +718,39 @@ static void test_sweep_query_engine(void) {
  * Fake upstream forwarder (UDP + TCP on 127.0.0.1) driven by a scenario id.
  * ======================================================================== */
 enum { FW_OK, FW_SILENT, FW_BADID, FW_NOQR, FW_BADQ, FW_TC_TCPOK, FW_TC_TCPFAIL,
-       FW_TC_TCPBADID, FW_HUGE, FW_SHORT, FW_TC_TCPZERO, FW_TC_TCPCLOSE, FW_TC_TCPBIG, FW_TC_TCPSLOW };
+       FW_TC_TCPBADID, FW_HUGE, FW_SHORT, FW_TC_TCPZERO, FW_TC_TCPCLOSE, FW_TC_TCPBIG, FW_TC_TCPSLOW,
+       FW_BADCK2,            /* 0.7: every UDP query gets BADCOOKIE (RCODE 23) with a server cookie; TCP answers (RFC 7873 s5.3) */
+       FW_BADCK2_TCPCLOSE }; /* the same, and the TCP connection is closed at once */
+
+/* FW_BADCK2: the question of the query, then an OPT RR whose COOKIE option is the query's client cookie and a 16-octet server cookie,
+ * extended RCODE 1 with header RCODE 7 (RFC 7873 s8, RFC 6891 s6.1.3).  0 when the query has no client cookie */
+static size_t fw_badcookie(const uint8_t *q, size_t qlen, uint8_t *out) {
+    size_t qe = 12;
+    while (qe < qlen && q[qe]) qe += 1u + q[qe];
+    qe += 5;
+    if (qe + 11 > qlen || q[qe + 1] != 0 || q[qe + 2] != 41) return 0;
+    size_t p = qe + 11, end = p + (((size_t)q[qe + 9] << 8) | q[qe + 10]);
+    if (end > qlen) return 0;
+    while (p + 4 <= end) {
+        size_t code = ((size_t)q[p] << 8) | q[p + 1], len = ((size_t)q[p + 2] << 8) | q[p + 3];
+        if (code == 10 && len >= 8 && p + 4 + len <= end) break;
+        p += 4 + len;
+    }
+    if (p + 12 > end) return 0;
+    memcpy(out, q, qe);
+    out[2] |= 0x80;
+    out[3] = (uint8_t)((out[3] & 0xF0) | 7);
+    out[6] = out[7] = out[8] = out[9] = 0; out[10] = 0; out[11] = 1;
+    size_t o = qe;
+    static const uint8_t hdr[] = { 0, 0, 41, 0x04, 0xD0, 1, 0, 0, 0, 0, 28, 0, 10, 0, 24 };
+    memcpy(out + o, hdr, sizeof(hdr)); o += sizeof(hdr);
+    memcpy(out + o, q + p + 4, 8); o += 8;
+    memset(out + o, 0x5C, 16); o += 16;
+    return o;
+}
 static volatile int g_fw_scn;
 static volatile int g_fw_stop;
+static volatile int g_fw_udp_hits;      /* UDP queries the fake forwarder got (written by its thread before it answers) */
 static int g_fw_udp = -1, g_fw_tcp = -1, g_fw_port;
 
 static size_t fw_answer(const uint8_t *q, size_t qlen, uint8_t *out, size_t pad) {
@@ -751,6 +781,7 @@ static void *fw_thread(void *arg) {
             struct sockaddr_storage from; socklen_t fl = sizeof(from);
             ssize_t n = recvfrom(g_fw_udp, buf, sizeof(buf), 0, (struct sockaddr *)&from, &fl);
             if (n < 12) continue;
+            __atomic_fetch_add(&g_fw_udp_hits, 1, __ATOMIC_SEQ_CST);
             int scn = g_fw_scn;
             size_t olen = fw_answer(buf, (size_t)n, out, scn == FW_HUGE ? 1400 : 0);
             switch (scn) {
@@ -761,6 +792,7 @@ static void *fw_thread(void *arg) {
             case FW_SHORT: olen = 6; break;
             case FW_TC_TCPOK: case FW_TC_TCPFAIL: case FW_TC_TCPBADID: case FW_TC_TCPZERO:
             case FW_TC_TCPCLOSE: case FW_TC_TCPBIG: out[2] |= 0x02; break;
+            case FW_BADCK2: case FW_BADCK2_TCPCLOSE: olen = fw_badcookie(buf, (size_t)n, out); break;
             default: break;
             }
             sendto(g_fw_udp, out, olen, 0, (struct sockaddr *)&from, fl);
@@ -769,12 +801,13 @@ static void *fw_thread(void *arg) {
             int c = accept(g_fw_tcp, NULL, NULL);
             if (c < 0) continue;
             int scn = g_fw_scn;
-            if (scn == FW_TC_TCPCLOSE) { close(c); continue; }
+            if (scn == FW_TC_TCPCLOSE || scn == FW_BADCK2_TCPCLOSE) { close(c); continue; }
             uint8_t lp[2];
             if (read_all_timeout(c, lp, 2, 1000) != 2) { close(c); continue; }
             size_t ql = ((size_t)lp[0] << 8) | lp[1];
             if (ql > sizeof(buf) || read_all_timeout(c, buf, ql, 1000) != (ssize_t)ql) { close(c); continue; }
-            size_t olen = fw_answer(buf, ql, out, scn == FW_TC_TCPBIG ? 3000 : 600);
+            /* (the padded answer goes after the query's OPT RR: a message that cannot be walked.  FW_BADCK2: the query echoed) */
+            size_t olen = fw_answer(buf, ql, out, scn == FW_TC_TCPBIG ? 3000 : scn == FW_BADCK2 ? 0 : 600);
             if (scn == FW_TC_TCPBADID) out[0] ^= 0xFF;
             if (scn == FW_TC_TCPZERO) olen = 0;
             uint8_t hl[2] = { (uint8_t)(olen >> 8), (uint8_t)olen };
@@ -819,6 +852,7 @@ static void test_forward_zone_scenarios(void) {
         "view \"default\" { match-clients { any; };\n"
         "  zone \"fwd.test.\" { type forward; forwarders { 127.0.0.1 port %d; }; forward-timeout 300; };\n"
         "  zone \"fwd2.test.\" { type forward; forwarders { not-an-ip; 127.0.0.1 port 1; 127.0.0.1 port %d; }; forward-timeout 400; };\n"
+        "  zone \"prog.test.\" { type program; program \"/bin/cat\"; };\n"
         "  zone \"example.\" { type master; file \"x\"; };\n"
         "};\n", g_fw_port, g_fw_port);
     sw_teardown();
@@ -826,6 +860,7 @@ static void test_forward_zone_scenarios(void) {
     sw_add_zone("example.", ZONE_EXAMPLE);
     sw_add_zone("fwd.test.", "$ORIGIN fwd.test.\n@ 60 IN SOA a. b. 1 2 3 4 5\n@ 60 IN NS ns.fwd.test.\n");
     sw_add_zone("fwd2.test.", "$ORIGIN fwd2.test.\n@ 60 IN SOA a. b. 1 2 3 4 5\n@ 60 IN NS ns.fwd2.test.\n");
+    sw_add_zone("prog.test.", "$ORIGIN prog.test.\n@ 60 IN SOA a. b. 1 2 3 4 5\n@ 60 IN NS ns.prog.test.\n");
     sw_finish_view();
     zone_config_t *z1 = find_zone_config_in_view(g_sw.cfg, "default", "fwd.test.");
     zone_config_t *z2 = find_zone_config_in_view(g_sw.cfg, "default", "fwd2.test.");
@@ -848,6 +883,63 @@ static void test_forward_zone_scenarios(void) {
             if (scn == FW_OK || scn == FW_HUGE)
                 sw_run(req, len, 512, names[zi], 1, "192.0.2.1", false);
         }
+    }
+    /* 0.7: this server's own cookie policy (RFC 7873 §5.2.3 / §5.2.4) before the query is handed on.  Over UDP an invalid server cookie,
+     * and a client cookie alone with require-server-cookie, get BADCOOKIE (RCODE 23: 7 in the header, 1 in the OPT TTL) from the engine and
+     * never reach the forwarder, nor a program zone's plugin (there is none here: a query that got to the plugin path would be SERVFAIL).
+     * Over TCP, and a query without a cookie, are handed on as for an authoritative zone.  (The fake forwarder counts a query before it
+     * answers and the engine waits for the answer, so the count is final when sw_run() returns.) */
+    {
+        g_fw_scn = FW_OK;
+        static const struct { const char *name; unsigned q; bool tcp, require; int rcode, ext, hits; } ck[] = {
+            { "www.fwd.test.", Q_EDNS | Q_SRVCOOKIE, false, false, 7, 1, 0 },
+            { "www.fwd.test.", Q_EDNS | Q_SRVCOOKIE, true,  false, 0, 0, 1 },
+            { "www.fwd.test.", Q_EDNS | Q_COOKIE,    false, false, 0, 0, 1 },
+            { "www.fwd.test.", Q_EDNS | Q_COOKIE,    false, true,  7, 1, 0 },
+            { "www.fwd.test.", Q_EDNS | Q_SRVCOOKIE, false, true,  7, 1, 0 },
+            { "www.fwd.test.", Q_EDNS | Q_COOKIE,    true,  true,  0, 0, 1 },
+            { "www.fwd.test.", Q_EDNS,               false, true,  0, 0, 1 },
+            { "a.prog.test.",  Q_EDNS | Q_SRVCOOKIE, false, false, 7, 1, 0 },
+            { "a.prog.test.",  Q_EDNS | Q_COOKIE,    false, true,  7, 1, 0 },
+            { "a.prog.test.",  Q_EDNS | Q_COOKIE,    true,  true,  2, 0, 0 },
+        };
+        for (size_t k = 0; k < NELEM(ck); k++) {
+            g_sw.cfg->require_server_cookie = ck[k].require;
+            int before = __atomic_load_n(&g_fw_udp_hits, __ATOMIC_SEQ_CST);
+            size_t len = sw_build(req, (uint16_t)(0x6800 + k), 0x01, 0, ck[k].name, 1, 1, ck[k].q);
+            int n = sw_run(req, len, 1232, ck[k].name, 1, "192.0.2.1", ck[k].tcp);
+            int hits = __atomic_load_n(&g_fw_udp_hits, __ATOMIC_SEQ_CST) - before;
+            size_t qend = 12;
+            while (qend < (size_t)n && g_res[qend] != 0) qend += 1u + g_res[qend];
+            qend += 5;                                                   /* the root label, QTYPE, QCLASS */
+            int ext = -1;                                                /* the OPT RR right after the question: owner, TYPE 41, CLASS, TTL */
+            if (n >= 0 && (size_t)n >= qend + 11 && g_res[qend] == 0 && g_res[qend + 1] == 0 && g_res[qend + 2] == 41) ext = g_res[qend + 5];
+            if ((g_res[3] & 0x0F) != ck[k].rcode || ext != ck[k].ext || hits != ck[k].hits) {
+                fprintf(stderr, "cookie case %zu (%s tcp=%d require=%d): rcode %d ext %d forwarded %d, want %d %d %d\n", k, ck[k].name,
+                        ck[k].tcp, ck[k].require, g_res[3] & 0x0F, ext, hits, ck[k].rcode, ck[k].ext, ck[k].hits);
+                assert(0);
+            }
+            if (ck[k].rcode == 7) assert(g_res[6] == 0 && g_res[7] == 0 && !(g_res[2] & 0x04));   /* no answer, AA=0 (§5.2.3) */
+        }
+        g_sw.cfg->require_server_cookie = false;
+    }
+    /* RFC 7873 s5.3, the client side: BADCOOKIE also to the retry with the new server cookie: the same query over TCP; when TCP gives
+     * nothing, the next forwarder (there is one: SERVFAIL) */
+    {
+        static const struct { int scn; int rcode; } b2[] = { { FW_BADCK2, 0 }, { FW_BADCK2_TCPCLOSE, 2 } };
+        for (size_t k = 0; k < NELEM(b2); k++) {
+            g_fw_scn = b2[k].scn;
+            int before = __atomic_load_n(&g_fw_udp_hits, __ATOMIC_SEQ_CST);
+            size_t len = sw_build(req, (uint16_t)(0x6900 + k), 0x01, 0, "www.fwd.test.", 1, 1, Q_EDNS);
+            int n = sw_run(req, len, 4096, "www.fwd.test.", 1, "192.0.2.1", false);
+            int hits = __atomic_load_n(&g_fw_udp_hits, __ATOMIC_SEQ_CST) - before;
+            if (n < 12 || (g_res[3] & 0x0F) != b2[k].rcode || hits != 2) {
+                fprintf(stderr, "BADCOOKIE twice, case %zu: n %d rcode %d UDP queries %d, want rcode %d, 2 UDP queries\n", k, n,
+                        n >= 12 ? g_res[3] & 0x0F : -1, hits, b2[k].rcode);
+                assert(0);
+            }
+        }
+        g_fw_scn = FW_OK;
     }
     /* invalid inputs */
     assert(dispatch_forward_zone(z1, req, 5, res, sizeof(res)) == 0);

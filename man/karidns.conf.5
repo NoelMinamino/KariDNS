@@ -703,7 +703,14 @@ another value is an error. See "BIND option values".
 \fIDescription:\fR A UDP query that carries a client cookie but no valid server
 cookie gets BADCOOKIE (with a server cookie to repeat the query with) instead of
 an answer (RFC 7873 \[u00A7]5.2.3; BIND 9.20). A query without a cookie option,
-and TCP queries, are answered as usual. Can be overridden per view.
+and TCP queries, are answered as usual. The same holds for \fBtype forward\fR
+and \fBtype program\fR zones (0.7): such a query, and a UDP query with an
+invalid server cookie (RFC 7873 \[u00A7]5.2.4), gets BADCOOKIE from this server
+and is not sent to the forwarders or the plugin. The BADCOOKIE also comes before
+the REFUSED for a name in no zone, a class without a zone or a zone not served
+to the client, and before the SERVFAIL of an empty zone (0.7: these answers used
+to carry the extended RCODE bits of BADCOOKIE on their own RCODE, RFC 6891
+\[u00A7]6.1.3, a wire RCODE of 21 or 18). Can be overridden per view.
 .TP 8
 \fBmax\-udp\-size <n>;\fR \fBedns\-udp\-size <n>;\fR
 \fIDefault:\fR \fB1232\fR
