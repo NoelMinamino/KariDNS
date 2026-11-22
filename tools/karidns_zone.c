@@ -1152,7 +1152,7 @@ static int kz_sink(void *ud, const char *data, size_t len) {
     if (o->dir_fd >= 0 && o->fd < 0) {
         static unsigned seq;
         snprintf(o->tmp, sizeof(o->tmp), ".karidns-zone.%ld.%u.tmp", (long)getpid(), seq++);
-        o->fd = openat(o->dir_fd, o->tmp, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0666);
+        o->fd = openat(o->dir_fd, o->tmp, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);   /* the mode is set at the commit */
         if (o->fd < 0) {
             o->err = errno;
             return 1;
@@ -1186,7 +1186,20 @@ static void kz_out_abort(kz_out_t *o) {
  * with EEXIST.  false: a message was given (the temporary file is gone). */
 static bool kz_out_commit(kz_out_t *o, const char *shown, const char *name, bool force) {
     int e = 0;
-    if (o->fd < 0 || fsync(o->fd) != 0) e = errno ? errno : EIO;
+    /* review Z-6 (sibling of the dbloader dump): the file was created 0666 & ~umask, so --force made a 0600 backup world-readable.  A file
+     * that is replaced keeps its permission bits; a new one gets 0666 & ~umask */
+    struct stat old;
+    mode_t mode;
+    if (force && fstatat(o->dir_fd, name, &old, AT_SYMLINK_NOFOLLOW) == 0 && S_ISREG(old.st_mode)) {
+        mode = old.st_mode & 0777;
+    } else {
+        mode_t um = umask(077);
+        umask(um);
+        mode = 0666 & ~um;
+    }
+    errno = 0;
+    if (o->fd >= 0 && fchmod(o->fd, mode) != 0) e = errno;
+    if (!e && (o->fd < 0 || fsync(o->fd) != 0)) e = errno ? errno : EIO;
     if (o->fd >= 0 && close(o->fd) != 0 && !e) e = errno;
     int fd = o->fd;
     o->fd = -1;

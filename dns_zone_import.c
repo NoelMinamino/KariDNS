@@ -344,6 +344,9 @@ static bool zi_check_zone(zi_t *z, zone_arena_t *arena, const char *apex, const 
     if (info->tinydns_out_of_zone > 0)
         kc_warning(&t, DC_ZONE_TINYDNS_OUT_OF_ZONE, "Zone '%s': %zu tinydns record(s) belong to no zone of the data file and are ignored (first: '%s')\n", apex,
                    info->tinydns_out_of_zone, info->first_tinydns_out_of_zone);
+    if (info->unencodable > 0)   /* karicheck: zone.record.wire errors; the server would leave them out (review Z sibling: they were dropped silently) */
+        kc_error(&t, DC_ZONE_RECORD_WIRE, "Zone '%s': %zu record(s) cannot be written in wire format (first: '%s'); `karicheck zone` shows why\n", apex,
+                 info->unencodable, info->first_unencodable);
     zone_lint_ttl(arena, "zone file", &t);
     if (info->no_ttl > 0 && !tinydns)
         kc_warning(&t, DC_ZONE_TTL_MISSING, "Zone '%s': %s:%zu: no TTL specified for '%s' (no $TTL, no earlier TTL, no SOA to take one from); %zu record(s) are served "
@@ -458,7 +461,7 @@ static void zi_recs_free(dbrecs_t *a) {
     memset(a, 0, sizeof(*a));
 }
 
-typedef struct { bool found, ambiguous; int64_t id; char *name, *type, *soa; const char *want; } zfind_t;
+typedef struct { bool found, ambiguous; int64_t id; char *name, *type, *soa; const char *want; bool oom; } zfind_t;
 
 static int zi_cb_zone(void *ud, const db_zone_row_t *r) {
     zfind_t *f = ud;
@@ -472,6 +475,8 @@ static int zi_cb_zone(void *ud, const db_zone_row_t *r) {
     f->name = strdup(r->name);
     f->type = strdup(r->type ? r->type : "");
     f->soa = r->soa_content ? strdup(r->soa_content) : NULL;
+    /* review Z-6: a failed copy left NULL that the callers read (zf.type[0]); stop the scan, the callers say "out of memory" */
+    if (!f->name || !f->type || (r->soa_content && !f->soa)) return f->oom = true;
     return 0;
 }
 
@@ -1193,8 +1198,9 @@ static int zi_apply(zi_t *z, zrows_t *rows, const char *shown, zi_result_t *res)
     in_tx = true;
 
     zf.want = rows->zone;
-    if ((rc = d->find_zone(c, rows->zone, zi_cb_zone, &zf)) != 0) {
-        status = zi_dbfail(z, "finding the zone");
+    if ((rc = d->find_zone(c, rows->zone, zi_cb_zone, &zf)) != 0 || zf.oom) {
+        if (zf.oom) ZI_ERR(z, DC_INTERNAL_OOM, shown, "out of memory");
+        else status = zi_dbfail(z, "finding the zone");
         goto out;
     }
     if (zf.ambiguous) {
@@ -1482,16 +1488,15 @@ static int zi_apply(zi_t *z, zrows_t *rows, const char *shown, zi_result_t *res)
     /* an apply that changed the zone and wrote no SOA of its own raises the serial by one (RFC 1982 section 3.1; secondaries and IXFR see a change only when it grows) */
     if (ap && nitems > 0 && !res->wrote_soa && !ap->create && z->o.serial == ZI_SERIAL_INCREMENT && !zi_bump_serial(z, &db, rows->zone, did, ap->api_serial, shown, res, &status))
         goto out;
-    if (zf.found ? zi_primary_type(zf.type) : (!z->zone_type[0] || zi_primary_type(z->zone_type))) {
-        bool back = ap && ap->readback_changed
-                        ? zi_verify_changed(z, rows->zone, did, shown, rids, nins, zi_apex_soa(&db, rows->zone), res)
-                        : zi_verify(z, rows->zone, did, shown, !whole || z->o.mode == ZI_MERGE, szone ? ZX_PLAIN_DNSSEC | ZX_PLAIN_CDS : 0, res);
-        if (!back) goto out;
-    } else {
-
-        ZI_WARN(z, DC_DB_IMPORT_NOT_PRIMARY, shown, "Zone '%s' has domains.type %s: the server does not serve the records of such a zone, so they were not checked", rows->zone,
-                zf.found && zf.type[0] ? zf.type : z->zone_type);
-    }
+    /* review Z-6: the rows of a zone that is not a primary one are read back too: the server does not serve them now, but a change of
+     * domains.type to MASTER would serve rows that no check had seen (the read-back was skipped for such a zone) */
+    bool back = ap && ap->readback_changed
+                    ? zi_verify_changed(z, rows->zone, did, shown, rids, nins, zi_apex_soa(&db, rows->zone), res)
+                    : zi_verify(z, rows->zone, did, shown, !whole || z->o.mode == ZI_MERGE, szone ? ZX_PLAIN_DNSSEC | ZX_PLAIN_CDS : 0, res);
+    if (!back) goto out;
+    if (!(zf.found ? zi_primary_type(zf.type) : (!z->zone_type[0] || zi_primary_type(z->zone_type))))
+        ZI_WARN(z, DC_DB_IMPORT_NOT_PRIMARY, shown, "Zone '%s' has domains.type %s: the server does not serve the records of such a zone (they were checked as "
+                "a primary zone's)", rows->zone, zf.found && zf.type[0] ? zf.type : z->zone_type);
     /* the RRsets changed with their records before and after, and the version row of the change (item E) */
     if (nitems > 0 && (ap || z->si.has_versions) && !zi_record_change(z, rows->zone, did, zi_apex_soa(&db, rows->zone), va, vb, items, nitems, gen0, has_gen, ap, res, &chg, &nchg, &status))
         goto out;
@@ -1575,18 +1580,10 @@ static bool zi_managed_type(const char *t) {
     return false;
 }
 
-/* days from 1970-01-01 to the civil date y-m-d (proleptic Gregorian calendar) */
-static int64_t zi_days_from_civil(int64_t y, unsigned m, unsigned d) {
-    y -= m <= 2;
-    const int64_t era = (y >= 0 ? y : y - 399) / 400;
-    const unsigned yoe = (unsigned)(y - era * 400);
-    const unsigned doy = (153u * (m > 2 ? m - 3 : m + 9) + 2) / 5 + d - 1;
-    const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    return era * 146097 + (int64_t)doe - 719468;
-}
-
 /* The Signature Expiration field of the content of an RRSIG row ("covered alg labels ttl expiration inception tag signer signature", RFC 4034 3.2):
- * seconds since the epoch as a decimal number, or YYYYMMDDHHmmSS in UTC.  The value is a 32 bit number of seconds modulo 2^32 (RFC 4034 3.1.5). */
+ * seconds since the epoch as a decimal number, or YYYYMMDDHHmmSS in UTC.  The value is a 32 bit number of seconds modulo 2^32 (RFC 4034 3.1.5).
+ * review Z-6: the date is read by the parser's own reader (dns_dnssec_time_from_text()); this one took any day 1-31 of any month, so
+ * 20260231000000 was a time (March 3) here and an error for the server. */
 static bool zi_rrsig_expire(const char *content, uint32_t *out) {
     const char *p = content;
     for (int f = 0; f < 4; f++) {
@@ -1596,25 +1593,11 @@ static bool zi_rrsig_expire(const char *content, uint32_t *out) {
     while (*p == ' ' || *p == '\t') p++;
     size_t n = 0;
     while (p[n] >= '0' && p[n] <= '9') n++;
-    if (n == 0 || (p[n] && p[n] != ' ' && p[n] != '\t')) return false;
-    if (n == 14) {
-        unsigned f[6];
-        static const unsigned len[6] = { 4, 2, 2, 2, 2, 2 };
-        size_t o = 0;
-        for (int i = 0; i < 6; i++) {
-            f[i] = 0;
-            for (unsigned j = 0; j < len[i]; j++) f[i] = f[i] * 10 + (unsigned)(p[o++] - '0');
-        }
-        if (f[1] < 1 || f[1] > 12 || f[2] < 1 || f[2] > 31 || f[3] > 23 || f[4] > 59 || f[5] > 60) return false;
-        int64_t t = zi_days_from_civil(f[0], f[1], f[2]) * 86400 + (int64_t)f[3] * 3600 + (int64_t)f[4] * 60 + (int64_t)f[5];
-        *out = (uint32_t)(uint64_t)t;                   /* modulo 2^32 */
-        return true;
-    }
-    if (n > 10) return false;
-    unsigned long long v = strtoull(p, NULL, 10);
-    if (v > 0xFFFFFFFFull) return false;
-    *out = (uint32_t)v;
-    return true;
+    if (n == 0 || n > 14 || (p[n] && p[n] != ' ' && p[n] != '\t')) return false;
+    char tok[15];
+    memcpy(tok, p, n);
+    tok[n] = '\0';
+    return dns_dnssec_time_from_text(tok, out);
 }
 
 /* the time (seconds since the epoch) a 32 bit RRSIG time stands for: the one within 2^31 seconds of now */
@@ -1965,8 +1948,9 @@ static int zi_apply_signer(zi_t *z, zrows_t *rows, zone_arena_t *farena, const c
     in_tx = true;
     if ((rc = d->w_mark(c, &mark)) != 0) ZI_SFAIL("marking the change log", rc);
     zf.want = rows->zone;
-    if (d->find_zone(c, rows->zone, zi_cb_zone, &zf) != 0) {
-        zi_dbfail(z, "finding the zone");
+    if (d->find_zone(c, rows->zone, zi_cb_zone, &zf) != 0 || zf.oom) {
+        if (zf.oom) ZI_ERR(z, DC_INTERNAL_OOM, shown, "out of memory");
+        else zi_dbfail(z, "finding the zone");
         goto out;
     }
     if (zf.ambiguous) {

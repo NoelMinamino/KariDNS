@@ -2637,8 +2637,116 @@ static void test_low_l4_wire_encoders(void) {
     printf("  -> LOC, long hex, character-strings, NSEC3 hash and SvcParamKey checks passed.\n");
 }
 
+/* ---- the external review of 2026-11-22, group 2 (planning/planing_0.7.x_review_2026-11-22.md) ---- */
+static char *rv_include_cb(parse_context_t *ctx, const char *path, dev_t *out_dev, ino_t *out_ino) {
+    (void)ctx;
+    return zone_read_include_file(path, ZONE_INCLUDE_MAX_BYTES, out_dev, out_ino);   /* the tools' reader: it refuses a NUL byte */
+}
+
+/* text of len bytes (it may hold a NUL); generated / max: the context's starting count and max-records */
+static void rv_load(zt_t *z, const char *text, size_t len, size_t generated, size_t max_records, const char *dir) {
+    memset(z, 0, sizeof(*z));
+    zone_arena_init(&z->arena);
+    char *visited_paths[16] = { 0 };
+    dev_t visited_devs[16] = { 0 };
+    ino_t visited_inos[16] = { 0 };
+    char *root_ttl = NULL, *root_ecs = NULL, *root_loc = NULL;
+    parse_context_t ctx = { .base_dir = dir ? dir : ".", .default_origin = "example.", .is_standalone_mode = true, .err_out = &z->err,
+                            .visited_paths = visited_paths, .visited_devs = visited_devs, .visited_inos = visited_inos,
+                            .visited_count = 0, .visited_cap = 16, .load_file_cb = rv_include_cb,
+                            .shared_ttl_io = &root_ttl, .shared_ecs_tag_io = &root_ecs, .shared_loc_tag_io = &root_loc,
+                            .generated_count = generated, .max_records = max_records };
+    char *buf = arena_alloc(&z->arena, len + 1);
+    assert(buf);
+    memcpy(buf, text, len);
+    buf[len] = '\0';
+    z->rc = parse_zone_fast(buf, len, &z->arena, &ctx);
+}
+
+static void rv_expect(const char *text, size_t generated, size_t max_records, const char *dir, bool ok, const char *msg) {
+    zt_t z;
+    rv_load(&z, text, strlen(text), generated, max_records, dir);
+    bool good = ok ? z.rc >= 0 : (z.rc < 0 && z.err.error_message && (!msg || strstr(z.err.error_message, msg)));
+    if (!good) fprintf(stderr, "review case (%s) rc %d '%s':\n%s", ok ? "must parse" : msg, z.rc, z.err.error_message ? z.err.error_message : "-", text);
+    assert(good);
+    zt_free(&z);
+}
+
+static void test_review_2026_11_22(void) {
+    printf("[TEST] Zone parser: review 2026-11-22 (Z-1 $GENERATE total, Z-2 NUL, quoted fields, tag names)...\n");
+    /* Z-1: the total of the zone (1,000,000) and max-records bound $GENERATE before it makes a record */
+    rv_expect("$ORIGIN example.\n$TTL 60\n@ SOA ns h 1 2 3 4 5\n$GENERATE 1-10 g$ A 192.0.2.1\n", ZONE_GENERATE_TOTAL_MAX - 10, 0, NULL, true, NULL);
+    rv_expect("$ORIGIN example.\n$TTL 60\n@ SOA ns h 1 2 3 4 5\n$GENERATE 1-11 g$ A 192.0.2.1\n", ZONE_GENERATE_TOTAL_MAX - 10, 0, NULL, false,
+              "more than 1000000 generated records");
+    rv_expect("$ORIGIN example.\n$TTL 60\n@ SOA ns h 1 2 3 4 5\n$GENERATE 1-5 g$ A 192.0.2.1\n$GENERATE 1-6 k$ A 192.0.2.1\n",
+              ZONE_GENERATE_TOTAL_MAX - 10, 0, NULL, false, "more than 1000000 generated records");
+    rv_expect("$ORIGIN example.\n$TTL 60\n@ SOA ns h 1 2 3 4 5\n$GENERATE 1-9 g$ A 192.0.2.1\n", 0, 10, NULL, true, NULL);   /* 1 + 9 */
+    rv_expect("$ORIGIN example.\n$TTL 60\n@ SOA ns h 1 2 3 4 5\n$GENERATE 1-10 g$ A 192.0.2.1\n", 0, 10, NULL, false, "max-records 10");
+    rv_expect("$ORIGIN example.\n$TTL 60\n@ SOA ns h 1 2 3 4 5\n$GENERATE 1-100001 g$ A 192.0.2.1\n", 0, 0, NULL, false, "100000 per statement");
+    /* Z-2: a NUL byte in the text is an error (the records after it were lost), also in tinydns data */
+    {
+        static const char nul_text[] = "$ORIGIN example.\n$TTL 60\n@ SOA ns h 1 2 3 4 5\n\0www A 192.0.2.1\n";
+        zt_t z;
+        rv_load(&z, nul_text, sizeof(nul_text) - 1, 0, 0, NULL);
+        assert(z.rc < 0 && z.err.error_message && strstr(z.err.error_message, "NUL byte") && z.err.error_offset == 46);
+        zt_free(&z);
+        zone_arena_t a;
+        zone_arena_init(&a);
+        parse_error_t e = { 0 };
+        parse_context_t tctx = { .default_origin = "example.", .err_out = &e };
+        char tbuf[] = "+a.example:192.0.2.1:300\n\0+b.example:192.0.2.2:300\n";
+        assert(parse_tinydns_data(tbuf, sizeof(tbuf) - 1, &a, &tctx) < 0 && e.error_message && strstr(e.error_message, "NUL byte"));
+        zone_arena_destroy(&a);
+    }
+    /* Z-2: an $INCLUDE file with a NUL byte */
+    {
+        char dir[] = "/tmp/karidns_rvnul_XXXXXX";
+        assert(mkdtemp(dir));
+        char p[600];
+        snprintf(p, sizeof(p), "%s/nul.inc", dir);
+        FILE *f = fopen(p, "wb");
+        assert(f);
+        fwrite("a A 192.0.2.1\n\0b A 192.0.2.2\n", 1, 30, f);
+        fclose(f);
+        snprintf(p, sizeof(p), "%s/ok.inc", dir);
+        write_file(p, "a A 192.0.2.1\n");
+        rv_expect("$ORIGIN example.\n$TTL 60\n@ SOA ns h 1 2 3 4 5\n$INCLUDE nul.inc\n", 0, 0, dir, false, "$INCLUDE file contains a NUL byte");
+        rv_expect("$ORIGIN example.\n$TTL 60\n@ SOA ns h 1 2 3 4 5\n$INCLUDE ok.inc\n", 0, 0, dir, true, NULL);
+        /* the total of Z-1 counts the $GENERATE of an $INCLUDE file too */
+        snprintf(p, sizeof(p), "%s/gen.inc", dir);
+        write_file(p, "$GENERATE 1-6 i$ A 192.0.2.1\n");
+        rv_expect("$ORIGIN example.\n$TTL 60\n@ SOA ns h 1 2 3 4 5\n$INCLUDE gen.inc\n$GENERATE 1-5 g$ A 192.0.2.1\n", ZONE_GENERATE_TOTAL_MAX - 10, 0, dir,
+                  false, "more than 1000000 generated records");
+        snprintf(p, sizeof(p), "rm -rf %s", dir);
+        assert(system(p) == 0);
+    }
+    /* Z-6: a quoted string is a field of its own */
+    rv_expect("$ORIGIN example.\n$TTL 60\n@ SOA ns h 1 2 3 4 5\n@ TXT \"abc\"def\n", 0, 0, NULL, false, "closing '\"'");
+    rv_expect("$ORIGIN example.\n$TTL 60\n@ SOA ns h 1 2 3 4 5\n@ TXT ab\"c d\"\n", 0, 0, NULL, false, "inside a field");
+    rv_expect("$ORIGIN example.\n$TTL 60\n@ SOA ns h 1 2 3 4 5\n@ CAA 0 issue \"ca.example\"x\n", 0, 0, NULL, false, "closing '\"'");
+    rv_expect("$ORIGIN example.\n$TTL 60\n@ SOA ns h 1 2 3 4 5\n@ TXT \"abc\" \"def\"\n@ TXT \"a\\\"b\";c\nt TXT ( \"x\")\nu TXT \"\"\nv TXT a\\\"b\n",
+              0, 0, NULL, true, NULL);
+    /* Z-6: a tag name is at most 63 characters (it was cut there) */
+    {
+        char text[600];
+        static const char t63[] = "ttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttt";
+        snprintf(text, sizeof(text), "$ORIGIN example.\n$TTL 60\n@ SOA ns h 1 2 3 4 5\n$LOCATION-TAG %s { 10.0.0.0/8; }\n$LOCATION %s\nw A 192.0.2.1\n", t63, t63);
+        rv_expect(text, 0, 0, NULL, true, NULL);
+        snprintf(text, sizeof(text), "$ORIGIN example.\n$TTL 60\n@ SOA ns h 1 2 3 4 5\n$LOCATION-TAG %sx { 10.0.0.0/8; }\n", t63);
+        rv_expect(text, 0, 0, NULL, false, "longer than 63");
+        snprintf(text, sizeof(text), "$ORIGIN example.\n$TTL 60\n@ SOA ns h 1 2 3 4 5\n$ECS-SUBNET-TAG %sx { 10.0.0.0/8; }\n", t63);
+        rv_expect(text, 0, 0, NULL, false, "longer than 63");
+        snprintf(text, sizeof(text), "$ORIGIN example.\n$TTL 60\n@ SOA ns h 1 2 3 4 5\n$ECS-SUBNET %sx\nw A 192.0.2.1\n", t63);
+        rv_expect(text, 0, 0, NULL, false, "longer than 63");
+        snprintf(text, sizeof(text), "$ORIGIN example.\n$TTL 60\n@ SOA ns h 1 2 3 4 5\n$LOCATION %sx\nw A 192.0.2.1\n", t63);
+        rv_expect(text, 0, 0, NULL, false, "longer than 63");
+    }
+    printf("  -> review 2026-11-22 passed.\n");
+}
+
 int main(void) {
     printf("=== Starting Zone Parser Path Coverage Tests ===\n");
+    test_review_2026_11_22();
     test_low_l4_zone_parser();
     test_low_l4_zone_validation();
     test_low_l4_wire_encoders();

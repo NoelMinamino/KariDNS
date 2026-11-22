@@ -1,0 +1,6 @@
+$ORIGIN fuzz.local.
+$TTL 60
+@ SOA ns h 1 2 3 4 5
+$LOCATION-TAG tttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttx { 10.0.0.0/8; }
+$ECS-SUBNET tttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttx
+w A 192.0.2.1

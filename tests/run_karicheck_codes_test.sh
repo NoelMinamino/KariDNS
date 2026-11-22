@@ -181,10 +181,9 @@ fx zone.names.target zone ck.test "$T/ck.test.conf"
 printf '=host.other.test:192.0.2.9:300\n' > "$T/tiny.data"
 printf 'zone "tiny.test" { type master; file "%s/tiny.data"; file-format tinydns; };\n' "$T" > "$T/tiny.conf"
 fx zone.tinydns.out-of-zone zones "$T/tiny.conf"
-# a tinydns SSHFP line whose fingerprint is no hexadecimal: the parser leaves it out, karicheck says so (review dns_tinydns_parser.c [8])
-printf 'Ztiny2.test:ns.tiny2.test:h.tiny2.test:1:3600:600:86400:300:300\n&tiny2.test::ns.tiny2.test:300\n_host.tiny2.test:1:1:zz:300\n' > "$T/tiny2.data"
-printf 'zone "tiny2.test" { type master; file "%s/tiny2.data"; file-format tinydns; };\n' "$T" > "$T/tiny2.conf"
-fx zone.tinydns.skipped zones "$T/tiny2.conf"
+# a zone file with a NUL byte (review Z-2: the rest of the file went unchecked); zone.tinydns.skipped is retired (such a line is an error)
+printf '$ORIGIN nul.test.\n$TTL 300\n@ IN SOA ns1 h 1 7200 3600 1209600 300\n\000www IN A 192.0.2.1\n' > "$T/nul.zone"
+fx io.nul-byte zone nul.test "$T/nul.zone"
 # CDS / CDNSKEY delete signals, a DNSKEY with protocol 2, data at a cut, a catalog zone that is broken (RFC 8078 4, RFC 4034 2.1.2, RFC 9432 5.1)
 zfix zone.dnskey.protocol dkp.test '' '@ DNSKEY 257 2 13 mdsswUyr3DPW132mOi8V9xESWE8jTo0dxCjjnopKl+GqJxpVXckHAeF+KkxLbxILfDLUT0rAK9iUzy1L53eKGQ=='
 zfix zone.cds.delete-content cdsd.test '' '@ CDS 0 0 0 01'

@@ -308,7 +308,8 @@ expect "one zone of a tinydns data file (by the name data.tinydns)" 0 import --s
 cp "$T/two.data" "$T/x.tinydns"
 expect "the format by file name (.tinydns)" 0 import --serial keep two-a.test "$T/x.tinydns"
 expect "a zone that is not in the data file" 1 import --format tinydns nothere.test "$T/two.data"
-printf 'Zbad-c.test:ns1.bad-c.test:h.bad-c.test:1:7200:3600:1209600:300:300\n+www.bad-c.test:999.1.1.1:300\n' > "$T/badc.data"
+# (the zone has no NS: its zone checks fail.  It held 999.1.1.1, taken as 231.1.1.1; since review Z-4 that is a syntax error of the whole file)
+printf 'Zbad-c.test:ns1.bad-c.test:h.bad-c.test:1:7200:3600:1209600:300:300\n+www.bad-c.test:192.0.2.9:300\n' > "$T/badc.data"
 expect "import --all: a bad zone fails, the others are not stopped" 1 import --all "$T/badc.data"
 errhas "...the reason" "bad-c.test"
 
@@ -477,8 +478,14 @@ errhas "...with --force" "use --force"
 echo OLD > "$T/o.zone"
 expect "...and untouched" 1 export example.test "$T/o.zone"
 same "...old content" "$(cat "$T/o.zone")" OLD
+chmod 600 "$T/o.zone"
 expect "--force replaces it" 0 export --force example.test "$T/o.zone"
 cmp -s "$T/o.zone" "$T/e0.out" && ok "...new content" || bad "...not replaced"
+# review Z-6: the file replaced keeps its permission bits (it got 0666 & ~umask, so a 0600 backup became readable by everyone)
+same "...and keeps its mode 0600" "$(stat -f %Lp "$T/o.zone" 2>/dev/null || stat -c %a "$T/o.zone")" 600
+rm -f "$T/o.zone"
+expect "...a new file" 0 export example.test "$T/o.zone"
+same "...gets 0666 less the umask" "$(stat -f %Lp "$T/o.zone" 2>/dev/null || stat -c %a "$T/o.zone")" "$(printf '%o' $(( 0666 & ~0$(umask) )))"
 ls -a "$T" | grep -q 'karidns-zone.*tmp' && bad "a temporary file was left behind" || ok "no temporary file is left behind"
 expect "a file in a directory that does not exist" 1 export example.test "$T/nodir/o.zone"
 errhas "...says so" "directory"

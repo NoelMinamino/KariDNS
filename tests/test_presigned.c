@@ -838,10 +838,51 @@ static void test_root_nsec_ordername(void) {
     }
 }
 
+/* review Z-3: zrows_make_presigned() gathered the ancestors of every row into a list of fixed size (4 per row), duplicates included, so a
+ * zone whose names share deep ancestors filled it and its later empty non-terminals (and their NSEC / NSEC3 rows) were left out without a
+ * word.  Rows by hand (NSEC layout; the chain is not checked here): n owners h.<i>.a.b.c.d.e.f.g.example.test with two rows each, so
+ * n + 7 ENTs (<i>.a...g and the 7 of a.b...g) from 16n ancestor walks. */
+static void test_presigned_rows_ents(void) {
+    printf("presigned rows: every empty non-terminal is kept\n");
+    enum { NOWN = 200 };
+    size_t n = 3 + 2 * NOWN;
+    db_record_row_t *rows = calloc(n, sizeof(*rows));
+    static char names[NOWN][64];
+    CHECK(rows != NULL);
+    if (!rows) return;
+    rows[0] = (db_record_row_t){ .name = "example.test", .type = "SOA", .content = "ns.example.test hm.example.test 1 2 3 4 5" };
+    rows[1] = (db_record_row_t){ .name = "example.test", .type = "NSEC", .content = "example.test SOA NSEC RRSIG" };
+    rows[2] = (db_record_row_t){ .name = "example.test", .type = "RRSIG", .content = "NSEC 13 2 300 20300101000000 20200101000000 1 example.test AAAA" };
+    for (int i = 0; i < NOWN; i++) {
+        snprintf(names[i], sizeof(names[i]), "h.%d.a.b.c.d.e.f.g.example.test", i);
+        rows[3 + 2 * i] = (db_record_row_t){ .name = names[i], .type = "A", .content = "192.0.2.1" };
+        rows[4 + 2 * i] = (db_record_row_t){ .name = names[i], .type = "TXT", .content = "\"x\"" };
+    }
+    zrows_t z;
+    memset(&z, 0, sizeof(z));
+    snprintf(z.zone, sizeof(z.zone), "example.test");
+    z.rows = rows;
+    z.n = n;
+    char err[300] = "";
+    CHECK_MSG(zrows_make_presigned(&z, err, sizeof(err)), "%s", err);
+    size_t ents = 0, dup = 0;
+    for (size_t i = 0; i < z.n; i++) {
+        if (z.rows[i].type) continue;
+        ents++;
+        for (size_t j = 0; j < i; j++)
+            if (!z.rows[j].type && strcmp(z.rows[j].name, z.rows[i].name) == 0) dup++;
+    }
+    CHECK_MSG(ents == NOWN + 7, "%zu ENT rows, want %d", ents, NOWN + 7);
+    CHECK(dup == 0);
+    CHECK(z.presigned && z.n == n - 1 + NOWN + 7);   /* the NSEC row goes, the ENT rows come */
+    zrows_free(&z);
+}
+
 int main(void) {
     printf("=== presigned zones (dns_presigned.c) ===\n");
     test_module();
     test_root_nsec_ordername();
+    test_presigned_rows_ents();
     if (!tool("dnssec-signzone") || !tool("dnssec-keygen")) {
         printf("[SKIP] dnssec-signzone / dnssec-keygen are not installed: the rebuild tests need signed zones\n");
         printf("\n%d checks, %d failed\n", g_checks, g_failed);

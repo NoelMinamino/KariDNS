@@ -566,6 +566,9 @@ long write_uncompressed_name(uint8_t *buf, size_t offset, size_t max_len, const 
 long write_uncompressed_name_ext(uint8_t *buf, size_t offset, size_t max_len, const char *name, bool downcase);
 int write_dns_name_str(uint8_t *packet_buf, uint16_t *offset, const char *name, compress_ctx_t *ctx, size_t max_len);
 int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr, const dns_record_t *rec, compress_ctx_t *comp_ctx, const char *owner_name, uint32_t override_ttl);
+/* RFC 4034 §3.2: an RRSIG expiration / inception time, YYYYMMDDHHmmSS in UTC (a real date: no February 30) or 1-10 digits of seconds since
+ * 1970 (a 32-bit value).  false for anything else; the value is kept modulo 2^32 (RFC 4034 §3.1.5). */
+bool dns_dnssec_time_from_text(const char *str, uint32_t *out);
 /* RFC 4034 §6.2 item 3 (RFC 6840 §5.1) の型について、非圧縮の RDATA 内のドメイン名を小文字にする */
 void dns_canonical_downcase_rdata(uint16_t type, uint8_t *rd, size_t len);
 /* rec の RDATA を正規形 (非圧縮、上の型の名前は小文字) で buf に書き、長さを返す。書けなければ -1。

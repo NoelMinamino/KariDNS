@@ -474,7 +474,7 @@ static char *dnssec_rdata_uint(zone_arena_t *arena, uint32_t v) {
     return s;
 }
 
-/* RFC 4034 §3.2: 時刻は UTC の YYYYMMDDHHmmSS。parse_dnssec_time() の逆 (days-to-civil, H. Hinnant)。
+/* RFC 4034 §3.2: 時刻は UTC の YYYYMMDDHHmmSS。dns_dnssec_time_from_text() の逆 (days-to-civil, H. Hinnant)。
  * gmtime() は使わない: Backend は capability mode で動き、gmtime() は UTC のゾーン情報ファイルを開くことがある。 */
 static char *dnssec_rdata_time(zone_arena_t *arena, uint32_t t) {
     uint64_t z = (uint64_t)t / 86400 + 719468;
@@ -1342,7 +1342,7 @@ static size_t base32hex_decode(const char *in, uint8_t *out, size_t out_cap) {
  * unsigned decimal number of seconds since 1970-01-01 (at most 10 digits, a 32-bit value). Anything else is an error
  * (review wire [7]; it used to give 0). A date is checked field by field and, as in BIND (dns_time32_fromtext), kept
  * modulo 2^32 (serial number arithmetic, RFC 4034 §3.1.5). */
-static bool parse_dnssec_time(const char *str, uint32_t *out) {
+bool dns_dnssec_time_from_text(const char *str, uint32_t *out) {
     size_t len = strlen(str);
     if (len == 0) return false;
     for (size_t i = 0; i < len; i++)
@@ -3109,8 +3109,8 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                     if (!parse_u8(rec->rdata[1], &algorithm) ||
                         !parse_u8(rec->rdata[2], &labels)) return -1;
                     orig_ttl = strtoul(rec->rdata[3], NULL, 10);
-                    if (!parse_dnssec_time(rec->rdata[4], &sig_exp) ||
-                        !parse_dnssec_time(rec->rdata[5], &sig_inc)) return -1;
+                    if (!dns_dnssec_time_from_text(rec->rdata[4], &sig_exp) ||
+                        !dns_dnssec_time_from_text(rec->rdata[5], &sig_inc)) return -1;
                     if (!parse_u16(rec->rdata[6], &key_tag)) return -1;
                     signer = rec->rdata[7];
                 }
@@ -5022,8 +5022,8 @@ void dns_record_preparse_cache(struct zone_arena_s *arena, dns_record_t *rec) {
                 if (parse_u8(rec->rdata[1], &rec->cache.rrsig.algorithm) &&
                     parse_u8(rec->rdata[2], &rec->cache.rrsig.labels) &&
                     parse_u16(rec->rdata[6], &rec->cache.rrsig.key_tag) &&
-                    parse_dnssec_time(rec->rdata[4], &rec->cache.rrsig.sig_exp) &&
-                    parse_dnssec_time(rec->rdata[5], &rec->cache.rrsig.sig_inc)) {
+                    dns_dnssec_time_from_text(rec->rdata[4], &rec->cache.rrsig.sig_exp) &&
+                    dns_dnssec_time_from_text(rec->rdata[5], &rec->cache.rrsig.sig_inc)) {
                     rec->cache.rrsig.type_covered = get_type_code(rec->rdata[0]);
                     rec->cache.rrsig.orig_ttl = strtoul(rec->rdata[3], NULL, 10);
                     rec->cache.rrsig.signer = rec->rdata[7];

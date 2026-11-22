@@ -23,7 +23,9 @@
 /* reading the zone file                                                                                          */
 /* ------------------------------------------------------------------------------------------------------------- */
 
-static char *zrows_read_file(const char *path) {
+/* the whole file and its length (review Z-2: the callers took strlen(), so a NUL byte cut the zone there without a word; the parser now
+ * refuses a NUL within the length it is given) */
+static char *zrows_read_file(const char *path, size_t *out_len) {
     FILE *f = fopen(path, "rb");
     if (!f) return NULL;
     size_t cap = 65536, len = 0;
@@ -46,8 +48,14 @@ static char *zrows_read_file(const char *path) {
             cap *= 2;
         }
     }
+    bool bad = ferror(f) != 0;                 /* a read error is not the end of the file */
     fclose(f);
+    if (bad) {
+        free(buf);
+        return NULL;
+    }
     buf[len] = '\0';
+    *out_len = len;
     return buf;
 }
 
@@ -105,6 +113,12 @@ static void zrows_parse_error(const parse_error_t *perr, const zone_arena_t *are
 static void zrows_report_ooz(const dns_record_t *rec, void *ud) {
     zrows_info_t *info = ud;
     if (info->out_of_zone++ == 0) snprintf(info->first_out_of_zone, sizeof(info->first_out_of_zone), "%s", rec->name ? rec->name : "");
+}
+
+static void zrows_report_unenc(const dns_record_t *rec, void *ud) {
+    zrows_info_t *info = ud;
+    if (info->unencodable++ == 0)
+        snprintf(info->first_unencodable, sizeof(info->first_unencodable), "%s %s", rec->name ? rec->name : "", rec->type ? rec->type : "");
 }
 
 /* what the importer warns about, from the parse context (karicheck's warnings) */
@@ -167,7 +181,7 @@ bool zrows_load_zone_text(const char *text, size_t len, const char *path, const 
     visited_inos[0] = st.st_ino;
 
     char *parse_buf = arena->file_bufs[0];
-    int rc = parse_zone_fast(parse_buf, strlen(parse_buf), arena, &ctx);
+    int rc = parse_zone_fast(parse_buf, len, arena, &ctx);   /* review Z-2: the length given, not strlen(): a NUL byte is an error */
     free(base_dir);
     free(root_path);
     if (rc < 0) {
@@ -187,19 +201,20 @@ bool zrows_load_zone_text(const char *text, size_t len, const char *path, const 
     }
     snprintf(apex_out, apex_cap, "%s", apex);
     zone_arena_drop_out_of_zone(arena, apex_out, info ? zrows_report_ooz : NULL, info);
-    zone_arena_drop_unencodable(arena, NULL, NULL);
+    zone_arena_drop_unencodable(arena, info ? zrows_report_unenc : NULL, info);   /* (review Z-2 sibling: was dropped without a word) */
     return true;
 }
 
 bool zrows_load_zone_file(const char *path, const char *apex_override, zone_arena_t *arena, char *apex_out,
                         size_t apex_cap, char *err, size_t errlen) {
-    char *buf = zrows_read_file(path);
+    size_t len = 0;
+    char *buf = zrows_read_file(path, &len);
     if (!buf) {
         zone_arena_init(arena);
         snprintf(err, errlen, "cannot read %s", path);
         return false;
     }
-    bool ok = zrows_load_zone_text(buf, strlen(buf), path, apex_override, arena, apex_out, apex_cap, NULL, err, errlen);
+    bool ok = zrows_load_zone_text(buf, len, path, apex_override, arena, apex_out, apex_cap, NULL, err, errlen);
     free(buf);
     return ok;
 }
@@ -219,7 +234,7 @@ static bool zrows_tdns_parse(const char *text, size_t len, const char *shown, ti
     ctx.all_zone_names = (const char **)zones;       /* the parser only reads the names */
     ctx.all_zone_count = nzones;
     char *parse_buf = arena->file_bufs[0];
-    if (parse_tinydns_data(parse_buf, strlen(parse_buf), arena, &ctx) < 0) {
+    if (parse_tinydns_data(parse_buf, len, arena, &ctx) < 0) {
         zrows_parse_error(&perr, arena, shown, info, err, errlen);
         zone_arena_destroy(arena);
         return false;
@@ -293,14 +308,14 @@ bool zrows_load_tinydns_text(const char *text, size_t len, const char *path, tim
     if (!zrows_tdns_parse(text, len, path ? path : "standard input", mtime, apex, zones, nzones, arena, info, err, errlen)) return false;
     snprintf(apex_out, apex_cap, "%s", apex);
     zone_arena_drop_out_of_zone(arena, apex_out, NULL, NULL);
-    zone_arena_drop_unencodable(arena, NULL, NULL);
+    zone_arena_drop_unencodable(arena, info ? zrows_report_unenc : NULL, info);
     return true;
 }
 
 /* the path versions: the file is read here (a file that cannot be read is "cannot read PATH") */
-static char *zrows_read_with_mtime(const char *path, time_t *mtime, char *err, size_t errlen) {
+static char *zrows_read_with_mtime(const char *path, time_t *mtime, size_t *len, char *err, size_t errlen) {
     struct stat st;
-    char *buf = zrows_read_file(path);
+    char *buf = zrows_read_file(path, len);
     if (!buf || stat(path, &st) != 0) {
         free(buf);
         snprintf(err, errlen, "cannot read %s", path);
@@ -314,9 +329,10 @@ bool zrows_tinydns_apexes(const char *path, char ***names, int *n, char *err, si
     time_t mt;
     *names = NULL;
     *n = 0;
-    char *buf = zrows_read_with_mtime(path, &mt, err, errlen);
+    size_t len = 0;
+    char *buf = zrows_read_with_mtime(path, &mt, &len, err, errlen);
     if (!buf) return false;
-    bool ok = zrows_tinydns_apexes_text(buf, strlen(buf), path, mt, names, n, NULL, err, errlen);
+    bool ok = zrows_tinydns_apexes_text(buf, len, path, mt, names, n, NULL, err, errlen);
     free(buf);
     return ok;
 }
@@ -324,12 +340,13 @@ bool zrows_tinydns_apexes(const char *path, char ***names, int *n, char *err, si
 bool zrows_load_tinydns_file(const char *path, const char *apex_override, const char *const *zones, int nzones, zone_arena_t *arena,
                            char *apex_out, size_t apex_cap, char *err, size_t errlen) {
     time_t mt;
-    char *buf = zrows_read_with_mtime(path, &mt, err, errlen);
+    size_t len = 0;
+    char *buf = zrows_read_with_mtime(path, &mt, &len, err, errlen);
     if (!buf) {
         zone_arena_init(arena);
         return false;
     }
-    bool ok = zrows_load_tinydns_text(buf, strlen(buf), path, mt, apex_override, zones, nzones, arena, apex_out, apex_cap, NULL, err, errlen);
+    bool ok = zrows_load_tinydns_text(buf, len, path, mt, apex_override, zones, nzones, arena, apex_out, apex_cap, NULL, err, errlen);
     free(buf);
     return ok;
 }
@@ -882,7 +899,10 @@ bool zrows_make_presigned(zrows_t *o, char *err, size_t errlen) {
             deleg.v[deleg.n++] = (char *)o->rows[i].name;
     qsort(deleg.v, deleg.n, sizeof(char *), zrows_cmp_str);
     if (!zrows_set_build(o, "DS", &ds) || !zrows_set_build(o, NULL, &all)) goto oom;
-    /* ENTs: ancestors (below the apex) of the names that are not occluded and are no owner themselves */
+    /* ENTs: ancestors (below the apex) of the names that are not occluded and are no owner themselves.
+     * review Z-3: the list had a fixed size (4 per row) and took every ancestor of every row, duplicates included; a zone whose rows used it
+     * up lost its later ENTs (and their NSEC3 rows) without a word, and the denial chain was broken.  It grows now, and the rows of one owner
+     * (they come together) add its ancestors once. */
     ents.v = malloc(ents_cap * sizeof(char *));
     if (!ents.v) goto oom;
     for (size_t i = 0; i < o->n; i++) {
@@ -891,11 +911,18 @@ bool zrows_make_presigned(zrows_t *o, char *err, size_t errlen) {
         if (mode3 && o->rows[i].type && strcmp(o->rows[i].type, "RRSIG") == 0 && o->rows[i].content &&
             strncmp(o->rows[i].content, "NSEC3 ", 6) == 0)
             continue;                                           /* a hashed owner */
+        if (i > 0 && strcmp(o->rows[i - 1].name, nm) == 0) continue;   /* (the previous row's owner: done; a skipped one has none to add) */
         for (const char *p = strchr(nm, '.'); p; p = strchr(p + 1, '.')) {
             const char *anc = p + 1;
             if (strcmp(anc, o->zone) == 0) break;
             if (zrows_set_has(&all, anc)) continue;
-            if (ents.n < ents_cap) ents.v[ents.n++] = (char *)anc;
+            if (ents.n == ents_cap) {
+                char **nv = ents_cap <= SIZE_MAX / (2 * sizeof(char *)) ? realloc(ents.v, ents_cap * 2 * sizeof(char *)) : NULL;
+                if (!nv) goto oom;
+                ents.v = nv;
+                ents_cap *= 2;
+            }
+            ents.v[ents.n++] = (char *)anc;
         }
     }
     qsort(ents.v, ents.n, sizeof(char *), zrows_cmp_str);

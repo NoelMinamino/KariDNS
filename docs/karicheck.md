@@ -102,7 +102,8 @@ When `config_path` is omitted, `/usr/local/etc/karidns/karidns.conf` is used (or
 ### Zone checks
 
 1. **Zone File Directives**:
-   - `$ORIGIN`, `$TTL`, `$INCLUDE` (up to 16 nesting levels and 32 files per zone), `$GENERATE` (BIND syntax, any RR type, at most 100,000 records per directive; see karidns(8) "ZONE FILE FORMAT")
+   - `$ORIGIN`, `$TTL`, `$INCLUDE` (up to 16 nesting levels and 32 files per zone), `$GENERATE` (BIND syntax, any RR type, at most 100,000 records per directive and 1,000,000 generated records per zone, and not past the zone's `max-records`: an error at the statement; see karidns(8) "ZONE FILE FORMAT")
+   - A NUL byte in a zone file, an `$INCLUDE` file, a tinydns data file, a configuration file or the zone text on standard input is an error (`io.nul-byte`; the server refuses such a file: the parsers stop at the NUL, so the rest of the file used to go unchecked); so is a file that cannot be read whole. A quoted string must be a field of its own (`"abc"def` and `ab"c d"` are errors, `key="value"` of SVCB and HTTPS is not), and a tag name has at most 63 characters.
    - `$INCLUDE` follows the rules of the server (karidns(8) "ZONE FILE FORMAT"): a relative name is read from `options { directory }` when `karicheck` knows one (a zone checked through a configuration), else from the directory of the zone file; an absolute path or one that leaves the base through `..` is accepted only inside the directory of the zone file or `directory`, and anything else is an error (`$INCLUDE '/etc/hosts' is outside the directories opened at startup (zone file dir, directory): ...`), so the verdict is the same as `karidns`' (standalone mode used to accept any absolute path).
    - TTLs: a `$TTL`, record TTL or `$GENERATE` TTL that is not digits with optional `s`/`m`/`h`/`d`/`w` units, or above 2147483647, is an error at its position (it used to become 3600); so are malformed SOA refresh, retry, expire and minimum fields and a SOA serial that is not a plain number 0-4294967295 (BIND 9.20 `fromtext_soa()`; the same in the `Z` line of a tinydns file); a number after a unit (`1h30`) is not a TTL. A zone in which some record has no TTL at all (no `$TTL`, no earlier TTL, no SOA to take the minimum from) gives a warning that names the file and line of the first such record (`zone.db:12: no TTL specified for 'www.example.test.' ...`, the path of the `$INCLUDE` file when it is in one) and how many records there are: BIND rejects it ("no TTL specified"), `karidns` serves those records with 3600.
    - Classes: a zone has the class of its first record; a record of another class is an error at its line (`class 'CH' != zone class 'IN'`, as BIND `lib/dns/master.c`).
@@ -110,7 +111,7 @@ When `config_path` is omitted, `/usr/local/etc/karidns/karidns.conf` is used (or
    - TXT-like types (`TXT`, `SPF`, `AVC`, `NINFO`, `RESINFO`, `WALLET`): a `<character-string>` of more than 255 octets gives a warning with file and line, `BIND rejects this`; `karidns` serves it split into 255-octet strings.
    - `\# <length> <hex>` RDATA may be written in any number of tokens (up to the 512 fields of a line) for every type.
    - KariDNS steering directives `$LOCATION`, `$LOCATION-TAG`, `$ECS-SUBNET`, `$ECS-SUBNET-TAG`: records that reference an undefined location or ECS tag are errors
-   - tinydns `data` files (through a configuration file with `file-format tinydns;`): invalid location prefix lengths (`/n` above 32, error), duplicate location codes, malformed IPv6 fields of `3`/`6` lines, and SRV/NAPTR/SSHFP field ranges of generic lines
+   - tinydns `data` files (through a configuration file with `file-format tinydns;`): a malformed IPv4 or IPv6 address, location prefix, location code, time stamp, NAPTR string or SSHFP fingerprint is a `zone.syntax` error with its line (karidns(8) "TINYDNS ZONE FORMAT"; such lines used to be read loosely, as djbdns does, or left out); invalid location prefix lengths (`/n` above 32, error), duplicate location codes, malformed IPv6 fields of `3`/`6` lines, and SRV/NAPTR/SSHFP field ranges of generic lines
 2. **Zone Integrity & Structural Invariants**:
    - Exactly one SOA record at the zone apex that every client sees, and at least one NS record at the apex. A tinydns zone (one `Z` line per location) and a zone with `$LOCATION` / `$ECS-SUBNET` tags may hold more SOA records when each of the others has a location, a time stamp or a tag; every SOA record of the zone must have the same serial (error, RFC 2181 §6.1), none may be restricted (or accompanied by another SOA) in a zone that holds DNSSEC records (RRSIG, DNSKEY, NSEC, NSEC3: error, the signature of the SOA RRset would not hold for every client), and a SOA restricted to a tinydns location the zone does not define, or whose countdown time stamp is over, is seen by nobody (warning). Several SOA records that every client sees are an error as before. See karidns(8) "Several SOA records".
    - CNAME exclusivity (CNAME must not co-exist with other record types at the same owner name, except DNSSEC RRs), CNAME loops, CNAME chains (warning), NS/MX targets that point to a CNAME (error, RFC 2181 §10.3) and SRV targets that point to a CNAME (warning, RFC 2782 "the name MUST NOT be an alias"; BIND's `check-srv-cname` default is also a warning)
@@ -304,6 +305,7 @@ Severity is the usual one of the code; a check whose severity the configuration 
 | `io.stat` | error | a file could not be examined with stat |
 | `io.stdin.read` | error | reading standard input failed |
 | `io.stdin.too-large` | error | the zone text on standard input is larger than 64 MiB |
+| `io.nul-byte` | error | a configuration or zone file, or the zone text on standard input, contains a NUL byte |
 | `io.file.too-large` | error | a configuration or zone file is larger than the server reads (256 MiB) |
 | `io.pipe` | error | a pipe for the database loader could not be created |
 | `io.fork` | error | the database loader could not be started |
@@ -429,7 +431,7 @@ Severity is the usual one of the code; a check whose severity the configuration 
 | `zone.empty` | error | the zone has no records |
 | `zone.out-of-zone` | warning | a record outside the zone is ignored |
 | `zone.tinydns.out-of-zone` | warning | tinydns records that belong to no zone of the view are ignored |
-| `zone.tinydns.skipped` | warning | tinydns lines with data that cannot be kept are left out |
+| `zone.tinydns.skipped` | warning | tinydns lines with data that cannot be kept are left out (0.7: such a line is a zone.syntax error) (retired: no longer printed) |
 | `zone.ttl.missing` | warning | records have no TTL and no $TTL |
 | `zone.string.long` | warning | a character-string of more than 255 octets |
 | `zone.limits` | error | the zone breaks a size limit of the configuration |
@@ -596,7 +598,7 @@ Severity is the usual one of the code; a check whose severity the configuration 
 | `db.import.no-reload` | warning | a reload request was asked for but the database has no karidns_reload_requests table |
 | `db.import.dry-run` | info | a dry run: everything but the commit was done, and nothing was written |
 | `db.import.verify` | error | the zone read back from the transaction is not one the loader would load; the transaction was rolled back |
-| `db.import.not-primary` | warning | the zone in the database is not a primary zone, so the records written were not checked |
+| `db.import.not-primary` | warning | the zone in the database is not a primary zone: the server does not serve the records written (they are checked all the same) |
 | `db.import.done` | info | a zone was imported, with the number of RRsets added, replaced and deleted |
 | `db.import.summary` | info | the end of an import of several zones: how many were imported and how many failed |
 | `db.import.change` | note | an RRset the import adds, replaces or deletes (listed for --dry-run and --verbose) |

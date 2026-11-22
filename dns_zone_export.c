@@ -149,7 +149,7 @@ out:
 /* one zone                                                                                                       */
 /* ------------------------------------------------------------------------------------------------------------- */
 
-typedef struct { const char *want; bool found, ambiguous; int64_t id; char *name, *type; } zfind_t;
+typedef struct { const char *want; bool found, ambiguous; int64_t id; char *name, *type; bool oom; } zfind_t;
 
 static int zx_cb_zone(void *ud, const db_zone_row_t *r) {
     zfind_t *f = ud;
@@ -162,6 +162,7 @@ static int zx_cb_zone(void *ud, const db_zone_row_t *r) {
     f->id = r->id;
     f->name = strdup(r->name);
     f->type = strdup(r->type ? r->type : "");
+    if (!f->name || !f->type) return f->oom = true;   /* review Z-6: zx_primary(zf.type) read a NULL; stop the scan */
     return 0;
 }
 
@@ -301,7 +302,7 @@ static void zx_add_sig_line(zx_text_t *b, const db_record_row_t *r) {
     char head[512];
     size_t nm = strlen(r->name);
     if (nm > 1 && r->name[nm - 1] == '.') nm--;
-    int h = snprintf(head, sizeof(head), "%.*s. %d IN RRSIG ", (int)nm, r->name, r->ttl_null ? 0 : (int)r->ttl);
+    int h = snprintf(head, sizeof(head), "%.*s. %lld IN RRSIG ", (int)nm, r->name, r->ttl_null ? 0LL : (long long)r->ttl);   /* (0..PDNS_MAX_TTL) */
     if (h < 0 || (size_t)h >= sizeof(head)) return;
     zx_text_add(b, head, (size_t)h);
     zx_text_add(b, c, (size_t)(w[7] + wl[7] - c));
@@ -318,6 +319,9 @@ static bool zx_skip_row(const zx_feed_t *f, const db_record_row_t *r) {
         char w[16];
         if (strcasecmp(t, "RRSIG") != 0) return zx_chain_type(t);
         if (!zx_covers_chain(r, w, sizeof(w))) return false;
+        /* review Z-6: the line is written from the row as it is, and "(int)ttl" made a TTL above 2^31 - 1 negative.  Such a row goes to the
+         * reader instead, which refuses the zone with its reason (PDNS_MAX_TTL), as it does for any other row */
+        if (!r->ttl_null && (r->ttl < 0 || r->ttl > (int64_t)PDNS_MAX_TTL)) return false;
         if (zx_chain_sig_kept(f, r, w) && f->sigs) zx_add_sig_line(f->sigs, r);
         return true;                                       /* (never into the zone) */
     }
@@ -408,7 +412,7 @@ int zx_read_zone_ex(const db_driver_t *d, db_conn_t *c, bool has_ext, const char
 int zx_export_zone_ex(zx_t *x, const char *zone, const char *view, const dzt_opts_t *fmt, dzt_sink_t sink, void *ud, unsigned plain) {
     const db_driver_t *d = x->drv;
     db_conn_t *c = x->conn;
-    zfind_t zf = { zone, false, false, 0, NULL, NULL };
+    zfind_t zf = { zone, false, false, 0, NULL, NULL, false };
     pdns_zone_t *z = NULL;
     zx_text_t sigs = {0};
     int ret = -1;
@@ -416,8 +420,9 @@ int zx_export_zone_ex(zx_t *x, const char *zone, const char *view, const dzt_opt
         ZX_ERR(x, DC_DB_EXPORT_READ, "%s", d->errmsg(c));
         return -1;
     }
-    if (d->find_zone(c, zone, zx_cb_zone, &zf) != 0) {
-        ZX_ERR(x, DC_DB_EXPORT_READ, "%s", d->errmsg(c));
+    if (d->find_zone(c, zone, zx_cb_zone, &zf) != 0 || zf.oom) {
+        if (zf.oom) ZX_ERR(x, DC_INTERNAL_OOM, "out of memory");
+        else ZX_ERR(x, DC_DB_EXPORT_READ, "%s", d->errmsg(c));
         goto out;
     }
     if (!zf.found || zf.ambiguous) {

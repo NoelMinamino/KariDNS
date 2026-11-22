@@ -55,6 +55,15 @@ int open_via_dir_cache(const char *path, int flags, mode_t mode, bool writable) 
     return open(path, flags);
 }
 
+/* true (and an error) when the text holds a NUL byte */
+KARIDNS_TOOL_FN bool kc_nul_byte(const char *buf, size_t len, const char *shown) {
+    const char *nul = len ? memchr(buf, '\0', len) : NULL;
+    if (!nul) return false;
+    dns_diag(DIAG_ERROR, DC_IO_NUL_BYTE, shown, 0, "%s contains a NUL byte (at offset %zu); the server refuses such a file\n", shown,
+             (size_t)(nul - buf));
+    return true;
+}
+
 // Helper to read entire file
 KARIDNS_TOOL_FN char *read_file_or_die(const char *path, bool *out_failed) {
     FILE *f = fopen(path, "r");
@@ -101,6 +110,14 @@ KARIDNS_TOOL_FN char *read_file_or_die(const char *path, bool *out_failed) {
     size_t read_bytes = fread(buf, 1, len, f);
     buf[read_bytes] = '\0';
     fclose(f);
+    /* review Z-2: the server refuses a file it cannot read whole or that holds a NUL byte (read_entire_file_stat()); the parsers stop at
+     * the NUL, so the rest of the file was not checked and the check said OK */
+    if (read_bytes != (size_t)len || kc_nul_byte(buf, read_bytes, path)) {
+        if (read_bytes != (size_t)len) dns_diag(DIAG_ERROR, DC_IO_READ, path, 0, "Could not read file: %s (short read)\n", path);
+        free(buf);
+        if (out_failed) *out_failed = true;
+        return NULL;
+    }
     if (out_failed) *out_failed = false;
     return buf;
 }
@@ -151,6 +168,10 @@ KARIDNS_TOOL_FN char *kc_read_stdin(bool *out_failed) {
         len += (size_t)got;
     }
     buf[len] = '\0';
+    if (kc_nul_byte(buf, len, KC_STDIN_NAME)) {   /* review Z-2 */
+        free(buf);
+        return NULL;
+    }
     *out_failed = false;
     return buf;
 }
@@ -417,6 +438,11 @@ KARIDNS_TOOL_FN int check_zone_run(const char *domain_raw, const char *file_arg,
         ctx.zone_exists_ud = view;
     }
 
+    {   /* review Z-1: a $GENERATE over max-records fails while parsing, as in the server */
+        zone_limits_t lim0;
+        zone_limits_effective(cfg, zcfg, view ? view->name : NULL, &lim0);
+        ctx.max_records = (size_t)lim0.max_records;
+    }
     int res;
     if (file_format && strcasecmp(file_format, "tinydns") == 0) {
         res = parse_tinydns_data(mutable_buf, strlen(mutable_buf), &arena, &ctx);
@@ -439,11 +465,6 @@ KARIDNS_TOOL_FN int check_zone_run(const char *domain_raw, const char *file_arg,
         kc_warning(&tally, DC_ZONE_TINYDNS_OUT_OF_ZONE, "Zone '%s': %zu tinydns record(s) belong to no zone configured in the same "
                         "view and are ignored (first: '%s')\n",
                 domain, ctx.out_of_zone_count, ctx.first_out_of_zone ? ctx.first_out_of_zone : "");
-    }
-    if (ctx.skipped_data_count > 0) {
-        kc_warning(&tally, DC_ZONE_TINYDNS_SKIPPED, "Zone '%s': %zu tinydns line(s) have data that cannot be kept (an SSHFP fingerprint that is not hexadecimal) "
-                        "and are left out (first: '%s')\n",
-                domain, ctx.skipped_data_count, ctx.first_skipped_data ? ctx.first_skipped_data : "");
     }
 
     if (arena.count == 0) {

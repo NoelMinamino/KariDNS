@@ -7,7 +7,7 @@
  *      (a) a context with err_out, (b) a context without err_out, (c) no context at all.
  *   3. Generic (:) records and unknown type characters.
  *   4. Robustness: truncation at every ':' boundary and junk fields must never crash or corrupt memory.
- * Known-lenient inputs (invalid IPv4 such as 300.0.2.10 is accepted) are executed but not pinned.
+ * Malformed address, time stamp and location fields are errors since review Z-4 / Z-6 (test_tinydns_parser.c pins them).
  * Meta-types (TKEY/TSIG/IXFR/ANY/...) in generic records are rejected.
  */
 #include <assert.h>
@@ -67,13 +67,13 @@ static const struct { const char *line; size_t n; uint16_t must_have; } VALID[] 
     { ":raw.example.com:99:\\002\\002\\003:300", 1, 99 },               /* SPF: one <character-string> of 2 octets */
     { "3www.example.com:20010db8000000000000000000000001:300", 1, 28 },
     { "6www.example.com:20010db8000000000000000000000001:300", 1, 28 },
-    { "Sexample.com:5.srv.example.com:5060:10:20:300", 1, 0 },
+    { "Sexample.com::5.srv.example.com:5060:10:20:300", 1, 33 },
     { "Nexample.com:100:10:u:E2U+sip::.:300", 1, 35 },             /* NAPTR (0.6.2: the order and the preference are numbers) */
     { "_ssh.example.com:1:1:0123456789abcdef0123456789abcdef01234567:300", 1, 44 },   /* SSHFP (0.6.2: the algorithm and the type are numbers) */
-    { "=www.example.com:192.0.2.10:300:20260101T000000:lo", 1, 1 },
-    { "=www.example.com:192.0.2.10:300:4611686018427387914", 1, 1 },
-    { "=www.example.com:192.0.2.10:0:4611686018427387914", 1, 1 },
-    { "=www.example.com:192.0.2.10:0:4611686018427387914:lo", 1, 1 },
+    { "=www.example.com:192.0.2.10:300:4000000065000000:lo", 1, 1 },
+    { "=www.example.com:192.0.2.10:300:400000006500000a", 1, 1 },
+    { "=www.example.com:192.0.2.10:0:400000006500000a", 1, 1 },
+    { "=www.example.com:192.0.2.10:0:400000006500000a:lo", 1, 1 },
     { "=www.example.com:192.0.2.10:300::lo", 1, 1 },
     { "=a\\056b.example.com:192.0.2.10:300", 1, 1 },                 /* octal escape for '.' stays inside the label */
     { "=a\\.b.example.com:192.0.2.10:300", 1, 1 },

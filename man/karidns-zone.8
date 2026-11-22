@@ -1,4 +1,4 @@
-.TH KARIDNS\-ZONE 8 "2026-11-17" "KariDNS" "KariDNS Manual"
+.TH KARIDNS\-ZONE 8 "2026-11-22" "KariDNS" "KariDNS Manual"
 .\" Generated from docs/karidns-zone.md by man/md2man.pl (make man): edit the Markdown manual, not this page.
 .SH NAME
 karidns\-zone \- writes a zone file into a PowerDNS 5.1 database (\fBimport\fR)
@@ -60,8 +60,11 @@ syntax error names the file and the line.
 .IP 2. 4
 Runs the checks of \fBkaricheck zone\fR on it (with the \fBcheck\-*\fR options
 of the configuration, below). An \fBerror\fR fails the import and nothing is
-written. A \fBwarning\fR is printed and the import goes on; \fB\-\-strict\fR
-makes a warning fail it.
+written. A text with a NUL byte is an error, and so is a record whose RDATA
+cannot be written in wire format (\fBzone.record.wire\fR, an RRSIG that expires
+on 31 February for one): the server would leave it out, and before 0.7 the
+import dropped it without a word. A \fBwarning\fR is printed and the import goes
+on; \fB\-\-strict\fR makes a warning fail it.
 .IP 3. 4
 In one transaction: finds the zone or creates it, applies the serial rule,
 deletes and inserts the rows, puts the zone in the view, adds the reload
@@ -112,8 +115,9 @@ The type of an existing zone (\fBdomains.type\fR) is never changed; a new zone
 is \fBNATIVE\fR (what \fBpdnsutil load\-zone\fR creates), or \fBMASTER\fR with
 \fB\-\-type MASTER\fR. A zone whose \fBdomains.type\fR is not \fBNATIVE\fR or
 \fBMASTER\fR is not a zone the server serves from records: the import goes on,
-with the warning \fBdb.import.not\-primary\fR, and the records are not read
-back.
+with the warning \fBdb.import.not\-primary\fR, and the records are read back as
+a primary zone's all the same (0.7: they used to be written unchecked, and a
+change of \fBdomains.type\fR to \fBMASTER\fR would have served them).
 .SS Modes
 .TP 8
 \fB\-\-mode replace\fR (the default)
@@ -782,8 +786,11 @@ half a file. Without \fB\-\-force\fR the name is taken with \fBlink(2)\fR, so a
 file that appeared in between is never replaced. Output files are never opened
 through a symbolic link: an existing link is not followed (without
 \fB\-\-force\fR it is an error, with \fB\-\-force\fR the link itself is
-replaced). With \fB\-\-json\fR the zone text cannot go to standard output: give
-a file.
+replaced). A file that \fB\-\-force\fR replaces keeps its permission bits; a new
+file gets \fB0666\fR less the umask (0.7: a replaced file used to get that as
+well, so a \fB0600\fR backup became readable by everyone under the usual
+umask). With \fB\-\-json\fR the zone text cannot go to standard output: give a
+file.
 .PP
 \fB\fBexport \-\-all \-\-dir DIR\fB\fR writes \fB<name>.zone\fR (BIND format) or
 \fB<name>.tinydns\fR (a tinydns data file) for every primary zone, in the order
