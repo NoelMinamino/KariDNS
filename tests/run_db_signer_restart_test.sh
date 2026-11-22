@@ -15,6 +15,7 @@
 #   C1  (c) `store none` + memory-limit: a big zone of the signer whose change waits stays in memory while a sweep over 200 other zones takes everything
 #       else out (dbstatus "held there", "held in memory now: 1 zone(s)", the WARNING that the holds keep the zones above memory-limit) and every zone of the
 #       sweep is still answered (the held bytes do not hold the fetches back).  Before (c) the zone was taken out and the next query read the unsigned version.
+#       The WARNING is checked after memory-limit is lowered below the held zone (karictl reconfig): the sweep alone does not reach above the limit on a slow build.
 #
 # Needs root (the server starts as root and drops to nobody, the loader is root-owned).  SKIP otherwise and when a binary or the database is missing.
 . "$(dirname "$0")/lib_proc.sh"
@@ -273,7 +274,19 @@ EV=$(dbst | sed -n 's/^residency: .* evictions=\([0-9]*\).*/\1/p' | head -1)
 [ "${EV:-0}" -gt 0 ] 2>/dev/null && pass "memory-limit took zones out of memory (evictions=$EV)" || fail "no evictions (evictions='$EV')"
 stays_ans www.sg.test 192.0.2.20 2 && pass "the signer's zone kept its signed version in memory (not taken out and read again unsigned)" || fail "the signer's zone was taken out and read as it is"
 wait_dbst "held in memory now: 1 zone(s)" 10 && pass "dbstatus: one zone held in memory, counted against memory-limit" || { fail "dbstatus does not count the held zone"; dbst | grep -i "signer-wait" | sed 's/^/         /'; }
-kari_wait_log "$LOG" "signer-wait: the database zones (.*) are above memory-limit (.*) and 1 zone(s) of karidns-signer" 10 && pass "a WARNING says that the held zone keeps the zones above memory-limit" || { fail "no WARNING about memory-limit"; grep -i "memory-limit\|signer" "$LOG" | tail -5 | sed 's/^/         /'; }
+# The WARNING is said when the zones in memory are above memory-limit while a zone is held.  Under a 2 MB limit the cache manager keeps them under it (the
+# other zones go first), and whether a round of the sweep finds them above it is a matter of timing (a slow coverage build never did): the limit is lowered
+# below the size of the held zone instead (karictl reconfig: the cache manager reads it at once), so the held zone alone keeps them above it.
+conf "memory-limit 1m; fetch-rate 5000; park-timeout 4000;"
+OUT=$($KCTL reconfig 2>&1) && pass "memory-limit lowered to 1 MB, below the held zone ($OUT)" || fail "karictl reconfig: $OUT"
+if kari_wait_log "$LOG" "signer-wait: the database zones (.*) are above memory-limit (.*) and 1 zone(s) of karidns-signer" 20; then
+    pass "a WARNING says that the held zone keeps the zones above memory-limit"
+else
+    fail "no WARNING about memory-limit"
+    dbst | grep -E "^cache:|^residency:|^signer-wait:" | sed 's/^/         /'
+    grep -i "memory-limit\|signer-wait" "$LOG" | tail -5 | sed 's/^/         /'
+fi
+stays_ans www.sg.test 192.0.2.20 1 && pass "...and the held zone keeps its signed version under the lower limit" || fail "the held zone was let go under the lower limit"
 signed sg.test 2
 $KCTL reload sg.test > /dev/null 2>&1
 wait_ans www.sg.test 192.0.2.21 10 && pass "signed and reloaded: the new version is served" || fail "after the reload: got '$(qa www.sg.test)'"
