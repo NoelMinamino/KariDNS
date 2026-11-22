@@ -291,20 +291,23 @@ static void test_spawn_and_restart(void) {
     CHECK(s.restart_pending);
 
     /* the Backend cannot take the stream (pair C is closed): the failure is logged and the loader, whose streams lead nowhere, is killed (or
-     * has ended by itself already); it is reaped as any exit */
+     * has ended by itself already); it is reaped as any exit.  Review DB L-2: the spawn is a failure (it returned true and counted a start) */
     write_loader(path, 0755);
     close(g_db_ctrl_fd);
     g_db_ctrl_fd = -1;
     s.restart_pending = false;
-    CHECK(db_sup_spawn(&s));
-    CHECK(s.pid > 0);
-    {
-        int rst = reap(s.pid);
-        CHECK(WIFEXITED(rst) || (WIFSIGNALED(rst) && WTERMSIG(rst) == SIGKILL));
-    }
+    starts = s.starts;
+    CHECK(!db_sup_spawn(&s));
+    CHECK_MSG(s.pid > 0 && s.starts == starts && !s.restart_pending, "pid %d, starts %u (were %u), restart pending %d", (int)s.pid, s.starts, starts, s.restart_pending);
     /* one loader at a time: db_sup_spawn() does not start another while the exit of the first has not been seen */
     CHECK(!db_sup_spawn(&s));
-    s.pid = 0;
+    {
+        pid_t kp = s.pid;
+        int rst = reap(kp);
+        CHECK(WIFEXITED(rst) || (WIFSIGNALED(rst) && WTERMSIG(rst) == SIGKILL));
+        CHECK(db_sup_child_exited(&s, kp, rst));                             /* the reap schedules the next start, as for any exit */
+        CHECK(s.pid == 0 && s.restart_pending && s.starts == starts);
+    }
     unsetenv("KARIDNS_TEST_LEAK");
 
     db_sup_after_fork_supervisor(&s);                                        /* the supervisor drops the Backend's ends ... */
@@ -670,7 +673,35 @@ static void test_log_pipe(void) {
     int fds_after = count_open_fds();
     CHECK_MSG(fds_after <= fds_before, "descriptors: %d before, %d after", fds_before, fds_after);
 
-    /* an end of stream while the loader still runs (it closed its stderr) closes the pipe and goes on */
+    /* review DB L-1: a read error is not an end of stream.  It closed the pipe without a word (a running loader's messages went nowhere, as far as
+     * anybody could tell); it closes it and says so, once.  A descriptor open for writing only stands in for one whose read fails (EBADF; the ends of
+     * a FreeBSD pipe can both be read). */
+    {
+        int ep[2];
+        memset(&g_logged, 0, sizeof(g_logged));
+        db_logrd_init(&s.log_rd);
+        s.log_fd = open("/dev/null", O_WRONLY);
+        CHECK(s.log_fd >= 0);
+        CHECK(!db_sup_log_read(&s));
+        CHECK(s.log_fd == -1);
+        CHECK_MSG(g_logged.n == 1 && g_logged.prio[0] == LOG_ERR && strstr(g_logged.text[0], "Cannot read the database loader's messages") &&
+                  strstr(g_logged.text[0], "logs to syslog itself"), "%d lines logged, the first: %s", g_logged.n, g_logged.n ? g_logged.text[0] : "-");
+        CHECK(!db_sup_log_read(&s));                                        /* closed: nothing more is read or said */
+        CHECK(g_logged.n == 1);
+        /* EAGAIN: nothing there yet, the pipe stays open and nothing is logged */
+        CHECK(pipe(ep) == 0);
+        CHECK(fcntl(ep[0], F_SETFL, fcntl(ep[0], F_GETFL, 0) | O_NONBLOCK) == 0);
+        s.log_fd = ep[0];
+        CHECK(!db_sup_log_read(&s));
+        CHECK(s.log_fd == ep[0] && g_logged.n == 1);
+        close(ep[1]);                                                       /* then the end of the stream: closed, silently */
+        CHECK(!db_sup_log_read(&s));
+        CHECK(s.log_fd == -1 && g_logged.n == 1);
+    }
+
+    /* an end of stream while the loader still runs (it closed its stderr) closes the pipe and goes on.  (New pairs: the ones above were closed, and a
+     * spawn whose streams cannot be handed over kills its loader and fails, review DB L-2; this case ran on such a killed loader before.) */
+    CHECK_MSG(db_sup_open_pairs(&s, err, sizeof(err)), "%s", err);
     write_script(path, "exec 2>&-\nsleep 1\nexit 0");
     s.restart_pending = false;
     CHECK(db_sup_spawn(&s));
@@ -686,6 +717,8 @@ static void test_log_pipe(void) {
     reap(pid);
     CHECK(db_sup_child_exited(&s, pid, 0));
     db_sup_log_finish(&s);                                                  /* nothing open: harmless */
+    db_sup_after_fork_supervisor(&s);
+    db_sup_close_supervisor_ends(&s);
     klog_set_hook(NULL);
     unlink(path);
 }

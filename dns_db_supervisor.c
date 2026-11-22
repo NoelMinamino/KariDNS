@@ -177,11 +177,18 @@ bool db_sup_log_read(db_sup_t *s) {
       db_logrd_feed(&s->log_rd, buf, (size_t)r, mono_ms(), db_log_sink, NULL);
     } else if (r < 0 && errno == EINTR) {
       continue;
-    } else if (r < 0 && errno == EAGAIN) {
+    } else if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
       return false;
     } else {                                    /* the end of the stream (the loader, and everything it started, closed its stderr), or an error */
+      /* review DB L-1: an error is not the end of the stream.  It closed the pipe silently: a loader that still ran had no reader for the rest of its
+       * life, and nothing said so.  It is said once (the pipe goes, so this is the last read of it); the loader's next write fails with EPIPE (it
+       * ignores SIGPIPE) and its messages go to syslog instead (karidns_dbloader.c vlg()), so they are not lost. */
+      const int rerr = r < 0 ? errno : 0;
       db_logrd_flush(&s->log_rd, mono_ms(), db_log_sink, NULL);
       log_close(s);
+      if (rerr)                                 /* (in the category of the loader's messages, where they are missed) */
+        kdns_logc(LOGC_DATABASE, LOG_ERR, "[Manager] Cannot read the database loader's messages: %s; the pipe is closed, the loader (pid %d) logs to syslog itself from now on",
+               strerror(rerr), (int)s->pid);
       return false;
     }
   }
@@ -536,6 +543,7 @@ bool db_sup_spawn(db_sup_t *s) {
     db_logrd_init(&s->log_rd);
     s->log_fd = log_rfd;
   }
+  bool handed = true;
   if (backend_fd >= 0) {
     /* The Backend turns the descriptors into its streams (and limits their rights).  If they cannot be sent, the Backend is
      * not listening any more; it is going down, and the loader will find its ends closed.  The fetch stream, when there is one,
@@ -544,12 +552,15 @@ bool db_sup_spawn(db_sup_t *s) {
     if (!send_fds(s->ctrl_fd, fds, backend_fetch_fd >= 0 ? 2 : 1)) {
       syslog(LOG_ERR, "[Manager] Cannot pass the loader stream to the Backend: %m; the loader is stopped (its streams lead nowhere)");
       kill(pid, SIGKILL);        /* (it is reaped as any exit of the loader: db_sup_child_exited() schedules the next try) */
+      handed = false;
     }
     close(backend_fd);
     if (backend_fetch_fd >= 0) close(backend_fetch_fd);
   }
-  s->pid = pid;
+  s->pid = pid;                  /* (also a loader that was killed above: it is reaped, and its exit schedules the next start) */
   s->started_ms = now;
+  /* review DB L-2: a loader killed because its streams could not be handed over was reported as started (and counted as a start): it is not */
+  if (!handed) return false;
   s->starts++;
   syslog(LOG_INFO, "[Manager] Database loader %s started (pid %d%s)", s->path, (int)pid,
          s->starts > 1 ? ", restart" : "");
