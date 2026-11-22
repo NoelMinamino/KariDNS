@@ -1057,10 +1057,19 @@ static void lint_nsec3(const char *domain, const zone_arena_t *arena, kc_tally_t
 /* checks on a whole parsed zone (called by karicheck zone and karidns-dbloader --check)                          */
 /* ------------------------------------------------------------------------------------------------------------- */
 
+#ifdef KARIDNS_UNIT_TEST
+int zone_lint_test_nomem;                       /* tests: the n-th sort buffer of zone_lint_ttl() / lint_catalog_members() cannot be allocated (0: off) */
+#define LINT_TEST_NOMEM() (zone_lint_test_nomem > 0 && --zone_lint_test_nomem == 0)
+#else
+#define LINT_TEST_NOMEM() false
+#endif
+
 void zone_lint_ttl(const zone_arena_t *arena_in, const char *what, kc_tally_t *t) {
     const zone_arena_t *arena = arena_in;
     if (arena->count > 0) {
-        dns_record_t **sorted = malloc(sizeof(dns_record_t *) * arena->count);
+        /* review Z L14: without the buffer the TTLs were not checked and nothing said so: an error now, as the other checks report theirs */
+        dns_record_t **sorted = LINT_TEST_NOMEM() || arena->count > SIZE_MAX / sizeof(dns_record_t *) ? NULL : malloc(sizeof(dns_record_t *) * arena->count);
+        if (!sorted) kc_error(t, DC_INTERNAL_OOM, "out of memory while checking the TTLs of the RRsets in the %s: they were not checked\n", what);
         if (sorted) {
             for (size_t k = 0; k < arena->count; k++) sorted[k] = &arena->records[k];
             qsort(sorted, arena->count, sizeof(dns_record_t *), cmp_rec_by_name_type);
@@ -1160,8 +1169,11 @@ static void lint_catalog_members(const char *domain, const zone_arena_t *arena, 
     if (m == 0) return;
     size_t cap = 16;
     while (cap < m * 2) cap <<= 1;
-    long *tab = malloc(cap * sizeof(*tab));
-    if (!tab) return;
+    long *tab = LINT_TEST_NOMEM() ? NULL : malloc(cap * sizeof(*tab));
+    if (!tab) {                                 /* (review Z L14, the sibling: not a silent return as if checked) */
+        kc_error(t, DC_INTERNAL_OOM, "out of memory while checking the member nodes of catalog zone '%s': they were not checked\n", domain);
+        return;
+    }
     for (size_t s = 0; s < cap; s++) tab[s] = -1;
     for (size_t i = 0; i < arena->count; i++) {
         const dns_record_t *r = &arena->records[i];
