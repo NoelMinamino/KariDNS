@@ -3134,7 +3134,25 @@ static void un_mark(const char *view) {
   rc_unlock();
 }
 
-_Atomic int db_store_test_un_delete_fail;
+_Atomic int db_store_test_un_delete_fail, db_store_test_ren_delete_fail;
+/* tests: true for the n-th call while *n counts down from n (0: off), as a registry's delete without memory fails */
+static bool test_fail_nth(_Atomic int *n) {
+  return atomic_load_explicit(n, memory_order_relaxed) > 0 && atomic_fetch_sub_explicit(n, 1, memory_order_relaxed) == 1;
+}
+
+/* review DB L-3: the old name of a zone that a pass's entry renames goes through the registry (its record and its element).  false: the delete failed (the store could not
+ * delete the record, or the registry had no memory for its queue): the old record and its zone stay, the failure is counted with the store's errors and logged (at most
+ * once in five seconds, as note_error()), and the caller fails the entry, so that the pass neither sweeps nor keeps a cursor and the next pass renames it again */
+static bool ren_delete(const char *view, const char *old, int64_t sid) {
+  if (!test_fail_nth(&db_store_test_ren_delete_fail) && dbreg_delete(view, old, sid) >= 0) return true;
+  atomic_fetch_add(&G.wt_errors, 1);
+  const int64_t now = mono_ns();
+  if (now - atomic_load_explicit(&G.last_err_log_ns, memory_order_relaxed) > 5000000000ll) {
+    atomic_store_explicit(&G.last_err_log_ns, now, memory_order_relaxed);
+    syslog(LOG_ERR, "[Store] view '%s': the old name '%s' of a renamed zone could not be deleted; it stays, the entry fails and the next pass renames the zone again", view, old);
+  }
+  return false;
+}
 
 /* the end of a complete pass: the zones the pass did not list are gone from the database.  As the sweep of the records (db_recon_end()): a zone is forgotten only once the registry
  * has deleted it (or had nothing of it: a zone that was never served); a delete that fails (no memory for the registry's queue) keeps the entry and counts in *nfail, and the caller
@@ -3162,8 +3180,7 @@ static uint64_t un_sweep(const char *view, uint64_t *nfail) {
       break;
     }
     int dr = -1;                                            /* (tests: the n-th delete of a sweep fails, as the registry's does without memory) */
-    if (atomic_load_explicit(&db_store_test_un_delete_fail, memory_order_relaxed) <= 0 || atomic_fetch_sub_explicit(&db_store_test_un_delete_fail, 1, memory_order_relaxed) != 1)
-      dr = dbreg_delete(view, old, sid);
+    if (!test_fail_nth(&db_store_test_un_delete_fail)) dr = dbreg_delete(view, old, sid);
     if (dr >= 0) {
       rc_lock();
       for (size_t i = 0; i < RC.un_n; i++)
@@ -3202,7 +3219,9 @@ static int un_apply(const char *view, const db_recon_entry_t *e) {
       if (has) snprintf(oldrec, sizeof(oldrec), "%s.", rs.name);
     }
   }
-  if (oldrec[0]) (void)dbreg_delete(view, oldrec, e->source_id);
+  /* review DB L-3: a delete that fails keeps the old record (and its zone); the entry fails (ren_delete(); recon_decide_locked() does the same for a rename between
+   * names the store holds) */
+  if (oldrec[0] && !ren_delete(view, oldrec, e->source_id)) return DBR_ERROR;
   int res;
   bool is_new = false;
   char *nn = strdup(e->name);
@@ -3516,7 +3535,12 @@ static int recon_decide_locked(store_t *st, const char *view, const db_recon_ent
     if (has_s) {
       char old[STORE_NAME_MAX + 2];
       snprintf(old, sizeof(old), "%s.", rs.name);
-      (void)dbreg_delete(view, old, e->source_id);
+      /* review DB L-3 (as D-2 in un_sweep()): a delete that fails keeps the old record; the entry fails here (ren_delete()).  The result was discarded, and only
+       * the store_set_known() below failing on the old record's source id (-EEXIST) kept the pass from going on as if it had been renamed */
+      if (!ren_delete(view, old, e->source_id)) {
+        if (zid_out) *zid_out = zs;                         /* (the record is still there: a pass counts it as listed, it is not for the sweep) */
+        return DBR_ERROR;
+      }
     } else {
       int dr = store_delete(st, zs);
       if (dr < 0 && dr != -ENOENT) {
