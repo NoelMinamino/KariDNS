@@ -282,15 +282,16 @@ conf.zone.transfer-key-undefined
 db.settings.combined
 zone.catalog.name-too-long
 zone.zonemd.canonical
-internal.oom
 io.fork
 io.pipe
 io.stat
 io.stdin.read
 zone.zonemd.compute-failed
 EOF
-# printed only when the zone checks get records no zone file can hold (tests/test_coverage_sweep_tools.c, built as test_coverage_sweep_tools-codelog)
+# printed only when the zone checks get records no zone file can hold (tests/test_coverage_sweep_tools.c, built as test_coverage_sweep_tools-codelog);
+# internal.oom: its allocation failures of the zone checks (zone_lint_test_nomem)
 cat > "$T/sweep.txt" <<'EOF'
+internal.oom
 conf.zone.program-args
 conf.zone.program-user-root
 zone.a.address
