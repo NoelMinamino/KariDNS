@@ -7557,24 +7557,58 @@ int main(int argc, char **argv) {
         return cst;
     }
     bool to_stdout = strcmp(dump, "-") == 0;
-    /* A file that is replaced (or does not exist yet) is written under a temporary name and renamed when the dump is complete: a dump that
-     * fails leaves the earlier file as it was.  Anything else (a device, a FIFO) is opened as it is. */
-    char tmp[PATH_MAX] = "";
-    bool use_tmp = false;
+    /* A file that is replaced (or does not exist yet) is written under a temporary name beside it and renamed when the dump is complete: a dump that
+     * fails leaves the earlier file as it was (and makes none).  A symbolic link is followed: the file it names is replaced the same way, the link stays.
+     * The new file has the mode and, where the user may set them, the owner and group of the file it replaces; a file that did not exist is made 0644
+     * (less the umask).  A device or a FIFO is written as it is and never removed.  Never written in place (review Z-5): a regular file whose temporary
+     * name does not fit PATH_MAX, and a link to nothing, are errors. */
+    char tmp[PATH_MAX] = "", real[PATH_MAX];
+    const char *target = dump;
+    bool use_tmp = false, have_old = false;
+    struct stat ds;
     if (!to_stdout) {
-        struct stat ds;
-        bool plain = lstat(dump, &ds) == 0 ? S_ISREG(ds.st_mode) : errno == ENOENT;
-        if (plain && snprintf(tmp, sizeof(tmp), "%s.tmp.%ld", dump, (long)getpid()) < (int)sizeof(tmp)) use_tmp = true;
+        const char *why = NULL;
+        bool regular = false;                                 /* (replaced through a temporary file: a regular file, or none yet) */
+        if (lstat(dump, &ds) != 0) {
+            if (errno == ENOENT) regular = true;
+            else why = strerror(errno);
+        } else if (S_ISLNK(ds.st_mode)) {
+            if (!realpath(dump, real)) {
+                why = errno == ENOENT ? "a symbolic link to a file that does not exist" : strerror(errno);
+            } else if (stat(real, &ds) != 0) {
+                why = strerror(errno);
+            } else {
+                target = real;
+                regular = have_old = S_ISREG(ds.st_mode);
+            }
+        } else {
+            regular = have_old = S_ISREG(ds.st_mode);
+        }
+        if (!why && regular) {
+            if (snprintf(tmp, sizeof(tmp), "%s.tmp.%ld", target, (long)getpid()) >= (int)sizeof(tmp)) why = "the path is too long for the temporary name of the dump";
+            else use_tmp = true;
+        }
+        if (why) {
+            fprintf(stderr, "karidns-dbloader: cannot create %s: %s\n", dump, why);
+            return EXIT_ERROR;
+        }
     }
     if (use_tmp) {
-        int dfd = open(tmp, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0666);
-        x.out = dfd >= 0 ? fdopen(dfd, "wb") : NULL;
+        int dfd = open(tmp, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, have_old ? 0600 : 0644);
+        bool ok = dfd >= 0;
+        if (ok && have_old) {
+            (void)!fchown(dfd, ds.st_uid, ds.st_gid);         /* (best effort: a user who is not root keeps the group only when it is one of theirs) */
+            ok = fchmod(dfd, ds.st_mode & 0777) == 0;
+        }
+        x.out = ok ? fdopen(dfd, "wb") : NULL;
         if (dfd >= 0 && !x.out) {
+            int e = errno;
             close(dfd);
             unlink(tmp);
+            errno = e;
         }
     } else {
-        x.out = to_stdout ? stdout : fopen(dump, "wb");
+        x.out = to_stdout ? stdout : fopen(target, "wb");
     }
     if (!x.out) {
         fprintf(stderr, "karidns-dbloader: cannot create %s: %s\n", dump, strerror(errno));
@@ -7591,14 +7625,12 @@ int main(int argc, char **argv) {
         status = EXIT_ERROR;
     }
     if (use_tmp) {
-        if (status < EXIT_ERROR && rename(tmp, dump) != 0) {
+        if (status < EXIT_ERROR && rename(tmp, target) != 0) {
             fprintf(stderr, "karidns-dbloader: cannot create %s: %s\n", dump, strerror(errno));
             status = EXIT_ERROR;
         }
         if (status >= EXIT_ERROR) unlink(tmp);
-    } else if (status >= EXIT_ERROR && !to_stdout) {
-        unlink(dump);
-    }
+    }                                                         /* (a device or a FIFO is not ours to remove) */
     ctx_view_reset(&x);
     kdb_enc_free(&x.enc);
     return status;
