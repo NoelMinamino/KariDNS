@@ -457,6 +457,9 @@ static void lint_sink(void *ud, char level, dns_diag_code_t code, const char *te
     snprintf(o->text + l, sizeof(o->text) - l, "%c %s\n", level, text);
 }
 
+extern int zone_lint_test_nomem;                /* dns_zone_lint.c (unit tests): the n-th sort buffer of the TTL / catalog checks is not allocated */
+static bool g_lint_catalog;                     /* lint_zone(): the zone is a catalog zone */
+
 /* Parse `body` (after a plain header) as a BIND zone of a.test. and run the checks; fix lets a test change the arena first.  Returns the
  * findings, one per line ("E ..." / "W ..."). */
 static void lint_zone(lint_out_t *o, const char *body, const char *raw, void (*fix)(zone_arena_t *)) {
@@ -483,6 +486,7 @@ static void lint_zone(lint_out_t *o, const char *body, const char *raw, void (*f
     in.domain = "a.test.";
     in.src = "lint.zone";
     in.raw_text = raw;
+    in.is_catalog = g_lint_catalog;
     zone_lint_records(&a, &in, &t);
     zone_arena_destroy(&a);
 }
@@ -659,6 +663,21 @@ static void test_lint_messages(void) {
         lint_expect("unrestricted / restricted TTL past the 64th", &o, "W RRset 'big.a.test.' type 1: an RR that every client sees and an RR with a "
                     "location, time stamp or tag have different TTLs (300 vs 600)");
         if (strstr(o.text, "has inconsistent TTLs")) { fprintf(stderr, "lint: different visibilities taken as one RRset:\n%s", o.text); assert(0); }
+        /* review Z L14: no memory for the sort buffer: the TTLs are not checked, and that is an error (it returned silently, as if checked) */
+        zone_lint_test_nomem = 1;
+        lint_ttl_zone(&o, "big 300 IN A 192.0.2.1\nbig 600 IN A 192.0.2.2\n");
+        lint_expect("TTL check without memory", &o, "E out of memory while checking the TTLs of the RRsets in the zone file: they were not checked");
+        if (zone_lint_test_nomem != 0 || strstr(o.text, "inconsistent TTLs")) { fprintf(stderr, "lint: TTL check without memory:\n%s", o.text); assert(0); }
+        /* ... and the sibling, the member nodes of a catalog zone */
+        g_lint_catalog = true;
+        lint_zone(&o, "version IN TXT \"2\"\nm1.zones IN PTR x.test.\nm2.zones IN PTR x.test.\n", NULL, NULL);
+        lint_expect("catalog members", &o, "name the same zone 'x.test.'");
+        zone_lint_test_nomem = 2;                                           /* (the first buffer is the TTL check's: lint_zone() runs it first) */
+        lint_zone(&o, "version IN TXT \"2\"\nm1.zones IN PTR x.test.\nm2.zones IN PTR x.test.\n", NULL, NULL);
+        if (zone_lint_test_nomem != 0) { fprintf(stderr, "lint: %d allocations left to fail\n", zone_lint_test_nomem); assert(0); }
+        g_lint_catalog = false;
+        lint_expect("catalog members without memory", &o, "E out of memory while checking the member nodes of catalog zone 'a.test.': they were not checked");
+        if (strstr(o.text, "name the same zone")) { fprintf(stderr, "lint: catalog check without memory:\n%s", o.text); assert(0); }
     }
     printf("  -> zone check messages compared.\n");
 }

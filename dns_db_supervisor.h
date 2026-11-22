@@ -102,7 +102,9 @@ void db_sup_after_fork_supervisor(db_sup_t *s);
  * routers: closes both of the supervisor's ends). */
 void db_sup_close_supervisor_ends(db_sup_t *s);
 /* Start the loader (the first time with the pair made by db_sup_open_pairs, later with a new pair whose Backend end
- * goes over pair C).  false: could not be started; a restart has been scheduled. */
+ * goes over pair C).  false: could not be started; a restart has been scheduled, or (the streams could not be handed to the Backend) the
+ * child was killed at once: s->pid is that child, and db_sup_child_exited() for it schedules the restart.  Only a start that returns true is
+ * counted in starts. */
 bool db_sup_spawn(db_sup_t *s);
 /* A child of the supervisor ended.  true: it was the loader (logged, restart scheduled); false: another child. */
 bool db_sup_child_exited(db_sup_t *s, pid_t pid, int status);
@@ -112,7 +114,8 @@ int db_sup_timeout_ms(const db_sup_t *s);
  * a SIGIO that did not come); -1 = no limit. */
 int db_sup_wait_ms(const db_sup_t *s);
 /* Read what the loader has written (at most DB_LOG_READ_BUDGET bytes) and log the lines.  true: the budget ran out, more may be waiting (call
- * again after the signals have been looked at).  The end of the stream closes the pipe. */
+ * again after the signals have been looked at).  The end of the stream closes the pipe; so does a read error (EINTR and EAGAIN are retried
+ * or waited for), which is logged: the loader then logs to syslog itself. */
 bool db_sup_log_read(db_sup_t *s);
 /* The loader has ended: log what is left in its pipe and close it. */
 void db_sup_log_finish(db_sup_t *s);

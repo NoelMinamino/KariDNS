@@ -197,7 +197,42 @@ static const char *cell_text(db_conn_t *c, PGresult *r, int row, int col, const 
     return t;
 }
 
-static int64_t cell_i64(PGresult *r, int row, int col) { return PQgetisnull(r, row, col) ? 0 : strtoll(PQgetvalue(r, row, col), NULL, 10); }
+/* An integer cell (0 for SQL NULL).  Review (the PostgreSQL sibling of D-7): the cell was read as far as it looked like a number (strtoll() without an end check), so a
+ * column of another type than the PowerDNS schema's (a TEXT '2abc', a NUMERIC '1.5') gave 2 or 1, and a value out of range the limit.  The whole cell must be a decimal
+ * integer now (PostgreSQL writes an integer column so: an optional '-', digits), in range; else *bad is set and c->err names the column of the result.  The text itself is
+ * not quoted: it is data of the database.  cell_u64(): the same for a value that cannot be negative (an xid8, a counter, a seq). */
+static void cell_int_text(db_conn_t *c, PGresult *r, int row, int col, bool sign, bool *bad, int64_t *s, uint64_t *u) {
+    *s = 0;
+    *u = 0;
+    if (PQgetisnull(r, row, col)) return;
+    const char *t = PQgetvalue(r, row, col);
+    const char *d = sign && t[0] == '-' ? t + 1 : t;
+    char *end = NULL;
+    errno = 0;
+    if (*d >= '0' && *d <= '9') {
+        if (sign) *s = strtoll(t, &end, 10);
+        else *u = strtoull(t, &end, 10);
+    }
+    if (!end || *end != '\0' || errno == ERANGE || (size_t)PQgetlength(r, row, col) != (size_t)(end - t)) {
+        const char *n = PQfname(r, col);
+        set_err(c, "column %s of the result: the value is not %s integer in range", n ? n : "?", sign ? "an" : "a non-negative");
+        *bad = true;
+        *s = 0;
+        *u = 0;
+    }
+}
+static int64_t cell_i64(db_conn_t *c, PGresult *r, int row, int col, bool *bad) {
+    int64_t s;
+    uint64_t u;
+    cell_int_text(c, r, row, col, true, bad, &s, &u);
+    return s;
+}
+static uint64_t cell_u64(db_conn_t *c, PGresult *r, int row, int col, bool *bad) {
+    int64_t s;
+    uint64_t u;
+    cell_int_text(c, r, row, col, false, bad, &s, &u);
+    return u;
+}
 static bool cell_true(PGresult *r, int row, int col) { return !PQgetisnull(r, row, col) && PQgetvalue(r, row, col)[0] == 't'; }
 
 /* ------------------------------------------------------------------------------------------------------------- */
@@ -413,14 +448,18 @@ static const struct { const char *table; const char *cols[SCHEMA_MAX_COLS]; int 
 };
 #define N_TABLES (sizeof(k_tables) / sizeof(k_tables[0]))
 enum { T_DOMAINS, T_RECORDS, T_META, T_KEYS, T_CHANGES, T_DV, T_PROF, T_TAGS, T_TDNS, T_TAGDEFS, T_VERSION, T_REQ, T_STATUS };
+/* the columns of the PowerDNS tables (the schema the user brings) that the loader reads as integers (cell_i64()), bit k = cols[k]: domains.id; records.domain_id, id, ttl, prio;
+ * domainmetadata.domain_id, id; cryptokeys.domain_id.  The karidns_* tables are made by db/karidns_ext.pgsql.sql. */
+static const unsigned k_int_cols[T_KEYS + 1] = { 0x1u, 0x63u, 0x3u, 0x1u };
 
 /* Which of k_tables exist in the search_path (exists[]) and which of their columns (found[], bit k = cols[k]); *schema_ok = the search_path
  * names at least one existing schema (a SET search_path to a missing schema is not an error in PostgreSQL).  One catalog query (to_regclass
- * follows search_path; no privilege on the tables is needed). */
-static int schema_scan(db_conn_t *c, bool exists[N_TABLES], unsigned found[N_TABLES], bool *schema_ok) {
+ * follows search_path; no privilege on the tables is needed).  notint (NULL: not asked): the columns of k_int_cols whose type is not smallint, integer or bigint. */
+static int schema_scan(db_conn_t *c, bool exists[N_TABLES], unsigned found[N_TABLES], bool *schema_ok, unsigned *notint) {
     PGresult *r = NULL;
     memset(found, 0, sizeof(unsigned) * N_TABLES);
     memset(exists, 0, sizeof(bool) * N_TABLES);
+    if (notint) memset(notint, 0, sizeof(unsigned) * N_TABLES);
     int ret = exec_rows(c, "SELECT current_schemas(false)::text", 0, NULL, &r, "schema lookup");
     if (ret != 0) return ret;
     const char *path = PQgetvalue(r, 0, 0);
@@ -428,7 +467,8 @@ static int schema_scan(db_conn_t *c, bool exists[N_TABLES], unsigned found[N_TAB
     PQclear(r);
     if (!*schema_ok) return 0;
     char sql[1400];
-    size_t o = (size_t)snprintf(sql, sizeof(sql), "SELECT c.relname, a.attname FROM pg_class c JOIN pg_attribute a ON a.attrelid = c.oid "
+    size_t o = (size_t)snprintf(sql, sizeof(sql), "SELECT c.relname, a.attname, a.atttypid IN ('int2'::regtype, 'int4'::regtype, 'int8'::regtype) "
+                                                  "FROM pg_class c JOIN pg_attribute a ON a.attrelid = c.oid "
                                                   "AND a.attnum > 0 AND NOT a.attisdropped WHERE c.oid = ANY (ARRAY[");
     for (size_t t = 0; t < N_TABLES && o < sizeof(sql); t++)
         o += (size_t)snprintf(sql + o, sizeof(sql) - o, "%sto_regclass('%s')::oid", t ? "," : "", k_tables[t].table);
@@ -445,7 +485,10 @@ static int schema_scan(db_conn_t *c, bool exists[N_TABLES], unsigned found[N_TAB
             if (strcmp(rel, k_tables[t].table) != 0) continue;
             exists[t] = true;
             for (int k = 0; k_tables[t].cols[k]; k++)
-                if (strcmp(att, k_tables[t].cols[k]) == 0) found[t] |= 1u << k;
+                if (strcmp(att, k_tables[t].cols[k]) == 0) {
+                    found[t] |= 1u << k;
+                    if (notint && t <= T_KEYS && (k_int_cols[t] & (1u << k)) && !cell_true(r, i, 2)) notint[t] |= 1u << k;
+                }
         }
     }
     PQclear(r);
@@ -457,7 +500,7 @@ static int pg_check_schema(db_conn_t *c, db_schema_info_t *out) {
     unsigned found[N_TABLES];
     bool exists[N_TABLES];
     bool schema_ok = false;
-    int ret = schema_scan(c, exists, found, &schema_ok);
+    int ret = schema_scan(c, exists, found, &schema_ok, NULL);
     if (ret != 0) return ret;
     if (!schema_ok) {
         set_err(c, "schema: the database-schema does not exist (or the role has no USAGE on it)");
@@ -491,8 +534,10 @@ static int pg_check_schema(db_conn_t *c, db_schema_info_t *out) {
          * written for a later loader */
         ret = exec_rows(c, "SELECT max(version) FROM karidns_schema_version", 0, NULL, &r, "karidns_schema_version");
         if (ret != 0) return ret;
-        long long v = PQgetisnull(r, 0, 0) ? 0 : strtoll(PQgetvalue(r, 0, 0), NULL, 10);
+        bool bad = false;
+        long long v = cell_i64(c, r, 0, 0, &bad);
         PQclear(r);
+        if (bad) return -1;
         if (v > 3) {
             set_err(c, "schema: karidns_schema_version is %lld; this loader reads versions 1 to 3", v);
             return -1;
@@ -556,9 +601,9 @@ static int priv_column(db_conn_t *c, const char *table, const char *col, int *ou
 
 static int pg_schema_findings(db_conn_t *c, const db_check_opts_t *o, db_finding_cb cb, void *ud) {
     PGresult *r = NULL;
-    unsigned found[N_TABLES];
+    unsigned found[N_TABLES], notint[N_TABLES];
     bool exists[N_TABLES], schema_ok = false;
-    int ret = schema_scan(c, exists, found, &schema_ok);
+    int ret = schema_scan(c, exists, found, &schema_ok, notint);
     if (ret != 0) return ret;
     if (!schema_ok) {
         fnd(cb, ud, 'E', "the database-schema does not exist (or the role has no USAGE on it)");
@@ -579,6 +624,12 @@ static int pg_schema_findings(db_conn_t *c, const db_check_opts_t *o, db_finding
         for (int k = 0; k_tables[t].cols[k]; k++)
             if (!(found[t] & (1u << k))) db_list_add(miss, sizeof(miss), &nm, k_tables[t].cols[k]);
         if (nm) fnd(cb, ud, 'E', "table %s has no column %s%s (PowerDNS 5.1 schema expected)", k_tables[t].table, miss, nm > 6 ? ", ..." : "");
+        /* (a warning: such a column is read while every value is an integer; a value that is not fails the read, cell_i64(), as a TEXT value does in the SQLite3 driver) */
+        miss[0] = '\0';
+        nm = 0;
+        for (int k = 0; k_tables[t].cols[k]; k++)
+            if (notint[t] & (1u << k)) db_list_add(miss, sizeof(miss), &nm, k_tables[t].cols[k]);
+        if (nm) fnd(cb, ud, 'W', "table %s: column %s is not of an integer type (PowerDNS 5.1 schema expected); a value that is not an integer is an error", k_tables[t].table, miss);
     }
     /* the karidns_* tables (design 3.7); what a missing one costs */
     static const struct { int t; const char *effect; } k_eff[] = {
@@ -630,10 +681,11 @@ static int pg_schema_findings(db_conn_t *c, const db_check_opts_t *o, db_finding
     }
     if (can_sel[T_VERSION]) {
         if ((ret = exec_rows(c, "SELECT max(version) FROM karidns_schema_version", 0, NULL, &r, "karidns_schema_version")) != 0) return ret;
-        bool none = PQgetisnull(r, 0, 0);
-        long long v = none ? 0 : strtoll(PQgetvalue(r, 0, 0), NULL, 10);
+        bool none = PQgetisnull(r, 0, 0), bad = false;
+        long long v = cell_i64(c, r, 0, 0, &bad);
         PQclear(r);
-        if (none) fnd(cb, ud, 'W', "karidns_schema_version has no row");
+        if (bad) fnd(cb, ud, 'E', "karidns_schema_version: %s", c->err);
+        else if (none) fnd(cb, ud, 'W', "karidns_schema_version has no row");
         else if (v > 3) fnd(cb, ud, 'E', "karidns_schema_version is %lld; this loader reads versions 1 to 3", v);
         else fnd(cb, ud, 'I', "karidns_* schema version %lld", v);
     }
@@ -790,12 +842,13 @@ typedef struct { db_zone_cb cb; void *ud; bool have_prev; int64_t prev; bool any
 
 static int zl_row(db_conn_t *c, PGresult *r, int i, void *ud) {
     zl_t *z = ud;
-    int64_t id = cell_i64(r, i, 0);
+    bool bad = false;
+    int64_t id = cell_i64(c, r, i, 0, &bad);
+    if (bad) return -1;
     if (z->have_prev && id == z->prev) return 0;      /* more than one enabled apex SOA: the first is enough here */
     z->have_prev = true;
     z->prev = id;
     z->any = true;
-    bool bad = false;
     db_zone_row_t row;
     row.id = id;
     row.name = cell_text(c, r, i, 1, "domains", id, "name", &bad);
@@ -937,17 +990,17 @@ typedef struct { db_record_cb cb; void *ud; } rl_t;
 static int rl_row(db_conn_t *c, PGresult *r, int i, void *ud) {
     rl_t *l = ud;
     bool bad = false;
-    int64_t did = cell_i64(r, i, 0);
+    int64_t did = cell_i64(c, r, i, 0, &bad);
     db_record_row_t rec;
     memset(&rec, 0, sizeof(rec));
-    rec.id = cell_i64(r, i, 1);
+    rec.id = cell_i64(c, r, i, 1, &bad);
     rec.name = cell_text(c, r, i, 2, "records", rec.id, "name", &bad);
     rec.type = cell_text(c, r, i, 3, "records", rec.id, "type", &bad);
     rec.content = cell_text(c, r, i, 4, "records", rec.id, "content", &bad);
     rec.ttl_null = PQgetisnull(r, i, 5);
-    rec.ttl = cell_i64(r, i, 5);
+    rec.ttl = cell_i64(c, r, i, 5, &bad);
     rec.prio_null = PQgetisnull(r, i, 6);
-    rec.prio = cell_i64(r, i, 6);
+    rec.prio = cell_i64(c, r, i, 6, &bad);
     rec.disabled = PQgetisnull(r, i, 7) || cell_true(r, i, 7) ? true : false;      /* NULL = disabled, like SQLite3 */
     rec.ordername = cell_text(c, r, i, 8, "records", rec.id, "ordername", &bad);
     if (bad) return -1;
@@ -973,16 +1026,16 @@ typedef struct { db_apex_cb cb; void *ud; } al_t;
 static int al_row(db_conn_t *c, PGresult *r, int i, void *ud) {
     al_t *l = ud;
     bool bad = false;
-    int64_t rid = cell_i64(r, i, 4);
+    int64_t rid = cell_i64(c, r, i, 4, &bad);
     db_apex_row_t a;
-    a.domain_id = cell_i64(r, i, 0);
+    a.domain_id = cell_i64(c, r, i, 0, &bad);
     const char *type = cell_text(c, r, i, 1, "records", rid, "type", &bad);
     a.is_soa = type && strcasecmp(type, "SOA") == 0;
     a.addr_type = type && strcasecmp(type, "A") == 0 ? 1 : type && strcasecmp(type, "AAAA") == 0 ? 28 : 0;
     a.name = cell_text(c, r, i, 5, "records", rid, "name", &bad);
     a.content = cell_text(c, r, i, 2, "records", rid, "content", &bad);
     a.ttl_null = PQgetisnull(r, i, 3);
-    a.ttl = cell_i64(r, i, 3);
+    a.ttl = cell_i64(c, r, i, 3, &bad);
     if (bad) return -1;
     return l->cb(l->ud, &a) != 0 ? DB_STOPPED : 0;
 }
@@ -1027,9 +1080,9 @@ typedef struct { db_meta_cb cb; void *ud; } ml_t;
 static int ml_row(db_conn_t *c, PGresult *r, int i, void *ud) {
     ml_t *l = ud;
     bool bad = false;
-    int64_t id = cell_i64(r, i, 3);
+    int64_t id = cell_i64(c, r, i, 3, &bad);
     db_meta_row_t m;
-    m.domain_id = cell_i64(r, i, 0);
+    m.domain_id = cell_i64(c, r, i, 0, &bad);
     m.kind = cell_text(c, r, i, 1, "domainmetadata", id, "kind", &bad);
     m.content = cell_text(c, r, i, 2, "domainmetadata", id, "content", &bad);
     if (bad) return -1;
@@ -1052,10 +1105,12 @@ static int pg_scan_metadata(db_conn_t *c, const int64_t *domain_id, db_meta_cb c
 typedef struct { db_key_cb cb; void *ud; } kl_t;
 
 static int kl_row(db_conn_t *c, PGresult *r, int i, void *ud) {
-    (void)c;
     kl_t *l = ud;
     if (PQgetisnull(r, i, 0)) return 0;
-    return l->cb(l->ud, cell_i64(r, i, 0)) != 0 ? DB_STOPPED : 0;
+    bool bad = false;
+    const int64_t did = cell_i64(c, r, i, 0, &bad);
+    if (bad) return -1;
+    return l->cb(l->ud, did) != 0 ? DB_STOPPED : 0;
 }
 
 /* 0.7 signer-wait (dns_db_driver.h signer_waiting): the rules of the signer's catch-up scan (signer/lib/db_pg.js catchUp()); once at a start of the loader */
@@ -1092,7 +1147,7 @@ typedef struct { db_domain_view_cb cb; void *ud; } dl_t;
 static int dl_row(db_conn_t *c, PGresult *r, int i, void *ud) {
     dl_t *l = ud;
     bool bad = false;
-    int64_t did = cell_i64(r, i, 0);
+    int64_t did = cell_i64(c, r, i, 0, &bad);
     const char *vn = cell_text(c, r, i, 1, "karidns_domain_views", did, "view_name", &bad);
     if (bad) return -1;
     if (!vn) return 0;                                  /* the column is NOT NULL; a NULL name maps to no view */
@@ -1141,9 +1196,9 @@ static int pg_scan_profiles(db_conn_t *c, db_profile_cb cb, void *ud) {
 static int xt_row(db_conn_t *c, PGresult *r, int i, void *ud) {
     const db_ext_sink_t *s = ud;
     bool bad = false;
-    int64_t did = cell_i64(r, i, 0);
+    int64_t did = cell_i64(c, r, i, 0, &bad);
     db_tag_row_t row;
-    row.record_id = cell_i64(r, i, 1);
+    row.record_id = cell_i64(c, r, i, 1, &bad);
     row.location_tag = cell_text(c, r, i, 2, "karidns_record_tags", row.record_id, "location_tag", &bad);
     row.ecs_tag = cell_text(c, r, i, 3, "karidns_record_tags", row.record_id, "ecs_tag", &bad);
     if (bad) return -1;
@@ -1153,11 +1208,11 @@ static int xt_row(db_conn_t *c, PGresult *r, int i, void *ud) {
 static int xd_row(db_conn_t *c, PGresult *r, int i, void *ud) {
     const db_ext_sink_t *s = ud;
     bool bad = false;
-    int64_t did = cell_i64(r, i, 0);
+    int64_t did = cell_i64(c, r, i, 0, &bad);
     db_tinydns_row_t row;
-    row.record_id = cell_i64(r, i, 1);
+    row.record_id = cell_i64(c, r, i, 1, &bad);
     row.ttd_null = PQgetisnull(r, i, 2);
-    row.ttd = cell_i64(r, i, 2);
+    row.ttd = cell_i64(c, r, i, 2, &bad);
     row.loc = cell_text(c, r, i, 3, "karidns_record_tinydns", row.record_id, "loc", &bad);
     row.countdown = cell_true(r, i, 4);
     if (bad) return -1;
@@ -1167,7 +1222,7 @@ static int xd_row(db_conn_t *c, PGresult *r, int i, void *ud) {
 static int xg_row(db_conn_t *c, PGresult *r, int i, void *ud) {
     const db_ext_sink_t *s = ud;
     bool bad = false;
-    int64_t did = cell_i64(r, i, 0);
+    int64_t did = cell_i64(c, r, i, 0, &bad);
     db_tagdef_row_t row;
     row.kind = cell_text(c, r, i, 1, "karidns_zone_tagdefs", did, "kind", &bad);
     row.tag = cell_text(c, r, i, 2, "karidns_zone_tagdefs", did, "tag", &bad);
@@ -1292,9 +1347,10 @@ static int snapshot_xmin(db_conn_t *c, uint64_t *xmin) {
     PGresult *r = NULL;
     int ret = exec_rows(c, "SELECT pg_snapshot_xmin(pg_current_snapshot())::text", 0, NULL, &r, "changes cursor");
     if (ret != 0) return ret;
-    *xmin = PQgetisnull(r, 0, 0) ? 0 : strtoull(PQgetvalue(r, 0, 0), NULL, 10);
+    bool bad = false;
+    *xmin = cell_u64(c, r, 0, 0, &bad);
     PQclear(r);
-    return 0;
+    return bad ? -1 : 0;
 }
 
 static int pg_changes_max(db_conn_t *c, uint64_t *seq) {
@@ -1324,23 +1380,25 @@ static int pg_changes_cover(db_conn_t *c, int64_t domain_id, uint64_t *cursor, u
                     3, pv, &r, "changes_cover");
     if (ret != 0) return ret;
     const int nt = PQntuples(r);
-    for (int i = 0; i < nt; i++) {
-        if ((unsigned)i < max) xids[i] = strtoull(PQgetvalue(r, i, 0), NULL, 10);
+    bool bad = false;
+    for (int i = 0; i < nt && !bad; i++) {
+        if ((unsigned)i < max) xids[i] = cell_u64(c, r, i, 0, &bad);
         (*n)++;
     }
     PQclear(r);
-    return 0;
+    return bad ? -1 : 0;
 }
 
 typedef struct { db_change_cb cb; void *ud; } cl_t;
 
 static int cl_row(db_conn_t *c, PGresult *r, int i, void *ud) {
-    (void)c;
     cl_t *l = ud;
+    bool bad = false;
     db_change_row_t row;
-    row.seq = (uint64_t)cell_i64(r, i, 0);
-    row.domain_id = cell_i64(r, i, 1);
-    row.pos = PQgetisnull(r, i, 2) ? 0 : strtoull(PQgetvalue(r, i, 2), NULL, 10);
+    row.seq = (uint64_t)cell_i64(c, r, i, 0, &bad);
+    row.domain_id = cell_i64(c, r, i, 1, &bad);
+    row.pos = cell_u64(c, r, i, 2, &bad);
+    if (bad) return -1;
     return l->cb(l->ud, &row) != 0 ? DB_STOPPED : 0;
 }
 
@@ -1365,8 +1423,10 @@ static int pg_changes_since(db_conn_t *c, uint64_t after, db_change_cb cb, void 
         ret = exec_rows(c, "SELECT (SELECT min(seq) FROM karidns_changes), EXISTS (SELECT 1 FROM karidns_changes WHERE xid < $1::xid8)", 1, pv, &r,
                         "changes_since");
         if (ret != 0) return ret;
-        if (!PQgetisnull(r, 0, 0) && strtoll(PQgetvalue(r, 0, 0), NULL, 10) > 1 && !cell_true(r, 0, 1)) g = true;
+        bool bad = false;
+        if (cell_i64(c, r, 0, 0, &bad) > 1 && !cell_true(r, 0, 1)) g = true;      /* (NULL: 0) */
         PQclear(r);
+        if (bad) return -1;
     }
     cl_t l = { cb, ud };
     ret = pg_scan(c, "changes_since", "SELECT seq, domain_id, xid::text FROM karidns_changes WHERE xid >= $1::xid8 ORDER BY seq", 1, pv, cl_row, &l);
@@ -1426,10 +1486,11 @@ static int pg_count_domains(db_conn_t *c, const char *view, uint64_t *n) {
                                 1, pv, &r, "count_domains")
                       : rs_exec(c, RS_COUNT, "SELECT count(*) FROM domains", 0, NULL, &r, "count_domains");
     if (ret != 0) return ret;
-    long long v = PQgetisnull(r, 0, 0) ? 0 : strtoll(PQgetvalue(r, 0, 0), NULL, 10);
+    bool bad = false;
+    long long v = cell_i64(c, r, 0, 0, &bad);
     *n = v < 0 ? 0 : (uint64_t)v;
     PQclear(r);
-    return 0;
+    return bad ? -1 : 0;
 }
 
 #ifdef KARIDNS_UNIT_TEST
@@ -1476,7 +1537,12 @@ static int pg_manifest_page(db_conn_t *c, int64_t after_id, unsigned limit, db_m
     db_mgroup_t *g = &c->mg;
     g->open = false;
     for (int i = 0; i < PQntuples(r) && ret == 0; i++) {
-        int64_t id = cell_i64(r, i, 0);
+        bool bad = false;
+        int64_t id = cell_i64(c, r, i, 0, &bad);
+        if (bad) {
+            ret = -1;
+            break;
+        }
         if (g->open && id != g->row.id) {
             g->open = false;
             (*nrows)++;
@@ -1486,12 +1552,12 @@ static int pg_manifest_page(db_conn_t *c, int64_t after_id, unsigned limit, db_m
                 break;
             }
         }
-        bool bad = false;
         if (!g->open) {
             const char *name = cell_text(c, r, i, 1, "domains", id, "name", &bad);
             const char *type = cell_text(c, r, i, 2, "domains", id, "type", &bad);
             bool has_state = !PQgetisnull(r, i, 3);
-            const char *why = bad ? NULL : db_mgroup_start(g, id, name, type, has_state, cell_i64(r, i, 3), cell_i64(r, i, 4));
+            const int64_t gen = cell_i64(c, r, i, 3, &bad), stime = cell_i64(c, r, i, 4, &bad);
+            const char *why = bad ? NULL : db_mgroup_start(g, id, name, type, has_state, gen, stime);
             if (why) {
                 set_err(c, "table domains id %lld: %s", (long long)id, why);
                 bad = true;
@@ -1552,21 +1618,22 @@ static int pg_changes_page(db_conn_t *c, db_change_pos_t *pos, unsigned limit, d
     PGresult *r = NULL;
     int ret = rs_exec(c, RS_CHANGES, sql, 3, pv, &r, "changes_page");
     if (ret != 0) return ret;
-    bool first = pos->seq == 0;
-    uint64_t xmin = strtoull(PQgetvalue(r, 0, 6), NULL, 10);
+    bool first = pos->seq == 0, bad = false;
+    uint64_t xmin = cell_u64(c, r, 0, 6, &bad);
     uint64_t settle = first ? xmin : pos->settle;
     uint64_t mx = pos->seq;
     int64_t cnt = 0;
-    for (int i = 0; i < PQntuples(r); i++) {
+    for (int i = 0; i < PQntuples(r) && !bad; i++) {
         if (PQgetisnull(r, i, 0)) continue;                        /* the empty window: x alone */
-        mx = strtoull(PQgetvalue(r, i, 4), NULL, 10);
-        cnt = strtoll(PQgetvalue(r, i, 5), NULL, 10);
+        mx = cell_u64(c, r, i, 4, &bad);
+        cnt = cell_i64(c, r, i, 5, &bad);
         db_change_entry_t e;
-        e.seq = strtoull(PQgetvalue(r, i, 1), NULL, 10);
-        e.domain_id = cell_i64(r, i, 0);
+        e.seq = cell_u64(c, r, i, 1, &bad);
+        e.domain_id = cell_i64(c, r, i, 0, &bad);
         e.op = cell_true(r, i, 2) ? DB_CHANGE_UPSERT : DB_CHANGE_DELETE;
-        e.pos_lo = strtoull(PQgetvalue(r, i, 7), NULL, 10);
-        e.pos_hi = strtoull(PQgetvalue(r, i, 8), NULL, 10);
+        e.pos_lo = cell_u64(c, r, i, 7, &bad);
+        e.pos_hi = cell_u64(c, r, i, 8, &bad);
+        if (bad) break;
         if (cb(ud, &e) != 0) {
             ret = DB_STOPPED;
             break;
@@ -1574,6 +1641,7 @@ static int pg_changes_page(db_conn_t *c, db_change_pos_t *pos, unsigned limit, d
     }
     PQclear(r);
     if (ret != 0) return ret;
+    if (bad) return -1;
     if (first && pos->cursor > 0) {
         if (pos->cursor > xmin) {
             *gap = true;                                           /* a cursor from the future: not this cluster's counter */
@@ -1583,8 +1651,9 @@ static int pg_changes_page(db_conn_t *c, db_change_pos_t *pos, unsigned limit, d
             ret = rs_exec(c, RS_GAP, "SELECT (SELECT min(seq) FROM karidns_changes), EXISTS (SELECT 1 FROM karidns_changes WHERE xid < $1::xid8)",
                           1, gv, &r, "changes_page");
             if (ret != 0) return ret;
-            if (!PQgetisnull(r, 0, 0) && strtoll(PQgetvalue(r, 0, 0), NULL, 10) > 1 && !cell_true(r, 0, 1)) *gap = true;
+            if (cell_i64(c, r, 0, 0, &bad) > 1 && !cell_true(r, 0, 1)) *gap = true;      /* (NULL: 0) */
             PQclear(r);
+            if (bad) return -1;
         }
     }
     *more = cnt >= (int64_t)limit;
@@ -1648,8 +1717,10 @@ static int pg_poll_log(db_conn_t *c, uint64_t *version) {
     PGresult *r = NULL;
     int ret = exec_rows(c, "SELECT count(*)::text, coalesce(max(seq), 0)::text FROM karidns_changes", 0, NULL, &r, "poll the change log");
     if (ret != 0) return ret;
-    uint64_t n = strtoull(PQgetvalue(r, 0, 0), NULL, 10), mx = strtoull(PQgetvalue(r, 0, 1), NULL, 10);
+    bool bad = false;
+    uint64_t n = cell_u64(c, r, 0, 0, &bad), mx = cell_u64(c, r, 0, 1, &bad);
     PQclear(r);
+    if (bad) return -1;
     c->nver = mx * 2654435761u + n;
     *version = c->nver;
     return 0;
@@ -1708,9 +1779,11 @@ static int pg_requests_max(db_conn_t *c, uint64_t *generation) {
     PGresult *r = NULL;
     int ret = exec_rows(c, "SELECT coalesce(max(generation), 0)::text FROM karidns_reload_requests", 0, NULL, &r, "requests_max");
     if (ret != 0) return ret;
-    *generation = PQgetisnull(r, 0, 0) ? 0 : strtoull(PQgetvalue(r, 0, 0), NULL, 10);
+    bool bad = false;
+    const int64_t g = cell_i64(c, r, 0, 0, &bad);
+    *generation = g < 0 ? 0 : (uint64_t)g;              /* (a negative one: 0, as the zone generation, review D-5; strtoull() made it a huge one) */
     PQclear(r);
-    return 0;
+    return bad ? -1 : 0;
 }
 
 static int pg_reload_requests(db_conn_t *c, uint64_t after, db_reload_cb cb, void *ud, uint64_t *max_gen, bool *gap) {
@@ -1737,7 +1810,7 @@ static int pg_reload_requests(db_conn_t *c, uint64_t after, db_reload_cb cb, voi
         for (int i = 0; i < n && ret == 0; i++) {
             bool bad = false;
             db_reload_row_t row;
-            row.generation = (uint64_t)cell_i64(r, i, 0);
+            row.generation = (uint64_t)cell_i64(c, r, i, 0, &bad);
             row.zone = cell_text(c, r, i, 1, "karidns_reload_requests", (int64_t)row.generation, "zone", &bad);
             row.force = cell_true(r, i, 2);
             if (bad) {
@@ -1944,9 +2017,10 @@ static int pg_w_create_zone(db_conn_t *c, const char *name, const char *type, in
     const char *pv[2] = { name, type ? type : "NATIVE" };
     PGresult *r = NULL;
     if ((ret = wq(c, W_CREATE, pv, &r, PGRES_TUPLES_OK, "w_create_zone")) != 0) return ret;
-    *id = cell_i64(r, 0, 0);
+    bool bad = false;
+    *id = cell_i64(c, r, 0, 0, &bad);
     PQclear(r);
-    return 0;
+    return bad ? -1 : 0;
 }
 
 #define W_DEL_CHUNK 1000
@@ -1995,9 +2069,10 @@ static int pg_w_insert_record(db_conn_t *c, int64_t domain_id, const db_record_r
                           row->disabled ? "t" : "f", auth ? "t" : "f", row->ordername };
     PGresult *r = NULL;
     if ((ret = wq(c, W_INS_REC, pv, &r, PGRES_TUPLES_OK, "w_insert_record")) != 0) return ret;
-    *id = cell_i64(r, 0, 0);
+    bool bad = false;
+    *id = cell_i64(c, r, 0, 0, &bad);
     PQclear(r);
-    return 0;
+    return bad ? -1 : 0;
 }
 
 static int ext_missing(db_conn_t *c) {
@@ -2105,9 +2180,11 @@ static int pg_w_zone_has_keys(db_conn_t *c, int64_t domain_id, bool *has) {
 typedef struct { db_auth_cb cb; void *ud; } au_t;
 
 static int au_row(db_conn_t *c, PGresult *r, int i, void *ud) {
-    (void)c;
     au_t *a = ud;
-    return a->cb(a->ud, cell_i64(r, i, 0), PQgetisnull(r, i, 1) || cell_true(r, i, 1)) != 0 ? DB_STOPPED : 0;
+    bool bad = false;
+    const int64_t id = cell_i64(c, r, i, 0, &bad);
+    if (bad) return -1;
+    return a->cb(a->ud, id, PQgetisnull(r, i, 1) || cell_true(r, i, 1)) != 0 ? DB_STOPPED : 0;
 }
 
 static int pg_w_scan_auth(db_conn_t *c, int64_t domain_id, db_auth_cb cb, void *ud) {
@@ -2367,10 +2444,11 @@ static int pg_w_zone_generation(db_conn_t *c, int64_t domain_id, uint64_t *gener
     const char *pv[1] = { did };
     PGresult *r = NULL;
     if ((ret = wq(c, W_ZGEN, pv, &r, PGRES_TUPLES_OK, "w_zone_generation")) != 0) return ret;
-    const int64_t g = cell_i64(r, 0, 0);
+    bool bad = false;
+    const int64_t g = cell_i64(c, r, 0, 0, &bad);
     *generation = g < 0 ? 0 : (uint64_t)g;                  /* (a negative one, which the schema's CHECK forbids, is 0: as SQLite3 and the manifest, review D-5) */
     PQclear(r);
-    return 0;
+    return bad ? -1 : 0;
 }
 
 static int pg_w_bump_serial(db_conn_t *c, int64_t domain_id, int64_t soa_id, const char *new_content, bool via_api, uint32_t *serial) {
@@ -2383,9 +2461,10 @@ static int pg_w_bump_serial(db_conn_t *c, int64_t domain_id, int64_t soa_id, con
         const char *pv[1] = { did };
         PGresult *r = NULL;
         if ((ret = wq(c, W_BUMP_API, pv, &r, PGRES_TUPLES_OK, "w_bump_serial")) != 0) return ret;
-        *serial = (uint32_t)cell_i64(r, 0, 0);
+        bool bad = false;
+        *serial = (uint32_t)cell_i64(c, r, 0, 0, &bad);
         PQclear(r);
-        return 0;
+        return bad ? -1 : 0;
     }
     const char *pv[3] = { sid, did, new_content };
     PGresult *r = NULL;
@@ -2418,10 +2497,11 @@ static int pg_w_insert_version(db_conn_t *c, int64_t domain_id, const db_version
                            v->has_serial_after ? sa : NULL, gb, ga, v->rollback_of ? rb : NULL, v->delta_complete ? "t" : "f" };
     PGresult *r = NULL;
     if ((ret = wq(c, W_INS_VER, pv, &r, PGRES_TUPLES_OK, "w_insert_version")) != 0) return ret;
-    *id = cell_i64(r, 0, 0);
-    *number = (uint32_t)cell_i64(r, 0, 1);
+    bool bad = false;
+    *id = cell_i64(c, r, 0, 0, &bad);
+    *number = (uint32_t)cell_i64(c, r, 0, 1, &bad);
     PQclear(r);
-    return 0;
+    return bad ? -1 : 0;
 }
 
 static int pg_w_insert_version_rrset(db_conn_t *c, int64_t version_id, const char *owner, const char *type, const char *before, const char *after) {
