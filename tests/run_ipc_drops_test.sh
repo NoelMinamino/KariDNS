@@ -11,6 +11,8 @@
 #      and every query that did not fit is counted (router.worker.dropped_full > 0), none is lost without a count; the Backend goes on (SIGCONT)
 #      and the ones that were queued are answered
 #   D  an IPC / UDP buffer above kern.ipc.maxsockbuf: the kernel refuses it, every buffer gets the most the kernel takes, the warning says "asked N, got M (limited by kern.ipc.maxsockbuf=X; set it to Y)"
+#   E  (0.7 IPC backpressure) the router stopped while 400 queries come, with a small reply queue (test switches KARIDNS_TEST_IPC_REPLY_QUEUE, _BUDGET_US):
+#      with no wait (the worker before 0.7) the replies that do not fit are dropped and counted; with the wait every query is answered, none dropped
 #
 # SKIP (exit 0, with the reason) without karidns, karictl, perl.  About 30 s.  See docs/karictl.md (ipcstats), docs/karidns.md (udp-recvbuf-size).
 # ==============================================================================
@@ -140,10 +142,10 @@ fi
 OUT=$(perl "$CLIENT" "$PORT" 1 1 1 5)
 [ "$(kv "$OUT" answered)" = 1 ] && ok "the server answers a query (the load generator works)" || bad "no answer to the first query" "$OUT"
 ctl ipcstats > "$T/ipc0.txt" 2>&1
-want="router.worker.spilled router.worker.dropped_full router.worker.dropped_error router.rx.truncated router.rx.short router.reply.short router.reply.bad_length router.reply.bad_socket router.client.dropped_full router.client.dropped_error worker.rx.short worker.rx.bad_length worker.reply.dropped_full worker.reply.dropped_error worker.async.dropped_full worker.udp.truncated worker.udp.short router.reply.cut router.client.retried dropped.total"
+want="router.worker.spilled router.worker.dropped_full router.worker.dropped_error router.rx.truncated router.rx.short router.reply.short router.reply.bad_length router.reply.bad_socket router.client.dropped_full router.client.dropped_error worker.rx.short worker.rx.bad_length worker.reply.dropped_full worker.reply.dropped_error worker.async.dropped_full worker.udp.truncated worker.udp.short router.reply.cut router.client.retried worker.reply.retried dropped.total"
 missing=""
 for k in $want; do grep -q "^ipc\\.$k=[0-9]*\$" "$T/ipc0.txt" || missing="$missing $k"; done
-[ -z "$missing" ] && ok "karictl ipcstats lists all 20 counters" || bad "karictl ipcstats lacks:$missing" "$(cat "$T/ipc0.txt")"
+[ -z "$missing" ] && ok "karictl ipcstats lists all 21 counters" || bad "karictl ipcstats lacks:$missing" "$(cat "$T/ipc0.txt")"
 [ "$(ipcv dropped.total)" = 0 ] && ok "nothing was dropped yet (ipc.dropped.total=0)" || bad "ipc.dropped.total=$(ipcv dropped.total) before any load"
 ctl stats > "$T/stats.prom" 2>&1
 grep -q '^karidns_ipc_events_total{event="router.worker.dropped_full"} 0$' "$T/stats.prom" && ok "karictl stats: karidns_ipc_events_total{event=...}" || bad "karictl stats has no karidns_ipc_events_total" "$(grep ipc "$T/stats.prom" | head -3)"
@@ -221,6 +223,64 @@ if [ "$MAXB" -gt 65536 ] && [ "$MAXB" -lt 1073741824 ] 2>/dev/null; then
 else
     echo "  (kern.ipc.maxsockbuf is $MAXB: part D skipped)"
 fi
+
+# ---------------------------------------------------------------- E. a router that does not read for a moment (0.7 IPC backpressure)
+# udp-receive backend, 1 router, 1 worker, the router's end of the reply queue made small (KARIDNS_TEST_IPC_REPLY_QUEUE 4096: a few datagrams) and the
+# router stopped (SIGSTOP) while 400 queries come (8 at a time, 2 ms apart; the client sends SIGCONT to the router after the last one, nothing is sent twice).
+#   E1 KARIDNS_TEST_IPC_REPLY_BUDGET_US=0, the worker as before 0.7: the replies that do not fit the queue are dropped (worker.reply.dropped_full > 0), and counted
+#   E2 the wait in force (KARIDNS_TEST_IPC_REPLY_BUDGET_US=10000000, so that the time the router is stopped is inside it): the worker waits for the queue,
+#      the queries wait in its UDP socket, and every one of the 400 is answered: nothing dropped, worker.reply.retried > 0
+echo "== E. the router stopped while 400 queries come, a small reply queue: dropped at once (the pre-0.7 worker) / waited for (0.7)"
+write_conf_e() {
+    cat > "$T/karidns.conf" <<EOF
+options {
+    port $PORT;
+    bind-address { 127.0.0.1; };
+    router-threads 1;
+    worker-threads 1;
+    udp-receive backend;
+    $USER_OPT
+};
+control-channel { socket "$CTRL_SOCK"; algorithm hmac-sha256; secret "c3RhdHMtdGVzdC1zZWNyZXQta2V5LTAwMQ=="; };
+zone "example.test" { type primary; file "$T/example.zone"; };
+EOF
+    chmod 644 "$T/karidns.conf"
+}
+# the router: the last single-threaded child of the manager (forked after the Backend; the first one is the broker)
+router_pid() { ps -ax -o pid= -o ppid= -o nlwp= | awk -v p="$SERVER_PID" -v b="$BACKEND" '$2 == p && $3 == 1 && $1 != b { r = $1 } END { print r }'; }
+run_e() {   # run_e LABEL BUDGET_US
+    write_conf_e
+    export KARIDNS_TEST_IPC_REPLY_QUEUE=4096 KARIDNS_TEST_IPC_REPLY_BUDGET_US=$2
+    start_server
+    unset KARIDNS_TEST_IPC_REPLY_QUEUE KARIDNS_TEST_IPC_REPLY_BUDGET_US
+    ROUTER=$(router_pid)
+    if [ -z "$BACKEND" ] || [ -z "$ROUTER" ]; then
+        bad "$1: no Backend / router process (Backend '$BACKEND', router '$ROUTER')" "$(ps -ax -o pid= -o ppid= -o nlwp= -o command= | awk -v p="$SERVER_PID" '$2 == p')"
+        stop_server; return 1
+    fi
+    OUT=$(perl "$CLIENT" "$PORT" 1 1 1 5)
+    [ "$(kv "$OUT" answered)" = 1 ] || { bad "$1: no answer before the test" "$OUT"; stop_server; return 1; }
+    D0=$(ipcv dropped.total); F0=$(ipcv worker.reply.dropped_full); R0=$(ipcv worker.reply.retried); U0=$(udp_full_drops)
+    kill -STOP "$ROUTER"
+    OUT=$(perl "$CLIENT" "$PORT" 400 400 0 5 8 2 "$ROUTER")
+    kill -CONT "$ROUTER" 2>/dev/null
+    echo "  $1: $OUT"
+    # (the counters are read through a bounded wait: the worker may still be sending the last replies when the client gives up)
+    i=0; while [ $i -lt 50 ] && [ "$(ipcv dropped.total)" = "$D0" ] && [ "$(ipcv worker.reply.retried)" = "$R0" ]; do sleep 0.1; i=$((i + 1)); done
+    F1=$(ipcv worker.reply.dropped_full); R1=$(ipcv worker.reply.retried)
+    echo "  $1: worker.reply.dropped_full +$((F1 - F0)), worker.reply.retried +$((R1 - R0)); not 0: $(ctl ipcstats | grep '^ipc\.' | grep -v '=0$' | tr '\n' ' ')"
+}
+run_e "E1 (no wait)" 0 && {
+    [ "$((F1 - F0))" -gt 0 ] && ok "E1: without the wait the replies that do not fit the queue are dropped: worker.reply.dropped_full +$((F1 - F0))" || bad "E1: worker.reply.dropped_full did not move ($F0 -> $F1): the reply queue did not fill" "$OUT"
+    account "E1" "$OUT" "$D0" "$U0"
+    stop_server
+}
+run_e "E2 (wait)" 10000000 && {
+    [ "$(kv "$OUT" answered)" = 400 ] && [ "$(kv "$OUT" sent)" = "$(kv "$OUT" received)" ] && ok "E2: every one of the 400 queries was answered, none sent twice" || bad "E2: not every query was answered" "$OUT"
+    [ "$F1" = "$F0" ] && [ "$(ipcv dropped.total)" = "$D0" ] && ok "E2: nothing dropped (worker.reply.dropped_full and ipc.dropped.total unchanged)" || bad "E2: dropped: worker.reply.dropped_full $F0 -> $F1, ipc.dropped.total $D0 -> $(ipcv dropped.total)" "$OUT"
+    [ "$((R1 - R0))" -gt 0 ] && ok "E2: the worker waited for the queue: worker.reply.retried +$((R1 - R0))" || bad "E2: worker.reply.retried did not move: the queue did not fill" "$OUT"
+    stop_server
+}
 
 echo
 echo "run_ipc_drops_test: $PASS ok, $FAILS failed"

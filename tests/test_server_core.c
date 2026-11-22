@@ -2749,39 +2749,45 @@ static void test_ipc_reply_flush(void) {
     /* 16 replies of 100 octets in one datagram (1660 octets: under the 2048 default) */
     g_ipc_pack_max = UDP_IPC_PACK_DEFAULT;
     FILL(UDP_BATCH_SIZE, 20);
-    assert(ipc_reply_flush(sv[0], b, UDP_BATCH_SIZE) == 0);
+    assert(ipc_reply_flush(sv[0], b->tx_iov, UDP_BATCH_SIZE) == 0);
     DRAIN(ndg, nfr);
     assert(ndg == 1 && nfr == UDP_BATCH_SIZE);
     /* 16 replies of 512 octets of payload under a limit of 2048: 3 per datagram (3 x 592 + padding = 1776), 6 datagrams */
     FILL(UDP_BATCH_SIZE, 512);
-    assert(ipc_reply_flush(sv[0], b, UDP_BATCH_SIZE) == 0);
+    assert(ipc_reply_flush(sv[0], b->tx_iov, UDP_BATCH_SIZE) == 0);
     DRAIN(ndg, nfr);
     assert(ndg == 6 && nfr == UDP_BATCH_SIZE);
     /* a limit above what the kernel takes (net.local.dgram.maxdgram): the packed datagram is refused with EMSGSIZE and every reply goes alone */
     g_ipc_pack_max = 1u << 20;
     FILL(UDP_BATCH_SIZE, 1500);                        /* (16 x 1580 octets: more than 8192 together) */
-    assert(ipc_reply_flush(sv[0], b, UDP_BATCH_SIZE) == 0);
+    assert(ipc_reply_flush(sv[0], b->tx_iov, UDP_BATCH_SIZE) == 0);
     DRAIN(ndg, nfr);
     assert(ndg == UDP_BATCH_SIZE && nfr == UDP_BATCH_SIZE);
     assert(ipcd_total(IPCD_WREP_FULL) == full0 && ipcd_total(IPCD_WREP_ERR) == err0);
     /* one reply alone, as before the framing */
     g_ipc_pack_max = UDP_IPC_PACK_DEFAULT;
     FILL(1, 30);
-    assert(ipc_reply_flush(sv[0], b, 1) == 0 && ipc_reply_flush(sv[0], b, 0) == 0);
+    assert(ipc_reply_flush(sv[0], b->tx_iov, 1) == 0 && ipc_reply_flush(sv[0], b->tx_iov, 0) == 0);
     DRAIN(ndg, nfr);
     assert(ndg == 1 && nfr == 1);
     /* a descriptor that fails (EBADF): every reply of every datagram counted as an error, not one per datagram */
     FILL(UDP_BATCH_SIZE, 512);
-    assert(ipc_reply_flush(-1, b, UDP_BATCH_SIZE) == UDP_BATCH_SIZE);
+    assert(ipc_reply_flush(-1, b->tx_iov, UDP_BATCH_SIZE) == UDP_BATCH_SIZE);
     assert(ipcd_total(IPCD_WREP_ERR) == err0 + UDP_BATCH_SIZE && ipcd_total(IPCD_WREP_FULL) == full0);
-    /* a full queue: what is not sent is counted as full, in replies */
+    /* a full queue that nobody reads (the real kernel: ENOBUFS): waited for within the budget, then what is not sent is counted as full, in replies */
     uint8_t one = 0;
     int filled = 0;
     while (send(sv[0], &one, 1, MSG_DONTWAIT) > 0 && filled < 1000000) filled++;
     assert(errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS);
     FILL(UDP_BATCH_SIZE, 20);
-    assert(ipc_reply_flush(sv[0], b, UDP_BATCH_SIZE) == UDP_BATCH_SIZE);
+    assert(ipc_reply_flush(sv[0], b->tx_iov, UDP_BATCH_SIZE) == UDP_BATCH_SIZE);
     assert(ipcd_total(IPCD_WREP_FULL) == full0 + UDP_BATCH_SIZE && ipcd_total(IPCD_WREP_ERR) == err0 + UDP_BATCH_SIZE);
+    /* emptied, the queue takes a whole batch again (this also clears the mark the wait left on sv[0]) */
+    while (recv(sv[1], rb, sizeof(rb), MSG_DONTWAIT) >= 0) {}
+    FILL(UDP_BATCH_SIZE, 20);
+    assert(ipc_reply_flush(sv[0], b->tx_iov, UDP_BATCH_SIZE) == 0);
+    DRAIN(ndg, nfr);
+    assert(ndg == 1 && nfr == UDP_BATCH_SIZE && ipcd_total(IPCD_WREP_FULL) == full0 + UDP_BATCH_SIZE);
     #undef DRAIN
     #undef FILL
     g_ipc_pack_max = saved_max;
@@ -2789,6 +2795,127 @@ static void test_ipc_reply_flush(void) {
     close(sv[1]);
     free(b);
     printf("  -> ipc_reply_flush passed.\n");
+}
+
+/* a worker -> router queue for ipc_reply_flush() in place of sendmsg(2): it takes fq_take datagrams, then refuses fq_refuse calls in a row (errno
+ * fq_errno; fq_refuse < 0: for good), then takes everything; fq_emsg refuses every datagram of more than one frame with EMSGSIZE.  The frames it took
+ * are in fq_order (their sock_fd_idx), fq_calls counts the calls. */
+static int fq_take, fq_refuse, fq_errno, fq_calls, fq_emsg, fq_n;
+static int fq_order[64];
+static ssize_t fq_sendmsg(int fd, const struct msghdr *m, int flags) {
+    (void)fd; (void)flags;
+    fq_calls++;
+    if (fq_emsg && m->msg_iovlen > 1) { errno = EMSGSIZE; return -1; }
+    if (fq_take == 0 && fq_refuse != 0) {
+        if (fq_refuse > 0) fq_refuse--;
+        errno = fq_errno;
+        return -1;
+    }
+    if (fq_take > 0) fq_take--;
+    size_t len = 0;
+    for (int i = 0; i < (int)m->msg_iovlen; i++) {
+        udp_ipc_t h;
+        memcpy(&h, m->msg_iov[i].iov_base, sizeof(h));
+        if (fq_n < 64) fq_order[fq_n++] = h.sock_fd_idx;
+        len += m->msg_iov[i].iov_len;
+    }
+    return (ssize_t)len;
+}
+static void fq_set(int take, int refuse, int err) { fq_take = take; fq_refuse = refuse; fq_errno = err; fq_calls = 0; fq_n = 0; }
+static void *fq_other_thread(void *arg) {
+    struct iovec *iov = arg;
+    fq_set(0, 1, ENOBUFS);
+    return (void *)(intptr_t)ipc_reply_flush(9, iov, 1);
+}
+
+/* ipc_reply_flush() (0.7, IPC backpressure): a full queue to the router is waited for within the budget, in order; what never goes is dropped and
+ * counted once; a queue that used its budget is not waited for again (by this thread) until a batch goes whole */
+static void test_ipc_reply_backpressure(void) {
+    printf("[TEST] Server Core: ipc_reply_flush waits for a full queue to the router within its budget, in order, and counts what is finally dropped...\n");
+    udp_batch_ctx_t *b = malloc(sizeof(*b));
+    assert(b);
+    #define FILL(n, pl) do { for (int i_ = 0; i_ < (n); i_++) { b->tx_iov[i_].iov_base = b->tx_buffers[i_]; \
+        b->tx_iov[i_].iov_len = ipcf_put(b->tx_buffers[i_], 0, i_, (uint16_t)(pl)); } } while (0)
+    const size_t saved_max = g_ipc_pack_max;
+    const long budget0 = g_ipc_reply_budget_us;
+    ssize_t (*saved)(int, const struct msghdr *, int) = g_ipc_sendmsg_fn;
+    g_ipc_sendmsg_fn = fq_sendmsg;
+    g_ipc_pack_max = UDP_IPC_PACK_DEFAULT;
+    fq_emsg = 0;
+    const uint64_t full0 = ipcd_total(IPCD_WREP_FULL), err0 = ipcd_total(IPCD_WREP_ERR), re0 = ipcd_total(IPCD_WREP_RETRIED);
+    /* 16 replies of 512 octets: 6 datagrams (3 frames each, the last 1); after 2 datagrams ENOBUFS 3 times, then the queue takes the rest: nothing
+     * dropped, the order kept, the 10 replies sent after the first refusal counted as retried.  A wide budget for the cases that must succeed (a
+     * loaded CI VM can overshoot two pauses of 1 ms by far) */
+    g_ipc_reply_budget_us = 5000000;
+    fq_set(2, 3, ENOBUFS);
+    FILL(UDP_BATCH_SIZE, 512);
+    assert(ipc_reply_flush(7, b->tx_iov, UDP_BATCH_SIZE) == 0);
+    assert(fq_calls == 9 && fq_n == UDP_BATCH_SIZE);
+    for (int i = 0; i < UDP_BATCH_SIZE; i++) assert(fq_order[i] == i);
+    assert(ipcd_total(IPCD_WREP_FULL) == full0 && ipcd_total(IPCD_WREP_ERR) == err0 && ipcd_total(IPCD_WREP_RETRIED) == re0 + 10);
+    /* EAGAIN the same way: one refusal, sent again at once */
+    fq_set(0, 1, EAGAIN);
+    FILL(UDP_BATCH_SIZE, 20);
+    assert(ipc_reply_flush(7, b->tx_iov, UDP_BATCH_SIZE) == 0 && fq_calls == 2 && fq_n == UDP_BATCH_SIZE);
+    assert(ipcd_total(IPCD_WREP_RETRIED) == re0 + 10 + UDP_BATCH_SIZE);
+    /* a queue that never takes again: bounded (the budget, here 2 ms, plus a pause of 1 ms; far under 500 ms), the 13 replies left dropped and counted once, as full */
+    g_ipc_reply_budget_us = 2000;
+    fq_set(1, -1, ENOBUFS);
+    FILL(UDP_BATCH_SIZE, 512);
+    int64_t t = fk_us();
+    assert(ipc_reply_flush(7, b->tx_iov, UDP_BATCH_SIZE) == 13);
+    t = fk_us() - t;
+    if (t < 2000 || t > 500000) printf("  [state] the budget took %lld us, %d calls\n", (long long)t, fq_calls);
+    assert(t >= 2000 && t < 500000 && fq_n == 3 && fq_calls >= 3);
+    assert(ipcd_total(IPCD_WREP_FULL) == full0 + 13 && ipcd_total(IPCD_WREP_ERR) == err0 && ipcd_total(IPCD_WREP_RETRIED) == re0 + 10 + UDP_BATCH_SIZE);
+    /* the next batch to that queue: tried once, not waited for (still full: all 16 dropped at once) */
+    fq_set(0, -1, ENOBUFS);
+    assert(ipc_reply_flush(7, b->tx_iov, UDP_BATCH_SIZE) == UDP_BATCH_SIZE && fq_calls == 1);
+    assert(ipcd_total(IPCD_WREP_FULL) == full0 + 13 + UDP_BATCH_SIZE);
+    /* another router's queue is still waited for */
+    g_ipc_reply_budget_us = 5000000;
+    fq_set(0, 2, ENOBUFS);
+    assert(ipc_reply_flush(8, b->tx_iov, 1) == 0 && fq_calls == 3);
+    /* so is the same queue by another thread (the marks are the thread's: an asynchronous resolution thread and a worker do not share them) */
+    pthread_t th;
+    void *rv = NULL;
+    assert(pthread_create(&th, NULL, fq_other_thread, b->tx_iov) == 0 && pthread_join(th, &rv) == 0);
+    assert((intptr_t)rv == 0 && fq_calls == 2);
+    /* a batch that goes whole clears the mark: the next refusal is waited for again */
+    fq_set(0, 0, ENOBUFS);
+    assert(ipc_reply_flush(7, b->tx_iov, 3) == 0 && fq_n == 3);
+    fq_set(0, 1, ENOBUFS);
+    assert(ipc_reply_flush(7, b->tx_iov, 3) == 0 && fq_calls == 2 && fq_n == 3);
+    /* a packed datagram refused as too long (EMSGSIZE) goes one frame at a time, and a full queue there is waited for too (the 3 frames sent
+     * after the refusal counted as retried) */
+    g_ipc_pack_max = 1u << 20;
+    fq_emsg = 1;
+    FILL(4, 100);
+    const uint64_t re1 = ipcd_total(IPCD_WREP_RETRIED);
+    fq_set(1, 1, ENOBUFS);
+    assert(ipc_reply_flush(7, b->tx_iov, 4) == 0 && fq_n == 4 && fq_calls == 6);
+    for (int i = 0; i < 4; i++) assert(fq_order[i] == i);
+    assert(ipcd_total(IPCD_WREP_RETRIED) == re1 + 3);
+    /* a frame refused there for its own reason (EBADF) is dropped as an error with no wait; the others go */
+    FILL(4, 100);
+    fq_set(0, 1, EBADF);
+    assert(ipc_reply_flush(7, b->tx_iov, 4) == 1 && fq_n == 3 && fq_calls == 5);
+    assert(ipcd_total(IPCD_WREP_ERR) == err0 + 1 && ipcd_total(IPCD_WREP_RETRIED) == re1 + 3);
+    /* ... and a queue that never takes again there: the frames left dropped as full */
+    g_ipc_reply_budget_us = 0;
+    FILL(4, 100);
+    fq_set(1, -1, ENOBUFS);
+    assert(ipc_reply_flush(7, b->tx_iov, 4) == 3 && fq_n == 1);
+    assert(ipcd_total(IPCD_WREP_FULL) == full0 + 13 + UDP_BATCH_SIZE + 3);
+    fq_emsg = 0;
+    fq_set(0, 0, ENOBUFS);
+    assert(ipc_reply_flush(7, b->tx_iov, 1) == 0);           /* (the mark of fd 7 cleared for the tests after this one) */
+    #undef FILL
+    g_ipc_sendmsg_fn = saved;
+    g_ipc_reply_budget_us = budget0;
+    g_ipc_pack_max = saved_max;
+    free(b);
+    printf("  -> ipc_reply_flush backpressure passed.\n");
 }
 
 // ----------------------------------------------------------------------------
@@ -3000,7 +3127,7 @@ static void test_ipcd_counters(void) {
     assert(dt != NULL);
     uint64_t sum = 0;
     for (int i = 0; i < IPCD_COUNT; i++)
-        if (i != IPCD_RTW_SPILLED && i != IPCD_RREP_CUT && i != IPCD_RCLI_RETRIED) sum += ipcd_total((ipcd_t)i);
+        if (i != IPCD_RTW_SPILLED && i != IPCD_RREP_CUT && i != IPCD_RCLI_RETRIED && i != IPCD_WREP_RETRIED) sum += ipcd_total((ipcd_t)i);
     assert(strtoull(dt + strlen("ipc.dropped.total="), NULL, 10) == sum);   // the spills are not losses
     // a buffer that is too small is cut at a line: no overflow
     for (size_t cap = 1; cap < 80; cap += 7) {
@@ -3017,12 +3144,6 @@ static void test_ipcd_counters(void) {
     for (int i = 0; i < 50; i++) (void)ipcd_total(IPCD_WRX_SHORT);
     for (int i = 0; i < 4; i++) assert(pthread_join(th[i], NULL) == 0);
     assert(ipcd_total(IPCD_WRX_SHORT) == c0 + 4 * 20000);
-    // a reply that a plain send() could not hand over (the asynchronous resolution threads): queue full, or another failure
-    const uint64_t wf0 = ipcd_total(IPCD_WREP_FULL), we0 = ipcd_total(IPCD_WREP_ERR);
-    ipc_reply_failed(ENOBUFS);
-    ipc_reply_failed(EAGAIN);
-    ipc_reply_failed(EBADF);
-    assert(ipcd_total(IPCD_WREP_FULL) == wf0 + 2 && ipcd_total(IPCD_WREP_ERR) == we0 + 1);
     // B3 phase 1: the queries each router passed on, in its own slot (one writer), shown per router and not as a drop
     const uint64_t r0 = ipcd_routed(1), r2 = ipcd_routed(2);
     pid = fork();
@@ -3047,7 +3168,7 @@ static void test_ipcd_counters(void) {
     dt = strstr(buf, "ipc.dropped.total=");
     sum = 0;
     for (int i = 0; i < IPCD_COUNT; i++)
-        if (i != IPCD_RTW_SPILLED && i != IPCD_RREP_CUT && i != IPCD_RCLI_RETRIED) sum += ipcd_total((ipcd_t)i);
+        if (i != IPCD_RTW_SPILLED && i != IPCD_RREP_CUT && i != IPCD_RCLI_RETRIED && i != IPCD_WREP_RETRIED) sum += ipcd_total((ipcd_t)i);
     assert(dt != NULL && strtoull(dt + strlen("ipc.dropped.total="), NULL, 10) == sum);   // (the routed queries are not drops)
     g_num_frontend_routers = saved_routers;
     for (size_t cap = 1; cap < 1500; cap += 37) {   // (the router lines are cut at a line as well)
@@ -3465,7 +3586,7 @@ static void test_router_reply_fd_and_budget(void) {
     const char *dt = strstr(fb, "ipc.dropped.total=");
     uint64_t sum = 0;
     for (int i = 0; i < IPCD_COUNT; i++)
-        if (i != IPCD_RTW_SPILLED && i != IPCD_RREP_CUT && i != IPCD_RCLI_RETRIED) sum += ipcd_total((ipcd_t)i);
+        if (i != IPCD_RTW_SPILLED && i != IPCD_RREP_CUT && i != IPCD_RCLI_RETRIED && i != IPCD_WREP_RETRIED) sum += ipcd_total((ipcd_t)i);
     assert(dt && strtoull(dt + strlen("ipc.dropped.total="), NULL, 10) == sum);   /* (the worker queries are not drops; the new drops are) */
     g_num_workers = KARIDNS_WORKER_THREADS_MAX;                                 /* (the reply of 128 workers fits the control thread's buffer) */
     fl = ipcd_format(fb, sizeof(fb));
@@ -9642,6 +9763,7 @@ int main(void) {
     test_sendmmsg_skip_failed();
     test_ipc_frame_parse_pack();
     test_ipc_reply_flush();
+    test_ipc_reply_backpressure();
     test_router_send_clients();
     test_ipc_send_spill();
     test_sockbuf_set();
