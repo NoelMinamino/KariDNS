@@ -559,7 +559,17 @@ static void test_store(int mode, const char *base) {
   CHECK_EQ(kv_num("store.lock.site.site_b.over_100ms"), 1);
   CHECK(kv_num("store.lock.site.site_b.max_us") >= 150000);
   CHECK(kv_num("store.lock.writer_hold_max_us") >= 150000);
-  CHECK(strcmp(kv_str("store.lock.writer_hold_max_site"), "site_b") == 0);
+  /* the longest hold of the store, whoever held it: site_b's 150 ms, unless a real writer of this test held the mutex longer (an fsync of the CI VM can stall for
+   * seconds: main CI on 14.4 after #242 saw another function here).  The site named must be the one whose own maximum is the store's maximum */
+  {
+    const char *ms = kv_str("store.lock.writer_hold_max_site");
+    char key[128];
+    snprintf(key, sizeof(key), "store.lock.site.%s.max_us", ms ? ms : "-");
+    const bool ok = ms && (strcmp(ms, "site_b") == 0 || (kv_num("store.lock.writer_hold_max_us") > kv_num("store.lock.site.site_b.max_us") && kv_num(key) == kv_num("store.lock.writer_hold_max_us")));
+    CHECK(ok);
+    if (!ok) printf("  writer_hold_max_site %s, writer_hold_max_us %llu, its site max %llu, site_b max %llu\n", ms ? ms : "(none)", kv_num("store.lock.writer_hold_max_us"), kv_num(key),
+                    kv_num("store.lock.site.site_b.max_us"));
+  }
   CHECK(kv_get("store.lock.site.site_c.slow") == NULL);
   /* 0.7 WP9: the cleaner, the space, the scrub, the open: the keys are there, a store that has done nothing of it says so */
   static const char *const WP9[] = { "store.compact.runs", "store.compact.moved_records", "store.compact.moved_bytes", "store.compact.segments_freed", "store.compact.bad_records",
