@@ -277,7 +277,7 @@ if ! kill -0 "$SERVER_PID" 2>/dev/null; then echo "ERROR: server did not start";
 
 expect "bad.test (serial mismatch) was not loaded: logged" "$(cat "$TMP_DIR/server.log")" "zone 'bad.test.?' not loaded.*different serials"
 OUT=$(Q $SRC_IN bad.test SOA)
-reject "bad.test is not answered" "$OUT" "flags:.* aa"
+reject "bad.test is not answered" "$OUT" "flags:( [a-z]+)* aa[ ;]"   # (the flags of the header only: the output is folded to one line, and a COOKIE such as "aad88..." after it matched ".* aa")
 expect "bad.test: some error status, no answer" "$OUT" "status: (REFUSED|SERVFAIL)"
 
 echo "=== 3. tinydns zone with one SOA per location (loc.test) ==="
