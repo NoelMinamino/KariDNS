@@ -949,6 +949,7 @@ typedef struct server_config_s {
   int cookie_secret_count;
   int udp_recvbuf_size;
   int udp_sndbuf_size;
+  bool udp_recvbuf_set, udp_sndbuf_set;   /* 0.7: written in the configuration (a size the kernel does not give is a WARNING then, a NOTICE for the default) */
   /* TCP の転送パラメータ (0 = OS 既定) */
   notify_retry_config_t notify_retry;
   int ixfr_history;         /* options の ixfr-history (既定 IXFR_HISTORY_DEFAULT) */

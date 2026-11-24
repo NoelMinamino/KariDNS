@@ -99,7 +99,7 @@ change the options that need a restart (`OK reloaded (restart needed for: ...)`)
 | UDP receive | routers read, workers answer over IPC | `udp-receive backend`: each worker reads its own socket (#227) | `udp-receive frontend;` |
 | Routers / workers | by all CPUs of the machine (from 4 CPUs: 2 routers + the rest) | by the CPUs the process may run on; from 4 CPUs half of them routers, up to 8 (#220, #226) | `router-threads N; worker-threads N;` |
 | `store-threads` | 2 | 8 (docs/karidns.md) | `store-threads 2;` |
-| `udp-recvbuf-size` (4M) | refused by the kernel on a stock system, sockets stayed at 16 KiB | the most the kernel gives, with a WARNING (#224) | raise the sysctls (section 6) |
+| `udp-recvbuf-size` (4M) | refused by the kernel on a stock system, sockets stayed at 16 KiB | the most the kernel gives, with a NOTICE (`[IPC] NOTICE`, `[Network] NOTICE: ... (the default)`; a WARNING when the size is written, #224, #256) | raise the sysctls (section 6) |
 | `alias-max-refresh-time` | a forged TTL of 86400 stayed about 16 h | 3600 s cap (#234) | `alias-max-refresh-time 1d;` |
 | DNS Cookies to forwarders and ALIAS resolvers | none | sent and checked (#234, #238) | none; a resolver that never sends a server cookie is accepted |
 | `secondary-stale-max` | n/a | `0` (unlimited), new (#203) | already the default |
@@ -208,7 +208,7 @@ karictl store           # store.* keys; store.reserve.refused must be 0
 karictl dbstatus        # held= long_reader=, signer-wait: lines
 ```
 
-Watch the log for `[IPC] WARNING`, `[Network] WARNING`, `[Store]` and `[Zone] secondary-expired:` lines for a day.
+Watch the log for `[IPC] WARNING`, `[Network] WARNING`, `[Store]` and `[Zone] secondary-expired:` lines for a day (`[IPC] NOTICE` and `[Network] NOTICE: ... (the default)` say that the default socket buffers are smaller than asked: raise the sysctls of section 8 on a busy server).
 A database with the store and no `memory-limit` logs `[DB] memory-limit is not set: <L> is used ...` once at the start; `karictl dbstatus`
 shows `memory-limit=<L> (default)` on its `memory:` line. Compare the `memory sizing:` line (what every zone needs) with it: a NOTICE or
 WARNING after it means the default keeps only part of the zones in memory; set `memory-limit` (or `unlimited`) if the host has the RAM.

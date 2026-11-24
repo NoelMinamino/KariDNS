@@ -9130,8 +9130,8 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
             return -1;
           }
           if (v > 0) {
-            if (rcv) config->udp_recvbuf_size = v;
-            else config->udp_sndbuf_size = v;
+            if (rcv) { config->udp_recvbuf_size = v; config->udp_recvbuf_set = true; }
+            else { config->udp_sndbuf_size = v; config->udp_sndbuf_set = true; }
           }
         } else if (strcmp(key, "tcp-receive-buffer") == 0 || strcmp(key, "tcp-send-buffer") == 0) {
           bool rcv = key[4] == 'r';

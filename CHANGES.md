@@ -48,7 +48,7 @@ What changes, what it breaks, and what to do. The step-by-step version is [docs/
   `memory-limit` (hw.physmem is the host's).
 - **Socket buffers**: the kernel refuses (does not clip) a `SO_RCVBUF` / `SO_SNDBUF` above about 8/9 of
   `kern.ipc.maxsockbuf`. On a stock system the `4M` default of `udp-recvbuf-size` was refused and the sockets stayed
-  at 16 KiB. 0.7 asks for the most the kernel gives and logs a WARNING that names the sysctl to raise (#224).
+  at 16 KiB. 0.7 asks for the most the kernel gives and logs a line that names the sysctl to raise (#224): a NOTICE for the default size, a WARNING for a size the configuration wrote (#256).
 - **Stricter configuration** (#248, #234, #211, #220). `karidns` refuses to start, and `karicheck conf` reports an
   error with file and line, for: an invalid `rate-limit` value (negative, above INT_MAX, not a number, `window 0`,
   prefix length out of range; it was a warning and the default stayed, #248); an `alias-max-refresh-time` outside 5 s

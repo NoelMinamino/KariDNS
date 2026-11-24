@@ -129,6 +129,7 @@ static void test_defaults(void) {
     CHECK(cfg.allow_program_zones == false);
     CHECK(cfg.additional_from_auth == ADDITIONAL_AUTH_YES);
     CHECK(cfg.udp_recvbuf_size == 4 * 1024 * 1024);
+    CHECK(!cfg.udp_recvbuf_set && !cfg.udp_sndbuf_set);     /* (0.7: the default: a size the kernel does not give is a NOTICE) */
     CHECK(cfg.udp_sndbuf_size == 4 * 1024 * 1024);
     CHECK(cfg.tcp_mss == 0);                /* 0 = leave the OS default alone */
     CHECK(cfg.tcp_window == 0);
@@ -4484,11 +4485,13 @@ static void test_bind_option_values_aliases(void) {
     server_config_t cfg;
     if (ok_with("udp buffers", "options { udp-receive-buffer 65536; udp-send-buffer 32768; };", "", &cfg)) {
         CHECK(cfg.udp_recvbuf_size == 65536 && cfg.udp_sndbuf_size == 32768);
+        CHECK(cfg.udp_recvbuf_set && cfg.udp_sndbuf_set);       /* (written: a WARNING) */
         free_server_config_fields(&cfg);
     }
     if (ok_with("udp buffer floor", "options { udp-receive-buffer 100; udp-send-buffer 0; };", "", &cfg)) {
         CHECK(cfg.udp_recvbuf_size == 4096);                    /* BIND raises a non-zero size to 4096 */
         CHECK(cfg.udp_sndbuf_size == 4 * 1024 * 1024);          /* 0 is the system's size: KariDNS keeps its own default */
+        CHECK(cfg.udp_recvbuf_set && !cfg.udp_sndbuf_set);      /* (0 keeps the default: not written) */
         free_server_config_fields(&cfg);
     }
     if (ok_with("both names, one value", "options { udp-recvbuf-size 65536; udp-receive-buffer 65536; udp-sndbuf-size 8k; udp-send-buffer 8192; };", "", &cfg)) {
