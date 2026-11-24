@@ -284,6 +284,8 @@ typedef struct store_stats {
   uint64_t reserve_bytes;
   uint32_t fs_blksize;            /* st_blksize of the table file: on ZFS the dataset's recordsize */
   bool     fs_recordsize_warn;    /* ZFS with a record size above 32 KiB */
+  uint32_t align_rs;              /* 0.7 attach-align: the record size images are aligned to (COPY mode on ZFS), 0 = not aligned */
+  uint64_t align_pads, align_pad_bytes;   /* records placed at the next record boundary since the open, and the bytes skipped for them */
   uint32_t space_level;           /* 0 = ok, 1 = low (a WARNING was said), 2 = degraded: new images are not stored */
   uint64_t store_bytes;           /* what the store occupies: segments, tables, indexes, journal */
   uint64_t growth_bytes_per_hour; /* the growth of the last hour (0 = not known or shrinking) */
@@ -654,6 +656,8 @@ extern void (*_Atomic store_test_commit_hook)(int step);
 extern void (*_Atomic store_test_prewrite_hook)(store_t *s);
 /* the stores opened while this is set start no flusher thread (the writers make the due commits and checkpoints after the mutex) */
 extern _Atomic bool store_test_no_flusher;
+/* the record size the stores opened while this is set align their images to (0.7 attach-align): 0 = by the file system (ZFS in COPY mode), UINT32_MAX = no alignment */
+extern _Atomic uint32_t store_test_align_rs;
 /* COPY mode reads a record into the image's buffer directly, not through the reading thread's buffer (0.7, store_image_read()) */
 extern _Atomic int store_test_rbuf_off;
 #ifdef KARIDNS_UNIT_TEST

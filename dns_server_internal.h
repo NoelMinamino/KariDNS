@@ -1536,6 +1536,7 @@ typedef struct {
   uint32_t victim_freq;
   uint64_t room_evictions, room_relaxed;         /* zones taken out on demand for a query that waited for room (also in evictions), and of those the ones younger than the minimum residency */
   uint64_t sampled;                          /* zones of the store taken out because a sample of the attach table chose them (also in evictions): 0.7 store S5, design 4.4 */
+  uint64_t evict_yields;                     /* 0.7 attach-align: times a round of sampled detaches let the registry lock go for the attaches that waited for it */
   uint64_t fixed;                            /* 0.7: the zone store's private table bytes, which memory-limit counts before the zones (dbreg_cache_set_fixed()) */
 } dbreg_cache_stats_t;
 void dbreg_cache_set_limit(uint64_t limit);
@@ -1556,6 +1557,7 @@ void dbreg_residency(dbreg_residency_t *out);
 #ifdef KARIDNS_UNIT_TEST
 void dbreg_cache_test_pause(bool on);                              /* TEST ONLY: the manager does nothing while paused */
 void dbreg_test_pin(const char *view, const char *name, bool pin);       /* TEST ONLY: pins (or not) a zone of the store the way the settings do, with the bytes it adds to the pinned total */
+void dbreg_test_reg_waiter(int d);                                 /* TEST ONLY: as if d more threads waited for the registry lock to register attaches (a round of sampled detaches lets the lock go) */
 uint16_t dbreg_test_flags(const char *view, const char *name);               /* TEST ONLY: the flags of the registry's element (under the registry lock) */
 void dbreg_cache_test_set_victim_freq(uint32_t f);                 /* TEST ONLY: the frequency a zone that is loaded now is compared with */
 void dbreg_cache_test_room_pause(bool on);                         /* TEST ONLY: dbreg_cache_make_room() takes nothing out while paused */

@@ -1826,6 +1826,7 @@ static bool extra_status_cb(store_extra_t *x) {
   dbreg_err_stats(&n, &x->err_noted, &x->err_dropped);
   x->err_texts = n;
   x->sampled_detaches = cs.sampled;
+  x->detach_lock_yields = cs.evict_yields;
   x->wa_ok = atomic_load(&G.wa_ok);
   x->wa_cold = atomic_load(&G.wa_cold);
   x->wa_over = atomic_load(&G.wa_over);

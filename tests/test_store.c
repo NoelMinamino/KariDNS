@@ -5605,6 +5605,100 @@ static void test_rbuf(void) {
   tdir_free(&d);
 }
 
+/* 0.7 attach-align (seg_align_pos()): with a record size forced (store_test_align_rs), no record that need not cross a record boundary crosses one unless skipping to the boundary would
+ * skip more than half a record; images read back the same after the cleaner moved them and after a reopen; the counters count the moves and the skipped bytes; the bytes skipped are dead
+ * bytes of their segment; no alignment (UINT32_MAX) moves nothing.  Returns the records that cross a boundary they need not cross. */
+static uint64_t align_scan(store_t *s, uint32_t n, const uint64_t *ver, uint64_t rs, bool aligned_store, const char *what) {
+  uint64_t cross = 0, bad = 0, aligned = 0;
+  for (uint32_t i = 0; i < n; i++) {
+    if (!ver[i]) continue;
+    CHECK(verify_i(s, 0, i, ver[i]));
+    store_read_lock();
+    const uint32_t z = find_i(s, 0, i);
+    store_zone_t zi;
+    const bool got = z != STORE_NONE && store_zone_get(s, z, &zi) == 0 && zi.state == STORE_STATE_STORED;
+    store_read_unlock();
+    CHECK(got);
+    if (!got) continue;
+    const uint64_t off = (zi.loc & ((1ull << 36) - 1)) * 64, rlen = (64u + (((uint64_t)zi.klen + 15u) & ~15ull) + zi.img_len + 63u) & ~63ull;
+    const uint64_t o = off % rs;
+    aligned += o == 0;
+    if ((o + rlen + rs - 1) / rs > (rlen + rs - 1) / rs) {
+      cross++;
+      if (aligned_store && o >= rs / 2) bad++;              /* (the end before it was at o: the boundary was at most half a record away, so the record should have started there) */
+    }
+  }
+  printf("  %s: record size %" PRIu64 ": %" PRIu64 " records at a boundary, %" PRIu64 " cross one they need not cross (%" PRIu64 " that should not)\n", what, rs, aligned, cross, bad);
+  CHECK_EQ(bad, 0);
+  return cross;
+}
+static void test_align(void) {
+  printf("[images aligned to the record size (COPY mode on ZFS)]\n");
+  const uint32_t sizes[3] = { 1024, 4096, UINT32_MAX };
+  uint64_t cross_off = 0, cross_on = 0;
+  for (int k = 0; k < 3; k++) {
+    tdir_t d;
+    tdir_new(&d, "align");
+    store_opts_t o;
+    small_opts(&o);
+    o.mode = STORE_MODE_COPY;
+    o.seg_size = 256u << 10;
+    o.compact_rate = UINT64_MAX;
+    o.scrub_interval_s = UINT32_MAX;
+    atomic_store(&store_test_align_rs, sizes[k]);
+    store_t *s = NULL;
+    CHECK_EQ(store_open(d.fd, &o, &s), 0);
+    if (!s) { atomic_store(&store_test_align_rs, 0); tdir_free(&d); return; }
+    store_view_add(s, "default");
+    enum { N = 600 };
+    uint64_t ver[N];
+    memset(ver, 0, sizeof(ver));
+    fill_dead(s, N, ver);                           /* (new zones, and replacements: the record written before the mutex, st_prewrite(), and the one inside it) */
+    CHECK_EQ(store_commit(s), 0);
+    store_stats_t st;
+    store_stats(s, &st);
+    const uint64_t rs = sizes[k] == UINT32_MAX ? 4096 : sizes[k];
+    printf("  align_bytes %u, pads %" PRIu64 ", pad bytes %" PRIu64 ", prewrites %" PRIu64 ", used %" PRIu64 ", live %" PRIu64 "\n", st.align_rs, st.align_pads, st.align_pad_bytes,
+           st.image_prewrites, st.seg_used_bytes, st.seg_live_bytes);
+    if (sizes[k] == UINT32_MAX) {
+      CHECK_EQ(st.align_rs, 0);
+      CHECK_EQ(st.align_pads, 0);
+      cross_off = align_scan(s, N, ver, rs, false, "not aligned");
+      CHECK(cross_off > 0);
+    } else {
+      CHECK_EQ(st.align_rs, sizes[k]);
+      CHECK(st.align_pads > 0);
+      CHECK(st.align_pad_bytes > 0 && st.align_pad_bytes < st.align_pads * (rs / 2 + 1));
+      CHECK(st.image_prewrites > 0);
+      CHECK(st.seg_used_bytes - st.seg_live_bytes >= st.align_pad_bytes);       /* (the skipped bytes are dead bytes) */
+      const uint64_t c = align_scan(s, N, ver, rs, true, "written");
+      if (sizes[k] == 4096) cross_on = c;
+      store_compact_report_t rep;
+      uint64_t moved = 0;
+      for (int it = 0; it < 40; it++) {
+        CHECK_EQ(store_compact(s, 0, true, &rep), 0);
+        CHECK_EQ(rep.bad_records, 0);
+        moved += rep.moved_records;
+        if (!rep.moved_records && !rep.segs_freed) break;
+      }
+      CHECK(moved > 0);
+      (void)align_scan(s, N, ver, rs, true, "after the cleaner");
+      check_consistent(s, "aligned, after the cleaner");
+    }
+    CHECK_EQ(store_close(s), 0);
+    o.create = false;
+    CHECK_EQ(store_open(d.fd, &o, &s), 0);
+    if (s) {
+      (void)align_scan(s, N, ver, rs, sizes[k] != UINT32_MAX, "after a reopen");
+      check_consistent(s, "aligned, reopen");
+      CHECK_EQ(store_close(s), 0);
+    }
+    atomic_store(&store_test_align_rs, 0);
+    tdir_free(&d);
+  }
+  CHECK(cross_on < cross_off);
+}
+
 static void test_hot_list(void) {
   printf("[hot.list: write, read, and what is not trusted]\n");
   tdir_t d, d2;
@@ -8768,6 +8862,7 @@ int main(void) {
   if (WANT("raclose")) test_readahead_close();
   if (WANT("resident")) { test_resident(STORE_MODE_MAP); test_resident(STORE_MODE_COPY); test_hot_list(); }
   if (WANT("rbuf")) test_rbuf();
+  if (WANT("align")) test_align();
   if (WANT("smallfs") && getenv("KARIDNS_STORE_SMALLFS")) test_smallfs(getenv("KARIDNS_STORE_SMALLFS"));
   if (WANT("zfs") && getenv("KARIDNS_STORE_ZFS_128K")) test_zfs_dir(getenv("KARIDNS_STORE_ZFS_128K"), true, "128K dataset");
   if (WANT("zfs") && getenv("KARIDNS_STORE_ZFS_16K")) test_zfs_dir(getenv("KARIDNS_STORE_ZFS_16K"), false, "16K dataset");

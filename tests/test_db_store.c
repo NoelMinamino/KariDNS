@@ -5544,11 +5544,23 @@ static int run_s5(const char *mode) {
         dbreg_cache_stats(&cs0);
         dbreg_cache_set_limit(res0 * 55 / 100);
         dbreg_cache_test_pause(false);
-        uint32_t taken = 0;
+        dbreg_cache_stats_t csm;
+        memset(&csm, 0, sizeof(csm));
+        uint32_t taken = 0, first = 0;
+        bool waiter = true;
+        dbreg_test_reg_waiter(1);                                                                   /* (0.7 attach-align: an attach waits for the lock: the first round lets it go between its slices of 64) */
         for (int round = 0; round < 400 && dbdir()->attach_count() > (size_t)NZ / 2; round++) {
-            taken += dbreg_cache_round();
+            const uint32_t got = dbreg_cache_round();
+            taken += got;
+            if (round == 0) {
+                first = got;
+                dbreg_test_reg_waiter(-1);
+                waiter = false;
+                dbreg_cache_stats(&csm);
+            }
             usleep(20000);
         }
+        if (waiter) dbreg_test_reg_waiter(-1);
         dbreg_cache_set_limit(0);
         dbreg_cache_test_pause(true);
         wait_retired();
@@ -5558,6 +5570,9 @@ static int run_s5(const char *mode) {
         CHECK(taken >= 100 && left <= (size_t)NZ * 6 / 10 && left >= 20);
         CHECK(resident_bytes() < res0);
         CHECK(cs1.evictions >= cs0.evictions + taken && cs1.sampled >= cs0.sampled + taken);         /* (every one of them was found by a sample) */
+        printf("  first round: %u zones taken out, %llu lock yields\n", first, (unsigned long long)(cs1.evict_yields - cs0.evict_yields));
+        CHECK(first > 64 && cs1.evict_yields >= cs0.evict_yields + 1);              /* (one yield after every slice of 64 samples that had more to take: the round of 2048 no longer holds the lock throughout) */
+        CHECK(cs1.evict_yields == csm.evict_yields);                                              /* (the later rounds: nobody waited, the lock was kept) */
         CHECK(in_memory(nm[100]));                                                                   /* (the hot zone: its priority is the highest of all) */
         CHECK(in_memory(nm[200]));                                                                   /* (the pinned zone) */
         CHECK(cs1.pinned_bytes > 0);                                                                 /* (counted when the zone was registered, not by a walk) */
