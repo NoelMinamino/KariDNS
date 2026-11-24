@@ -3325,11 +3325,33 @@ static void ck_precreate(store_t *s) {
  * A failed mmap(): on FreeBSD the replacement of a fixed mapping is one hold of the map lock, and the insert after the removal fails only by the swap accounting of vm.overcommit (strict, not the
  * default); if the range is gone it is mapped anonymous again and read back from the file, which holds its bytes, and no page is given back until the next start (rel_off, an ERROR). */
 #define ST_REL_STEP 1024u
+#if defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+#define ST_TSAN 1
+#endif
+#endif
+#if defined(__SANITIZE_THREAD__) && !defined(ST_TSAN)
+#define ST_TSAN 1
+#endif
+#ifdef ST_TSAN
+/* (TSan models an mmap() as a write of the whole range, which a lock-free reader's load of the same bytes "races" with; the kernel puts the same bytes there: the write is not one) */
+void AnnotateIgnoreWritesBegin(const char *file, int line);
+void AnnotateIgnoreWritesEnd(const char *file, int line);
+#define REL_IGNORE_BEGIN() AnnotateIgnoreWritesBegin(__FILE__, __LINE__)
+#define REL_IGNORE_END() AnnotateIgnoreWritesEnd(__FILE__, __LINE__)
+#else
+#define REL_IGNORE_BEGIN() ((void)0)
+#define REL_IGNORE_END() ((void)0)
+#endif
 static int rel_run(store_t *s, uint8_t *base, int fd, uint64_t off, uint64_t len) {
   uint8_t *const at = base + off;
   void *p;
   if (FAIL_REL()) { (void)munmap(at, (size_t)len); errno = ENOMEM; p = MAP_FAILED; }        /* (the test of the worst case: the run is gone) */
-  else p = mmap(at, (size_t)len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_FIXED | ST_NOCORE, fd, (off_t)(ST_HDR_PAGE + off));
+  else {
+    REL_IGNORE_BEGIN();
+    p = mmap(at, (size_t)len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_FIXED | ST_NOCORE, fd, (off_t)(ST_HDR_PAGE + off));
+    REL_IGNORE_END();
+  }
   if (p != MAP_FAILED) return 0;
   const int e = errno;
   char v[1];
