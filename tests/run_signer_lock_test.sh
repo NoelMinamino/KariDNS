@@ -32,13 +32,15 @@ pass() { echo "PASS: $*"; }
 
 # The program of one process: node lock.mjs FILE hold          -> "locked" and holds until killed, or "refused <message>" and exit 3
 #                                           FILE race T0 MS     -> waits for the time T0 (ms), tries; "won <pid> <t0> <t1>" after holding MS ms, or "lost <message>"
-# (copies of the two modules, which import only node: built-ins, so that the user nobody of L4 can read them whatever the modes of the tree)
-mkdir -p "$T/lib"
-cp signer/lib/db_sqlite.js node/lib/sqlite.js "$T/lib/"
-chmod 755 "$T/lib"; chmod 644 "$T/lib/"*.js
+# (copies of the modules lock.mjs needs, in the same signer/lib and node/lib layout so that their relative imports resolve; they import only node:
+# built-ins and each other, so that the user nobody of L4 can read them whatever the modes of the tree)
+mkdir -p "$T/signer/lib" "$T/node/lib"
+cp signer/lib/db_sqlite.js signer/lib/keys.js "$T/signer/lib/"
+cp node/lib/sqlite.js node/lib/names.js "$T/node/lib/"
+chmod 755 "$T/signer" "$T/signer/lib" "$T/node" "$T/node/lib"; chmod 644 "$T/signer/lib/"*.js "$T/node/lib/"*.js
 cat > "$T/lock.mjs" <<EOF
-import { acquireFileLock } from '$T/lib/db_sqlite.js';
-import { loadSqlite } from '$T/lib/sqlite.js';
+import { acquireFileLock } from '$T/signer/lib/db_sqlite.js';
+import { loadSqlite } from '$T/node/lib/sqlite.js';
 const sqlite = await loadSqlite();
 const [file, mode, t0, ms] = process.argv.slice(2);
 if (mode === 'race') { while (Date.now() < Number(t0)) { /* the same instant for all */ } }
