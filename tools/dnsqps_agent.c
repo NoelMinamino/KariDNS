@@ -2,8 +2,10 @@
  * Messages: a 4-byte big-endian length (1 .. DQ_MSG_MAX) and that many bytes of lines, "VERB\n" then "key=value\n".  Everything that arrives is untrusted:
  * the length, the number of lines, the characters of a key, every number (decimal digits, at most 2^58, so that the sums of 17 senders cannot overflow),
  * the histogram (bucket indexes in rising order), and the counts against each other (a result that does not add up is refused).
- * The agent authenticates the controller when it has a key (HMAC-SHA256 over its nonce, RFC 2104; OpenSSL, which dnsqps links already); nothing is
- * encrypted: the control port belongs on a private network.  An agent takes the same options as the command line, except those that start another
+ * With a key both sides authenticate every message after the HELLO, the RUN with its options and the RESULT included (HMAC-SHA256, RFC 2104, bound
+ * to the other side's fresh nonce, the direction and a sequence number: dq_conn_t in dnsqps.h; OpenSSL, which dnsqps links already).  Nothing is
+ * encrypted: the control port belongs on a private network.  The agent waits for several RUNs at once, each for 5 s at most, so a peer that says
+ * nothing cannot keep a controller out.  An agent takes the same options as the command line, except those that start another
  * listener, controller or help run; none of the options writes a file or runs a command. */
 #include "dnsqps.h"
 #include <errno.h>
@@ -152,8 +154,44 @@ void dq_conn_close(dq_conn_t *c) {
     c->buf = NULL;
 }
 
+void dq_conn_auth(dq_conn_t *c, const char *key, size_t klen, bool agent_side, const char *send_nonce, const char *recv_nonce) {
+    c->key = key;
+    c->klen = klen;
+    c->agent_side = agent_side;
+    c->sauth = klen && send_nonce;
+    c->rauth = klen && recv_nonce;
+    snprintf(c->snonce, sizeof c->snonce, "%s", send_nonce ? send_nonce : "");
+    snprintf(c->rnonce, sizeof c->rnonce, "%s", recv_nonce ? recv_nonce : "");
+    c->sseq = c->rseq = 0;
+}
+
+static void hex(const uint8_t *p, size_t n, char *out);
+
+/* the MAC of a message body (dnsqps.h, dq_conn_t); 0 = ok */
+static int conn_mac(const dq_conn_t *c, bool sending, const char *body, size_t blen, char out[65]) {
+    const char *dir = c->agent_side == sending ? "a2c" : "c2a";
+    char head[96];
+    int hl = snprintf(head, sizeof head, "dnsqps-agent-v2 %s %s %" PRIu64 "\n", dir, sending ? c->snonce : c->rnonce, sending ? c->sseq : c->rseq);
+    char *data = malloc((size_t)hl + blen);
+    if (!data) return -1;
+    memcpy(data, head, (size_t)hl);
+    memcpy(data + hl, body, blen);
+    unsigned char mac[EVP_MAX_MD_SIZE];
+    unsigned ml = 0;
+    unsigned char *r = HMAC(EVP_sha256(), c->key, (int)c->klen, (const unsigned char *)data, (size_t)hl + blen, mac, &ml);
+    free(data);
+    if (!r || ml < 32) return -1;
+    hex(mac, 32, out);
+    return 0;
+}
+
 int dq_conn_send(dq_conn_t *c, dq_msgb_t *b, unsigned timeout_ms) {
     if (b->ovf || b->len <= 4 || c->s == DQ_BADSOCK) return -1;
+    if (c->sauth) {
+        char mac[65];
+        if (conn_mac(c, true, b->p + 4, b->len - 4, mac) < 0 || !dq_msgb_kv(b, "mac", mac)) return -1;
+        c->sseq++;
+    }
     size_t pl = b->len - 4;
     b->p[0] = (char)(pl >> 24); b->p[1] = (char)(pl >> 16); b->p[2] = (char)(pl >> 8); b->p[3] = (char)pl;
     uint64_t end = dq_now_ns() + (uint64_t)timeout_ms * 1000000ull;
@@ -195,7 +233,21 @@ int dq_conn_recv(dq_conn_t *c, unsigned wait_ms, dq_msg_t *m, char *err, size_t 
                 c->pgot += (size_t)r;
                 if (c->pgot == c->plen) {
                     c->done = true;
-                    return dq_msg_parse(c->buf, c->plen, m, err, errlen) < 0 ? -1 : 1;
+                    if (!c->rauth) return dq_msg_parse(c->buf, c->plen, m, err, errlen) < 0 ? -1 : 1;
+                    /* the last line is mac=<64 hex>\n, over the lines before it (dq_conn_t) */
+                    const size_t tl = 4 + 64 + 1;
+                    char want[65];
+                    bool ok = c->plen > tl && c->buf[c->plen - tl - 1] == '\n' && memcmp(c->buf + c->plen - tl, "mac=", 4) == 0 &&
+                              c->buf[c->plen - 1] == '\n' && conn_mac(c, false, c->buf, c->plen - tl, want) == 0 &&
+                              CRYPTO_memcmp(c->buf + c->plen - tl + 4, want, 64) == 0;
+                    if (!ok) {   /* say what the peer said, if it is an ERR, but take nothing of it */
+                        const char *w = NULL;
+                        if (dq_msg_parse(c->buf, c->plen, m, NULL, 0) == 0 && !strcmp(m->verb, "ERR")) w = dq_msg_get(m, "msg");
+                        if (err && errlen) snprintf(err, errlen, "a message that is not authenticated%s%.120s", w ? ": ERR " : "", w ? w : "");
+                        return -1;
+                    }
+                    c->rseq++;
+                    return dq_msg_parse(c->buf, c->plen - tl, m, err, errlen) < 0 ? -1 : 1;
                 }
             }
             continue;
@@ -402,13 +454,19 @@ static int key_load(const char *path, char *key, size_t cap, size_t *klen, char 
     return 0;
 }
 
-static void mac_hex(const char *key, size_t klen, const char *nonce, char out[65]) {
-    char data[96];
-    int dl = snprintf(data, sizeof data, "dnsqps-agent-v1:%s", nonce);
-    unsigned char mac[EVP_MAX_MD_SIZE];
-    unsigned ml = 0;
-    HMAC(EVP_sha256(), key, (int)klen, (const unsigned char *)data, (size_t)dl, mac, &ml);
-    hex(mac, ml > 32 ? 32 : ml, out);
+/* a fresh nonce: 16 random octets as 32 hex digits; 0 = ok */
+static int new_nonce(char out[33]) {
+    uint8_t nb[16];
+    if (RAND_bytes(nb, sizeof nb) != 1) return -1;
+    hex(nb, sizeof nb, out);
+    return 0;
+}
+
+static bool is_nonce(const char *s) {
+    if (!s || strlen(s) != 32) return false;
+    for (; *s; s++)
+        if (!((*s >= '0' && *s <= '9') || (*s >= 'a' && *s <= 'f'))) return false;
+    return true;
 }
 
 /* ---------------------------------------------------------------- sockets */
@@ -519,60 +577,86 @@ static void send_err(dq_conn_t *c, const char *msg) {
     dq_msgb_free(&b);
 }
 
-static void agent_session(const dq_cfg_t *ac, dq_sock_t cs, dq_run_fn run, atomic_bool *stop) {
+/* A connection that has had its HELLO and waits for its RUN (T3-L2: several at once, each with a short deadline, so a peer that says nothing
+ * cannot keep the controller out) */
+#define PRE_MAX 8
+#define PRE_DEADLINE_NS 5000000000ull
+typedef struct {
+    bool used;
     dq_conn_t conn;
-    dq_conn_init(&conn, cs);
-    char err[300], key[256] = "";
-    size_t klen = 0;
-    if (ac->agent_key[0] && key_load(ac->agent_key, key, sizeof key, &klen, err, sizeof err) < 0) { send_err(&conn, err); dq_conn_close(&conn); return; }
-    uint8_t nb[16];
+    char key[256];
+    size_t klen;
     char nonce[33];
-    if (RAND_bytes(nb, sizeof nb) != 1) { dq_conn_close(&conn); return; }
-    hex(nb, sizeof nb, nonce);
+    uint64_t deadline;
+} pre_t;
+
+static void pre_close(pre_t *p) {
+    if (!p->used) return;
+    dq_conn_close(&p->conn);
+    OPENSSL_cleanse(p->key, sizeof p->key);
+    p->used = false;
+}
+
+/* a new connection: its key (read each time: a changed key file applies to the next controller), the HELLO with a fresh nonce; 0 = waiting for its RUN */
+static int pre_start(const dq_cfg_t *ac, pre_t *p, dq_sock_t cs) {
+    char err[300];
+    memset(p, 0, sizeof *p);
+    p->used = true;
+    dq_conn_init(&p->conn, cs);
+    if (ac->agent_key[0] && key_load(ac->agent_key, p->key, sizeof p->key, &p->klen, err, sizeof err) < 0) { send_err(&p->conn, err); pre_close(p); return -1; }
+    if (new_nonce(p->nonce) < 0) { pre_close(p); return -1; }
     dq_msgb_t b;
-    if (!dq_msgb_init(&b, "HELLO")) { dq_conn_close(&conn); return; }
-    dq_msgb_u64(&b, "v", 1);
-    dq_msgb_kv(&b, "nonce", nonce);
-    dq_msgb_kv(&b, "auth", klen ? "1" : "0");
-    int rc = dq_conn_send(&conn, &b, 5000);
+    if (!dq_msgb_init(&b, "HELLO")) { pre_close(p); return -1; }
+    dq_msgb_u64(&b, "v", 2);
+    dq_msgb_kv(&b, "nonce", p->nonce);
+    dq_msgb_kv(&b, "auth", p->klen ? "1" : "0");
+    int rc = dq_conn_send(&p->conn, &b, 2000);
     dq_msgb_free(&b);
+    if (rc < 0) { pre_close(p); return -1; }
+    /* the controller's messages are bound to this nonce; this side signs once the RUN gave the controller's */
+    dq_conn_auth(&p->conn, p->key, p->klen, true, NULL, p->nonce);
+    p->deadline = dq_now_ns() + PRE_DEADLINE_NS;
+    return 0;
+}
+
+/* the RUN of a waiting connection (m, verified when there is a key): checks it, runs the load, sends the result.  The connection is closed at the end */
+static void agent_run(const dq_cfg_t *ac, pre_t *p, dq_msg_t *m, dq_run_fn run, atomic_bool *stop) {
+    dq_conn_t *cn = &p->conn;
+    char err[300];
     agent_ctx_t ctx;
     memset(&ctx, 0, sizeof ctx);
-    ctx.conn = &conn;
+    ctx.conn = cn;
     ctx.stop = stop;
     ctx.wait_s = ac->agent_timeout;
-    int g = 0;
-    uint64_t end = dq_now_ns() + 10000000000ull;
-    while (rc == 0 && g == 0 && dq_now_ns() < end) g = dq_conn_recv(&conn, 200, &ctx.msg, err, sizeof err);
-    if (g != 1) { dq_conn_close(&conn); return; }
+    ctx.msg = *m;
     uint64_t ver = 0;
-    if (strcmp(ctx.msg.verb, "RUN") || !dq_msg_u64(&ctx.msg, "v", &ver) || ver != 1) { send_err(&conn, "expected RUN v=1"); dq_conn_close(&conn); return; }
-    if (klen) {
-        char want[65];
-        const char *mac = dq_msg_get(&ctx.msg, "mac");
-        mac_hex(key, klen, nonce, want);
-        if (!mac || strlen(mac) != 64 || CRYPTO_memcmp(mac, want, 64) != 0) { send_err(&conn, "authentication failed"); dq_conn_close(&conn); return; }
+    if (strcmp(ctx.msg.verb, "RUN") || !dq_msg_u64(&ctx.msg, "v", &ver) || ver != 2) { send_err(cn, "expected RUN v=2"); pre_close(p); return; }
+    if (p->klen) {
+        const char *cn_nonce = dq_msg_get(&ctx.msg, "cnonce");
+        if (!is_nonce(cn_nonce)) { send_err(cn, "expected a controller nonce"); pre_close(p); return; }
+        dq_conn_auth(cn, p->key, p->klen, true, cn_nonce, p->nonce);   /* from here on this side signs (a2c, the controller's nonce) */
+        cn->rseq = 1;                                                     /* (the RUN was message 0 of the controller) */
     }
     char *toks[DQ_MAXTOK];
     int nt = 0;
     for (unsigned i = 0; i < ctx.msg.n; i++)
         if (!strcmp(ctx.msg.k[i], "arg")) {
-            if (nt >= DQ_MAXTOK) { send_err(&conn, "too many options"); dq_conn_close(&conn); return; }
+            if (nt >= DQ_MAXTOK) { send_err(cn, "too many options"); pre_close(p); return; }
             toks[nt++] = ctx.msg.v[i];
         }
     dq_cfg_t cfg;
     dq_cfg_default(&cfg);
     if (dq_agent_check_tokens(toks, nt, err, sizeof err) < 0 || dq_parse_args(&cfg, nt, toks, err, sizeof err) < 0) {
-        send_err(&conn, err);
-        dq_conn_close(&conn);
+        send_err(cn, err);
+        pre_close(p);
         return;
     }
     dq_cfg_take_host(&cfg, ac);   /* this host's sending path, from the agent's own command line */
     int bad = dq_cfg_check(&cfg, err, sizeof err);
-    if (bad == 0 && dq_ctl_over_netmap(&cfg, cs)) { netmap_why(&cfg, err, sizeof err); bad = -1; }
+    if (bad == 0 && dq_ctl_over_netmap(&cfg, cn->s)) { netmap_why(&cfg, err, sizeof err); bad = -1; }
     if (bad < 0) {
-        send_err(&conn, err);
-        dq_conn_close(&conn);
+        send_err(cn, err);
+        pre_close(p);
         return;
     }
     cfg.json = false;
@@ -580,12 +664,30 @@ static void agent_session(const dq_cfg_t *ac, dq_sock_t cs, dq_run_fn run, atomi
     atomic_store(stop, false);
     dq_run_hooks_t hk = { agent_ready, agent_tick, &ctx };
     static dq_report_t rep;
-    if (run(&cfg, &hk, &rep, err, sizeof err) < 0) { send_err(&conn, err); dq_conn_close(&conn); return; }
-    if (atomic_load(stop)) { dq_conn_close(&conn); return; }   /* aborted: no result */
+    if (run(&cfg, &hk, &rep, err, sizeof err) < 0) { send_err(cn, err); pre_close(p); return; }
+    if (atomic_load(stop)) { pre_close(p); return; }   /* aborted: no result */
     dq_msgb_t rb;
-    if (dq_msgb_init(&rb, "RESULT") && dq_result_put(&rb, &rep) == 0) dq_conn_send(&conn, &rb, 5000);
+    if (dq_msgb_init(&rb, "RESULT") && dq_result_put(&rb, &rep) == 0) dq_conn_send(cn, &rb, 5000);
     dq_msgb_free(&rb);
-    dq_conn_close(&conn);
+    pre_close(p);
+}
+
+/* the listening socket and the connections waiting for their RUN: 1 = something to read (or a deadline to look at), 0 = nothing within ms */
+static int wait_pre(dq_sock_t ls, const pre_t *pre, int ms) {
+#ifdef _WIN32
+    WSAPOLLFD pf[PRE_MAX + 1];
+#else
+    struct pollfd pf[PRE_MAX + 1];
+#endif
+    unsigned n = 0;
+    pf[n].fd = ls; pf[n].events = POLLIN; pf[n].revents = 0; n++;
+    for (unsigned i = 0; i < PRE_MAX; i++)
+        if (pre[i].used) { pf[n].fd = pre[i].conn.s; pf[n].events = POLLIN; pf[n].revents = 0; n++; }
+#ifdef _WIN32
+    return WSAPoll(pf, n, ms) > 0;
+#else
+    return poll(pf, n, ms) > 0;
+#endif
 }
 
 int dq_agent_serve(const dq_cfg_t *c, dq_run_fn run, const atomic_bool *quit, atomic_bool *stop) {
@@ -596,15 +698,49 @@ int dq_agent_serve(const dq_cfg_t *c, dq_run_fn run, const atomic_bool *quit, at
     dq_sock_t ls = tcp_listen(c->agent, err, sizeof err);
     if (ls == DQ_BADSOCK) { fprintf(stderr, "dnsqps: %s\n", err); return 2; }
     fprintf(stderr, "dnsqps: agent listening on %s%s\n", c->agent, c->agent_key[0] ? " (key required)" : " (no key: keep this port on a private network)");
+    static pre_t pre[PRE_MAX];
     while (!atomic_load(quit)) {
-        if (!wait_sock(ls, false, 200)) continue;
+        wait_pre(ls, pre, 200);
+        /* T3-L2: a new connection gets its HELLO at once, beside the others that wait; when all places are taken the oldest gives way */
         dq_sock_t cs = accept(ls, NULL, NULL);
-        if (cs == DQ_BADSOCK) continue;
-        if (set_nonblock(cs) < 0) { dq_close(cs); continue; }
-        int one = 1;
-        setsockopt(cs, IPPROTO_TCP, TCP_NODELAY, (const char *)&one, sizeof one);
-        agent_session(c, cs, run, stop);
+        if (cs != DQ_BADSOCK) {
+            int one = 1;
+            if (set_nonblock(cs) < 0) {
+                dq_close(cs);
+            } else {
+                setsockopt(cs, IPPROTO_TCP, TCP_NODELAY, (const char *)&one, sizeof one);
+                unsigned slot = 0;
+                for (unsigned i = 0; i < PRE_MAX; i++) {
+                    if (!pre[i].used) { slot = i; break; }
+                    if (pre[i].deadline < pre[slot].deadline) slot = i;
+                }
+                pre_close(&pre[slot]);
+                pre_start(c, &pre[slot], cs);
+            }
+        }
+        uint64_t now = dq_now_ns();
+        for (unsigned i = 0; i < PRE_MAX; i++) {
+            pre_t *p = &pre[i];
+            if (!p->used) continue;
+            dq_msg_t m;
+            int g = dq_conn_recv(&p->conn, 0, &m, err, sizeof err);
+            if (g == 0) {
+                if (now >= p->deadline) pre_close(p);   /* no RUN in time: the place is free again */
+                continue;
+            }
+            if (g < 0) {
+                if (strncmp(err, "a message that is not authenticated", 35) == 0) send_err(&p->conn, "authentication failed");
+                pre_close(p);
+                continue;
+            }
+            /* a RUN (authenticated when there is a key): the others waiting are let go, this one runs */
+            for (unsigned j = 0; j < PRE_MAX; j++)
+                if (j != i) pre_close(&pre[j]);
+            agent_run(c, p, &m, run, stop);
+            break;
+        }
     }
+    for (unsigned i = 0; i < PRE_MAX; i++) pre_close(&pre[i]);
     dq_close(ls);
     return 0;
 }
@@ -754,17 +890,27 @@ int dq_controller(dq_cfg_t *c, int argc, char **argv, dq_run_fn run, atomic_bool
         while (g == 0 && dq_now_ns() < end) g = dq_conn_recv(&a->conn, 100, &m, err, sizeof err);
         uint64_t ver = 0;
         const char *nonce;
-        if (g != 1 || strcmp(m.verb, "HELLO") || !dq_msg_u64(&m, "v", &ver) || ver != 1 || !(nonce = dq_msg_get(&m, "nonce")) || strlen(nonce) != 32) {
+        if (g != 1 || strcmp(m.verb, "HELLO") || !dq_msg_u64(&m, "v", &ver) || ver != 2 || !is_nonce(nonce = dq_msg_get(&m, "nonce"))) {
             fprintf(stderr, "dnsqps: agent %s: no valid HELLO%s%s\n", a->name, g < 0 ? ": " : "", g < 0 ? err : "");
             goto done;
         }
         const char *auth = dq_msg_get(&m, "auth");
-        if (auth && auth[0] == '1' && !klen) { fprintf(stderr, "dnsqps: agent %s wants a key: give --agent-key FILE\n", a->name); goto done; }
+        bool agent_auth = auth && !strcmp(auth, "1");
+        if (agent_auth && !klen) { fprintf(stderr, "dnsqps: agent %s wants a key: give --agent-key FILE\n", a->name); goto done; }
+        /* T3-L1: with a key the agent must authenticate itself too, or anyone could stand in for it (and send a result) */
+        if (klen && !agent_auth) { fprintf(stderr, "dnsqps: agent %s has no key: start it with the same --agent-key FILE\n", a->name); goto done; }
+        char cnonce[33] = "";
+        if (klen) {
+            char anonce[33];
+            snprintf(anonce, sizeof anonce, "%s", nonce);
+            if (new_nonce(cnonce) < 0) { fprintf(stderr, "dnsqps: no random nonce\n"); goto done; }
+            dq_conn_auth(&a->conn, key, klen, false, anonce, cnonce);   /* sent: bound to the agent's nonce; received: to ours */
+        }
         dq_args_t args;
         if (dq_ctl_args(c, argc, argv, k, first + i, &args, err, sizeof err) < 0) { fprintf(stderr, "dnsqps: %s\n", err); goto done; }
         dq_msgb_t b;
-        bool ok = dq_msgb_init(&b, "RUN") && dq_msgb_u64(&b, "v", 1);
-        if (klen) { char mac[65]; mac_hex(key, klen, nonce, mac); ok = ok && dq_msgb_kv(&b, "mac", mac); }
+        bool ok = dq_msgb_init(&b, "RUN") && dq_msgb_u64(&b, "v", 2);
+        if (klen) ok = ok && dq_msgb_kv(&b, "cnonce", cnonce);
         for (int j = 0; ok && j < args.n; j++) ok = dq_msgb_kv(&b, "arg", args.t[j]);
         dq_args_free(&args);
         int srv = ok ? dq_conn_send(&a->conn, &b, 5000) : -1;

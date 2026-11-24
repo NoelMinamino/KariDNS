@@ -842,6 +842,8 @@ register_test "dag" "sh" "tests/run_dag_multi_server_timeout_test.sh" "dag multi
 register_test "dag" "sh" "tests/run_dag_multiline_ds_single_line_test.sh" "dag +multiline DS single-line formatting"
 register_test "dag" "sh" "tests/run_dag_replay_compare_recorded_test.sh" "dag replay --compare-recorded regression test"
 register_test "dag" "sh" "tests/run_dag_replay_diff_test.sh" "dag replay --diff and diff-file validation"
+register_test "dag" "sh" "tests/run_dag_review_test.sh" "dag (tools review 2026-11-23): +trace / +nssearch / +trace2 do not follow a response that fails TSIG verification, +trace NS addresses of the NS name only, --replay UDP answers by ID, no cut TCP comparison, bad text names skipped, pcapng refused, nanosecond pcap read, +tls-ca for tls/doh (openssl s_server; SKIP without)"
+register_test "core" "sh" "tests/run_karicheck_root_note_test.sh" "karicheck zone <domain> <file> as root: a note on a terminal (script(1)), none on a pipe (SKIP unless root)"
 register_test "dag" "sh" "tests/run_dag_rr_differential_test.sh" "dag RR wire differential test"
 register_test "dag" "sh" "tests/run_dag_sig0_update_test.sh" "dag RFC 3007 / RFC 2931 SIG(0) client-side transaction updates"
 register_test "dag" "sh" "tests/run_dag_tcp_connect_timeout_test.sh" "dag TCP/TLS connect timeout test (RFC 7858, RFC 8484)"

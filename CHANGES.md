@@ -73,6 +73,26 @@ What changes, what it breaks, and what to do. The step-by-step version is [docs/
 - **Database drivers read integers strictly** (#249, #250). An integer cell that is not exactly `-?digits` in range is
   an error that names the column (PostgreSQL), SQLite3 bind failures fail the statement, and `karicheck db` warns when an
   integer column of the PowerDNS tables is not int2/int4/int8.
+- **Tools: stricter checks from the tools review of 2026-11-23** (#257).
+  - `karictl` refuses a `karictl.conf` (or any file given with `-c`, `karidns.conf` included) that holds the `secret`
+    and that group or others can read or write: exit status 2 with the message `... holds the control secret and can
+    be read or written by group or others (mode 0644); ... chmod 600 <file>`. Fix: `chmod 600` the file (0400 works
+    too). A copy of `karictl.conf.sample` keeps the sample's mode 0644. It used to be a warning only.
+  - `dnsqps` agents and controllers speak protocol v2: with `--agent-key` every message after the HELLO is
+    authenticated in both directions (the RUN options and the agent's results included). A v1 agent and a v2
+    controller (or the reverse) do not work together (`no valid HELLO`): upgrade every agent and the controller
+    together. A controller with a key now refuses an agent without one.
+  - `dag +trace`, `+nssearch` and `+trace2` with `-y` / `-k` stop at a response that fails TSIG verification
+    (`;; TSIG verification failed, not following the referral; stopping trace.`; `+nssearch` exits 1). `dig` 9.20
+    prints the same verification error and follows the referral anyway: this is an intended difference
+    (docs/dag.md, TSIG).
+  - `karidns-tapstat` closes a sender that sends nothing for `-w` seconds after the handshake (new option, default
+    600); `karidns` reconnects with its next message and about a second of messages is counted as lost
+    (`karictl status`, "dnstap dropped (not connected)"). A sender whose credentials the socket mode does not allow
+    is refused, and `-m` with o+w is warned about.
+  - `dag --replay` refuses a pcapng file before anything is sent (it was read as a text query list); convert it with
+    `editcap -F pcap`. Nanosecond pcap files are read. Text lines with a bad name are skipped with a warning, tls/doh
+    servers are verified with `+tls-ca[=file]` (a warning without it), and UDP answers must carry the query's ID.
 - **`karictl` and `karidns` must be the same version** (#179, #180): `karidns_status_t` grew. `karictl ipcstats` is a
   separate text command so that an older server only shows nothing (#224).
 - **Database schema**: the schema version stays 3, but the SQL files changed. Re-apply them, as the owner of the

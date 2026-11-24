@@ -163,9 +163,9 @@ static size_t b64_decode_clean(const char *in, uint8_t *out, size_t max_out) {
         bits += 6;
         if (bits >= 8) {
             bits -= 8;
-            if (out_len < max_out) {
-                out[out_len++] = (uint8_t)((buf >> bits) & 0xFF);
-            }
+            /* T1-L5: a value longer than the buffer is refused (0), not cut: a cut RSA modulus or exponent is another key */
+            if (out_len >= max_out) return 0;
+            out[out_len++] = (uint8_t)((buf >> bits) & 0xFF);
         }
     }
     return out_len;
@@ -333,6 +333,10 @@ static EVP_PKEY *rsa_key_from_bind_fields(const char *file_buf) {
 
     if (!extract_bind_field(file_buf, "Modulus", b64, sizeof(b64))) return NULL;
     size_t n_len = b64_decode_clean(b64, n_buf, sizeof(n_buf));
+    if (n_len == 0 && b64[0] != '\0') {
+        fprintf(stderr, "error: the RSA modulus is longer than %zu bits (dag reads RSA keys of up to 4096 bits)\n", sizeof(n_buf) * 8);
+        return NULL;
+    }
 
     if (!extract_bind_field(file_buf, "PublicExponent", b64, sizeof(b64))) return NULL;
     size_t e_len = b64_decode_clean(b64, e_buf, sizeof(e_buf));

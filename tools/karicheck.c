@@ -2231,6 +2231,13 @@ KARIDNS_TOOL_FN int kc_run(int argc, char **argv) {
         const char *domain = argv[2];
         if (argc >= 4 && strstr(argv[3], ".conf") == NULL) {
             // Standalone mode: karicheck zone <domain> <zone_file_path>
+            /* T4-L4: a zone file that is not one of the server's (often one received from elsewhere) is parsed with the rights of whoever runs
+             * karicheck.  The parsers do not drop privileges themselves (the configuration and the zones it names are the server's own files,
+             * which the server reads as root at start-up too, and a lower user could not read the ones only root may): so say it, once, on
+             * stderr when that is a terminal: to the person who typed it, not to a program that runs karicheck and reads what it says. */
+            if (geteuid() == 0 && isatty(STDERR_FILENO))
+                fprintf(stderr, "karicheck: note: checking %s as root; a zone file from elsewhere is better checked as an unprivileged user\n",
+                        strcmp(argv[3], "-") == 0 ? "standard input" : argv[3]);
             dns_diag_counts(1, 0);
             return check_zone(domain, argv[3], true, false, NULL, NULL, NULL, NULL);
         } else {

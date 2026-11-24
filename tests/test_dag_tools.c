@@ -10,6 +10,8 @@
 #include <fcntl.h>
 #include <ctype.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
+#include <signal.h>
 #include <openssl/evp.h>
 
 #include "tools/dag_internal.h"
@@ -234,6 +236,24 @@ static void test_dag_sig0_client_keys(void) {
     if (key_rsa.pkey) EVP_PKEY_free(key_rsa.pkey);
     if (key_rsa.signer_name) free((void *)key_rsa.signer_name);
     unlink(tmp_rsa);
+
+    // 3b. T1-L5: an RSA modulus over 4096 bits (640 octets) is refused; before, the first 512 octets were taken (another key)
+    {
+        uint8_t big_n[640];
+        for (size_t i = 0; i < sizeof(big_n); i++) big_n[i] = (uint8_t)(0x80 | (i * 37));
+        char b64n[1024];
+        int bn = EVP_EncodeBlock((unsigned char *)b64n, big_n, (int)sizeof(big_n));
+        assert(bn > 0);
+        char big_path[] = "/tmp/Kbig.example.test.+008+23456.private";
+        FILE *bf = fopen(big_path, "w");
+        assert(bf);
+        fprintf(bf, "Private-key-format: v1.3\nAlgorithm: 8 (RSASHA256)\nModulus: %s\nPublicExponent: AQAB\nPrivateExponent: %s\n", b64n, b64n);
+        fclose(bf);
+        sig0_key_t key_big;
+        memset(&key_big, 0, sizeof(key_big));
+        assert(load_bind_sig0_private_key(big_path, &key_big) == false && key_big.pkey == NULL);
+        unlink(big_path);
+    }
 
     // 4. Invalid file paths
     sig0_key_t key_bad;
@@ -505,6 +525,37 @@ static void test_dag_internal_helpers(void) {
 
 static void test_dag_transport_helpers(void) {
     printf("[TEST] DAG Tools: proxyv2 & transport address resolution...\n");
+
+    // 0. T1-L1: tcp_send_all() sends every byte (more than one socket buffer, read on the other side as it goes), or fails
+    {
+        int sp[2];
+        assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sp) == 0);
+        static uint8_t big[1 << 20], back[1 << 20];
+        for (size_t i = 0; i < sizeof(big); i++) big[i] = (uint8_t)(i * 31);
+        pid_t pid = fork();
+        assert(pid >= 0);
+        if (pid == 0) {
+            close(sp[0]);
+            _exit(tcp_send_all(sp[1], big, sizeof(big)) ? 0 : 1);
+        }
+        close(sp[1]);
+        size_t got = 0;
+        while (got < sizeof(back)) {
+            ssize_t n = read(sp[0], back + got, sizeof(back) - got);
+            if (n <= 0) break;
+            got += (size_t)n;
+        }
+        int st = 0;
+        waitpid(pid, &st, 0);
+        assert(got == sizeof(big) && memcmp(big, back, sizeof(big)) == 0 && WIFEXITED(st) && WEXITSTATUS(st) == 0);
+        close(sp[0]);
+        assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sp) == 0);
+        close(sp[1]);
+        signal(SIGPIPE, SIG_IGN);
+        assert(!tcp_send_all(sp[0], big, 16));   /* the peer is gone */
+        close(sp[0]);
+        assert(tcp_send_all(-1, big, 0));        /* nothing to send */
+    }
 
     // 1. parse_proxy_arg
     query_opts_t qo;

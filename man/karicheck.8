@@ -1,4 +1,4 @@
-.TH KARICHECK 8 "2026-11-22" "KariDNS" "KariDNS Manual"
+.TH KARICHECK 8 "2026-11-24" "KariDNS" "KariDNS Manual"
 .\" Generated from docs/karicheck.md by man/md2man.pl (make man): edit the Markdown manual, not this page.
 .SH NAME
 karicheck \- Configuration and Zone File Validation Utility for KariDNS
@@ -61,7 +61,12 @@ for \fB<domain>\fR without a configuration file. The third argument is treated
 as a configuration file if it contains \fB.conf\fR, and as a zone file
 otherwise. A relative path is resolved against the current directory; the server
 resolves relative zone paths (also with \fB../\fR) against the directory it was
-started from.
+started from. Run as root with standard error on a terminal, \fBkaricheck\fR
+prints a note there that it parses the file with root's rights: a zone file from
+elsewhere is better checked as an unprivileged user. (\fBkaricheck\fR does not
+drop privileges itself: \fBconf\fR, \fBzones\fR and \fBzone <domain> [config]\fR
+read the server's own files, which the server also reads as root when it starts,
+and a lower user could not read the ones only root may.)
 .TP 8
 \fBzone <domain> \-\fR
 The zone text is read from standard input (BIND format, at most 64 MiB; a bigger

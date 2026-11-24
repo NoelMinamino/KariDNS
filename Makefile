@@ -54,7 +54,7 @@ SRCS = dns_server_core.c dns_log.c dns_log_state.c dns_db_stream.c dns_db_ingest
 OBJS = $(SRCS:.c=.o)
 
 # dag を構成するモジュール (dag.c 以外)。fuzz / unit test / asan ビルドでも共有する
-DAG_MOD_SRCS = tools/dag_output_yaml.c tools/dag_batch.c tools/dag_axfr_client.c tools/dag_trace.c tools/dag_trace_common.c tools/dag_iter.c tools/dag_roothints.c tools/dag_idn.c tools/dag_tsig_client.c tools/dag_edns_client.c tools/dag_transport.c tools/dag_http.c tools/dag_replay.c tools/dnstap_decode.c tools/dag_pcap_l4.c tools/dag_tcp_reassembly.c
+DAG_MOD_SRCS = tools/dag_output_yaml.c tools/dag_batch.c tools/dag_axfr_client.c tools/dag_trace.c tools/dag_trace_common.c tools/dag_iter.c tools/dag_roothints.c tools/dag_idn.c tools/dag_tsig_client.c tools/dag_edns_client.c tools/dag_transport.c tools/dag_http.c tools/dag_tls.c tools/dag_replay.c tools/dnstap_decode.c tools/dag_pcap_l4.c tools/dag_tcp_reassembly.c
 DAG_TARGET = dag
 DAG_SRCS = tools/dag.c $(DAG_MOD_SRCS) dns_wire.c dns_utils.c dns_zone_parser.c dns_cidr.c
 
@@ -189,16 +189,16 @@ FUZZ_DAG_BATCH_FILE_TARGET = tests/fuzz/fuzz_dag_batch_file
 FUZZ_DAG_BATCH_FILE_SRCS = tests/fuzz/fuzz_dag_batch_file.c $(DAG_MOD_SRCS) dns_wire.c dns_utils.c dns_zone_parser.c dns_cidr.c
 
 FUZZ_DAG_REPLAY_PCAP_READER_TARGET = tests/fuzz/fuzz_dag_replay_pcap_reader
-FUZZ_DAG_REPLAY_PCAP_READER_SRCS = tests/fuzz/fuzz_dag_replay_pcap_reader.c tools/dag_replay.c tools/dnstap_decode.c tools/dag_http.c tools/dag_pcap_l4.c tools/dag_tcp_reassembly.c dns_wire.c dns_utils.c dns_zone_parser.c dns_cidr.c
+FUZZ_DAG_REPLAY_PCAP_READER_SRCS = tests/fuzz/fuzz_dag_replay_pcap_reader.c tools/dag_replay.c tools/dnstap_decode.c tools/dag_http.c tools/dag_tls.c tools/dag_pcap_l4.c tools/dag_tcp_reassembly.c dns_wire.c dns_utils.c dns_zone_parser.c dns_cidr.c
 
 FUZZ_DAG_REPLAY_DIFF_TARGET = tests/fuzz/fuzz_dag_replay_diff
-FUZZ_DAG_REPLAY_DIFF_SRCS = tests/fuzz/fuzz_dag_replay_diff.c tools/dag_replay.c tools/dnstap_decode.c tools/dag_http.c tools/dag_pcap_l4.c tools/dag_tcp_reassembly.c dns_wire.c dns_utils.c dns_zone_parser.c dns_cidr.c
+FUZZ_DAG_REPLAY_DIFF_SRCS = tests/fuzz/fuzz_dag_replay_diff.c tools/dag_replay.c tools/dnstap_decode.c tools/dag_http.c tools/dag_tls.c tools/dag_pcap_l4.c tools/dag_tcp_reassembly.c dns_wire.c dns_utils.c dns_zone_parser.c dns_cidr.c
 
 FUZZ_TAPSTAT_TARGET = tests/fuzz/fuzz_tapstat
 FUZZ_TAPSTAT_SRCS = tests/fuzz/fuzz_tapstat.c tools/tapstat_core.c tools/dnstap_decode.c
 
 FUZZ_DAG_TCP_REASSEMBLY_TARGET = tests/fuzz/fuzz_dag_tcp_reassembly
-FUZZ_DAG_TCP_REASSEMBLY_SRCS = tests/fuzz/fuzz_dag_tcp_reassembly.c tools/dag_tcp_reassembly.c tools/dag_pcap_l4.c tools/dag_replay.c tools/dnstap_decode.c tools/dag_http.c dns_wire.c dns_utils.c dns_zone_parser.c dns_cidr.c
+FUZZ_DAG_TCP_REASSEMBLY_SRCS = tests/fuzz/fuzz_dag_tcp_reassembly.c tools/dag_tcp_reassembly.c tools/dag_pcap_l4.c tools/dag_replay.c tools/dnstap_decode.c tools/dag_http.c tools/dag_tls.c dns_wire.c dns_utils.c dns_zone_parser.c dns_cidr.c
 
 .PHONY: distclean
 .PHONY: dnsqps dnsqps-asan dnsqps-tsan dnsqps_test fuzz_dnsqps_resp fuzz_dnsqps_args fuzz_dnsqps_msg
@@ -354,7 +354,7 @@ tools/dag_tsig_client.o: tools/dag_tsig_client.c tools/dag_tsig_client.h tools/d
 tools/dag_edns_client.o: tools/dag_edns_client.c tools/dag_edns_client.h tools/dag_internal.h
 	$(CC) $(CFLAGS) -c tools/dag_edns_client.c -o tools/dag_edns_client.o
 
-tools/dag_transport.o: tools/dag_transport.c tools/dag_transport.h tools/dag_internal.h tools/dag_http.h
+tools/dag_transport.o: tools/dag_transport.c tools/dag_transport.h tools/dag_internal.h tools/dag_http.h tools/dag_tls.h
 	$(CC) $(CFLAGS) -c tools/dag_transport.c -o tools/dag_transport.o
 
 tools/dag_pcap_l4.o: tools/dag_pcap_l4.c tools/dag_pcap_l4.h
@@ -363,10 +363,13 @@ tools/dag_pcap_l4.o: tools/dag_pcap_l4.c tools/dag_pcap_l4.h
 tools/dag_tcp_reassembly.o: tools/dag_tcp_reassembly.c tools/dag_tcp_reassembly.h tools/dag_pcap_l4.h
 	$(CC) $(CFLAGS) -c tools/dag_tcp_reassembly.c -o tools/dag_tcp_reassembly.o
 
+tools/dag_tls.o: tools/dag_tls.c tools/dag_tls.h tools/dag_internal.h
+	$(CC) $(CFLAGS) -c tools/dag_tls.c -o tools/dag_tls.o
+
 tools/dag_http.o: tools/dag_http.c tools/dag_http.h tools/dag_internal.h
 	$(CC) $(CFLAGS) -c tools/dag_http.c -o tools/dag_http.o
 
-tools/dag_replay.o: tools/dag_replay.c tools/dag_replay.h tools/dag_pcap_l4.h tools/dag_tcp_reassembly.h tools/dag_http.h
+tools/dag_replay.o: tools/dag_replay.c tools/dag_replay.h tools/dag_pcap_l4.h tools/dag_tcp_reassembly.h tools/dag_http.h tools/dag_tls.h
 	$(CC) $(CFLAGS) -c tools/dag_replay.c -o tools/dag_replay.o
 
 tools/karictl.o: tools/karictl.c
@@ -421,7 +424,7 @@ TEST_COV_SWEEP_NET_SRCS = tests/test_coverage_sweep_net.c $(DAG_MOD_SRCS) dns_wi
 TEST_COV_SWEEP_TOOLS_SRCS = tests/test_coverage_sweep_tools.c tests/test_coverage_sweep_karictl_main.c dns_config_parser.c dns_diag.c dns_zone_parser.c dns_tinydns_parser.c dns_wire.c dns_utils.c dns_cidr.c dns_tsig_acl.c dns_zone_lint.c dns_db_checkproto.c dns_mem_advice.c $(TEST_SYSLOG_QUIET)
 TEST_COV_SWEEP_DAG_SRCS = tests/test_coverage_sweep_dag.c $(DAG_MOD_SRCS) dns_wire.c dns_utils.c dns_zone_parser.c dns_cidr.c dns_config_parser.c dns_diag.c dns_tinydns_parser.c dns_tsig_acl.c $(TEST_SYSLOG_QUIET)
 TEST_DAGREASM_SRCS = tests/test_dag_reassembly.c tools/dag_pcap_l4.c tools/dag_tcp_reassembly.c $(TEST_SYSLOG_QUIET)
-TEST_DAG_TOOLS_SRCS = tests/test_dag_tools.c tools/dag_tcp_reassembly.c tools/dag_pcap_l4.c tools/dag_tsig_client.c tools/dag_replay.c tools/dnstap_decode.c tools/dag_transport.c tools/dag_http.c dns_zone_parser.c dns_config_parser.c dns_diag.c dns_tinydns_parser.c dns_cidr.c dns_tsig_acl.c dns_wire.c dns_utils.c $(TEST_SYSLOG_QUIET)
+TEST_DAG_TOOLS_SRCS = tests/test_dag_tools.c tools/dag_tcp_reassembly.c tools/dag_pcap_l4.c tools/dag_tsig_client.c tools/dag_replay.c tools/dnstap_decode.c tools/dag_transport.c tools/dag_http.c tools/dag_tls.c dns_zone_parser.c dns_config_parser.c dns_diag.c dns_tinydns_parser.c dns_cidr.c dns_tsig_acl.c dns_wire.c dns_utils.c $(TEST_SYSLOG_QUIET)
 TEST_SERVER_CORE_SRCS = tests/test_server_core.c dns_server_core.c dns_log.c dns_log_state.c dns_db_stream.c dns_db_ingest.c dns_db_recon.c dns_db_store.c dns_xfr_store.c dns_xfr_state.c dns_park.c dns_mem_advice.c dns_store_status.c dns_store.c dns_db_install.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_wire.c dns_utils.c dns_config_parser.c dns_diag.c dns_zone_parser.c dns_tinydns_parser.c dns_cidr.c dns_tsig_acl.c dns_query_engine.c dns_plugin_sup.c dns_plugin_msg.c dns_alias.c dns_cookie_client.c dns_rrl.c dns_priv_sandbox.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_dynamic_update.c dns_axfr_ixfr.c dns_zone_image.c $(TEST_SYSLOG_QUIET)
 
 FI_WRAP_LDFLAGS  = -Wl,--wrap=malloc -Wl,--wrap=calloc -Wl,--wrap=realloc -Wl,--wrap=strdup -Wl,--wrap=strndup -Wl,--wrap=posix_memalign
@@ -2053,7 +2056,7 @@ $(EVICT_TARGET): $(EVICT_OBJS)
 # X-34: the suffix rules for the sanitizer, unit-test and fuzz objects (.asan.o, .tsan.o, .uta.o, .utn.o, .fz.o)
 # have no header dependencies, so a header change relinked stale objects. Each of these objects depends on every
 # project header: coarse (a header change rebuilds them all) but the same with BSD make and GNU make.
-PROJECT_HDRS = dns_alias.h dns_axfr_ixfr.h dns_db_driver.h dns_db_ingest.h dns_db_recon.h dns_db_store.h dns_park.h dns_mem_advice.h dns_db_install.h dns_db_stream.h dns_pdns_reader.h dns_presigned.h dns_zone_rows.h dns_zone_text.h dns_zone_changes.h dns_zone_render.h dns_zone_import.h dns_zone_export.h dns_zone_msg.h tests/db/zone2sql.h tests/db/zrows_feed.h tests/db/xfr_mocks.h tests/db/pdns_roundtrip.h tests/db/pdns_confcheck.h dns_catalog_zone.h dns_cidr.h dns_config_parser.h dns_dnstap.h dns_dynamic_update.h dns_edns_ecs.h dns_epoch_rcu.h dns_priv_sandbox.h dns_query_engine.h dns_rrl.h dns_server_internal.h dns_siphash.h dns_snapshot_rcu.h dns_tsig_acl.h dns_utils.h dns_wire.h dns_zone_parser.h dns_zone_lint.h dns_db_checkproto.h dns_diag.h dns_diag_codes.h tests/fi/kari_fi.h tests/sweep_watchdog.h tools/dag_axfr_client.h tools/dag_batch.h tools/dag_edns_client.h tools/dag_http.h tools/dag_internal.h tools/dag_iter.h tools/dag_output_yaml.h tools/dag_pcap_l4.h tools/dag_replay.h tools/dag_roothints.h tools/dag_tcp_reassembly.h tools/dag_trace.h tools/dag_trace_common.h tools/dag_transport.h tools/dag_tsig_client.h tools/dnstap_decode.h tools/tapstat_core.h tools/karidns_tool_linkage.h  dns_zone_image.h
+PROJECT_HDRS = dns_alias.h dns_axfr_ixfr.h dns_db_driver.h dns_db_ingest.h dns_db_recon.h dns_db_store.h dns_park.h dns_mem_advice.h dns_db_install.h dns_db_stream.h dns_pdns_reader.h dns_presigned.h dns_zone_rows.h dns_zone_text.h dns_zone_changes.h dns_zone_render.h dns_zone_import.h dns_zone_export.h dns_zone_msg.h tests/db/zone2sql.h tests/db/zrows_feed.h tests/db/xfr_mocks.h tests/db/pdns_roundtrip.h tests/db/pdns_confcheck.h dns_catalog_zone.h dns_cidr.h dns_config_parser.h dns_dnstap.h dns_dynamic_update.h dns_edns_ecs.h dns_epoch_rcu.h dns_priv_sandbox.h dns_query_engine.h dns_rrl.h dns_server_internal.h dns_siphash.h dns_snapshot_rcu.h dns_tsig_acl.h dns_utils.h dns_wire.h dns_zone_parser.h dns_zone_lint.h dns_db_checkproto.h dns_diag.h dns_diag_codes.h tests/fi/kari_fi.h tests/sweep_watchdog.h tools/dag_axfr_client.h tools/dag_batch.h tools/dag_edns_client.h tools/dag_http.h tools/dag_internal.h tools/dag_iter.h tools/dag_output_yaml.h tools/dag_pcap_l4.h tools/dag_replay.h tools/dag_roothints.h tools/dag_tcp_reassembly.h tools/dag_tls.h tools/dag_trace.h tools/dag_trace_common.h tools/dag_transport.h tools/dag_tsig_client.h tools/dnstap_decode.h tools/tapstat_core.h tools/karidns_tool_linkage.h  dns_zone_image.h
 $(ASAN_OBJS) $(TSAN_OBJS) $(EVICT_OBJS): $(PROJECT_HDRS)
 $(TEST_TAPSTAT_SRCS:.c=.uta.o) $(TEST_ASAN_SRCS:.c=.utn.o) $(TEST_DNSDIAG_SRCS:.c=.utn.o) $(TEST_AXFR_IXFR_SRCS:.c=.uta.o) $(TEST_CATALOG_SRCS:.c=.uta.o) $(TEST_CIDR_SRCS:.c=.uta.o) $(TEST_CONFDIR_SRCS:.c=.utn.o) $(TEST_CONF_SRCS:.c=.utn.o) $(TEST_COV_SWEEP_DAG_SRCS:.c=.uta.o) $(TEST_COV_SWEEP_NET_SRCS:.c=.uta.o) $(TEST_COV_SWEEP_SRCS:.c=.uta.o) $(TEST_COV_SWEEP_TOOLS_SRCS:.c=.uta.o) $(TEST_DAGFORMAT_SRCS:.c=.uta.o) $(TEST_DAGREASM_SRCS:.c=.utn.o) $(TEST_DAG_ITER_SRCS:.c=.uta.o) $(TEST_DAG_TOOLS_SRCS:.c=.uta.o) $(TEST_DNSSECPROOFS_SRCS:.c=.uta.o) $(TEST_DNSTAP_SRCS:.c=.uta.o) $(TEST_DYN_UPDATE_SRCS:.c=.uta.o) $(TEST_EDNS_ECS_SRCS:.c=.uta.o) $(TEST_EPOCH_RCU_SRCS:.c=.uta.o) $(TEST_HASH_SRCS:.c=.uta.o) $(TEST_QEPROTO_SRCS:.c=.uta.o) $(TEST_QUERY_EXP_SRCS:.c=.uta.o) $(TEST_RFC_VECTORS_SRCS:.c=.uta.o) $(TEST_RRL_SRCS:.c=.uta.o) $(TEST_SANDBOX_SRCS:.c=.uta.o) $(TEST_SERVER_CORE_SRCS:.c=.uta.o) $(TEST_SIG0_SRCS:.c=.utn.o) $(TEST_SNAPREBUILD_SRCS:.c=.uta.o) $(TEST_TINYDNS_SRCS:.c=.utn.o) $(TEST_TINYPATHS_SRCS:.c=.utn.o) $(TEST_WIREHELP_SRCS:.c=.utn.o) $(TEST_ZONEIMAGE_SRCS:.c=.utn.o) $(TEST_ZONEPATHS_SRCS:.c=.utn.o) $(TEST_DBSTREAM_SRCS:.c=.uta.o) : $(PROJECT_HDRS)
 $(FUZZ_TAPSTAT_SRCS:.c=.fz.o) $(FUZZ_CONF_SRCS:.c=.fz.o) $(FUZZ_JSON_ESCAPE_SRCS:.c=.fz.o) $(FUZZ_ZONE_TEXT_SRCS:.c=.fz.o) $(FUZZ_ZONE_CHANGES_SRCS:.c=.fz.o) $(FUZZ_CORE_SRCS:.c=.fz.o) $(FUZZ_DAG_AXFR_STREAM_SRCS:.c=.fz.o) $(FUZZ_DAG_BATCH_FILE_SRCS:.c=.fz.o) $(FUZZ_DAG_CHUNKED_HTTP_SRCS:.c=.fz.o) $(FUZZ_DAG_CLI_ARGS_SRCS:.c=.fz.o) $(FUZZ_DAG_HASH_SRCS:.c=.fz.o) $(FUZZ_DAG_ITER_SRCS:.c=.fz.o) $(FUZZ_DAG_RDATA_YAML_SRCS:.c=.fz.o) $(FUZZ_DAG_REPLAY_DIFF_SRCS:.c=.fz.o) $(FUZZ_DAG_REPLAY_PCAP_READER_SRCS:.c=.fz.o) $(FUZZ_DAG_SRCS:.c=.fz.o) $(FUZZ_DAG_TCP_REASSEMBLY_SRCS:.c=.fz.o) $(FUZZ_DYNAMIC_UPDATE_SRCS:.c=.fz.o) $(FUZZ_QUERY_ENGINE_SRCS:.c=.fz.o) $(FUZZ_SRCS:.c=.fz.o) $(FUZZ_TSIG_SRCS:.c=.fz.o) $(FUZZ_TSIG_VERIFY_SRCS:.c=.fz.o) $(FUZZ_XFR_PACKET_SRCS:.c=.fz.o) $(FUZZ_ZONE_SRCS:.c=.fz.o) $(FUZZ_ZONE_IMAGE_SRCS:.c=.fz.o) $(FUZZ_ZONE_IMAGE_VALIDATE_SRCS:.c=.fz.o) $(FUZZ_DB_STREAM_SRCS:.c=.fz.o) $(FUZZ_XFR_STATE_SRCS:.c=.fz.o) $(FUZZ_IPC_FRAME_SRCS:.c=.fz.o) $(FUZZ_DB_CHECKLINE_SRCS:.c=.fz.o) : $(PROJECT_HDRS)

@@ -90,6 +90,7 @@ key "karictl" {
     secret "dGVzdC1vbmx5LWR1bW15LWtleS1kby1ub3QtdXNl";
 };
 EOF
+chmod 600 "$CTL_CONF"   # karictl refuses a karictl.conf with the secret that others can read
 
 # Start UDP Listener on 10054 using Perl to capture sender IP and packet details
 rm -f "$OUT_NOTIFY"

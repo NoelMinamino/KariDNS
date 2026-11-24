@@ -68,7 +68,23 @@ is the order of work. The manuals have the detail: [karidns(8)](karidns.md), [ka
      store (the default directory);
    - `sslmode` `allow` / `prefer` in a PostgreSQL `conninfo` to a host that is not local is refused by the WebAdmin and
      the signer (node-pg would send plain text): use `require` or better (`disable` stays a warning).
+   - every `karictl.conf` that holds a `secret` must be private to its owner (#257): `karictl` refuses one that group
+     or others can read or write (exit status 2, the message names the file and the fix). Check them before the
+     upgrade, including the ones of the signer and the WebAdmin (`karictl-config`) and any `karidns.conf` you pass
+     with `-c`:
+
+     ```sh
+     ls -l /usr/local/etc/karidns/karictl.conf     # must be -rw------- (0600) or -r-------- (0400)
+     chmod 600 /usr/local/etc/karidns/karictl.conf
+     ```
 6. **`karictl` and `karidns` of one release.** The status structure grew (#179, #180); install both together.
+   - **`dnsqps` agents and their controller of one release** (#257): the agent protocol is v2 and does not talk to
+     v1 (`no valid HELLO`). Upgrade every `dnsqps --agent` host and the controller together.
+   - Scripts that run `dag +trace`, `+nssearch` or `+trace2` with a TSIG key: a response that fails verification now
+     ends the trace (`+nssearch` exits 1) instead of being followed as `dig` does (#257, docs/dag.md).
+   - `dag --replay` refuses pcapng files (exit status 1): convert them first (`editcap -F pcap in.pcapng out.pcap`).
+   - `karidns-tapstat` closes a sender that is silent for `-w` seconds (default 600) after the handshake; with a
+     quiet server raise `-w` above its quietest stretch (each close costs about a second of dnstap messages).
 7. **Plan the disk**: with a database or secondary zones the store is on by default (section 3). About 1.2-1.6 KB of
    disk per small database zone (#185), and free space for the first fill and the cleaner.
 8. Read "CHANGES.md / Upgrade notes" once for the items that are specific to your setup (DNS Cookies, `signer-wait`).

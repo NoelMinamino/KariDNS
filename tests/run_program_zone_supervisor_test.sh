@@ -127,6 +127,7 @@ key "karictl" {
     secret "$SECRET";
 };
 EOF
+chmod 600 "$TMP_DIR/karictl.conf"   # karictl refuses a karictl.conf with the secret that others can read
 
 base_zones() {
     zone rl.example. 192.0.2.10 "program-reload-line yes;"

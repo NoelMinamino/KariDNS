@@ -30,4 +30,11 @@ int trace_collect_glue(const uint8_t *pkt, size_t pkt_len, size_t *roff, int arc
  * name は @server に指定した文字列か NS 名 (末尾のドットは表示しない)。 */
 void trace_print_received(ssize_t n, const char *addr, int port, const char *name, int ms);
 
+/* T1-M1: the TSIG of a response (RFC 8945 §5.3.2: the client verifies every signed reply).  Without a key true; with one, the
+ * result of tsig_verify_packet(), and with report the line dig prints (";; Couldn't verify signature: ...").  A trace shows a
+ * response that fails, as dig does, but never takes the NS, glue or addresses of it for the next step: what such a response
+ * says is only the claim of whoever could send it (dig 9.20 +trace -y follows it anyway: an intended difference, docs/dag.md). */
+bool trace_tsig_verified(bool want_tsig, tsig_key_t *key, const uint8_t *resp, size_t n,
+                         const uint8_t *req_mac, size_t req_mac_len, bool report);
+
 #endif /* DAG_TRACE_COMMON_H */

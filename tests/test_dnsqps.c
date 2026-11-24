@@ -1037,6 +1037,97 @@ static void test_agent_msgs(void) {
     dq_conn_close(&rx);
     close(sv[1]);
     dq_msgb_free(&b);
+    /* T3-L1: authenticated messages both ways; a changed line, a reflected message, a replayed one, a wrong key and an unsigned ERR fail */
+    {
+        static const char key[] = "a-shared-secret-of-some-length", key2[] = "another-secret-of-some-length!";
+        static const char na[] = "00112233445566778899aabbccddeeff", nc[] = "ffeeddccbbaa99887766554433221100";
+        dq_conn_t ag, ct;
+        CHECK(sockpair(sv));
+        dq_conn_init(&ag, sv[0]);
+        dq_conn_init(&ct, sv[1]);
+        dq_conn_auth(&ag, key, strlen(key), true, nc, na);
+        dq_conn_auth(&ct, key, strlen(key), false, na, nc);
+        CHECK(dq_msgb_init(&b, "RUN") && dq_msgb_kv(&b, "arg", "-N") && dq_msgb_kv(&b, "arg", "10"));
+        CHECK(dq_conn_send(&ct, &b, 1000) == 0);
+        dq_msgb_free(&b);
+        CHECK(dq_conn_recv(&ag, 1000, &m, err, sizeof err) == 1 && !strcmp(m.verb, "RUN") && m.n == 2 && !dq_msg_get(&m, "mac"));
+        CHECK(dq_msgb_init(&b, "READY"));
+        CHECK(dq_conn_send(&ag, &b, 1000) == 0);
+        dq_msgb_free(&b);
+        CHECK(dq_conn_recv(&ct, 1000, &m, err, sizeof err) == 1 && !strcmp(m.verb, "READY"));
+        /* the controller's second message, sent again: its sequence number is gone */
+        CHECK(dq_msgb_init(&b, "GO"));
+        CHECK(dq_conn_send(&ct, &b, 1000) == 0);
+        CHECK(dq_conn_recv(&ag, 1000, &m, err, sizeof err) == 1 && !strcmp(m.verb, "GO"));
+        CHECK(b.len < 128);
+        CHECK(write(sv[1], b.p, b.len) == (ssize_t)b.len);   /* the same bytes again */
+        dq_msgb_free(&b);
+        CHECK(dq_conn_recv(&ag, 1000, &m, err, sizeof err) == -1 && strstr(err, "not authenticated"));
+        dq_conn_close(&ag);
+        dq_conn_close(&ct);
+        /* one octet of an option changed on the path */
+        CHECK(sockpair(sv));
+        dq_conn_init(&ag, sv[0]);
+        dq_conn_init(&ct, sv[1]);
+        dq_conn_auth(&ag, key, strlen(key), true, nc, na);
+        dq_conn_auth(&ct, key, strlen(key), false, na, nc);
+        CHECK(dq_msgb_init(&b, "RUN") && dq_msgb_kv(&b, "arg", "10"));
+        /* build the signed bytes by hand: send to a socket pair of our own, read them back, change one octet, pass them on */
+        int sv2[2];
+        CHECK(sockpair(sv2));
+        dq_conn_t tmp;
+        dq_conn_init(&tmp, sv2[1]);
+        dq_conn_auth(&tmp, key, strlen(key), false, na, nc);
+        CHECK(dq_conn_send(&tmp, &b, 1000) == 0);
+        dq_msgb_free(&b);
+        uint8_t sig[256];
+        ssize_t sl = read(sv2[0], sig, sizeof sig);
+        CHECK(sl > 20);
+        ssize_t at = -1;
+        for (ssize_t i = 0; i + 6 <= sl; i++)
+            if (!memcmp(sig + i, "arg=10", 6)) { at = i; break; }
+        CHECK(at >= 0);
+        sig[at + 4] = '9';                               /* arg=90 */
+        CHECK(write(sv[1], sig, (size_t)sl) == sl);
+        CHECK(dq_conn_recv(&ag, 1000, &m, err, sizeof err) == -1 && strstr(err, "not authenticated"));
+        dq_conn_close(&tmp);
+        close(sv2[0]);
+        dq_conn_close(&ag);
+        dq_conn_close(&ct);
+        /* a message sent back to its sender (c2a taken as a2c), a wrong key, an unsigned ERR (its text is kept in the error) */
+        CHECK(sockpair(sv));
+        dq_conn_init(&ag, sv[0]);
+        dq_conn_init(&ct, sv[1]);
+        dq_conn_auth(&ct, key, strlen(key), false, na, nc);
+        dq_conn_auth(&ag, key, strlen(key), false, nc, na);   /* the wrong side: expects c2a, gets c2a bound to another nonce */
+        CHECK(dq_msgb_init(&b, "GO"));
+        CHECK(dq_conn_send(&ct, &b, 1000) == 0);
+        dq_msgb_free(&b);
+        CHECK(dq_conn_recv(&ag, 1000, &m, err, sizeof err) == -1);
+        dq_conn_close(&ag);
+        dq_conn_close(&ct);
+        CHECK(sockpair(sv));
+        dq_conn_init(&ag, sv[0]);
+        dq_conn_init(&ct, sv[1]);
+        dq_conn_auth(&ct, key2, strlen(key2), false, na, nc);
+        dq_conn_auth(&ag, key, strlen(key), true, nc, na);
+        CHECK(dq_msgb_init(&b, "GO"));
+        CHECK(dq_conn_send(&ct, &b, 1000) == 0);
+        dq_msgb_free(&b);
+        CHECK(dq_conn_recv(&ag, 1000, &m, err, sizeof err) == -1);
+        dq_conn_close(&ag);
+        dq_conn_close(&ct);
+        CHECK(sockpair(sv));
+        dq_conn_init(&ct, sv[0]);
+        dq_conn_auth(&ct, key, strlen(key), false, na, nc);
+        CHECK(write(sv[1], "\0\0\0\x1e" "ERR\nmsg=authentication failed\n", 34) == 34);
+        CHECK(dq_conn_recv(&ct, 1000, &m, err, sizeof err) == -1 && strstr(err, "not authenticated: ERR authentication failed"));
+        dq_conn_close(&ct);
+        close(sv[1]);
+    }
+    /* T3-L3: a transmit buffer smaller than the largest frame is refused when the path opens */
+    CHECK(dq_frame_cap_check(DQ_FRMAX, "x", err, sizeof err) == 0);
+    CHECK(dq_frame_cap_check(1024, "vale0:a", err, sizeof err) == -1 && strstr(err, "vale0:a") && strstr(err, "1024"));
     /* the tokens an agent takes */
     char *ok1[] = { "-d", "q.txt", "-Q", "100", "+dnssec", "--seed", "7" };
     CHECK(dq_agent_check_tokens(ok1, 7, err, sizeof err) == 0);

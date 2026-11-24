@@ -98,3 +98,13 @@ void trace_print_received(ssize_t n, const char *addr, int port, const char *nam
     if (len > 1 && name[len - 1] == '.') len--;
     printf(";; Received %zd bytes from %s#%d(%.*s) in %d ms\n\n", n, addr, port, (int)len, name, ms);
 }
+
+bool trace_tsig_verified(bool want_tsig, tsig_key_t *key, const uint8_t *resp, size_t n,
+                         const uint8_t *req_mac, size_t req_mac_len, bool report) {
+    if (!want_tsig) return true;
+    uint8_t mac[64];
+    size_t mac_len = 0;
+    int terr = tsig_verify_packet(resp, n, key, req_mac, req_mac_len, NULL, 0, false, mac, &mac_len);
+    if (report) print_tsig_verify_error(terr, resp, n);
+    return terr == 0;
+}
