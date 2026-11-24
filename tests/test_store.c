@@ -2988,7 +2988,8 @@ static void test_reserve_survives_growth(void) {
   tdir_free(&d);
 }
 
-static void *ix_wait_thread(void *arg) { atomic_store(&g_ix_ret, (int)(store_index_wait(arg) ? 1 : 2)); return NULL; }
+static _Atomic uint64_t g_ix_call_us;   /* the time the waiting call took, measured around it (the wait it counts is inside) */
+static void *ix_wait_thread(void *arg) { const uint64_t t0 = now_ms(); const int r = store_index_wait(arg) ? 1 : 2; atomic_store(&g_ix_call_us, (now_ms() - t0 + 1) * 1000); atomic_store(&g_ix_ret, r); return NULL; }
 static void test_index_wait(void) {
   printf("[the producer waits for the build of the next index past 7/16 of the index instead of growing it inside the mutex]\n");
   for (int run = 0; run < 2; run++) {                                    /* run 1: the wait is bounded, the build ends later */
@@ -3035,7 +3036,11 @@ static void test_index_wait(void) {
       CHECK_EQ(st.growths_background, 1);
       CHECK_EQ(st.growths, 1);                                           /* (no growth inside the mutex) */
       CHECK_EQ(st.index_waits, 1);
-      CHECK(st.index_wait_us >= 100000);
+      {                                                                  /* (counted, within the call: the thread may start late on a loaded host, so not >= the 100 ms the main thread slept) */
+        const bool iw_ok = st.index_wait_us > 0 && st.index_wait_us <= atomic_load(&g_ix_call_us);
+        if (!iw_ok) printf("  index_wait_us %llu, call %llu us\n", (unsigned long long)st.index_wait_us, (unsigned long long)atomic_load(&g_ix_call_us));
+        CHECK(iw_ok);
+      }
       CHECK_EQ(st.index_wait_giveups, 0);
       CHECK(st.ix_slots > 1024);
     } else {

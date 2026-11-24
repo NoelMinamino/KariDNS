@@ -150,7 +150,7 @@ static bool kv_matches_json(const char *kvtext) {
     const kv_t *k = kv_get(line);
     if (!k) { printf("  (kv key not in json: %s)\n", line); return false; }
     if (!k->is_str) { if (strtoull(eq + 1, NULL, 10) != k->num && strcmp(line, "store.time.mono_ms") && strcmp(line, "store.time.unix")
-                                 && strcmp(line, "store.cache.page.sample_age_ms") && strncmp(line, "store.open.", 11) && strcmp(line, "store.space.checked_unix")) {      /* (the read-ahead thread may end between the two calls) */ printf("  (kv value differs: %s)\n", line); return false; } }
+                                 && strcmp(line, "store.cache.page.sample_age_ms") && strncmp(line, "store.open.", 11) && strcmp(line, "store.space.checked_unix") && strncmp(line, "store.ahead.", 12)) {      /* (the read-ahead thread may end, or allocate, between the two calls) */ printf("  (kv value differs: %s)\n", line); return false; } }
     lines++;
     p = nl + 1;
   }
