@@ -147,6 +147,10 @@ typedef struct store_opts {
    * or when bulk_ckpt_interval_ms passed since the last one and the segments grew (0 = 15 min).  Tests and the test build of the server set them. */
   uint64_t bulk_ckpt_bytes;
   uint32_t bulk_ckpt_interval_ms;
+  /* 0.7: the bound of the private memory of the tables (store.tables.private_bytes, "The tables in private memory" in dns_store.c): a checkpoint is made when the private pages of the tables it
+   * writes grew by this much since the last one gave its pages back (also during the manifest pass of a bulk fill), and every checkpoint maps the pages it wrote from their files again.
+   * 0 = the RAM / 32 (physmem), at least 64 MiB and at most 1 GiB; UINT64_MAX = no checkpoint for it (the pages are still given back). */
+  uint64_t tables_private_max;
 } store_opts_t;
 
 /* The zones the tables are reserved room for: `opt` (store-max-zones) when not 0, else the RAM (physmem / 256 bytes, a power of two, 1M .. 2^25; physmem 0 = unknown: 2^25). */
@@ -337,7 +341,13 @@ typedef struct store_stats {
   uint64_t segment_inline_create_max_us;   /* the longest file made inside the writer mutex */
   uint32_t segment_ready;           /* 1: a file is made ahead and waits */
   /* ---- 0.7: the tables in private memory, written by the checkpoint ---- */
-  uint64_t table_private_bytes;     /* pages of zt, zc, nx, ix, sx that the writers changed since the open: private memory of the process (counted in memory-limit) */
+  uint64_t table_private_bytes;     /* pages of zt, zc, nx, ix, sx that the writers changed and no checkpoint gave back yet: private memory of the process (counted in memory-limit) */
+  uint64_t table_private_index_bytes;   /* ... of them, those of the ix / sx generations (a generation made in this session is private whole until a checkpoint wrote it) */
+  uint64_t table_private_max;       /* the bound in force (store_opts_t.tables_private_max, or the one derived from the RAM) */
+  uint64_t table_released_bytes;    /* bytes of written pages that checkpoints mapped from their files again (the kernel may drop them) */
+  uint64_t table_release_max_us;    /* the longest hold of the writer mutex by one step of that (at most ST_REL_STEP pages) */
+  uint64_t table_private_checkpoints;   /* checkpoints begun because the private pages reached the bound */
+  uint64_t table_release_errors;    /* runs that could not be mapped from their file again (the tables keep their private pages until the next start) */
   uint64_t checkpoint_table_bytes;  /* bytes of the tables that checkpoints wrote since the open */
   uint64_t checkpoint_table_last_bytes; /* ... the last one */
   uint64_t checkpoint_paced_us;     /* the time fuzzy checkpoints waited to stay under their write rate (ck_pace()) */
@@ -670,6 +680,8 @@ extern _Atomic long store_test_fail_commit;
 /* the n-th write of a run of table pages by a checkpoint fails with -EIO (0 = off) */
 extern _Atomic long store_test_fail_ckwrite;
 extern _Atomic long store_test_fail_map;
+/* the n-th mapping of a run of written table pages from its file again (ck_release()) fails with ENOMEM and leaves the run unmapped, the worst a failed MAP_FIXED can do (0 = off) */
+extern _Atomic long store_test_fail_release;
 /* the bytes of the table files (zt, zc, nx, the current ix and sx) equal the memory of the store: true after a checkpoint with the writers kept out (store_checkpoint_clean()) */
 bool store_test_files_match(store_t *s);
 /* a hold of the writer mutex by the function `site` that lasted `us` microseconds (its start is set back): the counters of the holds as for a real one */

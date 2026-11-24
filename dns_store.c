@@ -85,7 +85,9 @@
  *   - The copy is taken after P while the writers go on: what it holds of records > P is made right by the replay from P, as for the fuzzy flush above; a page that no record
  *     between the last two begins changed was written by the checkpoint before (one at a time) with its value of P.
  *   - A replayed OP_GEN: the new generation's file holds what a checkpoint wrote, nothing when none followed the growth, so the open rebuilds the derived tables then (gen_replays).
- *   - The private pages (dmap_t.priv: written since the open) are memory the kernel cannot drop: store.tables.private_bytes, counted in memory-limit by the Backend.
+ *   - The private pages (dmap_t.priv: changed and not given back since) are memory the kernel cannot drop: store.tables.private_bytes, counted in memory-limit by the Backend.  They are bounded
+ *     (0.7, the 100M-zone fill): a checkpoint that wrote its pages maps every private page that no writer changed since its begin from the file again (ck_release()), and a checkpoint is due
+ *     when the private pages grew by opts.tables_private_max (a 32nd of the RAM, 64 MiB .. 1 GiB) since the last one gave its pages back (priv_due(); in a bulk fill too, also while a pass runs).
  *
  * Checkpoint (store_checkpoint(), by the journal size limit, by checkpoint_interval_ms, at close, after recovery).
  *     switch to the next journal file; commit up to P; write + fsync the changed pages of every table; fsync the new journal and the directory;
@@ -175,10 +177,12 @@
  *      checkpoints.  The cleaner, the removal of empty segments, the nx pass and the scrub do not run until the end is on disk (st_bulk_busy(): maintenance(); store_compact() and store_scrub_run() say -EBUSY), nor the emergency cleaning
  *      of a full disk: the store was empty (no segment bytes either), nothing is dead; a segment removed then would be one the cells of the on-disk bulk checkpoint still name.  The readers are
  *      unchanged: the tables in memory are the truth.  A writer that is not the fill (a secondary's copy, dns_xfr_store.c) asks for the end and puts its write off until the end is on disk (the restore thread makes it then).
- *   C  bulk checkpoints (store_bulk_phase(BODY / PASSED): none while a pass runs): a fuzzy checkpoint begun while BULK (ck_begin_locked(), ck.bulk) when the segments doubled since the last one and
- *      grew by at least opts.bulk_ckpt_bytes (4 GiB), or when opts.bulk_ckpt_interval_ms (15 min) passed and they grew (bulk_due()).  Its steps are those of any fuzzy checkpoint: the commit of its
+ *   C  bulk checkpoints (store_bulk_phase(BODY / PASSED)): a fuzzy checkpoint begun while BULK (ck_begin_locked(), ck.bulk) when the segments doubled since the last one and
+ *      grew by at least opts.bulk_ckpt_bytes (4 GiB), or when opts.bulk_ckpt_interval_ms (15 min) passed and they grew (bulk_due()), none of these while a pass runs; and, also while a pass runs,
+ *      when the private memory of the tables reached its bound (priv_due(), "The tables in private memory").  Its steps are those of any fuzzy checkpoint: the commit of its
  *      position P syncs the segments marked dirty and the directory (the files of new segments are in it before a superblock names them), zt and zc are copied as of P (and later; pair by pair under the cells' sequence counters, ck_write_cells(), so no pair is torn), nx by the nx rule
- *      (ck_nx_widen()); ix and sx are not written (their pages stay marked; a generation made during the fill is written whole at its end).  Its superblock says SBF_BULK | SBF_BULK_CK: the open
+ *      (ck_nx_widen()); ix and sx are written only when no pass runs (a pass inserts into every page of them; their pages stay marked, and a generation made during the fill is written whole
+ *      by the first bulk checkpoint after the pass, or by the end).  Its superblock says SBF_BULK | SBF_BULK_CK: the open
  *      does not read ix / sx from it (adopt_sb()) and rebuilds them from zt.  P names no record: the counters, views and cursors are those of the begin (under the mutex), the tables those of the copy.
  *   K  a crash during the fill (the open finds SBF_BULK without the clean flag): nothing is replayed (journal_skip(): the chain is passed over so that the next journal file is a new one; the records
  *      made after the end of the fill and before its checkpoint was on disk are lost with it); the derived tables are rebuilt with the bulk rules (rebuild_locked(RB_BULK); also after the
@@ -194,7 +198,7 @@
  *   E  the end (store_bulk_end(), the caller's ticker after the passes of every view ended complete, when no body is in flight and the scan of the wanted bodies went idle: bulk_end_check()): the flag
  *      goes under the writer mutex and bulk_end_pending is set, so every later
  *      record is logged with an LSN after P; then one ordinary fuzzy checkpoint at P: every unlogged change is before P and its copy is taken after it, which is the rule of every fuzzy checkpoint
- *      (records after P are replayed onto it); it writes every page marked since the last full write, ix / sx included (taken from the writers' maps, which no bulk checkpoint took), and its
+ *      (records after P are replayed onto it); it writes every page marked since the checkpoint that took the table last, ix / sx included (taken from the writers' maps; a page a bulk checkpoint wrote and no writer changed since holds its value), and its
  *      superblock has no SBF_BULK (ck_finish() clears bulk_end_pending).  The checkpoint thread makes it (ckpt_due() is true while the end is pending, after a failure or with no room for it once its back-off is over, 1 s doubling up to 5 min, in st_ckpt(); the
  *      caller's thread does not wait for it).  Until it is on disk a crash is a crash of the fill (K): the commits acknowledged since the end are lost with it, the cost of decision 1 of the plan.
  * What relied on the journal, and what the fill does there:
@@ -381,14 +385,15 @@ typedef struct {
 /* ------------------------------------------------------------------------------------------------------------------ */
 
 /* The pages of a table that the writers changed (0.7, private tables: see "The tables in private memory" at the top).  Owned by the writer mutex (the build of a generation outside
- * it writes a generation that is written whole, `all`).  dirty: pages changed since the begin of the last checkpoint, which takes the bitmap; priv: pages changed since the open, the
- * private copies that store.tables.private_bytes counts (acct, the store's counter: a generation retired by the readers' grace period subtracts its own when it is freed). */
+ * it writes a generation that is written whole, `all`).  dirty: pages changed since the begin of the last checkpoint, which takes the bitmap; priv: pages changed since the open and not
+ * mapped from the file again since (ck_release()), the private copies that store.tables.private_bytes counts (acct, the store's counter: a generation retired by the readers' grace period subtracts its own when it is freed). */
 typedef struct {
   uint64_t *dirty, *priv;
   uint64_t npages, npriv;
   bool all;                            /* every page is to be written: a generation made in this session, until the begin of its first checkpoint */
   uint8_t shift;                       /* log2 of the page size */
   _Atomic uint64_t *acct;
+  _Atomic uint64_t *acct_ix;           /* an index generation: its share of acct is counted here too (store_t.priv_ix_bytes: a bulk checkpoint during a pass does not write ix / sx, priv_now()) */
 } dmap_t;
 
 typedef struct {                       /* a table that grows in place inside a reserved address range */
@@ -597,7 +602,8 @@ struct store {
     uint64_t lsn, t0, tw0;                            /* tw0: when the write of the tables began (ck_pace()) */
     uint64_t epos;                                    /* the ring position after its switch: the old file's records and the new file's header are below it (rule F) */
     bool clean, dir;
-    bool bulk;                                        /* a bulk checkpoint: no ix / sx, the superblock says SBF_BULK_CK */
+    bool bulk;                                        /* a bulk checkpoint: the superblock says SBF_BULK_CK (ix / sx are not taken while a pass runs) */
+    bool by_priv;                                     /* begun while the private pages were at the bound (priv_due(): store.tables.private_checkpoints) */
     uint64_t bulk_seg;                                /* ... the segment bytes at its begin */
     int oldfd, newfd;
     uint32_t gen;                                     /* the journal file the superblock names (newfd until a commit switches the journal on) */
@@ -609,6 +615,11 @@ struct store {
   } ck;
   uint8_t *ck_buf;                                    /* (ck_busy) the copy of a run of pages that the checkpoint writes */
   _Atomic uint64_t priv_bytes;                        /* the private pages of the tables (store.tables.private_bytes) */
+  _Atomic uint64_t priv_ix_bytes;                     /* ... of them, those of the ix / sx generations */
+  uint64_t priv_max;                                  /* the bound (store_opts_t.tables_private_max resolved at the open: priv_due()) */
+  _Atomic uint64_t priv_floor;                        /* priv_now() when the last checkpoint had given its pages back (ck_release()) */
+  _Atomic bool rel_off;                               /* a run could not be mapped from its file again: no page is given back and no checkpoint is made for the bound until the next start */
+  _Atomic uint64_t n_rel_bytes, n_rel_max_us, n_rel_errors, n_priv_ckpts;   /* store.tables.released_bytes, .release_max_us, .release_errors, .private_checkpoints */
   _Atomic uint64_t n_ck_bytes, ck_last_bytes;         /* bytes of the tables written by checkpoints: all, the last one */
   _Atomic uint64_t n_ck_paced_us;                     /* the time fuzzy checkpoints gave way to the writers (ck_pace()) */
   struct { uint32_t nseg; seg_t *seg[ST_MAXSEG]; } cm;   /* (baton) the segments of the commit being made */
@@ -728,6 +739,7 @@ void (*store_test_before_counters)(store_t *s) = NULL;
 _Atomic long store_test_fail_commit = 0;
 _Atomic long store_test_fail_ckwrite = 0;
 _Atomic long store_test_fail_map = 0;      /* the n-th reservation of address space of a table fails with ENOMEM (a limit of address space, ulimit -v) */
+_Atomic long store_test_fail_release = 0;  /* the n-th run that a checkpoint maps from its file again fails, and leaves the run unmapped (ck_release()) */
 /* a writer function of the store (its name: "put", "set_known", "delete", "set_flags", "set_stamp", "set_cursor") fails before it changes anything with the errno this returns (0: no failure) */
 int (*store_test_write_fault)(const char *op, uint32_t zid) = NULL;
 void (*store_test_in_stats)(void) = NULL;
@@ -754,11 +766,13 @@ static bool st_fail_nth(_Atomic long *n) {
 #define FAIL_COMMIT() st_fail_nth(&store_test_fail_commit)
 #define FAIL_CKWRITE() st_fail_nth(&store_test_fail_ckwrite)
 #define FAIL_MAP() st_fail_nth(&store_test_fail_map)
+#define FAIL_REL() st_fail_nth(&store_test_fail_release)
 #else
 #define CRASH_POINT() ((void)0)
 #define FAIL_COMMIT() false
 #define FAIL_CKWRITE() false
 #define FAIL_MAP() false
+#define FAIL_REL() false
 #define AHEAD_HOOK(s, site) ((void)0)
 #define ST_FAULT(op, zid) ((void)0)
 #define ST_FAULT_RES(op, zid, res) ((void)0)
@@ -1360,8 +1374,17 @@ static int dm_resize(dmap_t *d, uint64_t npages) {
   d->npages = npages;
   return 0;
 }
+/* n private pages more (add) or fewer: the store's counters */
+static void dm_acct(const dmap_t *d, uint64_t n, bool add) {
+  const uint64_t b = n << d->shift;
+  if (add) atomic_fetch_add_explicit(d->acct, b, memory_order_relaxed);
+  else atomic_fetch_sub_explicit(d->acct, b, memory_order_relaxed);
+  if (!d->acct_ix) return;
+  if (add) atomic_fetch_add_explicit(d->acct_ix, b, memory_order_relaxed);
+  else atomic_fetch_sub_explicit(d->acct_ix, b, memory_order_relaxed);
+}
 static void dm_free(dmap_t *d) {
-  if (d->acct && d->npriv) atomic_fetch_sub_explicit(d->acct, d->npriv << d->shift, memory_order_relaxed);
+  if (d->acct && d->npriv) dm_acct(d, d->npriv, false);
   free(d->dirty);
   free(d->priv);
   d->dirty = d->priv = NULL;
@@ -1371,7 +1394,7 @@ static void dm_free(dmap_t *d) {
 static void dm_set_all(dmap_t *d) {
   const size_t nw = (size_t)((d->npages + 63) / 64);
   if (nw) memset(d->priv, 0xff, nw * sizeof(*d->priv));
-  atomic_fetch_add_explicit(d->acct, (d->npages - d->npriv) << d->shift, memory_order_relaxed);
+  dm_acct(d, d->npages - d->npriv, true);
   d->npriv = d->npages;
   d->all = true;
 }
@@ -1384,7 +1407,7 @@ static void dm_mark(dmap_t *d, uint64_t off, uint64_t len) {
     if (!(d->priv[p >> 6] & b)) {
       d->priv[p >> 6] |= b;
       d->npriv++;
-      atomic_fetch_add_explicit(d->acct, 1ull << d->shift, memory_order_relaxed);
+      dm_acct(d, 1, true);
     }
   }
 }
@@ -1540,6 +1563,7 @@ static int ixgen_map(store_t *s, ixgen_t *g, bool anon) {
   if (g->maplen >= (2u << 20)) fl |= MAP_ALIGNED_SUPER;
 #endif
   dm_init(s, &g->d);
+  g->d.acct_ix = &s->priv_ix_bytes;
   if (dm_resize(&g->d, g->maplen >> s->pgshift) < 0) return -ENOMEM;
   void *p = mmap(NULL, g->maplen, PROT_READ | PROT_WRITE, fl, anon ? -1 : g->fd, anon ? 0 : (off_t)ST_HDR_PAGE);
   if (p == MAP_FAILED) return -errno;
@@ -2888,14 +2912,17 @@ static void ck_merge_locked(store_t *s);
 static void ck_drop_taken(store_t *s);
 static void ck_alloc_plan_locked(store_t *s);
 static uint64_t st_seg_bytes(const store_t *s);
-/* fuzzy: the writers go on while it writes (not ck_full_locked()); one begun during a bulk fill is a bulk checkpoint: ix / sx are not taken (their pages stay marked for the checkpoint that
- * ends the fill, a generation made during the fill is written whole by it) and its superblock says SBF_BULK_CK */
+static bool priv_due(const store_t *s);
+/* fuzzy: the writers go on while it writes (not ck_full_locked()); one begun during a bulk fill is a bulk checkpoint: its superblock says SBF_BULK_CK, and while a pass runs ix / sx are not
+ * taken (the pass inserts into every page of them: their pages stay marked for the next checkpoint that takes them, a generation made during the fill is written whole by it) */
 static int ck_begin_locked(store_t *s, bool clean, bool fuzzy) {
   const uint64_t P = s->lsn;
   s->ck.bulk = fuzzy && atomic_load_explicit(&s->bulk, memory_order_relaxed);
   s->ck.bulk_seg = s->ck.bulk ? st_seg_bytes(s) : 0;
-  s->ck.ix = s->ck.bulk ? NULL : atomic_load_explicit(&s->ix, memory_order_relaxed);
-  s->ck.sx = s->ck.bulk ? NULL : atomic_load_explicit(&s->sx, memory_order_relaxed);
+  s->ck.by_priv = fuzzy && priv_due(s);
+  const bool noix = s->ck.bulk && !atomic_load_explicit(&s->bulk_body, memory_order_relaxed);
+  s->ck.ix = noix ? NULL : atomic_load_explicit(&s->ix, memory_order_relaxed);
+  s->ck.sx = noix ? NULL : atomic_load_explicit(&s->sx, memory_order_relaxed);
   int r = ck_take_locked(s);                         /* (the pages the writers changed up to P) */
   if (r < 0) return r;
   int oldfd = -1;
@@ -3261,6 +3288,7 @@ static void ck_finish(store_t *s) {
   atomic_store_explicit(&s->clean_on_disk, s->ck.clean, memory_order_relaxed);
   atomic_store_explicit(&s->ckpt_lsn, s->ck.lsn, memory_order_release);
   atomic_fetch_add_explicit(&s->n_checkpoints, 1, memory_order_relaxed);
+  if (s->ck.by_priv) atomic_fetch_add_explicit(&s->n_priv_ckpts, 1, memory_order_relaxed);
   if (s->ck.bulk) {                                   /* (the next one is due by the bytes appended since its begin, or by the time) */
     atomic_store_explicit(&s->bulk_base, s->ck.bulk_seg, memory_order_relaxed);
     atomic_store_explicit(&s->bulk_last_ms, st_now_ms(), memory_order_relaxed);
@@ -3283,6 +3311,93 @@ static void ck_precreate(store_t *s) {
   const uint32_t g = s->jrn_gen + 1;
   const int fd = journal_create(s, g);
   if (fd >= 0) { s->jnext_fd = fd; s->jnext_gen = g; }
+}
+
+/* ---- the written pages go back to the page cache (0.7: the private memory of the tables is bounded) ----
+ * The 100M-zone first fill on a 16 GB host was killed by the kernel at 57M zones: every page a writer had changed stayed private for the session, 225 bytes a zone (13.5 GB).  Now a checkpoint
+ * that wrote its pages (ck_busy held, after its superblock) maps every private page that holds what its file holds from the file again, MAP_PRIVATE | MAP_FIXED over the same address: the page
+ * is a page of the page cache once more (the kernel may drop it, a read brings it back), and the next store into it makes a private copy again (dm_mark()).  Such a page is one that is private and
+ * not marked in the writers' map: the begin of a checkpoint took its mark (one at a time: ck_busy) and that checkpoint wrote it, or gave it back to the map when it failed; a store into it since
+ * marked it again, inside the writer mutex.  So under the writer mutex (no store meanwhile) the page and the file hold the same bytes, and a lock-free reader reads those bytes from the old page or
+ * the new one (the kernel replaces the mapping under its map lock: a fault meanwhile waits for it).  Not given back: a generation to be written whole (d->all: its pages have no marks), one that is
+ * not the current one (a growth's old generation goes with the grace period), a page past what the file holds (extended).  In steps of at most ST_REL_STEP pages a hold of the writer mutex,
+ * so that the writers interleave (a checkpoint of 512 MiB is 128 steps).  The checkpoints that keep the bound: priv_due().
+ * A failed mmap(): on FreeBSD the replacement of a fixed mapping is one hold of the map lock, and the insert after the removal fails only by the swap accounting of vm.overcommit (strict, not the
+ * default); if the range is gone it is mapped anonymous again and read back from the file, which holds its bytes, and no page is given back until the next start (rel_off, an ERROR). */
+#define ST_REL_STEP 1024u
+static int rel_run(store_t *s, uint8_t *base, int fd, uint64_t off, uint64_t len) {
+  uint8_t *const at = base + off;
+  void *p;
+  if (FAIL_REL()) { (void)munmap(at, (size_t)len); errno = ENOMEM; p = MAP_FAILED; }        /* (the test of the worst case: the run is gone) */
+  else p = mmap(at, (size_t)len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_FIXED | ST_NOCORE, fd, (off_t)(ST_HDR_PAGE + off));
+  if (p != MAP_FAILED) return 0;
+  const int e = errno;
+  char v[1];
+  if (mincore(at, s->pagesz, (void *)v) != 0 && errno == ENOMEM) {          /* (the old pages are gone: the run is made again from its file, as private pages; their marks stay) */
+    if (mmap(at, (size_t)len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_FIXED | MAP_ANON | ST_NOCORE, -1, 0) == MAP_FAILED || st_pread_all(fd, at, (size_t)len, (off_t)(ST_HDR_PAGE + off)) < 0)
+      st_log(s, 3, "store: a run of a table could not be made again after a failed mapping (%s): the store stops here", strerror(errno));
+  }
+  return -e;
+}
+static uint64_t priv_now(const store_t *s);
+static void ck_release(store_t *s) {
+  if (atomic_load_explicit(&s->rel_off, memory_order_relaxed)) return;
+  const uint8_t sh = s->pgshift;
+  for (int i = 0; i < 5; i++) {
+    uint64_t p = 0;
+    for (bool more = true; more; ) {
+      wr_lock_raw(s);
+      const uint64_t t0 = st_now_us();
+      dmap_t *d;
+      uint8_t *base;
+      int fd;
+      uint64_t lim;                                   /* (pages that may be mapped from the file) */
+      if (i < 3) {
+        mtab_t *t = i == 0 ? &s->zt : i == 1 ? &s->zc : &s->nx;
+        const uint64_t m = atomic_load_explicit(&t->mapped, memory_order_relaxed), x = atomic_load_explicit(&t->extended, memory_order_relaxed);
+        d = &t->d;
+        base = t->base;
+        fd = t->fd;
+        lim = (m < x ? m : x) >> sh;
+      } else {
+        ixgen_t *g = atomic_load_explicit(i == 3 ? &s->ix : &s->sx, memory_order_relaxed);
+        if (!g) { wr_unlock_raw(s); break; }
+        d = &g->d;
+        base = (uint8_t *)g->slots;
+        fd = g->fd;
+        lim = d->all ? 0 : g->maplen >> sh;           /* (a growth since the last step made a generation to be written whole: nothing of it) */
+      }
+      if (lim > d->npages) lim = d->npages;
+      uint64_t n = 0;
+      int r = 0;
+      while (p < lim && n < ST_REL_STEP && r == 0) {
+        const uint64_t w = (d->priv[p >> 6] & ~d->dirty[p >> 6]) >> (p & 63);
+        if (!w) { p = (p | 63) + 1; continue; }
+        if (!(w & 1)) { p += (uint64_t)__builtin_ctzll(w); continue; }
+        const uint64_t a = p;
+        while (p < lim && n + (p - a) < ST_REL_STEP && (((d->priv[p >> 6] & ~d->dirty[p >> 6]) >> (p & 63)) & 1)) p++;
+        if ((r = rel_run(s, base, fd, a << sh, (p - a) << sh)) < 0) break;
+        for (uint64_t q = a; q < p; q++) d->priv[q >> 6] &= ~(1ull << (q & 63));
+        d->npriv -= p - a;
+        dm_acct(d, p - a, false);
+        n += p - a;
+      }
+      if (r < 0) {
+        atomic_store_explicit(&s->rel_off, true, memory_order_relaxed);
+        atomic_fetch_add_explicit(&s->n_rel_errors, 1, memory_order_relaxed);
+        st_log(s, 3, "store: the written pages of a table could not be mapped from its file again (%s): the tables keep their private memory until the next start (store.tables.release_errors)",
+               strerror(-r));
+      }
+      atomic_fetch_add_explicit(&s->n_rel_bytes, n << sh, memory_order_relaxed);
+      more = r == 0 && p < lim && !atomic_load_explicit(&s->ck_cancel, memory_order_relaxed);
+      const uint64_t us = st_now_us() - t0;
+      if (us > atomic_load_explicit(&s->n_rel_max_us, memory_order_relaxed)) atomic_store_explicit(&s->n_rel_max_us, us, memory_order_relaxed);     /* (ck_busy: one writer) */
+      wr_unlock_raw(s);
+      if (r < 0) return;
+      CRASH_POINT();
+    }
+  }
+  atomic_store_explicit(&s->priv_floor, priv_now(s), memory_order_relaxed);
 }
 
 /* The rest of a checkpoint that ck_begin_locked() began (ck_busy and the baton held, no lock): the commit of P, the baton back (commits go on), the flush, the superblock.  A failure
@@ -3312,6 +3427,7 @@ static int ck_run(store_t *s) {
   if (r == 0) {
     CRASH_POINT();
     ck_finish(s);
+    ck_release(s);
     baton_take(s);
     ck_precreate(s);
     bg_release(s, true, false);
@@ -3976,14 +4092,30 @@ static bool bulk_due(const store_t *s, uint64_t now) {
   if (seg <= atomic_load_explicit(&s->bulk_base, memory_order_relaxed)) return false;
   return seg >= bulk_next_bytes(s) || now - atomic_load_explicit(&s->bulk_last_ms, memory_order_relaxed) >= ivl;
 }
+/* The private memory of the tables that the next checkpoint writes and gives back (ck_release()): every private page, but those of ix / sx while a pass of a bulk fill runs (ck_begin_locked()
+ * does not take them then).  No lock: relaxed loads of the counters. */
+static uint64_t priv_now(const store_t *s) {
+  const uint64_t b = atomic_load_explicit(&s->priv_bytes, memory_order_relaxed);
+  if (!atomic_load_explicit(&s->bulk, memory_order_relaxed) || atomic_load_explicit(&s->bulk_body, memory_order_relaxed)) return b;
+  const uint64_t x = atomic_load_explicit(&s->priv_ix_bytes, memory_order_relaxed);
+  return b > x ? b - x : 0;
+}
+/* Is a checkpoint due for the bound of the private memory (0.7)?  When it grew by priv_max since the last checkpoint gave its pages back: what is left then (the pages changed while that
+ * checkpoint ran) is not counted twice, and a share that no checkpoint can give back makes no checkpoint after checkpoint.  Also during a pass of a bulk fill (its manifest pass writes a
+ * record for every zone: 128 bytes of zt and zc each; without this a fill of 100M zones held 13.5 GB). */
+static bool priv_due(const store_t *s) {
+  if (s->priv_max == UINT64_MAX || atomic_load_explicit(&s->rel_off, memory_order_relaxed)) return false;
+  const uint64_t f = atomic_load_explicit(&s->priv_floor, memory_order_relaxed);
+  return priv_now(s) >= (f > UINT64_MAX - s->priv_max ? UINT64_MAX : f + s->priv_max);
+}
 /* is a checkpoint due? */
 static bool ckpt_due(const store_t *s, uint64_t now) {
-  if (atomic_load_explicit(&s->bulk, memory_order_relaxed)) return bulk_due(s, now);     /* (a bulk fill: not by the journal, which holds nothing, nor by checkpoint_interval_ms) */
+  if (atomic_load_explicit(&s->bulk, memory_order_relaxed)) return bulk_due(s, now) || priv_due(s);     /* (a bulk fill: not by the journal, which holds nothing, nor by checkpoint_interval_ms) */
   if (atomic_load_explicit(&s->bulk_end_pending, memory_order_relaxed)) return now >= atomic_load_explicit(&s->bulk_end_next_ms, memory_order_relaxed);      /* (its end, until a superblock without SBF_BULK is on disk; after a failure, or with no room, once its back-off is over, st_ckpt()) */
   const uint64_t lsn = atomic_load_explicit(&s->lsn, memory_order_relaxed);
   if (atomic_load_explicit(&s->jbytes, memory_order_relaxed) >= jmax(s)) return true;
   if (lsn <= atomic_load_explicit(&s->ckpt_lsn, memory_order_relaxed)) return false;
-  if (atomic_load_explicit(&s->ck_want, memory_order_relaxed)) return true;
+  if (atomic_load_explicit(&s->ck_want, memory_order_relaxed) || priv_due(s)) return true;
   return s->o.checkpoint_interval_ms != UINT32_MAX && now - atomic_load_explicit(&s->last_ckpt_ms, memory_order_relaxed) >= s->o.checkpoint_interval_ms;
 }
 
@@ -6816,6 +6948,12 @@ void store_stats(const store_t *s, store_stats_t *o) {
   o->checkpoint_table_bytes = atomic_load_explicit(&s->n_ck_bytes, memory_order_relaxed);
   o->checkpoint_table_last_bytes = atomic_load_explicit(&s->ck_last_bytes, memory_order_relaxed);
   o->checkpoint_paced_us = atomic_load_explicit(&s->n_ck_paced_us, memory_order_relaxed);
+  o->table_private_index_bytes = atomic_load_explicit(&s->priv_ix_bytes, memory_order_relaxed);
+  o->table_private_max = s->priv_max;
+  o->table_released_bytes = atomic_load_explicit(&s->n_rel_bytes, memory_order_relaxed);
+  o->table_release_max_us = atomic_load_explicit(&s->n_rel_max_us, memory_order_relaxed);
+  o->table_private_checkpoints = atomic_load_explicit(&s->n_priv_ckpts, memory_order_relaxed);
+  o->table_release_errors = atomic_load_explicit(&s->n_rel_errors, memory_order_relaxed);
   rcu_aux_read_unlock();
 }
 
@@ -7815,7 +7953,12 @@ int store_open(int dirfd, const store_opts_t *opts, store_t **out) {
   if (s->o.sync_interval_ms == 0) s->o.sync_interval_ms = 100;
   if (s->o.checkpoint_interval_ms == 0) s->o.checkpoint_interval_ms = 30000;
   if (s->o.journal_max_bytes == 0) s->o.journal_max_bytes = 100ull << 20;
-  s->seg_size = s->o.seg_size ? s->o.seg_size : (256ull << 20);
+  s->priv_max = s->o.tables_private_max;              /* (0.7, the bound of the private memory of the tables, priv_due(): a 32nd of the RAM, 64 MiB .. 1 GiB) */
+  if (!s->priv_max) {
+    const uint64_t pm = (s->o.physmem ? s->o.physmem : st_physmem()) / 32;
+    s->priv_max = pm < (64ull << 20) ? 64ull << 20 : pm > (1ull << 30) ? 1ull << 30 : pm;
+  }
+  s->seg_size =s->o.seg_size ? s->o.seg_size : (256ull << 20);
   if (s->seg_size < 65536) s->seg_size = 65536;
   s->pagesz = (size_t)sysconf(_SC_PAGESIZE);
   if (s->pagesz == 0 || s->pagesz > ST_HDR_PAGE || (s->pagesz & (s->pagesz - 1))) { free(s); return -EINVAL; }
