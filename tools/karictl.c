@@ -181,7 +181,7 @@ char *extract_algorithm_from_config(const char *path) {
  * (dns_db_pgsql.c): the secret runs every control command.  NULL = refused or unreadable (said on stderr). */
 static char *karictl_read_conf_checked(const char *path) {
     int fd = open(path, O_RDONLY | O_CLOEXEC);
-    if (fd < 0) { fprintf(stderr, "karictl: cannot read %s: %s\n", path, strerror(errno)); return NULL; }
+    if (fd < 0) { fprintf(stderr, "Could not read secret from %s: %s\n", path, strerror(errno)); return NULL; }
     struct stat st;
     if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 0 || st.st_size > 1024 * 1024) {
         fprintf(stderr, "karictl: %s is not a regular file of at most 1 MiB\n", path);
