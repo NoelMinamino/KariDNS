@@ -5,8 +5,12 @@
 # more: it was removed before it was released).  It parks like any other query, the ingest thread takes the coldest zones out of memory on demand (the minimum residency only
 # relaxed for zones whose queries have been answered) and fetches the zone, and the query is answered when the zone is there.  Checked:
 #   - rounds of parallel queries for zones that do not fit memory-limit (24 zones of about 100 KB, memory-limit 1m, 4 queries at a time, each round at once after the last):
-#     every query is answered on the first try (no EDE 14), nothing is shed, room_evictions > 0 (the zones were taken out on demand), dbstatus has no over_limit field,
+#     every query is answered on the first try (no EDE 14), nothing is shed, dbstatus has no over_limit field,
 #     nothing waits, is in flight or holds a place afterwards, and the zones in memory stay within a bound
+#   - room on demand for certain: 3 zones larger than the hard line (about 1.6 MB each), asked for at once with fetch-concurrency 2 (its least): the third request comes to the
+#     ingest thread when the first zone is just installed: it is in memory and its query not answered yet (the cache manager cannot take it), so the zones are above the hard
+#     line whatever the speed of the host and the request waits for room: room_evictions > 0 and every query is answered (the rounds above make room on demand only
+#     when the host is fast enough that the 50 ms cache manager does not keep up: 0 under load, CI flakes row 51)
 #   - the same with fetch-concurrency 2 and fetch-rate 100 (the requests wait for a place and for the bucket as well as for room)
 #   - reloads (karictl reconfig, changing fetch-concurrency and fetch-rate) while the rounds run: every query is still answered, nothing is lost or left behind (places,
 #     the queue, the claim marks: dbstatus is idle afterwards and the server answers)
@@ -61,6 +65,18 @@ INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT
 WITH RECURSIVE m(j) AS (SELECT 0 UNION ALL SELECT j + 1 FROM m WHERE j < 999)
 INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled)
   SELECT d.id, 'h' || m.j || '.' || d.name, 'A', '192.0.2.' || (m.j % 250 + 1), 300, 0, 0 FROM domains d, m;
+SQL
+# 3 zones larger than the hard line of memory-limit 1m (110 %): b1.test .. b3.test, 14000 A records each
+sqlite3 "$T/db/z.db" <<SQL
+WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 3)
+INSERT INTO domains (name, type) SELECT printf('b%d.test', i), 'NATIVE' FROM n;
+INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled)
+  SELECT id, name, 'SOA', 'ns1.' || name || ' host.' || name || ' 1 3600 600 86400 300', 300, 0, 0 FROM domains WHERE name LIKE 'b%';
+INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT id, name, 'NS', 'ns1.' || name, 300, 0, 0 FROM domains WHERE name LIKE 'b%';
+INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT id, 'www.' || name, 'A', '192.0.2.80', 300, 0, 0 FROM domains WHERE name LIKE 'b%';
+WITH RECURSIVE m(j) AS (SELECT 0 UNION ALL SELECT j + 1 FROM m WHERE j < 13999)
+INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled)
+  SELECT d.id, 'h' || m.j || '.' || d.name, 'A', '192.0.2.' || (m.j % 250 + 1), 300, 0, 0 FROM domains d, m WHERE d.name LIKE 'b%';
 SQL
 chown -R nobody "$T/db"; chmod 600 "$T/db/z.db"*
 install -o root -g wheel -m 755 "$LOADER" "$T/karidns-dbloader" 2>/dev/null || { cp "$LOADER" "$T/karidns-dbloader"; chown 0:0 "$T/karidns-dbloader"; chmod 755 "$T/karidns-dbloader"; }
@@ -150,12 +166,31 @@ echo "  answered $GOOD, refused $REFUSED, other $ODD of $((ROUNDS * P)); $(dbs |
 [ "$GOOD" = "$((ROUNDS * P))" ] && pass "all $GOOD queries were answered on the first try" || { fail "answered $GOOD of $((ROUNDS * P)), refused $REFUSED, other $ODD"; state; }
 [ "$(field cache shed)" = "0" ] && pass "nothing was shed" || fail "shed=$(field cache shed)"
 RE=$(field cache room_evictions)
-[ "${RE:-0}" -gt 0 ] && pass "zones were taken out of memory on demand ($RE, $(field cache room_relaxed) of them younger than the minimum residency)" || fail "no zone was taken out on demand: $(dbs | grep '^cache:')"
+echo "  zones taken out on demand in the rounds: ${RE:-0}, $(field cache room_relaxed) of them younger than the minimum residency (0 on a slow host: the cache manager kept up; checked for certain below)"
 waitfor 10 idle && pass "nothing waits for room, is in flight or holds a place afterwards" || fail "fetchq: $(dbs | grep '^fetchq:'); $(dbs | grep '^cache:')"
 LIM=$(field cache limit); PEAK=$(field cache peak)
 [ "${PEAK:-0}" -lt $((LIM * 3)) ] && pass "the zones in memory stayed within a bound (peak $PEAK bytes, limit $LIM)" || fail "peak $PEAK against a limit of $LIM"
 [ "$(field cache room_timeouts)" = "0" ] && [ "$(field fetchq queue_dropped)" = "0" ] && pass "no request ran out of time waiting" || fail "room_timeouts=$(field cache room_timeouts) queue_dropped=$(field fetchq queue_dropped)"
 [ "$(field fetchq queue_full)" = "0" ] && pass "the queue never filled up" || fail "queue_full=$(field fetchq queue_full)"
+stop_srv
+
+echo "== room on demand for certain: 3 zones larger than the hard line at once, fetch-concurrency 2"
+conf "fetch-concurrency 2;"
+start_srv
+kari_try_snap "$T/nad" "$KCTL"
+PIDS=""
+for b in 1 2 3; do ( ./dag @127.0.0.1 -p "$PORT" "www.b$b.test" A +nohexdump +time=8 +tries=1 > "$T/b.$b" 2>&1 ) & PIDS="$PIDS $!"; done
+wait $PIDS
+BG=0; BL=""
+for b in 1 2 3; do
+    grep -q '192.0.2.80' "$T/b.$b" && BG=$((BG + 1)) || echo "  [other] www.b$b.test A: $(grep -E 'status:|EDE|timed out|no servers|error' "$T/b.$b" | head -3 | tr '\n' ' ')"
+    grep -q 'status:' "$T/b.$b" || BL="www.b$b.test"
+done
+[ "$BG" = 3 ] && pass "the 3 queries for zones larger than the hard line were answered" || { fail "answered $BG of 3"; [ -n "$BL" ] && kari_noanswer_diag "$T/nad" "$KCTL" "$T/srv.log" "$PORT" "$BL" A; state; }
+RE=$(field cache room_evictions)
+[ "${RE:-0}" -gt 0 ] && pass "zones were taken out of memory on demand ($RE, $(field cache room_relaxed) of them younger than the minimum residency; room_waits=$(field cache room_waits))" || { fail "no zone was taken out on demand"; state; }
+[ "$(field cache room_timeouts)" = "0" ] && [ "$(field cache shed)" = "0" ] && pass "no request ran out of time waiting for room, nothing was shed" || fail "room_timeouts=$(field cache room_timeouts) shed=$(field cache shed)"
+waitfor 10 idle && pass "nothing waits for room, is in flight or holds a place afterwards" || fail "fetchq: $(dbs | grep '^fetchq:'); $(dbs | grep '^cache:')"
 stop_srv
 
 echo "== the same with fetch-concurrency 2 and fetch-rate 100: the requests wait for a place and for the bucket as well"
