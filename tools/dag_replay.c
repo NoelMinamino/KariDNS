@@ -48,6 +48,8 @@
 #include "dag_tcp_reassembly.h"
 
 #include "dag_http.h"
+#include "dag_tls.h"
+#include <stdatomic.h>
 
 
 #define REPLAY_QUEUE_CAPACITY 1024
@@ -119,6 +121,9 @@ typedef struct {
     bool dnssec;
     char output_diff_path[512];
     FILE *diff_fp;
+    const char *tls_ca_file;    /* +tls-ca=FILE (the argv string) */
+    bool tls_default_store;     /* +tls-ca */
+    const char *tls_hostname;   /* +tls-hostname=NAME: the name the certificate must carry (default: the server's) */
 } replay_options_t;
 
 typedef struct {
@@ -811,6 +816,9 @@ static bool replay_resolve(const char *server, int port, bool stream,
     return ok;
 }
 
+static void replay_warn_too_large(const char *server, int port, const char *tr, size_t len, size_t cap);
+static bool replay_send_all(int fd, const uint8_t *p, size_t len);
+
 static ssize_t replay_exchange_posix(const char *server, int port, bool use_tcp,
                                      const uint8_t *pkt, size_t pkt_len,
                                      uint8_t *resp, size_t resp_cap, int timeout_ms) {
@@ -818,17 +826,25 @@ static ssize_t replay_exchange_posix(const char *server, int port, bool use_tcp,
     socklen_t slen = 0;
     if (!replay_resolve(server, port > 0 ? port : 53, use_tcp, &ss, &slen)) return -1;
 
+    if (pkt_len < 12) return -1;
     if (!use_tcp) {
         int fd = socket(ss.ss_family, SOCK_DGRAM, 0);
         if (fd < 0) return -1;
         set_replay_socket_timeouts(fd, timeout_ms);
 
-        ssize_t sent = sendto(fd, pkt, pkt_len, 0, (struct sockaddr *)&ss, slen);
-        if (sent != (ssize_t)pkt_len) {
+        /* T2-L2: a connected socket takes datagrams from the server's address and port only, and the answer must carry the
+         * query's ID (RFC 5452 §9.1): another datagram is not taken for the answer (a few are let pass, then it is a failure) */
+        if (connect(fd, (struct sockaddr *)&ss, slen) != 0 || send(fd, pkt, pkt_len, 0) != (ssize_t)pkt_len) {
             close(fd);
             return -1;
         }
-        ssize_t received = recvfrom(fd, resp, resp_cap, 0, NULL, NULL);
+        ssize_t received = -1;
+        for (int tries = 0; tries < 8; tries++) {
+            received = recv(fd, resp, resp_cap, 0);
+            if (received < 0) break;
+            if (received >= 12 && resp[0] == pkt[0] && resp[1] == pkt[1]) break;
+            received = -1;
+        }
         close(fd);
         return received;
     } else {
@@ -841,7 +857,7 @@ static ssize_t replay_exchange_posix(const char *server, int port, bool use_tcp,
             return -1;
         }
         uint8_t len_prefix[2] = { (uint8_t)(pkt_len >> 8), (uint8_t)(pkt_len & 0xFF) };
-        if (send(fd, len_prefix, 2, 0) != 2 || send(fd, pkt, pkt_len, 0) != (ssize_t)pkt_len) {
+        if (!replay_send_all(fd, len_prefix, 2) || !replay_send_all(fd, pkt, pkt_len)) {
             close(fd);
             return -1;
         }
@@ -855,16 +871,21 @@ static ssize_t replay_exchange_posix(const char *server, int port, bool use_tcp,
             }
             got_len += (size_t)n;
         }
-        uint16_t expected_len = ((uint16_t)rlen_buf[0] << 8) | rlen_buf[1];
-        if (expected_len > resp_cap) expected_len = (uint16_t)resp_cap;
-        ssize_t total = 0;
+        size_t expected_len = ((size_t)rlen_buf[0] << 8) | rlen_buf[1];
+        /* T2-L2: an answer larger than the buffer is a failure, said once; it was compared cut before */
+        if (expected_len > resp_cap) {
+            replay_warn_too_large(server, port, "TCP", expected_len, resp_cap);
+            close(fd);
+            return -1;
+        }
+        size_t total = 0;
         while (total < expected_len) {
             ssize_t r = recv(fd, resp + total, expected_len - total, 0);
             if (r <= 0) break;
-            total += r;
+            total += (size_t)r;
         }
         close(fd);
-        return total;
+        return total == expected_len ? (ssize_t)total : -1;   /* (a cut answer is not an answer) */
     }
 }
 
@@ -890,14 +911,50 @@ static int replay_default_port(replay_transport_t kind) {
 
 /* ワーカー起動前に1回だけ作る (以後は各スレッドが SSL_new するだけなのでスレッド安全)。
  * dag 本体の DoT/DoH 実装はグローバルな接続キャッシュを使うため、並列ワーカーからは呼ばない。
- * replay の対象は検証用のサーバなので、dag の +tls / +https と同じく証明書は検証しない。 */
+ * T2-L1: 証明書の検証は dag の +tls / +https と同じ (dag_tls.h): +tls-ca[=FILE] で検証し (+tls-hostname= で名前を指定)、
+ * 指定がなければ検証しない旨を警告する。比較ツールなので、検証しない応答は経路上で差し替えられ得る。 */
 static SSL_CTX *g_replay_ssl_ctx = NULL;
+static bool g_replay_tls_verify;
+static const char *g_replay_tls_hostname;
 
-static bool replay_init_tls(void) {
+static bool replay_init_tls(const replay_options_t *o) {
     if (g_replay_ssl_ctx) return true;
     g_replay_ssl_ctx = SSL_CTX_new(TLS_client_method());
     if (!g_replay_ssl_ctx) return false;
-    SSL_CTX_set_verify(g_replay_ssl_ctx, SSL_VERIFY_NONE, NULL);
+    if (!dag_tls_ctx_verify(g_replay_ssl_ctx, o->tls_ca_file, o->tls_default_store)) {
+        SSL_CTX_free(g_replay_ssl_ctx);
+        g_replay_ssl_ctx = NULL;
+        return false;
+    }
+    g_replay_tls_verify = o->tls_ca_file || o->tls_default_store;
+    g_replay_tls_hostname = o->tls_hostname;
+    if (!g_replay_tls_verify) {
+        fprintf(stderr, "[WARNING] TLS certificate verification is disabled for the tls / doh servers (opportunistic TLS): "
+                        "an answer can be replaced on the path. Use +tls-ca[=file] to verify the server certificate.\n");
+    }
+    return true;
+}
+
+/* a message said once for the whole run (the workers run in parallel) */
+static bool replay_once(atomic_flag *f) { return !atomic_flag_test_and_set(f); }
+
+static void replay_warn_too_large(const char *server, int port, const char *tr, size_t len, size_t cap) {
+    static atomic_flag told = ATOMIC_FLAG_INIT;
+    if (replay_once(&told)) {
+        fprintf(stderr, "[WARNING] a %s answer of %zu bytes from %s:%d is larger than the %zu-byte replay buffer: such answers "
+                        "count as failed, they are not compared cut (said once)\n", tr, len, server, port, cap);
+    }
+}
+
+/* T2-L2 (as tcp_send_all in dag_transport.c): every byte, or false */
+static bool replay_send_all(int fd, const uint8_t *p, size_t len) {
+    while (len > 0) {
+        ssize_t n = send(fd, p, len, 0);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return false;
+        p += n;
+        len -= (size_t)n;
+    }
     return true;
 }
 
@@ -945,17 +1002,22 @@ static ssize_t replay_exchange_tls(const char *server, int port, bool doh,
         return -1;
     }
     SSL_set_fd(ssl, (int)fd);
-    struct in_addr a4;
-    struct in6_addr a6;
-    if (inet_pton(AF_INET, server, &a4) != 1 && inet_pton(AF_INET6, server, &a6) != 1) {
-        SSL_set_tlsext_host_name(ssl, server);   // RFC 6066 SNI (IP リテラルには付けない)
-    }
+    /* RFC 6066 SNI (not for an address); with +tls-ca the name (or address) the certificate must carry */
+    dag_tls_ssl_peer(ssl, g_replay_tls_hostname ? g_replay_tls_hostname : server, g_replay_tls_verify);
     if (!doh) {
         SSL_set_alpn_protos(ssl, (const unsigned char *)"\x03" "dot", 4);  // RFC 7858 §3.1
     } else {
         SSL_set_alpn_protos(ssl, (const unsigned char *)"\x08" "http/1.1", 9);
     }
-    if (SSL_connect(ssl) != 1) goto done;
+    if (SSL_connect(ssl) != 1 || (g_replay_tls_verify && SSL_get_verify_result(ssl) != X509_V_OK)) {
+        static atomic_flag told = ATOMIC_FLAG_INIT;
+        long vr = SSL_get_verify_result(ssl);
+        if (g_replay_tls_verify && vr != X509_V_OK && replay_once(&told)) {
+            fprintf(stderr, "[ERROR] TLS peer certificate verification for %s:%d failed: %s (such answers count as failed; said once)\n",
+                    server, port, X509_verify_cert_error_string(vr));
+        }
+        goto done;
+    }
 
     if (!doh) {
         uint8_t len_prefix[2] = { (uint8_t)(pkt_len >> 8), (uint8_t)(pkt_len & 0xFF) };
@@ -963,7 +1025,7 @@ static ssize_t replay_exchange_tls(const char *server, int port, bool doh,
         uint8_t rlen_buf[2];
         if (ssl_read_exact(ssl, rlen_buf, 2) != 0) goto done;
         size_t rlen = ((size_t)rlen_buf[0] << 8) | rlen_buf[1];
-        if (rlen > resp_cap) goto done;
+        if (rlen > resp_cap) { replay_warn_too_large(server, port, "TLS", rlen, resp_cap); goto done; }
         if (ssl_read_exact(ssl, resp, rlen) != 0) goto done;
         result = (ssize_t)rlen;
     } else {
@@ -1457,11 +1519,13 @@ static size_t build_text_query(const char *qname, uint16_t qtype, bool dnssec_ok
     }
 
     size_t off = 12;
-    const char *p = qname;
+    /* T2-L3: RFC 1035 §2.3.4: a label is 1 to 63 octets and the name at most 255; "a..b", ".a" or a 64-octet label is not a
+     * name (0: the caller skips the line and says so).  "." alone is the root, and one trailing dot ends the name. */
+    const char *p = strcmp(qname, ".") == 0 ? "" : qname;
     while (*p) {
         const char *dot = strchr(p, '.');
         size_t lablen = dot ? (size_t)(dot - p) : strlen(p);
-        if (lablen == 0) break;
+        if (lablen == 0 || lablen > 63) return 0;
         if (off + 1 + lablen >= cap) return 0;
         buf[off++] = (uint8_t)lablen;
         memcpy(buf + off, p, lablen);
@@ -1469,7 +1533,7 @@ static size_t build_text_query(const char *qname, uint16_t qtype, bool dnssec_ok
         if (!dot) break;
         p = dot + 1;
     }
-    if (off >= cap) return 0;
+    if (off >= cap || off - 12 + 1 > 255) return 0;
     buf[off++] = 0; // Root label
 
     if (off + 4 > cap) return 0;
@@ -1588,6 +1652,15 @@ int run_replay_mode(int argc, char **argv) {
             opts.dnssec = true;
         } else if (strcmp(argv[idx], "+nodnssec") == 0 || strcmp(argv[idx], "+nodo") == 0) {
             opts.dnssec = false;
+        } else if (strncmp(argv[idx], "+tls-ca=", 8) == 0) {   /* T2-L1: as dag's +tls / +https */
+            opts.tls_ca_file = argv[idx] + 8;
+        } else if (strcmp(argv[idx], "+tls-ca") == 0) {
+            opts.tls_default_store = true;
+        } else if (strcmp(argv[idx], "+notls-ca") == 0) {
+            opts.tls_default_store = false;
+            opts.tls_ca_file = NULL;
+        } else if (strncmp(argv[idx], "+tls-hostname=", 14) == 0) {
+            opts.tls_hostname = argv[idx] + 14;
         }
         idx++;
     }
@@ -1597,7 +1670,8 @@ int run_replay_mode(int argc, char **argv) {
                         "[--compare-recorded] [--rate <qps>] [--workers <N>] [--diff] [--output <text|json>] "
                         "[--transport <udp|tcp|tls|doh>] [--max-queries <N>] [--ignore-ttl] "
                         "[--timeout-ms <N>] [--stop-after <N>] [--output-diff <file>] "
-                        "[--server1-transport <transport>] [--server2-transport <transport>]\n");
+                        "[--server1-transport <transport>] [--server2-transport <transport>] "
+                        "[+tls-ca[=file]] [+tls-hostname=name]\n");
         return 1;
     }
 
@@ -1618,7 +1692,7 @@ int run_replay_mode(int argc, char **argv) {
         replay_transport_t k = replay_transport_kind(tr_opts[i]);
         if (k == REPLAY_TR_TLS || k == REPLAY_TR_DOH) need_tls = true;
     }
-    if (need_tls && !replay_init_tls()) {
+    if (need_tls && !replay_init_tls(&opts)) {
         fprintf(stderr, "[ERROR] Failed to initialize TLS\n");
         return 1;
     }
@@ -1651,6 +1725,18 @@ int run_replay_mode(int argc, char **argv) {
         fprintf(stderr, "[ERROR] Cannot open replay input file: %s (%s)\n", opts.input_path, strerror(errno));
         if (opts.diff_fp && opts.diff_fp != stdout) fclose(opts.diff_fp);
         return 1;
+    }
+    {   /* T2-L4: pcapng (Section Header Block type 0x0A0D0D0A, the same in both byte orders) */
+        uint8_t m[4];
+        bool ng = fread(m, 1, 4, fp) == 4 && m[0] == 0x0a && m[1] == 0x0d && m[2] == 0x0d && m[3] == 0x0a;
+        fseek(fp, 0, SEEK_SET);
+        if (ng) {
+            fprintf(stderr, "[ERROR] %s is a pcapng file, which --replay does not read: convert it to pcap first "
+                            "(editcap -F pcap in.pcapng out.pcap)\n", opts.input_path);
+            fclose(fp);
+            if (opts.diff_fp && opts.diff_fp != stdout) fclose(opts.diff_fp);
+            return 1;
+        }
     }
 
     replay_queue_t *queue = calloc(1, sizeof(replay_queue_t));
@@ -1696,10 +1782,16 @@ int run_replay_mode(int argc, char **argv) {
     uint64_t seq = 0;
     uint32_t rate_delay_us = (opts.rate_qps > 0) ? (uint32_t)(1000000 / opts.rate_qps) : 0;
 
-    if (nread == 4 && ((magic[0] == 0xa1 && magic[1] == 0xb2 && magic[2] == 0xc3 && magic[3] == 0xd4) ||
-                       (magic[0] == 0xd4 && magic[1] == 0xc3 && magic[2] == 0xb2 && magic[3] == 0xa1))) {
+    /* T2-L4: the pcap magic in either byte order, microsecond (a1b2c3d4) or nanosecond (a1b23c4d) time stamps: the record layout
+     * is the same and the time stamps are not used, so both are read.  pcapng (its Section Header Block starts 0a0d0d0a) is another
+     * format: refused before anything is sent (see the open above), never read as a text query list (that sent garbage queries) */
+    bool pcap_be = nread == 4 && magic[0] == 0xa1 && magic[1] == 0xb2 &&
+                   ((magic[2] == 0xc3 && magic[3] == 0xd4) || (magic[2] == 0x3c && magic[3] == 0x4d));
+    bool pcap_le = nread == 4 && magic[3] == 0xa1 && magic[2] == 0xb2 &&
+                   ((magic[1] == 0xc3 && magic[0] == 0xd4) || (magic[1] == 0x3c && magic[0] == 0x4d));
+    if (pcap_be || pcap_le) {
         // PCAP File
-        bool is_le = (magic[0] == 0xd4);
+        bool is_le = pcap_le;
         uint8_t pcap_hdr[24];
         if (fread(pcap_hdr, 1, 24, fp) == 24) {
             uint32_t linktype = pcap_read_u32(pcap_hdr + 20, is_le);
@@ -1763,6 +1855,14 @@ int run_replay_mode(int argc, char **argv) {
                     fprintf(stderr, "[WARNING] %lu query(ies) had no recorded response in capture "
                                     "(incomplete capture or timeout). Excluding from comparison.\n",
                             (unsigned long)missing_response_count);
+                }
+                tcp_reasm_stats_t rs;
+                tcp_reasm_get_stats(tcp_reasm, &rs);
+                if (rs.short_frames || rs.ooo_dropped || rs.overflow_evicted) {
+                    fprintf(stderr, "[WARNING] TCP reassembly gave up part of the capture: %lu frame(s) shorter than a DNS header skipped, "
+                                    "%lu out-of-order segment(s) not kept, %lu stream(s) over the buffer limit dropped. "
+                                    "Messages in them are not compared.\n",
+                            (unsigned long)rs.short_frames, (unsigned long)rs.ooo_dropped, (unsigned long)rs.overflow_evicted);
                 }
                 tcp_reasm_destroy(tcp_reasm);
                 free(pairs);
@@ -1918,7 +2018,9 @@ int run_replay_mode(int argc, char **argv) {
 
         char line[1024];
         uint8_t dns_wire[MAX_REPLAY_PACKET_LEN];
+        unsigned long lineno = 0;
         while (fgets(line, sizeof(line), fp)) {
+            lineno++;
             char *p = line;
             while (*p && isspace((unsigned char)*p)) p++;
             if (!*p || *p == '#' || *p == ';') continue;
@@ -1944,7 +2046,10 @@ int run_replay_mode(int argc, char **argv) {
                     strncpy(line_transport, "udp", sizeof(line_transport) - 1);
                 }
                 size_t wlen = build_text_query(qname, qtype, line_dnssec, dns_wire, sizeof(dns_wire));
-                if (wlen > 0) {
+                if (wlen == 0) {
+                    fprintf(stderr, "[WARNING] %s line %lu: '%.80s' is not a query name (labels of 1 to 63 octets, "
+                                    "at most 255 in all: RFC 1035 2.3.4); line skipped\n", opts.input_path, lineno, qname);
+                } else {
                     seq++;
                     if (!enqueue_task(queue, dns_wire, wlen, seq, line_transport)) {
                         break;

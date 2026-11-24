@@ -139,7 +139,7 @@ use strict; use warnings; use IO::Socket::INET;
 my $s = IO::Socket::INET->new(LocalAddr => '127.0.0.1', LocalPort => $ARGV[0], Proto => 'tcp', Listen => 2, ReuseAddr => 1) or die "listen: $!";
 print STDERR "listening\n";
 my $c = $s->accept or die;
-my $m = "HELLO\nv=1\nnonce=00112233445566778899aabbccddeeff\nauth=0\n";
+my $m = "HELLO\nv=2\nnonce=00112233445566778899aabbccddeeff\nauth=0\n";
 print $c pack('N', length $m), $m;
 sleep 30;   # takes the run, says nothing
 PERL
@@ -193,6 +193,81 @@ start_agent "$A3" --agent-key "$W/key"; P3=$AGENT_PID
 [ "$rc" -eq 2 ] && grep -q 'wants a key' "$W/r13.err" || fail "no key for an agent that wants one: exit $rc: $(cat "$W/r13.err")"
 echo "ok: the shared key: right key runs, wrong key and no key are refused"
 
+# ---------------------------------------------------------------- 6b. the key covers the whole RUN and the agent's replies (T3-L1); a silent peer does not hold the agent (T3-L2)
+if perl -MDigest::SHA -e 1 2>/dev/null; then
+cat > "$W/auth.pl" <<'PERL'
+use strict; use warnings; use IO::Socket::INET; use IO::Select; use Digest::SHA qw(hmac_sha256_hex);
+my ($port, $case, $keyfile, @args) = @ARGV;
+open my $kf, '<', $keyfile or die; my $key = <$kf>; close $kf; $key =~ s/[\r\n \t]+\z//;
+my $c = IO::Socket::INET->new(PeerAddr => "127.0.0.1:$port", Proto => 'tcp') or die "connect: $!";
+sub rd { my ($n) = @_; my $b = ''; my $sel = IO::Select->new($c);
+    while (length $b < $n) { return undef unless $sel->can_read(8); my $r = sysread($c, my $x, $n - length $b); return undef unless $r; $b .= $x } $b }
+sub msg { my $h = rd(4); return undef unless defined $h; rd(unpack('N', $h)) }
+my $hello = msg(); die "no hello\n" unless defined $hello && $hello =~ /^HELLO\nv=2\nnonce=([0-9a-f]{32})\n/;
+my $na = $1;
+my $nc = '0123456789abcdef0123456789abcdef';
+my $body = "RUN\nv=2\ncnonce=$nc\n" . join('', map { "arg=$_\n" } @args);
+my $mac = hmac_sha256_hex("dnsqps-agent-v2 c2a $na 0\n" . $body, $key);
+$body =~ s/arg=10\n/arg=99999\n/ if $case eq 'tamper';           # an option changed on the path after the MAC was made
+$mac = hmac_sha256_hex("dnsqps-agent-v1:$na", $key) if $case eq 'v1mac';   # the old proof: the nonce only
+my $m = $body . "mac=$mac\n";
+syswrite($c, pack('N', length $m) . $m);
+my $r = msg();
+if (!defined $r) { print "CLOSED\n"; exit 0 }
+if ($r =~ /\AREADY\nmac=([0-9a-f]{64})\n\z/) {
+    print hmac_sha256_hex("dnsqps-agent-v2 a2c $nc 0\nREADY\n", $key) eq $1 ? "READY signed\n" : "READY badmac\n";
+} elsif ($r =~ /^ERR\nmsg=(.*)\n/) { print "ERR $1\n" } else { print "OTHER ", (split /\n/, $r)[0], "\n" }
+PERL
+cat > "$W/fake.pl" <<'PERL'
+use strict; use warnings; use IO::Socket::INET;
+my ($port, $case) = @ARGV;
+my $s = IO::Socket::INET->new(LocalAddr => '127.0.0.1', LocalPort => $port, Proto => 'tcp', Listen => 2, ReuseAddr => 1) or die "listen: $!";
+print STDERR "listening\n";
+my $c = $s->accept or die;
+my $m = "HELLO\nv=2\nnonce=00112233445566778899aabbccddeeff\nauth=" . ($case eq 'noauth' ? 0 : 1) . "\n";
+print $c pack('N', length $m), $m;
+sysread($c, my $x, 65536);
+my $r = "READY\n";   # not signed: anyone could send it
+print $c pack('N', length $r), $r;
+sleep 5;
+PERL
+    QF="$W/q.txt"
+    out=$(perl "$W/auth.pl" "$A3" good "$W/key" -s 127.0.0.1 -p "$PORT" -d "$QF" -N 10 2>&1 | head -1)
+    [ "$out" = "READY signed" ] || fail "a RUN with the v2 MAC: $out"
+    out=$(perl "$W/auth.pl" "$A3" tamper "$W/key" -s 127.0.0.1 -p "$PORT" -d "$QF" -N 10 2>&1 | head -1)
+    [ "$out" = "ERR authentication failed" ] || fail "a RUN whose options were changed after the MAC: $out"
+    out=$(perl "$W/auth.pl" "$A3" v1mac "$W/key" -s 127.0.0.1 -p "$PORT" -d "$QF" -N 10 2>&1 | head -1)
+    [ "$out" = "ERR authentication failed" ] || fail "a RUN with the old nonce-only proof: $out"
+    echo "ok: the MAC covers the RUN's options; the agent's READY is signed"
+    A6=$(kari_port 6 15757)
+    for case in noauth unsigned; do
+        perl "$W/fake.pl" "$A6" "$case" 2> "$W/fake_$case.err" &
+        FPID=$!; PIDS="$PIDS $FPID"
+        kari_wait_log "$W/fake_$case.err" listening 10 || fail "the fake agent ($case) did not start"
+        # shellcheck disable=SC2086
+        "$DQ" -r --agents "127.0.0.1:$A6" --agent-key "$W/key" $CTL -N 100 --agent-timeout 3 > "$W/fk_$case.out" 2> "$W/fk_$case.err"; rc=$?
+        kill "$FPID" 2>/dev/null; wait "$FPID" 2>/dev/null
+        case "$case" in
+            noauth) [ "$rc" -eq 2 ] && grep -q "has no key" "$W/fk_$case.err" || fail "a controller with a key and an agent without: exit $rc: $(cat "$W/fk_$case.err")" ;;
+            unsigned) [ "$rc" -ne 0 ] && grep -q "not authenticated" "$W/fk_$case.err" || fail "an unsigned READY: exit $rc: $(cat "$W/fk_$case.err")" ;;
+        esac
+    done
+    echo "ok: the controller authenticates the agent (no key, unsigned reply)"
+else
+    echo "SKIP: the v2 MAC checks (no Digest::SHA)"
+fi
+# a peer that connects and says nothing: the controller is served beside it, not after it
+perl -MIO::Socket::INET -e 'my $c = IO::Socket::INET->new("127.0.0.1:$ARGV[0]") or die; sleep 12' "$A2" &
+HOLD=$!; PIDS="$PIDS $HOLD"
+sleep 0.5
+t0=$(date +%s)
+# shellcheck disable=SC2086
+"$DQ" -r --agents "127.0.0.1:$A2" $CTL -N 2000 --json --agent-timeout 3 > "$W/hold.json" 2> "$W/hold.err"; rc=$?
+t1=$(date +%s)
+kill "$HOLD" 2>/dev/null
+[ "$rc" -eq 0 ] && [ "$(jnum sent < "$W/hold.json")" = "2000" ] || fail "a silent peer held the agent: exit $rc after $((t1 - t0)) s: $(cat "$W/hold.err")"
+echo "ok: a silent peer does not hold the agent (served in $((t1 - t0)) s)"
+
 # ---------------------------------------------------------------- 7. a raw client: garbage, an oversized message, options an agent must not take
 cat > "$W/raw.pl" <<'PERL'
 use strict; use warnings; use IO::Socket::INET; use IO::Select;
@@ -204,12 +279,12 @@ sub msg { my $h = rd(4); return undef unless defined $h; my $n = unpack('N', $h)
 my $hello = msg(); die "no hello\n" unless defined $hello && $hello =~ /^HELLO\n/;
 if ($case eq 'garbage') { syswrite($c, "\xff\xff\xff\xffgarbage") }
 elsif ($case eq 'zero') { syswrite($c, pack('N', 0)) }
-elsif ($case eq 'badverb') { my $m = "run\nv=1\n"; syswrite($c, pack('N', length $m) . $m) }
-elsif ($case eq 'nokv') { my $m = "RUN\nv=1\narg=-h\n"; syswrite($c, pack('N', length $m) . $m) }
-elsif ($case eq 'reflect') { my $m = "RUN\nv=1\narg=--reflect\narg=127.0.0.1:1\n"; syswrite($c, pack('N', length $m) . $m) }
-elsif ($case eq 'agent') { my $m = "RUN\nv=1\narg=--agent=127.0.0.1:9\n"; syswrite($c, pack('N', length $m) . $m) }
-elsif ($case eq 'badopt') { my $m = "RUN\nv=1\narg=--nosuchoption\n"; syswrite($c, pack('N', length $m) . $m) }
-elsif ($case eq 'slow') { syswrite($c, pack('N', 100) . "RUN\nv=1\n"); sleep 1 }   # a cut message, then the end of the connection
+elsif ($case eq 'badverb') { my $m = "run\nv=2\n"; syswrite($c, pack('N', length $m) . $m) }
+elsif ($case eq 'nokv') { my $m = "RUN\nv=2\narg=-h\n"; syswrite($c, pack('N', length $m) . $m) }
+elsif ($case eq 'reflect') { my $m = "RUN\nv=2\narg=--reflect\narg=127.0.0.1:1\n"; syswrite($c, pack('N', length $m) . $m) }
+elsif ($case eq 'agent') { my $m = "RUN\nv=2\narg=--agent=127.0.0.1:9\n"; syswrite($c, pack('N', length $m) . $m) }
+elsif ($case eq 'badopt') { my $m = "RUN\nv=2\narg=--nosuchoption\n"; syswrite($c, pack('N', length $m) . $m) }
+elsif ($case eq 'slow') { syswrite($c, pack('N', 100) . "RUN\nv=2\n"); sleep 1 }   # a cut message, then the end of the connection
 my $r = msg();
 if (defined $r && $r =~ /^ERR\nmsg=(.*)\n/) { print "ERR $1\n" } elsif (defined $r) { print "OTHER ", (split /\n/, $r)[0], "\n" } else { print "CLOSED\n" }
 PERL

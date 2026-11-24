@@ -4,7 +4,7 @@
 #
 #   gen-file OUT              write a Frame Streams file (START, dnstap frames, STOP) with known traffic
 #   send SOCK MODE            act as a dnstap sender on tapstat's socket and check the answers
-#                             MODE: good badct garbage oversize idle earlydata nofields
+#                             MODE: good badct garbage oversize idle earlydata nofields dataidle refused
 #   sum FILE                  add up the JSON lines of karidns-tapstat; prints name=value lines
 #
 # The known traffic of gen-file (what the test expects, with -z example.test,sub.example.test):
@@ -124,6 +124,19 @@ if ($cmd eq 'send') {
         die "not closed\n" unless closed_within($s, 3);
     } elsif ($mode eq 'idle') {
         die "an idle sender was not dropped\n" unless closed_within($s, 8);
+    } elsif ($mode eq 'dataidle') {
+        # the handshake, one frame, then silence: the receiver's -w closes it
+        print $s ctl(4, 1);
+        my $acc = read_exact($s, 42, 3);
+        die "no ACCEPT\n" unless defined $acc && $acc eq ctl(1, 1);
+        print $s ctl(2, 1), data((traffic())[0]);
+        die "a sender silent in the data phase was not dropped\n" unless closed_within($s, 8);
+    } elsif ($mode eq 'refused') {
+        # a sender the socket mode does not allow: closed without an ACCEPT
+        $SIG{PIPE} = 'IGNORE';
+        print $s ctl(4, 1);
+        my $acc = read_exact($s, 42, 3);
+        die "got an ACCEPT\n" if defined $acc;
     } elsif ($mode eq 'nofields') {
         # READY without a content type is accepted (ACCEPT without one), then a session
         print $s ctl(4, 0);

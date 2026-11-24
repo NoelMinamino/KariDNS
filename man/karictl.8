@@ -1,4 +1,4 @@
-.TH KARICTL 8 "2026-11-23" "KariDNS" "KariDNS Manual"
+.TH KARICTL 8 "2026-11-24" "KariDNS" "KariDNS Manual"
 .\" Generated from docs/karictl.md by man/md2man.pl (make man): edit the Markdown manual, not this page.
 .SH NAME
 karictl \- Remote Control and Management Utility for KariDNS
@@ -1774,8 +1774,16 @@ padding of the secret is ignored. The value after the first \fBalgorithm\fR
 \fBhmac\-sha224\fR, \fBhmac\-sha256\fR (default), \fBhmac\-sha384\fR or
 \fBhmac\-sha512\fR; it must match the server's \fBcontrol\-channel { algorithm
 }\fR, and an unsupported name exits with status 2. The key name is not used. The
-secret may decode to at most 256 bytes. \fBkarictl\fR prints a warning when the
-file is readable by group or other users; it should have mode \fB0600\fR.
+secret may decode to at most 256 bytes. A file that holds a \fBsecret\fR and
+that group or other users may read or write is refused (exit status 2, with the
+\fBchmod 600\fR that fixes it), as the server refuses such a
+\fBconninfo\-file\fR: whoever reads the secret can run every command the key
+allows. This applies to any file given with \fB\-c\fR that holds the secret,
+\fBkaridns.conf\fR included. The file is opened once and its mode checked on
+that descriptor. Each command word must be non-empty and free of white space and
+control characters, the command line at most 510 bytes, and a command takes at
+most three arguments (as \fBstats\fR and \fBstore\fR already checked): otherwise
+exit status 2 before anything is sent.
 .PP
 \fBRestricted keys.\fR The server can hold several keys, each allowed to run
 only some commands (\fBcontrol\-channel { keys { } }\fR in \fBkaridns.conf\fR,

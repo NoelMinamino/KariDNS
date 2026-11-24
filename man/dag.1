@@ -1,4 +1,4 @@
-.TH DAG 1 "2026-11-17" "KariDNS" "KariDNS Manual"
+.TH DAG 1 "2026-11-24" "KariDNS" "KariDNS Manual"
 .\" Generated from docs/dag.md by man/md2man.pl (make man): edit the Markdown manual, not this page.
 .SH NAME
 dag \- DNS Anomaly Generator, Protocol Inspector, and Multi-Server Verification
@@ -361,8 +361,12 @@ after \fB+trace\fR to show it again. \fB+trace\fR also implies \fB+dnssec\fR
 banner as a normal lookup (\fB; <<>> dag <<>> ...\fR, \fB;; global options:
 +cmd\fR). A response whose Authority section has no NS records (an authoritative
 NODATA answer, or an RFC 9824 compact denial with RCODE NOERROR) ends the trace
-like an answer. Each hop ends with \fB;; Received N bytes from ADDR#PORT(name)
-in T ms\fR, where \fBname\fR is the \fB@server\fR text (or the system resolver
+like an answer. With a TSIG key, see "TSIG with \fB+trace\fR" in TSIG
+TRANSACTION SECURITY: a hop whose response does not verify ends the trace. The
+NS addresses looked up through \fB@server\fR are only those of the NS name
+itself (or of the target of its CNAME in that answer), not every address record
+of the answer. Each hop ends with \fB;; Received N bytes from ADDR#PORT(name) in
+T ms\fR, where \fBname\fR is the \fB@server\fR text (or the system resolver
 address) for the first query and the nameserver name the address belongs to for
 the later ones, as in BIND \fBdig\fR. Like BIND \fBdig\fR 9.20, the trace ends
 at the authoritative answer: a \fBCNAME\fR (or \fBDNAME\fR) in the final answer
@@ -641,8 +645,26 @@ generated \fB.private\fR file (e.g.,
 \fBKexample.com.+013+12345.private\fR). When a file starting with
 \fBPrivate\-key\-format:\fR is passed, \fBdag\fR automatically switches to
 SIG(0) signing, deriving the signer domain name, algorithm, and key tag from the
-file and filename without needing extra flags, matching BIND \fBdig\fR behavior.
+file and filename without needing extra flags, matching BIND \fBdig\fR
+behavior. An RSA key (algorithm 8) of more than 4096 bits is refused with
+\fBerror: the RSA modulus is longer than 4096 bits\fR; it is never cut to 4096
+bits (a cut modulus is another key).
 .RE
+.PP
+\fBTSIG with \fB+trace\fB, \fB+nssearch\fB and \fB+trace2\fB (intentional
+difference from \fBdig\fB).\fR Every response to a signed query is verified (RFC
+8945 \[u00A7]5.3.2) and a failure is reported with the \fBdig\fR line (\fB;;
+Couldn't verify signature: ...\fR). \fBdig\fR 9.20 then goes on and follows the
+referral of that response. \fBdag\fR shows the response but takes nothing from
+it: \fB+trace\fR stops with \fB;; TSIG verification failed, not following the
+referral; stopping trace.\fR, \fB+nssearch\fR with \fB;; TSIG verification
+failed, not using the NS records of <name>\fR (exit status 1), the NS address
+lookups of \fB+trace\fR through \fB@server\fR drop the addresses of a reply that
+does not verify, and the \fB+trace2\fR priming query to \fB@server\fR fails
+(\fB;; priming query to <addr> failed: TSIG verification failed\fR). A path
+traced through a response that does not verify would be only the claim of
+whoever could send it. With every response verified the output is the same as
+\fBdig\fR's.
 .TP 8
 \fB+fuzztime[=timestamp]\fR
 Manually override the TSIG or SIG(0) signing time (seconds since Unix epoch) to

@@ -1,4 +1,4 @@
-.TH DAG\-REPLAY 1 "2026-11-13" "KariDNS" "KariDNS Manual"
+.TH DAG\-REPLAY 1 "2026-11-24" "KariDNS" "KariDNS Manual"
 .\" Generated from docs/dag_replay.md by man/md2man.pl (make man): edit the Markdown manual, not this page.
 .SH NAME
 dag\-replay \- High-Performance DNS Traffic Replay and Differential Testing
@@ -12,6 +12,7 @@ dag \-\-replay <traffic_file> \-\-server1 <host[:port]> [\-\-server2 <host[:port
     [\-\-stop\-after <N>] [\-\-max\-queries <N>]
     [\-\-transport <udp|tcp|tls|doh>] [\-\-server1\-transport <transport>] [\-\-server2\-transport <transport>]
     [\-\-output <text|json>] [+dnssec | +do] [+nodnssec | +nodo]
+    [+tls\-ca[=file]] [+tls\-hostname=name]
 .fi
 .RE
 .SH DESCRIPTION
@@ -64,11 +65,16 @@ false differences caused by normal cache/TTL aging.
 Path to the input traffic source. Automatically detects format:
 .RS 8
 .IP \(bu 2
-\fBPCAP file\fR (magic \fB0xa1b2c3d4\fR or \fB0xd4c3b2a1\fR)
+\fBPCAP file\fR (magic \fB0xa1b2c3d4\fR, or \fB0xa1b23c4d\fR for nanosecond time
+stamps, in either byte order; the time stamps are not used)
 .IP \(bu 2
 \fBdnstap Frame Streams file\fR (initial escape word \fB0x00000000\fR)
 .IP \(bu 2
 \fBText query file\fR (line-by-line domain name and type)
+.IP \(bu 2
+A \fBpcapng\fR file (first block type \fB0x0a0d0d0a\fR) is refused with an error
+(exit status 1) before anything is sent; convert it first, e.g. \fBeditcap \-F
+pcap in.pcapng out.pcap\fR.
 .RE
 .TP 8
 \fB\-\-rate <qps>\fR, \fB\-\-rate\-limit <qps>\fR
@@ -119,10 +125,31 @@ Explicitly force the global transport protocol for all replayed queries,
 overriding any transport recorded in the input capture file. \fBtls\fR (alias
 \fBdot\fR) is DNS over TLS (RFC 7858, ALPN \fBdot\fR) and \fBdoh\fR (alias
 \fBhttps\fR) is DNS over HTTPS (RFC 8484, \fBPOST /dns\-query\fR over
-HTTP/1.1). Each DoT/DoH query uses its own TLS connection; server certificates
-are not verified (as with \fBdag +tls\fR / \fB+https\fR without \fB+tls\-ca\fR),
-and SNI is sent when the server is given by name. Any other value is an error
-(exit status 1).
+HTTP/1.1). Each DoT/DoH query uses its own TLS connection, and SNI is sent when
+the server is given by name. As with \fBdag +tls\fR / \fB+https\fR, the server
+certificate is verified only with \fB+tls\-ca\fR (below); without it a warning
+is printed once, because an answer that is not verified can be replaced on the
+path and would change the comparison. Any other value is an error (exit status
+1).
+.TP 8
+\fB+tls\-ca\fR, \fB+tls\-ca=<file>\fR
+Verify the certificate of the \fBtls\fR / \fBdoh\fR servers against the system
+CA store (\fB+tls\-ca\fR) or the CA certificates in \fB<file>\fR, and check that
+it carries the server's name or address (RFC 8310 \[u00A7]8.1), as \fBdag
++tls\-ca\fR does. A server whose certificate does not verify gets no answer
+counted (an error is printed once). \fB+notls\-ca\fR turns it off again. A
+\fB<file>\fR that cannot be loaded is an error (exit status 1).
+.TP 8
+\fB+tls\-hostname=<name>\fR
+The name the certificate must carry (and the SNI) instead of the
+\fB\-\-server1\fR / \fB\-\-server2\fR host, e.g. when the server is given by
+address.
+.PP
+UDP answers are read on a connected socket (only from the server's address and
+port) and must carry the query's ID (RFC 5452 \[u00A7]9.1); another datagram is
+not taken for the answer. A TCP or DoT answer larger than the 4096-byte replay
+buffer, or cut short, counts as failed (a warning is printed once); it is never
+compared cut.
 .TP 8
 \fB\-\-server1\-transport <udp|tcp|tls|doh>\fR
 Force the transport protocol specifically for queries sent to
@@ -187,6 +214,14 @@ TCP (\fBIPPROTO_TCP\fR, 6). For TCP captures, the 2-byte DNS length prefix is
 stripped and parsed into wire-format queries. Original transport is retained for
 each replayed packet.
 .IP \(bu 2
+\fBTCP Reassembly (\fB\-\-compare\-recorded\fB)\fR: The streams are put back
+together from their segments (RFC 7766 \[u00A7]8 framing). Once a stream is in
+step, a frame whose length is below a DNS header (12 octets) is skipped by its
+length. An out-of-order segment larger than 1500 octets, or one that finds all 8
+waiting slots taken, is not kept, and a direction that holds more than 256 KiB
+is given up. Each of these is counted and reported in one warning at the end,
+since the messages in them are not compared.
+.IP \(bu 2
 \fBQuery Filtering\fR: Validates that the packet is a query (\fBQR == 0\fR) with
 at least one question. Non-DNS or response packets are ignored.
 .SS 3. Plain Text Query Lists (.txt)
@@ -214,6 +249,11 @@ OPT for that query.
 .IP \(bu 2
 \fBPacket Construction\fR: Automatically generates RFC 1035 compliant DNS wire
 packets with randomized Transaction IDs and standard RD flags.
+.IP \(bu 2
+\fBName Check\fR: A name with an empty label (\fBa..b\fR, \fB.a\fR), a label
+longer than 63 octets or more than 255 octets in all (RFC 1035 \[u00A7]2.3.4) is
+not sent: the line is skipped with a warning that names the file and the
+line. \fB.\fR alone is the root.
 .SH TRANSPORT RESOLUTION HIERARCHY
 When dispatching queries to target servers, \fBdag \-\-replay\fR determines the
 transport protocol using the following strict priority:

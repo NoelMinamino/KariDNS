@@ -78,17 +78,8 @@ static char *karictl_find_word(char *cfg, const char *word) {
     return NULL;
 }
 
-char* extract_secret_from_config(const char* path) {
-    struct stat st;
-    if (stat(path, &st) == 0) {
-        if (st.st_mode & (S_IRGRP | S_IROTH)) {
-            fprintf(stderr, "[WARNING] %s is readable by group/other users; "
-                            "this file contains a shared secret and should be "
-                            "mode 0600 (owner read/write only)\n", path);
-        }
-    }
-
-    char *cfg = karictl_read_entire_file(path);
+static char *extract_secret_from_text(const char *text) {
+    char *cfg = text ? strdup(text) : NULL;
     if (!cfg) return NULL;
     
     char *secret = NULL;
@@ -116,8 +107,8 @@ char* extract_secret_from_config(const char* path) {
     return secret;
 }
 
-char* extract_socket_from_config(const char* path) {
-    char *cfg = karictl_read_entire_file(path);
+static char *extract_socket_from_text(const char *text) {
+    char *cfg = text ? strdup(text) : NULL;
     if (!cfg) return NULL;
     
     char *sock = NULL;
@@ -143,8 +134,8 @@ char* extract_socket_from_config(const char* path) {
 
 /* karictl.conf の algorithm を読む (引用符付き・無しの両方)。未指定なら NULL。
  * secret/socket と同じく、ファイル中で最初に現れる "algorithm" の値を使う。 */
-char* extract_algorithm_from_config(const char* path) {
-    char *cfg = karictl_read_entire_file(path);
+static char *extract_algorithm_from_text(const char *text) {
+    char *cfg = text ? strdup(text) : NULL;
     if (!cfg) return NULL;
 
     char *alg = NULL;
@@ -162,6 +153,64 @@ char* extract_algorithm_from_config(const char* path) {
     }
     free(cfg);
     return alg;
+}
+
+char *extract_secret_from_config(const char *path) {
+    char *cfg = karictl_read_entire_file(path);
+    char *v = extract_secret_from_text(cfg);
+    if (cfg) { explicit_bzero(cfg, strlen(cfg)); free(cfg); }
+    return v;
+}
+
+char *extract_socket_from_config(const char *path) {
+    char *cfg = karictl_read_entire_file(path);
+    char *v = extract_socket_from_text(cfg);
+    free(cfg);
+    return v;
+}
+
+char *extract_algorithm_from_config(const char *path) {
+    char *cfg = karictl_read_entire_file(path);
+    char *v = extract_algorithm_from_text(cfg);
+    free(cfg);
+    return v;
+}
+
+/* T4-L3: karictl.conf as karictl_open_session() uses it: opened once and checked on that descriptor (no stat-then-open race), read from it.
+ * A file that holds a secret and that group or others may read or write is refused, as the server refuses such a conninfo-file
+ * (dns_db_pgsql.c): the secret runs every control command.  NULL = refused or unreadable (said on stderr). */
+static char *karictl_read_conf_checked(const char *path) {
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) { fprintf(stderr, "karictl: cannot read %s: %s\n", path, strerror(errno)); return NULL; }
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 0 || st.st_size > 1024 * 1024) {
+        fprintf(stderr, "karictl: %s is not a regular file of at most 1 MiB\n", path);
+        close(fd);
+        return NULL;
+    }
+    char *buf = malloc((size_t)st.st_size + 1);
+    size_t got = 0;
+    while (buf && got < (size_t)st.st_size) {
+        ssize_t n = read(fd, buf + got, (size_t)st.st_size - got);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) break;
+        got += (size_t)n;
+    }
+    close(fd);
+    if (!buf) { fprintf(stderr, "karictl: out of memory\n"); return NULL; }
+    buf[got] = '\0';
+    char *secret = extract_secret_from_text(buf);
+    if (secret && (st.st_mode & (S_IRGRP | S_IWGRP | S_IROTH | S_IWOTH))) {
+        fprintf(stderr, "karictl: %s holds the control secret and can be read or written by group or others (mode %04o); "
+                        "it must be private to its owner: chmod 600 %s\n", path, (unsigned)(st.st_mode & 07777), path);
+        explicit_bzero(secret, strlen(secret));
+        free(secret);
+        explicit_bzero(buf, got);
+        free(buf);
+        return NULL;
+    }
+    if (secret) { explicit_bzero(secret, strlen(secret)); free(secret); }
+    return buf;
 }
 
 /* 制御チャネルの HMAC。karidns 側 (dns_wire.c の TSIG アルゴリズム表) と同じ名前を受け付ける。 */
@@ -378,9 +427,17 @@ static void karictl_usage(FILE *fp, const char *argv0) {
 /* Connect to the control socket and authenticate (challenge/response HMAC).  Returns the descriptor, or -1 with the exit code in *rc.
  * One connection carries one command: a command that needs several (karictl stats pages) calls this again. */
 static int karictl_open_session(const char *conf_path, const char *cli_sock_path, int *rc) {
-    char *secret_b64 = extract_secret_from_config(conf_path);
+    char *conf_text = karictl_read_conf_checked(conf_path);
+    if (!conf_text) { *rc = 2; return -1; }
+    char *secret_b64 = extract_secret_from_text(conf_text);
+    char *cfg_alg = extract_algorithm_from_text(conf_text);
+    char *cfg_sock = extract_socket_from_text(conf_text);
+    explicit_bzero(conf_text, strlen(conf_text));
+    free(conf_text);
     if (!secret_b64) {
         fprintf(stderr, "Could not read secret from %s\n", conf_path);
+        free(cfg_alg);
+        free(cfg_sock);
         *rc = 2; return -1;
     }
 
@@ -389,6 +446,8 @@ static int karictl_open_session(const char *conf_path, const char *cli_sock_path
         fprintf(stderr, "Secret in config too long (max ~341 base64 chars)\n");
         explicit_bzero(secret_b64, b64_len);
         free(secret_b64);
+        free(cfg_alg);
+        free(cfg_sock);
         *rc = 2; return -1;
     }
 
@@ -398,6 +457,8 @@ static int karictl_open_session(const char *conf_path, const char *cli_sock_path
         fprintf(stderr, "Failed to decode base64 secret\n");
         explicit_bzero(secret_b64, b64_len);
         free(secret_b64);
+        free(cfg_alg);
+        free(cfg_sock);
         *rc = 2; return -1;
     }
     int padding = 0;
@@ -410,18 +471,17 @@ static int karictl_open_session(const char *conf_path, const char *cli_sock_path
     free(secret_b64);
 
     /* karidns の control-channel { algorithm } と同じアルゴリズムを使う (省略時 hmac-sha256) */
-    char *cfg_alg = extract_algorithm_from_config(conf_path);
     const EVP_MD *hmac_md = karictl_hmac_md(cfg_alg);
     if (!hmac_md) {
         fprintf(stderr, "Unsupported algorithm '%s' in %s (expected hmac-md5, hmac-sha1, hmac-sha224, "
                         "hmac-sha256, hmac-sha384 or hmac-sha512)\n", cfg_alg, conf_path);
         free(cfg_alg);
+        free(cfg_sock);
         explicit_bzero(secret_decoded, sizeof(secret_decoded));
         *rc = 2; return -1;
     }
     free(cfg_alg);
 
-    char *cfg_sock = extract_socket_from_config(conf_path);
     const char *target_sock = cli_sock_path ? cli_sock_path :
                               (cfg_sock ? cfg_sock : "/var/run/karidns/control.sock");
     struct sockaddr_un un;
@@ -1061,6 +1121,14 @@ static void json_views(const stats_view_t *vs, size_t nv) {
 
 /* one page: `obspage` with the cursor.  0 = the page is in page[0..*n), *next is the cursor of the following page ("" = the end);
  * 4 = the cursor is stale (the zones were reloaded); other = an exit code with the message printed */
+/* T4-L1: the strings of a snapshot from the server end inside their arrays before anything prints them with %s (a damaged or hostile reply
+ * must not make karictl read past them); every path that receives snapshots (stats pages, stats of one zone, observatory) calls this */
+static void obs_snap_terminate(zone_observatory_snapshot_t *s) {
+    s->domain[sizeof(s->domain) - 1] = '\0';
+    s->view_name[sizeof(s->view_name) - 1] = '\0';
+    s->shared_views[sizeof(s->shared_views) - 1] = '\0';
+}
+
 static int stats_fetch_page(const char *conf_path, const char *cli_sock, unsigned long want, const char *pattern, const char *cursor,
                             zone_observatory_snapshot_t *page, unsigned long *n, char *next, size_t next_cap) {
     int rc = 0;
@@ -1082,9 +1150,7 @@ static int stats_fetch_page(const char *conf_path, const char *cli_sock, unsigne
     snprintf(next, next_cap, "%s", strcmp(cur, "-") == 0 ? "" : cur);
     for (unsigned long i = 0; i < *n; i++) {
         if (!ctl_read_full(sock, &page[i], sizeof(page[i]))) { fprintf(stderr, "karictl: stats: truncated reply\n"); close(sock); return 3; }
-        page[i].domain[sizeof(page[i].domain) - 1] = '\0';
-        page[i].view_name[sizeof(page[i].view_name) - 1] = '\0';
-        page[i].shared_views[sizeof(page[i].shared_views) - 1] = '\0';
+        obs_snap_terminate(&page[i]);
     }
     close(sock);
     return 0;
@@ -1139,8 +1205,7 @@ static int karictl_stats(const char *conf_path, const char *cli_sock, const stat
             if (n == 0) { fprintf(stderr, "karictl: zone %s not found\n", o->zone); close(sock); rc = 3; break; }
             if (!ctl_read_full(sock, &page[0], sizeof(page[0]))) { fprintf(stderr, "karictl: stats: truncated reply\n"); close(sock); rc = 3; break; }
             close(sock);
-            page[0].domain[sizeof(page[0].domain) - 1] = '\0';
-            page[0].view_name[sizeof(page[0].view_name) - 1] = '\0';
+            obs_snap_terminate(&page[0]);
             if (o->json) json_zone(&page[0]);
             else if (!zbuf_add(&zb, &page[0])) { fprintf(stderr, "karictl: out of memory\n"); rc = 1; }
         }
@@ -1332,32 +1397,43 @@ int main(int argc, char **argv) {
         return karictl_stats(conf_path, cli_sock_path, &so);
     }
 
+    /* The control line: the words separated by one space, then a newline.  T4-L2: as on the stats and store paths, every word is checked
+     * before anything is sent: a space, a newline or another control character inside an argument would make other words (or another line)
+     * of it, an empty one would shift the rest, and a line too long or with more words than any command takes is an error, not cut. */
+    char cmd_msg[512];
+    {
+        const bool is_store = strcmp(argv[optind], "store") == 0;   /* store [-j | -k] [zone <name> [view]]: every word goes on; store compact | checkpoint | scrub start|stop change the store: the command `storeop` */
+        const bool op = is_store && optind + 1 < argc && (strcmp(argv[optind + 1], "compact") == 0 || strcmp(argv[optind + 1], "checkpoint") == 0 || strcmp(argv[optind + 1], "scrub") == 0);
+        if (!is_store && argc - optind > 4) {                         /* the longest: reload <zone> <view> force */
+            fprintf(stderr, "karictl: %s: too many arguments\n", argv[optind]);
+            karictl_usage(stderr, argv[0]);
+            return 2;
+        }
+        size_t ml = 0;
+        for (int ai = optind; ai < argc; ai++) {
+            const char *w = (ai == optind && op) ? "storeop" : argv[ai];
+            bool word_ok = w[0] != '\0';
+            for (const unsigned char *q = (const unsigned char *)w; *q && word_ok; q++) word_ok = *q > 0x20 && *q != 0x7f;
+            if (!word_ok) {
+                fprintf(stderr, "karictl: %s: an argument must not be empty or contain white space or control characters (write a space in a name as \\032)\n", argv[optind]);
+                return 2;
+            }
+            int n = snprintf(cmd_msg + ml, sizeof(cmd_msg) - ml, "%s%s", ai == optind ? "" : " ", w);
+            if (n < 0 || (size_t)n >= sizeof(cmd_msg) - ml - 1) {
+                fprintf(stderr, "karictl: %s: the command is longer than %zu bytes\n", argv[optind], sizeof(cmd_msg) - 2);
+                return 2;
+            }
+            ml += (size_t)n;
+        }
+        cmd_msg[ml++] = 0x0a;
+        cmd_msg[ml] = 0;
+    }
+
     int rc = 0;
     int sock = karictl_open_session(conf_path, cli_sock_path, &rc);
     if (sock < 0) return rc;
     char buf[1024];
     ssize_t r;
-
-    char cmd_msg[512];
-    if (strcmp(argv[optind], "store") == 0) {          /* store [-j | -k] [zone <name> [view]]: every word goes on; store compact | checkpoint | scrub start|stop change the store: the command `storeop` */
-        const bool op = optind + 1 < argc && (strcmp(argv[optind + 1], "compact") == 0 || strcmp(argv[optind + 1], "checkpoint") == 0 || strcmp(argv[optind + 1], "scrub") == 0);
-        size_t ml = (size_t)snprintf(cmd_msg, sizeof(cmd_msg), op ? "storeop" : "store");
-        for (int ai = optind + 1; ai < argc; ai++) {
-            int w = snprintf(cmd_msg + ml, sizeof(cmd_msg) - ml, " %s", argv[ai]);
-            if (w < 0 || (size_t)w >= sizeof(cmd_msg) - ml - 2) { fprintf(stderr, "karictl: store: the arguments are too long\n"); close(sock); return 2; }
-            ml += (size_t)w;
-        }
-        cmd_msg[ml++] = 0x0a;
-        cmd_msg[ml] = 0;
-    } else if (optind + 3 < argc) {                       /* reload <zone> <view> force */
-        snprintf(cmd_msg, sizeof(cmd_msg), "%s %s %s %s\n", argv[optind], argv[optind + 1], argv[optind + 2], argv[optind + 3]);
-    } else if (optind + 2 < argc) {
-        snprintf(cmd_msg, sizeof(cmd_msg), "%s %s %s\n", argv[optind], argv[optind + 1], argv[optind + 2]);
-    } else if (optind + 1 < argc) {
-        snprintf(cmd_msg, sizeof(cmd_msg), "%s %s\n", argv[optind], argv[optind + 1]);
-    } else {
-        snprintf(cmd_msg, sizeof(cmd_msg), "%s\n", argv[optind]);
-    }
 
     send(sock, cmd_msg, strlen(cmd_msg), 0);
 
@@ -1552,6 +1628,7 @@ int main(int argc, char **argv) {
                     close(sock);
                     return 3;
                 }
+                obs_snap_terminate(&snap);
                 char notify_time_str[64] = "never";
                 if (snap.last_notify_time > 0) {
                     time_t t = (time_t)snap.last_notify_time;
