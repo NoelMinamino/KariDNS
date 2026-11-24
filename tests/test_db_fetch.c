@@ -235,7 +235,7 @@ static void send_failed(int fd, kdb_enc_t *e, uint16_t view, const char *zone, u
 
 /* ---------------------------------------------------------------- the worker's side */
 extern int64_t g_ing_fetch_timeout_ms;                                 /* dns_db_ingest.c: 30 s, shortened here */
-extern int64_t g_ing_zone_stall_ms;                                    /* dns_db_ingest.c: 120 s, shortened here (review 2026-11-23 D-L4) */
+extern _Atomic int64_t g_ing_zone_stall_ms;                                    /* dns_db_ingest.c: 120 s, shortened here (review 2026-11-23 D-L4) */
 
 static bool wake_next(park_key_t *k, int ms) {
     park_wake_ring_t *r = park_wake_ring(0);
@@ -1930,10 +1930,10 @@ int main(void) {
         /* within the stall time nothing happens (the default, 120 s) */
         CHECK_MSG(!ch_next(&main6, &m, 700) && !main6.eof, "the batch stream: a message or the end before the stall time (eof %d)", (int)main6.eof);
         CHECK_MSG(!ch_next(&fetch6, &m, 10) && !fetch6.eof, "the fetch stream: a message or the end before the stall time (eof %d)", (int)fetch6.eof);
-        g_ing_zone_stall_ms = 300;
+        atomic_store(&g_ing_zone_stall_ms, 300);
         CHECK_MSG(!ch_next(&main6, &m, 10000) && main6.eof, "the batch stream was not closed after the stall time (eof %d)", (int)main6.eof);
         CHECK_MSG(!ch_next(&fetch6, &m, 10000) && fetch6.eof, "the fetch stream was not closed after the stall time (eof %d)", (int)fetch6.eof);
-        g_ing_zone_stall_ms = 120000;
+        atomic_store(&g_ing_zone_stall_ms, 120000);
         CHECK(dbreg_lookup_entry("default", "stall.test.") == NULL);              /* (nothing of the zone was installed) */
         hand_over(c[0], a7[1], -1);                                                 /* a loader without a fetch stream: the fetch that was out is failed */
         CHECK(wake_next(&k, 5000) && park_key_is(&k, "default", "r.test.") && k.failed);

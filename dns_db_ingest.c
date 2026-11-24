@@ -85,7 +85,7 @@ _Static_assert(ZDIR_APEX_GLUE_PER_NS == KDB_NOTIFY_ADDR_PER_NS && ZDIR_APEX_NADD
 #define STATIC_TEST
 STATIC_TEST int64_t g_ing_fetch_timeout_ms = 30000;
 /* review 2026-11-23 D-L4: a zone begun on a stream (ZONE_BEGIN) that gets no more data for this long is given up and the stream closed (zone_stalled()); a variable for the unit test */
-STATIC_TEST int64_t g_ing_zone_stall_ms = 120000;
+STATIC_TEST _Atomic int64_t g_ing_zone_stall_ms = 120000;      /* (atomic: the test changes it while the thread runs) */
 #define ING_FETCH_OUT_MAX (1u << 20)
 
 typedef struct {
@@ -5280,7 +5280,7 @@ static bool zone_stalled(const ing_job_t *j, int64_t *rx, bool paused, int64_t n
     *rx = now;
     return false;
   }
-  return now - *rx >= g_ing_zone_stall_ms;
+  return now - *rx >= atomic_load_explicit(&g_ing_zone_stall_ms, memory_order_relaxed);
 }
 
 static void zone_stall_check(ing_t *g) {
@@ -5323,7 +5323,7 @@ static void *ingest_thread(void *arg) {
       wait_ms = ING_WQ_TICK_MS;                          /* 0.7: names are remembered as shed: look again soon, to forget them when this thread has caught up (shed_release_check()) */
     if (g->hold && (wait_ms < 0 || wait_ms > 50)) wait_ms = 50;           /* warm-before-serve: look at the warm-up and the time often */
     if (g->cur || g->fcur) {                                               /* D-L4: a zone is open on a stream: look at its stall clock (zone_stall_check()) */
-      int64_t tick = g_ing_zone_stall_ms / 10;
+      int64_t tick = atomic_load_explicit(&g_ing_zone_stall_ms, memory_order_relaxed) / 10;
       if (tick > 1000) tick = 1000;
       if (tick < 10) tick = 10;
       if (wait_ms < 0 || wait_ms > tick) wait_ms = tick;
