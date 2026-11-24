@@ -1027,10 +1027,11 @@ has nothing more to fetch), 0 otherwise; \fB.fills\fR counts the fills that
 began since the start, \fB.unlogged_records\fR the changes made without a
 journal record; \fB.checkpoints\fR the bulk checkpoints (the durable points of
 the fill: made while the bodies are fetched, when the segments have doubled
-since the last one and grew by 4 GiB or more, or 15 minutes after the last one),
-\fB.next_checkpoint_bytes\fR the size of the segments at which the next one is
-due (0 while a pass runs); when the fill began (or was resumed) and when the
-last one ended
+since the last one and grew by 4 GiB or more, or 15 minutes after the last one;
+and, also while a pass lists the zones, when the private memory of the tables
+reached \fBstore.tables.private_max\fR), \fB.next_checkpoint_bytes\fR the size
+of the segments at which the next one is due (0 while a pass runs); when the
+fill began (or was resumed) and when the last one ended
 .TP 8
 \fBstore.bulk.resumed\fR, \fB.recoveries\fR, \fB.recovered_known\fR
 0.7: the start found an unlogged fill going on (1) and went on with it;
@@ -1066,12 +1067,26 @@ never wait for a page that is being written out (\fB.paced_us\fR: the time a
 checkpoint waited because it had written more than 256 MiB a second, so that the
 writers' journal appends do not queue behind a burst of it)
 .TP 8
-\fBstore.tables.private_bytes\fR
-0.7: the pages of the tables that the server changed since it started: memory of
-the process that the kernel cannot drop (about 200 bytes a zone once every page
-was written; 0 after a restart until a zone changes). \fBmemory\-limit\fR counts
-it: the zones in memory get the limit less this, at least a tenth of the limit
+\fBstore.tables.private_bytes\fR, \fB.private_index_bytes\fR
+0.7: the pages of the tables that the server changed and no checkpoint has given
+back to the page cache yet: memory of the process that the kernel cannot drop (0
+after a restart until a zone changes); \fB.private_index_bytes\fR is the share
+of \fBix\fR and \fBsx\fR (an index made by a growth or for a first fill is
+counted whole until a checkpoint wrote it, and a checkpoint during the listing
+pass of a first fill does not write it). \fBmemory\-limit\fR counts it: the
+zones in memory get the limit less this, at least a tenth of the limit
 (docs/karidns.md, "The tables in memory")
+.TP 8
+\fBstore.tables.private_max\fR, \fB.private_checkpoints\fR, \fB.released_bytes\fR, \fB.release_max_us\fR, \fB.release_errors\fR
+0.7: the bound of that memory (a 32nd of the RAM, at least 64 MiB and at most 1
+GiB): a checkpoint is made when the private pages grew by this much since the
+last checkpoint gave its pages back (\fB.private_checkpoints\fR counts them;
+during a first fill too, also while its pass lists the zones), and every
+checkpoint maps the pages it wrote and nobody changed since from their files
+again (\fB.released_bytes\fR; \fB.release_max_us\fR is the longest hold of the
+store's writer mutex by one step of that, at most 4 MiB). \fB.release_errors\fR
+counts the runs that could not be mapped again (should stay 0: the tables then
+keep their private pages until the next start, an ERROR says so)
 .TP 8
 \fBstore.writes.commits\fR, \fB.puts\fR, \fB.replaces\fR, \fB.deletes\fR, \fB.growths\fR, \fB.errors\fR
 Writer counters since the open (\fBerrors\fR counts a commit or a checkpoint
