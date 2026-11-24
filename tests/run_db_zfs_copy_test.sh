@@ -125,6 +125,8 @@ conf "memory-limit 4g;"
 start_srv
 waitfor 600 stored_all && pass "the store holds all $NZ zones" || fail "the store holds $(sf store.zones.stored) of $NZ zones"
 [ "$(sf store.mode)" = copy ] && [ "$(sf store.fstype)" = zfs ] && pass "the store is in COPY mode on zfs (store.mode=$(sf store.mode) store.fstype=$(sf store.fstype))" || fail "store.mode=$(sf store.mode) store.fstype=$(sf store.fstype), not copy on zfs"
+# 0.7 attach-align: the images of the first fill are placed by the record size of the dataset (store-align yes, the default)
+[ "$(sf store.fs.align_bytes)" = 16384 ] && pass "images aligned to the 16K record (store.fs.align_bytes=16384, align_pads=$(sf store.fs.align_pads))" || fail "store.fs.align_bytes=$(sf store.fs.align_bytes), not 16384"
 burst_check "the first burst" 7
 [ "$(sf store.zones.attached)" -ge $((NZ / 2)) ] 2>/dev/null && pass "$(sf store.zones.attached) zones are in memory at the stop" || fail "only $(sf store.zones.attached) zones are in memory"
 stop_srv
@@ -150,6 +152,12 @@ stop_srv
 echo "== store-hot-list no: nothing is attached before a query asks"
 conf "memory-limit 4g; store-hot-list no;"
 start_srv
+[ "$(sf store.fs.align_bytes)" = 16384 ] && pass "store-align is not touched by store-hot-list (align_bytes 16384)" || fail "align_bytes=$(sf store.fs.align_bytes)"
+stop_srv
+echo "== store-align no: nothing aligned"
+conf "memory-limit 4g; store-hot-list no; store-align no;"
+start_srv
+[ "$(sf store.fs.align_bytes)" = 0 ] && [ "$(sf store.fs.align_pads)" = 0 ] && pass "store-align no: store.fs.align_bytes=0" || fail "store-align no: align_bytes=$(sf store.fs.align_bytes) pads=$(sf store.fs.align_pads)"
 [ "$(sf store.hot.state)" = off ] && [ "$(sf store.hot.threads)" = 0 ] && pass "store-hot-list no: no list, no thread" || fail "store-hot-list no: state $(sf store.hot.state) threads $(sf store.hot.threads)"
 [ "$(sf store.zones.attached)" -le $((NZ / 5)) ] 2>/dev/null && pass "nothing is attached before a query asks ($(sf store.zones.attached))" || fail "$(sf store.zones.attached) zones attached without a list"
 burst_check "the burst without a list (the store threads alone)" 11

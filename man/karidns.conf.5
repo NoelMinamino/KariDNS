@@ -3902,6 +3902,15 @@ oldest), so that the answers go to clients that still wait (0.7; \fBkarictl
 store\fR \fBstore.attach.shed\fR, \fB.newest_first\fR). One more thread writes
 the zones to the store.
 .TP 8
+\fBstore\-align <yes|no>;\fR
+\fIDefault:\fR \fByes\fR
+.br
+\fIDescription:\fR 0.7, restart-only: in COPY mode on ZFS an image that would
+lie across a record boundary of the dataset that it need not cross starts at the
+boundary, when that skips at most half a record, so that an attach reads one
+record (see "Images aligned to the record" under "The zone store"); \fBno\fR
+appends every image where the last one ended (less disk for large zones)
+.TP 8
 \fBstore\-hot\-list <yes|no>;\fR
 \fIDefault:\fR \fByes\fR
 .br
@@ -5575,7 +5584,44 @@ MB of 48 MB, 19 MB of 100 MB), well before the quota is reached. The store stops
 storing images when only the reserve (half a segment, at most 128 MiB) is free,
 so with a quota set \fBstore\-segment\-size\fR so that the reserve is at least a
 fifth of the quota (a quota of 100 MB: segments of 64M), or leave the quota out
-and watch \fBstore.space.*\fR instead. \fBScrub.\fR Every
+and watch \fBstore.space.*\fR instead. \fBImages aligned to the record (ZFS,
+0.7).\fR A read of an image reads every record of the dataset that the image
+touches, and an image that lies across a record boundary costs two records (two
+reads from disk, two records in the ARC). In COPY mode on ZFS the store
+therefore starts an image that would cross a boundary it need not cross at that
+boundary, when that skips at most half a record (the record size is the
+dataset's, from \fBstatfs\fR; the skipped bytes are never written and are dead
+bytes of their segment, so on disk they cost only the rounding of each record to
+the pool's sector size). Small zones rarely move and cost almost nothing; zones
+whose images are more than half a record are stored one to a record. Measured on
+the build host (SATA SSD, \fBrecordsize=16K\fR, \fBcompression=lz4\fR, ashift
+12) with 10 million zones of 100 records (images of about 11 KB) and
+memory-limit 2G, under a uniform load of new names: an attach read 1.00 records
+instead of 1.61, the store attached 26,000 to 27,000 zones a second instead of
+20,600 to 21,900 (25,000 queries a second were answered without loss, against
+about 16,000 before), and the store took 83.7 GB on disk instead of 51.4 GB;
+20,000 zones of 10 records (images of about a kilobyte) took 0.15 %
+more. \fBstore.fs.align_bytes\fR, \fB.align_pads\fR and \fB.align_pad_bytes\fR
+show it. It is on by default; \fBstore\-align no;\fR turns it off, for a large
+store of big zones on a disk that cannot take the extra space (the queries then
+read 1.6 records for such a zone, and the ARC holds less of them). A store that
+exists keeps its records where they are when the setting changes (they are read
+as before, aligned or not): a zone written again, a first fill and a record that
+the cleaner moves follow the setting, so a store becomes aligned (or not) as it
+is rewritten; to change a whole store at once, stop the server, move the store
+away and let the next start make a first fill. \fBThe read queue of the pool.\fR
+ZFS lets at most \fBvfs.zfs.vdev.sync_read_max_active\fR (10 by default) reads
+of a disk be in flight, which caps the attaches of a store on an SSD or NVMe
+device below what the device can do (the build host's SATA SSD read 29,700
+random 8 KiB blocks a second at 10 in flight and 42,100 at 32). With a store
+that is not aligned yet, \fBvfs.zfs.vdev.sync_read_max_active=32\fR (in
+\fB/etc/sysctl.conf\fR; it applies to every pool of the host) with
+\fBstore\-threads 16\fR or more raised the attaches by about 10 % (21,900 to
+24,200 a second); with the images aligned it made no difference (the disk was no
+longer the limit). A host whose zones fit in memory-limit does not need it. The
+setting was measured as a test and put back (\fBsysctl
+vfs.zfs.vdev.sync_read_max_active=10\fR restores the default at once; remove the
+line from \fB/etc/sysctl.conf\fR to keep it). \fBScrub.\fR Every
 \fBstore\-scrub\-interval\fR the store reads every record, at 16 MiB a second at
 the most: the table record (its CRC), the way the name and source indexes lead
 to the zone, and for a stored zone the whole image: its checksum and the

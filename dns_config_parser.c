@@ -6708,6 +6708,7 @@ static int parse_database_option(token_ctx_t *ctx, database_config_t *db, const 
     return 0;
   }
   if (strcmp(key, "store-hot-list") == 0) return parse_bool_statement(ctx, NULL, key, &db->store_hot_list);      /* 0.7 fix 8: hot.list at a clean stop, and the background attach of its zones at the start */
+  if (strcmp(key, "store-align") == 0) return parse_bool_statement(ctx, NULL, key, &db->store_align);      /* 0.7 attach-align: images placed at the record boundary of the file system (COPY mode on ZFS) */
   if (strcmp(key, "store-threads") == 0) {
     if (db_take_uint(ctx, key, false, 1, KARIDNS_DB_STORE_THREADS_MAX, &u) != 0) return -1;
     db->store_threads = (uint32_t)u;
@@ -6801,6 +6802,7 @@ static int parse_database_block(token_ctx_t *ctx, server_config_t *config) {
   db->enabled = true;
   db->signer_wait = true;      /* 0.6.0 item C: a changed zone of the signer waits for the signer */
   db->store_hot_list = true;    /* 0.7 fix 8 */
+  db->store_align = true;       /* 0.7 attach-align */
   db->poll_interval = 2;
   db->coalesce_ms = 1000;
   db->default_ttl = 3600;
