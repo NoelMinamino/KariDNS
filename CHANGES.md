@@ -25,7 +25,7 @@ What changes, what it breaks, and what to do. The step-by-step version is [docs/
   `secondary-stale-max` (default 0, unlimited) limits how long an expired copy is served stale (RFC 8767 section 5).
   The name `_karidns-xfr` is reserved as a view name.
 - **The store format is quarantined, not migrated, when it changes** (docs/RELEASING.md). 0.6 had no store, so the upgrade to 0.7.0 drops nothing; a later release that changes `STORE_FORMAT_VERSION` says so in its notes.
-- **Zone images on ZFS are aligned to the record** (`store-align`, default yes, #PR). An image that would lie
+- **Zone images on ZFS are aligned to the record** (`store-align`, default yes, #259). An image that would lie
   across a record boundary it need not cross starts at the boundary (at most half a record skipped). Large zones
   cost disk: 10M zones of 100 records took 84 GB instead of 51 GB (+63 %); 20,000 zones of 10 records took 0.15 %
   more. A store written before keeps its layout; zones written again and records the cleaner moves are aligned.
@@ -217,7 +217,7 @@ server on pc31 with 8 CPUs and a one-queue em0, or on a VM; the client on anothe
 - **First fill** (#194, #195, #204, #206): the manifest pass under 400k qps load 110-125 s (was 287 s) at 10M zones on
   UFS; no REFUSED in the first second (180-273 before); writer hold maximum 1919 ms to 9.3 ms (#204); the unlogged
   bulk fill writes 4.27 GiB to the device instead of 23.3 GiB for 10M zones on ZFS, fill 410 s against 454 s (#206).
-- **Attaching zones from a ZFS store** (#PR; pc31, SATA SSD, 10M zones x 100 records, memory-limit 2G, uniform
+- **Attaching zones from a ZFS store** (#259; pc31, SATA SSD, 10M zones x 100 records, memory-limit 2G, uniform
   load of new names): images aligned to the record read 1.00 records per attach instead of 1.61 and the store
   attaches 26-27k zones/s instead of 20.6-21.9k (25k qps answered without loss, about 16k before); the eviction
   rounds no longer hold the registry lock for up to 2048 detaches: at 14k qps the client p99 29-46 ms to 7 ms.

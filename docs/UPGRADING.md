@@ -98,7 +98,7 @@ change the options that need a restart (`OK reloaded (restart needed for: ...)`)
 | Query for a database zone under overload | REFUSED / SERVFAIL | dropped and counted (#194, #195) | none |
 | UDP receive | routers read, workers answer over IPC | `udp-receive backend`: each worker reads its own socket (#227) | `udp-receive frontend;` |
 | Routers / workers | by all CPUs of the machine (from 4 CPUs: 2 routers + the rest) | by the CPUs the process may run on; from 4 CPUs half of them routers, up to 8 (#220, #226) | `router-threads N; worker-threads N;` |
-| Zone images on ZFS (COPY mode) | n/a | aligned to the record of the dataset (`store-align yes`, #PR): large zones use more disk (section 6) | `store-align no;` |
+| Zone images on ZFS (COPY mode) | n/a | aligned to the record of the dataset (`store-align yes`, #259): large zones use more disk (section 6) | `store-align no;` |
 | `store-threads` | 2 | 8 (docs/karidns.md) | `store-threads 2;` |
 | `udp-recvbuf-size` (4M) | refused by the kernel on a stock system, sockets stayed at 16 KiB | the most the kernel gives, with a WARNING (#224) | raise the sysctls (section 6) |
 | `alias-max-refresh-time` | a forged TTL of 86400 stayed about 16 h | 3600 s cap (#234) | `alias-max-refresh-time 1d;` |
@@ -159,7 +159,7 @@ For a ZFS host: make the dataset of the store with `recordsize=16K` (or 8K), `co
 - **Disk use.** About 1.2-1.6 KB per small database zone, plus a journal ring (64 MiB of address space) and segment
   files (`store-segment-size`, 256 MiB). Free space is read at every checkpoint; the cleaner needs room to copy
   before it frees a segment, and a new image is refused below that (docs/karidns.md "The zone store").
-- **Alignment on ZFS** (#PR). In COPY mode on ZFS an image that would lie across a record boundary it need not
+- **Alignment on ZFS** (#259). In COPY mode on ZFS an image that would lie across a record boundary it need not
   cross starts at the boundary. Zones of about a kilobyte cost nothing measurable (+0.15 %); zones whose images are
   more than half a record (16 KiB records: images above 8 KiB, about 70 records and more) are stored one to a record:
   10M zones of 100 records used 84 GB instead of 51 GB. A store that exists keeps its records where they are (they
