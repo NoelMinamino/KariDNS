@@ -1,4 +1,4 @@
-.TH KARIDNS.CONF 5 "2026-11-24" "KariDNS" "KariDNS Manual"
+.TH KARIDNS.CONF 5 "2026-11-25" "KariDNS" "KariDNS Manual"
 .\" Generated from docs/karidns.md by man/md2man.pl (make man): edit the Markdown manual, not this page.
 .SH NAME
 karidns.conf \- the configuration file of karidns(8)
@@ -4526,14 +4526,16 @@ tables (0.7):\fR the pages of \fBzt\fR, \fBzc\fR, \fBnx\fR, \fBix\fR and
 \fBsx\fR that the server changed and no checkpoint gave back to the page cache
 yet are memory of the process that the kernel cannot drop (see "The tables in
 memory" under the zone store), at most about \fBstore.tables.private_max\fR (a
-32nd of the RAM, 64 MiB to 1 GiB) plus, during a first fill, the indexes made
-for it (about 43 bytes a zone until the listing pass is over), shown as
-\fBstore.tables.private_bytes\fR by \fBkarictl store\fR; the zones in memory get
-the limit less those bytes, and at least a tenth of the limit. Raise
-\fBmemory\-limit\fR by that much when you move to the store; a WARNING says so
-(at most once an hour) while the tables hold half of the limit or more. A reload
-of \fBkaridns.conf\fR changes it: within 50 ms when a limit is set, within a
-second when there was none.
+32nd of the RAM, 64 MiB to 1 GiB) plus, during the listing pass of a first fill,
+the indexes made for it (not bounded yet: 43 bytes a zone when they are built
+once, measured up to about 165 bytes per name at 100 million zones when the
+growths overlap, so a first fill of 100 million zones does not fit on a 16 GB
+host; a known limit), shown as \fBstore.tables.private_bytes\fR by \fBkarictl
+store\fR; the zones in memory get the limit less those bytes, and at least a
+tenth of the limit. Raise \fBmemory\-limit\fR by that much when you move to the
+store; a WARNING says so (at most once an hour) while the tables hold half of
+the limit or more. A reload of \fBkaridns.conf\fR changes it: within 50 ms when
+a limit is set, within a second when there was none.
 .IP \(bu 2
 \fBThe default (0.7.x).\fR A database block whose zones go to the zone store
 (\fBstore\fR, the default of a production server) and that does not write
@@ -5482,20 +5484,23 @@ zones, and the first fill of 100 million zones on a 16 GB host was killed by the
 kernel at 57 million. What stays above the bound for a while: an index made for
 a first fill or by a growth (\fBix.N\fR, \fBsx.N\fR, about 21 bytes a zone each
 for a first fill, 43 for both; \fBstore.tables.private_index_bytes\fR) is
-private whole until a checkpoint after the listing pass wrote it;
-\fBmemory\-limit\fR counts the private pages (see "Memory limit"). A restart
-writes nothing until a zone changes, so after a restart the figure starts at
-0. Recovery is unchanged: the last checkpoint and the replay of the journal; a
-crash between a growth of an index and the next checkpoint (the new \fBix.N\fR /
-\fBsx.N\fR holds nothing yet) makes the next start rebuild the indexes from
-\fBzt.1\fR, a few seconds at 10 million zones. The files stay in the format of
-earlier versions; go back to an earlier version only after a clean stop. \fBThe
-first fill without a journal (0.7).\fR The first fill of an empty store (the
-first pass finds no zone record in any view and no bytes in the segments, and
-reserves the tables for the zones the loader announces) keeps no journal: the
-database holds every zone, so a fill that a crash cuts off can be read again. A
-configuration with secondary zones whose copies the store keeps fills with the
-journal, as before: their copies must be durable when they are
+private whole until a checkpoint after the listing pass wrote it, and the bound
+does not hold them: in the listing pass of a first fill they grow with the
+number of names (measured 14.9 GB at 90 million names, three generations alive
+at once), a known limit of 0.7 that a later version removes by building them
+once after the pass; \fBmemory\-limit\fR counts the private pages (see "Memory
+limit"). A restart writes nothing until a zone changes, so after a restart the
+figure starts at 0. Recovery is unchanged: the last checkpoint and the replay of
+the journal; a crash between a growth of an index and the next checkpoint (the
+new \fBix.N\fR / \fBsx.N\fR holds nothing yet) makes the next start rebuild the
+indexes from \fBzt.1\fR, a few seconds at 10 million zones. The files stay in
+the format of earlier versions; go back to an earlier version only after a clean
+stop. \fBThe first fill without a journal (0.7).\fR The first fill of an empty
+store (the first pass finds no zone record in any view and no bytes in the
+segments, and reserves the tables for the zones the loader announces) keeps no
+journal: the database holds every zone, so a fill that a crash cuts off can be
+read again. A configuration with secondary zones whose copies the store keeps
+fills with the journal, as before: their copies must be durable when they are
 acknowledged. Before the first change the store makes a superblock durable that
 says so; from then on the writers (the pass, the bodies) change the tables as
 before but write no journal record, nothing is synced by a commit, and no
