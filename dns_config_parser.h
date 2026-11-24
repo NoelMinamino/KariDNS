@@ -762,6 +762,7 @@ typedef struct {
   uint8_t store_mode;          /* `store-mode`: 0 auto (by the file system), 1 map, 2 copy (STORE_MODE_*) */
   uint32_t store_threads;      /* `store-threads`: threads that attach zones from the store, 1..32 (0 = the default,  8) */
   bool store_hot_list;         /* `store-hot-list` (default yes, restart-only): at a clean stop the zones that are in memory are written to hot.list of the store, most used first, and the next start attaches them in that order in the background (0.7 fix 8) */
+  bool store_align;            /* `store-align` (default yes, restart-only): in COPY mode on ZFS an image that would lie across a record boundary it need not cross starts at the boundary when that skips at most half a record (0.7 attach-align; dns_store.c seg_align_pos()) */
   uint64_t store_segment_size;     /* `store-segment-size`: the size a segment file of the store grows to before the next one is begun, 1 MiB..4 GiB (0 = the default, 256 MiB); the cleaner works one segment at a time */
   uint32_t store_max_zones;        /* `store-max-zones` (restart-only): the zones the tables of the store are reserved address space for, 1024..2^31 (0 = by the RAM: physmem / 256 bytes, a power of two, 1M..32M zones) */
   uint32_t store_scrub_interval;   /* `store-scrub-interval`: seconds between the starts of two scrubs of the store, 60..31536000 (0 = the default, a week; UINT32_MAX = `off`) */

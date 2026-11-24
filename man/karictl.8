@@ -1276,6 +1276,11 @@ still has them; \fBstore.errors.total\fR)
 Zones that were taken out of memory because the sample of the attach table chose
 them (also in \fBstore.detach.count\fR)
 .TP 8
+\fBstore.detach.lock_yields\fR
+Times a round of sampled detaches let the registry lock go, between two slices
+of 64, for attaches that waited to be registered (a long round no longer holds
+the attaches back)
+.TP 8
 \fBstore.attach.build_ns_per_zone\fR
 0.7: the mean time of the first half of an attach on the store threads (the
 record and image read, the checks, the entry made; not the registration), in
@@ -1442,6 +1447,13 @@ writes that found no room, when the degraded state began (0 = not degraded)
 \fBst_blksize\fR of a table file (on ZFS the record size of the dataset) and 1
 when it is above 32 KiB (the server says so in syslog; see "The zone store" in
 karidns.md)
+.TP 8
+\fBstore.fs.align_bytes\fR, \fB.align_pads\fR, \fB.align_pad_bytes\fR
+The record size the images are aligned to (COPY mode on ZFS: an image that would
+lie across a record boundary, and need not, starts at the boundary when that
+skips at most half a record, so an attach reads one record instead of two; 0 =
+not aligned), the images placed so since the open, and the bytes skipped for
+them (never written; dead bytes of their segment)
 .TP 8
 \fBstore.scrub.interval_s\fR, \fB.running\fR, \fB.progress_pct\fR
 Seconds between two scrubs (0 = never), whether a pass runs, how far it is

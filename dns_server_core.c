@@ -4754,6 +4754,7 @@ STATIC_TEST void collect_restart_only_changes(const server_config_t *o, const se
     if (o->database.store_threads != n->database.store_threads) append_list_item(buf, sz, "database store-threads");
     if (o->database.store_max_zones != n->database.store_max_zones) append_list_item(buf, sz, "database store-max-zones");
     if (o->database.store_hot_list != n->database.store_hot_list) append_list_item(buf, sz, "database store-hot-list");
+    if (o->database.store_align != n->database.store_align) append_list_item(buf, sz, "database store-align");
   }
 }
 

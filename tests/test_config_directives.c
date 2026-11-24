@@ -632,6 +632,16 @@ static void test_database_block(void) {
         free_server_config_fields(&cfg);
     }
     expect_reject("store-hot-list maybe", "options { database { driver sqlite3; database-file \"/x.db\"; store-hot-list maybe; }; };");
+    /* 0.7 attach-align: store-align */
+    if (parse_ok("options { database { driver sqlite3; database-file \"/x.db\"; store-align no; }; };", &cfg)) {
+        CHECK(!cfg.database.store_align);
+        free_server_config_fields(&cfg);
+    }
+    if (parse_ok("options { database { driver sqlite3; database-file \"/x.db\"; store-align yes; }; };", &cfg)) {
+        CHECK(cfg.database.store_align);
+        free_server_config_fields(&cfg);
+    }
+    expect_reject("store-align maybe", "options { database { driver sqlite3; database-file \"/x.db\"; store-align maybe; }; };");
     expect_reject("store-threads 33", "options { database { driver sqlite3; database-file \"/x.db\"; store-threads 33; }; };");
     /* defaults */
     if (parse_ok("options { database { driver sqlite3; database-file \"/x.db\"; }; };", &cfg)) {
@@ -642,6 +652,7 @@ static void test_database_block(void) {
         CHECK(d->db_reload_timeout == 30 && d->ingest_threads == 1 && d->loader_threads == 1);
         CHECK(d->park_max == 0 && d->park_timeout_ms == 0);                          /* (0: the worker's defaults, 16384 and 1500 ms) */
         CHECK(d->store_hot_list && d->store_threads == 0);                           /* 0.7: hot.list is on by default; 0: the default number of store threads (8) */
+        CHECK(d->store_align);                                                        /* (0.7 attach-align: on by default) */
         CHECK(KARIDNS_DB_STORE_THREADS_DEFAULT == 8 && KARIDNS_DB_STORE_THREADS_MAX == 32);
         CHECK(d->memory_limit == 0);                                                  /* (0: no limit, every database zone stays in memory) */
         CHECK(d->fetch_rate == 0);                                                    /* (0.7 P-A: 0 is the default, unlimited) */

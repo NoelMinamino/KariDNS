@@ -5697,6 +5697,64 @@ static void test_align(void) {
     tdir_free(&d);
   }
   CHECK(cross_on < cross_off);
+
+  /* `store-align no` (no_align) wins over the record size; a store written so and opened again with the alignment on keeps its records where they are (they are read as before), the
+   * zones written again and the records the cleaner moves are aligned */
+  {
+    tdir_t d;
+    tdir_new(&d, "alignexist");
+    store_opts_t o;
+    small_opts(&o);
+    o.mode = STORE_MODE_COPY;
+    o.seg_size = 256u << 10;
+    o.compact_rate = UINT64_MAX;
+    o.scrub_interval_s = UINT32_MAX;
+    o.no_align = true;
+    atomic_store(&store_test_align_rs, 4096);
+    store_t *s = NULL;
+    CHECK_EQ(store_open(d.fd, &o, &s), 0);
+    enum { N = 600 };
+    uint64_t ver[N];
+    memset(ver, 0, sizeof(ver));
+    uint64_t c0 = 0, c1 = 0, c2 = 0;
+    if (s) {
+      store_view_add(s, "default");
+      fill_dead(s, N, ver);
+      CHECK_EQ(store_commit(s), 0);
+      store_stats_t st;
+      store_stats(s, &st);
+      CHECK(st.align_rs == 0 && st.align_pads == 0);
+      c0 = align_scan(s, N, ver, 4096, false, "store-align no");
+      CHECK(c0 > 0);
+      CHECK_EQ(store_close(s), 0);
+    }
+    o.create = false;
+    o.no_align = false;
+    CHECK_EQ(store_open(d.fd, &o, &s), 0);
+    if (s) {
+      store_stats_t st;
+      store_stats(s, &st);
+      CHECK(st.align_rs == 4096 && st.align_pads == 0);
+      c1 = align_scan(s, N, ver, 4096, false, "reopened with the alignment on, nothing written");
+      CHECK_EQ(c1, c0);                                                      /* (the records stay where they are) */
+      for (uint32_t i = 0; i < N; i++)
+        if (ver[i] && i % 2 == 0) { CHECK_EQ(put_i(s, 0, i, 4, NULL), 0); ver[i] = 4; }
+      CHECK_EQ(store_commit(s), 0);
+      store_compact_report_t rep;
+      for (int it = 0; it < 40; it++) {
+        CHECK_EQ(store_compact(s, 0, true, &rep), 0);
+        if (!rep.moved_records && !rep.segs_freed) break;
+      }
+      store_stats(s, &st);
+      c2 = align_scan(s, N, ver, 4096, false, "half written again, then the cleaner");
+      printf("  existing store: %" PRIu64 " -> %" PRIu64 " -> %" PRIu64 " records cross a boundary they need not cross, %" PRIu64 " pads\n", c0, c1, c2, st.align_pads);
+      CHECK(st.align_pads > 0 && c2 < c1);
+      check_consistent(s, "existing store aligned");
+      CHECK_EQ(store_close(s), 0);
+    }
+    atomic_store(&store_test_align_rs, 0);
+    tdir_free(&d);
+  }
 }
 
 static void test_hot_list(void) {

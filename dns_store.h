@@ -138,6 +138,7 @@ typedef struct store_opts {
   /* the structure check of an image (zone_image_validate()); the scrub calls it for every image it reads.  NULL = the checksum only. */
   int    (*validate)(const void *image, size_t len, char *why, size_t whylen);
   bool     no_readahead;          /* do not start the thread that reads zt into memory after the open (tests) */
+  bool     no_align;              /* do not place images at the record boundaries of the file system (`store-align no`; 0.7 attach-align: COPY mode on ZFS aligns by default) */
   /* The scrub and the cleaner make the zone of a damaged image KNOWN in the store; a zone that is attached in memory (MAP mode: its image is the mapped pages) keeps serving them.  The zone id is
    * queued under the writer mutex and handed to this function by the tick (and at the end of a scrub pass or a compact call) with no lock of the store held: ud is bad_image_ctx.  It returns 0 (done, or
    * nothing to do) or 1 (not now: asked again at the next tick, a bounded number of times).  NULL: nothing is queued. */

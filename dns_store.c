@@ -7570,6 +7570,7 @@ static void fs_open_checks(store_t *s) {
              (sfs.f_iosize & (sfs.f_iosize - 1)) == 0)
       rs = (uint32_t)sfs.f_iosize;
     if ((uint64_t)rs * 16 > s->seg_size) rs = 0;                  /* (a record that is a large part of a segment: aligning would only end segments early) */
+    if (s->o.no_align) rs = 0;                                    /* (`store-align no`) */
     s->align_rs = rs;
   }
   struct stat st;
