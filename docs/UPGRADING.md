@@ -68,7 +68,23 @@ is the order of work. The manuals have the detail: [karidns(8)](karidns.md), [ka
      store (the default directory);
    - `sslmode` `allow` / `prefer` in a PostgreSQL `conninfo` to a host that is not local is refused by the WebAdmin and
      the signer (node-pg would send plain text): use `require` or better (`disable` stays a warning).
+   - every `karictl.conf` that holds a `secret` must be private to its owner (#257): `karictl` refuses one that group
+     or others can read or write (exit status 2, the message names the file and the fix). Check them before the
+     upgrade, including the ones of the signer and the WebAdmin (`karictl-config`) and any `karidns.conf` you pass
+     with `-c`:
+
+     ```sh
+     ls -l /usr/local/etc/karidns/karictl.conf     # must be -rw------- (0600) or -r-------- (0400)
+     chmod 600 /usr/local/etc/karidns/karictl.conf
+     ```
 6. **`karictl` and `karidns` of one release.** The status structure grew (#179, #180); install both together.
+   - **`dnsqps` agents and their controller of one release** (#257): the agent protocol is v2 and does not talk to
+     v1 (`no valid HELLO`). Upgrade every `dnsqps --agent` host and the controller together.
+   - Scripts that run `dag +trace`, `+nssearch` or `+trace2` with a TSIG key: a response that fails verification now
+     ends the trace (`+nssearch` exits 1) instead of being followed as `dig` does (#257, docs/dag.md).
+   - `dag --replay` refuses pcapng files (exit status 1): convert them first (`editcap -F pcap in.pcapng out.pcap`).
+   - `karidns-tapstat` closes a sender that is silent for `-w` seconds (default 600) after the handshake; with a
+     quiet server raise `-w` above its quietest stretch (each close costs about a second of dnstap messages).
 7. **Plan the disk**: with a database or secondary zones the store is on by default (section 3). About 1.2-1.6 KB of
    disk per small database zone (#185), and free space for the first fill and the cleaner.
 8. Read "CHANGES.md / Upgrade notes" once for the items that are specific to your setup (DNS Cookies, `signer-wait`).
@@ -98,15 +114,16 @@ change the options that need a restart (`OK reloaded (restart needed for: ...)`)
 | Query for a database zone under overload | REFUSED / SERVFAIL | dropped and counted (#194, #195) | none |
 | UDP receive | routers read, workers answer over IPC | `udp-receive backend`: each worker reads its own socket (#227) | `udp-receive frontend;` |
 | Routers / workers | by all CPUs of the machine (from 4 CPUs: 2 routers + the rest) | by the CPUs the process may run on; from 4 CPUs half of them routers, up to 8 (#220, #226) | `router-threads N; worker-threads N;` |
+| Zone images on ZFS (COPY mode) | n/a | aligned to the record of the dataset (`store-align yes`, #259): large zones use more disk (section 6) | `store-align no;` |
 | `store-threads` | 2 | 8 (docs/karidns.md) | `store-threads 2;` |
-| `udp-recvbuf-size` (4M) | refused by the kernel on a stock system, sockets stayed at 16 KiB | the most the kernel gives, with a WARNING (#224) | raise the sysctls (section 6) |
+| `udp-recvbuf-size` (4M) | refused by the kernel on a stock system, sockets stayed at 16 KiB | the most the kernel gives, with a NOTICE (`[IPC] NOTICE`, `[Network] NOTICE: ... (the default)`; a WARNING when the size is written, #224, #256) | raise the sysctls (section 6) |
 | `alias-max-refresh-time` | a forged TTL of 86400 stayed about 16 h | 3600 s cap (#234) | `alias-max-refresh-time 1d;` |
 | DNS Cookies to forwarders and ALIAS resolvers | none | sent and checked (#234, #238) | none; a resolver that never sends a server cookie is accepted |
 | `secondary-stale-max` | n/a | `0` (unlimited), new (#203) | already the default |
 | Forwarder warnings (`[Forward] ...`) | one line per event, written at once | event lines: rate-limited per category and second, a summary says how many were left out (#260) | none |
 | Loader log lines | the loader chose the priority and the prefix | always `[DB] ...`, at most `LOG_ERR` (#260) | none |
 | `KARIDNS_TEST_IPC_REPLY_BUDGET_US` / `_QUEUE` | read from the environment by every build | test build only (#260) | none (test switches) |
-| `memory-limit` | none | none (**TODO: change this row when the small-VPS default lands**; it is not in main yet) | `memory-limit` set explicitly |
+| `database { memory-limit }` not written | none: every database zone stays in memory | with the zone store: half of the RAM above 256 MB, at least `64M` (512 MB: `128M`, 1 GB: `384M`, 16 GB: `8064M`; #256); the coldest zones above it are taken out and read again from the store; the start logs `[DB] memory-limit is not set: 362M is used (the default: half of the 980 MB of RAM above 256 MB, at least 64M) ...` at NOTICE. Without the store (`store none;`, `zone-store none;`) still none | `memory-limit unlimited;` (or a size) |
 
 Memory notes: the Backend holds about 70 MB fixed plus about 0.45 KB for every database zone in the directory;
 `memory-limit` bounds the zones in memory, not that part (docs/karidns.md "Memory limit"). The store's tables are
@@ -161,6 +178,13 @@ For a ZFS host: make the dataset of the store with `recordsize=16K` (or 8K), `co
 - **Disk use.** About 1.2-1.6 KB per small database zone, plus a journal ring (64 MiB of address space) and segment
   files (`store-segment-size`, 256 MiB). Free space is read at every checkpoint; the cleaner needs room to copy
   before it frees a segment, and a new image is refused below that (docs/karidns.md "The zone store").
+- **Alignment on ZFS** (#259). In COPY mode on ZFS an image that would lie across a record boundary it need not
+  cross starts at the boundary. Zones of about a kilobyte cost nothing measurable (+0.15 %); zones whose images are
+  more than half a record (16 KiB records: images above 8 KiB, about 70 records and more) are stored one to a record:
+  10M zones of 100 records used 84 GB instead of 51 GB. A store that exists keeps its records where they are (they
+  are read as before); a zone written again, a first fill into an empty store, and a record the cleaner moves are
+  aligned, so a store becomes aligned as it is rewritten. To align a whole store at once, stop the server, move the
+  store away and let the next start make a first fill. `store-align no;` keeps the old layout for every write.
 - **Secondary zones** (also without a database): the default store is made on the first start and a NOTICE says so;
   the copies appear with the first refresh of each zone (a zone that does not change is stored by its "up to date"
   answer). The first start after the upgrade transfers or checks every secondary as before; later restarts serve the
@@ -211,14 +235,17 @@ karictl store           # store.* keys; store.reserve.refused must be 0
 karictl dbstatus        # held= long_reader=, signer-wait: lines
 ```
 
-Watch the log for `[IPC] WARNING`, `[Network] WARNING`, `[Store]` and `[Zone] secondary-expired:` lines for a day.
+Watch the log for `[IPC] WARNING`, `[Network] WARNING`, `[Store]` and `[Zone] secondary-expired:` lines for a day (`[IPC] NOTICE` and `[Network] NOTICE: ... (the default)` say that the default socket buffers are smaller than asked: raise the sysctls of section 8 on a busy server).
+A database with the store and no `memory-limit` logs `[DB] memory-limit is not set: <L> is used ...` once at the start; `karictl dbstatus`
+shows `memory-limit=<L> (default)` on its `memory:` line. Compare the `memory sizing:` line (what every zone needs) with it: a NOTICE or
+WARNING after it means the default keeps only part of the zones in memory; set `memory-limit` (or `unlimited`) if the host has the RAM.
 
 ## 10. Rolling back
 
 - **Server and tools**: `pkg add` the 0.6.x packages (with `-f` to replace). `karictl` and `karidns` must be of the
   same release.
 - **Configuration**: a 0.7 configuration that uses `store-*`, `zone-store`, `router-threads`, `worker-threads`,
-  `udp-receive`, `secondary-stale-max` or `alias-max-refresh-time` is not understood by 0.6: remove those lines first
+  `udp-receive`, `secondary-stale-max`, `alias-max-refresh-time` or `memory-limit unlimited` is not understood by 0.6: remove those lines first
   (0.6 does not know them).
 - **The store**: 0.6 reads no store. Stop the server cleanly first (the manual says to downgrade only after a clean stop, #199), then the directory can be removed; database zones are read from the database as in 0.6.
   Secondary zones start as in 0.6 (zone file or nothing, then a transfer) and lose their stored copies and expire
@@ -229,6 +256,5 @@ Watch the log for `[IPC] WARNING`, `[Network] WARNING`, `[Store]` and `[Zone] se
 
 ## Pending items
 
-- **`memory-limit` default for small VPS installs**: TODO, not merged yet; update section 3 when it lands.
 - Open pull request #253 (signer / WebAdmin review group A: key order, re-sign floor, file checks, atomic failure
   record, column allowlist) is not in main; add its notes if it merges before the release.

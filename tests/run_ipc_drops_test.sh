@@ -221,6 +221,18 @@ if [ "$MAXB" -gt 65536 ] && [ "$MAXB" -lt 1073741824 ] 2>/dev/null; then
     OUT=$(perl "$CLIENT" "$PORT" 2000 100 1 10 16 0)
     [ "$(kv "$OUT" unanswered)" = 0 ] && ok "the server with the clamped buffers answers 2000 queries" || bad "clamped buffers: $OUT"
     stop_server
+    # D2 (0.7, user 2026-11-24): the default size (not written; `0` keeps the default) that the kernel does not give is a NOTICE, not a WARNING
+    if [ "$MAXB" -lt 4718592 ]; then
+        write_conf 0
+        start_server
+        kari_wait_log "$LOG" '\[IPC\] NOTICE' 15 && ok "the default size the kernel does not give: [IPC] NOTICE" || bad "no [IPC] NOTICE line" "$(grep -i 'ipc\]\|network\]' "$LOG" | head -4)"
+        grep -q "\[IPC\] NOTICE: .*asked 4194304 (the default), got .*kern.ipc.maxsockbuf=$MAXB" "$LOG" && ok "... it says the default and the sysctl" || bad "notice text" "$(grep '\[IPC\] NOTICE' "$LOG" | head -1)"
+        grep -q "\[Network\] NOTICE: UDP SO_RCVBUF: asked 4194304 (the default), got" "$LOG" && ok "the UDP sockets: [Network] NOTICE" || bad "no UDP NOTICE" "$(grep -i 'network\]' "$LOG" | head -3)"
+        ! grep -q "\[IPC\] WARNING\|\[Network\] WARNING: UDP" "$LOG" && ok "no WARNING for the default size" || bad "a WARNING for the default" "$(grep 'WARNING' "$LOG" | head -3)"
+        stop_server
+    else
+        echo "  (kern.ipc.maxsockbuf $MAXB gives the 4M default: part D2 skipped)"
+    fi
 else
     echo "  (kern.ipc.maxsockbuf is $MAXB: part D skipped)"
 fi

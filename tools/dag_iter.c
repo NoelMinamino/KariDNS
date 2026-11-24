@@ -737,6 +737,10 @@ static int it_exchange(it_ctx_t *ctx, const char *addr, const char *nsname, cons
             hexdump(ctx->rbuf, (size_t)n);
             printf("\n");
         }
+        /* T1-M1: a signed query (the priming query to @server) gets a reply whose TSIG is verified (RFC 8945 §5.3.2), as on the
+         * main path.  One that fails is shown but is a bad reply here: nothing of it is cached or followed */
+        bool signed_ok = trace_tsig_verified(q.want_tsig, &q.tsig_key, ctx->rbuf, (size_t)n, req_mac, req_mac_len,
+                                             show && it_out_enabled(ctx));
         if (show) {
             if (ctx->dopt->yaml) {
                 if (ctx->depth == 0) print_response_yaml(ctx->rbuf, (size_t)n, addr, (uint16_t)ctx->port, ctx->use_tcp, ctx->dopt);
@@ -747,6 +751,13 @@ static int it_exchange(it_ctx_t *ctx, const char *addr, const char *nsname, cons
             }
         }
 
+        if (!signed_ok) {
+            reset_dag_arena();
+            memset(r, 0, sizeof(*r));
+            r->kind = IT_RESP_BAD;
+            snprintf(r->why, sizeof(r->why), "TSIG verification failed");
+            return IT_RESP_BAD;
+        }
         if (ctx->depth == 0 && ctx->last_resp) {
             memcpy(ctx->last_resp, ctx->rbuf, (size_t)n);
             ctx->last_len = (size_t)n;

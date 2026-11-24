@@ -814,39 +814,42 @@ the limit), \fBfit\fR the share of the zones that fit under the limit,
 \fBrecommended\fR the \fBmemory\-limit\fR that keeps every zone, \fBstatus\fR
 the level of the syslog line the server says about it (\fBnotice\fR: below what
 every zone needs, \fBwarning\fR: less than half of the zones fit, \fBerror\fR:
-the limit cannot hold the zones of the reads in flight). Without
-\fBmemory\-limit\fR: \fB| no memory\-limit | recommended=R | status=ok\fR. The
-same figures are in syslog at every start and reload (docs/karidns.md, "Memory
-limit"). These lines come after the \fBzone directory:\fR line; the lines before
-keep their form. Then, the totals since the server started, and the last
-protocol error of the loader link. With a zone name (and optionally a view):
-that zone's view, database id, SOA serial, status (\fBapplied\fR, \fBrejected\fR
-or \fBshadowed\fR) and the last error, then, for a \fBSLAVE\fR or \fBCONSUMER\fR
-zone (B7b), its type, masters and TSIG key and the last successful transfer with
-the serial (with the zone store, 0.7, \fBa copy is kept in the zone store; a
-restart restores it\fR, without it \fBkept in memory only; a restart transfers
-it again\fR; \fBsettings from the primary: in force\fR when the primary sent
-settings, B8t-2) and (0.7) the lines \fBStore:\fR, \fBLast\-refresh:\fR and
-\fBExpired:\fR of \fBzonestatus\fR, indented, then (B7a) the settings it runs
-with: where they come from (\fBprofile 'name'\fR with the zone's own metadata
-overriding it, \fBthe zone's own metadata\fR, or \fBnone\fR), its
-\fBallow\-transfer\fR and \fBallow\-update\fR entries with their match mode, the
-entries \fBacl\-ceiling\fR cuts away (\fBlies outside acl\-ceiling\fR, \fBis
-narrowed by acl\-ceiling\fR, or \fBno acl\-ceiling is configured: these ACLs
-refuse everybody\fR) and a \fBsettings error\fR line when a TSIG key the
-settings name is no longer defined in \fBkaridns.conf\fR. The summary also
-counts the distinct settings (zones with the same settings share one block) and
-the zones that name an undefined key. A zone that was rejected keeps serving its
-last good version (its serial is shown). Without a \fBdatabase\fR block the
-server answers \fBERROR no database block is configured\fR. With the zone store
-(0.7) the \fBstore pass:\fR line shows the reconcile with the loader: the pass
-that runs or ran last (the entries it listed, new / changed / renamed /
-unchanged / already asked for / refused with this version), the sweep (zones the
-pass did not list, deleted), the bodies (records without one now, fetched,
-failed, in flight) and the changes applied; a \fBMASS\-DELETE GUARD HELD:\fR
-line says that a sweep was held back (more than 20 percent of a view's zones and
-more than 1,000 are not in the database) and that \fBkarictl reload \-force\fR
-releases it.
+the limit cannot hold the zones of the reads in flight). With no limit in force
+(\fBmemory\-limit unlimited\fR, or none written without the zone store): \fB| no
+memory\-limit | recommended=R | status=ok\fR; with the default from the RAM
+(0.7, no \fBmemory\-limit\fR written and the zone store) \fBmemory\-limit=L
+(default)\fR. The same figures are in syslog at every start and reload
+(docs/karidns.md, "Memory limit"). These lines come after the \fBzone
+directory:\fR line; the lines before keep their form. Then, the totals since the
+server started, and the last protocol error of the loader link. With a zone name
+(and optionally a view): that zone's view, database id, SOA serial, status
+(\fBapplied\fR, \fBrejected\fR or \fBshadowed\fR) and the last error, then, for
+a \fBSLAVE\fR or \fBCONSUMER\fR zone (B7b), its type, masters and TSIG key and
+the last successful transfer with the serial (with the zone store, 0.7, \fBa
+copy is kept in the zone store; a restart restores it\fR, without it \fBkept in
+memory only; a restart transfers it again\fR; \fBsettings from the primary: in
+force\fR when the primary sent settings, B8t-2) and (0.7) the lines
+\fBStore:\fR, \fBLast\-refresh:\fR and \fBExpired:\fR of \fBzonestatus\fR,
+indented, then (B7a) the settings it runs with: where they come from
+(\fBprofile 'name'\fR with the zone's own metadata overriding it, \fBthe zone's
+own metadata\fR, or \fBnone\fR), its \fBallow\-transfer\fR and
+\fBallow\-update\fR entries with their match mode, the entries
+\fBacl\-ceiling\fR cuts away (\fBlies outside acl\-ceiling\fR, \fBis narrowed by
+acl\-ceiling\fR, or \fBno acl\-ceiling is configured: these ACLs refuse
+everybody\fR) and a \fBsettings error\fR line when a TSIG key the settings name
+is no longer defined in \fBkaridns.conf\fR. The summary also counts the distinct
+settings (zones with the same settings share one block) and the zones that name
+an undefined key. A zone that was rejected keeps serving its last good version
+(its serial is shown). Without a \fBdatabase\fR block the server answers
+\fBERROR no database block is configured\fR. With the zone store (0.7) the
+\fBstore pass:\fR line shows the reconcile with the loader: the pass that runs
+or ran last (the entries it listed, new / changed / renamed / unchanged /
+already asked for / refused with this version), the sweep (zones the pass did
+not list, deleted), the bodies (records without one now, fetched, failed, in
+flight) and the changes applied; a \fBMASS\-DELETE GUARD HELD:\fR line says that
+a sweep was held back (more than 20 percent of a view's zones and more than
+1,000 are not in the database) and that \fBkarictl reload \-force\fR releases
+it.
 .RS 8
 .PP
 .RS 2
@@ -1276,6 +1279,11 @@ still has them; \fBstore.errors.total\fR)
 Zones that were taken out of memory because the sample of the attach table chose
 them (also in \fBstore.detach.count\fR)
 .TP 8
+\fBstore.detach.lock_yields\fR
+Times a round of sampled detaches let the registry lock go, between two slices
+of 64, for attaches that waited to be registered (a long round no longer holds
+the attaches back)
+.TP 8
 \fBstore.attach.build_ns_per_zone\fR
 0.7: the mean time of the first half of an attach on the store threads (the
 record and image read, the checks, the entry made; not the registration), in
@@ -1442,6 +1450,13 @@ writes that found no room, when the degraded state began (0 = not degraded)
 \fBst_blksize\fR of a table file (on ZFS the record size of the dataset) and 1
 when it is above 32 KiB (the server says so in syslog; see "The zone store" in
 karidns.md)
+.TP 8
+\fBstore.fs.align_bytes\fR, \fB.align_pads\fR, \fB.align_pad_bytes\fR
+The record size the images are aligned to (COPY mode on ZFS: an image that would
+lie across a record boundary, and need not, starts at the boundary when that
+skips at most half a record, so an attach reads one record instead of two; 0 =
+not aligned), the images placed so since the open, and the bytes skipped for
+them (never written; dead bytes of their segment)
 .TP 8
 \fBstore.scrub.interval_s\fR, \fB.running\fR, \fB.progress_pct\fR
 Seconds between two scrubs (0 = never), whether a pass runs, how far it is
@@ -1787,8 +1802,16 @@ padding of the secret is ignored. The value after the first \fBalgorithm\fR
 \fBhmac\-sha224\fR, \fBhmac\-sha256\fR (default), \fBhmac\-sha384\fR or
 \fBhmac\-sha512\fR; it must match the server's \fBcontrol\-channel { algorithm
 }\fR, and an unsupported name exits with status 2. The key name is not used. The
-secret may decode to at most 256 bytes. \fBkarictl\fR prints a warning when the
-file is readable by group or other users; it should have mode \fB0600\fR.
+secret may decode to at most 256 bytes. A file that holds a \fBsecret\fR and
+that group or other users may read or write is refused (exit status 2, with the
+\fBchmod 600\fR that fixes it), as the server refuses such a
+\fBconninfo\-file\fR: whoever reads the secret can run every command the key
+allows. This applies to any file given with \fB\-c\fR that holds the secret,
+\fBkaridns.conf\fR included. The file is opened once and its mode checked on
+that descriptor. Each command word must be non-empty and free of white space and
+control characters, the command line at most 510 bytes, and a command takes at
+most three arguments (as \fBstats\fR and \fBstore\fR already checked): otherwise
+exit status 2 before anything is sent.
 .PP
 \fBRestricted keys.\fR The server can hold several keys, each allowed to run
 only some commands (\fBcontrol\-channel { keys { } }\fR in \fBkaridns.conf\fR,

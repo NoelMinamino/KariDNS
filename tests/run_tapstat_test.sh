@@ -181,6 +181,31 @@ perl "$MOCK" sum "$TMP_DIR/s1.json" > "$TMP_DIR/s1.sum"
 has "$TMP_DIR/s1.sum" "frames=8" "frames of the two correct sessions add up over the intervals"
 has "$TMP_DIR/s1.sum" "responses=7" "responses"
 
+# ---- 3b. T4-L5: a sender silent in the data phase (-w), a sender the socket mode does not allow, the o+w warning ----
+echo "[3b] socket mode: -w, peer credentials, -m 666"
+SOCK2="$TMP_DIR/t2.sock"
+"$TAPSTAT" -s "$SOCK2" -i 60 -f json -w 1 -m 660 > "$TMP_DIR/s2.json" 2> "$TMP_DIR/s2.err" &
+TAP_PID=$!
+for i in $(seq 1 50); do [ -S "$SOCK2" ] && break; sleep 0.1; done
+perl "$MOCK" send "$SOCK2" dataidle > "$TMP_DIR/m.out" 2>&1 && pass "-w 1: a sender silent after the handshake is dropped" || fail "dataidle: $(cat "$TMP_DIR/m.out")"
+if [ "$(id -u)" = "0" ] && id nobody >/dev/null 2>&1; then
+    # the file mode would let nobody in (666 after the start); the credentials (not root, not this user, not in the socket's group) do not
+    chmod 666 "$SOCK2"
+    cp "$MOCK" "$TMP_DIR/mock_nobody.pl" && chmod 644 "$TMP_DIR/mock_nobody.pl"
+    su -m nobody -c "perl '$TMP_DIR/mock_nobody.pl' send '$SOCK2' refused" > "$TMP_DIR/m.out" 2>&1 && pass "a sender the -m 660 socket does not allow is refused" || fail "refused: $(cat "$TMP_DIR/m.out")"
+    grep -q "does not allow, connection refused" "$TMP_DIR/s2.err" && pass "the refusal is reported" || fail "no refusal message: $(cat "$TMP_DIR/s2.err")"
+else
+    echo "  SKIP: the peer credential check needs root (a sender of another user)"
+fi
+perl "$MOCK" send "$SOCK2" good > "$TMP_DIR/m.out" 2>&1 && pass "this user is still served" || fail "good after the checks: $(cat "$TMP_DIR/m.out")"
+kill -TERM "$TAP_PID"; wait "$TAP_PID"; TAP_PID=""
+"$TAPSTAT" -s "$TMP_DIR/t3.sock" -i 60 -m 666 > /dev/null 2> "$TMP_DIR/s3.err" &
+TAP_PID=$!
+for i in $(seq 1 50); do grep -q "every local user" "$TMP_DIR/s3.err" 2>/dev/null && break; sleep 0.1; done
+grep -q "warning: -m 666 lets every local user connect" "$TMP_DIR/s3.err" && pass "-m 666 is warned about" || fail "no -m 666 warning: $(cat "$TMP_DIR/s3.err")"
+kill -TERM "$TAP_PID"; wait "$TAP_PID"; TAP_PID=""
+"$TAPSTAT" -s "$TMP_DIR/t4.sock" -w 0 >/dev/null 2>&1; [ $? -eq 2 ] && pass "-w 0: exit 2" || fail "-w 0"
+
 # ---- 4. a real karidns ----
 echo "[4] karidns -> karidns-tapstat"
 USER_OPT=""

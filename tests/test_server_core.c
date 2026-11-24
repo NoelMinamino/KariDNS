@@ -3062,6 +3062,7 @@ static void test_sockbuf_set(void) {
     assert(sockbuf_limit_for(2097152) == 1864135);                   // the stock 2 MB
     assert(sockbuf_maxsockbuf_for(2048) == 2304);
     assert(sockbuf_maxsockbuf_for(4194304) == 4718592);              // what the 4 MB default needs
+    assert(sockbuf_short_level(true) == LOG_WARNING && sockbuf_short_level(false) == LOG_NOTICE);   // 0.7: a written size the kernel does not give: WARNING; the default: NOTICE
     for (unsigned long n = 1; n < 20000000UL; n = n * 3 + 7) assert(sockbuf_limit_for(sockbuf_maxsockbuf_for(n)) >= n);
 
     int s = socket(AF_INET, SOCK_DGRAM, 0);

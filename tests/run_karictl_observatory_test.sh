@@ -82,7 +82,7 @@ key "karictl" {
 EOF
 
 chmod 755 "$TMP_DIR"
-chmod 644 "$TMP_DIR/obs.example.com.zone" "$TMP_DIR/karidns.conf" "$TMP_DIR/karictl.conf"
+chmod 644 "$TMP_DIR/obs.example.com.zone" "$TMP_DIR/karidns.conf"; chmod 600 "$TMP_DIR/karictl.conf"
 
 # 4. Start Server
 echo "[+] Starting karidns on port $PORT (control: $CTRL_SOCK)..."

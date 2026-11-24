@@ -36,11 +36,14 @@ int karictl_main(int argc, char **argv);
 static char g_tmp[256];
 static int g_runs;
 
+static const char *g_out_path;   /* when set: the child's stdout goes to this file */
+
 static int run_child(int (*fn)(int, char **), int argc, char **argv) {
     fflush(stdout); fflush(stderr);
     pid_t pid = fork();
     if (pid == 0) {
         if (!getenv("SWTOOLS_VERBOSE")) { int dn = open("/dev/null", O_WRONLY); dup2(dn, 1); dup2(dn, 2); }
+        if (g_out_path) { int of = open(g_out_path, O_WRONLY | O_CREAT | O_TRUNC, 0600); if (of >= 0) dup2(of, 1); }
         wd_child();
         alarm(20);
         exit(fn(argc, argv) & 0xFF);
@@ -270,7 +273,12 @@ static void *ctl_server(void *arg) {
         r = recv(c, b, sizeof(b) - 1, 0);
         if (r <= 0) { close(c); continue; }
         b[r] = 0;
-        if (!strncmp(b, "status", 6)) {
+        if (mode == 10 && !strncmp(b, "observatory", 11)) {   /* T4-L1: a snapshot whose strings fill their arrays (no NUL) */
+            zone_observatory_snapshot_t z; memset(&z, 0, sizeof(z));
+            memset(z.domain, 'A', sizeof(z.domain)); memset(z.view_name, 'B', sizeof(z.view_name)); memset(z.shared_views, 'C', sizeof(z.shared_views));
+            send(c, "OK 1\n", 5, 0);
+            send(c, &z, sizeof(z), 0);
+        } else if (!strncmp(b, "status", 6)) {
             karidns_status_t st; memset(&st, 0, sizeof(st));
             st.boot_time = time(NULL) - 100000; st.last_configured_time = time(NULL) - 50; st.num_zones = 3;
             st.worker_threads = 4; st.frontend_alive = mode != 6; st.query_logging = true; st.rrl_dropped = 5;
@@ -315,6 +323,7 @@ static void *ctl_server(void *arg) {
 
 static void test_karictl(void) {
     printf("[TEST] tools sweep: karictl against a fake control socket...\n");
+    mode_t old_umask = umask(077);   /* T4-L3: karictl refuses a karictl.conf with a secret that others can read: the files of this test are 0600 */
     snprintf(g_sock, sizeof(g_sock), "/tmp/kctl_%d.sock", (int)getpid());
     unlink(g_sock);
     int ls = socket(AF_UNIX, SOCK_STREAM, 0);
@@ -358,6 +367,48 @@ static void test_karictl(void) {
                                    { "a", "b", "c", NULL }, { "a.test", "--zones", "x", NULL }, { "--after-view", "v", NULL, NULL }, { "--after", "", NULL, NULL } };
     for (size_t bi = 0; bi < N(bad_stats); bi++)
         assert(run_tool(karictl_main, "karictl", "-c", cp, "stats", bad_stats[bi][0], bad_stats[bi][1], bad_stats[bi][2], NULL) == 2);
+    /* tools review 2026-11-23 */
+    {
+        /* T4-L1: observatory prints the strings of a snapshot that has no NUL in them only up to their arrays' end */
+        char outp[300];
+        snprintf(outp, sizeof(outp), "%s/obs.out", g_tmp);
+        g_ctl_mode = 10;
+        g_out_path = outp;
+        assert(run_tool(karictl_main, "karictl", "-c", cp, "observatory", "a.test", NULL) == 0);
+        g_out_path = NULL;
+        g_ctl_mode = 0;
+        FILE *of = fopen(outp, "r"); assert(of);
+        char line[2048] = "";
+        assert(fgets(line, sizeof(line), of));
+        fclose(of);
+        size_t na = strspn(line + 6, "A");
+        assert(strncmp(line, "Zone: ", 6) == 0 && na == 255 && strncmp(line + 6 + na, " (view: ", 8) == 0);
+        assert(strspn(line + 6 + na + 8, "B") == 63);
+        /* T4-L2: a word with white space, a newline or another control character, an empty word, too many words, a line too long: exit 2,
+         * nothing sent (the fake server would answer anything) */
+        static char longw[600];
+        memset(longw, 'x', sizeof(longw) - 1);
+        const char *badw[][5] = { { "reload", "a b", NULL, NULL, NULL }, { "reload", "a\nstop", NULL, NULL, NULL }, { "notify", "", NULL, NULL, NULL },
+                                  { "zonestatus", "a\tb", NULL, NULL, NULL }, { "reload", "a.test", "v", "force", "extra" }, { "reload", longw, NULL, NULL, NULL },
+                                  { "store", "zone", "a\x01" "b", NULL, NULL }, { "reload\x7f", NULL, NULL, NULL, NULL } };
+        for (size_t bi = 0; bi < N(badw); bi++)
+            assert(run_tool(karictl_main, "karictl", "-c", cp, badw[bi][0], badw[bi][1], badw[bi][2], badw[bi][3], badw[bi][4], NULL) == 2);
+        assert(run_tool(karictl_main, "karictl", "-c", cp, "reload", "a.test", "v", "force", NULL) == 0);   /* four words still go */
+        /* T4-L3: a karictl.conf with the secret that group or others can read is refused; without a secret the mode does not matter */
+        char opn[300];
+        snprintf(opn, sizeof(opn), "%s/karictl_open.conf", g_tmp);
+        FILE *cf = fopen(opn, "w"); assert(cf); fputs(conf, cf); fclose(cf);
+        assert(chmod(opn, 0644) == 0);
+        assert(run_tool(karictl_main, "karictl", "-c", opn, "reconfig", NULL) == 2);
+        assert(chmod(opn, 0620) == 0);
+        assert(run_tool(karictl_main, "karictl", "-c", opn, "reconfig", NULL) == 2);
+        assert(chmod(opn, 0600) == 0);
+        assert(run_tool(karictl_main, "karictl", "-c", opn, "reconfig", NULL) == 0);
+        assert(chmod(opn, 0400) == 0);
+        assert(run_tool(karictl_main, "karictl", "-c", opn, "reconfig", NULL) == 0);
+        assert(run_tool(karictl_main, "karictl", "-c", g_tmp, "reconfig", NULL) == 2);   /* a directory */
+        unlink(opn);
+    }
     run_tool(karictl_main, "karictl", "-f", cp_nosock, "-s", g_sock, "status", NULL);
     run_tool(karictl_main, "karictl", "-c", cp_nosecret, "status", NULL);
     run_tool(karictl_main, "karictl", "-c", cp_long, "status", NULL);
@@ -443,6 +494,7 @@ static void test_karictl(void) {
     int k = socket(AF_UNIX, SOCK_STREAM, 0); connect(k, (struct sockaddr *)&un, sizeof(un)); close(k);
     pthread_join(t, NULL);
     close(ls); unlink(g_sock);
+    umask(old_umask);
     printf("  -> karictl runs done.\n");
 }
 

@@ -94,6 +94,7 @@ typedef struct {
   uint32_t nviews;
   uint64_t max_zone_records, max_zone_bytes;
   uint64_t memory_limit;
+  bool limit_default;          /* memory_limit is the default from the RAM (0.7.x: memory-limit not written) */
   uint32_t fetch_rate;
   uint32_t park_timeout_ms;    /* park-timeout: how long a request waits for room */
   uint32_t fetch_concurrency, loader_threads;
@@ -612,6 +613,14 @@ static bool limit_ctrl_rights(int fd) {
 /* configuration snapshot                                                                                         */
 /* ------------------------------------------------------------------------------------------------------------- */
 
+/* 0.7.x: the RAM (hw.physmem) read before the sandbox, by db_ingest_start(); the default memory-limit is derived from it (dns_mem_advice.h) */
+static uint64_t g_ram;
+static _Atomic bool g_limit_default;   /* the limit in force is the default (the sizing lines and dbstatus say so) */
+
+uint64_t db_ingest_memory_limit(const server_config_t *cfg, bool *is_default) {
+  return ma_effective_limit(cfg->database.memory_limit, cfg->database.memory_limit_unlimited, db_store_enabled(), g_ram, is_default);   /* (the store that opened: the default directory is used only when its parent exists, db_store_start() runs first) */
+}
+
 static void fill_snap(const server_config_t *cfg, ing_cfg_t *c) {
   memset(c, 0, sizeof(*c));
   if (cfg && cfg->database.enabled) {
@@ -621,7 +630,7 @@ static void fill_snap(const server_config_t *cfg, ing_cfg_t *c) {
     for (const view_config_t *v = cfg->views; v; v = v->next) c->nviews++;
     c->max_zone_records = cfg->database.max_zone_records;
     c->max_zone_bytes = cfg->database.max_zone_bytes;
-    c->memory_limit = cfg->database.memory_limit;
+    c->memory_limit = db_ingest_memory_limit(cfg, &c->limit_default);
     c->fetch_rate = cfg->database.fetch_rate;
     c->park_timeout_ms = cfg->database.park_timeout_ms ? cfg->database.park_timeout_ms : PARK_DEFAULT_TIMEOUT_MS;
     c->fetch_concurrency = cfg->database.fetch_concurrency;
@@ -732,7 +741,7 @@ static bool build_config(ing_t *g, ing_cfg_t *snap) {
     kdb_enc_u32(&g->enc, 5, db->default_ttl);
     kdb_enc_u8(&g->enc, 6, (uint8_t)db->bulk_threshold);
     kdb_enc_u32(&g->enc, 7, db->loader_threads);
-    if (db->memory_limit && !dbdir()) kdb_enc_u8(&g->enc, 8, 1);       /* D1a milestone 4: the directory only for the zones that are not in memory (design 3.3); with the zone store (S3) the store is the directory and a zone is sent whole */
+    if (snap->memory_limit && !dbdir()) kdb_enc_u8(&g->enc, 8, 1);       /* D1a milestone 4: the directory only for the zones that are not in memory (design 3.3); with the zone store (S3) the store is the directory and a zone is sent whole */
     kdb_enc_u8(&g->enc, 9, db->signer_wait ? 1 : 0);        /* 0.6.0 item C: a changed zone of the signer waits for the signer */
     if (store_proto) kdb_enc_u8(&g->enc, 10, 1);            /* 0.7 WP7b: the store protocol (no INVENTORY: the loader lists the zones or the changes, the Backend asks for the bodies) */
     ok = kdb_enc_end(&g->enc) == 0 && !too_many && idx <= 0xFFFF &&(snap->nviews == 0 || (g->view_names && g->view_db));
@@ -5067,6 +5076,8 @@ static void ma_inputs(ma_in_t *in, const dbreg_residency_t *rs, uint64_t limit) 
   in->resident_zones = rs->resident;
   in->resident_bytes = zdb.resident;
   in->limit = limit;
+  in->limit_default = limit && atomic_load_explicit(&g_limit_default, memory_order_relaxed);
+  in->ram = g_ram;
   in->fetch_conc = atomic_load_explicit(&g_fetch_conc, memory_order_relaxed);
   if (dbdir()) db_store_ma_inputs(in);                  /* the mode, and the size of the images the store holds */
 }
@@ -5131,6 +5142,7 @@ static void *cache_thread(void *arg) {
     snapshot_cfg(&c);
     uint64_t lim = c.enabled ? c.memory_limit : 0;
     dbreg_cache_set_limit(lim);
+    atomic_store_explicit(&g_limit_default, c.enabled && c.limit_default, memory_order_relaxed);
     set_fetch_limits(&c);
     atomic_store_explicit(&g_xfr_timeout_ms, c.xfr_timeout_ms ? c.xfr_timeout_ms : KARIDNS_DB_XFR_FETCH_TIMEOUT_DEFAULT, memory_order_relaxed);
     if (c.enabled) ma_tick(lim, now_ms());                  /* 0.7 P-F: the sizing lines and the run-time warning */
@@ -5415,6 +5427,9 @@ static void *ingest_thread(void *arg) {
 
 bool db_ingest_start(int stream_fd, int ctrl_fd, int fetch_fd) {
   ing_t *g = &g_ing;
+  g_ram = ma_host_ram();                                   /* (before the sandbox: the Backend cannot read hw.physmem in capability mode) */
+  const char *tram = getenv("KARIDNS_TEST_PHYSMEM");       /* test switch (tests/run_db_memdefault_test.sh): the RAM the default memory-limit is derived from, in bytes */
+  if (tram && *tram) g_ram = strtoull(tram, NULL, 10);
   static struct ing_wq *s_wq;
   static struct ing_lq *s_lq;
   memset(g, 0, sizeof(*g));
@@ -5498,6 +5513,12 @@ bool db_ingest_start(int stream_fd, int ctrl_fd, int fetch_fd) {
   if (fetch_fd >= 0) fetch_adopt(g, fetch_fd);
   park_fetch_set_notify(g->kq);
   dbreg_cache_set_limit(snap.memory_limit);              /* before the first batch: the startup load already keeps within it */
+  atomic_store_explicit(&g_limit_default, snap.limit_default, memory_order_relaxed);
+  if (snap.limit_default) {                          /* 0.7.x: a database block without memory-limit gets one from the RAM (docs/karidns.md, "Memory limit") */
+    char t[400];
+    ma_text_default(t, sizeof(t), snap.memory_limit, g_ram);
+    syslog(LOG_NOTICE, "[DB] %s", t);
+  }
   if (snap.warm_wait) {                              /* warm-before-serve: the workers wait for the hot list to be read, at most this long (db_ingest_hold_queries) */
     g->hold = true;
     g->hold_start_ms = now_ms();
@@ -6028,13 +6049,14 @@ size_t db_ingest_status(const char *zone, const char *view, char *out, size_t ca
               (unsigned long long)cs.xfr[DBREG_XFR_SUMMARY], (unsigned long long)cs.xfr_marked, (unsigned)atomic_load_explicit(&g_xfr_timeout_ms, memory_order_relaxed));
     if (cs.limit)
       st_append(&c, "cache: limit=%llu resident=%llu retired=%llu previous=%llu inflight=%llu held=%llu long_reader=%d evictions=%llu rounds=%llu cold=%llu marked=%llu misses=%llu "
-                    "shed=%llu pinned=%llu peak=%llu victim_freq=%u room_evictions=%llu room_relaxed=%llu room_waits=%llu room_timeouts=%llu room_waiting=%u\n",
+                    "shed=%llu pinned=%llu peak=%llu victim_freq=%u room_evictions=%llu room_relaxed=%llu room_waits=%llu room_timeouts=%llu room_waiting=%u limit_default=%d\n",
                 (unsigned long long)cs.limit, (unsigned long long)cs.resident, (unsigned long long)cs.retired, (unsigned long long)cs.previous, (unsigned long long)cs.inflight, (unsigned long long)cs.held, cs.long_reader ? 1 : 0,
                 (unsigned long long)cs.evictions, (unsigned long long)cs.rounds, (unsigned long long)cs.cold, (unsigned long long)cs.marked,
                 (unsigned long long)cs.misses, (unsigned long long)atomic_load_explicit(&g_fetch_shed, memory_order_relaxed),
                 (unsigned long long)cs.pinned_bytes, (unsigned long long)cs.peak, (unsigned)cs.victim_freq,
                 (unsigned long long)cs.room_evictions, (unsigned long long)cs.room_relaxed, (unsigned long long)atomic_load_explicit(&g_room_waits, memory_order_relaxed),
-                (unsigned long long)atomic_load_explicit(&g_room_timeouts, memory_order_relaxed), (unsigned)atomic_load_explicit(&g_room_waiting, memory_order_relaxed));
+                (unsigned long long)atomic_load_explicit(&g_room_timeouts, memory_order_relaxed), (unsigned)atomic_load_explicit(&g_room_waiting, memory_order_relaxed),
+                atomic_load_explicit(&g_limit_default, memory_order_relaxed) ? 1 : 0);
     else
       st_append(&c, "cache: no memory-limit (every database zone stays in memory)\n");
     st_append(&c, "apex: asked=%llu answered=%llu walking=%d walks=%llu queued=%u (summaries asked for after a reload, for the apex of zones out of memory; queued: zones in the list that wait for a free place or a token)\n",

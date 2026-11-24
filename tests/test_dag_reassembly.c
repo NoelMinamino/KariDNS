@@ -543,12 +543,86 @@ static void test_reassembly_paths(void) {
     printf("  -> targeted reassembly paths passed.\n");
 }
 
+/* ---------------------------------------------------------------- tools review 2026-11-23: T1-L3, T1-L4 */
+static void test_reassembly_review(void) {
+    printf("[TEST] dag reassembly: short frames resynchronised, lost segments counted (T1-L3, T1-L4)...\n");
+    tcp_reasm_stats_t s;
+    tcp_reasm_get_stats(NULL, &s);
+    assert(s.short_frames == 0 && s.ooo_dropped == 0 && s.overflow_evicted == 0);
+
+    /* T1-L3: message A (20), a frame of length 4 (below a header), message B (20).  Before the fix the frame stopped the direction for
+     * good and B never came out */
+    model_reset(0, 0, 0, false);
+    bytestream_t *m = &g_m.st[0][0];
+    m->bytes = malloc(64);
+    m->len = 0; m->nmsg = 2;
+    m->bytes[m->len++] = 0; m->bytes[m->len++] = 20; m->moff[0] = m->len; m->mlen[0] = 20;
+    for (int k = 0; k < 20; k++) m->bytes[m->len++] = (uint8_t)(0x41 + k);
+    m->bytes[m->len++] = 0; m->bytes[m->len++] = 4;
+    for (int k = 0; k < 4; k++) m->bytes[m->len++] = 0xEE;
+    m->bytes[m->len++] = 0; m->bytes[m->len++] = 20; m->moff[1] = m->len; m->mlen[1] = 20;
+    for (int k = 0; k < 20; k++) m->bytes[m->len++] = (uint8_t)(0x61 + k);
+    tcp_reasm_table_t *t = tcp_reasm_create(2, 64 * 1024);
+    feed(t, 0, 0, 3000, m, 0, 26, 0x18);         /* A and half of the short frame */
+    feed(t, 0, 0, 3000, m, 26, m->len - 26, 0x18);
+    assert(!g_m.mismatch && g_m.got[0][0] == 2);
+    tcp_reasm_get_stats(t, &s);
+    assert(s.short_frames == 1);
+    tcp_reasm_get_stats(t, NULL);                 /* (no crash) */
+    tcp_reasm_destroy(t);
+
+    /* before the first message a short "length" still waits (the head of a stream caught in the middle may come later): not counted */
+    static const size_t len100[] = { 100 };
+    model_reset(0, 0, 0, false);
+    m = &g_m.st[0][0];
+    custom_stream(m, 1, len100);
+    m->bytes[20] = 0; m->bytes[21] = 3;
+    t = tcp_reasm_create(2, 64 * 1024);
+    feed(t, 0, 0, 77, m, 20, m->len - 20, 0x18);
+    feed(t, 0, 0, 77, m, 0, 20, 0x18);
+    assert(!g_m.mismatch && g_m.got[0][0] == 1);
+    tcp_reasm_get_stats(t, &s);
+    assert(s.short_frames == 0);
+    tcp_reasm_destroy(t);
+
+    /* T1-L4: an out-of-order segment over the 1500-byte slot, and 10 more than the 8 slots: 1 + 2 lost, counted */
+    model_reset(0, 0, 0, false);
+    static uint8_t huge[4000];
+    huge[0] = 0x0F; huge[1] = 0xA0 - 2; for (int i = 2; i < 4000; i++) huge[i] = (uint8_t)(i * 5);
+    bytestream_t hs = { .bytes = huge, .len = 4000, .nmsg = 1, .moff = { 2 }, .mlen = { 3998 } };
+    g_m.st[0][0] = hs;
+    t = tcp_reasm_create(2, 64 * 1024);
+    feed(t, 0, 0, 10, &hs, 0, 100, 0x18);
+    feed(t, 0, 0, 10, &hs, 200, 2000, 0x18);
+    for (int i = 0; i < 10; i++) feed(t, 0, 0, 10, &hs, 3000 + i * 50, 40, 0x18);
+    feed(t, 0, 0, 10, &hs, 3050, 40, 0x18);       /* a duplicate of a kept one (slot 1; slot 0 was given up twice): not a loss */
+    tcp_reasm_get_stats(t, &s);
+    assert(s.ooo_dropped == 3 && s.overflow_evicted == 0);
+    tcp_reasm_destroy(t);
+    g_m.st[0][0].bytes = NULL;
+
+    /* a direction over max_buffer_per_direction: the stream is given up and counted */
+    static uint8_t big[600];
+    big[0] = 0x02; big[1] = 0x00;
+    bytestream_t bigs = { .bytes = big, .len = 514, .nmsg = 1, .moff = { 2 }, .mlen = { 512 } };
+    g_m.st[0][0] = bigs;
+    t = tcp_reasm_create(4, 256);
+    feed(t, 0, 0, 100, &bigs, 0, 300, 0x18);
+    tcp_reasm_get_stats(t, &s);
+    assert(s.overflow_evicted == 1);
+    tcp_reasm_destroy(t);
+    g_m.st[0][0].bytes = NULL;
+    model_reset(0, 0, 0, false);
+    printf("  -> resync and counters passed.\n");
+}
+
 int main(void) {
     printf("=== Starting dag pcap / TCP Reassembly Tests ===\n");
     test_extract_l4();
     test_reassembly_model();
     test_reassembly_limits();
     test_reassembly_paths();
+    test_reassembly_review();
     printf("=== All dag pcap / TCP Reassembly Tests PASSED ===\n");
     return 0;
 }

@@ -1,6 +1,7 @@
 #include "dag_transport.h"
 #include "dag_internal.h"
 #include "dag_http.h"
+#include "dag_tls.h"
 
 const char *dag_strcasestr(const char *haystack, const char *needle) {
     if (!haystack || !needle) return NULL;
@@ -110,11 +111,29 @@ size_t build_proxyv2_header(uint8_t *buf, size_t buf_cap, const query_opts_t *qo
     return off;
 }
 
+/* T1-L1: send() on a stream socket may take only part of the buffer (POSIX send(2): a signal, a send timeout); the rest is
+ * sent until all of it is out.  false = the connection failed before that (a length prefix without all of its message would
+ * leave the stream out of step, RFC 7766 §8). */
+bool tcp_send_all(int sock, const void *buf, size_t len) {
+    const uint8_t *p = buf;
+    while (len > 0) {
+        ssize_t n = send(sock, p, len, 0);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return false;
+        p += n;
+        len -= (size_t)n;
+    }
+    return true;
+}
+
 void send_proxyv2_if_enabled(int sock, const query_opts_t *qo, bool is_tcp) {
     if (qo && qo->use_proxy) {
         uint8_t pbuf[64];
         size_t plen = build_proxyv2_header(pbuf, sizeof(pbuf), qo, is_tcp);
-        if (plen > 0) send(sock, pbuf, plen, 0);
+        if (plen > 0) {
+            if (is_tcp) (void)tcp_send_all(sock, pbuf, plen);
+            else send(sock, pbuf, plen, 0);
+        }
     }
 }
 
@@ -521,7 +540,8 @@ int do_tcp_send_request(const char *server, int port, const query_opts_t *qo, co
     else prefix_value = (uint16_t)body_len;
 
     uint8_t len_prefix[2] = { prefix_value >> 8, prefix_value & 0xFF };
-    if (send(sock, len_prefix, 2, 0) < 0) { perror("send(len prefix)"); close(sock); return -1; }
+    set_socket_timeouts(sock, timeout_sec);   /* (before the sends: a peer that takes nothing does not hold dag for ever) */
+    if (!tcp_send_all(sock, len_prefix, 2)) { perror("send(len prefix)"); close(sock); return -1; }
 
     if (idle_hold) {
         printf(";; --break tcp-idle-hold: sent only the length prefix, holding connection open for up to %lds...\n", idle_secs);
@@ -549,10 +569,8 @@ int do_tcp_send_request(const char *server, int port, const query_opts_t *qo, co
     if (zero_len_break) {
         /* prefix already claims 0 bytes; send no body at all */
     } else if (!(too_short && body_len == 0)) {
-        if (send(sock, pkt, body_len, 0) < 0) { perror("send(body)"); close(sock); return -1; }
+        if (!tcp_send_all(sock, pkt, body_len)) { perror("send(body)"); close(sock); return -1; }
     }
-
-    set_socket_timeouts(sock, timeout_sec);
 
     return sock;
 }
@@ -595,32 +613,8 @@ static SSL *establish_tls(int tcp_sock, const query_opts_t *qo, const char *serv
         g_ssl_ctx = SSL_CTX_new(TLS_client_method());
         if (!g_ssl_ctx) return NULL;
     }
-    if (qo->tls_ca_file) {
-        if (SSL_CTX_load_verify_locations(g_ssl_ctx, qo->tls_ca_file, NULL) != 1) {
-            fprintf(stderr, ";; Error: could not load TLS CA file '%s'\n", qo->tls_ca_file);
-            return NULL;
-        }
-        SSL_CTX_set_verify(g_ssl_ctx, SSL_VERIFY_PEER, NULL);
-    } else if (qo->tls_verify_default_store) {
-        SSL_CTX_set_default_verify_paths(g_ssl_ctx);
-        static const char *const default_ca_locations[] = {
-            "/etc/ssl/cert.pem",
-            KARIDNS_SYSCONFDIR "/ssl/cert.pem",
-            KARIDNS_PREFIX "/share/certs/ca-root-nss.crt",
-            "/etc/ssl/certs/ca-certificates.crt",
-            "/etc/pki/tls/certs/ca-bundle.crt",
-            "/etc/ssl/ca-bundle.pem",
-            NULL
-        };
-        for (int i = 0; default_ca_locations[i]; i++) {
-            if (access(default_ca_locations[i], R_OK) == 0) {
-                SSL_CTX_load_verify_locations(g_ssl_ctx, default_ca_locations[i], NULL);
-                break;
-            }
-        }
-        SSL_CTX_set_verify(g_ssl_ctx, SSL_VERIFY_PEER, NULL);
-    } else {
-        SSL_CTX_set_verify(g_ssl_ctx, SSL_VERIFY_NONE, NULL);
+    if (!dag_tls_ctx_verify(g_ssl_ctx, qo->tls_ca_file, qo->tls_verify_default_store)) return NULL;
+    if (!qo->tls_ca_file && !qo->tls_verify_default_store) {
         static bool warned_no_verify = false;
         if (!warned_no_verify) {
             fprintf(stderr,
@@ -637,51 +631,11 @@ static SSL *establish_tls(int tcp_sock, const query_opts_t *qo, const char *serv
     if (!ssl) return NULL;
     SSL_set_fd(ssl, tcp_sock);
 
-    const char *raw_sni_host = qo->tls_hostname ? qo->tls_hostname : server;
-    char clean_sni_host[256];
-    const char *check_host = raw_sni_host;
-
-    if (raw_sni_host) {
-        size_t slen = strlen(raw_sni_host);
-        if (raw_sni_host[0] == '[' && slen > 2 && raw_sni_host[slen - 1] == ']') {
-            size_t inner_len = slen - 2;
-            if (inner_len < sizeof(clean_sni_host)) {
-                memcpy(clean_sni_host, raw_sni_host + 1, inner_len);
-                clean_sni_host[inner_len] = '\0';
-                check_host = clean_sni_host;
-            }
-        } else if (slen > 1 && raw_sni_host[slen - 1] == '.') {
-            // RFC 6066 §3: The hostname specification for SNI MUST NOT end with a trailing dot
-            size_t inner_len = slen - 1;
-            if (inner_len < sizeof(clean_sni_host)) {
-                memcpy(clean_sni_host, raw_sni_host, inner_len);
-                clean_sni_host[inner_len] = '\0';
-                check_host = clean_sni_host;
-            }
-        }
-    }
-
-    struct in_addr a4; struct in6_addr a6;
-    bool sni_is_ip = (inet_pton(AF_INET, check_host, &a4) == 1 || inet_pton(AF_INET6, check_host, &a6) == 1);
-    if (!sni_is_ip && check_host) {
-        SSL_set_tlsext_host_name(ssl, check_host);
-    }
-
     // RFC 7858 §3.1: DoT クライアントは ALPN "dot" を送信する (DoH時は除く)
     if (qo && !qo->use_doh) {
         SSL_set_alpn_protos(ssl, (const unsigned char *)"\x03dot", 4);
     }
-
-    /* 証明書検証を行うモード(tls_ca_fileまたはtls_verify_default_store指定時)
-       のみ、ホスト名検証パラメータを明示的に設定する */
-    if (qo->tls_ca_file || qo->tls_verify_default_store) {
-        if (sni_is_ip) {
-            X509_VERIFY_PARAM *vpm = SSL_get0_param(ssl);
-            X509_VERIFY_PARAM_set1_ip_asc(vpm, check_host);
-        } else if (check_host) {
-            SSL_set1_host(ssl, check_host);
-        }
-    }
+    dag_tls_ssl_peer(ssl, qo->tls_hostname ? qo->tls_hostname : server, qo->tls_ca_file || qo->tls_verify_default_store);
 
     if (SSL_connect(ssl) <= 0) {
         if (qo->tls_ca_file || qo->tls_verify_default_store) {
@@ -1045,9 +999,9 @@ ssize_t do_doh_exchange(const char *server, int port, const query_opts_t *qo,
             if (SSL_write(ssl, pkt, (int)pkt_len) <= 0) goto cleanup;
         }
     } else {
-        if (send(sock, req_hdr, req_hdr_len, 0) < 0) goto cleanup;
+        if (!tcp_send_all(sock, req_hdr, (size_t)req_hdr_len)) goto cleanup;
         if (qo->doh_method == DOH_POST) {
-            if (send(sock, pkt, pkt_len, 0) < 0) goto cleanup;
+            if (!tcp_send_all(sock, pkt, pkt_len)) goto cleanup;
         }
     }
 
@@ -1153,7 +1107,7 @@ ssize_t do_tcp_exchange(const char *server, int port, const query_opts_t *qo,
     uint16_t prefix_value = (uint16_t)pkt_len;
     uint8_t len_prefix[2] = { (uint8_t)(prefix_value >> 8), (uint8_t)(prefix_value & 0xFF) };
 
-    bool send_ok = (send(sock, len_prefix, 2, 0) == 2 && send(sock, pkt, pkt_len, 0) == (ssize_t)pkt_len);
+    bool send_ok = tcp_send_all(sock, len_prefix, 2) && tcp_send_all(sock, pkt, pkt_len);
     if (!send_ok && reused) {
         close_cached_tcp();
         sock = connect_tcp(server, port, qo, timeout_sec);
@@ -1171,7 +1125,7 @@ ssize_t do_tcp_exchange(const char *server, int port, const query_opts_t *qo,
             g_cached_conn.bind_port = qo->bind_port;
             g_cached_conn.is_tls = false;
         }
-        if (send(sock, len_prefix, 2, 0) != 2 || send(sock, pkt, pkt_len, 0) != (ssize_t)pkt_len) {
+        if (!tcp_send_all(sock, len_prefix, 2) || !tcp_send_all(sock, pkt, pkt_len)) {
             close_cached_tcp();
             return -1;
         }
@@ -1199,7 +1153,7 @@ ssize_t do_tcp_exchange(const char *server, int port, const query_opts_t *qo,
             g_cached_conn.bind_port = qo->bind_port;
             g_cached_conn.is_tls = false;
         }
-        if (send(sock, len_prefix, 2, 0) == 2 && send(sock, pkt, pkt_len, 0) == (ssize_t)pkt_len) {
+        if (tcp_send_all(sock, len_prefix, 2) && tcp_send_all(sock, pkt, pkt_len)) {
             n = do_tcp_recv_response(sock, resp, resp_cap);
         }
     }

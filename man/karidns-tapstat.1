@@ -1,4 +1,4 @@
-.TH KARIDNS\-TAPSTAT 1 "2026-11-13" "KariDNS" "KariDNS Manual"
+.TH KARIDNS\-TAPSTAT 1 "2026-11-24" "KariDNS" "KariDNS Manual"
 .\" Generated from docs/karidns-tapstat.md by man/md2man.pl (make man): edit the Markdown manual, not this page.
 .SH NAME
 karidns\-tapstat \- Aggregates the dnstap stream of \fBkaridns\fR into periodic
@@ -56,8 +56,9 @@ control frames 512 bytes), every protobuf field is bounds-checked, only the DNS
 header and question are read from the embedded DNS message, and a sender that
 breaks the protocol (data before START, a wrong content type, an oversized
 frame, ...) has its connection closed with a message on standard error. A sender
-that does not finish the handshake within 5 seconds is dropped. The content type
-accepted is \fBprotobuf:dnstap.Dnstap\fR.
+that does not finish the handshake within 5 seconds is dropped, and one that is
+silent for \fB\-w\fR seconds afterwards as well. The content type accepted is
+\fBprotobuf:dnstap.Dnstap\fR.
 .SS What is counted
 \fBkaridns\fR sends \fBAUTH_QUERY\fR and \fBAUTH_RESPONSE\fR messages (\fBdnstap
 { log\-queries yes; log\-responses yes; }\fR; both by default).
@@ -158,7 +159,21 @@ Client prefix lengths, 0 to 32 (default 24) and 0 to 128 (default 56).
 Octal permission of the socket file (default \fB660\fR). The sender
 (\fBkaridns\fR) must be able to connect to the socket: the Backend of
 \fBkaridns\fR connects through its unprivileged broker, so give the socket a
-group or mode that the user of \fBkaridns\fR can write to.
+group or mode that the user of \fBkaridns\fR can write to. Every sender is
+checked against this mode when it connects, from its credentials
+(\fBLOCAL_PEERCRED\fR on FreeBSD): root, the user \fBkaridns\-tapstat\fR runs
+as, or, when the mode gives the group write access, a member of the socket
+file's group; any other is refused with a message on standard error. A mode with
+\fBo+w\fR (such as \fB666\fR) lets every local user send made-up dnstap and fill
+the 16 places, so it is accepted with a warning only.
+.TP 8
+\fB\-w seconds\fR
+Close a sender that has sent nothing for this long after the handshake, 1 to
+86400 (default \fB600\fR): a sender that holds a place without sending gives it
+up. \fBkaridns\fR notices it with its next message and connects again about a
+second later (the messages of that second are counted as lost in \fBkarictl
+status\fR, "dnstap dropped (not connected)"); keep \fB\-w\fR well above the
+quietest stretch of the server.
 .TP 8
 \fB\-V\fR, \fB\-\-version\fR
 Print the version.

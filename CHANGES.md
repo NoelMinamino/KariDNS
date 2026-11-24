@@ -8,7 +8,7 @@ A pull request that changes behaviour adds its line here (docs/RELEASING.md).
 
 ## 0.7.0 (unreleased)
 
-The pull requests of this section are #178 to #252 (the 0.6.2 tag is at #177). Figures are the ones the pull
+The pull requests of this section are #178 to #256 (the 0.6.2 tag is at #177). Figures are the ones the pull
 request bodies report; the host, load and method are in the pull request.
 
 ### Upgrade notes / incompatible changes
@@ -25,6 +25,11 @@ What changes, what it breaks, and what to do. The step-by-step version is [docs/
   `secondary-stale-max` (default 0, unlimited) limits how long an expired copy is served stale (RFC 8767 section 5).
   The name `_karidns-xfr` is reserved as a view name.
 - **The store format is quarantined, not migrated, when it changes** (docs/RELEASING.md). 0.6 had no store, so the upgrade to 0.7.0 drops nothing; a later release that changes `STORE_FORMAT_VERSION` says so in its notes.
+- **Zone images on ZFS are aligned to the record** (`store-align`, default yes, #259). An image that would lie
+  across a record boundary it need not cross starts at the boundary (at most half a record skipped). Large zones
+  cost disk: 10M zones of 100 records took 84 GB instead of 51 GB (+63 %); 20,000 zones of 10 records took 0.15 %
+  more. A store written before keeps its layout; zones written again and records the cleaner moves are aligned.
+  `store-align no;` keeps the old layout (for a large store on a tight disk).
 - **`fetch-rate` defaults to unlimited** (was 200 zones/s) and database zones are answered, not refused (#184).
   A query beyond `fetch-concurrency` or a configured rate waits (parked) instead of being shed. Under overload a
   query for a database zone is dropped and counted, not answered REFUSED or SERVFAIL (#194, #195).
@@ -36,9 +41,19 @@ What changes, what it breaks, and what to do. The step-by-step version is [docs/
     the replies. There is one socket per worker and listen address; the start is refused above 4096 sockets or
     `RLIMIT_NOFILE`. `udp-receive frontend` is the 0.6 behaviour.
   - `store-threads` defaults to 8 (it was 2, docs/karidns.md).
+- **A default `memory-limit` for database zones in the store** (#256). A `database { }` block whose zones go to the
+  zone store and that does not write `memory-limit` gets one from the RAM: half of the RAM above 256 MB, at least
+  `64M` (512 MB: `128M`, 1 GB: `384M`, 16 GB: `8064M`). The coldest zones above it are taken out of memory and read
+  again from the store when asked for; before, every attached zone stayed in memory and a database larger than the
+  host grew the Backend until the kernel killed it. The start logs it at NOTICE (`[DB] memory-limit is not set: 384M
+  is used (the default: half of the 1.0 GB of RAM above 256 MB, at least 64M) ...`), `karictl dbstatus` shows
+  `memory-limit=384M (default)` and `limit_default=1`, and `karicheck db` says the default of its host. Keep the old
+  behaviour with `memory-limit unlimited;`. Without the store (`store none;`, `zone-store none;`) an unset
+  `memory-limit` is still no limit. In a jail or container whose memory is limited below the host's RAM, write
+  `memory-limit` (hw.physmem is the host's).
 - **Socket buffers**: the kernel refuses (does not clip) a `SO_RCVBUF` / `SO_SNDBUF` above about 8/9 of
   `kern.ipc.maxsockbuf`. On a stock system the `4M` default of `udp-recvbuf-size` was refused and the sockets stayed
-  at 16 KiB. 0.7 asks for the most the kernel gives and logs a WARNING that names the sysctl to raise (#224).
+  at 16 KiB. 0.7 asks for the most the kernel gives and logs a line that names the sysctl to raise (#224): a NOTICE for the default size, a WARNING for a size the configuration wrote (#256).
 - **Stricter configuration** (#248, #234, #211, #220). `karidns` refuses to start, and `karicheck conf` reports an
   error with file and line, for: an invalid `rate-limit` value (negative, above INT_MAX, not a number, `window 0`,
   prefix length out of range; it was a warning and the default stayed, #248); an `alias-max-refresh-time` outside 5 s
@@ -73,6 +88,26 @@ What changes, what it breaks, and what to do. The step-by-step version is [docs/
 - **Database drivers read integers strictly** (#249, #250). An integer cell that is not exactly `-?digits` in range is
   an error that names the column (PostgreSQL), SQLite3 bind failures fail the statement, and `karicheck db` warns when an
   integer column of the PowerDNS tables is not int2/int4/int8.
+- **Tools: stricter checks from the tools review of 2026-11-23** (#257).
+  - `karictl` refuses a `karictl.conf` (or any file given with `-c`, `karidns.conf` included) that holds the `secret`
+    and that group or others can read or write: exit status 2 with the message `... holds the control secret and can
+    be read or written by group or others (mode 0644); ... chmod 600 <file>`. Fix: `chmod 600` the file (0400 works
+    too). A copy of `karictl.conf.sample` keeps the sample's mode 0644. It used to be a warning only.
+  - `dnsqps` agents and controllers speak protocol v2: with `--agent-key` every message after the HELLO is
+    authenticated in both directions (the RUN options and the agent's results included). A v1 agent and a v2
+    controller (or the reverse) do not work together (`no valid HELLO`): upgrade every agent and the controller
+    together. A controller with a key now refuses an agent without one.
+  - `dag +trace`, `+nssearch` and `+trace2` with `-y` / `-k` stop at a response that fails TSIG verification
+    (`;; TSIG verification failed, not following the referral; stopping trace.`; `+nssearch` exits 1). `dig` 9.20
+    prints the same verification error and follows the referral anyway: this is an intended difference
+    (docs/dag.md, TSIG).
+  - `karidns-tapstat` closes a sender that sends nothing for `-w` seconds after the handshake (new option, default
+    600); `karidns` reconnects with its next message and about a second of messages is counted as lost
+    (`karictl status`, "dnstap dropped (not connected)"). A sender whose credentials the socket mode does not allow
+    is refused, and `-m` with o+w is warned about.
+  - `dag --replay` refuses a pcapng file before anything is sent (it was read as a text query list); convert it with
+    `editcap -F pcap`. Nanosecond pcap files are read. Text lines with a bad name are skipped with a warning, tls/doh
+    servers are verified with `+tls-ca[=file]` (a warning without it), and UDP answers must carry the query's ID.
 - **`karictl` and `karidns` must be the same version** (#179, #180): `karidns_status_t` grew. `karictl ipcstats` is a
   separate text command so that an older server only shows nothing (#224).
 - **Database schema**: the schema version stays 3, but the SQL files changed. Re-apply them, as the owner of the
@@ -223,6 +258,10 @@ server on pc31 with 8 CPUs and a one-queue em0, or on a VM; the client on anothe
 - **First fill** (#194, #195, #204, #206): the manifest pass under 400k qps load 110-125 s (was 287 s) at 10M zones on
   UFS; no REFUSED in the first second (180-273 before); writer hold maximum 1919 ms to 9.3 ms (#204); the unlogged
   bulk fill writes 4.27 GiB to the device instead of 23.3 GiB for 10M zones on ZFS, fill 410 s against 454 s (#206).
+- **Attaching zones from a ZFS store** (#259; pc31, SATA SSD, 10M zones x 100 records, memory-limit 2G, uniform
+  load of new names): images aligned to the record read 1.00 records per attach instead of 1.61 and the store
+  attaches 26-27k zones/s instead of 20.6-21.9k (25k qps answered without loss, about 16k before); the eviction
+  rounds no longer hold the registry lock for up to 2048 detaches: at 14k qps the client p99 29-46 ms to 7 ms.
 - **Clean open** of the store: 9 ms at 1M zones, 23 ms at 10M (#185).
 - **Backend heap**: a small attached zone 739 B (was 1128 B) (#185); `zone_db_entry_t` 1032 to 584 bytes (#184); the
   Backend's virtual size on a 512 MB host 5.9 GB to 1.0 GB (#211).

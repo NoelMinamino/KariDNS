@@ -6708,6 +6708,7 @@ static int parse_database_option(token_ctx_t *ctx, database_config_t *db, const 
     return 0;
   }
   if (strcmp(key, "store-hot-list") == 0) return parse_bool_statement(ctx, NULL, key, &db->store_hot_list);      /* 0.7 fix 8: hot.list at a clean stop, and the background attach of its zones at the start */
+  if (strcmp(key, "store-align") == 0) return parse_bool_statement(ctx, NULL, key, &db->store_align);      /* 0.7 attach-align: images placed at the record boundary of the file system (COPY mode on ZFS) */
   if (strcmp(key, "store-threads") == 0) {
     if (db_take_uint(ctx, key, false, 1, KARIDNS_DB_STORE_THREADS_MAX, &u) != 0) return -1;
     db->store_threads = (uint32_t)u;
@@ -6740,8 +6741,12 @@ static int parse_database_option(token_ctx_t *ctx, database_config_t *db, const 
     db->hot_list_interval = (uint32_t)u;
     return 0;
   }
-  if (strcmp(key, "memory-limit") == 0)       /* K, M, G suffixes (up to 1024G); unset = no limit (every database zone stays in memory) */
-    return db_take_uint(ctx, key, true, KARIDNS_DB_MEMORY_LIMIT_MIN, KARIDNS_DB_MEMORY_LIMIT_MAX, &db->memory_limit);
+  if (strcmp(key, "memory-limit") == 0) {     /* K, M, G suffixes (up to 1024G) or `unlimited` (every database zone stays in memory); unset = the default from the RAM (0.7.x, dns_mem_advice.h) */
+    if (db_take_uint_word(ctx, key, true, KARIDNS_DB_MEMORY_LIMIT_MIN, KARIDNS_DB_MEMORY_LIMIT_MAX, "unlimited", 0, &u) != 0) return -1;
+    db->memory_limit = u;
+    db->memory_limit_unlimited = u == 0;
+    return 0;
+  }
   if (strcmp(key, "acl-ceiling") == 0) {
     /* addresses and "key" entries like allow-transfer (see zone_transfer_acl_allows(), dns_tsig_acl.c) */
     free_str_list(db->acl_ceiling, db->acl_ceiling_count);
@@ -6797,6 +6802,7 @@ static int parse_database_block(token_ctx_t *ctx, server_config_t *config) {
   db->enabled = true;
   db->signer_wait = true;      /* 0.6.0 item C: a changed zone of the signer waits for the signer */
   db->store_hot_list = true;    /* 0.7 fix 8 */
+  db->store_align = true;       /* 0.7 attach-align */
   db->poll_interval = 2;
   db->coalesce_ms = 1000;
   db->default_ttl = 3600;
@@ -6864,7 +6870,7 @@ static size_t db_config_body_size(const server_config_t *config) {
     if (sqlite ? !v->database_file : !v->database_schema) vn += 5;      /* a view on the global source */
     n += 4 + vn;
   }
-  n += 8 + 5 + 8 + (db->memory_limit ? 5 : 0) + 5;                      /* default ttl, bulk threshold, loader threads, memory limit, signer wait */
+  n += 8 + 5 + 8 + 5 + 5;                                               /* default ttl, bulk threshold, loader threads, memory limit (dir_only: also the default from the RAM), signer wait */
   return n;
 }
 
@@ -9126,8 +9132,8 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
             return -1;
           }
           if (v > 0) {
-            if (rcv) config->udp_recvbuf_size = v;
-            else config->udp_sndbuf_size = v;
+            if (rcv) { config->udp_recvbuf_size = v; config->udp_recvbuf_set = true; }
+            else { config->udp_sndbuf_size = v; config->udp_sndbuf_set = true; }
           }
         } else if (strcmp(key, "tcp-receive-buffer") == 0 || strcmp(key, "tcp-send-buffer") == 0) {
           bool rcv = key[4] == 'r';

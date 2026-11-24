@@ -16,6 +16,7 @@ int connect_udp(const char *server, int port, int pref_family, const char *bind_
 int connect_tcp(const char *server, int port, const query_opts_t *qo, int timeout_sec);
 void close_cached_tcp(void);
 
+bool tcp_send_all(int sock, const void *buf, size_t len);   /* every byte of buf, or false */
 int do_tcp_send_request(const char *server, int port, const query_opts_t *qo,
                         const uint8_t *pkt, size_t pkt_len, int timeout_sec);
 ssize_t do_tcp_recv_response(int sock, uint8_t *resp, size_t resp_cap);

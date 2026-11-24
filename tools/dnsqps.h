@@ -262,6 +262,9 @@ typedef struct {
 /* copy the frame to dst and patch the DNS ID, the UDP source port, the source address (set_sip) and the cookie; the IPv4 header checksum and the UDP checksum
  * are updated incrementally (RFC 1624).  Returns the frame length, 0 when cap is too small */
 size_t dq_frame_emit(uint8_t *dst, size_t cap, const dq_fsend_t *s, bool v6, uint16_t sport);
+/* a transmit buffer of cap bytes takes every frame dnsqps builds (DQ_FRMAX); else -1 and why (a path checks it when it opens: a frame that can
+ * never fit would be retried for ever) */
+int dq_frame_cap_check(size_t cap, const char *what, char *err, size_t errlen);
 /* header + payload with the lengths and checksums set; returns the frame length, 0 when cap is too small */
 size_t dq_frame_build(const dq_frame_tpl_t *t, uint8_t *out, size_t cap, const uint8_t *payload, size_t plen);
 /* a UDP datagram addressed to our_ip (4 or 16 bytes, family v6) in an Ethernet frame (one VLAN tag allowed); 0 = ok, -1 = anything else */
@@ -365,7 +368,18 @@ bool dq_msgb_init(dq_msgb_t *b, const char *verb);
 bool dq_msgb_kv(dq_msgb_t *b, const char *key, const char *val);
 bool dq_msgb_u64(dq_msgb_t *b, const char *key, uint64_t v);
 void dq_msgb_free(dq_msgb_t *b);
-typedef struct { dq_sock_t s; uint8_t hdr[4]; unsigned hgot; uint32_t plen; size_t pgot; char *buf; bool done; } dq_conn_t;
+/* With a key (T3-L1) every message after the HELLO carries, as its last line, mac=HMAC-SHA256(key, "dnsqps-agent-v2 DIR NONCE SEQ\n" + the lines
+ * before it): DIR is c2a or a2c (a message cannot be sent back), NONCE the other side's fresh nonce (the controller's messages are bound to the
+ * agent's nonce and the agent's to the controller's: no replay from another session), SEQ the number of the message in that direction (none
+ * dropped, reordered or repeated).  sauth / rauth: sign what is sent, verify what is received. */
+typedef struct {
+    dq_sock_t s; uint8_t hdr[4]; unsigned hgot; uint32_t plen; size_t pgot; char *buf; bool done;
+    const char *key; size_t klen; bool agent_side, sauth, rauth;
+    char snonce[33], rnonce[33];
+    uint64_t sseq, rseq;
+} dq_conn_t;
+/* the key of the connection (kept by the caller), and the nonce each direction is bound to (NULL: that direction is not authenticated) */
+void dq_conn_auth(dq_conn_t *c, const char *key, size_t klen, bool agent_side, const char *send_nonce, const char *recv_nonce);
 void dq_conn_init(dq_conn_t *c, dq_sock_t s);
 void dq_conn_close(dq_conn_t *c);
 int dq_conn_send(dq_conn_t *c, dq_msgb_t *b, unsigned timeout_ms);                       /* 0 = sent, -1 = error or timeout */

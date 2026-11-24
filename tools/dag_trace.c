@@ -42,6 +42,8 @@ static int resolve_ns_addr_type(const char *ns_name, uint16_t qtype, const ns_re
     uint8_t res_resp[4096];
     ssize_t res_n = do_dns_exchange_auto(rsv->server, rsv->port, &resolve_qo, res_qbuf, res_qlen, res_resp, sizeof(res_resp), resolve_qo.timeout_sec, use_tcp);
     if (res_n <= 12) return count;
+    if (!trace_tsig_verified(resolve_qo.want_tsig, &resolve_qo.tsig_key, res_resp, (size_t)res_n, res_req_mac, res_req_mac_len, true))
+        return count;   /* T1-M1: the addresses of a reply that does not verify are not used */
     int qd = (res_resp[4] << 8) | res_resp[5];
     int an = (res_resp[6] << 8) | res_resp[7];
     size_t roff = 12;
@@ -50,10 +52,18 @@ static int resolve_ns_addr_type(const char *ns_name, uint16_t qtype, const ns_re
         if (expand_wire_name(res_resp, res_n, roff, &roff, &g_dag_arena, &d) != 0) return count;
         roff += 4;
     }
+    /* T1-L2: only the address records of the NS name itself, or of the name its CNAME chain in this answer leads to (RFC 1034
+     * §3.6.2; a CNAME for an NS name is not allowed, RFC 2181 §10.3, but resolvers follow it).  Any other owner in the answer
+     * section is not an address of this name. */
+    char want[256];
+    snprintf(want, sizeof(want), "%s", ns_name);
     for (int k = 0; k < an; k++) {
         dns_record_t rec; uint16_t type;
         if (parse_resource_record(res_resp, res_n, &roff, &g_dag_arena, &rec, &type) != 0) break;
-        if (type == qtype && rec.rdata_count > 0 && count < out_cap) {
+        if (!rec.name || !trace_name_equal(rec.name, want)) continue;
+        if (type == 5 /* CNAME */ && rec.rdata_count > 0) {
+            snprintf(want, sizeof(want), "%s", rec.rdata[0]);
+        } else if (type == qtype && rec.rdata_count > 0 && count < out_cap) {
             if (out_names) snprintf(out_names[count], 256, "%s", ns_name);
             snprintf(out[count++], 64, "%s", rec.rdata[0]);
         }
@@ -165,11 +175,8 @@ static int run_trace_query_impl(const char *qname, const char *server, const cha
     }
 
     if (root_n > 12) {
-        if (root_qo.want_tsig) {
-            uint8_t dummy_mac[64]; size_t dummy_mac_len = 0;
-            int terr = tsig_verify_packet(root_resp, (size_t)root_n, &root_qo.tsig_key, root_req_mac, root_req_mac_len, NULL, 0, false, dummy_mac, &dummy_mac_len);
-            print_tsig_verify_error(terr, root_resp, (size_t)root_n);
-        }
+        bool root_signed_ok = trace_tsig_verified(root_qo.want_tsig, &root_qo.tsig_key, root_resp, (size_t)root_n,
+                                                  root_req_mac, root_req_mac_len, true);
         if (dopt->yaml) {
             print_response_yaml(root_resp, root_n, eff_server, port, eff_use_tcp, dopt);
         } else {
@@ -178,6 +185,11 @@ static int run_trace_query_impl(const char *qname, const char *server, const cha
             int dt_ms_root = timespec_diff_ms(&start_ts, &end_ts);
             /* dig: "from ADDR#PORT(@server に指定した名前)" */
             trace_print_received(root_n, g_last_server_ip[0] ? g_last_server_ip : eff_server, port, eff_server, dt_ms_root);
+        }
+        if (!root_signed_ok) {   /* T1-M1: the root NS of a reply that does not verify are not followed */
+            if (!dopt->yaml) printf(";; TSIG verification failed, not following the referral; stopping trace.\n");
+            ret = 0;
+            goto cleanup;
         }
 
         size_t offset = 12;
@@ -294,11 +306,8 @@ static int run_trace_query_impl(const char *qname, const char *server, const cha
             printf("\n");
         }
 
-        if (n > 12 && hop_qo.want_tsig) {
-            uint8_t dummy_mac[64]; size_t dummy_mac_len = 0;
-            int terr = tsig_verify_packet(resp, (size_t)n, &hop_qo.tsig_key, hop_req_mac, hop_req_mac_len, NULL, 0, false, dummy_mac, &dummy_mac_len);
-            print_tsig_verify_error(terr, resp, (size_t)n);
-        }
+        bool hop_signed_ok = n <= 12 ||
+                             trace_tsig_verified(hop_qo.want_tsig, &hop_qo.tsig_key, resp, (size_t)n, hop_req_mac, hop_req_mac_len, true);
 
         if (dopt->yaml) {
             print_response_yaml(resp, n, target_ips[active_target_idx], port, eff_use_tcp, dopt);
@@ -308,6 +317,10 @@ static int run_trace_query_impl(const char *qname, const char *server, const cha
             trace_print_received(n, target_ips[active_target_idx], port, target_names[active_target_idx], dt_ms_hop);
         }
 
+        if (!hop_signed_ok) {   /* T1-M1: nor the referral of a hop */
+            if (!dopt->yaml) printf(";; TSIG verification failed, not following the referral; stopping trace.\n");
+            break;
+        }
         if (n < 12) break;
         int flags = (resp[2] << 8) | resp[3];
         int ancount = (resp[6] << 8) | resp[7];
@@ -419,10 +432,10 @@ int run_nssearch(const char *qname, const char *server, int port, bool use_tcp, 
     
     if (n < 12) return 1;
 
-    if (ns_qo.want_tsig) {
-        uint8_t dummy_mac[64]; size_t dummy_mac_len = 0;
-        int terr = tsig_verify_packet(resp, (size_t)n, &ns_qo.tsig_key, ns_req_mac, ns_req_mac_len, NULL, 0, false, dummy_mac, &dummy_mac_len);
-        print_tsig_verify_error(terr, resp, (size_t)n);
+    if (!trace_tsig_verified(ns_qo.want_tsig, &ns_qo.tsig_key, resp, (size_t)n, ns_req_mac, ns_req_mac_len, true)) {
+        /* T1-M1: the servers named by a reply that does not verify are not asked */
+        printf(";; TSIG verification failed, not using the NS records of %s\n", qname);
+        return 1;
     }
     int qdcount = (resp[4] << 8) | resp[5];
     int ancount = (resp[6] << 8) | resp[7];
@@ -586,11 +599,7 @@ int run_nssearch(const char *qname, const char *server, int port, bool use_tcp, 
             }
         }
         if (sn > 12) {
-            if (qo.want_tsig) {
-                uint8_t dummy_mac[64]; size_t dummy_mac_len = 0;
-                int terr = tsig_verify_packet(resp, (size_t)sn, &qo.tsig_key, soa_req_mac, soa_req_mac_len, NULL, 0, false, dummy_mac, &dummy_mac_len);
-                print_tsig_verify_error(terr, resp, (size_t)sn);
-            }
+            trace_tsig_verified(qo.want_tsig, &qo.tsig_key, resp, (size_t)sn, soa_req_mac, soa_req_mac_len, true);
             int sancount = (resp[6] << 8) | resp[7];
             size_t soff = 12;
             int sqdcount = (resp[4] << 8) | resp[5];
