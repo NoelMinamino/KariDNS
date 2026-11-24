@@ -1,4 +1,4 @@
-.TH KARIDNS 8 "2026-11-22" "KariDNS" "KariDNS Manual"
+.TH KARIDNS 8 "2026-11-24" "KariDNS" "KariDNS Manual"
 .\" Generated from docs/karidns.md by man/md2man.pl (make man): edit the Markdown manual, not this page.
 .SH NAME
 karidns \- Authoritative DNS Server Daemon for FreeBSD
@@ -156,6 +156,114 @@ receives its parameters in a heap block.
 Network I/O events for TCP connections and UDP sockets are managed using FreeBSD
 \fBkqueue(2)\fR.
 .RE
+.SS Trust boundaries: what each process can do if it is compromised
+The Backend is the only process in Capsicum capability mode (\fBcap_enter(2)\fR
+is called once, after its threads are started). The others are confined by other
+means, and some of them are trusted with more than the shape of what they
+send. This is the threat model the code is built to (Capsicum review
+2026-11-23):
+.TP 8
+Manager (supervisor)
+\fICapability mode:\fR no
+.br
+\fIConfinement:\fR runs as root; starts and restarts the others
+.br
+\fITrusted with:\fR everything (it is the trusted side)
+.TP 8
+Backend
+\fICapability mode:\fR \fByes\fR
+.br
+\fIConfinement:\fR capability mode; every descriptor limited with
+\fBcap_rights_limit(2)\fR (a start-up descriptor that cannot be limited refuses
+the start); the workers' UDP sockets may only receive
+.br
+\fITrusted with:\fR nothing it receives from the network, the loader or the
+plugins
+.TP 8
+Frontend routers
+\fICapability mode:\fR \fBno\fR
+.br
+\fIConfinement:\fR the run user; the descriptors cut to what a router needs by
+hand; the router's copy of a worker UDP socket may only send (\fBCAP_SEND\fR,
+\fBCAP_CONNECT\fR, \fBCAP_GETSOCKNAME\fR)
+.br
+\fITrusted with:\fR the Backend's replies (see below)
+.TP 8
+Connect broker
+\fICapability mode:\fR no
+.br
+\fIConfinement:\fR the run user; it only makes the connections the Backend asks
+for (\fBsocket(2)\fR + \fBconnect(2)\fR): TCP or UDP to a unicast address with a
+port, or the dnstap UNIX socket of the start; a source address only from the
+configuration of the start
+.br
+\fITrusted with:\fR the Backend's requests
+.TP 8
+\fBkaridns\-dbloader\fR
+\fICapability mode:\fR no (by design)
+.br
+\fIConfinement:\fR its own \fBloader\-user\fR; it holds the database
+credentials, the Backend holds none
+.br
+\fITrusted with:\fR the \fBcontents\fR of the database zones (below)
+.TP 8
+\fBtype program\fR plugins
+\fICapability mode:\fR no
+.br
+\fIConfinement:\fR \fBprogram\-user\fR; TEST-ONLY feature
+.br
+\fITrusted with:\fR the answers of their zones
+.PP
+What remains when one of them is taken over:
+.IP \(bu 2
+\fBThe reply channel is checked for shape, not meaning.\fR A router checks every
+frame a worker sends (length, bounds, that the socket is one of that worker's),
+but the destination address and the payload are what the worker says; with
+\fBudp\-receive backend\fR a router cannot match a reply to a query it never
+saw. A compromised Backend can therefore make the server's UDP sockets send any
+payload to any address: a reflection point at the server's addresses. It cannot
+send on another worker's socket, open a socket itself, or reach the file system;
+through the connect broker it can open TCP and UDP connections to any unicast
+address, as the run user (the broker is what makes the transfers of secondary
+zones, the forward zones and the dnstap reconnects possible from the
+sandbox). Closing the first would need per-query state in the router, which
+\fBudp\-receive backend\fR removes by design.
+.IP \(bu 2
+\fBThe loader is authoritative for the contents of the database zones.\fR The
+Backend checks everything the loader sends for form (KDB1 framing, names,
+counts, sizes, the structure and rules of each zone image,
+\fBzone_image_validate_ex()\fR), not for truth: a compromised loader can serve
+any structurally valid zone into any view that takes zones from the database. It
+cannot corrupt the Backend's memory or reach a view outside the
+configuration. The digest of a zone image is the loader's claim and is used to
+decide that a zone is unchanged; the Backend does not compute it again. A pass
+that would delete more than 20 % (and more than 1000) of a view's stored zones
+deletes nothing (\fBDBS_GUARD_PCT\fR). A zone that the loader begins and does
+not finish within 120 s closes the stream (the partial image is freed, the
+supervisor starts the loader again). The loader's log lines are always logged as
+\fB[DB] ...\fR and never above \fBLOG_ERR\fR.
+.IP \(bu 2
+\fBMemory that waits for a reader is not capped.\fR Zone snapshots and versions
+that a reload, a transfer or an UPDATE replaced are freed in order once nobody
+reads them; a reader that never finishes (a stuck control command, a thread that
+stays in a read section) keeps them, and nothing cuts it off. \fBkarictl
+status\fR shows the queue (\fBretired zone snapshots waiting\fR), and a warning
+is logged when the oldest has waited more than 60 s (docs/karictl.md). The
+configuration is double-buffered and cannot grow this way: a reload waits
+instead.
+.IP \(bu 2
+\fBLog writes are synchronous outside the event path.\fR Messages that a client
+or a remote server can cause (refused transfers and UPDATEs, malformed queries,
+forwarders that fail) go through the event path: rate-limited per category and
+second, and a worker only writes a record into its ring. Other messages are
+written by the thread that logs them, to every channel at once; a file channel
+on a stalled file system or a standard error that nobody reads (a pipe of a
+supervisor that stopped reading) stops that thread. Run the server with standard
+error on a terminal, a file or \fB/dev/null\fR, not on a pipe that may stop
+being read.
+.IP \(bu 2
+\fBWithout \fBCAPABILITY_MODE\fB in the kernel\fR the Backend runs without the
+sandbox, with a \fBLOG_CRIT\fR line (above); every other boundary stays.
 .SH OPTIONS & ARGUMENTS
 .TP 8
 \fB<config_file>\fR, \fB\-c config_file\fR

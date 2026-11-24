@@ -702,6 +702,18 @@ static int restore_do(zone_db_entry_t *e, bool own) {
       ok = apex != ZONE_IMAGE_NONE && apex == zi->apex_name && soa != ZONE_IMAGE_NONE && zone_image_soa(zi, soa, NULL, 0, NULL, 0, &nums) == 0 && nums.serial == z.serial;
       if (!ok) snprintf(why, sizeof(why), "not the image of the zone, or another serial");
     }
+    /* review 2026-11-23 D-L5 / D-L6: as the attach of a stored database zone does (dns_db_store.c attach_build()), the copy is looked at as an image that
+     * arrives now: the rules of the zone and of every source (zone_image_check_policy(); an image an older build wrote, or one stored before a rule was
+     * made), then the limits of the configuration as they are now (max-records & co., zone_limits_gate_image(): a limit tightened since the transfer).  A
+     * copy that fails is not used: the next refresh transfers the zone, which the transfer then checks the same way */
+    if (ok) {
+      const zone_image_policy_t pol = { e->domain, z.serial, UINT64_MAX, 0, 0, 0, true, (zi->flags & ZONE_IMAGE_F_TINYDNS) != 0, true };
+      ok = zone_image_check_policy(img.data, img.len, &pol, why, sizeof(why)) == 0;
+    }
+    if (ok && zone_limits_gate_image(e, zi, "the restore of the stored copy") != 0) {      /* (logged by it) */
+      ok = false;
+      snprintf(why, sizeof(why), "over a limit of the configuration");
+    }
   } else {
     snprintf(why, sizeof(why), "%s", r == -EBADMSG ? "the checksum is wrong" : strerror(-r));
   }

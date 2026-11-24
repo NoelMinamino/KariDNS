@@ -389,6 +389,7 @@ typedef struct {
     uint64_t max_records;        /* max-zone-records, 0 = no limit */
     bool extended;               /* KDB_ZF_EXTENDED */
     bool tinydns;                /* KDB_ZF_TINYDNS */
+    bool xfr_copy;               /* a secondary's stored copy (dns_xfr_store.c restore_do()): ECS trusted resolvers may be in the image (Extended AXFR ECS_TRUSTED puts them there) */
 } zone_image_policy_t;
 int zone_image_validate_ex(const void *buf, size_t len, const zone_image_policy_t *pol, char *why, size_t whylen);
 /* the checks of zone_image_validate_ex() after the structure: the policy of the zone (what ZONE_BEGIN said, the owners, the RRs, the SOA, the extensions) and the rules of every source of a zone (ALIAS / LUA RDATA, ALIAS beside A / AAAA or

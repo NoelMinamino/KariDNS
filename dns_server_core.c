@@ -367,10 +367,15 @@ STATIC_TEST pid_t g_broker_pid = -1;
 STATIC_TEST char g_pid_file_path[1024];   /* defined below, with the supervisor's state */
 STATIC_TEST int g_pid_fd;
 
-__attribute__((unused)) STATIC_TEST void start_connect_broker(void) {
+/* false (logged): there is no broker (the socket pair or the fork failed), or the Backend's end of its socket kept wider rights than it needs
+ * (review 2026-11-23 A-L1: it was not checked; the broker connects wherever it is asked to).  main() refuses the start: without a broker the
+ * transfers, the forward zones and dnstap failed quietly before. */
+__attribute__((unused)) STATIC_TEST bool start_connect_broker(void) {
   int sv[2];
-  if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0)
-    return;
+  if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sv) < 0) {   /* (F-B2: no exec'd child inherits it) */
+    syslog(LOG_CRIT, "[Broker] cannot create the connect broker's socket pair: %m");
+    return false;
+  }
 
   /* [SEC] このブローカー子プロセスが行うのは socket()+connect() の代行
    * だけであり、いずれもroot権限を必要としない。しかし従来はfork時点の
@@ -389,9 +394,10 @@ __attribute__((unused)) STATIC_TEST void start_connect_broker(void) {
   gc_snapshot_wait_idle();
   pid_t pid = fork();
   if (pid < 0) {
+    syslog(LOG_CRIT, "[Broker] cannot fork the connect broker: %m");
     close(sv[0]);
     close(sv[1]);
-    return;
+    return false;
   }
   if (pid == 0) {
     klog_set_role(KLOG_ROLE_AUX);
@@ -531,7 +537,12 @@ __attribute__((unused)) STATIC_TEST void start_connect_broker(void) {
   g_broker_pid = pid;
   cap_rights_t broker_rights;
   cap_rights_init(&broker_rights, CAP_SEND, CAP_RECV, CAP_EVENT, CAP_FCNTL, CAP_SHUTDOWN);   /* CAP_SHUTDOWN: broker_connect_opts() ends a conversation that lost a message */
-  cap_rights_limit(g_broker_sock, &broker_rights);
+  if (!limit_fd_rights(g_broker_sock, &broker_rights, "connect broker socket")) {
+    close(g_broker_sock);                     /* (the broker reads the end of the stream and exits) */
+    g_broker_sock = -1;
+    return false;
+  }
+  return true;
 }
 
 int broker_connect(int family, int type, struct sockaddr *addr,
@@ -3602,7 +3613,8 @@ void *worker_thread_func(void *arg) {
   cap_rights_init(&ipc_rights, CAP_EVENT, CAP_READ, CAP_WRITE, CAP_RECV, CAP_SEND);
   for (int f = 0; f < g_num_frontend_routers; f++) {
     int my_ipc_fd = g_ipc_fds[f][w][1];
-    cap_rights_limit(my_ipc_fd, &ipc_rights);
+    if (!limit_fd_rights(my_ipc_fd, &ipc_rights, "worker IPC socket"))   /* (logged; review 2026-11-23 A-L1: the start fails, as for a socket it cannot watch) */
+      goto worker_startup_failed;
     struct kevent ev_ipc;
     EV_SET(&ev_ipc, my_ipc_fd, EVFILT_READ, EV_ADD | EV_CLEAR, 0, 0, (void *)1);
     kevent(kq, &ev_ipc, 1, NULL, 0, NULL);
@@ -6070,8 +6082,11 @@ void *control_thread_func(void *arg) {
 
           cap_rights_t rights;
           cap_rights_init(&rights, CAP_RECV, CAP_SEND, CAP_EVENT, CAP_GETSOCKOPT);
-          cap_rights_limit(cfd, &rights);
-          
+          if (!limit_fd_rights(cfd, &rights, "control connection")) {   /* (logged; review 2026-11-23 A-L1: a connection with wide rights is not served) */
+            close(cfd);
+            continue;
+          }
+
           ctrl_client_t *c = calloc(1, sizeof(ctrl_client_t));
           if (!c) {
               syslog(LOG_ERR, "[Control] OOM allocating ctrl_client_t; dropping connection");
@@ -8128,7 +8143,8 @@ STATIC_TEST bool daemonize(void) {
   cap_rights_t io_rights;
   cap_rights_init(&io_rights, CAP_READ, CAP_WRITE, CAP_FSTAT);
   for (int stdio_fd = STDIN_FILENO; stdio_fd <= STDERR_FILENO; stdio_fd++)
-    cap_rights_limit(stdio_fd, &io_rights);
+    if (!limit_fd_rights(stdio_fd, &io_rights, "standard I/O"))   /* (logged, errno set; review 2026-11-23 A-L1: refused like a failed fork) */
+      return false;
   return true;
 }
 
@@ -8165,7 +8181,7 @@ STATIC_TEST void setup_ipc_tables(int num_workers) {
 
   for (int f = 0; f < g_num_frontend_routers; f++) {
     for (int w = 0; w < num_workers; w++) {
-      if (socketpair(AF_UNIX, SOCK_DGRAM, 0, g_ipc_fds[f][w]) < 0) {
+      if (socketpair(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0, g_ipc_fds[f][w]) < 0) {   /* (review 2026-11-23 F-B2: an exec'd child, the loader or a plugin, never inherits an end; fork() keeps them) */
         syslog(LOG_CRIT, "[IPC] Failed to create socketpair for router %d worker %d: %m", f, w);
         log_startup_refused();   // 0.7: (start-up only) the log files this start made go to the run user, as on the other refusals
         exit(1);
@@ -8180,9 +8196,12 @@ STATIC_TEST void setup_ipc_tables(int num_workers) {
       ipc_set_buf(g_ipc_fds[f][w][1], SO_SNDBUF, sndbuf_size, true);
     }
   }
-  /* test switches (tests/run_ipc_drops_test.sh E): the wait of a worker for a full queue to its router (ipc_reply_flush(); 0 = drop at once, as
-   * before 0.7), and a small queue of the replies, so that a router held for a moment fills it: the send buffer of the worker's end (a connected unix datagram
-   * socket of FreeBSD 15 queues what one sender sent up to the sender's SO_SNDBUF; the receiver's SO_RCVBUF does not limit it, measured on 15.1) */
+#ifdef KARIDNS_TEST_EVICT
+  /* TEST ONLY (karidns-evict, make evict, and the instrumented karidns of `make coverage`; never a production build: review 2026-11-23 F-B3, the
+   * release binary read them from its environment unchecked).  tests/run_ipc_drops_test.sh E: the wait of a worker for a full queue to its router
+   * (ipc_reply_flush(); 0 = drop at once, as before 0.7), and a small queue of the replies, so that a router held for a moment fills it: the send
+   * buffer of the worker's end (a connected unix datagram socket of FreeBSD 15 queues what one sender sent up to the sender's SO_SNDBUF; the
+   * receiver's SO_RCVBUF does not limit it, measured on 15.1) */
   const char *tb = getenv("KARIDNS_TEST_IPC_REPLY_BUDGET_US"), *tq = getenv("KARIDNS_TEST_IPC_REPLY_QUEUE");
   if (tb && *tb) g_ipc_reply_budget_us = atol(tb);
   if (tq && atoi(tq) > 0) {
@@ -8193,8 +8212,9 @@ STATIC_TEST void setup_ipc_tables(int num_workers) {
         (void)setsockopt(g_ipc_fds[f][w][0], SOL_SOCKET, SO_RCVBUF, &q, sizeof(q));   /* (the router's end too: another kernel may count it there) */
       }
   }
+#endif
 
-  if (socketpair(AF_UNIX, SOCK_DGRAM, 0, g_notify_ipc) < 0) {
+  if (socketpair(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0, g_notify_ipc) < 0) {
     syslog(LOG_CRIT, "[IPC] Failed to create notify socketpair: %m");
     log_startup_refused();
     exit(1);
@@ -8216,21 +8236,23 @@ STATIC_TEST void setup_ipc_tables(int num_workers) {
            g_ipc_buf_written ? "WARNING" : "NOTICE", g_ipc_buf_short, g_ipc_buf_asked, g_ipc_buf_written ? "" : " (the default)", g_ipc_buf_got, g_ipc_buf_err ? ", setsockopt: " : "", g_ipc_buf_err ? strerror(g_ipc_buf_err) : "",
            sockbuf_maxsockbuf(), sockbuf_maxsockbuf_for((unsigned long)g_ipc_buf_asked), g_ipc_buf_asked,
            sysctl_num("net.local.dgram.recvspace"), sysctl_num("net.local.dgram.maxdgram"));
-  cap_rights_t n_rights_0, n_rights_1;
-  cap_rights_init(&n_rights_0, CAP_RECV, CAP_EVENT);
-  cap_rights_limit(g_notify_ipc[0], &n_rights_0);
-  cap_rights_init(&n_rights_1, CAP_SEND, CAP_EVENT, CAP_FCNTL);
-  cap_rights_limit(g_notify_ipc[1], &n_rights_1);
-
-  if (socketpair(AF_UNIX, SOCK_DGRAM, 0, g_notify_resp_ipc) < 0) {
+  if (socketpair(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0, g_notify_resp_ipc) < 0) {
     syslog(LOG_CRIT, "[IPC] Failed to create NOTIFY response socketpair: %m");
     log_startup_refused();
     exit(1);
   }
   fcntl(g_notify_resp_ipc[0], F_SETFL, fcntl(g_notify_resp_ipc[0], F_GETFL, 0) | O_NONBLOCK);
   fcntl(g_notify_resp_ipc[1], F_SETFL, fcntl(g_notify_resp_ipc[1], F_GETFL, 0) | O_NONBLOCK);
-  cap_rights_limit(g_notify_resp_ipc[0], &n_rights_0);
-  cap_rights_limit(g_notify_resp_ipc[1], &n_rights_1);
+  /* the receiving ends [0] and the sending ends [1] of both NOTIFY pairs; review 2026-11-23 A-L1: a descriptor that keeps wider rights refuses the
+   * start (it was not checked) */
+  cap_rights_t n_rights_0, n_rights_1;
+  cap_rights_init(&n_rights_0, CAP_RECV, CAP_EVENT);
+  cap_rights_init(&n_rights_1, CAP_SEND, CAP_EVENT, CAP_FCNTL);
+  if (!limit_fd_rights(g_notify_ipc[0], &n_rights_0, "NOTIFY IPC") || !limit_fd_rights(g_notify_ipc[1], &n_rights_1, "NOTIFY IPC") ||
+      !limit_fd_rights(g_notify_resp_ipc[0], &n_rights_0, "NOTIFY response IPC") || !limit_fd_rights(g_notify_resp_ipc[1], &n_rights_1, "NOTIFY response IPC")) {
+    log_startup_refused();
+    exit(1);
+  }
 }
 
 /* 非root起動時に、path (pid file / 制御ソケット) を作成できるかを
@@ -8669,7 +8691,12 @@ int main(int argc, char **argv) {
                     CAP_FSTAT, CAP_FSTATFS, CAP_FTRUNCATE, CAP_SEEK,
                     CAP_RENAMEAT_SOURCE, CAP_RENAMEAT_TARGET, CAP_UNLINKAT,
                     CAP_FCNTL);
-    cap_rights_limit(g_cwd_fd, &cwd_rights);
+    if (!limit_fd_rights(g_cwd_fd, &cwd_rights, "start-up directory")) {
+      /* (logged; review 2026-11-23 A-L1) not kept with wider rights: without it the directories are opened by their relative path, as when it cannot be
+       * opened (open_dir_by_path(), outside capability mode only, in the same working directory) */
+      close(g_cwd_fd);
+      g_cwd_fd = -1;
+    }
   }
 
   g_config_path = config_file;
@@ -8962,7 +8989,18 @@ int main(int argc, char **argv) {
     log_startup_refused();
     return 1;
   }
-  start_connect_broker();
+  if (!start_connect_broker()) {
+    /* (logged by it; the daemon's stderr is /dev/null by now, the foreground server's the terminal) */
+    fprintf(stderr, "[ERROR] Refusing to start: the connect broker could not be started (see the log)\n");
+    if (g_pid_fd >= 0) {
+      strlcpy(g_pid_file_path, effective_pid_file, sizeof(g_pid_file_path));
+      g_supervisor_pid = getpid();
+      cleanup_pid_file();
+    }
+    free_server_config_fields(&g_config_db.config_a);
+    log_startup_refused();
+    return 1;
+  }
 
   sigset_t set;
   sigemptyset(&set);
@@ -9121,7 +9159,16 @@ int main(int argc, char **argv) {
         fcntl(g_control_sock, F_SETFL, fcntl(g_control_sock, F_GETFL, 0) | O_NONBLOCK);
         cap_rights_t ctrl_rights;
         cap_rights_init(&ctrl_rights, CAP_ACCEPT, CAP_EVENT, CAP_GETSOCKOPT, CAP_SETSOCKOPT, CAP_FCNTL, CAP_RECV, CAP_SEND);
-        cap_rights_limit(g_control_sock, &ctrl_rights);
+        if (!limit_fd_rights(g_control_sock, &ctrl_rights, "control socket")) {   /* (logged; review 2026-11-23 A-L1) */
+          fprintf(stderr, "[ERROR] Refusing to start: the rights of the control socket '%s' cannot be limited: %s\n", sock_path, strerror(errno));
+          umask(old_mask);
+          close(g_control_sock);
+          g_control_sock = -1;
+          cleanup_pid_file();                   /* (the socket file goes with ctl_bound_unlink() at exit) */
+          free_server_config_fields(&g_config_db.config_a);
+          log_startup_refused();
+          return 1;
+        }
       } else {
         // control-channel 有効時に制御ソケットを bind できなければ起動しない
         int bind_errno = errno;

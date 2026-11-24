@@ -47,6 +47,27 @@ karidns [-v | --version | -V] [-f] [-d debug_level] [-p port | -p pid_file] [-P 
 4. **Kqueue Event Loop**:
    - Network I/O events for TCP connections and UDP sockets are managed using FreeBSD `kqueue(2)`.
 
+### Trust boundaries: what each process can do if it is compromised
+
+The Backend is the only process in Capsicum capability mode (`cap_enter(2)` is called once, after its threads are started). The others are confined by other means, and some of them are trusted with more than the shape of what they send. This is the threat model the code is built to (Capsicum review 2026-11-23):
+
+| Process | Capability mode | Confinement | Trusted with |
+|---|---|---|---|
+| Manager (supervisor) | no | runs as root; starts and restarts the others | everything (it is the trusted side) |
+| Backend | **yes** | capability mode; every descriptor limited with `cap_rights_limit(2)` (a start-up descriptor that cannot be limited refuses the start); the workers' UDP sockets may only receive | nothing it receives from the network, the loader or the plugins |
+| Frontend routers | **no** | the run user; the descriptors cut to what a router needs by hand; the router's copy of a worker UDP socket may only send (`CAP_SEND`, `CAP_CONNECT`, `CAP_GETSOCKNAME`) | the Backend's replies (see below) |
+| Connect broker | no | the run user; it only makes the connections the Backend asks for (`socket(2)` + `connect(2)`): TCP or UDP to a unicast address with a port, or the dnstap UNIX socket of the start; a source address only from the configuration of the start | the Backend's requests |
+| `karidns-dbloader` | no (by design) | its own `loader-user`; it holds the database credentials, the Backend holds none | the **contents** of the database zones (below) |
+| `type program` plugins | no | `program-user`; TEST-ONLY feature | the answers of their zones |
+
+What remains when one of them is taken over:
+
+- **The reply channel is checked for shape, not meaning.** A router checks every frame a worker sends (length, bounds, that the socket is one of that worker's), but the destination address and the payload are what the worker says; with `udp-receive backend` a router cannot match a reply to a query it never saw. A compromised Backend can therefore make the server's UDP sockets send any payload to any address: a reflection point at the server's addresses. It cannot send on another worker's socket, open a socket itself, or reach the file system; through the connect broker it can open TCP and UDP connections to any unicast address, as the run user (the broker is what makes the transfers of secondary zones, the forward zones and the dnstap reconnects possible from the sandbox). Closing the first would need per-query state in the router, which `udp-receive backend` removes by design.
+- **The loader is authoritative for the contents of the database zones.** The Backend checks everything the loader sends for form (KDB1 framing, names, counts, sizes, the structure and rules of each zone image, `zone_image_validate_ex()`), not for truth: a compromised loader can serve any structurally valid zone into any view that takes zones from the database. It cannot corrupt the Backend's memory or reach a view outside the configuration. The digest of a zone image is the loader's claim and is used to decide that a zone is unchanged; the Backend does not compute it again. A pass that would delete more than 20 % (and more than 1000) of a view's stored zones deletes nothing (`DBS_GUARD_PCT`). A zone that the loader begins and does not finish within 120 s closes the stream (the partial image is freed, the supervisor starts the loader again). The loader's log lines are always logged as `[DB] ...` and never above `LOG_ERR`.
+- **Memory that waits for a reader is not capped.** Zone snapshots and versions that a reload, a transfer or an UPDATE replaced are freed in order once nobody reads them; a reader that never finishes (a stuck control command, a thread that stays in a read section) keeps them, and nothing cuts it off. `karictl status` shows the queue (`retired zone snapshots waiting`), and a warning is logged when the oldest has waited more than 60 s (docs/karictl.md). The configuration is double-buffered and cannot grow this way: a reload waits instead.
+- **Log writes are synchronous outside the event path.** Messages that a client or a remote server can cause (refused transfers and UPDATEs, malformed queries, forwarders that fail) go through the event path: rate-limited per category and second, and a worker only writes a record into its ring. Other messages are written by the thread that logs them, to every channel at once; a file channel on a stalled file system or a standard error that nobody reads (a pipe of a supervisor that stopped reading) stops that thread. Run the server with standard error on a terminal, a file or `/dev/null`, not on a pipe that may stop being read.
+- **Without `CAPABILITY_MODE` in the kernel** the Backend runs without the sandbox, with a `LOG_CRIT` line (above); every other boundary stays.
+
 ---
 
 ## OPTIONS & ARGUMENTS

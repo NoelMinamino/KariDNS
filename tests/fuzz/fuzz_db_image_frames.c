@@ -70,7 +70,7 @@ static void zone_drop(zone_t *z) {
 
 static void check_image(const zone_t *z, const kdb_limits_t *lim, run_t *r) {
     char why[300];
-    const zone_image_policy_t pol = { z->name, z->serial, z->rr_count, z->size, lim->max_zone_bytes, lim->max_zone_records, (z->flags & KDB_ZF_EXTENDED) != 0, (z->flags & KDB_ZF_TINYDNS) != 0 };
+    const zone_image_policy_t pol = { z->name, z->serial, z->rr_count, z->size, lim->max_zone_bytes, lim->max_zone_records, (z->flags & KDB_ZF_EXTENDED) != 0, (z->flags & KDB_ZF_TINYDNS) != 0, false };
     if (z->have != z->size) abort();                             /* the machine accepted ZONE_END: the image is complete */
     const int vr = zone_image_validate_ex(z->img, z->have, &pol, why, sizeof(why));
     mix(&r->sum, (uint64_t)(vr + 3));

@@ -183,8 +183,9 @@ logger -p daemon.notice -t karidns-signer-probe "probe $$" 2> /dev/null
 i=0; while [ $i -lt 20 ]; do grep -q "karidns-signer-probe.*probe $$" /var/log/messages 2> /dev/null && { SYSLOG=YES; break; }; sleep 0.2; i=$((i + 1)); done
 [ $SYSLOG = YES ] || echo "SKIP: a line of logger(1) does not reach /var/log/messages (no syslogd here): the syslog lines of the daemon"
 $RC onestart > "$T/rc_start.out" 2>&1 && ok "onestart" || { bad "onestart" "$(cat "$T/rc_start.out")"; done_; }
-SUP=$(cat /var/run/karidns_signer/supervisor.pid 2> /dev/null); CHILD=""
-i=0; while [ $i -lt 100 ] && [ -z "$CHILD" ]; do CHILD=$(cat /var/run/karidns_signer/child.pid 2> /dev/null); sleep 0.1; i=$((i + 1)); done
+# both pid files are read through the bounded wait: the supervisor writes its own after onestart returns (CI flake row 60)
+SUP=""; CHILD=""
+i=0; while [ $i -lt 100 ] && { [ -z "$SUP" ] || [ -z "$CHILD" ]; }; do SUP=$(cat /var/run/karidns_signer/supervisor.pid 2> /dev/null); CHILD=$(cat /var/run/karidns_signer/child.pid 2> /dev/null); sleep 0.1; i=$((i + 1)); done
 { [ -n "$SUP" ] && kill -0 "$SUP" 2> /dev/null; } && ok "the supervisor pid file names a live process" || bad "no live supervisor ($SUP)"
 { [ -n "$CHILD" ] && kill -0 "$CHILD" 2> /dev/null; } && ok "the child pid file names a live process" || bad "no live child ($CHILD)"
 same "the pid directory is the service user's" "$(stat -f %Su /var/run/karidns_signer)" nobody

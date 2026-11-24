@@ -375,6 +375,9 @@ static void conf_text(char *out, size_t cap, const char *store_stmt) {
            "  zone \"k.test\" { type slave; masters { 192.0.2.1; }; primary-settings no; };\n"
            "  zone \"l.test\" { type slave; masters { 192.0.2.1; }; primary-settings no; };\n"
            "  zone \"p.test\" { type slave; masters { 192.0.2.2; }; primary-settings no; };\n"
+           "  zone \"pol.test\" { type slave; masters { 192.0.2.1; }; primary-settings no; };\n"
+           "  zone \"lim.test\" { type slave; masters { 192.0.2.1; }; primary-settings no; max-records 4; };\n"
+           "  zone \"ecs.test\" { type slave; masters { 192.0.2.1; }; primary-settings no; };\n"
            "  zone \"cat.test\" { type slave; masters { 192.0.2.1; }; primary-settings no; catalog-zone yes; };\n"
            "%s"
            "};\n", store_stmt, g_dir, g_dir, g_extra_zones);
@@ -456,6 +459,24 @@ static void put_raw(const char *zone, uint32_t meta_serial, uint32_t img_serial,
   memset(&m, 0, sizeof(m));
   m.flags = STORE_F_XFR;
   m.serial = meta_serial;
+  m.stamp_time = (uint64_t)stamp;
+  xfr_state_encode(&s, m.digest);
+  CHECK_EQ(store_put_ex(st, (uint16_t)xfr_store_vid(), k, (size_t)n, &m, img, img->total_size, STORE_PUT_NO_DEGRADE, NULL), 0);
+  free(img);
+}
+
+/* a record of the zone with the image the test made, under the identity this module gives the zone (the image is freed) */
+static void put_img(const char *zone, zone_image_t *img, uint32_t serial, time_t stamp) {
+  store_t *st = db_store_handle();
+  char k[XFR_KEY_MAX + 1];
+  const int n = xfr_key_make("v1", XFR_K_CONFIG, zone, k, sizeof(k));
+  CHECK(img != NULL);
+  if (!img) return;
+  xfr_state_t s = { .kind = XFR_K_CONFIG, .identity = xfr_identity(XFR_K_CONFIG, zone, "v1", NULL, 0), .last_ok = (uint32_t)time(NULL) };
+  store_meta_t m;
+  memset(&m, 0, sizeof(m));
+  m.flags = STORE_F_XFR;
+  m.serial = serial;
   m.stamp_time = (uint64_t)stamp;
   xfr_state_encode(&s, m.digest);
   CHECK_EQ(store_put_ex(st, (uint16_t)xfr_store_vid(), k, (size_t)n, &m, img, img->total_size, STORE_PUT_NO_DEGRADE, NULL), 0);
@@ -609,6 +630,11 @@ static int life1(void) {
   refresh_end(ent("d.test."), XFR_OUT_TRANSFERRED, now);
                                                                           /* (d.test: its image is damaged at the end of this life, after the store check) */
   put_raw("e.test.", 99, 7, xfr_identity(XFR_K_CONFIG, "e.test.", "v1", NULL, 0), now);   /* the record's serial is not the image's */
+  /* review 2026-11-23 D-L5 / D-L6: a copy with an owner outside its zone (zone_image_check_policy()), one over max-records 4 (8 RRs), and one whose image
+   * carries an ECS trusted resolver (an Extended AXFR puts them there: allowed in a secondary's copy, refused from the database) */
+  put_img("pol.test.", zi_from_text_ex("pol.test.", "$ORIGIN pol.test.\n$TTL 300\n@ SOA ns1 host 3 3600 600 86400 300\n@ NS ns1\nhost.other.test. A 192.0.2.9\n", true), 3, now);
+  put_img("lim.test.", zi_zone("lim.test.", 3, NULL, NULL, 5), 3, now);
+  put_img("ecs.test.", zi_from_text_trusted("ecs.test.", "$ORIGIN ecs.test.\n$TTL 300\n@ SOA ns1 host 3 3600 600 86400 300\n@ NS ns1\nwww A 192.0.2.80\n"), 3, now);
   zone_db_entry_t *f = ent("f.test.");
   CHECK(f && f->xfr_origin == XFR_ORIGIN_FILE && atomic_load(&f->serial) == 100);
   install(f, 50, XFR_ORIGIN_XFR, now, 0);                                 /* a retransfer to a lower serial */
@@ -778,7 +804,12 @@ static int life2(void) {
   CHECK(i && atomic_load(&i->serial) == 4 && atomic_load(&i->next_check) > now && atomic_load(&i->next_check) <= now + 600);
   zone_db_entry_t *j = ent("j.test.");
   CHECK(j && atomic_load(&j->serial) == 0);                                /* (no record) */
-  CHECK(c.restored >= 6 && c.restored_expired >= 1 && c.restore_bad == 2 && c.restore_identity == 1 && c.file_won == 1);
+  CHECK(c.restored >= 6 && c.restored_expired >= 1 && c.restore_bad == 4 && c.restore_identity == 1 && c.file_won == 1);
+  /* review 2026-11-23 D-L5 / D-L6: pol (an owner outside the zone) and lim (over max-records) are not restored, their records are KNOWN; ecs (an ECS trusted resolver in
+   * the image, as an Extended AXFR copy has) is restored */
+  CHECK(rec("pol.test.", XFR_K_CONFIG, &z) && z.state == STORE_STATE_KNOWN && atomic_load(&ent("pol.test.")->serial) == 0);
+  CHECK(rec("lim.test.", XFR_K_CONFIG, &z) && z.state == STORE_STATE_KNOWN && atomic_load(&ent("lim.test.")->serial) == 0);
+  CHECK(ent("ecs.test.") && atomic_load(&ent("ecs.test.")->serial) == 3);
   /* p: the copy is served and the zone refreshed at once (another primaries digest) -- the configuration of life 2 is the same, so the digest is too: no refresh_now */
   zone_db_entry_t *p = ent("p.test.");
   CHECK(p && atomic_load(&p->serial) == 2 && !atomic_load(&p->refresh_now));

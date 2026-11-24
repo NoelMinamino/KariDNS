@@ -120,6 +120,9 @@ change the options that need a restart (`OK reloaded (restart needed for: ...)`)
 | `alias-max-refresh-time` | a forged TTL of 86400 stayed about 16 h | 3600 s cap (#234) | `alias-max-refresh-time 1d;` |
 | DNS Cookies to forwarders and ALIAS resolvers | none | sent and checked (#234, #238) | none; a resolver that never sends a server cookie is accepted |
 | `secondary-stale-max` | n/a | `0` (unlimited), new (#203) | already the default |
+| Forwarder warnings (`[Forward] ...`) | one line per event, written at once | event lines: rate-limited per category and second, a summary says how many were left out (#260) | none |
+| Loader log lines | the loader chose the priority and the prefix | always `[DB] ...`, at most `LOG_ERR` (#260) | none |
+| `KARIDNS_TEST_IPC_REPLY_BUDGET_US` / `_QUEUE` | read from the environment by every build | test build only (#260) | none (test switches) |
 | `database { memory-limit }` not written | none: every database zone stays in memory | with the zone store: half of the RAM above 256 MB, at least `64M` (512 MB: `128M`, 1 GB: `384M`, 16 GB: `8064M`; #256); the coldest zones above it are taken out and read again from the store; the start logs `[DB] memory-limit is not set: 362M is used (the default: half of the 980 MB of RAM above 256 MB, at least 64M) ...` at NOTICE. Without the store (`store none;`, `zone-store none;`) still none | `memory-limit unlimited;` (or a size) |
 
 Memory notes: the Backend holds about 70 MB fixed plus about 0.45 KB for every database zone in the directory;
