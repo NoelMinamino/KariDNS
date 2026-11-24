@@ -84,6 +84,8 @@ _Static_assert(ZDIR_APEX_GLUE_PER_NS == KDB_NOTIFY_ADDR_PER_NS && ZDIR_APEX_NADD
 /* a fetch the loader has not answered by then is given up (the queries have timed out long before); a variable for the unit test */
 #define STATIC_TEST
 STATIC_TEST int64_t g_ing_fetch_timeout_ms = 30000;
+/* review 2026-11-23 D-L4: a zone begun on a stream (ZONE_BEGIN) that gets no more data for this long is given up and the stream closed (zone_stalled()); a variable for the unit test */
+STATIC_TEST _Atomic int64_t g_ing_zone_stall_ms = 120000;      /* (atomic: the test changes it while the thread runs) */
 #define ING_FETCH_OUT_MAX (1u << 20)
 
 typedef struct {
@@ -323,6 +325,7 @@ typedef struct {
   uint8_t *fout;               /* FETCH_REQ messages not written yet */
   size_t fout_len, fout_off, fout_cap;
   ing_job_t *fcur;             /* the zone being received on the fetch stream */
+  int64_t s_rx_ms, f_rx_ms;    /* review 2026-11-23 D-L4: when the batch / fetch stream last had data (zone_stalled()) */
   ing_profile_t *fprofiles;
   size_t fnprof, fcprof, fprof_bytes;
   uint64_t fseq;               /* request ids */
@@ -1277,7 +1280,7 @@ static void job_execute(ing_job_t *j) {
   /* 0.7 M3: the image is the loader's claim: what the building of the zone from RRs used to check (ZONE_DATA) is checked on the image now (the zone, the size, the counts, the limits of the stream,
    * what the extended encoding allows; dns_zone_image.h).  The time is counted (store.fill.validate_us). */
   {
-    const zone_image_policy_t pol = { j->zone, j->serial, j->rr_count, j->img_size, j->lim_bytes, j->lim_records, (j->zflags & KDB_ZF_EXTENDED) != 0, (j->zflags & KDB_ZF_TINYDNS) != 0 };
+    const zone_image_policy_t pol = { j->zone, j->serial, j->rr_count, j->img_size, j->lim_bytes, j->lim_records, (j->zflags & KDB_ZF_EXTENDED) != 0, (j->zflags & KDB_ZF_TINYDNS) != 0, false };
     char vw[160];
     const int64_t tv0 = mono_ns();
     const int vr = zone_image_validate_ex(j->img, j->img_len, &pol, vw, sizeof(vw));
@@ -2980,6 +2983,7 @@ static void stream_pass(ing_t *g) {
         drop_stream(g);
         return;
       }
+      g->s_rx_ms = now_ms();
       if (kdb_framer_feed(&g->fr, g->rbuf, (size_t)n) != KDB_OK) {
         protocol_error(g, g->fr.reason);
         return;
@@ -4875,6 +4879,7 @@ static void on_fetch_readable(ing_t *g) {
         fetch_drop(g);
         return;
       }
+      g->f_rx_ms = now_ms();
       if (kdb_framer_feed(&g->ffr, g->frbuf, (size_t)n) != KDB_OK) {
         fetch_protocol_error(g, g->ffr.reason);
         return;
@@ -5276,6 +5281,33 @@ static void xr_run(ing_t *g) {
   }
 }
 
+/* review 2026-11-23 D-L4: a zone begun on a stream and never finished.  The loader builds the messages of a zone in memory before it writes the first
+ * one (karidns_dbloader.c, B6b), so after ZONE_BEGIN the rest of the zone only waits for the socket: a stream that brings no data for g_ing_zone_stall_ms
+ * while a zone is open is a loader that hangs (or one that holds the image buffer, D-L1, on purpose).  The zone is given up and the stream closed
+ * (protocol_error() / fetch_protocol_error(): the partial image is freed; the supervisor starts the loader again).  The clock does not run while this
+ * thread itself does not read the stream (paused: a frame held for the reconcile thread, the read event off, frames left in the framer).  An open
+ * batch between two zones has no such limit: the loader reads the database then. */
+static bool zone_stalled(const ing_job_t *j, int64_t *rx, bool paused, int64_t now) {
+  if (!j || paused) {
+    *rx = now;
+    return false;
+  }
+  return now - *rx >= atomic_load_explicit(&g_ing_zone_stall_ms, memory_order_relaxed);
+}
+
+static void zone_stall_check(ing_t *g) {
+  const int64_t now = now_ms();
+  char why[KDB_REASON_LEN + DNS_NAME_TEXT_SIZE];
+  if (g->stream_fd >= 0 && zone_stalled(g->cur, &g->s_rx_ms, g->read_off || g->held_valid || g->sresume, now)) {
+    snprintf(why, sizeof(why), "zone '%s' was begun and nothing more came for %lld ms", g->cur->zone, (long long)(now - g->s_rx_ms));
+    protocol_error(g, why);
+  }
+  if (g->fetch_fd >= 0 && zone_stalled(g->fcur, &g->f_rx_ms, g->fresume, now)) {
+    snprintf(why, sizeof(why), "zone '%s' was begun and nothing more came for %lld ms", g->fcur->zone, (long long)(now - g->f_rx_ms));
+    fetch_protocol_error(g, why);
+  }
+}
+
 static void *ingest_thread(void *arg) {
   ing_t *g = arg;
   rcu_aux_thread_pin();
@@ -5302,6 +5334,12 @@ static void *ingest_thread(void *arg) {
     if (s_shed_since && now_ms() < s_shed_last_ms + (int64_t)atomic_load_explicit(&g_park_timeout_ms, memory_order_relaxed) && (wait_ms < 0 || wait_ms > ING_WQ_TICK_MS))
       wait_ms = ING_WQ_TICK_MS;                          /* 0.7: names are remembered as shed: look again soon, to forget them when this thread has caught up (shed_release_check()) */
     if (g->hold && (wait_ms < 0 || wait_ms > 50)) wait_ms = 50;           /* warm-before-serve: look at the warm-up and the time often */
+    if (g->cur || g->fcur) {                                               /* D-L4: a zone is open on a stream: look at its stall clock (zone_stall_check()) */
+      int64_t tick = atomic_load_explicit(&g_ing_zone_stall_ms, memory_order_relaxed) / 10;
+      if (tick > 1000) tick = 1000;
+      if (tick < 10) tick = 10;
+      if (wait_ms < 0 || wait_ms > tick) wait_ms = tick;
+    }
     if (wait_ms < 0 || wait_ms > 10000) wait_ms = 10000;                  /* (the busy share of dbstatus is closed at the end of a window, so the thread wakes at least that often) */
     if (g->sresume || g->fresume) wait_ms = 0;                            /* 0.7 fix 8: frames are left in a framer, the requests of the queries were served first */
     if (g->fmore) wait_ms = 0;                                            /* B2 W5: the last pass of fetch_issue() stopped at its bound: serve what is ready on the streams, then go on */
@@ -5360,6 +5398,7 @@ static void *ingest_thread(void *arg) {
     if (g->sresume && !ran_s && g->stream_fd >= 0) on_stream_readable(g);        /* (what the last pass left, when no event of the stream came) */
     if (g->fresume && !ran_f && g->fetch_fd >= 0) on_fetch_readable(g);
     if (g->inv_active) pump_inventory(g);
+    zone_stall_check(g);
     if (g->need_cleanup) cleanup_stream_state(g);
     maybe_apply_delta(g);
     if (g->nwarm > 0 || g->fmore || g->nwq > 0 || g->nlq > 0 || g->bg_on || park_fetch_pending()) fetch_issue(g);

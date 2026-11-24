@@ -1985,7 +1985,7 @@ typedef struct { time_t last; unsigned long held; } log_rl_t;
 extern const char *g_config_path;
 extern int g_broker_sock;
 extern pid_t g_broker_pid;
-void start_connect_broker(void);
+bool start_connect_broker(void);
 extern int g_num_workers;
 extern int g_num_frontend_routers;
 extern int g_ipc_fds[KARIDNS_ROUTER_THREADS_MAX][KARIDNS_WORKER_THREADS_MAX][2];

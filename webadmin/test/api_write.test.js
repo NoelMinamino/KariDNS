@@ -763,19 +763,29 @@ test('a body that does not arrive in time is a 408, a route can have more time',
   const server = await listen(d.app, router);
   try {
     const port = server.address().port;
+    // gap 'reply': the next part goes only once the server has answered (or after 3 s), so the 408 does not hang on two timers racing on a loaded
+    // host: the server's read timer starts when it has parsed the head, later than the client's write (CI flake row 59)
     const talk = (path, parts, gap) => new Promise((resolve) => {
       const s = net.connect(port, '127.0.0.1');
       let out = '';
-      s.on('data', (x) => { out += x; });
+      let replied = null;
+      s.on('data', (x) => { out += x; if (replied) { const f = replied; replied = null; f(); } });
       s.on('close', () => resolve(out));
       s.write(`POST /api/v1${path} HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: 7\r\n\r\n`);
       let i = 0;
       const next = () => {
-        if (i < parts.length) { s.write(parts[i++]); setTimeout(next, gap); } else setTimeout(() => s.end(), 150);
+        if (i >= parts.length) { setTimeout(() => s.end(), 150); return; }
+        s.write(parts[i++]);
+        if (gap !== 'reply') setTimeout(next, gap);
+        else if (out) next();
+        else {
+          const t = setTimeout(() => { replied = null; next(); }, 3000);
+          replied = () => { clearTimeout(t); next(); };
+        }
       };
       next();
     });
-    const slow = await talk('/slow', ['{"a"', ':1}'], 250);
+    const slow = await talk('/slow', ['{"a"', ':1}'], 'reply');
     assert.match(slow, /^HTTP\/1\.1 408 /);
     assert.match(slow, /urn:karidns:api:request-timeout/);
     assert.match(slow, /Connection: close/i);

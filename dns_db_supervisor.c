@@ -153,11 +153,17 @@ void db_logrd_tick(db_logrd_t *rd, int64_t now_ms, db_logrd_sink_t sink, void *u
 
 void db_log_sink(int prio, int level, const char *text, void *ud) {
   (void)ud;
+  /* review 2026-11-23 D-L2: the loader is not trusted to say who it is or how loud it is.  Every line of an honest loader starts with "[DB] " (karidns_dbloader.c
+   * vlg()); any other text, "[Sandbox] ..." or "[Startup] ..." of a loader that pretends to be the server, is logged after a "[DB] " of its own.  And no
+   * loader line is above LOG_ERR: an emergency, alert or critical line would reach every terminal or page someone (syslog.conf *.emerg) on the word of the
+   * process that reads the database. */
+  if (prio < LOG_ERR) prio = LOG_ERR;
+  const bool tagged = strncmp(text, "[DB] ", 5) == 0;
   /* a debug line goes at its own level (the manager's channels and level decide, dns_log.h logev_post(): one atomic load when nobody wants it);
    * above debug 10, the highest level a message of the server has (LOGEV_LEVEL_MAX), at debug 10, so that a `severity debug 99` channel or
    * `karictl trace 99` still shows it (the loader writes none above 10) */
-  if (level > 0) logev_post(LOGC_DATABASE, level > LOGEV_LEVEL_MAX ? LOGEV_LEVEL_MAX : level, NULL, 0, text[0] == '[' ? "%s" : "[DB] %s", text);
-  else kdns_logc(LOGC_DATABASE, prio, text[0] == '[' ? "%s" : "[DB] %s", text);
+  if (level > 0) logev_post(LOGC_DATABASE, level > LOGEV_LEVEL_MAX ? LOGEV_LEVEL_MAX : level, NULL, 0, tagged ? "%s" : "[DB] %s", text);
+  else kdns_logc(LOGC_DATABASE, prio, tagged ? "%s" : "[DB] %s", text);
 }
 
 static void log_close(db_sup_t *s) {
@@ -378,7 +384,7 @@ static void child_exec(const db_sup_t *s, int stream_fd, int fetch_fd, int log_w
   if (hi < 0) _exit(127);
   int hw = log_wfd >= 0 ? fcntl(log_wfd, F_DUPFD, 10) : -1;
   if (log_wfd >= 0 && hw < 0) _exit(127);
-  const char *pri = hw >= 0 ? "<3>" : "";      /* LOG_ERR for the pipe reader (what is written below before the exec) */
+  const char *pri = hw >= 0 ? "<3>" : "";      /* LOG_ERR for the pipe reader (what is written below before the exec); "[DB] ": the reader tags every other line as the loader's (D-L2) */
   int hf = fetch_fd >= 0 ? fcntl(fetch_fd, F_DUPFD, 10) : -1;
   if (fetch_fd >= 0 && hf < 0) _exit(127);
   int dn = open("/dev/null", O_RDWR);
@@ -393,12 +399,12 @@ static void child_exec(const db_sup_t *s, int stream_fd, int fetch_fd, int log_w
   char err[256];
   int xfd = exec_file_open_checked(s->path, geteuid(), "database loader", "the user running karidns", err, sizeof(err));
   if (xfd < 0) {
-    int n = snprintf(msg, sizeof(msg), "%s[Manager] %s\n", pri, err);
+    int n = snprintf(msg, sizeof(msg), "%s[DB] %s\n", pri, err);
     (void)!write(2, msg, snprintf_len(n, sizeof(msg)));
     _exit(127);
   }
   if (!apply_run_identity_id(&s->id, err, sizeof(err))) {
-    int n = snprintf(msg, sizeof(msg), "%s[Manager] database loader: %s\n", pri, err);
+    int n = snprintf(msg, sizeof(msg), "%s[DB] database loader: %s\n", pri, err);
     (void)!write(2, msg, snprintf_len(n, sizeof(msg)));
     _exit(127);
   }
@@ -428,7 +434,7 @@ static void child_exec(const db_sup_t *s, int stream_fd, int fetch_fd, int log_w
   argv[ac] = NULL;
   extern char **environ;
   exec_file_exec_fd(xfd, s->path, argv, environ);
-  int n = snprintf(msg, sizeof(msg), "%s[Manager] cannot execute '%s': %s\n", pri, s->path, strerror(errno));
+  int n = snprintf(msg, sizeof(msg), "%s[DB] cannot execute '%s': %s\n", pri, s->path, strerror(errno));
   (void)!write(2, msg, snprintf_len(n, sizeof(msg)));
   _exit(127);
 }

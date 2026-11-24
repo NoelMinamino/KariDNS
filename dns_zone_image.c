@@ -2015,7 +2015,7 @@ int zone_image_check_policy(const void *buf, size_t len, const zone_image_policy
         if (!pol->extended) PBAD("zone level tables in a zone that did not announce the extended encoding");
         int ntr = 0;
         (void)zone_image_ecs_trusted(img, &ntr);
-        if (ntr != 0) PBAD("ECS trusted resolvers in the image (they come from the settings of the zone)");
+        if (ntr != 0 && !pol->xfr_copy) PBAD("ECS trusted resolvers in the image (they come from the settings of the zone)");
         int nloc = 0;
         (void)zone_image_locations(img, &nloc);
         if (nloc > 4096) PBAD("more than 4096 tinydns locations");

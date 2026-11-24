@@ -2650,7 +2650,7 @@ size_t dns_rrl_slip_response(uint8_t *res, size_t res_len, size_t buf_cap) {
   int signed_len = tsig_finish_response(res, len, limit, &t_query_tsig);
   if (signed_len >= DNS_HEADER_SIZE) return (size_t)signed_len;
   /* HMAC の計算に失敗したときだけ。以前と同じ無署名の TC 応答 (クライアントは TCP で問い直す) */
-  syslog(LOG_WARNING, "[RRL] could not sign the slip response; sending it unsigned");
+  logev_post(LOGC_GENERAL, LOG_LVL_WARNING, NULL, 0, "[RRL] could not sign the slip response; sending it unsigned");
   return len;
 }
 
@@ -2759,7 +2759,7 @@ static int dispatch_forward_zone_ck(const zone_config_t *zcfg, const uint8_t *re
   for (int i = 0; i < x->forwarders_count; i++) {
     uint32_t rem = remaining_ms(deadline);
     if (rem == 0) {
-      syslog(LOG_WARNING, "[Forward] zone '%s': total timeout budget (%ums) expired; stopping forwarder loop",
+      logev_post(LOGC_GENERAL, LOG_LVL_WARNING, NULL, 0, "[Forward] zone '%s': total timeout budget (%ums) expired; stopping forwarder loop",
              zcfg->domain, total_budget);
       break;
     }
@@ -2768,7 +2768,7 @@ static int dispatch_forward_zone_ck(const zone_config_t *zcfg, const uint8_t *re
     struct sockaddr_storage ss;
     size_t ss_len = resolve_ip_port_to_sockaddr(fwd->ip, fwd->port, &ss);
     if (ss_len == 0) {
-      syslog(LOG_ERR, "[Forward] zone '%s': forwarder '%s' is not a valid IP address, skipping",
+      logev_post(LOGC_GENERAL, LOG_LVL_ERROR, NULL, 0, "[Forward] zone '%s': forwarder '%s' is not a valid IP address, skipping",
              zcfg->domain, fwd->ip);
       continue;
     }
@@ -2801,7 +2801,7 @@ static int dispatch_forward_zone_ck(const zone_config_t *zcfg, const uint8_t *re
         } else if (ckc_expected(ckt, ck)) {
           /* the message cannot carry a cookie (a SIG(0) RR must stay last): without one an answer from a forwarder that sends
            * cookies could be forged, so this forwarder is not asked */
-          syslog(LOG_WARNING, "[Forward] zone '%s': the query cannot carry a DNS cookie; not sent to forwarder '%s:%d', which sends cookies",
+          logev_post(LOGC_GENERAL, LOG_LVL_WARNING, NULL, 0, "[Forward] zone '%s': the query cannot carry a DNS cookie; not sent to forwarder '%s:%d', which sends cookies",
                  zcfg->domain, fwd->ip, fwd->port);
           skipped = true;   /* no exchange: not counted against the forwarder (ckc_account) */
           break;
@@ -2873,18 +2873,18 @@ static int dispatch_forward_zone_ck(const zone_config_t *zcfg, const uint8_t *re
     if (!skipped) ckc_account(ckt, ck, accepted, monotonic_ms() / 1000);
 
     if (connect_failed) {
-      syslog(LOG_WARNING, "[Forward] zone '%s': connect to forwarder '%s:%d' failed",
+      logev_post(LOGC_GENERAL, LOG_LVL_WARNING, NULL, 0, "[Forward] zone '%s': connect to forwarder '%s:%d' failed",
              zcfg->domain, fwd->ip, fwd->port);
       continue;
     }
     if (mismatched)
-      syslog(LOG_WARNING, "[Forward] zone '%s': forwarder '%s:%d' returned a mismatched "
+      logev_post(LOGC_GENERAL, LOG_LVL_WARNING, NULL, 0, "[Forward] zone '%s': forwarder '%s:%d' returned a mismatched "
              "response (id/question mismatch), discarded", zcfg->domain, fwd->ip, fwd->port);
     if (ck_bad)
-      syslog(LOG_WARNING, "[Forward] zone '%s': a response from forwarder '%s:%d' with a wrong or missing DNS cookie was discarded "
+      logev_post(LOGC_GENERAL, LOG_LVL_WARNING, NULL, 0, "[Forward] zone '%s': a response from forwarder '%s:%d' with a wrong or missing DNS cookie was discarded "
              "(RFC 7873 section 5.3)", zcfg->domain, fwd->ip, fwd->port);
     if (got < (ssize_t)DNS_HEADER_SIZE && !bad_twice) {
-      syslog(LOG_WARNING, "[Forward] zone '%s': forwarder '%s:%d' timed out or failed, trying next",
+      logev_post(LOGC_GENERAL, LOG_LVL_WARNING, NULL, 0, "[Forward] zone '%s': forwarder '%s:%d' timed out or failed, trying next",
              zcfg->domain, fwd->ip, fwd->port);
       continue;
     }
@@ -2912,7 +2912,7 @@ static int dispatch_forward_zone_ck(const zone_config_t *zcfg, const uint8_t *re
         }
       }
       if (bad_twice) {
-        syslog(LOG_WARNING, "[Forward] zone '%s': forwarder '%s:%d' answered BADCOOKIE twice and not over TCP, trying next",
+        logev_post(LOGC_GENERAL, LOG_LVL_WARNING, NULL, 0, "[Forward] zone '%s': forwarder '%s:%d' answered BADCOOKIE twice and not over TCP, trying next",
                zcfg->domain, fwd->ip, fwd->port);
         continue;
       }
@@ -2923,7 +2923,7 @@ static int dispatch_forward_zone_ck(const zone_config_t *zcfg, const uint8_t *re
     return fwd_reply(req, req_len, s_forward_res_buf, (size_t)got, cookied, added, ccopt, ccopt_len, res, max_res_len);
   }
 
-  syslog(LOG_ERR, "[Forward] zone '%s': all %d forwarder(s) failed or timed out", zcfg->domain, x->forwarders_count);
+  logev_post(LOGC_GENERAL, LOG_LVL_ERROR, NULL, 0, "[Forward] zone '%s': all %d forwarder(s) failed or timed out", zcfg->domain, x->forwarders_count);
   return build_synthetic_servfail(req, req_len, res, max_res_len);
 }
 

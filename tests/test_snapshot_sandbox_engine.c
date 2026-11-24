@@ -444,10 +444,51 @@ static void test_priv_sandbox_root_trailing_slash(void) {
     printf("  -> trailing slash passed.\n");
 }
 
+/* review 2026-11-23 A-L3: a read-only request for a directory that the cache holds only as writable gets a read-only fd (a dup limited to the
+ * read-only rights), not the writable one.  The kernel enforces the rights of a descriptor outside capability mode too, so a create through the
+ * read-only request fails with ENOTCAPABLE; before the fix it made the file.  Also with the capability-mode flag set (the dup path takes no new
+ * resource), and the writable request still gets the writable fd. */
+static void test_priv_sandbox_readonly_of_writable(void) {
+    printf("[TEST] Priv Sandbox: a read-only request for a directory cached as writable...\n");
+    for (int pass = 0; pass < 2; pass++) {
+        char dir[] = "/tmp/karidns_dcrw_XXXXXX";
+        assert(mkdtemp(dir) != NULL);
+        char w[PATH_MAX], x[PATH_MAX], y[PATH_MAX];
+        snprintf(w, sizeof(w), "%s/w.txt", dir);
+        snprintf(x, sizeof(x), "%s/x.txt", dir);
+        snprintf(y, sizeof(y), "%s/y.txt", dir);
+        int fd = open_via_dir_cache(w, O_CREAT | O_WRONLY, 0600, true);                /* the directory enters the cache as writable only */
+        assert(fd >= 0);
+        assert(write(fd, "z", 1) == 1);
+        close(fd);
+        if (pass == 1) atomic_store_explicit(&g_capsicum_enabled, true, memory_order_release);
+        errno = 0;
+        fd = open_via_dir_cache(x, O_CREAT | O_WRONLY, 0600, false);
+        assert(fd == -1 && errno == ENOTCAPABLE);                                       /* the read-only fd has no CAP_CREATE */
+        struct stat sb;
+        assert(stat(x, &sb) == -1 && errno == ENOENT);
+        fd = open_via_dir_cache(w, O_RDONLY, 0, false);                                 /* reading through it works */
+        assert(fd >= 0);
+        char c = 0;
+        assert(read(fd, &c, 1) == 1 && c == 'z');
+        close(fd);
+        assert(stat_via_dir_cache(w, &sb) == 0 && sb.st_size == 1);
+        fd = open_via_dir_cache(y, O_CREAT | O_WRONLY, 0600, true);                     /* the writable entry is still the writable one */
+        assert(fd >= 0);
+        close(fd);
+        atomic_store_explicit(&g_capsicum_enabled, false, memory_order_release);
+        unlink(w);
+        unlink(y);
+        rmdir(dir);
+    }
+    printf("  -> read-only of writable passed.\n");
+}
+
 int main(void) {
     printf("=== Starting Sandbox & Snapshot RCU Engine Unit Tests ===\n");
     test_priv_sandbox_root_below();
     test_priv_sandbox_root_trailing_slash();
+    test_priv_sandbox_readonly_of_writable();
     test_priv_sandbox_directory_caching();
     test_priv_sandbox_path_errors();
     test_snapshot_rcu_lifecycle_and_suffix_lookup();
