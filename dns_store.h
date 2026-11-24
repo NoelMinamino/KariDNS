@@ -737,6 +737,7 @@ uint64_t store_test_sum64(const void *p, size_t n);
 /* path of a store file (for damage tests), written into buf */
 /* 0.7, the bulk fill: the segment bytes the bulk checkpoints count (the sum of the segments' used bytes) */
 uint64_t store_test_seg_bytes(store_t *s);
+void store_test_bulk_dump(store_t *s, char *buf, size_t n);
 /* the first back-off of the checkpoint that ends a bulk fill after a failure (0: 1 s; it doubles up to 5 min) */
 extern _Atomic uint32_t store_test_bulk_end_ms;
 #endif

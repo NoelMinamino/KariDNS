@@ -7867,6 +7867,28 @@ static bool wait_stat(store_t *s, uint64_t (*get)(const store_stats_t *), uint64
 }
 static uint64_t get_bulk_ck(const store_stats_t *st) { return st->bulk_checkpoints; }
 
+static uint64_t fsync_probe_ms(void) {
+  char p[600];
+  snprintf(p, sizeof p, "%s/probe.%d", g_base, (int)getpid());
+  const uint64_t t0 = now_ms();
+  int fd = open(p, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+  if (fd >= 0) { char b[4096] = { 1 }; if (write(fd, b, sizeof b) < 0) {} fsync(fd); close(fd); unlink(p); }
+  return now_ms() - t0;
+}
+/* A bulk checkpoint is a flush of several files, each with an fsync(): on a loaded disk one fsync() took 3.3 to 3.8 s here (a 4 KiB file, probed when the wait failed; iostat: 1.2 s a write and 2.3 s a cache
+ * flush on the SSD after the kill loops before this case), CI VMs stall for 3 s as well, and a checkpoint made 4.5 s + more than 5.7 s: 10 s was too short (flake row 61).  The wait is for a
+ * state that the checkpoint thread reaches, so it is long (60 s) and a failure prints the state of the store and the disk's fsync() time. */
+#define CK_WAIT_MS 60000
+static bool wait_ckpt(store_t *s, uint64_t (*get)(const store_stats_t *), uint64_t want) {
+  if (wait_stat(s, get, want, CK_WAIT_MS)) return true;
+  char dbuf[1024];
+  store_stats_t st;
+  store_test_bulk_dump(s, dbuf, sizeof dbuf);
+  store_stats(s, &st);
+  printf("  bulk checkpoint wait failed (%d s): %s; checkpoints %llu, bulk %llu; fsync() of a 4 KiB file now %llu ms\n", CK_WAIT_MS / 1000, dbuf, (unsigned long long)st.checkpoints, (unsigned long long)st.bulk_checkpoints, (unsigned long long)fsync_probe_ms());
+  return false;
+}
+#define CK_WAIT(s, get, want) CHECK(wait_ckpt((s), (get), (want)))
 static void test_bulk_basic(void) {
   printf("[a bulk fill: no journal record, no commit, no checkpoint by size or interval; bulk checkpoints in the body fill only, by the segment bytes; its end logs again]\n");
   tdir_t d;
@@ -7919,7 +7941,7 @@ static void test_bulk_basic(void) {
   /* 2. the body fill: a bulk checkpoint at once (the segments are past 256 KiB), the next one at twice the bytes of that one */
   store_bulk_phase(s, STORE_BULK_PASSED);
   CHECK_EQ(store_bulk(s), 2);
-  CHECK(wait_stat(s, get_bulk_ck, 1, 10000));
+  CK_WAIT(s, get_bulk_ck, 1);
   store_stats(s, &st);
   CHECK_EQ(st.bulk_checkpoints, 1);
   CHECK_EQ(st.checkpoints, ck0 + 1);
@@ -7929,7 +7951,7 @@ static void test_bulk_basic(void) {
   CHECK_EQ(log_count(6, "bulk checkpoint 1 of the fill"), 1);
   uint32_t k = 600;
   for (uint64_t seg = store_test_seg_bytes(s); seg < st.bulk_next_bytes && k < 20000; seg = store_test_seg_bytes(s)) CHECK_EQ(put_i(s, 0, k++, 2, NULL), 0);
-  CHECK(wait_stat(s, get_bulk_ck, 2, 10000));
+  CK_WAIT(s, get_bulk_ck, 2);
   usleep(300000);
   store_stats(s, &st);
   CHECK_EQ(st.bulk_checkpoints, 2);                                       /* (no more: the segments have not doubled again) */

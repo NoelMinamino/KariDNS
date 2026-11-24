@@ -4144,6 +4144,18 @@ static bool ckpt_due(const store_t *s, uint64_t now) {
   return s->o.checkpoint_interval_ms != UINT32_MAX && now - atomic_load_explicit(&s->last_ckpt_ms, memory_order_relaxed) >= s->o.checkpoint_interval_ms;
 }
 
+#ifdef KARIDNS_UNIT_TEST
+/* the state that decides the bulk checkpoint, for a test that waits for one and does not get it (no lock: a figure; it showed a checkpoint in its flush, ck_busy and io_hold set, io_busy not: a slow disk) */
+void store_test_bulk_dump(store_t *s, char *buf, size_t n) {
+  const uint64_t now = st_now_ms();
+  snprintf(buf, n, "bulk=%d body=%d passed=%d seg=%llu base=%llu next=%llu last_ms_ago=%lld bulk_due=%d priv_due=%d priv=%llu ix=%llu floor=%llu max=%llu rel_off=%d io_busy=%d ck_busy=%d handoff=%d io_hold=%d ck_ends=%llu fl_on=%d",
+           (int)atomic_load(&s->bulk), (int)atomic_load(&s->bulk_body), (int)atomic_load(&s->bulk_passed), (unsigned long long)st_seg_bytes(s), (unsigned long long)atomic_load(&s->bulk_base),
+           (unsigned long long)bulk_next_bytes(s), (long long)(now - atomic_load(&s->bulk_last_ms)), (int)bulk_due(s, now), (int)priv_due(s), (unsigned long long)atomic_load(&s->priv_bytes),
+           (unsigned long long)atomic_load(&s->priv_ix_bytes), (unsigned long long)atomic_load(&s->priv_floor), (unsigned long long)s->priv_max, (int)atomic_load(&s->rel_off), (int)s->io_busy, (int)s->ck_busy,
+           (int)s->ck_handoff, atomic_load(&s->io_hold), (unsigned long long)s->ck_ends, (int)s->fl_on);
+}
+#endif
+
 /* After a writer call (writer mutex held): no I/O wait here.  The due commit and checkpoint are the flusher's (it is woken); a journal that is full is switched at once when no other
  * checkpoint runs (the flush of that checkpoint is handed to the flusher), so that the journal stays near its bound. */
 static int post_write(store_t *s) {
