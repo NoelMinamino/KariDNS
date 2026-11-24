@@ -154,7 +154,7 @@ For a ZFS host: make the dataset of the store with `recordsize=16K` (or 8K), `co
   meanwhile (a zone not yet read is fetched for the query, #184, #191, #194). The first fill of an empty store keeps
   no journal (the database is the source of truth, #206): after a crash during it the pass is read again. Measured
   (10M zones, lab host): about 2 minutes for the pass on UFS under load, about 7 minutes for the whole fill on ZFS
-  (CHANGES.md, Performance). A small install takes seconds.
+  (CHANGES.md, Performance).
 - **Disk use.** About 1.2-1.6 KB per small database zone, plus a journal ring (64 MiB of address space) and segment
   files (`store-segment-size`, 256 MiB). Free space is read at every checkpoint; the cleaner needs room to copy
   before it frees a segment, and a new image is refused below that (docs/karidns.md "The zone store").
