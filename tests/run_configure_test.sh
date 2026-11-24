@@ -301,12 +301,12 @@ P=$(probe --prefix=/opt/kd --sysconfdir=/etc/kdt --libexecdir=/opt/lx); R="/opt/
 [ "$P" = "$R" ] && ok "--prefix, --sysconfdir, --libexecdir reach KARIDNS_DB_DEFAULT_LOADER_PATH and the CA bundle names" || bad "options: '$P' $(head -3 "$T/probe.err")"
 P=$(probe --prefix=/opt/kd); R="/opt/kd/libexec/karidns-dbloader /opt/kd/etc/ssl/cert.pem /opt/kd/share/certs/ca-root-nss.crt "
 [ "$P" = "$R" ] && ok "--prefix alone moves libexecdir and sysconfdir with it" || bad "prefix: '$P' $(head -3 "$T/probe.err")"
-if grep -q 'KARIDNS_SYSCONFDIR "/ssl/cert.pem"' tools/dag_transport.c && grep -q 'KARIDNS_PREFIX "/share/certs/ca-root-nss.crt"' tools/dag_transport.c; then
-    ok "dag_transport.c builds its two /usr/local CA bundle names from these macros"
+if grep -q 'KARIDNS_SYSCONFDIR "/ssl/cert.pem"' tools/dag_tls.c && grep -q 'KARIDNS_PREFIX "/share/certs/ca-root-nss.crt"' tools/dag_tls.c; then
+    ok "dag_tls.c builds its two /usr/local CA bundle names from these macros"
 else
-    bad "dag_transport.c has a fixed /usr/local CA bundle name"
+    bad "dag_tls.c has a fixed /usr/local CA bundle name"
 fi
-if grep -n '"/usr/local/' tools/dag_transport.c tools/dag_http.c dns_config_parser.h > "$T/fixed" 2>&1; then
+if grep -n '"/usr/local/' tools/dag_transport.c tools/dag_tls.c tools/dag_http.c dns_config_parser.h > "$T/fixed" 2>&1; then
     bad "a fixed /usr/local path in dag's TLS code or in the loader default: $(cat "$T/fixed")"
 else
     ok "no fixed /usr/local path in dag's TLS code or in the loader default"

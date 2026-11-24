@@ -54,7 +54,7 @@ SRCS = dns_server_core.c dns_log.c dns_log_state.c dns_db_stream.c dns_db_ingest
 OBJS = $(SRCS:.c=.o)
 
 # dag を構成するモジュール (dag.c 以外)。fuzz / unit test / asan ビルドでも共有する
-DAG_MOD_SRCS = tools/dag_output_yaml.c tools/dag_batch.c tools/dag_axfr_client.c tools/dag_trace.c tools/dag_trace_common.c tools/dag_iter.c tools/dag_roothints.c tools/dag_idn.c tools/dag_tsig_client.c tools/dag_edns_client.c tools/dag_transport.c tools/dag_http.c tools/dag_replay.c tools/dnstap_decode.c tools/dag_pcap_l4.c tools/dag_tcp_reassembly.c
+DAG_MOD_SRCS = tools/dag_output_yaml.c tools/dag_batch.c tools/dag_axfr_client.c tools/dag_trace.c tools/dag_trace_common.c tools/dag_iter.c tools/dag_roothints.c tools/dag_idn.c tools/dag_tsig_client.c tools/dag_edns_client.c tools/dag_transport.c tools/dag_http.c tools/dag_tls.c tools/dag_replay.c tools/dnstap_decode.c tools/dag_pcap_l4.c tools/dag_tcp_reassembly.c
 DAG_TARGET = dag
 DAG_SRCS = tools/dag.c $(DAG_MOD_SRCS) dns_wire.c dns_utils.c dns_zone_parser.c dns_cidr.c
 
@@ -189,16 +189,16 @@ FUZZ_DAG_BATCH_FILE_TARGET = tests/fuzz/fuzz_dag_batch_file
 FUZZ_DAG_BATCH_FILE_SRCS = tests/fuzz/fuzz_dag_batch_file.c $(DAG_MOD_SRCS) dns_wire.c dns_utils.c dns_zone_parser.c dns_cidr.c
 
 FUZZ_DAG_REPLAY_PCAP_READER_TARGET = tests/fuzz/fuzz_dag_replay_pcap_reader
-FUZZ_DAG_REPLAY_PCAP_READER_SRCS = tests/fuzz/fuzz_dag_replay_pcap_reader.c tools/dag_replay.c tools/dnstap_decode.c tools/dag_http.c tools/dag_pcap_l4.c tools/dag_tcp_reassembly.c dns_wire.c dns_utils.c dns_zone_parser.c dns_cidr.c
+FUZZ_DAG_REPLAY_PCAP_READER_SRCS = tests/fuzz/fuzz_dag_replay_pcap_reader.c tools/dag_replay.c tools/dnstap_decode.c tools/dag_http.c tools/dag_tls.c tools/dag_pcap_l4.c tools/dag_tcp_reassembly.c dns_wire.c dns_utils.c dns_zone_parser.c dns_cidr.c
 
 FUZZ_DAG_REPLAY_DIFF_TARGET = tests/fuzz/fuzz_dag_replay_diff
-FUZZ_DAG_REPLAY_DIFF_SRCS = tests/fuzz/fuzz_dag_replay_diff.c tools/dag_replay.c tools/dnstap_decode.c tools/dag_http.c tools/dag_pcap_l4.c tools/dag_tcp_reassembly.c dns_wire.c dns_utils.c dns_zone_parser.c dns_cidr.c
+FUZZ_DAG_REPLAY_DIFF_SRCS = tests/fuzz/fuzz_dag_replay_diff.c tools/dag_replay.c tools/dnstap_decode.c tools/dag_http.c tools/dag_tls.c tools/dag_pcap_l4.c tools/dag_tcp_reassembly.c dns_wire.c dns_utils.c dns_zone_parser.c dns_cidr.c
 
 FUZZ_TAPSTAT_TARGET = tests/fuzz/fuzz_tapstat
 FUZZ_TAPSTAT_SRCS = tests/fuzz/fuzz_tapstat.c tools/tapstat_core.c tools/dnstap_decode.c
 
 FUZZ_DAG_TCP_REASSEMBLY_TARGET = tests/fuzz/fuzz_dag_tcp_reassembly
-FUZZ_DAG_TCP_REASSEMBLY_SRCS = tests/fuzz/fuzz_dag_tcp_reassembly.c tools/dag_tcp_reassembly.c tools/dag_pcap_l4.c tools/dag_replay.c tools/dnstap_decode.c tools/dag_http.c dns_wire.c dns_utils.c dns_zone_parser.c dns_cidr.c
+FUZZ_DAG_TCP_REASSEMBLY_SRCS = tests/fuzz/fuzz_dag_tcp_reassembly.c tools/dag_tcp_reassembly.c tools/dag_pcap_l4.c tools/dag_replay.c tools/dnstap_decode.c tools/dag_http.c tools/dag_tls.c dns_wire.c dns_utils.c dns_zone_parser.c dns_cidr.c
 
 .PHONY: distclean
 .PHONY: dnsqps dnsqps-asan dnsqps-tsan dnsqps_test fuzz_dnsqps_resp fuzz_dnsqps_args fuzz_dnsqps_msg
@@ -363,6 +363,9 @@ tools/dag_pcap_l4.o: tools/dag_pcap_l4.c tools/dag_pcap_l4.h
 tools/dag_tcp_reassembly.o: tools/dag_tcp_reassembly.c tools/dag_tcp_reassembly.h tools/dag_pcap_l4.h
 	$(CC) $(CFLAGS) -c tools/dag_tcp_reassembly.c -o tools/dag_tcp_reassembly.o
 
+tools/dag_tls.o: tools/dag_tls.c tools/dag_tls.h tools/dag_internal.h
+	$(CC) $(CFLAGS) -c tools/dag_tls.c -o tools/dag_tls.o
+
 tools/dag_http.o: tools/dag_http.c tools/dag_http.h tools/dag_internal.h
 	$(CC) $(CFLAGS) -c tools/dag_http.c -o tools/dag_http.o
 
@@ -421,7 +424,7 @@ TEST_COV_SWEEP_NET_SRCS = tests/test_coverage_sweep_net.c $(DAG_MOD_SRCS) dns_wi
 TEST_COV_SWEEP_TOOLS_SRCS = tests/test_coverage_sweep_tools.c tests/test_coverage_sweep_karictl_main.c dns_config_parser.c dns_diag.c dns_zone_parser.c dns_tinydns_parser.c dns_wire.c dns_utils.c dns_cidr.c dns_tsig_acl.c dns_zone_lint.c dns_db_checkproto.c dns_mem_advice.c $(TEST_SYSLOG_QUIET)
 TEST_COV_SWEEP_DAG_SRCS = tests/test_coverage_sweep_dag.c $(DAG_MOD_SRCS) dns_wire.c dns_utils.c dns_zone_parser.c dns_cidr.c dns_config_parser.c dns_diag.c dns_tinydns_parser.c dns_tsig_acl.c $(TEST_SYSLOG_QUIET)
 TEST_DAGREASM_SRCS = tests/test_dag_reassembly.c tools/dag_pcap_l4.c tools/dag_tcp_reassembly.c $(TEST_SYSLOG_QUIET)
-TEST_DAG_TOOLS_SRCS = tests/test_dag_tools.c tools/dag_tcp_reassembly.c tools/dag_pcap_l4.c tools/dag_tsig_client.c tools/dag_replay.c tools/dnstap_decode.c tools/dag_transport.c tools/dag_http.c dns_zone_parser.c dns_config_parser.c dns_diag.c dns_tinydns_parser.c dns_cidr.c dns_tsig_acl.c dns_wire.c dns_utils.c $(TEST_SYSLOG_QUIET)
+TEST_DAG_TOOLS_SRCS = tests/test_dag_tools.c tools/dag_tcp_reassembly.c tools/dag_pcap_l4.c tools/dag_tsig_client.c tools/dag_replay.c tools/dnstap_decode.c tools/dag_transport.c tools/dag_http.c tools/dag_tls.c dns_zone_parser.c dns_config_parser.c dns_diag.c dns_tinydns_parser.c dns_cidr.c dns_tsig_acl.c dns_wire.c dns_utils.c $(TEST_SYSLOG_QUIET)
 TEST_SERVER_CORE_SRCS = tests/test_server_core.c dns_server_core.c dns_log.c dns_log_state.c dns_db_stream.c dns_db_ingest.c dns_db_recon.c dns_db_store.c dns_xfr_store.c dns_xfr_state.c dns_park.c dns_mem_advice.c dns_store_status.c dns_store.c dns_db_install.c dns_snapshot_rcu.c dns_epoch_rcu.c dns_wire.c dns_utils.c dns_config_parser.c dns_diag.c dns_zone_parser.c dns_tinydns_parser.c dns_cidr.c dns_tsig_acl.c dns_query_engine.c dns_plugin_sup.c dns_plugin_msg.c dns_alias.c dns_cookie_client.c dns_rrl.c dns_priv_sandbox.c dns_catalog_zone.c dns_dnstap.c dns_edns_ecs.c dns_dynamic_update.c dns_axfr_ixfr.c dns_zone_image.c $(TEST_SYSLOG_QUIET)
 
 FI_WRAP_LDFLAGS  = -Wl,--wrap=malloc -Wl,--wrap=calloc -Wl,--wrap=realloc -Wl,--wrap=strdup -Wl,--wrap=strndup -Wl,--wrap=posix_memalign
