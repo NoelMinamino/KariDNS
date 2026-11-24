@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { nextDue, backoff, busyDelay, CHANGED_RETRIES, Debounce, OwnWrites } from '../lib/scheduler.js';
+import { nextDue, plausibleExpire, expireProblem, MIN_RESIGN_INTERVAL, backoff, busyDelay, CHANGED_RETRIES, Debounce, OwnWrites } from '../lib/scheduler.js';
 
 const T = { refresh: 302400, jitter: 86400, validity: 1209600, now: 1000000 };
 
@@ -25,10 +25,32 @@ test('what a run leaves is never due at once (-i refresh+jitter means more than 
   for (const r of [0, 0.3, 0.9999]) assert.ok(nextDue({ ...T, minExpire: T.now + left, rand: () => r }) > T.now);
 });
 
-test('never in the past, and a fallback without an expiration', () => {
-  assert.equal(nextDue({ ...T, minExpire: T.now, rand: () => 0 }), T.now + 1);
+test('never in the past, never sooner than MIN_RESIGN_INTERVAL (review W1-L5), and a fallback without an expiration', () => {
+  // an expiration in the past or within refresh after a successful run: not the next second (the old floor was now + 1: a zone signed every second)
+  assert.equal(MIN_RESIGN_INTERVAL, 3600);
+  assert.equal(nextDue({ ...T, minExpire: T.now, rand: () => 0 }), T.now + 3600);
+  assert.equal(nextDue({ ...T, minExpire: T.now - 86400 * 400, rand: () => 0.5 }), T.now + 3600);
+  assert.equal(nextDue({ ...T, minExpire: T.now + T.refresh + 10, rand: () => 0 }), T.now + 3600);
+  // a short validity (the tests: 60 s, refresh 20, jitter 5) keeps its pace: the floor is at most validity - refresh - jitter
+  assert.equal(nextDue({ minExpire: T.now, validity: 60, refresh: 20, jitter: 5, now: T.now, rand: () => 0 }), T.now + 35);
+  assert.equal(nextDue({ minExpire: T.now + 60, validity: 60, refresh: 20, jitter: 5, now: T.now, rand: () => 0 }), T.now + 40);
   assert.equal(nextDue({ ...T, minExpire: null }), T.now + 1209600 - 302400 - 86400);
   assert.equal(nextDue({ ...T, minExpire: undefined, validity: 100, refresh: 60, jitter: 60 }), T.now + 1);
+});
+
+test('plausibleExpire / expireProblem: what import reports is checked before the schedule uses it (review W1-L5)', () => {
+  const v = T.validity;
+  assert.equal(plausibleExpire(T.now + v, T.now, v), T.now + v);
+  assert.equal(plausibleExpire(T.now - 5, T.now, v), T.now - 5, 'a past time is a time (nextDue floors it)');
+  assert.equal(plausibleExpire(T.now + v + 366 * 86400, T.now, v), T.now + v + 366 * 86400, 'long signatures kept from an earlier signer');
+  for (const bad of [T.now + v + 366 * 86400 + 1, 1e15, -1, 1.5, NaN, Infinity, '1000', null, undefined]) assert.equal(plausibleExpire(bad, T.now, v), null, String(bad));
+  const P = { now: T.now, refresh: T.refresh, validity: v };
+  assert.equal(expireProblem({ ...P, raw: null }), null);
+  assert.equal(expireProblem({ ...P, raw: T.now + v }), null);
+  assert.equal(expireProblem({ ...P, raw: T.now + T.refresh + 1 }), null);
+  assert.match(expireProblem({ ...P, raw: T.now + T.refresh }), /^the earliest signature of the zone expires at 1970-01-\d\dT\d\d:\d\d:\d\dZ, within refresh of now, although the zone was just signed: .* not signed again before 3600 s/);
+  assert.match(expireProblem({ ...P, raw: 0 }), /expires at 1970-01-01T00:00:00Z/);
+  assert.match(expireProblem({ ...P, raw: 1e15 }), /^karidns-zone reported the earliest signature expiration 1000000000000000, which is not a time to plan by/);
 });
 
 test('backoff: 1 minute doubling to 1 hour', () => {

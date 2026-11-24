@@ -47,7 +47,7 @@ From a source tree (no package): `cd webadmin && npm ci --ignore-scripts`, then 
 
 | File | Owner, mode | Holds |
 |---|---|---|
-| `/usr/local/etc/karidns/karidns-webadmin.conf` | root:karidns-webadmin, 0640 | the settings (no secret) |
+| `/usr/local/etc/karidns/karidns-webadmin.conf` | root:karidns-webadmin, 0640 | the settings (no secret, but policy: `trusted-proxy`, `require-totp`, ...); since 0.7 the start, `--check` and SIGHUP refuse a symbolic link, another owner than root or the service user, and a file the group or others can write (`chmod go-w`) |
 | `api.conninfo`, `check.conninfo` (PostgreSQL) | karidns-webadmin, **0600** | the connection of the roles `karidns_api` and the check role, with passwords if the database needs them; `--check` and the start refuse any other owner or mode |
 | `/usr/local/libexec/karidns-webadmin/webadmin/ui/` | root, 0444 files in 0755 directories | the files of the web interface (`ui-dir`); read once at the start, served under `/` and `/ui/` |
 | `/var/db/karidns-webadmin/totp.key` | karidns-webadmin, **0600** | the AES-256 key that wraps the TOTP secrets in the database; made at the first start; the directory is made by the rc script at the start (0700) when it is missing and its parent exists; an existing directory is never changed, and a `.` or `..` component or a symbolic link in its path is refused |
@@ -379,7 +379,7 @@ One line per request, to syslog (`logger(1)`, tag `karidns-webadmin`, `notice`):
 
 **Restore** the database, then the key file with its mode (0600, the service user), then `service karidns_webadmin configtest`. Sessions and tokens come back with the database; a restored session older than its idle time is simply dead.
 
-**Upgrade.** `pkg add` the new `karidns-webadmin` package (the program is replaced, the configuration and the key file stay). Apply the new SQL files again (they only create what is missing and replace the functions: PostgreSQL `karidns_ext.pgsql.sql`, then the role scripts; SQLite3 `karidns_ext.sqlite3.sql`, `karidns_audit.sqlite3.sql`, and `karidns_auth.sqlite3.sql` on the auth file), run `service karidns_webadmin configtest` — it names a schema that is not at the version the service wants — and restart. Upgrade `karidns-zone` and `karicheck` with the same release: the service refuses a `karidns-zone` that speaks another JSON schema.
+**Upgrade.** `pkg add` the new `karidns-webadmin` package (the program is replaced, the configuration and the key file stay). Apply the new SQL files again (they only create what is missing and replace the functions: PostgreSQL `karidns_ext.pgsql.sql`, then the role scripts; SQLite3 `karidns_ext.sqlite3.sql`, `karidns_audit.sqlite3.sql`, and `karidns_auth.sqlite3.sql` on the auth file), run `service karidns_webadmin configtest` — it names a schema that is not at the version the service wants — and restart. Upgrade `karidns-zone` and `karicheck` with the same release: the service refuses a `karidns-zone` that speaks another JSON schema. From 0.6 to 0.7: the configuration file must be a regular file of root or of the service user that the group and others cannot write (`chown root karidns-webadmin.conf; chmod go-w karidns-webadmin.conf`), else the service does not start and configtest says why.
 
 **Rotate the TOTP key** (0.7) with the service stopped, as the service user:
 

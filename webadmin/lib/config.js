@@ -1,9 +1,8 @@
 // The configuration file of karidns-webadmin (planning 9): lines `key = value`, `#` comments, `[dataset <name>]` sections.  The same format as the signer's;
 // the value parsers are the shared ones (node/lib/conf.js).  parseConfig() is pure (text in, object out); loadConfig() reads the file.
 
-import fs from 'node:fs';
 import os from 'node:os';
-import { parseBool, parseDuration, parseInt1, parseEnum, parseAbsPath, parseSchema, parseLog } from '../../node/lib/conf.js';
+import { parseBool, parseDuration, parseInt1, parseEnum, parseAbsPath, parseSchema, parseLog, readConfigFile } from '../../node/lib/conf.js';
 
 const parseListen = (v) => {
   if (v.startsWith('/')) return parseAbsPath(v);
@@ -279,12 +278,7 @@ export function datasetList(cfg) {
   return [...cfg.datasets.values()].map((d) => ({ name: d.name, schema: d.schema, views: d.views }));
 }
 
+// (the file is policy, trusted-proxy, require-totp, ...: checked like the other files of the service, a regular file of root or of our user that nobody else can change; review W4-L1, 0.7)
 export function loadConfig(file) {
-  let text;
-  try {
-    text = fs.readFileSync(file, 'utf8');
-  } catch (e) {
-    throw new Error(`cannot read ${file}: ${e.message}`);
-  }
-  return parseConfig(text);
+  return parseConfig(readConfigFile(file, { program: 'karidns-webadmin' }));
 }

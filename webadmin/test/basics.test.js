@@ -175,9 +175,18 @@ test('loadConfig reads a file', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kw-conf-'));
   try {
     const f = path.join(dir, 'c.conf');
-    fs.writeFileSync(f, SQLITE);
+    fs.writeFileSync(f, SQLITE, { mode: 0o644 });
     assert.equal(loadConfig(f).settings.database, 'sqlite3');
     assert.throws(() => loadConfig(path.join(dir, 'missing.conf')), /cannot read/);
+    // review W4-L1 (0.7): the settings are policy; a file others can change, or a link, is refused with the fix in the message
+    if (process.platform !== 'win32') {
+      fs.chmodSync(f, 0o646);
+      assert.throws(() => loadConfig(f), /has mode 0646: the group or other users can change it; chmod go-w /);
+      fs.chmodSync(f, 0o640);
+      assert.equal(loadConfig(f).settings.database, 'sqlite3');
+      fs.symlinkSync(f, path.join(dir, 'l.conf'));
+      assert.throws(() => loadConfig(path.join(dir, 'l.conf')), /is a symbolic link: point karidns-webadmin at the file itself/);
+    }
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

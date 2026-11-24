@@ -232,11 +232,11 @@ phase_sqlite() {
     zexport() { "$ZR" export --no-config --sqlite3 "$DB" "$1"; }
     sqlite3 "$DB" < tests/db/pdns_schema.sqlite3.sql > /dev/null && sqlite3 "$DB" < db/karidns_ext.sqlite3.sql > /dev/null && sqlite3 "$DB" < db/karidns_audit.sqlite3.sql > /dev/null || { bad "cannot make the zone file"; return 1; }
     sqlite3 "$AUTH" < db/karidns_auth.sqlite3.sql > /dev/null || { bad "cannot make the auth file"; return 1; }
-    chmod 600 "$AUTH"; chmod 666 "$DB"
+    chmod 600 "$AUTH"; kari_share_sqlite "$DB"
     for z in example signed; do
         zimport "$z.test" "$T/$z.test.zone" > "$P/import.out" 2>&1 && ok "$z.test is imported (karidns-zone import)" || bad "import of $z.test" "$(cat "$P/import.out")"
     done
-    chmod 666 "$DB"*
+    kari_share_sqlite "$DB"*
     zexport example.test | norm example.test. | nosoa > "$P/exp0.n"
     norm example.test. < "$T/example.test.zone" | nosoa > "$P/orig0.n"
     cmp -s "$P/exp0.n" "$P/orig0.n" && ok "the export of the fresh database equals the zone file" || bad "the export differs from the zone file" "$(diff "$P/orig0.n" "$P/exp0.n")"
@@ -334,7 +334,7 @@ EOF
     chmod 644 "$P/signer.conf"
     if [ $SERVER = 1 ]; then same "signed.test is served unsigned before the request" "$(./dag @127.0.0.1 -p "$PORT" www.signed.test A +dnssec +noall +answer +nohexdump | grep -c RRSIG)" 0; fi
     $NODE "$ROOT/signer/bin/karidns-signer.js" --check -c "$P/signer.conf" > "$P/sg.check" 2>&1 && ok "karidns-signer --check is fine" || bad "signer --check" "$(cat "$P/sg.check")"
-    sqlite3 "$DB" "INSERT INTO karidns_key_requests (domain_id, kind, algorithm) SELECT id, 'enable', 13 FROM domains WHERE name = 'signed.test'" && chmod 666 "$DB"*
+    sqlite3 "$DB" "INSERT INTO karidns_key_requests (domain_id, kind, algorithm) SELECT id, 'enable', 13 FROM domains WHERE name = 'signed.test'" && kari_share_sqlite "$DB"*
     $NODE "$ROOT/signer/bin/karidns-signer.js" -c "$P/signer.conf" >> "$P/signer.log" 2>&1 &
     SG=$!
     i=0; st=""

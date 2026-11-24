@@ -1,4 +1,4 @@
-.TH KARIDNS\-WEBADMIN 8 "2026-11-17" "KariDNS" "KariDNS Manual"
+.TH KARIDNS\-WEBADMIN 8 "2026-11-24" "KariDNS" "KariDNS Manual"
 .\" Generated from docs/karidns-webadmin.md by man/md2man.pl (make man): edit the Markdown manual, not this page.
 .SH NAME
 karidns\-webadmin \- the service that gives people and programs an HTTP API for
@@ -106,7 +106,10 @@ no install scripts, and CI runs \fBnpm audit \-\-audit\-level=high\fR.
 \fB/usr/local/etc/karidns/karidns\-webadmin.conf\fR
 \fIOwner, mode:\fR root:karidns-webadmin, 0640
 .br
-\fIHolds:\fR the settings (no secret)
+\fIHolds:\fR the settings (no secret, but policy: \fBtrusted\-proxy\fR,
+\fBrequire\-totp\fR, ...); since 0.7 the start, \fB\-\-check\fR and SIGHUP
+refuse a symbolic link, another owner than root or the service user, and a file
+the group or others can write (\fBchmod go\-w\fR)
 .TP 8
 \fBapi.conninfo\fR, \fBcheck.conninfo\fR (PostgreSQL)
 \fIOwner, mode:\fR karidns-webadmin, \fB0600\fR
@@ -1048,7 +1051,11 @@ PostgreSQL \fBkaridns_ext.pgsql.sql\fR, then the role scripts; SQLite3
 karidns_webadmin configtest\fR \[u2014] it names a schema that is not at the
 version the service wants \[u2014] and restart. Upgrade \fBkaridns\-zone\fR and
 \fBkaricheck\fR with the same release: the service refuses a \fBkaridns\-zone\fR
-that speaks another JSON schema.
+that speaks another JSON schema. From 0.6 to 0.7: the configuration file must be
+a regular file of root or of the service user that the group and others cannot
+write (\fBchown root karidns\-webadmin.conf; chmod go\-w
+karidns\-webadmin.conf\fR), else the service does not start and configtest says
+why.
 .PP
 \fBRotate the TOTP key\fR (0.7) with the service stopped, as the service user:
 .PP

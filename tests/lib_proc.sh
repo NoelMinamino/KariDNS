@@ -302,6 +302,19 @@ kari_ipc_diag() {
     echo "  [ipc diag] kern.ipc.maxsockbuf=$(sysctl -n kern.ipc.maxsockbuf 2>/dev/null) net.local.dgram.recvspace=$(sysctl -n net.local.dgram.recvspace 2>/dev/null)"
 }
 
+# kari_share_sqlite FILE... : a SQLite3 file the signer uses holds the private keys, and karidns-signer refuses one that other users can read (0.7 review W1-L3).
+# A test that shares it with the server's loader (the user nobody) makes nobody the owner of the file and of its -wal / -shm, mode 0660 (the signer of the
+# tests runs as root); not root: 0660, ours.  The signer's lock file (*.signer.lock) is left alone: it must stay the signer's.
+kari_share_sqlite() {
+    for _f in "$@"; do
+        case $_f in *.signer.lock) continue ;; esac
+        [ -e "$_f" ] || continue
+        chmod 660 "$_f"
+        if [ "$(id -u)" = 0 ] && id nobody >/dev/null 2>&1; then chown nobody "$_f"; fi
+    done
+    return 0
+}
+
 # kari_now : the time of day (UTC) with milliseconds, for the diagnostics (FreeBSD's date(1) has no %N)
 kari_now() { perl -MTime::HiRes=time -MPOSIX=strftime -e '$t = time; print strftime("%H:%M:%S", gmtime($t)), sprintf(".%03d\n", ($t - int($t)) * 1000)' 2>/dev/null || date -u '+%H:%M:%S'; }
 

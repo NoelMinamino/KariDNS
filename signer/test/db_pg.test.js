@@ -95,15 +95,22 @@ test('metadata and keys', async () => {
 
 test('insertKeys: one statement with arrays, and the transaction id as the write id', async () => {
   const { db, main } = await open();
-  FakeClient.script = () => ({ rows: [{ xid: '9001' }] });
-  const w = await db.insertKeys(7, [{ flags: 257, content: 'K1' }, { flags: 256, content: 'K2' }]);
-  assert.deepEqual(w, { xid: '9001', seq_first: null, seq_last: null });
+  FakeClient.script = () => ({ rows: [{ xid: '9001', ids: '12,13' }] });
+  const w = await db.insertKeys(7, [{ flags: 257, content: 'K1' }, { flags: 256, content: 'K2' }], 5);
+  assert.deepEqual(w, { xid: '9001', seq_first: null, seq_last: null, ids: [12, 13] });
   const [text, params] = last(main);
-  assert.match(text, /^INSERT INTO cryptokeys \(domain_id, flags, active, published, content\) SELECT \$1, f, true, true, c FROM unnest\(\$2::int\[\], \$3::text\[\]\)/);
-  assert.match(text, /RETURNING pg_current_xact_id\(\)::text AS xid$/);
-  assert.deepEqual(params, [7, [257, 256], ['K1', 'K2']]);
+  assert.match(text, /^WITH k AS \(INSERT INTO cryptokeys \(domain_id, flags, active, published, content\) SELECT \$1, f, true, true, c FROM unnest\(\$2::int\[\], \$3::text\[\]\) AS t\(f, c\) RETURNING id\)/);
+  // review W1-L1: the note goes into the pending request in the same statement as the keys (all or none)
+  assert.match(text, /n AS \(UPDATE karidns_key_requests SET message = \$5::text \|\| \(SELECT ids FROM ids\) WHERE id = \$4 AND state = 'pending' RETURNING 1\) SELECT pg_current_xact_id\(\)::text AS xid, \(SELECT ids FROM ids\) AS ids$/);
+  assert.deepEqual(params, [7, [257, 256], ['K1', 'K2'], 5, 'stored keys: cryptokeys ']);
   FakeClient.script = () => ({ rows: [] });
-  assert.equal((await db.insertKeys(7, [])).xid, null);
+  assert.deepEqual(await db.insertKeys(7, []), { xid: null, seq_first: null, seq_last: null, ids: [] });
+  assert.equal(last(main)[1][3], null, 'no request: nothing is noted');
+  FakeClient.script = (t) => (/strpos/.test(t) ? { rows: [{ message: 'stored keys: cryptokeys 12,13' }] } : { rows: [] });
+  assert.equal(await db.storedKeysNote(7), 'stored keys: cryptokeys 12,13');
+  assert.deepEqual(last(main), ["SELECT message FROM karidns_key_requests WHERE domain_id = $1 AND kind = 'enable' AND strpos(message, $2::text) > 0 ORDER BY id DESC LIMIT 1", [7, 'stored keys: cryptokeys ']]);
+  FakeClient.script = () => ({ rows: [] });
+  assert.equal(await db.storedKeysNote(7), null);
 });
 
 test('key requests and state', async () => {
@@ -121,18 +128,20 @@ test('key requests and state', async () => {
   assert.match(last(main)[0], /ON CONFLICT \(domain_id\) DO UPDATE SET signed_at = excluded\.signed_at/);
   await db.dropState(2);
   assert.deepEqual(last(main), ['DELETE FROM karidns_signer_state WHERE domain_id = $1', [2]]);
-  await db.requestReload('a.test');
-  assert.deepEqual(last(main), ['INSERT INTO karidns_reload_requests (zone) VALUES ($1)', ['a.test']]);
 });
 
-test('recordFailure: attempts + 1 and the backoff for the new count', async () => {
+test('recordFailure: attempts + 1 and the backoff for the new count, in one statement (review W1-L2)', async () => {
   const { db, main } = await open();
-  FakeClient.script = (t) => (/SELECT attempts/.test(t) ? { rows: [{ attempts: 2 }] } : { rows: [] });
+  FakeClient.script = (t) => (/RETURNING attempts/.test(t) ? { rows: [{ attempts: 3 }] } : { rows: [] });
   assert.equal(await db.recordFailure(4, { error: 'boom', nextDue: (n) => 1000 + n, durationMs: 3 }), 3);
-  assert.deepEqual(last(main)[1], [4, 1003, 3, 'boom', 3]);
-  FakeClient.script = () => ({ rows: [] });
+  // the read and the write are one statement: no SELECT first (the zone's lock is not held any more when the result is recorded)
+  assert.equal(main.log.length, 1);
+  const [text, params] = last(main);
+  assert.match(text, /^INSERT INTO karidns_signer_state AS s .* VALUES \(\$1, to_timestamp\(\(\$2::float8\[\]\)\[1\]\), 1, \$3, \$4\) ON CONFLICT \(domain_id\) DO UPDATE SET attempts = s\.attempts \+ 1, next_due = to_timestamp\(\(\$2::float8\[\]\)\[least\(s\.attempts \+ 1, 16\)\]\),.* RETURNING attempts$/);
+  assert.deepEqual(params, [4, Array.from({ length: 16 }, (_, i) => 1001 + i), 'boom', 3]);
+  FakeClient.script = (t) => (/RETURNING attempts/.test(t) ? { rows: [{ attempts: 1 }] } : { rows: [] });
   assert.equal(await db.recordFailure(4, { error: 'again', nextDue: (n) => n }), 1);
-  assert.deepEqual(last(main)[1], [4, 1, 1, 'again', null]);
+  assert.deepEqual(last(main)[1].slice(2), ['again', null]);
 });
 
 test('markDue goes in chunks, never later than it is', async () => {
