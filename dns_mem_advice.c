@@ -19,6 +19,50 @@
 #include <stdio.h>
 #include <string.h>
 #include <syslog.h>
+#if defined(__FreeBSD__)
+#include <sys/types.h>
+#include <sys/sysctl.h>
+#endif
+
+uint64_t ma_default_limit(uint64_t ram) {
+    if (ram == 0) ram = MA_DEFAULT_RAM_UNKNOWN;
+    uint64_t v = ram > MA_DEFAULT_RESERVE ? (ram - MA_DEFAULT_RESERVE) / 2 : 0;
+    v &= ~((1ull << 20) - 1);                                  /* (a MiB multiple: the value prints as memory-limit accepts it) */
+    return v < MA_DEFAULT_MIN ? MA_DEFAULT_MIN : v;
+}
+
+uint64_t ma_effective_limit(uint64_t configured, bool unlimited, bool store, uint64_t ram, bool *is_default) {
+    if (is_default) *is_default = false;
+    if (configured) return configured;
+    if (unlimited || !store) return 0;
+    if (is_default) *is_default = true;
+    return ma_default_limit(ram);
+}
+
+uint64_t ma_host_ram(void) {
+#if defined(__FreeBSD__)
+    uint64_t v = 0;
+    size_t l = sizeof(v);
+    if (sysctlbyname("hw.physmem", &v, &l, NULL, 0) == 0 && (l == 4 || l == 8)) return v;     /* (a 32-bit host answers 4 bytes: the low ones of v, which starts at 0) */
+#endif
+    return 0;
+}
+
+size_t ma_text_default(char *buf, size_t n, uint64_t limit, uint64_t ram) {
+    char lim[32], r[32], res[32], mn[32];
+    ma_fmt_limit(lim, sizeof(lim), limit);
+    ma_fmt_limit(mn, sizeof(mn), MA_DEFAULT_MIN);
+    ma_fmt_size(r, sizeof(r), ram);
+    ma_fmt_size(res, sizeof(res), MA_DEFAULT_RESERVE);
+    int w;
+    if (ram)
+        w = snprintf(buf, n, "memory-limit is not set: %s is used (the default: half of the %s of RAM above %s, at least %s); set memory-limit to change it, "
+                             "or `memory-limit unlimited;` to keep every database zone in memory", lim, r, res, mn);
+    else
+        w = snprintf(buf, n, "memory-limit is not set and the RAM is not known: %s is used (the default for 1 GB of RAM); set memory-limit to change it, "
+                             "or `memory-limit unlimited;` to keep every database zone in memory", lim);
+    return snprintf_len(w, n);
+}
 
 static uint64_t round_up(uint64_t v, uint64_t m) {
     uint64_t r = v / m * m;
@@ -30,6 +74,8 @@ void ma_estimate(const ma_in_t *in, ma_est_t *e) {
     memset(e, 0, sizeof(*e));
     e->zones = in->zones;
     e->limit = in->limit;
+    e->limit_default = in->limit && in->limit_default;
+    e->ram = in->ram;
     const bool st = in->store_mode != MA_STORE_NONE;
     uint64_t avg_image = 0;                                    /* the store knows it (stored images / stored bytes) */
     if (in->have_records) {
@@ -79,6 +125,7 @@ void ma_estimate(const ma_in_t *in, ma_est_t *e) {
     const uint64_t kept = fit < e->counted_all ? fit : e->counted_all;
     const uint64_t kept_img = kept / 100 * imgpct;
     e->backend_limit = MA_FIXED_LIMIT + e->directory + (kept - kept_img);
+    if (e->fit_pct >= 100) e->backend_limit = e->backend_all;  /* (every zone fits: the Backend is the one without a limit; measured 0.7.x on a 1 vCPU / 1 GB VM, 1000 zones: 35-37 MB with and without, not 70 MB + the zones) */
     e->loader_limit = st ? MA_LOADER_STORE : MA_LOADER_FIXED + in->zones * MA_LOADER_ZONE_LIM;
     if (st) e->mapped = e->tables + kept_img;
     if (e->fit_pct >= 100) e->level = MA_LEVEL_INFO;
@@ -122,8 +169,22 @@ static const char *basis_text(const ma_est_t *e, char *b, size_t n) {
     return b;
 }
 
+/* the limit in force as the texts name it: "384M", or "384M (the default from 1.0 GB of RAM)" when memory-limit was not written */
+static const char *lim_text(char *b, size_t n, const ma_est_t *e) {
+    char v[32], r[32];
+    ma_fmt_limit(v, sizeof(v), e->limit);
+    if (!e->limit_default) snprintf(b, n, "%s", v);
+    else if (e->ram) {
+        ma_fmt_size(r, sizeof(r), e->ram);
+        snprintf(b, n, "%s (the default from %s of RAM)", v, r);
+    } else {
+        snprintf(b, n, "%s (the default)", v);
+    }
+    return b;
+}
+
 size_t ma_text_estimate(char *buf, size_t n, const ma_est_t *e) {
-    char basis[120], data[32], be[32], ld[32], dir[32], lim[32], rec[32], bl[32], ll[32];
+    char basis[120], data[32], be[32], ld[32], dir[32], lim[80], rec[32], bl[32], ll[32];
     ma_fmt_size(data, sizeof(data), e->counted_all);
     ma_fmt_size(be, sizeof(be), e->backend_all);
     ma_fmt_size(ld, sizeof(ld), e->loader_all);
@@ -135,7 +196,7 @@ size_t ma_text_estimate(char *buf, size_t n, const ma_est_t *e) {
                              "fixed part 35 MB) and the loader about %s; a memory-limit of %s would keep every zone in memory",
                      e->zones, basis_text(e, basis, sizeof(basis)), be, data, dir, ld, rec);
     } else {
-        ma_fmt_limit(lim, sizeof(lim), e->limit);
+        lim_text(lim, sizeof(lim), e);
         ma_fmt_size(bl, sizeof(bl), e->backend_limit);
         ma_fmt_size(ll, sizeof(ll), e->loader_limit);
         w = snprintf(buf, n, "memory sizing: %" PRIu64 " zone(s) (%s); every zone in memory needs a memory-limit of %s (zone data %s) and the Backend about %s, the loader about %s; "
@@ -146,12 +207,12 @@ size_t ma_text_estimate(char *buf, size_t n, const ma_est_t *e) {
 }
 
 size_t ma_text_advice(char *buf, size_t n, const ma_est_t *e) {
-    char lim[32], rec[32], wm[32], fm[32], data[32], av[32];
+    char lim[80], rec[32], wm[32], fm[32], data[32], av[32];
     if (e->level == MA_LEVEL_INFO || !e->limit) {
         if (n) buf[0] = '\0';
         return 0;
     }
-    ma_fmt_limit(lim, sizeof(lim), e->limit);
+    lim_text(lim, sizeof(lim), e);
     ma_fmt_limit(rec, sizeof(rec), e->recommended);
     ma_fmt_limit(wm, sizeof(wm), e->working_min);
     ma_fmt_size(fm, sizeof(fm), e->fit_min);
@@ -174,7 +235,7 @@ size_t ma_text_advice(char *buf, size_t n, const ma_est_t *e) {
 }
 
 size_t ma_text_status(char *buf, size_t n, const ma_est_t *e) {
-    char data[32], be[32], ld[32], rec[32], lim[32], wm[32], bl[32], ll[32], basis[120];
+    char data[32], be[32], ld[32], rec[32], lim[80], wm[32], bl[32], ll[32], basis[120];
     ma_fmt_size(data, sizeof(data), e->counted_all);
     ma_fmt_size(be, sizeof(be), e->backend_all);
     ma_fmt_size(ld, sizeof(ld), e->loader_all);
@@ -186,7 +247,7 @@ size_t ma_text_status(char *buf, size_t n, const ma_est_t *e) {
         ma_fmt_limit(lim, sizeof(lim), e->limit);
         ma_fmt_size(bl, sizeof(bl), e->backend_limit);
         ma_fmt_size(ll, sizeof(ll), e->loader_limit);
-        w = snprintf(buf + l, n - l, "memory-limit=%s fit=%u%% backend=%s loader=%s | recommended=%s (half of the zones: at least %s) | status=%s", lim, e->fit_pct, bl, ll, rec, wm,
+        w = snprintf(buf + l, n - l, "memory-limit=%s%s fit=%u%% backend=%s loader=%s | recommended=%s (half of the zones: at least %s) | status=%s", lim, e->limit_default ? " (default)" : "", e->fit_pct, bl, ll, rec, wm,
                      ma_level_name(e->level));
     } else {
         w = snprintf(buf + l, n - l, "no memory-limit | recommended=%s | status=%s", rec, ma_level_name(e->level));
@@ -287,8 +348,8 @@ int ma_rt_tick(ma_rt_t *st, const ma_rt_in_t *in, const ma_est_t *e, char *buf, 
     if (!load && over < MA_OVERLOAD_MIN) return 0;
     if (st->last_warn_ms && in->now_ms - st->last_warn_ms < MA_WARN_EVERY_MS) return 0;
     st->last_warn_ms = in->now_ms;
-    char lim[32], rec[32], wm[32];
-    ma_fmt_limit(lim, sizeof(lim), e->limit);
+    char lim[80], rec[32], wm[32];
+    lim_text(lim, sizeof(lim), e);
     ma_fmt_limit(rec, sizeof(rec), e->recommended);
     ma_fmt_limit(wm, sizeof(wm), e->working_min);
     int w = snprintf(buf, n, "memory-limit %s is too small for the traffic: in the last %" PRId64 " s %" PRIu64 " queries (%" PRIu64 "/s) had to wait for a zone that was not in memory and %" PRIu64

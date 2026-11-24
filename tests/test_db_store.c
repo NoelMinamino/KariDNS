@@ -5802,6 +5802,7 @@ static void lk_cfg(const char *dbextra, unsigned rate, uint64_t memory_limit) {
     server_config_t *c = &pool[used++ % 8];
     CHECK(parse_named_conf(conf, c) == 0);
     if (memory_limit) c->database.memory_limit = memory_limit;
+    if (!c->database.memory_limit) c->database.memory_limit_unlimited = true;        /* (0.7: what an unset memory-limit meant when these cases were written; with the store it is the default from the RAM now) */
     atomic_store_explicit(&g_config_db.active, c, memory_order_release);
     for (int i = 0; i < 300 && !(st_field("fetch", "rate") == rate && dbreg_cache_limit() == c->database.memory_limit); i++) usleep(20000);
     usleep(150000);

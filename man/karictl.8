@@ -1,4 +1,4 @@
-.TH KARICTL 8 "2026-11-23" "KariDNS" "KariDNS Manual"
+.TH KARICTL 8 "2026-11-24" "KariDNS" "KariDNS Manual"
 .\" Generated from docs/karictl.md by man/md2man.pl (make man): edit the Markdown manual, not this page.
 .SH NAME
 karictl \- Remote Control and Management Utility for KariDNS
@@ -814,39 +814,42 @@ the limit), \fBfit\fR the share of the zones that fit under the limit,
 \fBrecommended\fR the \fBmemory\-limit\fR that keeps every zone, \fBstatus\fR
 the level of the syslog line the server says about it (\fBnotice\fR: below what
 every zone needs, \fBwarning\fR: less than half of the zones fit, \fBerror\fR:
-the limit cannot hold the zones of the reads in flight). Without
-\fBmemory\-limit\fR: \fB| no memory\-limit | recommended=R | status=ok\fR. The
-same figures are in syslog at every start and reload (docs/karidns.md, "Memory
-limit"). These lines come after the \fBzone directory:\fR line; the lines before
-keep their form. Then, the totals since the server started, and the last
-protocol error of the loader link. With a zone name (and optionally a view):
-that zone's view, database id, SOA serial, status (\fBapplied\fR, \fBrejected\fR
-or \fBshadowed\fR) and the last error, then, for a \fBSLAVE\fR or \fBCONSUMER\fR
-zone (B7b), its type, masters and TSIG key and the last successful transfer with
-the serial (with the zone store, 0.7, \fBa copy is kept in the zone store; a
-restart restores it\fR, without it \fBkept in memory only; a restart transfers
-it again\fR; \fBsettings from the primary: in force\fR when the primary sent
-settings, B8t-2) and (0.7) the lines \fBStore:\fR, \fBLast\-refresh:\fR and
-\fBExpired:\fR of \fBzonestatus\fR, indented, then (B7a) the settings it runs
-with: where they come from (\fBprofile 'name'\fR with the zone's own metadata
-overriding it, \fBthe zone's own metadata\fR, or \fBnone\fR), its
-\fBallow\-transfer\fR and \fBallow\-update\fR entries with their match mode, the
-entries \fBacl\-ceiling\fR cuts away (\fBlies outside acl\-ceiling\fR, \fBis
-narrowed by acl\-ceiling\fR, or \fBno acl\-ceiling is configured: these ACLs
-refuse everybody\fR) and a \fBsettings error\fR line when a TSIG key the
-settings name is no longer defined in \fBkaridns.conf\fR. The summary also
-counts the distinct settings (zones with the same settings share one block) and
-the zones that name an undefined key. A zone that was rejected keeps serving its
-last good version (its serial is shown). Without a \fBdatabase\fR block the
-server answers \fBERROR no database block is configured\fR. With the zone store
-(0.7) the \fBstore pass:\fR line shows the reconcile with the loader: the pass
-that runs or ran last (the entries it listed, new / changed / renamed /
-unchanged / already asked for / refused with this version), the sweep (zones the
-pass did not list, deleted), the bodies (records without one now, fetched,
-failed, in flight) and the changes applied; a \fBMASS\-DELETE GUARD HELD:\fR
-line says that a sweep was held back (more than 20 percent of a view's zones and
-more than 1,000 are not in the database) and that \fBkarictl reload \-force\fR
-releases it.
+the limit cannot hold the zones of the reads in flight). With no limit in force
+(\fBmemory\-limit unlimited\fR, or none written without the zone store): \fB| no
+memory\-limit | recommended=R | status=ok\fR; with the default from the RAM
+(0.7, no \fBmemory\-limit\fR written and the zone store) \fBmemory\-limit=L
+(default)\fR. The same figures are in syslog at every start and reload
+(docs/karidns.md, "Memory limit"). These lines come after the \fBzone
+directory:\fR line; the lines before keep their form. Then, the totals since the
+server started, and the last protocol error of the loader link. With a zone name
+(and optionally a view): that zone's view, database id, SOA serial, status
+(\fBapplied\fR, \fBrejected\fR or \fBshadowed\fR) and the last error, then, for
+a \fBSLAVE\fR or \fBCONSUMER\fR zone (B7b), its type, masters and TSIG key and
+the last successful transfer with the serial (with the zone store, 0.7, \fBa
+copy is kept in the zone store; a restart restores it\fR, without it \fBkept in
+memory only; a restart transfers it again\fR; \fBsettings from the primary: in
+force\fR when the primary sent settings, B8t-2) and (0.7) the lines
+\fBStore:\fR, \fBLast\-refresh:\fR and \fBExpired:\fR of \fBzonestatus\fR,
+indented, then (B7a) the settings it runs with: where they come from
+(\fBprofile 'name'\fR with the zone's own metadata overriding it, \fBthe zone's
+own metadata\fR, or \fBnone\fR), its \fBallow\-transfer\fR and
+\fBallow\-update\fR entries with their match mode, the entries
+\fBacl\-ceiling\fR cuts away (\fBlies outside acl\-ceiling\fR, \fBis narrowed by
+acl\-ceiling\fR, or \fBno acl\-ceiling is configured: these ACLs refuse
+everybody\fR) and a \fBsettings error\fR line when a TSIG key the settings name
+is no longer defined in \fBkaridns.conf\fR. The summary also counts the distinct
+settings (zones with the same settings share one block) and the zones that name
+an undefined key. A zone that was rejected keeps serving its last good version
+(its serial is shown). Without a \fBdatabase\fR block the server answers
+\fBERROR no database block is configured\fR. With the zone store (0.7) the
+\fBstore pass:\fR line shows the reconcile with the loader: the pass that runs
+or ran last (the entries it listed, new / changed / renamed / unchanged /
+already asked for / refused with this version), the sweep (zones the pass did
+not list, deleted), the bodies (records without one now, fetched, failed, in
+flight) and the changes applied; a \fBMASS\-DELETE GUARD HELD:\fR line says that
+a sweep was held back (more than 20 percent of a view's zones and more than
+1,000 are not in the database) and that \fBkarictl reload \-force\fR releases
+it.
 .RS 8
 .PP
 .RS 2

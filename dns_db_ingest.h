@@ -30,6 +30,9 @@
  * enter_capsicum_sandbox().  stream_fd may be -1 (the loader is not connected yet); ctrl_fd is the Backend end of
  * pair C.  false: could not start. */
 bool db_ingest_start(int stream_fd, int ctrl_fd, int fetch_fd);
+/* 0.7.x: the memory-limit in force for a database block: the one written, 0 for `memory-limit unlimited` or without the zone store, else the default from the RAM that
+ * db_ingest_start() read (dns_mem_advice.h, ma_default_limit(); *is_default true, may be NULL).  Before db_ingest_start() the RAM is not known: the default for 1 GB. */
+uint64_t db_ingest_memory_limit(const server_config_t *cfg, bool *is_default);
 /* D1a: fetch_fd is the Backend end of the second stream (design 6.1), -1 without one.  The thread also reads the fetch requests the workers push
  * (dns_park.h) and sends them to the loader on it; what comes back wakes the parked queries. */
 

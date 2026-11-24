@@ -749,7 +749,8 @@ typedef struct {
   uint32_t loader_threads;     /* 1..16 */
   uint32_t park_max;           /* D1a: queries one worker parks for a zone that is not in memory, 1..65536 (0 = the default, 1024); restart-only */
   uint32_t park_timeout_ms;    /* D1a: how long a parked query waits for the zone, 10..60000 ms (0 = the default, 1500) */
-  uint64_t memory_limit;       /* D1a step 5: bytes the database zones may hold in memory (resident + retired, not freed yet); 0 = no limit, every zone stays resident. 1M..1T */
+  uint64_t memory_limit;       /* D1a step 5: bytes the database zones may hold in memory (resident + retired, not freed yet); 0 = not written (0.7.x: the default from the RAM, ma_default_limit()) or `unlimited`. 1M..1T */
+  bool memory_limit_unlimited; /* `memory-limit unlimited;`: no limit, every database zone stays in memory (what an unset memory-limit meant before 0.7.x) */
   uint32_t fetch_rate;         /* D1a: zones read from the database for queries per second, 1..100000; a token bucket with a burst of one second.  0 = unlimited, the default (0.7 P-A; `fetch-rate unlimited` or `fetch-rate 0`) */
   uint32_t fetch_concurrency;  /* D1a: fetches in flight to the loader while memory-limit is set, 2..256 (0 = loader-threads x 16, at least 16): a request over it waits (0.7 P-B), it is not refused */
   uint32_t transfer_fetch_timeout_ms;   /* D1a step 7: how long an AXFR / IXFR of a zone that is not in memory waits for the zone, 100..600000 ms (0 = the default, 10000) */
@@ -1019,6 +1020,11 @@ bool db_acl_ceiling_configured(const server_config_t *cfg);
 /* loader-path with its default */
 static inline const char *db_loader_path(const server_config_t *c) {
   return c->database.loader_path ? c->database.loader_path : KARIDNS_DB_DEFAULT_LOADER_PATH;
+}
+/* 0.7.x: do the database zones go to the zone store?  Not with database { store none; } nor with options { zone-store none; } (the parser refuses the two
+ * saying different things): the configuration side of db_store_dir_cfg() of the server, for the tools that do not link it (karicheck adds the check of the default directory) */
+static inline bool db_uses_store(const server_config_t *c) {
+  return c->database.enabled && !c->database.store_none && !(c->zone_store_set && c->zone_store_none && !c->database.store_dir);
 }
 
 #define MAX_INCLUDE_DEPTH 16

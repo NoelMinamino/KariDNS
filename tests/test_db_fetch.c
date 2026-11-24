@@ -364,6 +364,7 @@ static void gate_cfg(const char *dbextra, unsigned conc, unsigned rate, uint64_t
     server_config_t *c = &pool[used++ % 16];
     CHECK(parse_named_conf(conf, c) == 0);
     if (memory_limit) c->database.memory_limit = memory_limit;
+    if (!c->database.memory_limit) c->database.memory_limit_unlimited = true;        /* (0.7: what an unset memory-limit meant when these cases were written; with the store it is the default from the RAM now) */
     atomic_store_explicit(&g_config_db.active, c, memory_order_release);
     for (int i = 0; i < 300 && !(st_field("fetch", "concurrency") == conc && st_field("fetch", "rate") == rate && dbreg_cache_limit() == c->database.memory_limit); i++) usleep(20000);
     usleep(150000);                                               /* (the thread takes the rest of the settings, park-timeout among them, in the same round: it comes every 50 ms) */

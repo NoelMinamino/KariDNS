@@ -6740,8 +6740,12 @@ static int parse_database_option(token_ctx_t *ctx, database_config_t *db, const 
     db->hot_list_interval = (uint32_t)u;
     return 0;
   }
-  if (strcmp(key, "memory-limit") == 0)       /* K, M, G suffixes (up to 1024G); unset = no limit (every database zone stays in memory) */
-    return db_take_uint(ctx, key, true, KARIDNS_DB_MEMORY_LIMIT_MIN, KARIDNS_DB_MEMORY_LIMIT_MAX, &db->memory_limit);
+  if (strcmp(key, "memory-limit") == 0) {     /* K, M, G suffixes (up to 1024G) or `unlimited` (every database zone stays in memory); unset = the default from the RAM (0.7.x, dns_mem_advice.h) */
+    if (db_take_uint_word(ctx, key, true, KARIDNS_DB_MEMORY_LIMIT_MIN, KARIDNS_DB_MEMORY_LIMIT_MAX, "unlimited", 0, &u) != 0) return -1;
+    db->memory_limit = u;
+    db->memory_limit_unlimited = u == 0;
+    return 0;
+  }
   if (strcmp(key, "acl-ceiling") == 0) {
     /* addresses and "key" entries like allow-transfer (see zone_transfer_acl_allows(), dns_tsig_acl.c) */
     free_str_list(db->acl_ceiling, db->acl_ceiling_count);
@@ -6864,7 +6868,7 @@ static size_t db_config_body_size(const server_config_t *config) {
     if (sqlite ? !v->database_file : !v->database_schema) vn += 5;      /* a view on the global source */
     n += 4 + vn;
   }
-  n += 8 + 5 + 8 + (db->memory_limit ? 5 : 0) + 5;                      /* default ttl, bulk threshold, loader threads, memory limit, signer wait */
+  n += 8 + 5 + 8 + 5 + 5;                                               /* default ttl, bulk threshold, loader threads, memory limit (dir_only: also the default from the RAM), signer wait */
   return n;
 }
 

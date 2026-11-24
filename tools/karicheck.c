@@ -781,6 +781,8 @@ KARIDNS_TOOL_FN void kc_check_sqlite_file(kc_tally_t *t, const char *what, const
                  path, path);
 }
 
+KARIDNS_TOOL_FN bool kc_db_uses_store(const server_config_t *cfg);
+
 /* beta design 7.2: the checks of options { database { } } that need no connection.  `karicheck db` (B12) reads the
  * data.  Returns the number of errors. */
 KARIDNS_TOOL_FN int kc_check_database(const server_config_t *cfg) {
@@ -816,11 +818,14 @@ KARIDNS_TOOL_FN int kc_check_database(const server_config_t *cfg) {
             kc_check_loader_driver(&t, db, lp, db->driver);
     }
 
-    /* D1a step 7 (design 8.4): the hot list is made from the frequencies the cache manager keeps, which it does only with memory-limit */
-    if (db->loader_state_file && db->memory_limit == 0)
-        kc_warning(&t, DC_CONF_DATABASE_STATE_FILE, "database: loader-state-file has no effect without memory-limit (every zone stays in memory, so there is no hot list to warm from)\n");
-    if (db->warm_before_serve && db->memory_limit == 0)
-        kc_warning(&t, DC_CONF_DATABASE_WARM, "database: warm-before-serve only waits for the directory to be loaded without memory-limit (every zone is read at the start)\n");
+    /* D1a step 7 (design 8.4): the hot list is made from the frequencies the cache manager keeps, which it does only with memory-limit
+     * (0.7.x: an unset memory-limit is the default from the RAM when the zones go to the store; `memory-limit unlimited`, or no memory-limit without the store, is none) */
+    const bool no_limit = db->memory_limit == 0 && (db->memory_limit_unlimited || !kc_db_uses_store(cfg));
+    const char *why = db->memory_limit_unlimited ? "memory-limit unlimited" : "no memory-limit and no zone store";
+    if (db->loader_state_file && no_limit)
+        kc_warning(&t, DC_CONF_DATABASE_STATE_FILE, "database: loader-state-file has no effect without memory-limit (%s: every zone stays in memory, so there is no hot list to warm from)\n", why);
+    if (db->warm_before_serve && no_limit)
+        kc_warning(&t, DC_CONF_DATABASE_WARM, "database: warm-before-serve only waits for the directory to be loaded without memory-limit (%s: every zone is read at the start)\n", why);
     /* 0.7 store S2: the directory of the zone store: karidns makes the last component of an explicit directory (mode 0700, the user it runs as) and refuses to start when it cannot use it */
     if (db->store_dir && !db->store_none) {
         struct stat ssb;
@@ -1945,6 +1950,22 @@ KARIDNS_TOOL_FN int kc_db_run_source(const server_config_t *cfg, const kc_dbsrc_
  * are asked for, so what it says about memory-limit is the share of zones that fit and the recommendation, as the server says it at its start. */
 /* 0.7 S6 (store design 3.6): when the store is on ZFS (the images are read with pread() and the ARC is their cache), the Backend's heap, vfs.zfs.arc.max, the loader and about a
  * gigabyte for the system have to fit in RAM together.  Said as an information line (a sum that is over RAM says so in its text); the server cannot read these values in its sandbox. */
+/* 0.7.x: will the server put the database zones in the zone store?  As the server decides it (dns_db_store.c, db_store_wanted()): not with `store none` or
+ * `zone-store none`; a directory that is named is used; the default one only when its parent exists and KARIDNS_NO_DEFAULT_STORE is not 1 (the tests).  The default
+ * memory-limit comes with the store only. */
+KARIDNS_TOOL_FN bool kc_db_uses_store(const server_config_t *cfg) {
+    if (!db_uses_store(cfg)) return false;
+    if (cfg->database.store_dir || (cfg->zone_store_set && cfg->zone_store_dir)) return true;
+    const char *nodef = getenv("KARIDNS_NO_DEFAULT_STORE");
+    if (nodef && strcmp(nodef, "1") == 0) return false;
+    char parent[KARIDNS_DB_PATH_MAX + 1];
+    snprintf(parent, sizeof(parent), "%s", KARIDNS_DB_DEFAULT_STORE_DIR);
+    char *sl = strrchr(parent, '/');
+    if (sl && sl != parent) *sl = '\0';
+    struct stat st;
+    return stat(parent, &st) == 0 && S_ISDIR(st.st_mode);
+}
+
 KARIDNS_TOOL_FN bool kc_db_store_on_zfs(const database_config_t *db) {
 #if defined(__FreeBSD__)
     char path[KARIDNS_DB_PATH_MAX + 1];
@@ -1968,11 +1989,10 @@ KARIDNS_TOOL_FN void kc_db_zfs_memory(const database_config_t *db, const ma_est_
 #if defined(__FreeBSD__)
     if (db->store_none || db->store_mode == 1) return;           /* (`store-mode map` keeps the images in the page cache: not what this sums) */
     if (!kc_db_store_on_zfs(db)) return;
-    uint64_t arc = 0, ram = 0;
+    uint64_t arc = 0;
     size_t l = sizeof(arc);
     if (sysctlbyname("vfs.zfs.arc.max", &arc, &l, NULL, 0) != 0 || (l != 4 && l != 8)) return;
-    l = sizeof(ram);
-    if (sysctlbyname("hw.physmem", &ram, &l, NULL, 0) != 0 || (l != 4 && l != 8)) ram = 0;
+    const uint64_t ram = ma_host_ram();
     ma_arc_t a;
     ma_arc_sum(e->limit ? e->backend_limit : e->backend_all, arc, e->limit ? e->loader_limit : e->loader_all, ram, &a);
     char t[640];
@@ -1991,9 +2011,15 @@ KARIDNS_TOOL_FN void kc_db_memory(const server_config_t *cfg, const kc_msum_t *m
     in.zones = ms->zones;
     in.have_records = true;
     in.records = ms->records;
-    in.limit = db->memory_limit;
+    in.ram = ma_host_ram();                             /* (0.7.x: an unset memory-limit is the default from the RAM of the host the server runs on; this one is assumed to be it) */
+    in.limit = ma_effective_limit(db->memory_limit, db->memory_limit_unlimited, kc_db_uses_store(cfg), in.ram, &in.limit_default);
+    if (in.limit_default) {
+        char d[400];
+        ma_text_default(d, sizeof(d), in.limit, in.ram);
+        dns_diag(DIAG_INFO, DC_DB_MEMORY_ESTIMATE, NULL, 0, "%s (the RAM of this host)\n", d);
+    }
     in.fetch_conc = db->fetch_concurrency ? db->fetch_concurrency : (db->loader_threads ? db->loader_threads : 1) * KARIDNS_DB_FETCH_CONC_PER_THREAD;
-    if (!db->store_none) in.store_mode = db->store_mode == 1 ? MA_STORE_MAP : db->store_mode == 2 ? MA_STORE_COPY : kc_db_store_on_zfs(db) ? MA_STORE_COPY : MA_STORE_MAP;      /* (0.7 D6: the store is the directory; the loader keeps no table) */
+    if (kc_db_uses_store(cfg)) in.store_mode = db->store_mode == 1 ? MA_STORE_MAP : db->store_mode == 2 ? MA_STORE_COPY : kc_db_store_on_zfs(db) ? MA_STORE_COPY : MA_STORE_MAP;      /* (0.7 D6: the store is the directory; the loader keeps no table) */
     ma_est_t e;
     ma_estimate(&in, &e);
     char t[900];
