@@ -1092,7 +1092,7 @@ static void test_pending(void) {
   park_free(&t);
 }
 
-/* the attach ring: 8 bytes a request, 4096 of them, a full ring says so; the store threads take requests without a lock, each one exactly once */
+/* the attach ring: 8 bytes a request, PARK_ATTACH_RING of them, a full ring says so; the store threads take requests without a lock, each one exactly once */
 #define ATC 4
 #define ATN 20000
 static _Atomic uint32_t g_at_seen[ATN];
@@ -1118,10 +1118,10 @@ static void test_attach_ring(void) {
   printf("[attach requests: the ring, the claims]\n");
   park_attach_req_t q;
   CHECK(!park_attach_next(&q) && !park_attach_pending());
-  for (int i = 0; i < PARK_ATTACH_RING; i++) CHECK(park_attach_zid(11, 5, (uint32_t)i));
+  for (int i = 0; i < PARK_ATTACH_RING; i++) CHECK(park_attach_zid_at(11, 5, (uint32_t)i, false, 0));      /* (one time for all: a slow (instrumented) fill is not "behind") */
   CHECK(!park_attach_zid(11, 5, 99999) && park_attach_pending());                              /* (full: the caller keeps the query parked and asks again) */
   CHECK(!park_attach_zid(-1, 5, 1) && !park_attach_zid(PARK_MAX_WORKERS, 5, 1));
-  for (int i = 0; i < PARK_ATTACH_RING; i++) CHECK(park_attach_next(&q) && !q.by_name && q.sview == 5 && q.zid == (uint32_t)i && q.worker == 11);
+  for (int i = 0; i < PARK_ATTACH_RING; i++) CHECK(park_attach_next_at(&q, 0) && !q.by_name && q.sview == 5 && q.zid == (uint32_t)i && q.worker == 11);
   CHECK(!park_attach_next(&q) && !park_attach_pending());
   /* by name: the slots of the other threads, 16 of them; a worker's ring and the slots take turns */
   CHECK(park_attach_request_any("v1", "a.test.") && park_attach_request_bg("v1", "b.test.") && !park_attach_request_any("v1", "") && park_attach_pending());
@@ -1254,6 +1254,152 @@ static void test_attach_adopt(void) {
   CHECK(!park_attach_pending());
   /* a request by name and a request of the by_name kind never carry the flag */
   CHECK(park_attach_request_any("v1", "adopt.test.") && park_attach_next(&q) && !q.adopt && q.by_name);
+}
+
+/* 0.7 attach shed: a request that nobody waits for any more is dropped unread, and the store threads take the newest requests first when they are behind (dns_park.h PARK_ATT_LIFO_MS) */
+#define ASN 30000
+static _Atomic uint32_t g_as_seen[ASN];
+static _Atomic bool g_as_stop;
+static void *as_consumer(void *arg) {
+  (void)arg;
+  park_attach_req_t q;
+  for (;;) {
+    const bool stop = atomic_load(&g_as_stop);
+    if (park_attach_next_at(&q, 60000)) {                                   /* (every request is a minute old: the store threads are behind, newest first, one take in eight the oldest) */
+      if (q.by_name || q.sview != 6 || q.zid >= ASN || q.worker != 16) CHECK(false);
+      else atomic_fetch_add(&g_as_seen[q.zid], 1);
+    } else if (stop) {
+      return NULL;
+    } else {
+      usleep(50);
+    }
+  }
+}
+
+static void test_attach_shed_order(void) {
+  printf("[attach requests: dropped when nobody waits; newest first when behind]\n");
+  park_attach_req_t q;
+  uint64_t shed0, new0, queued;
+  park_attach_counts(&shed0, &new0, &queued);
+  CHECK(!park_attach_next(&q) && queued == 0);
+  /* in time (the oldest at most PARK_ATT_LIFO_MS old): in the order they came */
+  for (uint32_t i = 1; i <= 10; i++) CHECK(park_attach_zid_at(14, 6, i, false, 1000));
+  park_attach_counts(&shed0, &new0, &queued);
+  CHECK(queued == 10);
+  CHECK(park_attach_next_at(&q, 1000 + PARK_ATT_LIFO_MS) && q.zid == 1 && q.worker == 14 && q.sview == 6 && !q.adopt);
+  /* behind: the newest first, and one take in PARK_ATT_FIFO_EVERY the oldest (a request whose queries keep waiting is not left behind) */
+  uint32_t got[PARK_ATT_FIFO_EVERY];
+  for (int i = 0; i < PARK_ATT_FIFO_EVERY; i++) CHECK(park_attach_next_at(&q, 1000 + PARK_ATT_LIFO_MS + 8) && (got[i] = q.zid) > 0);
+  int oldest = 0;
+  uint32_t want = 10;
+  for (int i = 0; i < PARK_ATT_FIFO_EVERY; i++) {
+    if (got[i] == 2) {
+      oldest++;
+      continue;
+    }
+    CHECK(got[i] == want);
+    want--;
+  }
+  uint64_t shed1, new1;
+  park_attach_counts(&shed1, &new1, &queued);
+  CHECK(oldest == 1 && new1 - new0 == PARK_ATT_FIFO_EVERY - 1 && shed1 == shed0);
+  CHECK(park_attach_next_at(&q, 1100) && q.zid == 3 && !park_attach_next_at(&q, 1100));   /* (the last one: 3; the age is told in 4 ms steps) */
+  park_attach_counts(&shed1, &new1, &queued);
+  CHECK(queued == 0 && !park_attach_pending());
+
+  /* a request made with the zone's claim: dropped unread when the claim is gone (every worker left it), kept while one waits; a request without a claim and an adopt are never dropped */
+  CHECK(park_att_claim(6, 900, 14) == 1 && park_attach_zid_at(14, 6, 900, true, 2000));
+  park_att_requested(6, 900);
+  CHECK(park_att_claim(6, 901, 14) == 1 && park_attach_zid_at(14, 6, 901, true, 2000));
+  park_att_requested(6, 901);
+  CHECK(park_attach_zid_at(14, 6, 902, false, 2000) && park_attach_zid_at(14, (uint16_t)(6 | PARK_ATT_ADOPT), 903, true, 2000));
+  CHECK(park_att_leave(6, 900, 14));                                                 /* (the worker's last query for 900 ended without it) */
+  CHECK(park_attach_next_at(&q, 2004) && q.zid == 901 && park_att_take(6, 901) == (1u << 14));
+  CHECK(park_attach_next_at(&q, 2004) && q.zid == 902 && park_attach_next_at(&q, 2004) && q.zid == 903 && q.adopt && !park_attach_next_at(&q, 2004));
+  park_attach_counts(&shed1, &new1, &queued);
+  CHECK(shed1 - shed0 == 1);
+  /* behind, with requests nobody waits for at the bottom: they are dropped on the way, whichever take it is, and the request that still has a query is taken */
+  for (uint32_t i = 910; i < 915; i++) {
+    CHECK(park_att_claim(6, i, 14) == 1 && park_attach_zid_at(14, 6, i, true, 3000));
+    park_att_requested(6, i);
+    CHECK(park_att_leave(6, i, 14));
+  }
+  CHECK(park_att_claim(6, 920, 14) == 1 && park_attach_zid_at(14, 6, 920, true, 4400));
+  park_att_requested(6, 920);
+  CHECK(park_attach_next_at(&q, 4500) && q.zid == 920 && !park_attach_next_at(&q, 4500));
+  (void)park_att_take(6, 920);
+  park_attach_counts(&shed1, &new1, &queued);
+  CHECK(shed1 - shed0 == 6 && queued == 0);
+  /* a ring that is full of old requests: a newest-first take leaves a hole, the tail moves when the oldest go, the room comes back */
+  for (int i = 0; i < PARK_ATTACH_RING; i++) CHECK(park_attach_zid_at(15, 6, (uint32_t)i, false, 0));
+  CHECK(!park_attach_room(15));
+  int newest = 0;
+  for (int i = 0; i < PARK_ATT_FIFO_EVERY; i++) {
+    CHECK(park_attach_next_at(&q, 5000) && q.worker == 15);
+    newest += q.zid == PARK_ATTACH_RING - 1 - (uint32_t)newest;
+  }
+  CHECK(newest == PARK_ATT_FIFO_EVERY - 1 && park_attach_room(15));                  /* (the one oldest take freed the slot at the tail) */
+  int left = 0;
+  while (park_attach_next_at(&q, 5000)) left++;
+  CHECK(left == PARK_ATTACH_RING - PARK_ATT_FIFO_EVERY && !park_attach_pending());
+  /* one producer of old requests and four consumers that are behind (newest first, the slots taken out of order): every request comes out once */
+  pthread_t th[ATC];
+  atomic_store(&g_as_stop, false);
+  for (int i = 0; i < ATC; i++) pthread_create(&th[i], NULL, as_consumer, NULL);
+  for (uint32_t i = 0; i < ASN; i++)
+    while (!park_attach_zid_at(16, 6, i, false, 0)) usleep(20);
+  while (park_attach_pending()) usleep(200);
+  atomic_store(&g_as_stop, true);
+  for (int i = 0; i < ATC; i++) pthread_join(th[i], NULL);
+  int once = 0;
+  for (int i = 0; i < ASN; i++) once += atomic_load(&g_as_seen[i]) == 1;
+  CHECK(once == ASN);
+  /* the worker's call, with the clock */
+  CHECK(park_att_claim(6, 940, 13) == 1 && park_attach_claimed(13, 6, 940));
+  park_att_requested(6, 940);
+  CHECK(park_attach_next(&q) && q.zid == 940 && q.worker == 13 && park_att_take(6, 940) == (1u << 13) && !park_attach_next(&q));
+  /* a worker from 15 up shares its bit: its request is never dropped, though the claim went (the group leaves a claim of only its bit with no request in a ring) */
+  uint32_t set0;
+  bool req0;
+  park_attach_counts(&shed0, &new0, &queued);
+  CHECK(park_att_claim(6, 941, 20) == 1 && park_attach_claimed(20, 6, 941) && park_att_leave(6, 941, 20) && !park_att_peek(6, 941, &set0, &req0));
+  CHECK(park_attach_next(&q) && q.zid == 941 && q.worker == 20 && !park_attach_next(&q));
+  park_attach_counts(&shed1, &new1, &queued);
+  CHECK(shed1 == shed0);
+  /* the leave of a worker that is not in the set changes nothing, also for a claim whose request is not in a ring yet (its owner is about to make it) */
+  CHECK(park_att_claim(6, 942, 3) == 1 && park_att_leave(6, 942, 4) && park_att_peek(6, 942, &set0, &req0) && set0 == (1u << 3) && park_att_take(6, 942) == (1u << 3));
+
+  /* the worker's side: the last query of the table that waits for the attach leaves the claim when it ends without the zone; another query for the zone takes its part first */
+  park_table_t t;
+  CHECK(park_init(&t, 16));
+  udp_ipc_t ipc = mk_ipc(2);
+  uint8_t pay[20] = { 0 };
+  park_set_worker(&t, 14);
+  int32_t a = park_udp(&t, 0, 200, "v1", "shed.test.", 3, &ipc, pay, 20), b = park_udp(&t, 0, 900, "v1", "shed.test.", 3, &ipc, pay, 20);
+  CHECK(a >= 0 && b >= 0);
+  park_mark_attach(&t, a, 1, 300);
+  park_entry_attach_zid(&t.e[a], 6, 930);
+  CHECK(park_att_claim(6, 930, 14) == 1);
+  park_att_requested(6, 930);
+  uint32_t set;
+  bool req;
+  CHECK(park_expire(&t, 400) == 1);                                                  /* (a: its whole park-timeout is up) */
+  park_entry_t *e = park_next_done(&t);
+  CHECK(e == &t.e[a] && e->state == PARK_TIMEOUT);
+  park_release(&t, e);
+  CHECK(park_att_peek(6, 930, &set, &req) && set == (1u << 14) && t.e[b].azid == 1 && t.e[b].preq == (((uint64_t)6 << 32) | 930));   /* (b waits for the zone: the claim stays, b holds it) */
+  CHECK(park_expire(&t, 1000) == 1 && (e = park_next_done(&t)) == &t.e[b]);
+  park_release(&t, e);
+  CHECK(!park_att_peek(6, 930, &set, &req));                                         /* (nobody waits: the claim went, a request for it would be dropped unread) */
+  /* a table without its worker (park_set_worker() never called, or out of range) leaves no claim */
+  park_set_worker(&t, PARK_MAX_WORKERS);
+  int32_t c = park_udp(&t, 1000, 200, "v1", "shed2.test.", 3, &ipc, pay, 20);
+  CHECK(c >= 0 && t.att_w == -1);
+  park_entry_attach_zid(&t.e[c], 6, 931);
+  CHECK(park_att_claim(6, 931, 14) == 1);
+  park_release(&t, &t.e[c]);
+  CHECK(park_att_peek(6, 931, &set, &req) && park_att_take(6, 931) == (1u << 14));
+  park_free(&t);
 }
 
 /* 0.7 fix 3 / park-max 16384: what a table of the new default size reserves, and what a table full of the usual requests touches (the pages that no entry used are not memory) */
@@ -1626,6 +1772,7 @@ int main(int argc, char **argv) {
   test_pending();
   test_attach_ring();
   test_attach_adopt();
+  test_attach_shed_order();
   test_park_max_memory();
   test_claim_race();
   test_att_group_and_ask();

@@ -48,7 +48,8 @@
 #define PARK_MAX_WORKERS 128         /* as MAX_WORKERS of dns_server_core.c */
 #define PARK_WAKE_RING 4096
 #define PARK_FETCH_RING 128
-#define PARK_ATTACH_RING 4096        /* 0.7 store: attach requests of one worker (8 bytes each: a zone id) */
+#define PARK_ATTACH_RING 65536       /* 0.7 store: attach requests of one worker (8 bytes each: a zone id, 512 KiB a worker, touched as the ring turns).  Room for park-timeout (1.5 s) of requests at 40k a second: a ring that fills leaves
+                                      * the new requests pending in the worker (oldest first), which the newest-first order of the store threads cannot reach (measured: one store thread fell from 15k to 4.8k attaches a second with 16384) */
 #define PARK_BLK_SMALL 256           /* the payload block of an entry that fits (the two names, the ipc header and a request of about 100 bytes) */
 
 typedef enum { PARK_FREE = 0, PARK_WAIT, PARK_READY, PARK_TIMEOUT } park_state_t;
@@ -109,11 +110,14 @@ typedef struct park_table {
   uint32_t bnfree[2], bsize[2];
   /* counters (read by karictl status in a later milestone; the worker alone writes them) */
   uint64_t n_parked, n_full, n_toobig, n_timeout, n_woken, n_failed, n_cancelled;
+  int att_w;                         /* 0.7: the worker that owns the table (park_set_worker(); -1: none): the claim of a stored zone is left in its name when its last query for the zone ends without it (park_release()) */
 } park_table_t;
 
 /* cap entries; false: out of memory or cap == 0 */
 bool park_init(park_table_t *t, uint32_t cap);
 void park_free(park_table_t *t);
+/* the worker that owns the table (0.7): when the last query of the table that waits for the attach of a stored zone ends without the zone (its time is up, its TCP connection went), the worker leaves the zone's claim (park_att_leave()), so that a store thread that comes to the request finds nobody waiting and drops it unread (park_attach_next()) */
+void park_set_worker(park_table_t *t, int w);
 size_t park_bytes(const park_table_t *t);          /* the bytes park_init() reserved (about 1 KB an entry, half of it touched by usual requests) */
 
 /* The 64-bit key of (view, zone) that the table, the wake keys and the claims use.  The zone is compared without regard to case (the directory's names are lower case already). */
@@ -350,6 +354,21 @@ typedef struct {
   char zone[PARK_ZONE_MAX + 1];
 } park_attach_req_t;
 bool park_attach_zid(int w, uint16_t sview, uint32_t zid);       /* false: worker w's ring is full */
+/* 0.7: the request of a worker that holds or joined the zone's claim (park_att_claim() 1 or 2).  A store thread that comes to it when the claim is gone drops it unread and counts it (park_attach_shed()):
+ * every worker that waited has left the claim (park_att_leave(): their queries ended without the zone, park-timeout) or the zone was done by another request; nobody waits for the attach.  A request made
+ * without a claim (no room for one), the request of a worker from 15 up (its bit is shared: whether one of its group still waits cannot be told), an adopt and a request by name are never dropped. */
+bool park_attach_claimed(int w, uint16_t sview, uint32_t zid);
+/* The order (0.7).  While the oldest request of a ring is at most PARK_ATT_LIFO_MS old the store threads take the requests in the order they came.  When it is older the store threads are far behind (more
+ * attaches are asked for than they can make, a flood of random names) and a request taken in order would mostly be answered after its client gave up: the requests that came last are taken first, as their queries have the most time left (a client gives up after about a second,
+ * park-timeout is 1.5 s), and one take in PARK_ATT_FIFO_EVERY is still the oldest one, so that a request whose queries keep waiting (a busy zone) is never left behind for good.  Above the line FIFO
+ * order answers the queries when their clients have given up already: with a store of 10 million zones of 100 records whose knee was 15k cold queries a second, 20k offered gave 5.5k to 11.6k answers.  Each request carries the time it
+ * was made (4 ms units, 14 bits: ages up to 65 s are told right; an older one may be taken for a young one, which changes the order only). */
+#define PARK_ATT_LIFO_MS 400         /* (100 ms was measured to cost 5-9 % of the answers at the knee: a burst that the order of arrival drains in a few hundred ms left its oldest requests behind) */
+#define PARK_ATT_FIFO_EVERY 8
+bool park_attach_zid_at(int w, uint16_t sview, uint32_t zid, bool claimed, int64_t now_ms);   /* the same with the time given (the tests) */
+bool park_attach_next_at(park_attach_req_t *out, int64_t now_ms);
+/* the requests dropped unread because nobody waited for them, the requests taken newest first, and the slots of the rings in use now (waiting requests and the slots of the ones taken out of order) */
+void park_attach_counts(uint64_t *shed, uint64_t *newest_first, uint64_t *queued);
 /* 0.7 fix 7: the worker attaches a resident image itself and hands the registration to the store threads: room in the ring first (only the worker pushes to it, so a push after a true answer works),
  * then park_attach_adopt() (the same ring, sview with PARK_ATT_ADOPT set: park_attach_next() reports adopt) */
 #define PARK_ATT_ADOPT 0x8000u
