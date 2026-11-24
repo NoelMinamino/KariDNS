@@ -1,10 +1,9 @@
 // The configuration file of karidns-signer (planning 3.8): lines `key = value`, `#` comments, `[zone <name>]` sections for per-zone values.
 // Parsed here, no dependency.  parseConfig() is pure (text in, object out); loadConfig() reads the file (the conninfo file is read and checked by node/lib/conf.js readPrivateFile).
 
-import fs from 'node:fs';
 import os from 'node:os';
 import { canonicalZone } from '../../node/lib/names.js';
-import { parseBool, parseDuration, parseInt1, parseEnum, parseAbsPath, parseSchema, parseLog } from '../../node/lib/conf.js';
+import { parseBool, parseDuration, parseInt1, parseEnum, parseAbsPath, parseSchema, parseLog, readConfigFile } from '../../node/lib/conf.js';
 
 const DAY = 86400;
 
@@ -143,12 +142,7 @@ export function validate(cfg) {
   return problems;
 }
 
+// (the file is checked like the other files of the service: a regular file of root or of our user that nobody else can change; review W1-L4, 0.7)
 export function loadConfig(path) {
-  let text;
-  try {
-    text = fs.readFileSync(path, 'utf8');
-  } catch (e) {
-    throw new Error(`cannot read ${path}: ${e.message}`);
-  }
-  return parseConfig(text);
+  return parseConfig(readConfigFile(path, { program: 'karidns-signer' }));
 }

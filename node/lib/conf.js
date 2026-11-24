@@ -178,3 +178,25 @@ export function readPrivateFile(file, { uid = process.getuid?.(), program = 'kar
     fsx.closeSync(fd);
   }
 }
+
+// A configuration file of karidns-signer or karidns-webadmin (0.7 review W1-L4, W4-L1): no secret in it, but it is policy (the tools the signer runs, the database,
+// trusted-proxy, require-totp, ...), so it gets the checks of the other files a service reads: a regular file (no symbolic link), owned by root or by the user running
+// us, and nobody else may change it (no write bit for the group or others; reading is fine).  -> null or the reason, with the command that fixes it.
+export function checkConfigFile(file, st, uid = process.getuid?.(), program = 'karidns') {
+  if (!st.isFile()) return `${file} is not a regular file`;
+  if (uid !== undefined && st.uid !== 0 && st.uid !== uid) return `${file} belongs to uid ${st.uid}, not to root or to the user running ${program}: chown root ${file}`;
+  const mode = st.mode & 0o777;
+  if (mode & 0o022) return `${file} has mode ${mode.toString(8).padStart(4, '0')}: the group or other users can change it; chmod go-w ${file}`;
+  return null;
+}
+
+// The text of a configuration file, read once like a private file (no link followed, no wait on a FIFO, the checks on fstat(2) of the descriptor) under
+// checkConfigFile's rule.  Throws Error(the reason).
+export function readConfigFile(file, { uid = process.getuid?.(), program = 'karidns', fsx = fs } = {}) {
+  try {
+    return readPrivateFile(file, { uid, program, fsx, check: (st) => checkConfigFile(file, st, uid, program) });
+  } catch (e) {
+    if (e.code === 'ELOOP' || e.code === 'EMLINK') throw new Error(`${file} is a symbolic link: point ${program} at the file itself (-c)`);
+    throw e;
+  }
+}

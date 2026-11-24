@@ -19,6 +19,10 @@ export const ALGORITHMS = new Map([
   [16, { name: 'ED448', kind: 'ed', type: 'ed448', size: 57, pkcs8: '3047020100300506032b6571043b0439' }],
 ]);
 
+// The words before the ids in the message of an enable request whose new keys are in cryptokeys while its zone is not signed yet, `stored keys: cryptokeys 12,13`
+// (review W1-L1, 0.7): the database layers write it with the INSERT, pipeline.js reads the ids back to sign with those keys on the next try.
+export const STORED_KEYS = 'stored keys: cryptokeys ';
+
 // the BIND names (dnssec-keygen -a) of the algorithms the signer generates
 export function algorithmName(alg) {
   const a = ALGORITHMS.get(alg);

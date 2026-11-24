@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { parseBool, parseDuration, parseInt1, parseEnum, parseText, parseAbsPath, parseSchema, parseLog, parseConninfo, plaintextWarning, checkConninfoFile, readPrivateFile } from '../lib/conf.js';
+import { parseBool, parseDuration, parseInt1, parseEnum, parseText, parseAbsPath, parseSchema, parseLog, parseConninfo, plaintextWarning, checkConninfoFile, readPrivateFile, checkConfigFile, readConfigFile } from '../lib/conf.js';
 
 test('yes / no', () => {
   for (const v of ['yes', 'Yes', 'true', 'on', '1']) assert.equal(parseBool(v), true);
@@ -104,6 +104,43 @@ test('the mode check of a conninfo file', () => {
     fs.writeFileSync(f, 'x', { mode: 0o600 });
     if (process.platform !== 'win32') assert.equal(checkConninfoFile(f), null);
     else assert.equal(typeof checkConninfoFile(f), 'string');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('the check of a configuration file (0.7 review W1-L4, W4-L1): ours or root, nobody else may write it', () => {
+  const st = (o = {}) => ({ isFile: () => true, uid: 1000, mode: 0o100644, ...o });
+  assert.equal(checkConfigFile('/c', st(), 1000), null);
+  assert.equal(checkConfigFile('/c', st({ uid: 0, mode: 0o100640 }), 1000), null, 'root:<group> 0640, the documented setup');
+  assert.equal(checkConfigFile('/c', st({ mode: 0o100400 }), 1000), null);
+  assert.match(checkConfigFile('/c', st({ isFile: () => false }), 1000), /^\/c is not a regular file$/);
+  assert.equal(checkConfigFile('/c', st({ uid: 1001 }), 1000, 'karidns-signer'), '/c belongs to uid 1001, not to root or to the user running karidns-signer: chown root /c');
+  assert.equal(checkConfigFile('/c', st({ mode: 0o100664 }), 1000), '/c has mode 0664: the group or other users can change it; chmod go-w /c');
+  assert.match(checkConfigFile('/c', st({ uid: 0, mode: 0o100646 }), 1000), /mode 0646/);
+});
+
+test('readConfigFile: read once from the descriptor, a link, a foreign owner and a group-writable file refused', () => {
+  const f = privateFs({ '/c': { text: 'database = pg\n', mode: 0o644 }, '/w': { text: 'x', mode: 0o666 }, '/o': { text: 'x', uid: 1001 },
+    '/l': { link: 'ELOOP' }, '/bl': { link: 'EMLINK' } });
+  assert.equal(readConfigFile('/c', { uid: 1000, fsx: f }), 'database = pg\n');
+  assert.throws(() => readConfigFile('/w', { uid: 1000, program: 'karidns-webadmin', fsx: f }), /^Error: \/w has mode 0666: the group or other users can change it; chmod go-w \/w$/);
+  assert.throws(() => readConfigFile('/o', { uid: 1000, program: 'karidns-signer', fsx: f }), /belongs to uid 1001, not to root or to the user running karidns-signer/);
+  assert.throws(() => readConfigFile('/l', { uid: 1000, program: 'karidns-signer', fsx: f }), /^Error: \/l is a symbolic link: point karidns-signer at the file itself \(-c\)$/);
+  assert.throws(() => readConfigFile('/bl', { uid: 1000, fsx: f }), /is a symbolic link/);
+  assert.throws(() => readConfigFile('/none', { uid: 1000, fsx: f }), /^Error: cannot read \/none: ENOENT$/);
+  assert.equal(f.seen.closed.length, f.seen.opened.length);
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kn-cfg-'));
+  try {
+    const p = path.join(dir, 'c');
+    fs.writeFileSync(p, 'a = 1\n', { mode: 0o644 });
+    let refused = null;
+    if (process.platform !== 'win32') {
+      assert.equal(readConfigFile(p), 'a = 1\n');
+      fs.chmodSync(p, 0o664);
+    }
+    try { readConfigFile(p); } catch (e) { refused = e.message; }
+    assert.match(refused, /chmod go-w/);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

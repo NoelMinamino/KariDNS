@@ -53,14 +53,14 @@ export function parseArgs(argv) {
   return o;
 }
 
-// The SQLite3 file holds the private keys (karidns_signer_keys).  The documented setup shares it with the server's loader through a group,
-// so group access is fine; access for others is not (audit M8, 0.6.2).  -> a warning or null.
-export function sqliteModeWarning(file, stat = fs.statSync) {
+// The SQLite3 file holds the private keys (cryptokeys).  The documented setup shares it with the server's loader through a group,
+// so group access is fine; access for others is not (audit M8, 0.6.2): the start and --check refuse it (a warning until 0.7, review W1-L3).  -> the problem or null.
+export function sqliteModeProblem(file, stat = fs.statSync) {
   let st;
   try { st = stat(file); } catch { return null; }   // (a file that cannot be read is a problem the callers tell already)
   if ((st.mode & 0o007) === 0) return null;
   const mode = (st.mode & 0o777).toString(8).padStart(4, '0');
-  return `sqlite-file ${file} has mode ${mode}: other users can read the signing keys in it; remove their access (chmod o-rwx)`;
+  return `sqlite-file ${file} has mode ${mode}: other users can read the signing keys in it; remove their access: chmod o-rwx ${file}`;
 }
 
 // --check: the permissions of the files and the tools' versions.  Returns { problems, notes, warnings }.
@@ -89,8 +89,8 @@ export async function checkSetup(config, { run = runChild, st = {}, nodeVersion 
     if ((nodeVersion.split('.').map(Number)[0] ?? 0) < 22) problems.push(`database = sqlite3 needs Node 22.13 or newer (this is ${nodeVersion})`);
     try {
       fs.accessSync(s['sqlite-file'], fs.constants.R_OK | fs.constants.W_OK);
-      const w = sqliteModeWarning(s['sqlite-file'], st.sqlite);
-      if (w) warnings.push(w);
+      const p = sqliteModeProblem(s['sqlite-file'], st.sqlite);
+      if (p) problems.push(p);
       else notes.push(`sqlite-file ${s['sqlite-file']}: fine`);
     } catch (e) {
       problems.push(`sqlite-file ${s['sqlite-file']}: ${e.code ?? e.message}`);
@@ -120,8 +120,8 @@ export async function openDb(config, { onFatal, warn, importPg, importSqlite = l
   const s = config.settings;
   let db;
   if (s.database === 'sqlite3') {
-    const w = sqliteModeWarning(s['sqlite-file'], statSqlite);
-    if (w) warn?.(w);
+    const p = sqliteModeProblem(s['sqlite-file'], statSqlite);
+    if (p) throw new Error(p);
     db = new SqliteDb({ file: s['sqlite-file'], sqlite: await importSqlite() });
     db.open();
   } else {

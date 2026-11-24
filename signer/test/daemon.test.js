@@ -210,6 +210,23 @@ test('signed: per-zone settings decide next_due', async () => {
   assert.equal(find(m.calls, 'recordSuccess')[0][2].nextDue, exp - 1200);
 });
 
+test('signed: an earliest expiration in the past or absurd never makes the zone due the next second (review W1-L5)', async () => {
+  const m = make();
+  m.outcomes.set(1, { status: 'signed', serial: 9, minExpire: m.clock.now - 3600, durationMs: 1, request: null });
+  m.outcomes.set(2, { status: 'signed', serial: 9, minExpire: 1e15, durationMs: 1, request: null });
+  m.db.due = [{ domainId: 1, zone: 'a.test', attempts: 0 }, { domainId: 2, zone: 'b.test', attempts: 0 }];
+  await m.d.tick();
+  await idle(m.d);
+  const rec = new Map(find(m.calls, 'recordSuccess').map(([, id, s]) => [id, s]));
+  assert.equal(rec.get(1).nextDue, m.clock.now + 3600, 'past: one hour, not now + 1');
+  assert.equal(rec.get(1).minExpire, m.clock.now - 3600);
+  // absurd: not stored (PostgreSQL's to_timestamp would refuse it, and the run would be repeated every 30 s), the fallback validity - refresh - jitter
+  assert.equal(rec.get(2).minExpire, null);
+  assert.equal(rec.get(2).nextDue, m.clock.now + 1209600 - 259200 - 86400);
+  assert.ok(m.logs.some((l) => /^warn a\.test: the earliest signature of the zone expires at .*, within refresh of now/.test(l)), m.logs.join('\n'));
+  assert.ok(m.logs.some((l) => /^warn b\.test: karidns-zone reported the earliest signature expiration 1000000000000000/.test(l)));
+});
+
 test('key-added: the request is answered and the zone made due for the next run', async () => {
   const m = make();
   m.outcomes.set(4, { status: 'key-added', request: { state: 'done', message: 'key 1 added' } });

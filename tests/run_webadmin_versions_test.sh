@@ -55,7 +55,7 @@ DB=$T/db/zones.sqlite3
 AUTH=$T/auth.sqlite3
 sqlite3 "$DB" < tests/db/pdns_schema.sqlite3.sql > /dev/null && sqlite3 "$DB" < db/karidns_ext.sqlite3.sql > /dev/null && sqlite3 "$DB" < db/karidns_audit.sqlite3.sql > /dev/null || { echo "  [FAIL] cannot make the zone file"; exit 1; }
 sqlite3 "$AUTH" < db/karidns_auth.sqlite3.sql > /dev/null || { echo "  [FAIL] cannot make the auth file"; exit 1; }
-chmod 600 "$AUTH"; chmod 666 "$DB"
+chmod 600 "$AUTH"; kari_share_sqlite "$DB"
 cat > "$T/example.test.zone" <<'EOF'
 $ORIGIN example.test.
 $TTL 300
@@ -90,7 +90,7 @@ for z in example signed real; do
     "$ZONE" import --no-config --sqlite3 "$DB" "$z.test" "$T/$z.test.zone" > "$T/import.out" 2>&1 && ok "$z.test is imported (version 1)" || bad "import of $z" "$(cat "$T/import.out")"
 done
 sqlite3 "$DB" "INSERT INTO domainmetadata (domain_id, kind, content) SELECT id, 'X-KARIDNS-SIGNER', '1' FROM domains WHERE name = 'signed.test'"
-chmod 666 "$DB"*
+kari_share_sqlite "$DB"*
 
 # ---------------------------------------------------------------- karidns, its loader, the control keys
 PORT=$(kari_port 0 $((20000 + $$ % 20000)))
