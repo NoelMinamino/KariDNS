@@ -357,7 +357,7 @@ if [ -x ./karicheck ]; then
     out=$(./karicheck db "$T/k.conf" 2>&1); st=$?
     echo "$out" | grep -q "cannot write in the directory" && [ "$st" -ne 0 ] && pass "a directory the loader cannot write in is an error" || fail "karicheck db (exit $st): $(echo "$out" | head -12)"
     chmod 700 "$T/st"
-    sed 's/memory-limit 256m;//' "$T/k.conf" > "$T/k3.conf"
+    sed 's/memory-limit 256m;/memory-limit unlimited;/' "$T/k.conf" > "$T/k3.conf"          # (0.7.x: an unset memory-limit is the default from the RAM with the store)
     out=$(./karicheck conf "$T/k3.conf" 2>&1)
     echo "$out" | grep -q "loader-state-file has no effect without memory-limit" && pass "karicheck conf warns: the state file needs memory-limit" || fail "karicheck conf: $(echo "$out" | head -5)"
 else

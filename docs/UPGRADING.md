@@ -115,11 +115,11 @@ change the options that need a restart (`OK reloaded (restart needed for: ...)`)
 | UDP receive | routers read, workers answer over IPC | `udp-receive backend`: each worker reads its own socket (#227) | `udp-receive frontend;` |
 | Routers / workers | by all CPUs of the machine (from 4 CPUs: 2 routers + the rest) | by the CPUs the process may run on; from 4 CPUs half of them routers, up to 8 (#220, #226) | `router-threads N; worker-threads N;` |
 | `store-threads` | 2 | 8 (docs/karidns.md) | `store-threads 2;` |
-| `udp-recvbuf-size` (4M) | refused by the kernel on a stock system, sockets stayed at 16 KiB | the most the kernel gives, with a WARNING (#224) | raise the sysctls (section 6) |
+| `udp-recvbuf-size` (4M) | refused by the kernel on a stock system, sockets stayed at 16 KiB | the most the kernel gives, with a NOTICE (`[IPC] NOTICE`, `[Network] NOTICE: ... (the default)`; a WARNING when the size is written, #224, #256) | raise the sysctls (section 6) |
 | `alias-max-refresh-time` | a forged TTL of 86400 stayed about 16 h | 3600 s cap (#234) | `alias-max-refresh-time 1d;` |
 | DNS Cookies to forwarders and ALIAS resolvers | none | sent and checked (#234, #238) | none; a resolver that never sends a server cookie is accepted |
 | `secondary-stale-max` | n/a | `0` (unlimited), new (#203) | already the default |
-| `memory-limit` | none | none (**TODO: change this row when the small-VPS default lands**; it is not in main yet) | `memory-limit` set explicitly |
+| `database { memory-limit }` not written | none: every database zone stays in memory | with the zone store: half of the RAM above 256 MB, at least `64M` (512 MB: `128M`, 1 GB: `384M`, 16 GB: `8064M`; #256); the coldest zones above it are taken out and read again from the store; the start logs `[DB] memory-limit is not set: 362M is used (the default: half of the 980 MB of RAM above 256 MB, at least 64M) ...` at NOTICE. Without the store (`store none;`, `zone-store none;`) still none | `memory-limit unlimited;` (or a size) |
 
 Memory notes: the Backend holds about 70 MB fixed plus about 0.45 KB for every database zone in the directory;
 `memory-limit` bounds the zones in memory, not that part (docs/karidns.md "Memory limit"). The store's tables are
@@ -224,14 +224,17 @@ karictl store           # store.* keys; store.reserve.refused must be 0
 karictl dbstatus        # held= long_reader=, signer-wait: lines
 ```
 
-Watch the log for `[IPC] WARNING`, `[Network] WARNING`, `[Store]` and `[Zone] secondary-expired:` lines for a day.
+Watch the log for `[IPC] WARNING`, `[Network] WARNING`, `[Store]` and `[Zone] secondary-expired:` lines for a day (`[IPC] NOTICE` and `[Network] NOTICE: ... (the default)` say that the default socket buffers are smaller than asked: raise the sysctls of section 8 on a busy server).
+A database with the store and no `memory-limit` logs `[DB] memory-limit is not set: <L> is used ...` once at the start; `karictl dbstatus`
+shows `memory-limit=<L> (default)` on its `memory:` line. Compare the `memory sizing:` line (what every zone needs) with it: a NOTICE or
+WARNING after it means the default keeps only part of the zones in memory; set `memory-limit` (or `unlimited`) if the host has the RAM.
 
 ## 10. Rolling back
 
 - **Server and tools**: `pkg add` the 0.6.x packages (with `-f` to replace). `karictl` and `karidns` must be of the
   same release.
 - **Configuration**: a 0.7 configuration that uses `store-*`, `zone-store`, `router-threads`, `worker-threads`,
-  `udp-receive`, `secondary-stale-max` or `alias-max-refresh-time` is not understood by 0.6: remove those lines first
+  `udp-receive`, `secondary-stale-max`, `alias-max-refresh-time` or `memory-limit unlimited` is not understood by 0.6: remove those lines first
   (0.6 does not know them).
 - **The store**: 0.6 reads no store. Stop the server cleanly first (the manual says to downgrade only after a clean stop, #199), then the directory can be removed; database zones are read from the database as in 0.6.
   Secondary zones start as in 0.6 (zone file or nothing, then a transfer) and lose their stored copies and expire
@@ -242,6 +245,5 @@ Watch the log for `[IPC] WARNING`, `[Network] WARNING`, `[Store]` and `[Zone] se
 
 ## Pending items
 
-- **`memory-limit` default for small VPS installs**: TODO, not merged yet; update section 3 when it lands.
 - Open pull request #253 (signer / WebAdmin review group A: key order, re-sign floor, file checks, atomic failure
   record, column allowlist) is not in main; add its notes if it merges before the release.

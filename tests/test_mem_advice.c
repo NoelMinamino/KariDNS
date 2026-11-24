@@ -501,7 +501,63 @@ static void test_arc(void) {
     CHECK(a.arc_fit == 0 && a.level == MA_LEVEL_WARNING, "arc rest does not fit");
 }
 
+/* 0.7.x: the default memory-limit from the RAM, the limit in force for the three ways of writing it, and how the texts name a default */
+static void test_default_limit(void) {
+    CHECK(ma_default_limit(512ull << 20) == 128ull << 20, "512 MB of RAM: %llu", (unsigned long long)ma_default_limit(512ull << 20));
+    CHECK(ma_default_limit(1ull << 30) == 384ull << 20, "1 GB: %llu", (unsigned long long)ma_default_limit(1ull << 30));
+    CHECK(ma_default_limit(1027715072ull) == 362ull << 20, "a 1 GB VM's hw.physmem (980 MB): %llu", (unsigned long long)ma_default_limit(1027715072ull));
+    CHECK(ma_default_limit(16ull << 30) == (16ull << 30) / 2 - (128ull << 20), "16 GB: %llu", (unsigned long long)ma_default_limit(16ull << 30));
+    CHECK(ma_default_limit(256ull << 20) == MA_DEFAULT_MIN && ma_default_limit(300ull << 20) == MA_DEFAULT_MIN && ma_default_limit(100ull << 20) == MA_DEFAULT_MIN, "small RAM: the minimum");
+    CHECK(ma_default_limit(0) == ma_default_limit(MA_DEFAULT_RAM_UNKNOWN), "RAM not known: as for 1 GB");
+    CHECK(ma_default_limit((1ull << 30) + 12345) % (1ull << 20) == 0, "a MiB multiple");
+    bool d = true;
+    CHECK(ma_effective_limit(3ull << 30, false, true, 1ull << 30, &d) == 3ull << 30 && !d, "written: as written");
+    d = true;
+    CHECK(ma_effective_limit(0, true, true, 1ull << 30, &d) == 0 && !d, "unlimited: no limit");
+    d = true;
+    CHECK(ma_effective_limit(0, false, false, 1ull << 30, &d) == 0 && !d, "store none: no default (a limit makes the start lazy there)");
+    CHECK(ma_effective_limit(64ull << 20, false, false, 1ull << 30, NULL) == 64ull << 20, "store none: a written limit is kept");
+    d = false;
+    CHECK(ma_effective_limit(0, false, true, 1ull << 30, &d) == 384ull << 20 && d, "not written: the default");
+    CHECK(ma_effective_limit(0, false, true, 512ull << 20, NULL) == 128ull << 20, "is_default may be NULL");
+#if defined(__FreeBSD__)
+    CHECK(ma_host_ram() >= (64ull << 20), "hw.physmem of this host: %llu", (unsigned long long)ma_host_ram());
+#else
+    CHECK(ma_host_ram() == 0, "no hw.physmem here");
+#endif
+    char t[600];
+    size_t l = ma_text_default(t, sizeof(t), 384ull << 20, 1ull << 30);
+    CHECK(l == strlen(t) && strstr(t, "memory-limit is not set: 384M is used") && strstr(t, "half of the 1.0 GB of RAM above 256 MB, at least 64M") && strstr(t, "memory-limit unlimited"), "default text: %s", t);
+    ma_text_default(t, sizeof(t), 384ull << 20, 0);
+    CHECK(strstr(t, "the RAM is not known: 384M is used") != NULL, "default text, RAM unknown: %s", t);
+    ma_in_t in = mk(1000, 11000, 384ull << 20);
+    in.limit_default = true;
+    in.ram = 1ull << 30;
+    ma_est_t e;
+    ma_estimate(&in, &e);
+    CHECK(e.limit_default && e.ram == 1ull << 30 && e.fit_pct == 100 && e.level == MA_LEVEL_INFO, "default limit, every zone fits: default %d fit %u level %d", e.limit_default, e.fit_pct, e.level);
+    ma_text_estimate(t, sizeof(t), &e);
+    CHECK(strstr(t, "memory-limit 384M (the default from 1.0 GB of RAM) keeps 100%") != NULL, "estimate names the default: %s", t);
+    ma_text_status(t, sizeof(t), &e);
+    CHECK(strstr(t, "memory-limit=384M (default) fit=100%") != NULL, "status names the default: %s", t);
+    in.ram = 0;
+    in.zones = 1000000;
+    in.records = 11000000;
+    ma_estimate(&in, &e);
+    ma_text_advice(t, sizeof(t), &e);
+    CHECK(e.level == MA_LEVEL_WARNING && strstr(t, "memory-limit 384M (the default) keeps only"), "advice names the default: %s", t);
+    in.limit_default = false;
+    ma_estimate(&in, &e);
+    ma_text_advice(t, sizeof(t), &e);
+    CHECK(!e.limit_default && strstr(t, "memory-limit 384M keeps only"), "a written limit is named bare: %s", t);
+    in.limit = 0;
+    in.limit_default = true;                                   /* (no limit: nothing is a default) */
+    ma_estimate(&in, &e);
+    CHECK(!e.limit_default, "unlimited is not a default");
+}
+
 int main(void) {
+    test_default_limit();
     test_arc();
     test_w9_points();
     test_bases();

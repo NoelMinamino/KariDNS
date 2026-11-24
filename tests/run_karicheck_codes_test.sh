@@ -153,7 +153,7 @@ dbconf() {          # dbconf EXTRA [LOADER-PATH [LOADER-USER]]
     printf 'options {\n  user "%s";\n  database { driver sqlite3; database-file "%s/x.db"; loader-user "%s"; loader-path "%s"; %s };\n};\n' "$LU" "$DBD" "${3:-$LU}" "${2:-$DBD/noanswer}" "$1" > "$T/f.conf"
 }
 dbconf 'acl-ceiling { 192.0.2.0/24; }; acl-ceiling-match all;'; fx conf.database.acl-ceiling-match conf "$T/f.conf"
-dbconf 'loader-state-file "'"$DBD"'/state"; warm-before-serve 5;'; fx conf.database.state-file conf "$T/f.conf"; fx conf.database.warm conf "$T/f.conf"
+dbconf 'loader-state-file "'"$DBD"'/state"; warm-before-serve 5; memory-limit unlimited;'; fx conf.database.state-file conf "$T/f.conf"; fx conf.database.warm conf "$T/f.conf"
 dbconf ''; fx conf.database.loader-answer conf "$T/f.conf"
 dbconf '' "$DBD/noanswer" root; fx conf.database.identity-root conf "$T/f.conf"
 

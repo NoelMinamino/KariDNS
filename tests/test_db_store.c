@@ -207,6 +207,12 @@ static bool places_are(uint32_t n, int ms) {
     return park_places_used() == n;
 }
 
+/* the claim mark goes after the wake (lookup_shed(), lookup_drop(): wake, then park_claim_clear()), on the ingest thread: wait for it, do not read it once right after the wake */
+static bool claim_gone(uint64_t key, int ms) {
+    for (int i = 0; i < ms / 5 && park_claim_held(key); i++) usleep(5000);
+    return !park_claim_held(key);
+}
+
 static void drain_wakes(void) {
     park_key_t kk;
     while (park_wake_pop(park_wake_ring(0), &kk)) {}
@@ -1376,7 +1382,7 @@ static int run_mode(const char *mode) {
         batch_begin(a[0], &e, 25, KDB_BATCH_DIFF);
         send_zone(a[0], &e, "cold1.test.", 1, 0, 170);
         batch_end(a[0], &e, &mainc, 25, 1, 0);
-        for (int w = 0; w < 500; w++) {                                     /* (the install runs on a builder thread: the limit stays until the zone is in the store, or a slow host installs it after the limit is gone) */
+        for (int w = 0; w < 3000; w++) {                                    /* (the install runs on a builder thread: the limit stays until the zone is in the store; 30 s, an ASan build on a loaded CI VM took more than 5) */
             if (dbdir()->rec_get("default", "cold1.test.", &rec) && rec.state == STORE_STATE_STORED && dbreg_lookup_entry("default", "cold1.test.") == NULL) break;
             usleep(10000);
         }
@@ -5802,6 +5808,7 @@ static void lk_cfg(const char *dbextra, unsigned rate, uint64_t memory_limit) {
     server_config_t *c = &pool[used++ % 8];
     CHECK(parse_named_conf(conf, c) == 0);
     if (memory_limit) c->database.memory_limit = memory_limit;
+    if (!c->database.memory_limit) c->database.memory_limit_unlimited = true;        /* (0.7: what an unset memory-limit meant when these cases were written; with the store it is the default from the RAM now) */
     atomic_store_explicit(&g_config_db.active, c, memory_order_release);
     for (int i = 0; i < 300 && !(st_field("fetch", "rate") == rate && dbreg_cache_limit() == c->database.memory_limit); i++) usleep(20000);
     usleep(150000);
@@ -6004,7 +6011,7 @@ static int run_lookup_body(const char *dir) {
         kdb_enc_u16(&e, 1, 0); kdb_enc_name(&e, 2, "apex6.test."); kdb_enc_i64(&e, 3, 880066); kdb_enc_str(&e, 4, "reading the records: the database is busy"); kdb_enc_u64(&e, 5, rid);
         kdb_enc_end(&e);
         ch_send(f[0], &e);
-        CHECK(wake_for("apex6.test.", &k, 5000) && k.failed && k.ask == 0 && places_are(0, 2000) && !park_claim_held(park_lookup_claim_key("default", "apex6.test.")));
+        CHECK(wake_for("apex6.test.", &k, 5000) && k.failed && k.ask == 0 && places_are(0, 2000) && claim_gone(park_lookup_claim_key("default", "apex6.test."), 2000));
         /* the loader says "busy" (KDB_FETCH_BUSY_REASON): overload, not a failure: the queries that wait are dropped (a wake with PARK_ASK_DROP: counted store.park.drop.queue / store.lookup.drop.queue at their workers), not
          * answered SERVFAIL.  Once for the lookup itself, once for the body of the zone that it found */
         drain_wakes();
@@ -6111,7 +6118,7 @@ static int run_lookup_body(const char *dir) {
             snprintf(nm, sizeof(nm), "s%d.nz.test.", i);
             CHECK_MSG(park_shed_held(park_lookup_claim_key("default", nm), t_shed), "%s not held %lld ms after the asks: remembered %llu from %llu, releases %llu from %llu",   /* (a name that was shed is remembered: its worker asks no more for it) */
                       nm, (long long)(t_shed - t_ask7), (unsigned long long)ls7.remembered, (unsigned long long)rem0, (unsigned long long)ls7.remember_releases, (unsigned long long)rel0);
-            CHECK(wake_for(nm, &k, 5000) && k.ask == PARK_ASK_DROP && !k.failed && !park_claim_held(park_lookup_claim_key("default", nm)));
+            CHECK(wake_for(nm, &k, 5000) && k.ask == PARK_ASK_DROP && !k.failed && claim_gone(park_lookup_claim_key("default", nm), 2000));
         }
         CHECK(!shed_held_now("s0.nz.test.") && !shed_held_now("s8.nz.test."));                    /* (the ones that were asked for, or wait, are not) */
         for (int i = 6; i < 9; i++) {
@@ -6210,7 +6217,7 @@ static int run_lookup_body(const char *dir) {
         drain_wakes();
         CHECK(lk_asked("away1.test."));
         CHECK(wake_for("away1.test.", &k, 6000) && !k.failed && k.ask == PARK_ASK_DROP);
-        CHECK(!park_claim_held(park_lookup_claim_key("default", "away1.test.")));
+        CHECK(claim_gone(park_lookup_claim_key("default", "away1.test."), 2000));
     }
     {
         const store_lookup_t ls = lk_stats();

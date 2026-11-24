@@ -2039,6 +2039,7 @@ void ipcd_set_self(int slot);
 void ipcd_init(void);
 unsigned long sockbuf_limit_for(unsigned long maxsockbuf);
 unsigned long sockbuf_maxsockbuf_for(unsigned long size);
+int sockbuf_short_level(bool written);
 long long sockbuf_maxsockbuf(void);
 int sockbuf_set(int fd, int opt, int want, int *err);
 void sockbuf_note(int kind, int dir, int asked, int got);

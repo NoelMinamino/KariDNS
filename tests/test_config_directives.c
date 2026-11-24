@@ -129,6 +129,7 @@ static void test_defaults(void) {
     CHECK(cfg.allow_program_zones == false);
     CHECK(cfg.additional_from_auth == ADDITIONAL_AUTH_YES);
     CHECK(cfg.udp_recvbuf_size == 4 * 1024 * 1024);
+    CHECK(!cfg.udp_recvbuf_set && !cfg.udp_sndbuf_set);     /* (0.7: the default: a size the kernel does not give is a NOTICE) */
     CHECK(cfg.udp_sndbuf_size == 4 * 1024 * 1024);
     CHECK(cfg.tcp_mss == 0);                /* 0 = leave the OS default alone */
     CHECK(cfg.tcp_window == 0);
@@ -643,7 +644,7 @@ static void test_database_block(void) {
         CHECK(d->park_max == 0 && d->park_timeout_ms == 0);                          /* (0: the worker's defaults, 16384 and 1500 ms) */
         CHECK(d->store_hot_list && d->store_threads == 0);                           /* 0.7: hot.list is on by default; 0: the default number of store threads (8) */
         CHECK(KARIDNS_DB_STORE_THREADS_DEFAULT == 8 && KARIDNS_DB_STORE_THREADS_MAX == 32);
-        CHECK(d->memory_limit == 0);                                                  /* (0: no limit, every database zone stays in memory) */
+        CHECK(d->memory_limit == 0 && !d->memory_limit_unlimited);                    /* (0.7.x: not written = the default from the RAM, db_ingest_memory_limit()) */
         CHECK(d->fetch_rate == 0);                                                    /* (0.7 P-A: 0 is the default, unlimited) */
         CHECK(d->transfer_fetch_timeout_ms == 0);                                     /* (0: the default, 10 seconds) */
         CHECK_STR(db_loader_path(&cfg), KARIDNS_DB_DEFAULT_LOADER_PATH);
@@ -675,6 +676,16 @@ static void test_database_block(void) {
     expect_reject("memory-limit 512k", DBP "memory-limit 512k; }; };");
     expect_reject("memory-limit 2t", DBP "memory-limit 2t; }; };");
     expect_reject("memory-limit abc", DBP "memory-limit abc; }; };");
+    /* 0.7.x: `unlimited` keeps every zone in memory (what an unset memory-limit was before); a later number replaces it */
+    if (parse_ok(DBP "memory-limit unlimited; }; };", &cfg)) {
+        CHECK(cfg.database.memory_limit == 0 && cfg.database.memory_limit_unlimited);
+        free_server_config_fields(&cfg);
+    }
+    if (parse_ok(DBP "memory-limit UNLIMITED; memory-limit 64m; }; };", &cfg)) {
+        CHECK(cfg.database.memory_limit == 64ull << 20 && !cfg.database.memory_limit_unlimited);
+        free_server_config_fields(&cfg);
+    }
+    expect_reject("memory-limit unlimit", DBP "memory-limit unlimit; }; };");
     expect_reject("transfer-fetch-timeout 99", DBP "transfer-fetch-timeout 99; }; };");
     expect_reject("transfer-fetch-timeout 600001", DBP "transfer-fetch-timeout 600001; }; };");
     expect_reject("transfer-fetch-timeout abc", DBP "transfer-fetch-timeout abc; }; };");
@@ -4474,11 +4485,13 @@ static void test_bind_option_values_aliases(void) {
     server_config_t cfg;
     if (ok_with("udp buffers", "options { udp-receive-buffer 65536; udp-send-buffer 32768; };", "", &cfg)) {
         CHECK(cfg.udp_recvbuf_size == 65536 && cfg.udp_sndbuf_size == 32768);
+        CHECK(cfg.udp_recvbuf_set && cfg.udp_sndbuf_set);       /* (written: a WARNING) */
         free_server_config_fields(&cfg);
     }
     if (ok_with("udp buffer floor", "options { udp-receive-buffer 100; udp-send-buffer 0; };", "", &cfg)) {
         CHECK(cfg.udp_recvbuf_size == 4096);                    /* BIND raises a non-zero size to 4096 */
         CHECK(cfg.udp_sndbuf_size == 4 * 1024 * 1024);          /* 0 is the system's size: KariDNS keeps its own default */
+        CHECK(cfg.udp_recvbuf_set && !cfg.udp_sndbuf_set);      /* (0 keeps the default: not written) */
         free_server_config_fields(&cfg);
     }
     if (ok_with("both names, one value", "options { udp-recvbuf-size 65536; udp-receive-buffer 65536; udp-sndbuf-size 8k; udp-send-buffer 8192; };", "", &cfg)) {
