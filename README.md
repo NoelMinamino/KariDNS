@@ -64,6 +64,7 @@ KariDNS implements specifications according to official IETF RFC standards. For 
 - **[Client Geolocation & Subnet Steering Guide (ECS & Location)](docs/KariDNS_How_to_use_ECS_and_location.md)**
 - **['type program' Zone Plugin Guide](docs/KariDNS_how_to_use_type_program_zone.md)**
 - **[Installation & Multi-Platform Distribution Guide (FreeBSD, Linux, macOS, Homebrew)](docs/distribution.md)**
+- **[Release notes (CHANGES.md)](CHANGES.md)** and **[Upgrading from 0.6 to 0.7](docs/UPGRADING.md)**
 
 ---
 

@@ -149,9 +149,17 @@ test('loadConfig reads a file and reports one that is missing', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ks-cfg-'));
   try {
     const f = path.join(dir, 'c.conf');
-    fs.writeFileSync(f, 'database = pg\nconninfo-file = /x\n');
+    fs.writeFileSync(f, 'database = pg\nconninfo-file = /x\n', { mode: 0o644 });
     assert.equal(loadConfig(f).settings.database, 'pg');
     assert.throws(() => loadConfig(path.join(dir, 'none.conf')), /cannot read/);
+    // review W1-L4 (0.7): a file others can change, or a link, is refused with the fix in the message (SIGHUP reads it the same way)
+    if (process.platform !== 'win32') {
+      fs.chmodSync(f, 0o664);
+      assert.throws(() => loadConfig(f), /has mode 0664: the group or other users can change it; chmod go-w /);
+      fs.chmodSync(f, 0o644);
+      fs.symlinkSync(f, path.join(dir, 'l.conf'));
+      assert.throws(() => loadConfig(path.join(dir, 'l.conf')), /is a symbolic link: point karidns-signer at the file itself/);
+    }
   } finally {
     fs.rmSync(dir, { recursive: true });
   }

@@ -6,7 +6,7 @@
 // The work comes from three places: the state table (next_due <= now: the zones that are due), the key requests (polled), and the change log (a
 // signer zone that someone else changed is made due after a debounce; our own writes are skipped by their write id).  `workers` zones run at a time.
 
-import { Debounce, OwnWrites, nextDue, backoff, busyDelay, CHANGED_RETRIES } from './scheduler.js';
+import { Debounce, OwnWrites, nextDue, plausibleExpire, expireProblem, backoff, busyDelay, CHANGED_RETRIES } from './scheduler.js';
 import { zoneSettings } from './config.js';
 
 export const REQUEST_POLL = 5;            // seconds between two looks at the key requests
@@ -243,14 +243,18 @@ export class Daemon {
         this.busy.delete(id);
         this.notBefore.delete(id);
         this.stats.signed++;
+        // an expiration in the past, too near or absurd is never a reason to sign the zone every second (review W1-L5, 0.7): scheduler.js
+        const minExpire = plausibleExpire(out.minExpire, now, z.validity);
         await db.recordSuccess(id, {
           // one second after the end of the run: the change log rows of our own write have changed_at of the second they were made in (PostgreSQL rounds it, SQLite3 cuts it),
           // never later than this; the scan at the start (catchUp) takes the rows after this time for the changes of somebody else
-          signedAt: now + 1, serial: out.serial, minExpire: out.minExpire,
-          nextDue: nextDue({ minExpire: out.minExpire, refresh: z.refresh, jitter: z.jitter, validity: z.validity, now, rand: this.rand }),
+          signedAt: now + 1, serial: out.serial, minExpire,
+          nextDue: nextDue({ minExpire, refresh: z.refresh, jitter: z.jitter, validity: z.validity, now, rand: this.rand }),
           durationMs: out.durationMs,
         });
         log.info(`signed ${job.zone}: serial ${out.serial}, ${out.durationMs} ms${job.request ? `, request ${job.request.id} ${out.request?.state}` : ''}`);
+        const odd = expireProblem({ raw: out.minExpire, now, refresh: z.refresh, validity: z.validity });
+        if (odd) log.warn(`${job.zone}: ${odd}`);
         for (const w of out.warnings ?? []) log.warn(`${job.zone}: ${w}`);
         if (out.request) await db.finishRequest(job.request.id, out.request.state, out.request.message, now);
         break;

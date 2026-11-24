@@ -90,6 +90,21 @@ test('policies: the types are an array column', async () => {
   assert.deepEqual(t3.log.map((l) => l[0]), ['UPDATE karidns_auth.rr_policies SET ttl_max = $1 WHERE id = $2', 'UPDATE karidns_auth.rr_policies SET allowed_types = $2::text[] WHERE id = $1']);
 });
 
+test('updatePrincipal / updatePolicy take only the columns of their list (review W3-L1, 0.7): a key is never SQL', async () => {
+  const t = fakeTx();
+  assert.equal(await S.updatePrincipal(t, 4, {}), 0);
+  await S.updatePrincipal(t, 4, { name: 'n', display_name: null, email: 'a@example.test', disabled: true });
+  assert.equal(t.log[0][0], 'UPDATE karidns_auth.principals SET name = $1, display_name = $2, email = $3, disabled = $4 WHERE id = $5');
+  const bad = { 'disabled = false, kind': 'x' };
+  await assert.rejects(S.updatePrincipal(t, 4, bad), /^Error: store: "disabled = false, kind" is not a column that can be changed$/);
+  await assert.rejects(S.updatePrincipal(t, 4, { kind: 'group' }), /"kind" is not a column/, 'a real column that is not for a patch');
+  await assert.rejects(S.updatePolicy(t, 4, { 'name = name; DROP TABLE x; --': 1 }), /is not a column that can be changed/);
+  await assert.rejects(S.updatePolicy(t, 4, { created_by: 1 }), /"created_by" is not a column/);
+  assert.equal(t.log.length, 1, 'nothing was sent for a refused patch');
+  await S.updatePolicy(t, 4, { name: 'p', allow_wildcard: true, allow_delegation: false, allow_dname: false, apex_editable: true, ttl_min: 1, ttl_max: 2, max_rr: null });
+  assert.equal(t.log[1][0], 'UPDATE karidns_auth.rr_policies SET name = $1, allow_wildcard = $2, allow_delegation = $3, allow_dname = $4, apex_editable = $5, ttl_min = $6, ttl_max = $7, max_rr = $8 WHERE id = $9');
+});
+
 test('grants: a global master has no schema; the schema of a domain master is the dataset\'s', async () => {
   const tx = fakeTx([[/INSERT INTO karidns_auth.grants/, [{ id: 1 }]]]);
   await S.createGrant(tx, { principalId: 2, role: 'domain_master', schema: 'public', zone: 'example.test', suffix: null, policyId: 3, grantedBy: 1 });
