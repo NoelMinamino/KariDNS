@@ -2,12 +2,13 @@
 // requests and the change log; the zone data goes through karidns-zone.  Built-in node:sqlite, no package.  Times are unix seconds.
 //
 // The interface (db_pg.js has the same):
-//   open() close()  tryLock(id) unlock(id)  getMeta(id)  getKeys(id)  insertKeys(id, keys)  pendingRequests(limit)  finishRequest(id, state, message)
+//   open() close()  tryLock(id) unlock(id)  getMeta(id)  getKeys(id)  insertKeys(id, keys, requestId)  storedKeysNote(id)  pendingRequests(limit)  finishRequest(id, state, message)
 //   dueZones(now, limit)  recordSuccess(id, s)  recordFailure(id, f)  markDue(ids, now)  dropState(id)  catchUp()  signerZones(ids)
 //   changesStart()  changesSince(cursor)  waitForChange(ms)
 
 import fs from 'node:fs';
 import { setTimeout as sleep } from 'node:timers/promises';
+import { STORED_KEYS } from './keys.js';
 
 const META_KINDS = ['PRESIGNED', 'NSEC3PARAM', 'X-KARIDNS-SIGNER'];
 const CHUNK = 500;
@@ -203,15 +204,17 @@ export class SqliteDb {
       .map((r) => ({ id: r.id, flags: r.flags, active: !!r.active, published: r.published == null ? true : !!r.published, content: r.content }));
   }
 
-  async insertKeys(id, keys) {
+  // (as db_pg.js: one transaction for the keys and the note in the request)
+  async insertKeys(id, keys, requestId = null) {
     const ins = this.db.prepare('INSERT INTO cryptokeys (domain_id, flags, active, published, content) VALUES (?, ?, 1, 1, ?)');
     this.db.exec('BEGIN IMMEDIATE');
     try {
       const before = this.db.prepare('SELECT coalesce(max(seq), 0) AS m FROM karidns_changes').get().m;
-      for (const k of keys) ins.run(id, k.flags, k.content);
+      const ids = keys.map((k) => Number(ins.run(id, k.flags, k.content).lastInsertRowid));
       const after = this.db.prepare('SELECT coalesce(max(seq), 0) AS m FROM karidns_changes').get().m;
+      if (requestId != null) this.db.prepare("UPDATE karidns_key_requests SET message = ? WHERE id = ? AND state = 'pending'").run(`${STORED_KEYS}${ids.join(',')}`, requestId);
       this.db.exec('COMMIT');
-      return { xid: null, seq_first: after > before ? before + 1 : null, seq_last: after > before ? after : null };   // the write id: the log rows are ours
+      return { xid: null, seq_first: after > before ? before + 1 : null, seq_last: after > before ? after : null, ids };   // the write id: the log rows are ours
     } catch (e) {
       try { this.db.exec('ROLLBACK'); } catch { /* no transaction */ }
       throw e;
@@ -225,6 +228,10 @@ export class SqliteDb {
 
   async finishRequest(id, state, message, now) {
     this.db.prepare("UPDATE karidns_key_requests SET state = ?, message = ?, done_at = ? WHERE id = ? AND state = 'pending'").run(state, message, now, id);
+  }
+
+  async storedKeysNote(id) {
+    return this.db.prepare("SELECT message FROM karidns_key_requests WHERE domain_id = ? AND kind = 'enable' AND instr(message, ?) > 0 ORDER BY id DESC LIMIT 1").get(id, STORED_KEYS)?.message ?? null;
   }
 
   async dueZones(now, limit) {

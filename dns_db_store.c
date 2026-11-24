@@ -1826,6 +1826,7 @@ static bool extra_status_cb(store_extra_t *x) {
   dbreg_err_stats(&n, &x->err_noted, &x->err_dropped);
   x->err_texts = n;
   x->sampled_detaches = cs.sampled;
+  x->detach_lock_yields = cs.evict_yields;
   x->wa_ok = atomic_load(&G.wa_ok);
   x->wa_cold = atomic_load(&G.wa_cold);
   x->wa_over = atomic_load(&G.wa_over);
@@ -1845,6 +1846,7 @@ static bool extra_status_cb(store_extra_t *x) {
   x->hot_written = atomic_load(&G.hot_written);
   x->hot_threads = atomic_load(&G.hot_nthr);
   x->hot_per_s = hot_rate(x->hot_attached);
+  park_attach_counts(&x->att_shed, &x->att_newest, &x->att_queued);
   return true;
 }
 
@@ -4390,6 +4392,7 @@ static store_t *core_start(const server_config_t *cfg, bool *created_out) {
     o.scrub_interval_s = db->store_scrub_interval;           /* 0.7 S6 (WP9): the scrub of the store: its interval, and the structure check it makes of every image it reads */
     o.seg_size = db->store_segment_size;                     /* (0 = 256 MiB) */
     o.max_zones = db->store_max_zones;                       /* (0 = by the RAM) */
+    o.no_align = !db->store_align;                           /* (0.7 attach-align: `store-align no`) */
   }
   o.validate = zone_image_validate;
   o.bad_image = bad_image_hook;                             /* a zone whose image the scrub or the cleaner found damaged is taken out of memory */

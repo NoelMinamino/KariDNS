@@ -78,6 +78,14 @@ static int nm_open_io(dq_io_t **out, const dq_cfg_t *c, dq_target_t *tg, unsigne
         free(x);
         return -1;
     }
+    /* T3-L3: nm_fill() copies a whole frame into one slot; a ring whose buffers are smaller than the largest frame (dev.netmap.buf_size) would
+     * refuse that frame on every try and the worker would spin on it to the end of the run: refused here, with the reason */
+    if (dq_frame_cap_check(NETMAP_TXRING(x->d->nifp, x->d->first_tx_ring)->nr_buf_size, name, err, errlen) < 0) {
+        size_t l = strlen(err);
+        snprintf(err + l, errlen > l ? errlen - l : 0, " (raise dev.netmap.buf_size)");
+        nm_close_io((dq_io_t *)x);
+        return -1;
+    }
     x->nchan = nchan;
     x->v6 = tg->v6;
     x->sport0 = (uint16_t)(tg->sport_base + worker * nchan);

@@ -5,7 +5,10 @@
 // One connection does all the queries, one runs LISTEN karidns_changes.  Queries are serialised (a promise chain), so nothing interleaves; every
 // statement is a single statement (no transaction spans two awaits).
 
+import { STORED_KEYS } from './keys.js';
+
 const CHUNK = 5000;
+const RETRY_DUES = 16;                  // (recordFailure; scheduler.js backoff() is constant from the 7th failure on)
 
 export class PgDb {
   // Client: pg's Client class; conn: its options; schema: undefined or a checked schema name
@@ -91,11 +94,21 @@ export class PgDb {
     return r.rows.map((k) => ({ id: k.id, flags: k.flags, active: k.active === true, published: k.published == null ? true : k.published === true, content: k.content }));
   }
 
-  // all keys in one statement: all or none.  Returns the write id (the xid8 of the transaction), so that the change log rows of the INSERT are known as ours.
-  async insertKeys(id, keys) {
-    const r = await this.query('INSERT INTO cryptokeys (domain_id, flags, active, published, content) SELECT $1, f, true, true, c FROM unnest($2::int[], $3::text[]) AS t(f, c) RETURNING pg_current_xact_id()::text AS xid',
-      [id, keys.map((k) => k.flags), keys.map((k) => k.content)]);
-    return { xid: r.rows[0]?.xid ?? null, seq_first: null, seq_last: null };
+  // all keys in one statement: all or none.  Returns the write id (the xid8 of the transaction), so that the change log rows of the INSERT are known as ours, and the
+  // ids of the rows.  requestId: the pending request the keys are for; the same statement writes STORED_KEYS and the ids into its message (pipeline.js, review W1-L1).
+  async insertKeys(id, keys, requestId = null) {
+    const r = await this.query(`WITH k AS (INSERT INTO cryptokeys (domain_id, flags, active, published, content) SELECT $1, f, true, true, c FROM unnest($2::int[], $3::text[]) AS t(f, c) RETURNING id),
+        ids AS (SELECT string_agg(id::text, ',' ORDER BY id) AS ids FROM k),
+        n AS (UPDATE karidns_key_requests SET message = $5::text || (SELECT ids FROM ids) WHERE id = $4 AND state = 'pending' RETURNING 1)
+      SELECT pg_current_xact_id()::text AS xid, (SELECT ids FROM ids) AS ids`,
+    [id, keys.map((k) => k.flags), keys.map((k) => k.content), requestId, STORED_KEYS]);
+    return { xid: r.rows[0]?.xid ?? null, seq_first: null, seq_last: null, ids: (r.rows[0]?.ids ?? '').split(',').filter(Boolean).map(Number) };
+  }
+
+  // the message of the latest enable request of the zone that names keys an earlier try stored (pipeline.js), or null
+  async storedKeysNote(id) {
+    const r = await this.query("SELECT message FROM karidns_key_requests WHERE domain_id = $1 AND kind = 'enable' AND strpos(message, $2::text) > 0 ORDER BY id DESC LIMIT 1", [id, STORED_KEYS]);
+    return r.rows[0]?.message ?? null;
   }
 
   async pendingRequests(limit) {
@@ -122,14 +135,16 @@ export class PgDb {
     [id, s.signedAt, s.serial, s.minExpire, s.nextDue, s.durationMs]);
   }
 
-  // attempts + 1, the error, and the next time from the backoff for the new count (the lock of the zone makes the read and the write one unit); returns the count
+  // attempts + 1, the error, and the next time from the backoff for the new count; returns the count.  One statement (review W1-L2, 0.7): the advisory lock of the
+  // zone is released when the run ends, before its result is recorded, so a SELECT and a later write would let the write of another instance in between and
+  // overwrite it with a stale count.  The next times of the counts 1..RETRY_DUES go as one array (the backoff stops growing long before that) and the statement
+  // takes the one of the count it makes.
   async recordFailure(id, f) {
-    const old = await this.query('SELECT attempts FROM karidns_signer_state WHERE domain_id = $1', [id]);
-    const attempts = (old.rows[0]?.attempts ?? 0) + 1;
-    await this.query(`INSERT INTO karidns_signer_state (domain_id, next_due, attempts, last_error, last_duration_ms) VALUES ($1, to_timestamp($2::double precision), $3, $4, $5)
-      ON CONFLICT (domain_id) DO UPDATE SET next_due = excluded.next_due, attempts = excluded.attempts, last_error = excluded.last_error,
-        last_duration_ms = excluded.last_duration_ms`, [id, f.nextDue(attempts), attempts, f.error, f.durationMs ?? null]);
-    return attempts;
+    const dues = Array.from({ length: RETRY_DUES }, (_, i) => f.nextDue(i + 1));
+    const r = await this.query(`INSERT INTO karidns_signer_state AS s (domain_id, next_due, attempts, last_error, last_duration_ms) VALUES ($1, to_timestamp(($2::float8[])[1]), 1, $3, $4)
+      ON CONFLICT (domain_id) DO UPDATE SET attempts = s.attempts + 1, next_due = to_timestamp(($2::float8[])[least(s.attempts + 1, ${RETRY_DUES})]),
+        last_error = excluded.last_error, last_duration_ms = excluded.last_duration_ms RETURNING attempts`, [id, dues, f.error, f.durationMs ?? null]);
+    return r.rows[0].attempts;
   }
 
   async markDue(ids, now) {
@@ -137,11 +152,6 @@ export class PgDb {
       await this.query(`INSERT INTO karidns_signer_state (domain_id, next_due) SELECT d.id, to_timestamp($2::double precision) FROM domains d WHERE d.id = ANY($1::int[])
         ON CONFLICT (domain_id) DO UPDATE SET next_due = least(karidns_signer_state.next_due, excluded.next_due)`, [ids.slice(i, i + CHUNK), now]);
     }
-  }
-
-  // the signer role may INSERT into karidns_reload_requests (the loaders LISTEN karidns_reload)
-  async requestReload(zone) {
-    await this.query('INSERT INTO karidns_reload_requests (zone) VALUES ($1)', [zone]);
   }
 
   async dropState(id) {

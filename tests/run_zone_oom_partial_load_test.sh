@@ -125,6 +125,7 @@ key "karictl" {
     secret "dGVzdC1vbmx5LWR1bW15LWtleS1kby1ub3QtdXNl";
 };
 EOF
+chmod 600 "$TMP_DIR/karictl.conf"   # karictl refuses a karictl.conf with the secret that others can read
 
 echo "=== 1. Starting KariDNS with fault-injected OOM on zone2 (call #1) ==="
 # OOM_FAIL_NTH_ZONE_CALLOC=1 will fail create_new_zone_entry() for the 2nd zone (zone2.example.com)

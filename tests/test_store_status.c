@@ -161,9 +161,10 @@ static bool extra_fn(store_extra_t *x) {
   memset(x, 0, sizeof(*x));
   x->pool_used = 7; x->pool_slabs = 1; x->pool_slab_bytes = 2u << 20; x->pool_slot_bytes = 256; x->pool_free_slots = 100;
   x->attach_slots = 2048; x->attach_grows = 3; x->attach_shrinks = 1;
-  x->folded = 11; x->fold_rows = 5; x->fold_replaced = 2; x->err_texts = 4; x->err_noted = 9; x->err_dropped = 1; x->sampled_detaches = 6;
+  x->folded = 11; x->fold_rows = 5; x->fold_replaced = 2; x->err_texts = 4; x->err_noted = 9; x->err_dropped = 1; x->sampled_detaches = 6; x->detach_lock_yields = 3;
   x->wa_ok = 100; x->wa_cold = 7; x->wa_over = 2; x->wa_claim = 3; x->wa_fail = 4; x->wa_decline = 5; x->wa_full = 6; x->wa_adopted = 98; x->wa_lost = 2; x->wa_ns = 1500000; x->build_n = 8; x->build_ns = 200000;
   x->hot_state = 2; x->hot_listed = 1000; x->hot_attached = 990; x->hot_skipped = 10; x->hot_written = 1234; x->hot_threads = 6; x->hot_per_s = 123456;
+  x->att_shed = 41; x->att_newest = 42; x->att_queued = 43;
   return true;
 }
 static bool g_mem_ok = true;
@@ -576,7 +577,7 @@ static void test_store(int mode, const char *base) {
                                      "store.compact.pinned_skips", "store.compact.incomplete", "store.compact.last_unix", "store.compact.rate_bytes", "store.compact.candidates",
                                      "store.compact.dead_bytes", "store.compact.nx_reclaims", "store.compact.nx_reclaimed_bytes", "store.space.fs_total_bytes", "store.space.fs_free_bytes",
                                      "store.space.checked_unix", "store.space.reserve_bytes", "store.space.store_bytes", "store.space.growth_bytes_per_hour", "store.space.full_in_hours",
-                                     "store.space.degraded_puts", "store.space.enospc_events", "store.space.degraded_since_unix", "store.fs.blksize", "store.fs.recordsize_warning",
+                                     "store.space.degraded_puts", "store.space.enospc_events", "store.space.degraded_since_unix", "store.fs.blksize", "store.fs.recordsize_warning", "store.fs.align_bytes", "store.fs.align_pads", "store.fs.align_pad_bytes",
                                      "store.scrub.interval_s", "store.scrub.running", "store.scrub.progress_pct", "store.scrub.passes", "store.scrub.last_start_unix",
                                      "store.scrub.last_end_unix", "store.scrub.zones_checked", "store.scrub.bytes_checked", "store.scrub.bad_images", "store.scrub.bad_cells",
                                      "store.scrub.bad_index", "store.scrub.io_errors", "store.segments.free_numbers", "store.segments.draining", "store.segments.pinned",
@@ -609,6 +610,7 @@ static void test_store(int mode, const char *base) {
   CHECK_EQ(kv_num("store.errors.memory_texts"), 4);
   CHECK_EQ(kv_num("store.errors.memory_pushed_out"), 1);
   CHECK_EQ(kv_num("store.detach.sampled"), 6);
+  CHECK_EQ(kv_num("store.detach.lock_yields"), 3);
   CHECK_EQ(kv_num("store.attach.build_ns_per_zone"), 25000);              /* (200,000 ns over 8 timed attaches) */
   CHECK_EQ(kv_num("store.attach.worker.ok"), 100);
   CHECK_EQ(kv_num("store.attach.worker.mean_us"), 15);                  /* (1,500,000 ns over 100 attaches) */
@@ -620,6 +622,9 @@ static void test_store(int mode, const char *base) {
   CHECK_EQ(kv_num("store.attach.worker.full"), 6);
   CHECK_EQ(kv_num("store.attach.worker.registered"), 98);
   CHECK_EQ(kv_num("store.attach.worker.dropped"), 2);
+  CHECK_EQ(kv_num("store.attach.shed"), 41);
+  CHECK_EQ(kv_num("store.attach.newest_first"), 42);
+  CHECK_EQ(kv_num("store.attach.queued"), 43);
   CHECK(strcmp(kv_str("store.hot.state"), "done") == 0);
   CHECK_EQ(kv_num("store.hot.listed"), 1000);
   CHECK_EQ(kv_num("store.hot.attached"), 990);

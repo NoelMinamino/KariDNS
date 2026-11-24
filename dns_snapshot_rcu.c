@@ -23,6 +23,7 @@
 #include <stdint.h>
 #include <stdatomic.h>
 #include <pthread.h>
+#include <sched.h>
 #include "dns_log.h"
 #include <unistd.h>
 #include <fcntl.h>
@@ -4537,6 +4538,7 @@ static void attach_offered_init(dbreg_attach_info_t *offered, const dbdir_rec_t 
     for (int i = 0; i < 32; i++) offered->digest_set |= offered->digest[i] != 0;
 }
 
+static void reg_lock_for_attach(void);         /* (0.7 attach-align: the registry lock, taken by an attach: the manager lets it in between its slices) */
 int dbreg_attach_store(const char *view, const char *name, const dbdir_rec_t *rec, zone_db_entry_t *entry, bool bg, void (*under_lock)(void *), void *under_arg) {
     const dbdir_ops_t *ops = dbdir();
     if (!ops || !store_zone_entry(entry)) {
@@ -4550,7 +4552,7 @@ int dbreg_attach_store(const char *view, const char *name, const dbdir_rec_t *re
     attach_offered_init(&offered, rec, bg, under_lock, under_arg);
     const bool sh_cfg = dbreg_config_shadows(view, name);               /* (the configuration's snapshot is not taken under the registry lock) */
     for (int attempt = 0;; attempt++) {
-        pthread_mutex_lock(&g_zone_db_rebuild_lock);
+        reg_lock_for_attach();
         commit_post_t post;
         memset(&post, 0, sizeof(post));
         bool busy;
@@ -4592,7 +4594,7 @@ void dbreg_attach_store_n(dbreg_att_item_t *it, size_t n) {
     /* an item whose record has a cell that is being written is looked at again after a pause, outside the lock, as the single attach does (a few times; then it is STALE) */
     for (int attempt = 0;; attempt++) {
         bool again = false;
-        pthread_mutex_lock(&g_zone_db_rebuild_lock);
+        reg_lock_for_attach();
         for (size_t i = 0; i < n; i++) {
             if (!live[i]) continue;
             bool busy;
@@ -5390,6 +5392,8 @@ bool dbreg_cache_over_limit(void) {
 
 static _Atomic uint64_t g_room_evicted, g_room_relaxed;      /* zones taken out on demand (dbreg_cache_make_room()), of which younger than CACHE_MIN_RESIDENT_MS */
 static _Atomic uint64_t g_sampled_evictions;     /* zones of the store that a sample of the attach table chose (cache_sample_evict_locked()) */
+static _Atomic uint32_t g_reg_att_waiters;       /* 0.7 attach-align: threads that wait for the registry lock to register attaches (reg_lock_for_attach()) */
+static _Atomic uint64_t g_evict_yields;          /* ... and the times a round of sampled detaches let the lock go for them (cache_evict_yield_locked()) */
 
 void dbreg_cache_stats(dbreg_cache_stats_t *o) {
     zone_bytes_t zb;
@@ -5415,6 +5419,7 @@ void dbreg_cache_stats(dbreg_cache_stats_t *o) {
     o->room_evictions = atomic_load_explicit(&g_room_evicted, memory_order_relaxed);
     o->room_relaxed = atomic_load_explicit(&g_room_relaxed, memory_order_relaxed);
     o->sampled = atomic_load_explicit(&g_sampled_evictions, memory_order_relaxed);
+    o->evict_yields = atomic_load_explicit(&g_evict_yields, memory_order_relaxed);
 }
 
 typedef struct {
@@ -5560,8 +5565,29 @@ static bool sample_eval_locked(dbreg_zone_t *z, uint32_t now32, cache_cand_t *c)
     return true;
 }
 
+/* 0.7 attach-align (A): the samples are taken in slices of CACHE_SAMPLE_SLICE, and between two slices the lock is let go for the attaches that wait for it (dbreg_attach_store_n():
+ * at memory-limit 2G with 10 million zones every attach needs a zone taken out, and a round of the manager of up to CACHE_SAMPLE_ITER detaches held the lock 10-16 ms: 22 % of the attaches
+ * waited that long to be registered, 2026-11-24 profile).  The callers keep nothing of the registry across the call but the counters they pass (the store's zones are sampled, not walked).
+ * A thread that waits for the lock to register attaches says so (g_reg_att_waiters); the slice ends by letting it in, at most CACHE_YIELD_SPINS yields. */
+#define CACHE_SAMPLE_SLICE 64
+#define CACHE_YIELD_SPINS 256
+static void reg_lock_for_attach(void) {
+    if (pthread_mutex_trylock(&g_zone_db_rebuild_lock) == 0) return;
+    atomic_fetch_add_explicit(&g_reg_att_waiters, 1, memory_order_relaxed);
+    pthread_mutex_lock(&g_zone_db_rebuild_lock);
+    atomic_fetch_sub_explicit(&g_reg_att_waiters, 1, memory_order_relaxed);
+}
+static void cache_evict_yield_locked(void) {
+    if (atomic_load_explicit(&g_reg_att_waiters, memory_order_relaxed) == 0) return;
+    pthread_mutex_unlock(&g_zone_db_rebuild_lock);
+    for (int i = 0; i < CACHE_YIELD_SPINS && atomic_load_explicit(&g_reg_att_waiters, memory_order_relaxed) != 0; i++) sched_yield();
+    pthread_mutex_lock(&g_zone_db_rebuild_lock);
+    atomic_fetch_add_explicit(&g_evict_yields, 1, memory_order_relaxed);
+}
+
 /* Take out zones by samples until `want` bytes are free (or nothing more can be taken).  allow_relaxed: room on demand, which may take a young zone whose queries are answered when the old ones do not
- * cover it.  Returns the bytes freed; *evicted and *nrelaxed count the zones, *boundary the highest frequency of an unmarked victim. */
+ * cover it.  Returns the bytes freed; *evicted and *nrelaxed count the zones, *boundary the highest frequency of an unmarked victim.  The lock is held at the call and at the return, and let go
+ * between slices (above). */
 static uint64_t cache_sample_evict_locked(uint64_t want, uint32_t now32, bool allow_relaxed, uint32_t *evicted, uint32_t *nrelaxed, uint32_t *boundary, bool *took_unflagged, int reason) {
     const dbdir_ops_t *ops = dbdir();
     uint64_t freed = 0;
@@ -5570,6 +5596,7 @@ static uint64_t cache_sample_evict_locked(uint64_t want, uint32_t now32, bool al
         const bool relaxed = pass == 1;
         int dry = 0;
         for (unsigned iter = 0; iter < CACHE_SAMPLE_ITER && freed < want && dry < 4; iter++) {
+            if (iter && iter % CACHE_SAMPLE_SLICE == 0) cache_evict_yield_locked();
             cache_cand_t best;
             bool have = false;
             for (int i = 0; i < CACHE_SAMPLE_N; i++) {
@@ -6121,6 +6148,7 @@ uint16_t dbreg_test_flags(const char *view, const char *name) {
     return f;
 }
 
+void dbreg_test_reg_waiter(int d) { atomic_fetch_add_explicit(&g_reg_att_waiters, (uint32_t)d, memory_order_relaxed); }
 void dbreg_test_pin(const char *view, const char *name, bool pin) {
     pthread_mutex_lock(&g_zone_db_rebuild_lock);
     dbreg_view_t *rv = dbreg_view_get(view, false);

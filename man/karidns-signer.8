@@ -1,4 +1,4 @@
-.TH KARIDNS\-SIGNER 8 "2026-11-22" "KariDNS" "KariDNS Manual"
+.TH KARIDNS\-SIGNER 8 "2026-11-24" "KariDNS" "KariDNS Manual"
 .\" Generated from docs/karidns-signer.md by man/md2man.pl (make man): edit the Markdown manual, not this page.
 .SH NAME
 karidns\-signer \- keeps the zones of a KariDNS database (PostgreSQL or SQLite3)
@@ -103,6 +103,17 @@ of one zone. A key written twice in one place, an unknown key and a bad value
 are errors that name the line. Durations are a number with an optional unit
 \fBs\fR, \fBm\fR, \fBh\fR, \fBd\fR or \fBw\fR (a bare number is
 seconds). \fBkaridns\-signer.conf.sample\fR shows all of it.
+.PP
+\fBThe file itself (0.7).\fR It holds no secret, but it decides which tools run
+and which database is written, so it is checked like the other files of the
+service when the signer starts, when \fB\-\-check\fR runs and at every
+\fBSIGHUP\fR: a regular file (not a symbolic link; \fB\-c\fR names the file
+itself), owned by root or by the signer's user, and not writable by the group or
+other users (read access is fine). Otherwise the start stops with the reason and
+the command that fixes it, for instance \fB... has mode 0664: the group or other
+users can change it; chmod go\-w ...\fR or \fB... belongs to uid 1001, not to
+root or to the user running karidns\-signer: chown root ...\fR; a SIGHUP that
+finds such a file keeps the old settings and logs the reason.
 .TP 8
 \fBdatabase\fR
 \fIDefault:\fR (required)
@@ -143,8 +154,11 @@ certificate from your own CA needs that CA in the service's environment
 \fIMeaning:\fR \fBsqlite3\fR: the database file. The user needs write access to
 the file \fBand its directory\fR (\fB<file>.signer.lock\fR is created there, WAL
 files too). The file holds the private keys of the zones: when other users (not
-the owner, not the group) can read it, \fB\-\-check\fR and the start warn
-(\fBchmod o\-rwx\fR it).
+the owner, not the group) can read it, \fB\-\-check\fR reports a problem and the
+start is refused (\fBsqlite\-file ... has mode 0644: other users can read the
+signing keys in it; remove their access: chmod o\-rwx ...\fR; a warning until
+0.7, review W1-L3). Group access is fine (the loader reads the file through a
+group).
 .TP 8
 \fBkarictl\-config\fR
 \fIMeaning:\fR \fBsqlite3\fR: the \fBkarictl\fR configuration of the restricted
@@ -315,6 +329,14 @@ karidns_signer reload\fR sends \fBSIGHUP\fR. \fBkaridns_signer_cpuset="2\-3"\fR
 starts it under \fBcpuset \-l\fR.
 .IP 6. 4
 \fBPut a zone under the signer\fR (next section).
+.PP
+\fBUpgrading from 0.6.\fR Two files that 0.6 accepted are refused (the start
+stops, \fBservice karidns_signer configtest\fR names the file and the fix): a
+configuration file that is a symbolic link, belongs to another user than root or
+the signer's, or that the group or others can write (\fBchown root
+karidns\-signer.conf; chmod go\-w karidns\-signer.conf\fR), and a SQLite3
+\fBsqlite\-file\fR that other users can read (\fBchmod o\-rwx <file>\fR; 0.6
+warned).
 .SH KEY REQUESTS
 A row in \fBkaridns_key_requests\fR asks the signer for something. The WebAdmin
 files the rows (a global master or the zone's domain master); an operator can do
@@ -376,12 +398,25 @@ key is read from its \fB.private\fR file (Private-key-format v1.2, the form
 PowerDNS keeps in \fBcryptokeys.content\fR), the files are wiped, the tag
 computed by the signer is compared with the one \fBdnssec\-keygen\fR chose (RFC
 4034 appendix B). The key is stored in \fBcryptokeys\fR (\fBflags\fR 257 or 256,
-\fBactive\fR and \fBpublished\fR true) \fBafter\fR the signed zone is written,
-so a key can never be in the database without a zone that uses it. If that
-\fBINSERT\fR fails (database failover, say) the signer tries again for about 10
-minutes (15 times, from 1 s to 60 s) with the same key; if it cannot, the
-request is \fBfailed\fR with the message that the keys were lost and the DNSKEYs
-have to be replaced with a request of kind \fBadd\fR.
+\fBactive\fR and \fBpublished\fR true) after the signed zone has passed
+\fBkaricheck\fR and \fBbefore\fR the signed zone is imported (0.7, review W1-L1;
+0.6 stored it after the import, and a crash in between left a served DNSKEY
+whose private key was lost), so a DNSKEY is never served without its private key
+in the database. If that \fBINSERT\fR fails (database failover, say) the signer
+tries again for about 10 minutes (15 times, from 1 s to 60 s) with the same key;
+if it cannot, nothing is written and the request is \fBfailed\fR (\fBthe new
+keys could not be stored ...: nothing was written, the zone is not signed; file
+the request again\fR). The same write puts \fBstored keys: cryptokeys <ids>\fR
+into the message of the pending request. A run that stops after the \fBINSERT\fR
+(the import fails, the zone changed while it was signed, the process dies)
+leaves the keys in \fBcryptokeys\fR and the zone unsigned; the loader refuses
+that version (keys without \fBPRESIGNED\fR) and the server keeps serving the
+last one. The next try of the request, or a new \fBenable\fR request of the
+zone, finds the rows by that note and signs with exactly those keys (\fBsigning
+enabled with the keys an earlier try stored (cryptokeys <ids>)\fR); a failed
+request says so in its message (\fBthe zone is not signed, the new keys are kept
+(stored keys: cryptokeys <ids>; ...): <the reason>\fR). Keys the note does not
+name (a row added or removed by hand) make the zone refused as above.
 .SH HOW A ZONE IS SIGNED
 For each zone, in a work directory of its own (wiped on every path, also after
 an error and at start):
@@ -505,9 +540,19 @@ dropped.
 \fBBefore expiry.\fR \fBnext_due\fR = the earliest RRSIG expiration of the zone
 \[u2212] \fBrefresh\fR \[u2212] a random part of \fBjitter\fR. (Not \fBsigned_at
 + validity \[u2212] refresh\fR: \fB\-i\fR keeps older signatures that still have
-time, so some of them expire earlier than the new ones.) The due zones are read
-in \fBnext_due\fR order with a limit (an index), so a million zones cost no full
-scan. A signer zone without a state row is due at once.
+time, so some of them expire earlier than the new ones.) It is never sooner than
+one hour after a signing (or \fBvalidity\fR \[u2212] \fBrefresh\fR \[u2212]
+\fBjitter\fR, when that is shorter): an earliest expiration that is already
+within \fBrefresh\fR after a successful run (a signature that
+\fBdnssec\-signzone\fR keeps but does not make again, such as one of a key made
+inactive in a rollover, or a wrong clock) is logged as a warning, and signing
+again at once would not change it (0.7, review W1-L5: it used to make the zone
+due the next second, every second). An expiration that is not a believable time
+(more than a year after the end of a fresh signature, or not a number) is logged
+and not stored; the zone is then looked at after \fBvalidity\fR \[u2212]
+\fBrefresh\fR \[u2212] \fBjitter\fR. The due zones are read in \fBnext_due\fR
+order with a limit (an index), so a million zones cost no full scan. A signer
+zone without a state row is due at once.
 .IP \(bu 2
 \fBOn change.\fR PostgreSQL: \fBLISTEN karidns_changes\fR (and a look at the
 change log every 30 s as a safety net); SQLite3: a poll of \fBkaridns_changes\fR
@@ -645,7 +690,10 @@ next start. The rc script and the wrapper set \fBulimit \-c 0\fR. Keys and key
 text are never logged; messages of the tools are cut to 1 KB.
 .IP \(bu 2
 \fBPrivilege.\fR Its own user, no root. The database role cannot write user data
-(above). The conninfo file is checked like the loader's.
+(above). The conninfo file is checked like the loader's; the configuration file
+must be a regular file of root or of the signer's user that nobody else can
+write, and the SQLite3 file must not be readable by other users (0.7; both are
+refused at the start).
 .IP \(bu 2
 \fBThe one npm dependency\fR is \fBpg\fR with an exact version and an integrity
 hash in \fBpackage\-lock.json\fR; install scripts are off

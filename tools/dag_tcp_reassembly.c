@@ -44,6 +44,7 @@ struct tcp_reasm_table {
     size_t   max_buffer_per_direction;
     uint32_t next_stream_id;
     uint64_t global_seq_no;
+    tcp_reasm_stats_t stats;
 };
 
 static void evict_stream(tcp_stream_t *st) {
@@ -55,6 +56,38 @@ static void evict_stream(tcp_stream_t *st) {
         }
     }
     memset(st, 0, sizeof(*st));
+}
+
+/* a direction that cannot take more (max_buffer_per_direction, or no memory): the stream is given up and counted */
+static void overflow_evict(tcp_reasm_table_t *t, tcp_stream_t *st) {
+    t->stats.overflow_evicted++;
+    evict_stream(st);
+}
+
+void tcp_reasm_get_stats(const tcp_reasm_table_t *t, tcp_reasm_stats_t *out) {
+    if (!out) return;
+    if (t) *out = t->stats;
+    else memset(out, 0, sizeof(*out));
+}
+
+/* T1-L4: a segment that arrived ahead of the stream waits in a slot.  One larger than a slot, or one that finds every slot
+ * taken (replace_first: the forward case gives up the oldest slot for it, as before), is lost and counted, not dropped silently */
+static void ooo_store(tcp_reasm_table_t *t, tcp_reasm_dir_t *d, uint32_t seq, const uint8_t *payload, size_t len, bool replace_first) {
+    if (len > sizeof(d->ooo[0].data)) { t->stats.ooo_dropped++; return; }
+    int slot = -1;
+    for (int i = 0; i < TCP_REASM_MAX_OOO_SEGMENTS; i++) {
+        if (!d->ooo[i].in_use) { slot = i; break; }
+        if (d->ooo[i].seq == seq) return;   /* a duplicate */
+    }
+    if (slot < 0) {
+        t->stats.ooo_dropped++;   /* the segment given up: the new one, or the one in slot 0 */
+        if (!replace_first) return;
+        slot = 0;
+    }
+    d->ooo[slot].in_use = true;
+    d->ooo[slot].seq = seq;
+    d->ooo[slot].len = (uint16_t)len;
+    memcpy(d->ooo[slot].data, payload, len);
 }
 
 tcp_reasm_table_t *tcp_reasm_create(uint32_t max_streams, size_t max_buffer_per_direction) {
@@ -133,7 +166,7 @@ static bool prepend_to_dir_buf(tcp_reasm_dir_t *d, size_t max_buf, const uint8_t
     return true;
 }
 
-static void process_ooo(tcp_stream_t *st, int dir_idx, size_t max_buf) {
+static void process_ooo(tcp_reasm_table_t *t, tcp_stream_t *st, int dir_idx, size_t max_buf) {
     tcp_reasm_dir_t *d = &st->dir[dir_idx];
     bool progress = true;
 
@@ -148,7 +181,7 @@ static void process_ooo(tcp_stream_t *st, int dir_idx, size_t max_buf) {
 
             if (seg->seq == d->next_seq) {
                 if (!append_to_dir_buf(d, max_buf, seg->data, seg->len)) {
-                    evict_stream(st);
+                    overflow_evict(t, st);
                     return;
                 }
                 d->next_seq += seg->len;
@@ -163,7 +196,7 @@ static void process_ooo(tcp_stream_t *st, int dir_idx, size_t max_buf) {
                     size_t overlap = (size_t)(d->next_seq - seg->seq);
                     size_t new_bytes = seg->len - overlap;
                     if (!append_to_dir_buf(d, max_buf, seg->data + overlap, new_bytes)) {
-                        evict_stream(st);
+                        overflow_evict(t, st);
                         return;
                     }
                     d->next_seq += (uint32_t)new_bytes;
@@ -180,7 +213,7 @@ static void process_ooo(tcp_stream_t *st, int dir_idx, size_t max_buf) {
                     if (SEQ_GE(end_seq, base_seq)) {
                         size_t new_prefix = (size_t)(base_seq - seg->seq);
                         if (!prepend_to_dir_buf(d, max_buf, seg->data, new_prefix)) {
-                            evict_stream(st);
+                            overflow_evict(t, st);
                             return;
                         }
                         if (SEQ_GT(end_seq, d->next_seq)) {
@@ -188,7 +221,7 @@ static void process_ooo(tcp_stream_t *st, int dir_idx, size_t max_buf) {
                             size_t new_suffix = seg->len - overlap;
                             d->next_seq += (uint32_t)new_suffix;
                             if (!append_to_dir_buf(d, max_buf, seg->data + overlap, new_suffix)) {
-                                evict_stream(st);
+                                overflow_evict(t, st);
                                 return;
                             }
                         }
@@ -204,7 +237,7 @@ static void process_ooo(tcp_stream_t *st, int dir_idx, size_t max_buf) {
                         size_t new_bytes = seg->len - overlap;
                         d->next_seq += (uint32_t)new_bytes;
                         if (!append_to_dir_buf(d, max_buf, seg->data + overlap, new_bytes)) {
-                            evict_stream(st);
+                            overflow_evict(t, st);
                             return;
                         }
                         seg->in_use = false;
@@ -220,18 +253,20 @@ static void process_ooo(tcp_stream_t *st, int dir_idx, size_t max_buf) {
     }
 }
 
-static void drain_dns_messages(tcp_stream_t *st, int dir_idx, tcp_reasm_message_cb cb, void *user_ctx) {
+static void drain_dns_messages(tcp_reasm_table_t *t, tcp_stream_t *st, int dir_idx, tcp_reasm_message_cb cb, void *user_ctx) {
     tcp_reasm_dir_t *d = &st->dir[dir_idx];
     while (d->buf_len >= 2) {
         uint16_t msg_len = ((uint16_t)d->buf[0] << 8) | d->buf[1];
-        if (msg_len < 12) {
-            // DNS message length in TCP must be at least 12 bytes (standard header).
-            // Do not drain; waiting for missing prefix segments or unaligned stream.
-            break;
-        }
+        /* A DNS message is at least its 12-byte header (RFC 1035 §4.1.1).  Before the first message the buffer may still lack
+         * its start (a segment to prepend), so it waits.  After one, the stream is in step: a shorter frame is skipped by its
+         * own length (RFC 7766 §8 framing) and counted (T1-L3), instead of stopping the direction for good. */
+        bool too_short = msg_len < 12;
+        if (too_short && !d->has_drained) break;
         if (d->buf_len < 2 + (size_t)msg_len) break;
 
-        if (cb) {
+        if (too_short) {
+            t->stats.short_frames++;
+        } else if (cb) {
             cb(user_ctx, st->stream_id, dir_idx, st->addr_key, st->port_key, d->buf + 2, (size_t)msg_len);
         }
         d->has_drained = true;
@@ -305,45 +340,22 @@ void tcp_reasm_feed(tcp_reasm_table_t *t, const pcap_l4_info_t *l4, tcp_reasm_me
         d->base_seq_known = true;
         d->next_seq = seq + (uint32_t)len;
         if (!append_to_dir_buf(d, t->max_buffer_per_direction, payload, len)) {
-            evict_stream(target_stream);
+            overflow_evict(t, target_stream);
             return;
         }
-        process_ooo(target_stream, direction, t->max_buffer_per_direction);
+        process_ooo(t, target_stream, direction, t->max_buffer_per_direction);
     } else {
         uint32_t base_seq = d->next_seq - (uint32_t)d->buf_len;
         if (seq == d->next_seq) {
             d->next_seq += (uint32_t)len;
             if (!append_to_dir_buf(d, t->max_buffer_per_direction, payload, len)) {
-                evict_stream(target_stream);
+                overflow_evict(t, target_stream);
                 return;
             }
-            process_ooo(target_stream, direction, t->max_buffer_per_direction);
+            process_ooo(t, target_stream, direction, t->max_buffer_per_direction);
         } else if (SEQ_GT(seq, d->next_seq)) {
             // Forward out-of-order segment
-            if (len <= sizeof(d->ooo[0].data)) {
-                int slot = -1;
-                for (int i = 0; i < TCP_REASM_MAX_OOO_SEGMENTS; i++) {
-                    if (!d->ooo[i].in_use) {
-                        slot = i;
-                        break;
-                    }
-                    if (d->ooo[i].seq == seq) {
-                        slot = -2; // Duplicate
-                        break;
-                    }
-                }
-                if (slot >= 0) {
-                    d->ooo[slot].in_use = true;
-                    d->ooo[slot].seq = seq;
-                    d->ooo[slot].len = (uint16_t)len;
-                    memcpy(d->ooo[slot].data, payload, len);
-                } else if (slot == -1) {
-                    d->ooo[0].in_use = true;
-                    d->ooo[0].seq = seq;
-                    d->ooo[0].len = (uint16_t)len;
-                    memcpy(d->ooo[0].data, payload, len);
-                }
-            }
+            ooo_store(t, d, seq, payload, len, true);
         } else if (SEQ_LT(seq, base_seq)) {
             // Segment starts before currently buffered window
             if (!d->has_drained) {
@@ -351,7 +363,7 @@ void tcp_reasm_feed(tcp_reasm_table_t *t, const pcap_l4_info_t *l4, tcp_reasm_me
                 if (SEQ_GE(end_seq, base_seq)) {
                     size_t new_prefix = (size_t)(base_seq - seq);
                     if (!prepend_to_dir_buf(d, t->max_buffer_per_direction, payload, new_prefix)) {
-                        evict_stream(target_stream);
+                        overflow_evict(t, target_stream);
                         return;
                     }
                     if (SEQ_GT(end_seq, d->next_seq)) {
@@ -359,25 +371,13 @@ void tcp_reasm_feed(tcp_reasm_table_t *t, const pcap_l4_info_t *l4, tcp_reasm_me
                         size_t new_suffix = len - overlap;
                         d->next_seq += (uint32_t)new_suffix;
                         if (!append_to_dir_buf(d, t->max_buffer_per_direction, payload + overlap, new_suffix)) {
-                            evict_stream(target_stream);
+                            overflow_evict(t, target_stream);
                             return;
                         }
                     }
-                    process_ooo(target_stream, direction, t->max_buffer_per_direction);
+                    process_ooo(t, target_stream, direction, t->max_buffer_per_direction);
                 } else {
-                    if (len <= sizeof(d->ooo[0].data)) {
-                        int slot = -1;
-                        for (int i = 0; i < TCP_REASM_MAX_OOO_SEGMENTS; i++) {
-                            if (!d->ooo[i].in_use) { slot = i; break; }
-                            if (d->ooo[i].seq == seq) { slot = -2; break; }
-                        }
-                        if (slot >= 0) {
-                            d->ooo[slot].in_use = true;
-                            d->ooo[slot].seq = seq;
-                            d->ooo[slot].len = (uint16_t)len;
-                            memcpy(d->ooo[slot].data, payload, len);
-                        }
-                    }
+                    ooo_store(t, d, seq, payload, len, false);
                 }
             } else {
                 // has_drained == true: Data before base_seq was already consumed.
@@ -387,10 +387,10 @@ void tcp_reasm_feed(tcp_reasm_table_t *t, const pcap_l4_info_t *l4, tcp_reasm_me
                     size_t new_bytes = len - overlap;
                     d->next_seq += (uint32_t)new_bytes;
                     if (!append_to_dir_buf(d, t->max_buffer_per_direction, payload + overlap, new_bytes)) {
-                        evict_stream(target_stream);
+                        overflow_evict(t, target_stream);
                         return;
                     }
-                    process_ooo(target_stream, direction, t->max_buffer_per_direction);
+                    process_ooo(t, target_stream, direction, t->max_buffer_per_direction);
                 }
             }
         } else {
@@ -400,15 +400,15 @@ void tcp_reasm_feed(tcp_reasm_table_t *t, const pcap_l4_info_t *l4, tcp_reasm_me
                 size_t new_bytes = len - overlap;
                 d->next_seq += (uint32_t)new_bytes;
                 if (!append_to_dir_buf(d, t->max_buffer_per_direction, payload + overlap, new_bytes)) {
-                    evict_stream(target_stream);
+                    overflow_evict(t, target_stream);
                     return;
                 }
-                process_ooo(target_stream, direction, t->max_buffer_per_direction);
+                process_ooo(t, target_stream, direction, t->max_buffer_per_direction);
             }
         }
     }
 
     if (target_stream->in_use) {
-        drain_dns_messages(target_stream, direction, cb, user_ctx);
+        drain_dns_messages(t, target_stream, direction, cb, user_ctx);
     }
 }

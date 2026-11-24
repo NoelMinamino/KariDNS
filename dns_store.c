@@ -683,6 +683,8 @@ struct store {
   _Atomic uint64_t n_reprobe_lock;                 /* probes made inside the writer mutex to confirm a refusal (store.space.reprobe_in_lock) */
   _Atomic uint64_t fs_total, fs_avail, fs_checked_unix;
   _Atomic uint32_t fs_blksize, fs_rec_warn;
+  uint32_t align_rs;                               /* 0.7 attach-align: COPY mode on ZFS, the record size the images are placed in (seg_align_pos()); 0 = not aligned */
+  _Atomic uint64_t n_align_pads, n_align_pad_bytes;   /* records placed at the next record boundary, and the bytes skipped for them (store.segment.align_pads, .align_pad_bytes) */
   _Atomic uint32_t space_level;
   _Atomic bool degraded;                           /* a write went to the KNOWN fallback and no image was stored since */
   uint64_t last_err_ms, last_warn_ms, nospc_since;
@@ -728,6 +730,7 @@ void (*_Atomic store_test_regrow_hook)(int step);
 void (*_Atomic store_test_commit_hook)(int step);
 void (*_Atomic store_test_prewrite_hook)(store_t *s);
 _Atomic bool store_test_no_flusher;
+_Atomic uint32_t store_test_align_rs;
 static void st_hook(void (*_Atomic *h)(int), int step) {
   void (*f)(int) = atomic_load_explicit(h, memory_order_acquire);
   if (f) f(step);
@@ -4430,11 +4433,27 @@ static void seg_pre_take(store_t *s, uint32_t n, seg_t *g) {
   if (old) retire_add_seg(s, old);                     /* (a reader or a commit may still hold it) */
   atomic_fetch_add_explicit(&s->n_seg_pre, 1, memory_order_relaxed);
 }
-/* A new segment is needed.  A segment made ahead by seg_pre_make() is taken when there is one: no file is made inside the mutex.  Else the file is made here, as before (store.segment.inline_creates). */
+/* 0.7 attach-align: on ZFS a read of an image reads (and decompresses) every record of the file that the image touches, and the ARC keeps whole records.  An image of 11 KB in
+ * records of 16 KB lay across a boundary in 68 % of the cases (1.5-1.6 records read per attach, 2026-11-24 profile): a record that would cross a boundary that it need not cross
+ * starts at that boundary instead, when the bytes skipped are at most a record / ST_ALIGN_GAP_DIV (bounded padding: a store of small zones, where a record crosses a boundary in
+ * a few percent of the cases and skips less than its own size, grows by a few percent of its logical size; the skipped bytes are never written, a hole the file system keeps
+ * for nothing or a run of zeros its compression removes).  The skipped bytes count as dead bytes of the segment (they are not a record).  Readers do not change: a record is
+ * where its cell says; the cleaner steps over the gap as over any bytes that are not a record. */
+#define ST_ALIGN_GAP_DIV 2
+static uint64_t seg_align_pos(const store_t *s, uint64_t used, uint64_t rlen) {
+  const uint64_t rs = s->align_rs;
+  if (rs == 0) return used;
+  const uint64_t o = used % rs, next = used - o + rs;
+  if (o == 0 || next - used > rs / ST_ALIGN_GAP_DIV) return used;
+  return (o + rlen + rs - 1) / rs > (rlen + rs - 1) / rs ? next : used;      /* (records read from here, from the boundary) */
+}
+
+/* A new segment is needed.  A segment made ahead by seg_pre_make() is taken when there is one: no file is made inside the mutex.  Else the file is made here, as before (store.segment.inline_creates).
+ * *used_out: where the record goes (the end of the open segment, or the next record boundary: seg_align_pos()). */
 static int seg_place(store_t *s, uint64_t rlen, uint32_t *cur_out, uint64_t *used_out) {
   jb_t *j = &s->jb;
   uint32_t cur = (uint32_t)jb_vget(s, j, V_CUR_SEG);
-  uint64_t used = cur ? jb_vget(s, j, V_SEG(cur, 0)) : 0;
+  uint64_t used = cur ? seg_align_pos(s, jb_vget(s, j, V_SEG(cur, 0)), rlen) : 0;
   if (cur == 0 || used + rlen > s->seg_size) {
     uint32_t nsegs = (uint32_t)jb_vget(s, j, V_NSEGS), n = 0, rsv, want = 0;
     seg_t *pg;
@@ -4462,7 +4481,7 @@ static int seg_place(store_t *s, uint64_t rlen, uint32_t *cur_out, uint64_t *use
     }
     if ((r = jb_vset(j, V_CUR_SEG, n)) < 0 || (r = jb_vset(j, V_SEG(n, 0), ST_SEGHDR)) < 0 || (r = jb_vset(j, V_SEG(n, 1), 0)) < 0) return r;
     cur = n;
-    used = ST_SEGHDR;
+    used = seg_align_pos(s, ST_SEGHDR, rlen);
     s->pre_asked = 0;
   }
   *cur_out = cur;
@@ -4475,6 +4494,11 @@ static int st_pwritev_all(int fd, const struct iovec *iov, int niov, uint64_t rl
  * (used, live) go into the builder */
 static int seg_note_append(store_t *s, uint32_t cur, uint64_t used, uint64_t rlen, uint64_t *loc) {
   jb_t *j = &s->jb;
+  const uint64_t end = jb_vget(s, j, V_SEG(cur, 0));
+  if (used > end) {                                   /* (seg_align_pos() moved it to a record boundary) */
+    atomic_fetch_add_explicit(&s->n_align_pads, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&s->n_align_pad_bytes, used - end, memory_order_relaxed);
+  }
   s->seg_dirty[cur] = 1;
   *loc = ((uint64_t)cur << ST_LOC_SHIFT) | (used / 64);
   space_used(s, rlen);
@@ -4574,7 +4598,7 @@ static int seg_append(store_t *s, uint32_t zid, uint16_t view, const uint8_t *fn
 typedef struct prew {
   seg_t *g;
   uint32_t cur, zid;
-  uint64_t used, rlen, prev_loc;
+  uint64_t used, rlen, prev_loc, end;            /* used: where the record is written; end: the end of the open segment it was placed after (seg_align_pos()) */
 } prew_t;
 static _Thread_local bool t_ap_held;                  /* this thread holds ap_mu (store_put(): the emergency cleaning inside it appends) */
 
@@ -4621,13 +4645,14 @@ static bool st_prewrite(store_t *s, uint16_t view, const char *name, size_t nlen
     zt_t t;
     zt_unpack(&rt, &t);
     const uint32_t cur = (uint32_t)VG(s, V_CUR_SEG);
-    const uint64_t used = cur ? VG(s, V_SEG(cur, 0)) : 0;
+    const uint64_t end = cur ? VG(s, V_SEG(cur, 0)) : 0, used = end >= ST_SEGHDR ? seg_align_pos(s, end, rlen) : end;
     seg_t *g = cur && used >= ST_SEGHDR && used + rlen <= s->seg_size && space_allow(s, rlen) == 0 ? seg_get(s, cur) : NULL;
     if (g) {
       p->g = g;
       p->cur = cur;
       p->zid = z;
       p->used = used;
+      p->end = end;
       p->rlen = rlen;
       p->prev_loc = t.state == STORE_STATE_STORED ? t.loc : 0;
       atomic_fetch_add_explicit(&s->io_hold, 1, memory_order_acq_rel);      /* (the segment's descriptor is not freed under the write, nor its seg_t reused: put_locked() compares it) */
@@ -4777,7 +4802,7 @@ static int put_locked(store_t *s, uint16_t view, const char *name, size_t nlen, 
     const prew_t *p = s->prew;                       /* (store_put(): the record may be in place already, written before the mutex) */
     s->prew = NULL;
     const uint64_t prev = exists && ot.state == STORE_STATE_STORED ? ot.loc : 0;
-    if (p && exists && p->zid == nz && p->prev_loc == prev && p->rlen == st_reclen(nlen, ilen) && jb_vget(s, j, V_CUR_SEG) == p->cur && jb_vget(s, j, V_SEG(p->cur, 0)) == p->used &&
+    if (p && exists && p->zid == nz && p->prev_loc == prev && p->rlen == st_reclen(nlen, ilen) && jb_vget(s, j, V_CUR_SEG) == p->cur && jb_vget(s, j, V_SEG(p->cur, 0)) == p->end &&
         atomic_load_explicit(&s->segs[p->cur], memory_order_acquire) == p->g) {
       rlen = p->rlen;
       r = seg_note_append(s, p->cur, p->used, rlen, &loc);
@@ -5144,6 +5169,11 @@ static int cl_step_locked(store_t *s, uint64_t *quota, unsigned nrec_max, store_
     if (!hp) { s->cl_off = off + 64; continue; }
     rhdr_t h;
     memcpy(&h, hp, sizeof(h));
+    if (h.magic == 0 && s->align_rs) {                    /* (the gap before a record boundary, seg_align_pos(): not a record, and not one of the records this slice may look at) */
+      looked--;
+      s->cl_off = off + 64;
+      continue;
+    }
     if (h.magic != ST_MAGIC_REC || h.reclen < ST_RHDR || (h.reclen & 63u) || off + h.reclen > used) { s->cl_off = off + 64; continue; }       /* (not a record: look at the next 64 bytes) */
     const uint64_t rlen = h.reclen, loc = loc_of(S, off);
     r64_t rt, rc;
@@ -6857,6 +6887,9 @@ void store_stats(const store_t *s, store_stats_t *o) {
   o->reserve_bytes = s->reserve_bytes;
   o->fs_blksize = atomic_load_explicit(&s->fs_blksize, memory_order_relaxed);
   o->fs_recordsize_warn = atomic_load_explicit(&s->fs_rec_warn, memory_order_relaxed) != 0;
+  o->align_rs = s->align_rs;
+  o->align_pads = atomic_load_explicit(&s->n_align_pads, memory_order_relaxed);
+  o->align_pad_bytes = atomic_load_explicit(&s->n_align_pad_bytes, memory_order_relaxed);
   o->space_level = atomic_load_explicit(&s->space_level, memory_order_relaxed);
   o->store_bytes = atomic_load_explicit(&s->store_bytes, memory_order_relaxed);
   o->growth_bytes_per_hour = atomic_load_explicit(&s->growth_bph, memory_order_relaxed);
@@ -7687,6 +7720,19 @@ static void ra_stop_join(store_t *s) {
 /* ZFS: a segment is read in records of the dataset's record size; with the default of 128 KiB every attach would read and decompress 128 KiB for a zone of about a kilobyte (S0 Z1:
  * 50 us from the ARC against 6-10 us at 8 / 16 KiB).  st_blksize of a table file is the record size there. */
 static void fs_open_checks(store_t *s) {
+  /* 0.7 attach-align: the record size of the dataset (statfs f_iosize on ZFS; st_blksize of a file smaller than a record is the file's size), for seg_align_pos(): COPY mode on ZFS only (MAP and UFS read pages) */
+  {
+    uint32_t rs = 0;
+    const uint32_t forced = atomic_load_explicit(&store_test_align_rs, memory_order_relaxed);
+    struct statfs sfs;
+    if (forced) rs = forced == UINT32_MAX ? 0 : forced;
+    else if (strcmp(s->fstype, "zfs") == 0 && s->mode == STORE_MODE_COPY && fstatfs(s->dirfd, &sfs) == 0 && sfs.f_iosize >= 4096 && sfs.f_iosize <= (1 << 20) &&
+             (sfs.f_iosize & (sfs.f_iosize - 1)) == 0)
+      rs = (uint32_t)sfs.f_iosize;
+    if ((uint64_t)rs * 16 > s->seg_size) rs = 0;                  /* (a record that is a large part of a segment: aligning would only end segments early) */
+    if (s->o.no_align) rs = 0;                                    /* (`store-align no`) */
+    s->align_rs = rs;
+  }
   struct stat st;
   if (s->zt.fd < 0 || fstat(s->zt.fd, &st) != 0) return;
   atomic_store_explicit(&s->fs_blksize, (uint32_t)st.st_blksize, memory_order_relaxed);

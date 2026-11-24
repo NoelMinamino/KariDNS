@@ -2904,7 +2904,7 @@ static void park_ask(park_table_t *pt, int widx, int32_t pi, const park_plan_t *
       park_entry_attach_zid(e, sv, pel->zid);               /* (a store thread that cannot name the zone says it by the id) */
       const int c = park_att_claim_tag(sv, pel->zid, widx, e->key);          /* (the key of the zone this query waits for: a store thread that finds another zone under the id wakes the waiters, dns_db_store.c att_take()) */
       if (c == 0) return;                                /* (the request of another worker's claim is in a ring: this entry is woken with it) */
-      if (park_attach_zid(widx, sv, pel->zid)) park_att_requested(sv, pel->zid);
+      if (c > 0 ? park_attach_claimed(widx, sv, pel->zid) : park_attach_zid(widx, sv, pel->zid)) park_att_requested(sv, pel->zid);      /* (with the claim: a store thread drops the request unread once every worker of the claim has left it) */
       else park_pending_set(pt, e, PARK_PEND_ATTACH_ZID, ((uint64_t)sv << 32) | pel->zid, (uint8_t)widx);
     } else if (!park_attach_request_any(pp->hv, pp->name)) {
       park_pending_set(pt, e, PARK_PEND_ATTACH_NAME, 0, 0);
@@ -2924,7 +2924,9 @@ static void park_ask_again(park_table_t *pt, int widx) {
     case PARK_PEND_ATTACH_ZID: {
       const uint16_t sv = (uint16_t)(e->preq >> 32);
       const uint32_t zid = (uint32_t)e->preq;
-      ok = park_attach_zid(widx, sv, zid);
+      uint32_t set;
+      bool req;
+      ok = park_att_peek(sv, zid, &set, &req) ? park_attach_claimed(widx, sv, zid) : park_attach_zid(widx, sv, zid);     /* (the claim the entry made or joined, unless there was no room for one) */
       if (ok) park_att_requested(sv, zid);
       break;
     }
@@ -3538,6 +3540,7 @@ void *worker_thread_func(void *arg) {
       park_on = kevent(kq, &ev_park, 1, NULL, 0, NULL) == 0;
       if (park_on) {
         park_register_worker(ctx->thread_id, kq);
+        park_set_worker(&park, ctx->thread_id);
         t_park_tbl = &park;
       }
     }
@@ -4751,6 +4754,7 @@ STATIC_TEST void collect_restart_only_changes(const server_config_t *o, const se
     if (o->database.store_threads != n->database.store_threads) append_list_item(buf, sz, "database store-threads");
     if (o->database.store_max_zones != n->database.store_max_zones) append_list_item(buf, sz, "database store-max-zones");
     if (o->database.store_hot_list != n->database.store_hot_list) append_list_item(buf, sz, "database store-hot-list");
+    if (o->database.store_align != n->database.store_align) append_list_item(buf, sz, "database store-align");
   }
 }
 
@@ -7031,6 +7035,20 @@ void *control_thread_func(void *arg) {
 
 /* One UDP socket buffer: sockbuf_set() asks for `want`; the log says what it got and, when that is less, why and which sysctl to set (the sizes are also shown by
  * karictl ipcstats, sockbuf_note()).  `what` is the option's name in the message, `knob` the configuration statement. */
+/* 0.7 (small-VPS defaults, user 2026-11-24): were udp-recvbuf-size / udp-sndbuf-size written?  Set by udp_buf_sizes() for the sockets made after it.  A size the
+ * kernel does not give is a WARNING when the operator asked for it, a NOTICE for the default: a stock FreeBSD (kern.ipc.maxsockbuf 2 MB) gives about 1.8 MB of the
+ * 4M default, and five WARNING lines at every start of a small host said nothing the operator had done wrong. */
+static bool g_udp_buf_set[2];   /* [0] receive, [1] send */
+STATIC_TEST int sockbuf_short_level(bool written) { return written ? LOG_WARNING : LOG_NOTICE; }
+
+/* the sizes asked for the UDP sockets and the queues between the routers and the workers: the configuration's, else 4M (one place for the three users) */
+static void udp_buf_sizes(const server_config_t *cfg, int *rcv, int *snd) {
+  *rcv = cfg && cfg->udp_recvbuf_size > 0 ? cfg->udp_recvbuf_size : 4 * 1024 * 1024;
+  *snd = cfg && cfg->udp_sndbuf_size > 0 ? cfg->udp_sndbuf_size : 4 * 1024 * 1024;
+  g_udp_buf_set[0] = cfg && cfg->udp_recvbuf_set;
+  g_udp_buf_set[1] = cfg && cfg->udp_sndbuf_set;
+}
+
 static void udp_sockbuf_one(int fd, int opt, int want, const char *what, const char *knob) {
   int err = 0;
   const int got = sockbuf_set(fd, opt, want, &err);
@@ -7042,8 +7060,9 @@ static void udp_sockbuf_one(int fd, int opt, int want, const char *what, const c
     return;
   }
   const long long mx = sockbuf_maxsockbuf();
-  syslog(LOG_WARNING, "[Network] WARNING: UDP %s: asked %d, got %d (limited by kern.ipc.maxsockbuf=%lld; set it to %lu to get %d, or lower %s); a full socket buffer loses %s",
-         what, want, got, mx, sockbuf_maxsockbuf_for((unsigned long)want), want, knob, opt == SO_RCVBUF ? "queries" : "replies");
+  const bool written = g_udp_buf_set[opt == SO_RCVBUF ? 0 : 1];
+  syslog(sockbuf_short_level(written), "[Network] %s: UDP %s: asked %d%s, got %d (limited by kern.ipc.maxsockbuf=%lld; set it to %lu to get %d, or lower %s); a full socket buffer loses %s",
+         written ? "WARNING" : "NOTICE", what, want, written ? "" : " (the default)", got, mx, sockbuf_maxsockbuf_for((unsigned long)want), want, knob, opt == SO_RCVBUF ? "queries" : "replies");
 }
 
 void setup_udp_socket_buffers(int fd, int desired_rcv, int desired_snd) {
@@ -7141,8 +7160,8 @@ int open_router_udp_sockets(server_config_t *cfg, int out_fds[MAX_BIND_ADDRS], b
 int open_router_udp_sockets_given(server_config_t *cfg, int n_given, int out_fds[MAX_BIND_ADDRS], bool out_is_wildcard[MAX_BIND_ADDRS], router_src_t out_src[MAX_BIND_ADDRS]) {
   int num_fds = n_given > 0 ? (n_given < MAX_BIND_ADDRS ? n_given : MAX_BIND_ADDRS) : 0;
   int opt = 1;
-  int rcvbuf_size = cfg->udp_recvbuf_size > 0 ? cfg->udp_recvbuf_size : 4 * 1024 * 1024;
-  int sndbuf_size = cfg->udp_sndbuf_size > 0 ? cfg->udp_sndbuf_size : 4 * 1024 * 1024;
+  int rcvbuf_size, sndbuf_size;
+  udp_buf_sizes(cfg, &rcvbuf_size, &sndbuf_size);
 
   for (int i = 0; n_given < 0 && i < cfg->listen_count; i++) {
     const listen_addr_t *la = &cfg->listen[i];
@@ -7307,8 +7326,8 @@ bool be_udp_budget(int workers, int addrs, int routers, long long nofile, char *
  * (udp_listen_socket()); close-on-exec, nothing is executed with them.  A family the host does not have skips the address (as the routers do);
  * any other failure, or a bind that fails, refuses the start (err).  Sets g_be_udp_count, g_be_udp_wild, g_be_udp_src. */
 bool open_backend_udp_sockets(server_config_t *cfg, int num_workers, char *err, size_t errlen) {
-  const int rcvbuf_size = cfg->udp_recvbuf_size > 0 ? cfg->udp_recvbuf_size : 4 * 1024 * 1024;
-  const int sndbuf_size = cfg->udp_sndbuf_size > 0 ? cfg->udp_sndbuf_size : 4 * 1024 * 1024;
+  int rcvbuf_size, sndbuf_size;
+  udp_buf_sizes(cfg, &rcvbuf_size, &sndbuf_size);
   int a = 0;
   g_be_udp_count = 0;
   for (int i = 0; i < cfg->listen_count && a < MAX_BIND_ADDRS; i++) {
@@ -8117,12 +8136,14 @@ STATIC_TEST bool daemonize(void) {
  * net.local.dgram.*) is counted; setup_ipc_tables() logs one warning for all of them. */
 static int g_ipc_buf_short;
 static int g_ipc_buf_asked, g_ipc_buf_got, g_ipc_buf_err;
+static bool g_ipc_buf_written;    /* 0.7: a short one was a size the configuration wrote (udp-recvbuf-size / udp-sndbuf-size): WARNING, else NOTICE */
 static void ipc_set_buf(int fd, int opt, int size, bool queue) {
   int err = 0;
   const int got = sockbuf_set(fd, opt, size, &err);          /* the size asked for, or the most the kernel takes (sockbuf_set()) */
   if (queue) sockbuf_note(SOCKBUF_IPC, opt == SO_RCVBUF ? 0 : 1, size, got);
   if (got < size) {
     g_ipc_buf_short++;
+    if (queue && g_udp_buf_set[opt == SO_RCVBUF ? 0 : 1]) g_ipc_buf_written = true;
     g_ipc_buf_asked = size;
     g_ipc_buf_got = got;
     g_ipc_buf_err = err;
@@ -8132,14 +8153,15 @@ static void ipc_set_buf(int fd, int opt, int size, bool queue) {
 STATIC_TEST void setup_ipc_tables(int num_workers) {
   g_num_workers = num_workers;
   g_ipc_buf_short = 0;
+  g_ipc_buf_written = false;
   ipcd_init();   /* (before the Backend and the routers are forked: they share the counters) */
   /* B3 phase 3: the packed replies of a worker stay under the kernel's limit of one unix datagram (a larger one is EMSGSIZE whatever the buffers
    * are); 64 KiB at most, the size of the router's receive buffers.  Read here, before the fork: the Backend inherits it. */
   const long long maxdgram = sysctl_num("net.local.dgram.maxdgram");
   g_ipc_pack_max = maxdgram >= (long long)(sizeof(udp_ipc_t) + DNS_HEADER_SIZE) ? (maxdgram < 65536 ? (size_t)maxdgram : 65536) : UDP_IPC_PACK_DEFAULT;
   server_config_t *cfg = &g_config_db.config_a;
-  int rcvbuf_size = (cfg && cfg->udp_recvbuf_size > 0) ? cfg->udp_recvbuf_size : 4 * 1024 * 1024;
-  int sndbuf_size = (cfg && cfg->udp_sndbuf_size > 0) ? cfg->udp_sndbuf_size : 4 * 1024 * 1024;
+  int rcvbuf_size, sndbuf_size;
+  udp_buf_sizes(cfg, &rcvbuf_size, &sndbuf_size);
 
   for (int f = 0; f < g_num_frontend_routers; f++) {
     for (int w = 0; w < num_workers; w++) {
@@ -8187,11 +8209,11 @@ STATIC_TEST void setup_ipc_tables(int num_workers) {
   ipc_set_buf(g_notify_ipc[1], SO_RCVBUF, nbufsize, false);
   ipc_set_buf(g_notify_ipc[1], SO_SNDBUF, nbufsize, false);
   if (g_ipc_buf_short > 0)
-    syslog(LOG_WARNING, "[IPC] WARNING: %d socket buffer setting(s) between the routers and the workers did not get the size asked for (last: asked %d, got %d%s%s; limited by "
+    syslog(sockbuf_short_level(g_ipc_buf_written), "[IPC] %s: %d socket buffer setting(s) between the routers and the workers did not get the size asked for (last: asked %d%s, got %d%s%s; limited by "
                         "kern.ipc.maxsockbuf=%lld; set it to %lu to get %d, or lower udp-recvbuf-size / udp-sndbuf-size).  A queue that is too small drops queries and replies when a "
                         "worker is busy (counted: karictl ipcstats).  net.local.dgram.recvspace=%lld is what a socket keeps when the kernel could not enlarge it; "
                         "net.local.dgram.maxdgram=%lld limits one message",
-           g_ipc_buf_short, g_ipc_buf_asked, g_ipc_buf_got, g_ipc_buf_err ? ", setsockopt: " : "", g_ipc_buf_err ? strerror(g_ipc_buf_err) : "",
+           g_ipc_buf_written ? "WARNING" : "NOTICE", g_ipc_buf_short, g_ipc_buf_asked, g_ipc_buf_written ? "" : " (the default)", g_ipc_buf_got, g_ipc_buf_err ? ", setsockopt: " : "", g_ipc_buf_err ? strerror(g_ipc_buf_err) : "",
            sockbuf_maxsockbuf(), sockbuf_maxsockbuf_for((unsigned long)g_ipc_buf_asked), g_ipc_buf_asked,
            sysctl_num("net.local.dgram.recvspace"), sysctl_num("net.local.dgram.maxdgram"));
   cap_rights_t n_rights_0, n_rights_1;

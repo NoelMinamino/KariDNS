@@ -119,6 +119,7 @@ for b in "$ZONE" "$KARICHECK" "$KARICTL"; do [ -x "$b" ] || { echo "SKIP: $b is 
 cp "$ZONE" "$T/karidns-zone" && cp "$KARICHECK" "$T/karicheck" && cp "$KARICTL" "$T/karictl" && chmod 755 "$T/karidns-zone" "$T/karicheck" "$T/karictl"      # (the rc script part runs the service as another user: the binaries must be where it can enter)
 DB=$T/zones.sqlite3
 sqlite3 "$DB" < tests/db/pdns_schema.sqlite3.sql > /dev/null && sqlite3 "$DB" < db/karidns_ext.sqlite3.sql > /dev/null || { bad "cannot make the zone file"; done_; }
+chmod 600 "$DB"     # the file holds the signing keys: the signer refuses one that other users can read (0.7 review W1-L3)
 : > "$T/karictl.conf"
 CONF=$T/karidns-signer.conf
 WORK=$T/work

@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { EventEmitter } from 'node:events';
 import { parseConfig } from '../lib/config.js';
-import { parseArgs, checkSetup, openDb, main, USAGE, VERSION, DEFAULT_CONFIG, sqliteModeWarning } from '../lib/cli.js';
+import { parseArgs, checkSetup, openDb, main, USAGE, VERSION, DEFAULT_CONFIG, sqliteModeProblem } from '../lib/cli.js';
 import { loadSqlite } from '../../node/lib/sqlite.js';
 import { readPrivateFile } from '../../node/lib/conf.js';
 
@@ -82,16 +82,21 @@ test('--check: the tools, the files; nothing is changed', async () => {
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
-test('--check: a SQLite3 file other users can read is a warning (audit M8)', async () => {
+test('--check: a SQLite3 file other users can read is a problem (audit M8; refused since 0.7, review W1-L3)', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ks-cli-'));
   try {
     fs.writeFileSync(path.join(dir, 'p.sqlite3'), '');
     const r = await checkSetup(parseConfig(GOOD(dir)), { run: fakeRun().run, st: { work: goodStat, sqlite: () => ({ mode: 0o100604 }) } });
-    assert.deepEqual(r.problems, []);
-    assert.deepEqual(r.warnings, [`sqlite-file ${path.join(dir, 'p.sqlite3')} has mode 0604: other users can read the signing keys in it; remove their access (chmod o-rwx)`]);
+    const f = path.join(dir, 'p.sqlite3');
+    assert.deepEqual(r.problems, [`sqlite-file ${f} has mode 0604: other users can read the signing keys in it; remove their access: chmod o-rwx ${f}`]);
+    assert.deepEqual(r.warnings, []);
     assert.ok(!r.notes.some((n) => /^sqlite-file /.test(n)));
-    // a file that cannot be examined: no warning here (the start and access() report it)
-    assert.equal(sqliteModeWarning('/nonexistent/p.sqlite3'), null);
+    // group access is the documented setup (the loader reads the file through a group)
+    const g = await checkSetup(parseConfig(GOOD(dir)), { run: fakeRun().run, st: { work: goodStat, sqlite: () => ({ mode: 0o100660 }) } });
+    assert.deepEqual(g.problems, []);
+    assert.ok(g.notes.includes(`sqlite-file ${f}: fine`));
+    // a file that cannot be examined: nothing here (the start and access() report it)
+    assert.equal(sqliteModeProblem('/nonexistent/p.sqlite3'), null);
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -214,11 +219,14 @@ test('openDb: SQLite3 and PostgreSQL', async () => {
     raw.exec(fs.readFileSync(new URL('../../db/karidns_ext.sqlite3.sql', import.meta.url), 'utf8'));
     raw.close();
     const warned = [];
-    const db = await openDb(parseConfig(`database = sqlite3\nsqlite-file = ${file}\nkarictl-config = /k`), { importSqlite: async () => sqlite, warn: (m) => warned.push(m), statSqlite: () => ({ mode: 0o100644 }) });
+    const sqConf = parseConfig(`database = sqlite3\nsqlite-file = ${file}\nkarictl-config = /k`);
+    // audit M8 (0.6.2), review W1-L3 (0.7): the file holds the signing keys; access for others is refused at the start (and by --check); it was a warning before
+    await assert.rejects(openDb(sqConf, { importSqlite: async () => sqlite, warn: (m) => warned.push(m), statSqlite: () => ({ mode: 0o100644 }) }),
+      { message: `sqlite-file ${file} has mode 0644: other users can read the signing keys in it; remove their access: chmod o-rwx ${file}` });
+    const db = await openDb(sqConf, { importSqlite: async () => sqlite, warn: (m) => warned.push(m), statSqlite: () => ({ mode: 0o100640 }) });
     assert.equal(typeof db.dueZones, 'function');
     db.close();
-    // audit M8 (0.6.2): the file holds the signing keys; access for others is warned at the start (and by --check)
-    assert.deepEqual(warned, [`sqlite-file ${file} has mode 0644: other users can read the signing keys in it; remove their access (chmod o-rwx)`]);
+    assert.deepEqual(warned, []);
     // PostgreSQL: a conninfo file that is not acceptable, then one that is
     const cfg = parseConfig('database = pg\nconninfo-file = /ci\nschema = ks');
     await assert.rejects(openDb(cfg, { readPrivate: () => { throw new Error('/ci has mode 0644, it must be 0600 or 0400'); } }), /mode 0644/);

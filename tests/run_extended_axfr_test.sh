@@ -232,6 +232,7 @@ key "karictl" {
     secret "$SECRET";
 };
 EOF
+chmod 600 "$TMP_DIR/karictl.conf"   # karictl refuses a karictl.conf with the secret that others can read
 
 echo "=== Starting Master on Port $PORT1 and Secondary on Port $PORT2 ==="
 "$KARIDNS" -f "$TMP_DIR/master.conf" > "$TMP_DIR/master.log" 2>&1 &

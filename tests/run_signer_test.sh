@@ -63,8 +63,8 @@ mkdir "$T/db" "$T/work"; chmod 700 "$T/work"
 [ $SERVER = 1 ] && { chown nobody "$T/db"; chmod 777 "$T/db"; }
 DB="$T/db/p.sqlite3"
 sqlite3 "$DB" < tests/db/pdns_schema.sqlite3.sql > /dev/null && sqlite3 "$DB" < db/karidns_ext.sqlite3.sql || { echo "  [FAIL] cannot create the schema"; exit 1; }
-[ $SERVER = 1 ] && chmod 666 "$DB"
-dbq() { sqlite3 "$DB" "$1"; _rc=$?; [ $SERVER = 1 ] && chmod 666 "$DB"* 2>/dev/null; return $_rc; }
+kari_share_sqlite "$DB"
+dbq() { sqlite3 "$DB" "$1"; _rc=$?; kari_share_sqlite "$DB"*; return $_rc; }
 asu() { "$@"; }
 ZONE_BIN="$ROOT/karidns-zone"
 ZI="$ZONE_BIN"

@@ -138,6 +138,12 @@ static uint32_t word_swap(uint8_t *p, unsigned neww) {   /* write the word, retu
 
 static uint16_t csum_update(unsigned hc, uint32_t acc) { return (uint16_t)~dq_csum_fold((uint32_t)(uint16_t)~hc + acc); }
 
+int dq_frame_cap_check(size_t cap, const char *what, char *err, size_t errlen) {
+    if (cap >= DQ_FRMAX) return 0;
+    snprintf(err, errlen, "%s: buffers of %zu bytes are smaller than the largest query frame (%u bytes)", what, cap, (unsigned)DQ_FRMAX);
+    return -1;
+}
+
 size_t dq_frame_emit(uint8_t *dst, size_t cap, const dq_fsend_t *s, bool v6, uint16_t sport) {
     unsigned hlen = v6 ? 62 : 42;
     if (cap < s->flen || s->flen < hlen + 12) return 0;

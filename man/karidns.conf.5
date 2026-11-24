@@ -1,4 +1,4 @@
-.TH KARIDNS.CONF 5 "2026-11-23" "KariDNS" "KariDNS Manual"
+.TH KARIDNS.CONF 5 "2026-11-24" "KariDNS" "KariDNS Manual"
 .\" Generated from docs/karidns.md by man/md2man.pl (make man): edit the Markdown manual, not this page.
 .SH NAME
 karidns.conf \- the configuration file of karidns(8)
@@ -356,10 +356,12 @@ kernel refuses a request above its limit instead of clipping it\fR: the limit is
 \fBkern.ipc.maxsockbuf\fR, which is 2 MiB on a stock FreeBSD, so the \fB4M\fR
 default is refused there. Since 0.7 the server then asks for the most the kernel
 takes (about 1.8 MB on a stock system; the socket never gets less than it had)
-and logs a \fBWARNING\fR at start-up: \fB[IPC] WARNING: ... asked N, got M
-(limited by kern.ipc.maxsockbuf=X; set it to Y to get N, or lower
-udp\-recvbuf\-size / udp\-sndbuf\-size)\fR and, for each UDP socket,
-\fB[Network] WARNING: UDP SO_RCVBUF: asked N, got M (limited by
+and logs it at start-up, as a \fBNOTICE\fR when the size is the default (not
+written: \fBasked N (the default), got M ...\fR) and as a \fBWARNING\fR when
+\fBudp\-recvbuf\-size\fR / \fBudp\-sndbuf\-size\fR asked for it (0.7, #256):
+\fB[IPC] WARNING: ... asked N, got M (limited by kern.ipc.maxsockbuf=X; set it
+to Y to get N, or lower udp\-recvbuf\-size / udp\-sndbuf\-size)\fR and, for each
+UDP socket, \fB[Network] WARNING: UDP SO_RCVBUF: asked N, got M (limited by
 kern.ipc.maxsockbuf=X; set it to Y to get N ...)\fR. To get the full size set
 the sysctl to Y (\fBsysctl kern.ipc.maxsockbuf=8388608\fR, and in
 \fB/etc/sysctl.conf\fR) or write a size that fits. Before 0.7 the refused
@@ -3798,12 +3800,14 @@ they do not wait: one that finds none is dropped, counted as
 \fBrate=unlimited\fR or \fBrate=N/s\fR. Since 0.6.2 a loader thread reads about
 4,400 zones per second (SQLite3, 1M zones of 11 records, 8 vCPU).
 .TP 8
-\fBmemory\-limit <size>;\fR
-\fIDefault:\fR none
+\fBmemory\-limit <size>;\fR \fBmemory\-limit unlimited;\fR
+\fIDefault:\fR with the zone store: half of the RAM above 256 MB, at least
+\fB64M\fR (0.7.x); without the store: none
 .br
 \fIDescription:\fR D1a: how much memory the zones of the database may hold;
-zones that do not fit are read when a query needs them and taken out again. See
-"Memory limit" below.
+zones that do not fit are read when a query needs them and taken out
+again. \fBunlimited\fR keeps every zone in memory (what an unset
+\fBmemory\-limit\fR did before 0.7.x). See "Memory limit" below, "The default".
 .TP 8
 \fBloader\-state\-file "<path>";\fR
 \fIDefault:\fR none
@@ -3889,8 +3893,23 @@ them read more at once (a few per disk queue: the disk of the measurements gave
 5,200 reads a second at depth 1 and 38,700 at depth 16); a thread that has
 nothing to do costs nothing. Before 0.7.0 the default was 2. In MAP mode a query
 for a stored zone whose image is in the page cache does not wait for them at all
-(see "Attach on the worker" below). One more thread writes the zones to the
-store.
+(see "Attach on the worker" below). When more first touches are asked for than
+they attach (a flood of random names, a small \fBmemory\-limit\fR), the answers
+stay near what they attach instead of falling: a request whose queries have all
+ended at \fBpark\-timeout\fR is dropped unread, and while the oldest request
+waits more than 400 ms the newest are taken first (one take in eight the
+oldest), so that the answers go to clients that still wait (0.7; \fBkarictl
+store\fR \fBstore.attach.shed\fR, \fB.newest_first\fR). One more thread writes
+the zones to the store.
+.TP 8
+\fBstore\-align <yes|no>;\fR
+\fIDefault:\fR \fByes\fR
+.br
+\fIDescription:\fR 0.7, restart-only: in COPY mode on ZFS an image that would
+lie across a record boundary of the dataset that it need not cross starts at the
+boundary, when that skips at most half a record, so that an attach reads one
+record (see "Images aligned to the record" under "The zone store"); \fBno\fR
+appends every image where the last one ended (less disk for large zones)
 .TP 8
 \fBstore\-hot\-list <yes|no>;\fR
 \fIDefault:\fR \fByes\fR
@@ -3975,9 +3994,11 @@ entry of the park table, makes the server read nothing and learns nothing about
 the zone. DoT and DoH, which do not park, answer SERVFAIL + EDE 14 for such a
 zone (REFUSED for a client that may not ask). A DB zone's own settings cannot
 contain \fBallow\-query\fR, so for a zone out of memory the view's and options'
-statements decide. Without \fBmemory\-limit\fR nothing takes a zone out of
-memory, so no query parks and these options change nothing (see "Memory limit"
-below and \fBkaridns\-dbloader(8)\fR, "The fetch stream").
+statements decide. With no limit in force (\fBmemory\-limit unlimited\fR, or
+none written without the zone store; 0.7: with the store an unset
+\fBmemory\-limit\fR is the default from the RAM) nothing takes a zone out of
+memory, so no query parks for that and these options change nothing (see "Memory
+limit" below and \fBkaridns\-dbloader(8)\fR, "The fetch stream").
 .PP
 | \fBserver\-id "<id>";\fR | the host name | postgresql (milestone B11): the
 name under which this server writes its row of \fBkaridns_server_status\fR
@@ -4483,34 +4504,77 @@ keys and \fBacl\-ceiling\fR, the views a zone is mapped to, and the zones of
 checks"). \fBkaricheck conf\fR still checks the block without a connection.
 .SS Memory limit (D1a)
 \fBdatabase { memory\-limit <size>; }\fR (\fBK\fR, \fBM\fR, \fBG\fR suffixes, 1M
-to 1024G; unset = no limit, every database zone stays in memory and nothing in
-this section applies) is a target for what the zones of the database hold in
-memory, not a hard limit: the versions in use, the previous versions kept for
-rollback, \fBand\fR the ones that were replaced or taken out but are not freed
-yet -- except, since 0.7, retired versions that a reader or a transfer holds
-(\fBheld\fR, see below): taking zones out cannot free them, so they are not
-weighed against the limit. Since 0.7 it counts what a zone holds while it is in
-memory: its version (the image and the glue block, each at the size the
-allocator really holds, not the size asked for), the IXFR differences, \fBand
-what the zone's entry costs by itself\fR -- the entry (about 0.65 KB with the
-allocator's rounding), the lock it makes (about 0.1 KB on FreeBSD) and, for a
-database zone, its settings block: about 0.85 KB per zone, which is about 40% of
-a zone of eleven records (before 0.7 the limit counted only the version and the
-image, 1.3 KB of the 3.2 KB such a zone needs). The entry's share is counted
-with the zone's first version and goes with it when the zone is taken out of
-memory. It does not count the directory (every zone of the database, about 0.45
-KB each, listed by \fBkarictl dbstatus\fR), the park tables or the loader's
-process. \fBWith the zone store it also counts the store's tables (0.7):\fR the
-pages of \fBzt\fR, \fBzc\fR, \fBnx\fR, \fBix\fR and \fBsx\fR that the server
-changed since it started are memory of the process that the kernel cannot drop
-(see "The tables in memory" under the zone store), about 200 bytes a stored zone
-once every page has been written (a first fill writes them all: about 1.8 GB at
-10 million zones), shown as \fBstore.tables.private_bytes\fR by \fBkarictl
-store\fR; the zones in memory get the limit less those bytes, and at least a
-tenth of the limit. Raise \fBmemory\-limit\fR by that much when you move to the
-store; a WARNING says so (at most once an hour) while the tables hold half of
-the limit or more. A reload of \fBkaridns.conf\fR changes it: within 50 ms when
-a limit is set, within a second when there was none.
+to 1024G, or \fBunlimited\fR: no limit, every database zone stays in memory and
+nothing in this section applies; unset = the default below) is a target for what
+the zones of the database hold in memory, not a hard limit: the versions in use,
+the previous versions kept for rollback, \fBand\fR the ones that were replaced
+or taken out but are not freed yet -- except, since 0.7, retired versions that a
+reader or a transfer holds (\fBheld\fR, see below): taking zones out cannot free
+them, so they are not weighed against the limit. Since 0.7 it counts what a zone
+holds while it is in memory: its version (the image and the glue block, each at
+the size the allocator really holds, not the size asked for), the IXFR
+differences, \fBand what the zone's entry costs by itself\fR -- the entry (about
+0.65 KB with the allocator's rounding), the lock it makes (about 0.1 KB on
+FreeBSD) and, for a database zone, its settings block: about 0.85 KB per zone,
+which is about 40% of a zone of eleven records (before 0.7 the limit counted
+only the version and the image, 1.3 KB of the 3.2 KB such a zone needs). The
+entry's share is counted with the zone's first version and goes with it when the
+zone is taken out of memory. It does not count the directory (every zone of the
+database, about 0.45 KB each, listed by \fBkarictl dbstatus\fR), the park tables
+or the loader's process. \fBWith the zone store it also counts the store's
+tables (0.7):\fR the pages of \fBzt\fR, \fBzc\fR, \fBnx\fR, \fBix\fR and
+\fBsx\fR that the server changed since it started are memory of the process that
+the kernel cannot drop (see "The tables in memory" under the zone store), about
+200 bytes a stored zone once every page has been written (a first fill writes
+them all: about 1.8 GB at 10 million zones), shown as
+\fBstore.tables.private_bytes\fR by \fBkarictl store\fR; the zones in memory get
+the limit less those bytes, and at least a tenth of the limit. Raise
+\fBmemory\-limit\fR by that much when you move to the store; a WARNING says so
+(at most once an hour) while the tables hold half of the limit or more. A reload
+of \fBkaridns.conf\fR changes it: within 50 ms when a limit is set, within a
+second when there was none.
+.IP \(bu 2
+\fBThe default (0.7.x).\fR A database block whose zones go to the zone store
+(\fBstore\fR, the default of a production server) and that does not write
+\fBmemory\-limit\fR gets one from the RAM of the host: \fBhalf of the RAM above
+256 MB, at least \fB64M\fB\fR, rounded down to a MiB (\fBhw.physmem\fR, read
+when the server starts, before the sandbox; 512 MB of RAM: \fB128M\fR; 1 GB:
+\fB384M\fR (a 1 GB virtual machine reports 980 MB: \fB362M\fR); 2 GB:
+\fB896M\fR; 4 GB: \fB1920M\fR; 16 GB: \fB8064M\fR). The 256 MB are for the
+kernel, the routers, the loader, the zones of \fBkaridns.conf\fR and the rest of
+a small host; the half leaves room for the overshoot of the limit (up to about
+1.5 times with batches, see "The limit is a target") and for the page cache or
+the ARC that the store reads its images from. The start says it at NOTICE:
+\fBmemory\-limit is not set: 362M is used (the default: half of the 980 MB of
+RAM above 256 MB, at least 64M); set memory\-limit to change it, or
+memory\-limit unlimited; to keep every database zone in memory\fR; the sizing
+lines name it \fBmemory\-limit 362M (the default from 980 MB of RAM)\fR, the
+\fBmemory:\fR line of \fBkarictl dbstatus\fR says \fBmemory\-limit=362M
+(default)\fR, its \fBcache:\fR line ends with \fBlimit_default=1\fR, and
+\fBkaricheck db\fR says the same from the RAM of the host it runs on (it assumes
+the server runs there). A reload that removes \fBmemory\-limit\fR goes back to
+the default. \fBWhy:\fR without a limit every zone that a query attaches stays
+in memory, so a database larger than the host is a server the kernel kills: on a
+16 GB host with 10 million zones of 100 records (104 GB of zone data, which the
+sizing line said) the Backend grew from 2 to 14.7 GB in 70 seconds of queries,
+where \fBmemory\-limit 8G\fR served the same traffic with the Backend at 10.3 GB
+(planning, 1B run). \fBWhat it costs when every zone fits:\fR nothing
+measurable: on a 1 vCPU / 1 GB virtual machine (UFS, 1,000 database zones and
+100 zone files) the processes held 76.9 MB with the default and 76.5 MB without
+a limit after every zone was asked for, the start took 87 and 88 ms, and the
+same zones were in memory before and after the queries. \fBWithout the store\fR
+(\fBstore none\fR, \fBzone\-store none\fR, or the default directory whose parent
+does not exist) an unset \fBmemory\-limit\fR stays no limit, as before: there a
+limit makes the loader send every zone the Backend does not have as a summary,
+so the start reads no zone until a query asks for it (measured: 1,000 zones out
+of memory after the start, each first query parked). In a jail or a host whose
+memory is limited below its RAM (\fBrctl\fR, a container), \fBhw.physmem\fR is
+the host's: write \fBmemory\-limit\fR there. \fBUpgrade (behaviour change):\fR a
+configuration with the store and without \fBmemory\-limit\fR that held more
+database zones in memory than the default now has the coldest ones taken out
+(and read again from the store when they are asked for); \fBmemory\-limit
+unlimited;\fR keeps the behaviour of 0.6.x and of the 0.7 builds before it
+(every zone stays in memory).
 .IP \(bu 2
 \fB\fBmemory\-limit\fB is not a limit on the size of the process (design
 8.1).\fR It counts what the zones in memory hold, not what the process holds on
@@ -5520,7 +5584,44 @@ MB of 48 MB, 19 MB of 100 MB), well before the quota is reached. The store stops
 storing images when only the reserve (half a segment, at most 128 MiB) is free,
 so with a quota set \fBstore\-segment\-size\fR so that the reserve is at least a
 fifth of the quota (a quota of 100 MB: segments of 64M), or leave the quota out
-and watch \fBstore.space.*\fR instead. \fBScrub.\fR Every
+and watch \fBstore.space.*\fR instead. \fBImages aligned to the record (ZFS,
+0.7).\fR A read of an image reads every record of the dataset that the image
+touches, and an image that lies across a record boundary costs two records (two
+reads from disk, two records in the ARC). In COPY mode on ZFS the store
+therefore starts an image that would cross a boundary it need not cross at that
+boundary, when that skips at most half a record (the record size is the
+dataset's, from \fBstatfs\fR; the skipped bytes are never written and are dead
+bytes of their segment, so on disk they cost only the rounding of each record to
+the pool's sector size). Small zones rarely move and cost almost nothing; zones
+whose images are more than half a record are stored one to a record. Measured on
+the build host (SATA SSD, \fBrecordsize=16K\fR, \fBcompression=lz4\fR, ashift
+12) with 10 million zones of 100 records (images of about 11 KB) and
+memory-limit 2G, under a uniform load of new names: an attach read 1.00 records
+instead of 1.61, the store attached 26,000 to 27,000 zones a second instead of
+20,600 to 21,900 (25,000 queries a second were answered without loss, against
+about 16,000 before), and the store took 83.7 GB on disk instead of 51.4 GB;
+20,000 zones of 10 records (images of about a kilobyte) took 0.15 %
+more. \fBstore.fs.align_bytes\fR, \fB.align_pads\fR and \fB.align_pad_bytes\fR
+show it. It is on by default; \fBstore\-align no;\fR turns it off, for a large
+store of big zones on a disk that cannot take the extra space (the queries then
+read 1.6 records for such a zone, and the ARC holds less of them). A store that
+exists keeps its records where they are when the setting changes (they are read
+as before, aligned or not): a zone written again, a first fill and a record that
+the cleaner moves follow the setting, so a store becomes aligned (or not) as it
+is rewritten; to change a whole store at once, stop the server, move the store
+away and let the next start make a first fill. \fBThe read queue of the pool.\fR
+ZFS lets at most \fBvfs.zfs.vdev.sync_read_max_active\fR (10 by default) reads
+of a disk be in flight, which caps the attaches of a store on an SSD or NVMe
+device below what the device can do (the build host's SATA SSD read 29,700
+random 8 KiB blocks a second at 10 in flight and 42,100 at 32). With a store
+that is not aligned yet, \fBvfs.zfs.vdev.sync_read_max_active=32\fR (in
+\fB/etc/sysctl.conf\fR; it applies to every pool of the host) with
+\fBstore\-threads 16\fR or more raised the attaches by about 10 % (21,900 to
+24,200 a second); with the images aligned it made no difference (the disk was no
+longer the limit). A host whose zones fit in memory-limit does not need it. The
+setting was measured as a test and put back (\fBsysctl
+vfs.zfs.vdev.sync_read_max_active=10\fR restores the default at once; remove the
+line from \fB/etc/sysctl.conf\fR to keep it). \fBScrub.\fR Every
 \fBstore\-scrub\-interval\fR the store reads every record, at 16 MiB a second at
 the most: the table record (its CRC), the way the name and source indexes lead
 to the zone, and for a stored zone the whole image: its checksum and the
@@ -5817,28 +5918,30 @@ database can read.
 .RE
 .IP \(bu 2
 \fB\fBkarictl dbstatus\fB\fR has a line \fBcache:
-limit=... resident=... retired=... previous=... inflight=... held=... long_reader=... evictions=... rounds=... cold=... marked=... misses=... shed=... pinned=... peak=... victim_freq=... room_evictions=... room_relaxed=... room_waits=... room_timeouts=... room_waiting=...\fR:
-\fBretired\fR is what was replaced or taken out and is not freed yet,
-\fBinflight\fR the part of it that was taken out, \fBheld\fR (0.7) the part of
-it that a reader or a transfer holds (versions kept after a short wait for their
-grace period did not end, or retired more than a second ago, and while
-\fBlong_reader\fR is 1 every retired version except those taken out
-(\fBinflight\fR) and the previous versions dropped under memory pressure, which
-are not shown on their own: so \fBheld\fR + \fBinflight\fR can be below
-\fBretired\fR; not weighed against the limit), \fBlong_reader\fR (0.7) 1 while a
-thread of the server has been in a read section for a second or more, \fBcold\fR
-the zones that came without data, \fBmarked\fR the zones that were read but are
-not kept (admission), \fBmisses\fR the queries that had to wait for a zone,
-\fBshed\fR the requests that were refused (0.7: only the true refusals are left:
-a request that found the wait queue full, and the background requests that were
-dropped; a query that waits for a place, a token or room is not shed),
-\fBpeak\fR the largest resident + retired + previous seen when a zone was
-installed or a round ran, \fBroom_evictions\fR the zones taken out on demand for
-queries that waited for room and \fBroom_relaxed\fR the ones of them that were
-younger than the minimum residency, \fBroom_waits\fR the requests that had to
-wait for room (counted once each), \fBroom_timeouts\fR those of them that ran
-out of \fBpark\-timeout\fR before there was room, \fBroom_waiting\fR those that
-wait for room now (all since the start except \fBroom_waiting\fR).
+limit=... resident=... retired=... previous=... inflight=... held=... long_reader=... evictions=... rounds=... cold=... marked=... misses=... shed=... pinned=... peak=... victim_freq=... room_evictions=... room_relaxed=... room_waits=... room_timeouts=... room_waiting=... limit_default=...\fR:
+\fBlimit_default\fR (0.7) is 1 when the limit is the default from the RAM (no
+\fBmemory\-limit\fR written, see "The default"), \fBretired\fR is what was
+replaced or taken out and is not freed yet, \fBinflight\fR the part of it that
+was taken out, \fBheld\fR (0.7) the part of it that a reader or a transfer holds
+(versions kept after a short wait for their grace period did not end, or retired
+more than a second ago, and while \fBlong_reader\fR is 1 every retired version
+except those taken out (\fBinflight\fR) and the previous versions dropped under
+memory pressure, which are not shown on their own: so \fBheld\fR +
+\fBinflight\fR can be below \fBretired\fR; not weighed against the limit),
+\fBlong_reader\fR (0.7) 1 while a thread of the server has been in a read
+section for a second or more, \fBcold\fR the zones that came without data,
+\fBmarked\fR the zones that were read but are not kept (admission), \fBmisses\fR
+the queries that had to wait for a zone, \fBshed\fR the requests that were
+refused (0.7: only the true refusals are left: a request that found the wait
+queue full, and the background requests that were dropped; a query that waits
+for a place, a token or room is not shed), \fBpeak\fR the largest resident +
+retired + previous seen when a zone was installed or a round ran,
+\fBroom_evictions\fR the zones taken out on demand for queries that waited for
+room and \fBroom_relaxed\fR the ones of them that were younger than the minimum
+residency, \fBroom_waits\fR the requests that had to wait for room (counted once
+each), \fBroom_timeouts\fR those of them that ran out of \fBpark\-timeout\fR
+before there was room, \fBroom_waiting\fR those that wait for room now (all
+since the start except \fBroom_waiting\fR).
 .IP \(bu 2
 \fBZone transfers of a zone that is out of memory (AXFR, IXFR).\fR The client is
 checked first, as \fBallow\-query\fR is for a parked query:

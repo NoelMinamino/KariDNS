@@ -25,4 +25,12 @@ void tcp_reasm_destroy(tcp_reasm_table_t *t);
 // 完全なDNSメッセージが組み上がるたびに cb が呼ばれる。
 void tcp_reasm_feed(tcp_reasm_table_t *t, const pcap_l4_info_t *l4, tcp_reasm_message_cb cb, void *user_ctx);
 
+// What the table had to give up (the caller reports it: a replay that silently compared fewer messages would mislead).
+typedef struct {
+    uint64_t short_frames;     // RFC 7766 §8 framing with a length below a DNS header (12): skipped to stay in step
+    uint64_t ooo_dropped;      // out-of-order segments not kept (larger than a slot, or every slot taken)
+    uint64_t overflow_evicted; // streams dropped because a direction reached max_buffer_per_direction
+} tcp_reasm_stats_t;
+void tcp_reasm_get_stats(const tcp_reasm_table_t *t, tcp_reasm_stats_t *out);
+
 #endif /* DAG_TCP_REASSEMBLY_H */

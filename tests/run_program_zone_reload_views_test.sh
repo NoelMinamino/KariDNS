@@ -76,6 +76,7 @@ key "karictl" {
     secret "$SECRET";
 };
 EOF
+chmod 600 "$TMP_DIR/karictl.conf"   # karictl refuses a karictl.conf with the secret that others can read
 
 # view NAME CLIENTS ADDR: a view with the program zone z.example., whose plugin answers ADDR
 view() {

@@ -15,6 +15,15 @@ class Q {
 
   // "col IN list" where the list is one parameter (tx.list: an array on PostgreSQL, JSON text on SQLite3)
   list(tx, col, arr, type) { return tx.list(col, this.params.push(tx.listParam(arr)), type); }
+
+  // "col = value" of each [key, value] of a patch.  The keys are column names written into the text, so the data layer itself takes only the columns of its
+  // list (review W3-L1, 0.7: the handlers pass bodies checked by shape(), but a later caller must not be able to put SQL there); another key is a programming error.
+  sets(entries, columns) {
+    return entries.map(([k, v]) => {
+      if (!columns.includes(k)) throw new Error(`store: ${JSON.stringify(String(k)).slice(0, 40)} is not a column that can be changed`);
+      return `${k} = ${this.add(v)}`;
+    });
+  }
 }
 
 // "name = x OR name = x." : PowerDNS stores a zone name without the final dot, but a database may hold it with
@@ -64,10 +73,12 @@ export async function createPrincipal(tx, { kind, name, display_name = null, ema
     [kind, name, display_name, email, disabled, createdBy])).id;
 }
 
+const PRINCIPAL_SET = ['name', 'display_name', 'email', 'disabled'];
+
 // patch: { name, display_name, email, disabled } (only the keys present change)
 export async function updatePrincipal(tx, id, patch) {
   const q = new Q();
-  const set = Object.entries(patch).map(([k, v]) => `${k} = ${q.add(v)}`);
+  const set = q.sets(Object.entries(patch), PRINCIPAL_SET);
   if (set.length === 0) return 0;
   return (await tx.run(`UPDATE ${tx.A}principals SET ${set.join(', ')} WHERE id = ${q.add(id)}`, q.params)).changes;
 }
@@ -211,6 +222,7 @@ const policy = (r, types) => ({
   apex_editable: bool(r.apex_editable), ttl_min: r.ttl_min, ttl_max: r.ttl_max, max_rr: r.max_rr,
 });
 const PFLAGS = 'allow_wildcard, allow_delegation, allow_dname, apex_editable, ttl_min, ttl_max, max_rr';
+const POLICY_SET = ['name', ...PFLAGS.split(', ')];            // (allowed_types: setPolicyTypes)
 
 // ids: undefined = all; else the rows with these ids.  after / limit page by id.
 export async function listPolicies(tx, { ids, after = 0, limit = 100000 } = {}) {
@@ -258,7 +270,7 @@ export async function createPolicy(tx, p, createdBy) {
 
 export async function updatePolicy(tx, id, patch) {
   const q = new Q();
-  const set = Object.entries(patch).filter(([k]) => k !== 'allowed_types').map(([k, v]) => `${k} = ${q.add(v)}`);
+  const set = q.sets(Object.entries(patch).filter(([k]) => k !== 'allowed_types'), POLICY_SET);
   let changes = 0;
   if (set.length) changes = (await tx.run(`UPDATE ${tx.A}rr_policies SET ${set.join(', ')} WHERE id = ${q.add(id)}`, q.params)).changes;
   if (patch.allowed_types) {

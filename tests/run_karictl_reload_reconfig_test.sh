@@ -100,6 +100,7 @@ key "karictl" {
     secret "dGVzdC1vbmx5LWR1bW15LWtleS1kby1ub3QtdXNl";
 };
 EOF
+chmod 600 "$TMP_DIR/karictl.conf"   # karictl refuses a karictl.conf with the secret that others can read
 
 # Start local test server
 "$KARIDNS" -f "$TMP_DIR/karidns.conf" > "$TMP_DIR/karidns.log" 2>&1 &

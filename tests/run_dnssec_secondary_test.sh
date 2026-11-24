@@ -198,6 +198,7 @@ cat > "$W/karictl.conf" <<EOF
 socket "$W/ixfr.sock";
 key "karictl" { algorithm hmac-sha256; secret "ZG5zc2VjLXNlY29uZGFyeS10ZXN0LWtleS0wMDE="; };
 EOF
+chmod 600 "$W/karictl.conf"   # karictl refuses a karictl.conf with the secret that others can read
 
 perl "$W/relay.pl" $RPORT $PPORT > "$W/relay.log" 2>&1 &
 RELAY_PID=$!

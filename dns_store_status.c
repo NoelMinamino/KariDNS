@@ -622,6 +622,7 @@ static void add_extra(list_t *l) {
   U("store.errors.memory_noted", x.err_noted);
   U("store.errors.memory_pushed_out", x.err_dropped);
   U("store.detach.sampled", x.sampled_detaches);
+  U("store.detach.lock_yields", x.detach_lock_yields);
   U("store.attach.build_ns_per_zone", x.build_n ? x.build_ns / x.build_n : 0);
   U("store.attach.worker.ok", x.wa_ok);
   U("store.attach.worker.mean_us", x.wa_ok ? x.wa_ns / x.wa_ok / 1000 : 0);
@@ -633,6 +634,9 @@ static void add_extra(list_t *l) {
   U("store.attach.worker.full", x.wa_full);
   U("store.attach.worker.registered", x.wa_adopted);
   U("store.attach.worker.dropped", x.wa_lost);
+  U("store.attach.shed", x.att_shed);
+  U("store.attach.newest_first", x.att_newest);
+  U("store.attach.queued", x.att_queued);
   {
     static const char *const hs[] = { "none", "attaching", "done", "high-mark", "off" };
     add_s(l, "store.hot.state", x.hot_state < 5 ? hs[x.hot_state] : "none");
@@ -849,6 +853,9 @@ static void add_store(list_t *l, const store_t *s, const store_attach_stats_t *a
   U("store.space.degraded_since_unix", st->degraded_since_unix);
   U("store.fs.blksize", st->fs_blksize);
   U("store.fs.recordsize_warning", st->fs_recordsize_warn ? 1 : 0);
+  U("store.fs.align_bytes", st->align_rs);
+  U("store.fs.align_pads", st->align_pads);
+  U("store.fs.align_pad_bytes", st->align_pad_bytes);
   /* the scrub (design 2.4) */
   U("store.scrub.interval_s", st->scrub_interval_s == UINT32_MAX ? 0 : st->scrub_interval_s);
   U("store.scrub.running", st->scrub_running ? 1 : 0);

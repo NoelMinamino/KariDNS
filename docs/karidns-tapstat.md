@@ -43,7 +43,7 @@ The summary goes to standard output, or, with `-o`, into a file that is replaced
 
 ### Input is untrusted
 
-Everything on the socket and in the file is treated as hostile: Frame Streams lengths are capped before a buffer is sized from them (data frames 256 KiB, control frames 512 bytes), every protobuf field is bounds-checked, only the DNS header and question are read from the embedded DNS message, and a sender that breaks the protocol (data before START, a wrong content type, an oversized frame, ...) has its connection closed with a message on standard error. A sender that does not finish the handshake within 5 seconds is dropped. The content type accepted is `protobuf:dnstap.Dnstap`.
+Everything on the socket and in the file is treated as hostile: Frame Streams lengths are capped before a buffer is sized from them (data frames 256 KiB, control frames 512 bytes), every protobuf field is bounds-checked, only the DNS header and question are read from the embedded DNS message, and a sender that breaks the protocol (data before START, a wrong content type, an oversized frame, ...) has its connection closed with a message on standard error. A sender that does not finish the handshake within 5 seconds is dropped, and one that is silent for `-w` seconds afterwards as well. The content type accepted is `protobuf:dnstap.Dnstap`.
 
 ### What is counted
 
@@ -97,7 +97,10 @@ Each of the five tables holds at most `-k` keys (default 10000; qname keys take 
 : Client prefix lengths, 0 to 32 (default 24) and 0 to 128 (default 56).
 
 `-m mode`
-: Octal permission of the socket file (default `660`). The sender (`karidns`) must be able to connect to the socket: the Backend of `karidns` connects through its unprivileged broker, so give the socket a group or mode that the user of `karidns` can write to.
+: Octal permission of the socket file (default `660`). The sender (`karidns`) must be able to connect to the socket: the Backend of `karidns` connects through its unprivileged broker, so give the socket a group or mode that the user of `karidns` can write to. Every sender is checked against this mode when it connects, from its credentials (`LOCAL_PEERCRED` on FreeBSD): root, the user `karidns-tapstat` runs as, or, when the mode gives the group write access, a member of the socket file's group; any other is refused with a message on standard error. A mode with `o+w` (such as `666`) lets every local user send made-up dnstap and fill the 16 places, so it is accepted with a warning only.
+
+`-w seconds`
+: Close a sender that has sent nothing for this long after the handshake, 1 to 86400 (default `600`): a sender that holds a place without sending gives it up. `karidns` notices it with its next message and connects again about a second later (the messages of that second are counted as lost in `karictl status`, "dnstap dropped (not connected)"); keep `-w` well above the quietest stretch of the server.
 
 `-V`, `--version`
 : Print the version.

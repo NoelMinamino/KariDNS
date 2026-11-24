@@ -1,4 +1,4 @@
-.TH KARICHECK 8 "2026-11-22" "KariDNS" "KariDNS Manual"
+.TH KARICHECK 8 "2026-11-24" "KariDNS" "KariDNS Manual"
 .\" Generated from docs/karicheck.md by man/md2man.pl (make man): edit the Markdown manual, not this page.
 .SH NAME
 karicheck \- Configuration and Zone File Validation Utility for KariDNS
@@ -61,7 +61,12 @@ for \fB<domain>\fR without a configuration file. The third argument is treated
 as a configuration file if it contains \fB.conf\fR, and as a zone file
 otherwise. A relative path is resolved against the current directory; the server
 resolves relative zone paths (also with \fB../\fR) against the directory it was
-started from.
+started from. Run as root with standard error on a terminal, \fBkaricheck\fR
+prints a note there that it parses the file with root's rights: a zone file from
+elsewhere is better checked as an unprivileged user. (\fBkaricheck\fR does not
+drop privileges itself: \fBconf\fR, \fBzones\fR and \fBzone <domain> [config]\fR
+read the server's own files, which the server also reads as root when it starts,
+and a lower user could not read the ones only root may.)
 .TP 8
 \fBzone <domain> \-\fR
 The zone text is read from standard input (BIND format, at most 64 MiB; a bigger
@@ -752,12 +757,12 @@ warning
 \fBloader\-state\-file\fR (D1a step 7): the directory does not exist or cannot be written by the loader user (the loader writes \fB<file>.tmp\fR there and renames it), the file cannot be read by it
 error
 .TP 8
-\fBloader\-state\-file\fR that is not a valid hot list (empty, truncated, a bad count or checksum: the loader ignores it and the next list replaces it); a directory that everybody can write in; \fBloader\-state\-file\fR or \fBwarm\-before\-serve\fR without \fBmemory\-limit\fR (\fBkaricheck conf\fR)
+\fBloader\-state\-file\fR that is not a valid hot list (empty, truncated, a bad count or checksum: the loader ignores it and the next list replaces it); a directory that everybody can write in; \fBloader\-state\-file\fR or \fBwarm\-before\-serve\fR without a \fBmemory\-limit\fR in force (\fBmemory\-limit unlimited\fR, or no \fBmemory\-limit\fR and no zone store; with the store an unset \fBmemory\-limit\fR is the default from the RAM, 0.7) (\fBkaricheck conf\fR)
 warning
 .TP 8
 \fBMemory (0.7, only when the whole configuration is checked, not for \fBkaricheck db VIEW\fB)\fR
 .TP 8
-the zones and the records the loaders counted (\fBkaridns\-dbloader \-\-check\fR prints an \fBM\fR line), what they need in memory (the Backend with every zone resident, the loader) and the \fBmemory\-limit\fR that keeps every zone, with the share of zones that fit under the configured \fBmemory\-limit\fR (the same figures and lines the server says in syslog at its start; \fBdb.memory.estimate\fR); without \fBmemory\-limit\fR that is all it says
+the zones and the records the loaders counted (\fBkaridns\-dbloader \-\-check\fR prints an \fBM\fR line), what they need in memory (the Backend with every zone resident, the loader) and the \fBmemory\-limit\fR that keeps every zone, with the share of zones that fit under the \fBmemory\-limit\fR in force (the same figures and lines the server says in syslog at its start; \fBdb.memory.estimate\fR); with the zone store and no \fBmemory\-limit\fR, the default the server will use, computed from the RAM of the host karicheck runs on (\fBmemory\-limit is not set: 384M is used ...\fR, see karidns(8) "Memory limit"); with \fBmemory\-limit unlimited\fR (or no limit without the store) the estimate is all it says
 info
 .TP 8
 \fBmemory\-limit\fR is below what every zone needs (\fBdb.memory.limit\-below\-all\fR)

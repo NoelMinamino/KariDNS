@@ -364,6 +364,7 @@ static void gate_cfg(const char *dbextra, unsigned conc, unsigned rate, uint64_t
     server_config_t *c = &pool[used++ % 16];
     CHECK(parse_named_conf(conf, c) == 0);
     if (memory_limit) c->database.memory_limit = memory_limit;
+    if (!c->database.memory_limit) c->database.memory_limit_unlimited = true;        /* (0.7: what an unset memory-limit meant when these cases were written; with the store it is the default from the RAM now) */
     atomic_store_explicit(&g_config_db.active, c, memory_order_release);
     for (int i = 0; i < 300 && !(st_field("fetch", "concurrency") == conc && st_field("fetch", "rate") == rate && dbreg_cache_limit() == c->database.memory_limit); i++) usleep(20000);
     usleep(150000);                                               /* (the thread takes the rest of the settings, park-timeout among them, in the same round: it comes every 50 ms) */
@@ -385,6 +386,21 @@ static void drain_wakes(void) {
         while (park_wake_pop(park_wake_ring(w), &kk)) {}
         (void)park_wake_take_overflow(park_wake_ring(w));                    /* (a dropped wake: the flag is cleared too) */
     }
+}
+/* drain_wakes() once the wakes of the fetches that just ended have all been queued: a fetch that ends gives its place back (park_places_used()) before it wakes the workers that waited
+ * for it (fetch_complete()), so a test that waits for the places and drains at once can leave a late wake on a ring for the next case (test_db_fetch B2 W8, CI flake 56).  Drained until
+ * nothing came for 30 ms, at most 2 s. */
+static void drain_wakes_settled(void) {
+    park_key_t kk;
+    int quiet = 0;
+    drain_wakes();
+    for (int i = 0; i < 200 && quiet < 3; i++) {
+        usleep(10000);
+        bool any = false;
+        for (int w = 0; w < 4; w++) while (park_wake_pop(park_wake_ring(w), &kk)) any = true;
+        quiet = any ? 0 : quiet + 1;
+    }
+    drain_wakes();
 }
 
 /* what a worker does before it asks (fetch_gate() and the request itself, as udp_park() does it): 1 asked with a claim, 0 asked without; never turned away (0.7 P-B), -2 the
@@ -1999,7 +2015,7 @@ int main(void) {
             CHECK(park_rate_level(mono_ms()) == 0);                                  /* (no bucket) */
             for (int i = 0; i < 40; i++) send_failed(f5[0], &e, 0, out[i].u.fetch_req.name, out[i].u.fetch_req.request_id);
             CHECK(wait_places(0, 5000));
-            drain_wakes();
+            drain_wakes_settled();
         }
 
         /* ---- no refusal when the pool is full: fetch-concurrency 2.  Two fetches in flight; the requests that come after wait, in order, and go out one for each place that
@@ -2039,7 +2055,7 @@ int main(void) {
             send_failed(f5[0], &e, 0, fl[4].u.fetch_req.name, fl[4].u.fetch_req.request_id);
             send_failed(f5[0], &e, 0, fl[5].u.fetch_req.name, fl[5].u.fetch_req.request_id);
             CHECK(wait_places(0, 5000));
-            drain_wakes();
+            drain_wakes_settled();
         }
 
         /* ---- the deadline: park-timeout 400.  A request that waits for a place is dropped when it is over: the mark goes, the workers are woken (not failed), the place of
@@ -2081,7 +2097,7 @@ int main(void) {
             send_failed(f5[0], &e, 0, fl[1].u.fetch_req.name, fl[1].u.fetch_req.request_id);
             send_failed(f5[0], &e, 0, rq.u.fetch_req.name, rq.u.fetch_req.request_id);
             CHECK(wait_places(0, 5000));
-            drain_wakes();
+            drain_wakes_settled();
         }
 
         /* ---- a transfer's request (no worker's) waits like a query's, once per zone; a background request does not wait (and is not refused for the queue: it is dropped when no
@@ -2111,7 +2127,7 @@ int main(void) {
             send_failed(f5[0], &e, 0, fl[1].u.fetch_req.name, fl[1].u.fetch_req.request_id);
             send_failed(f5[0], &e, 0, fl[2].u.fetch_req.name, fl[2].u.fetch_req.request_id);
             CHECK(wait_places(0, 5000));
-            drain_wakes();
+            drain_wakes_settled();
         }
 
         /* ---- 0.7: the wait queue is full (true overload): the request is shed, counted (`queue_full`), and its queries are dropped (the key says PARK_ASK_DROP: the worker answers nothing), not answered "not ready" ---- */
@@ -2162,7 +2178,7 @@ int main(void) {
             send_failed(f5[0], &e, 0, fl[1].u.fetch_req.name, fl[1].u.fetch_req.request_id);
             send_failed(f5[0], &e, 0, fl[2].u.fetch_req.name, fl[2].u.fetch_req.request_id);
             CHECK(wait_places(0, 5000));
-            drain_wakes();
+            drain_wakes_settled();
         }
 
         /* ---- a configured rate waits (it does not refuse): fetch-rate 4, a bucket of 4.  Eight requests: four go out at once, the rest wait for the bucket and go out in order
@@ -2187,7 +2203,7 @@ int main(void) {
             CHECK(ST("fetchq", "queued") == 0 && ST("fetch", "refused_by_rate") == r0 && ST("cache", "shed") == s0 && !park_wake_pending(park_wake_ring(0)));
             for (int i = 0; i < 8; i++) send_failed(f5[0], &e, 0, got[i].u.fetch_req.name, got[i].u.fetch_req.request_id);
             CHECK(wait_places(0, 5000));
-            drain_wakes();
+            drain_wakes_settled();
             /* one token a second: the first goes out, two wait; the reload to no rate (the default) lets them out at once */
             gate_cfg("fetch-concurrency 256; fetch-rate 1; park-timeout 5000; memory-limit 1024g;", 256, 1, 0);
             park_rate_reset();
@@ -2201,7 +2217,7 @@ int main(void) {
             CHECK(mono_ms() - t1 < 900 && ST("fetchq", "queued") == 0 && ST("fetch", "refused_by_rate") == r0);
             for (int i = 0; i < 3; i++) send_failed(f5[0], &e, 0, got[i].u.fetch_req.name, got[i].u.fetch_req.request_id);
             CHECK(wait_places(0, 5000));
-            drain_wakes();
+            drain_wakes_settled();
         }
 
         /* ---- the queue is bounded (ING_WQ_MAX = 8192 in dns_db_ingest.c): with the places taken, 8292 requests for as many zones: 8192 wait, 100 are refused (the only refusal that
@@ -2253,7 +2269,7 @@ int main(void) {
             send_failed(f5[0], &e, 0, fl[0].u.fetch_req.name, fl[0].u.fetch_req.request_id);
             send_failed(f5[0], &e, 0, fl[1].u.fetch_req.name, fl[1].u.fetch_req.request_id);
             CHECK(wait_places(0, 5000));
-            drain_wakes();
+            drain_wakes_settled();
         }
 
         /* ======================================================================================================================================
@@ -2265,7 +2281,7 @@ int main(void) {
         {
             printf("[B2 W8: room on demand]\n");
             CHECK(IS_COLD(12) && IS_COLD(13) && IS_COLD(14) && IS_COLD(15) && IS_COLD(16) && IS_COLD(17) && IS_COLD(18) && IS_COLD(19));
-            drain_wakes();
+            drain_wakes_settled();
             dbreg_cache_test_pause(true);
             dbreg_cache_stats_t w0;
             uint64_t wlim = 0;
@@ -2283,6 +2299,7 @@ int main(void) {
                 CHECK(req_next(&fetch5, &m, 5000) && strcmp(m.u.fetch_req.name, cz[12]) == 0 && m.u.fetch_req.mode == KDB_FETCH_FULL);
                 CHECK(!dbreg_cache_over_limit());
                 CHECK(ST("cache", "evictions") > ev0 && ST("cache", "room_evictions") > re0 && ST("cache", "shed") == sh0 && ST("cache", "room_waits") == wt0);
+                if (park_wake_pending(park_wake_ring(0)) || park_places_used() != 1) printf("    (room: wake pending %d, places %u)\n", (int)park_wake_pending(park_wake_ring(0)), (unsigned)park_places_used());
                 CHECK(!park_wake_pending(park_wake_ring(0)) && park_places_used() == 1 && NOT_CLAIMED(park_claim_key("default", cz[12])));
                 int zi = 0;
                 CHECK(sscanf(cz[12], "z%d", &zi) == 1);

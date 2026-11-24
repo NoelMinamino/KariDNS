@@ -260,7 +260,29 @@ test('insertKeys: active and published, in one transaction, and the write id (th
     // a write that logs nothing has no range
     t.raw.exec('DROP TRIGGER IF EXISTS karidns_trg_cryptokeys_ins');
     const w2 = await t.db.insertKeys(a, [{ flags: 256, content: 'Y' }]);
-    assert.deepEqual(w2, { xid: null, seq_first: null, seq_last: null });
+    assert.deepEqual(w2, { xid: null, seq_first: null, seq_last: null, ids: [w.ids[1] + 1] });
+    assert.deepEqual(w.ids, keys.map((k) => k.id));
+  } finally { t.done(); }
+});
+
+test('insertKeys with a request: the note in its message, in the same transaction; storedKeysNote finds the latest (review W1-L1)', async () => {
+  const t = fresh();
+  try {
+    const a = id(t.raw, 'a.test');
+    const b = id(t.raw, 'b.test');
+    t.raw.exec(`INSERT INTO karidns_key_requests (domain_id, kind, algorithm, key_type, state, message, done_at) VALUES (${a}, 'enable', 13, 'csk', 'failed', 'x (stored keys: cryptokeys 1; y)', 1)`);
+    t.raw.exec(`INSERT INTO karidns_key_requests (domain_id, kind, algorithm, key_type) VALUES (${a}, 'enable', 13, 'csk')`);
+    const req = t.raw.prepare("SELECT max(id) AS m FROM karidns_key_requests").get().m;
+    assert.equal(await t.db.storedKeysNote(a), 'x (stored keys: cryptokeys 1; y)');
+    assert.equal(await t.db.storedKeysNote(b), null);
+    const w = await t.db.insertKeys(a, [{ flags: 257, content: 'KSK' }, { flags: 256, content: 'ZSK' }], req);
+    assert.equal(t.raw.prepare('SELECT message FROM karidns_key_requests WHERE id = ?').get(req).message, `stored keys: cryptokeys ${w.ids.join(',')}`);
+    assert.equal(await t.db.storedKeysNote(a), `stored keys: cryptokeys ${w.ids.join(',')}`, 'the latest request wins');
+    // all or none: a failed INSERT leaves the message as it was
+    t.raw.exec("UPDATE karidns_key_requests SET message = NULL WHERE id = " + req);
+    t.raw.exec("CREATE TRIGGER bad_key BEFORE INSERT ON cryptokeys WHEN NEW.content = 'BAD' BEGIN SELECT RAISE(ABORT, 'bad key'); END");
+    await assert.rejects(t.db.insertKeys(a, [{ flags: 256, content: 'BAD' }], req), /bad key/);
+    assert.equal(t.raw.prepare('SELECT message FROM karidns_key_requests WHERE id = ?').get(req).message, null);
   } finally { t.done(); }
 });
 

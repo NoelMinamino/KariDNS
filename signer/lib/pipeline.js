@@ -8,8 +8,12 @@
 //   { status: 'failed', error, request }
 //   { status: 'key-added', request }   (a key request of kind add)
 //
-// The work directory of the zone is wiped on every path (finally), the keys are never logged, and a key that was generated for an `enable` request
-// stays on disk until it is in cryptokeys (planning 3.5).
+// The work directory of the zone is wiped on every path (finally) and the keys are never logged.  A key generated for an `enable` request is stored in
+// cryptokeys after the signed zone is checked and BEFORE the signed zone (with its DNSKEY) is imported (review W1-L1, 0.7): no DNSKEY is ever served whose
+// private key the database does not hold, whatever stops the run.  The same statement writes the row ids into the request's message (STORED_KEYS, keys.js);
+// a run that stops after that (a crash, the import failing, the zone changing) leaves the keys in cryptokeys and the zone unsigned (the loader refuses that
+// version, keys and no PRESIGNED, and the server keeps serving the last one), and the next run of that request, or a new enable request of the zone, signs
+// with exactly those keys instead of refusing a zone with keys and no PRESIGNED metadata.
 
 import fs from 'node:fs';
 import path from 'node:path';
@@ -20,7 +24,7 @@ import { pipeline } from 'node:stream/promises';
 import { setTimeout as sleepMs } from 'node:timers/promises';
 import { canonicalZone } from '../../node/lib/names.js';
 import { zoneSettings } from './config.js';
-import { loadKey, parseKeyStem } from './keys.js';
+import { loadKey, parseKeyStem, STORED_KEYS } from './keys.js';
 import { makeZoneDir, wipeDir, wipeFile, writeSecret } from './workdir.js';
 import { clip } from '../../node/lib/run.js';
 import { checkArgv, exportArgv, importArgv, keygenArgv, parseNsec3param, reloadArgv, signzoneArgv } from './argv.js';
@@ -122,21 +126,33 @@ export async function generateKeys(ctx, dir, zone, request) {
   return out;
 }
 
-// INSERT the keys of a zone that is signed already: retry with the same key files (the caller keeps them) until it works or the delays run out
-export async function insertKeysWithRetry(ctx, domainId, keys, delays = KEY_RETRY_DELAYS) {
+// INSERT new keys: retry with the same keys (the caller keeps them) until it works or the delays run out.  requestId: the request whose message gets the
+// row ids (STORED_KEYS).  -> { error: null, ids } or { error }
+export async function insertKeysWithRetry(ctx, domainId, keys, delays = KEY_RETRY_DELAYS, requestId = null) {
   let lastError = null;
   for (let i = 0; i <= delays.length; i++) {
     try {
       // the INSERT writes change log rows (a trigger on cryptokeys); they are ours, not a reason to sign the zone again
-      ctx.ownWrites?.add(await ctx.db.insertKeys(domainId, keys));
-      return null;
+      const w = await ctx.db.insertKeys(domainId, keys, requestId);
+      ctx.ownWrites?.add(w);
+      return { error: null, ids: w.ids };
     } catch (e) {
       lastError = e;
       ctx.log.warn(`cannot store the keys of domain ${domainId} (try ${i + 1}): ${clip(e.message)}`);
     }
     if (i < delays.length) await ctx.sleep(delays[i] * 1000);
   }
-  return lastError;
+  return { error: lastError };
+}
+
+// The row ids a note (STORED_KEYS) names, when they are exactly the keys of the zone (rows: getKeys), else null.
+export function storedKeyIds(note, rows) {
+  const at = note ? note.indexOf(STORED_KEYS) : -1;
+  const m = at < 0 ? null : /^\d+(?:,\d+)*/.exec(note.slice(at + STORED_KEYS.length));
+  if (!m) return null;
+  const ids = [...new Set(m[0].split(',').map(Number))].sort((a, b) => a - b);
+  const have = rows.map((r) => Number(r.id)).sort((a, b) => a - b);
+  return ids.length === have.length && ids.every((v, i) => v === have[i]) ? ids : null;
 }
 
 export async function signZone(ctx, job) {
@@ -175,7 +191,6 @@ export async function signZone(ctx, job) {
 async function runZone(ctx, job, zone, settings, dir, t0) {
   const { db } = ctx;
   const req = job.request ?? null;
-  const cfgDb = ctx.config.settings;
   const meta = await db.getMeta(job.domainId);
   if (req?.kind === 'add') return addKey(ctx, job, zone, dir, meta);
   if (!meta.signer && req?.kind !== 'enable') {
@@ -184,13 +199,29 @@ async function runZone(ctx, job, zone, settings, dir, t0) {
   }
   const rows = await db.getKeys(job.domainId);
   const warnings = [];
-  let generated = [];
+  // st.kept: the ids of the keys an earlier try of an enable request stored (STORED_KEYS), or of this run's new keys once they are stored
+  const st = { meta, rows, generated: [], kept: null, warnings };
   if (req?.kind === 'enable' && !meta.signer) {
     if (rows.length > 0 && !meta.presigned) {
-      throw fail('the zone has cryptokeys rows but no PRESIGNED metadata: the server does not serve such a zone (online signing is not supported); remove the keys, or sign the zone with them first');
+      st.kept = storedKeyIds(await db.storedKeysNote(job.domainId), rows);
+      if (!st.kept) throw fail('the zone has cryptokeys rows but no PRESIGNED metadata: the server does not serve such a zone (online signing is not supported); remove the keys, or sign the zone with them first');
     }
-    if (rows.length === 0) generated = await generateKeys(ctx, dir, zone, req);
+    if (rows.length === 0) st.generated = await generateKeys(ctx, dir, zone, req);
   }
+  try {
+    return await signRun(ctx, job, zone, settings, dir, t0, st);
+  } catch (e) {
+    // the keys are in cryptokeys but the zone was not written: the message names them (the request is answered with it; the next enable request finds them)
+    if (!st.kept || (e instanceof PipelineError && e.kind !== 'failed')) throw e;
+    // (the note first: the message is clipped at its end)
+    throw fail(`the zone is not signed, the new keys are kept (${STORED_KEYS}${st.kept.join(',')}; a new enable request of the zone signs with them): ${e instanceof PipelineError ? e.message : `unexpected error: ${e.message}`}`);
+  }
+}
+
+async function signRun(ctx, job, zone, settings, dir, t0, st) {
+  const { meta, rows, generated, warnings } = st;
+  const req = job.request ?? null;
+  const cfgDb = ctx.config.settings;
 
   // the keys: the rows that are active or published, and the ones just generated (active and published)
   const keys = [];
@@ -246,6 +277,15 @@ async function runZone(ctx, job, zone, settings, dir, t0) {
   r = await ctx.run(ctx.tools.karicheck, checkArgv(zone, out), { cwd: dir, timeoutMs });
   if (r.code !== 0) throw fail(toolMessage('karicheck', r));
 
+  // The new keys go into cryptokeys now, before their DNSKEYs can be served (review W1-L1): if the INSERT cannot be made, nothing is written and the request fails
+  // as a whole; once it is made, the request's message names the rows.  (import --signer compares the records with the signed file, not cryptokeys: the INSERT
+  // is not a change of the zone for it.)
+  if (generated.length) {
+    const { error, ids } = await insertKeysWithRetry(ctx, job.domainId, generated, ctx.keyRetryDelays, req.id);
+    if (error) throw fail(`the new keys could not be stored (${clip(error.message, 200)}): nothing was written, the zone is not signed; file the request again`);
+    st.kept = ids;
+  }
+
   r = await ctx.run(ctx.tools.zone, importArgv(cfgDb, zone, out), { cwd: dir, timeoutMs });
   if (r.code === 3) throw new PipelineError('changed', 'the zone changed while it was signed');
   if (r.code === 4) throw new PipelineError('busy', 'the database is busy');
@@ -266,33 +306,18 @@ async function runZone(ctx, job, zone, settings, dir, t0) {
     if (w) warnings.push(w);
   }
 
-  let request = req ? { state: 'done', message: generated.length ? `signing enabled: ${generated.map((g) => `key ${g.key.tag} (algorithm ${g.key.algorithm}, flags ${g.key.flags})`).join(', ')}` : (meta.signer ? 'the zone was signed already' : 'signing enabled with the zone\'s keys') } : null;
-  if (generated.length) {
-    const err = await insertKeysWithRetry(ctx, job.domainId, generated, ctx.keyRetryDelays);
-    if (err) {
-      const m = `the zone was signed, but its new keys could not be stored (${clip(err.message, 200)}) and are lost: request an additional key (kind add) to replace the DNSKEYs`;
-      warnings.push(m);
-      request = { state: 'failed', message: m };
-    } else {
-      // The INSERT is in the change log (a trigger on cryptokeys), after the reload above: the loader would take it for a change of the zone, which waits for the signer.
-      // A reload after the INSERT covers it (a one-zone reload covers the rows it has read) and changes nothing that is served.
-      const w = await reloadZone(ctx, zone, dir);
-      if (w) warnings.push(w);
-    }
-  }
-  return { status: 'signed', serial: sg.serial, minExpire, writeId, durationMs: Date.now() - t0, request, warnings };
+  let message = 'signing enabled with the zone\'s keys';
+  if (generated.length) message = `signing enabled: ${generated.map((g) => `key ${g.key.tag} (algorithm ${g.key.algorithm}, flags ${g.key.flags})`).join(', ')}`;
+  else if (st.kept) message = `signing enabled with the keys an earlier try stored (cryptokeys ${st.kept.join(',')})`;
+  else if (meta.signer) message = 'the zone was signed already';
+  return { status: 'signed', serial: sg.serial, minExpire, writeId, durationMs: Date.now() - t0, request: req ? { state: 'done', message } : null, warnings };
 }
 
-// Ask the server to read the zone again: PostgreSQL through a row of karidns_reload_requests (the first request is made by import --signer --reload, in the
-// transaction of the signature), SQLite3 through karictl and the restricted key of the signer.  A failure is a message (the zone is signed; the server serves the
-// old version until the next reload), not an error.
+// SQLite3: ask the server to read the zone again through karictl and the restricted key of the signer (PostgreSQL: import --signer --reload puts the reload
+// request in the transaction of the signature).  A failure is a message (the zone is signed; the server serves the old version until the next reload), not an error.
 async function reloadZone(ctx, zone, dir) {
   const s = ctx.config.settings;
   try {
-    if (s.database === 'pg') {
-      await ctx.db.requestReload(zone);
-      return null;
-    }
     const rr = await ctx.run(ctx.tools.karictl, reloadArgv(s, zone), { cwd: dir, timeoutMs: 60000 });
     if (rr.code === 0) return null;
     return `karictl reload ${zone} failed (the server serves the old version until it is reloaded): ${clip(rr.spawnError ?? (rr.stderr || rr.stdout || `exit status ${rr.code}`), 300)}`;
@@ -306,7 +331,7 @@ async function addKey(ctx, job, zone, dir, meta) {
   const req = job.request;
   if (!meta.signer) throw fail('the zone is not signed by karidns-signer (no X-KARIDNS-SIGNER metadata): request kind enable first');
   const generated = await generateKeys(ctx, dir, zone, req);
-  const err = await insertKeysWithRetry(ctx, job.domainId, generated, ctx.keyRetryDelays);
+  const { error: err } = await insertKeysWithRetry(ctx, job.domainId, generated, ctx.keyRetryDelays);
   if (err) throw fail(`the new key could not be stored: ${clip(err.message, 200)}`);
   return { status: 'key-added', request: { state: 'done', message: `key ${generated[0].key.tag} (algorithm ${generated[0].key.algorithm}, flags ${generated[0].key.flags}) added` } };
 }

@@ -9,7 +9,7 @@ import { parseConfig } from '../lib/config.js';
 import { tools } from '../lib/argv.js';
 import { OwnWrites } from '../lib/scheduler.js';
 import { loadKey } from '../lib/keys.js';
-import { signZone, prepareInput, signingMode, requestedKeys, generateKeys, insertKeysWithRetry, PipelineError, KEY_RETRY_DELAYS, defaultSleep } from '../lib/pipeline.js';
+import { signZone, prepareInput, signingMode, requestedKeys, generateKeys, insertKeysWithRetry, storedKeyIds, PipelineError, KEY_RETRY_DELAYS, defaultSleep } from '../lib/pipeline.js';
 
 const FX = JSON.parse(fs.readFileSync(new URL('./fixtures/keys.json', import.meta.url), 'utf8'));
 const POOL = (alg) => FX.bind.filter((k) => k.algorithm === alg);
@@ -55,12 +55,14 @@ function setup(conf = SQLITE_CONF, over = {}) {
     async getMeta() { if (state.metaFails) throw new Error('database went away'); return state.meta; },
     async getKeys() { return state.keys; },
     async dropState() { state.dropped++; },
-    async requestReload(zone) { if (state.reloadFails) throw new Error('no table'); state.reloads = [...(state.reloads ?? []), zone]; },
-    async insertKeys(id, keys) {
+    async insertKeys(id, keys, requestId) {
       if (state.insertFails > 0) { state.insertFails--; throw new Error('connection reset'); }
       state.inserted.push(...keys);
-      return { xid: 'X1', seq_first: null, seq_last: null };
+      state.insertedAfter = calls.map((c) => c.name);                   // what had run when the keys were stored
+      state.insertedFor = requestId;
+      return { xid: 'X1', seq_first: null, seq_last: null, ids: keys.map((_, i) => 40 + i) };
     },
+    async storedKeysNote() { return state.note ?? null; },
   };
   const run = async (file, argv, opts) => {
     const name = Object.entries(t).find(([, v]) => v === file)?.[0];
@@ -189,17 +191,20 @@ test('keys: published only -> its DNSKEY in the zone, no file, not passed; neith
   } finally { s.done(); }
 });
 
-test('first signing (request enable, no keys, a CSK): keys generated, signed, imported, and only then stored; NSEC3 with no salt and 0 iterations', async () => {
+test('first signing (request enable, no keys, a CSK): keys generated, signed, checked, stored, and only then imported; NSEC3 with no salt and 0 iterations', async () => {
   const s = setup(SQLITE_CONF, { meta: { signer: false, presigned: false, nsec3param: null }, exportText: EXPORT_UNSIGNED });
   try {
     const out = await signZone(s.ctx, { ...JOB, request: ENABLE });
     assert.equal(out.status, 'signed', out.error);
-    assert.deepEqual(names(s.calls), ['keygen', 'zone', 'signzone', 'karicheck', 'zone', 'karictl', 'karictl']);   // the second reload is for the key INSERT
+    assert.deepEqual(names(s.calls), ['keygen', 'zone', 'signzone', 'karicheck', 'zone', 'karictl']);   // one reload: the INSERT was before the import
     assert.deepEqual(s.calls[0].argv.slice(0, 5), ['-q', '-a', 'ECDSAP256SHA256', '-f', 'KSK']);
     const sign = s.calls[2].argv;
     assert.deepEqual(sign.slice(sign.indexOf('-3'), sign.indexOf('-3') + 4), ['-3', '-', '-H', '0']);
     assert.ok(sign.includes('-z'));
-    // nothing is stored before the import has succeeded, and what is stored is the sanitized private key
+    // review W1-L1 (0.7): the key is in cryptokeys before the import makes its DNSKEY servable (it used to be stored after the import: a crash in between lost it),
+    // the request named in the same write; what is stored is the sanitized private key
+    assert.deepEqual(s.state.insertedAfter, ['keygen', 'zone', 'signzone', 'karicheck']);
+    assert.equal(s.state.insertedFor, 5);
     assert.equal(s.state.inserted.length, 1);
     assert.equal(s.state.inserted[0].flags, 257);
     assert.match(s.state.inserted[0].content, /^Private-key-format: v1\.3\nAlgorithm: 13 \(ECDSAP256SHA256\)\nPrivateKey: \S+\n$/);
@@ -437,13 +442,73 @@ test('a write that PostgreSQL rolled back for a concurrent update is "busy", not
   } finally { s.done(); }
 });
 
-test('exit status 3 of the first signing: the generated keys are discarded, nothing stored', async () => {
+test('exit status 3 of the first signing: the new keys stay stored, and the next try of the request signs with them (review W1-L1)', async () => {
   const s = setup(SQLITE_CONF, { meta: { signer: false, presigned: false, nsec3param: null }, exportText: EXPORT_UNSIGNED, exit: { ...EXIT0, import: 3 } });
+  let stored;
   try {
     assert.deepEqual(await signZone(s.ctx, { ...JOB, request: ENABLE }), { status: 'changed' });
-    assert.deepEqual(s.state.inserted, []);
+    assert.equal(s.state.inserted.length, 1, 'stored before the import');
+    stored = s.state.inserted[0];
     empty(s.work);
   } finally { s.done(); }
+  // the next run: the zone has that row and no PRESIGNED; the request's message names it (the database wrote it with the INSERT): no new key, signed with it
+  const again = setup(SQLITE_CONF, { meta: { signer: false, presigned: false, nsec3param: null }, exportText: EXPORT_UNSIGNED, keys: [{ id: 40, flags: 257, active: true, published: true, content: stored.content }], note: 'stored keys: cryptokeys 40' });
+  try {
+    const out = await signZone(again.ctx, { ...JOB, request: ENABLE });
+    assert.equal(out.status, 'signed', out.error);
+    assert.ok(!names(again.calls).includes('keygen'));
+    assert.deepEqual(again.state.inserted, []);
+    assert.deepEqual(out.request, { state: 'done', message: 'signing enabled with the keys an earlier try stored (cryptokeys 40)' });
+    const sign = again.calls.find((c) => c.name === 'signzone').argv;
+    assert.ok(sign.includes('-3'), 'the request decides the chain (NSEC3), as for a first signing');
+    empty(again.work);
+  } finally { again.done(); }
+  // a note that names other rows than the zone has (a key added by hand, a row deleted) is not a reason to sign: refused as before
+  for (const [note, keys] of [['stored keys: cryptokeys 40', [row(KSK, 257), { ...row(ZSK, 256), id: 40 }]], ['stored keys: cryptokeys 41', [{ ...row(KSK, 257), id: 40 }]], ['done', [{ ...row(KSK, 257), id: 40 }]]]) {
+    const x = setup(SQLITE_CONF, { meta: { signer: false, presigned: false, nsec3param: null }, keys, note });
+    try {
+      const out = await signZone(x.ctx, { ...JOB, request: ENABLE });
+      assert.equal(out.status, 'failed');
+      assert.match(out.error, /cryptokeys rows but no PRESIGNED metadata/);
+      assert.deepEqual(x.calls, []);
+    } finally { x.done(); }
+  }
+});
+
+test('the import fails after the new keys are stored: the request says which rows hold them, and the zone is not signed (review W1-L1)', async () => {
+  const s = setup(SQLITE_CONF, { meta: { signer: false, presigned: false, nsec3param: null }, exportText: EXPORT_UNSIGNED, exit: { ...EXIT0, import: 1 } });
+  try {
+    const out = await signZone(s.ctx, { ...JOB, request: { ...ENABLE, keyType: 'ksk' } });
+    assert.equal(out.status, 'failed');
+    assert.equal(out.error, 'the zone is not signed, the new keys are kept (stored keys: cryptokeys 40,41; a new enable request of the zone signs with them): karidns-zone import: import failed');
+    assert.equal(out.request.message, out.error, 'the answer of the request carries the note: a new request finds the rows by it');
+    assert.equal(s.state.inserted.length, 2);
+    assert.ok(!names(s.calls).includes('karictl'));
+    empty(s.work);
+    noSecrets(...s.logs, JSON.stringify(out));
+  } finally { s.done(); }
+  // the keys of an earlier try, and something unexpected (not a PipelineError) on the way
+  const t = setup(SQLITE_CONF, { meta: { signer: false, presigned: false, nsec3param: null }, exportText: EXPORT_UNSIGNED, keys: [{ ...row(KSK, 257), id: 40 }], note: 'the zone is not signed, the new keys are kept (stored keys: cryptokeys 40; a new ...' });
+  t.ctx.run = async () => { throw new Error('kaboom'); };
+  try {
+    const out = await signZone(t.ctx, { ...JOB, request: ENABLE });
+    assert.equal(out.error, 'the zone is not signed, the new keys are kept (stored keys: cryptokeys 40; a new enable request of the zone signs with them): unexpected error: kaboom');
+  } finally { t.done(); }
+  // "changed" and "busy" keep their meaning (the request stays pending and is tried again)
+  const b = setup(SQLITE_CONF, { meta: { signer: false, presigned: false, nsec3param: null }, exportText: EXPORT_UNSIGNED, keys: [{ ...row(KSK, 257), id: 40 }], note: 'stored keys: cryptokeys 40', exit: { ...EXIT0, import: 4 } });
+  try {
+    assert.deepEqual(await signZone(b.ctx, { ...JOB, request: ENABLE }), { status: 'busy' });
+  } finally { b.done(); }
+});
+
+test('storedKeyIds: the ids of the note, only when they are exactly the rows', () => {
+  const rows = (...ids) => ids.map((id) => ({ id }));
+  assert.deepEqual(storedKeyIds('stored keys: cryptokeys 12,3', rows(3, 12)), [3, 12]);
+  assert.deepEqual(storedKeyIds('x (stored keys: cryptokeys 7; y)', rows('7')), [7], 'pg may give ids as text');
+  assert.equal(storedKeyIds(null, rows(1)), null);
+  assert.equal(storedKeyIds('stored keys: cryptokeys ', rows(1)), null);
+  assert.equal(storedKeyIds('stored keys: cryptokeys 1', rows(1, 2)), null);
+  assert.equal(storedKeyIds('stored keys: cryptokeys 1,2', rows(1)), null);
 });
 
 test('a result of karidns-zone that is not usable is an error', async () => {
@@ -513,14 +578,14 @@ test('the keys of a signed zone are stored with retries, with the same key files
   } finally { s.done(); }
 });
 
-test('the keys cannot be stored at all: the zone is signed, the request says what happened, nothing is claimed done', async () => {
+test('the keys cannot be stored at all: nothing is written, the zone is not signed, the request fails (review W1-L1: no DNSKEY without its key)', async () => {
   const s = setup(SQLITE_CONF, { meta: { signer: false, presigned: false, nsec3param: null }, exportText: EXPORT_UNSIGNED, insertFails: 99 });
   try {
     const out = await signZone(s.ctx, { ...JOB, request: ENABLE });
-    assert.equal(out.status, 'signed', out.error);
+    assert.equal(out.status, 'failed');
     assert.equal(out.request.state, 'failed');
-    assert.match(out.request.message, /could not be stored .*connection reset.* are lost: request an additional key \(kind add\)/);
-    assert.equal(out.warnings.length, 1);
+    assert.match(out.request.message, /^the new keys could not be stored \(connection reset\): nothing was written, the zone is not signed; file the request again$/);
+    assert.deepEqual(names(s.calls), ['keygen', 'zone', 'signzone', 'karicheck'], 'no import');
     assert.deepEqual(s.state.slept, [1000, 2000, 4000]);
     empty(s.work);
     noSecrets(...s.logs, JSON.stringify(out));
@@ -639,9 +704,10 @@ test('the retry delays add up to about ten minutes; the default sleep sleeps', a
 test('insertKeysWithRetry and generateKeys directly', async () => {
   const s = setup(SQLITE_CONF, { insertFails: 1 });
   try {
-    assert.equal(await insertKeysWithRetry(s.ctx, 1, [{ flags: 256, content: 'x' }], [0]), null);
+    assert.deepEqual(await insertKeysWithRetry(s.ctx, 1, [{ flags: 256, content: 'x' }], [0]), { error: null, ids: [40] });
+    assert.equal(s.state.insertedFor, null, 'no request: no note');
     s.state.insertFails = 5;
-    const err = await insertKeysWithRetry(s.ctx, 1, [{ flags: 256, content: 'x' }], []);
+    const { error: err } = await insertKeysWithRetry(s.ctx, 1, [{ flags: 256, content: 'x' }], []);
     assert.match(err.message, /connection reset/);
     const dir = fs.mkdtempSync(path.join(s.work, 'g-'));
     const keys = await generateKeys(s.ctx, dir, 'example.test', { kind: 'enable', keyType: 'ksk', algorithm: 13, bits: null });
@@ -652,29 +718,31 @@ test('insertKeysWithRetry and generateKeys directly', async () => {
 });
 
 
-test('after the keys are stored the zone is reloaded again (the INSERT is in the change log, after the first reload)', async () => {
-  // PostgreSQL: import --signer --reload has the first request; the second is a row of karidns_reload_requests
+test('a first signing reloads the zone once: the INSERT of the keys was before the import, whose reload covers it', async () => {
+  // PostgreSQL: import --signer --reload has the request, nothing else
   const pg = setup(PG_CONF, { meta: { signer: false, presigned: false, nsec3param: null }, exportText: EXPORT_UNSIGNED });
   try {
     const out = await signZone(pg.ctx, { ...JOB, request: ENABLE });
     assert.equal(out.status, 'signed', out.error);
     assert.deepEqual(names(pg.calls), ['keygen', 'zone', 'signzone', 'karicheck', 'zone']);
-    assert.deepEqual(pg.state.reloads, ['example.test']);
+    assert.ok(pg.calls[4].argv.includes('--reload'));
     assert.deepEqual(out.warnings, []);
   } finally { pg.done(); }
-  const pg2 = setup(PG_CONF, { meta: { signer: false, presigned: false, nsec3param: null }, exportText: EXPORT_UNSIGNED, reloadFails: true });
-  try {
-    const out = await signZone(pg2.ctx, { ...JOB, request: ENABLE });
-    assert.equal(out.status, 'signed');
-    assert.equal(out.request.state, 'done');
-    assert.match(out.warnings[0], /the reload request for example\.test failed .*: no table/);
-  } finally { pg2.done(); }
-  // SQLite3: karictl, twice (after the signature and after the INSERT); a failure is a warning each time
+  // SQLite3: karictl once; a failure is a warning, and a karictl that cannot be run at all as well
   const sq = setup(SQLITE_CONF, { meta: { signer: false, presigned: false, nsec3param: null }, exportText: EXPORT_UNSIGNED, exit: { ...EXIT0, karictl: 3 } });
   try {
     const out = await signZone(sq.ctx, { ...JOB, request: ENABLE });
     assert.equal(out.status, 'signed');
-    assert.equal(out.warnings.length, 2);
-    assert.equal(names(sq.calls).filter((n) => n === 'karictl').length, 2);
+    assert.equal(out.request.state, 'done');
+    assert.equal(out.warnings.length, 1);
+    assert.equal(names(sq.calls).filter((n) => n === 'karictl').length, 1);
   } finally { sq.done(); }
+  const sq2 = setup(SQLITE_CONF, { keys: [row(KSK, 257)] });
+  const run = sq2.ctx.run;
+  sq2.ctx.run = async (file, argv, opts) => { if (file === sq2.ctx.tools.karictl) throw new Error('no such tool'); return run(file, argv, opts); };
+  try {
+    const out = await signZone(sq2.ctx, JOB);
+    assert.equal(out.status, 'signed');
+    assert.match(out.warnings[0], /the reload request for example\.test failed .*: no such tool/);
+  } finally { sq2.done(); }
 });

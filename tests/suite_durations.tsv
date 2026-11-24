@@ -153,9 +153,11 @@ tests/run_alias_cookie_refresh_test.sh	60
 tests/run_db_apex_test.sh	12
 tests/run_db_auth_rls_test.sh	15
 tests/run_db_auth_schema_test.sh	9
+tests/run_db_attach_shed_test.sh	96
 tests/run_db_autoreload_test.sh	59
 tests/run_db_bgfetch_test.sh	6
 tests/run_db_cache_test.sh	19
+tests/run_db_cold_burst_test.sh	150
 tests/run_db_converge_test.sh	67
 tests/run_db_ddl_test.sh	6
 tests/run_db_dironly_test.sh	26
@@ -201,6 +203,7 @@ tests/run_db_tags_test.sh	3
 tests/run_db_views_test.sh	3
 tests/run_db_warm_test.sh	35
 tests/run_db_xfer_test.sh	23
+tests/run_db_zfs_copy_test.sh	25
 tests/run_db_zoneadd_perf_test.sh	7
 tests/run_dnssec_answer_sections_test.sh	3
 tests/run_dnssec_denial_gap_test.sh	2

@@ -22,6 +22,10 @@
  *   WARNING  memory-limit keeps less than half of the zones: unless the traffic is much more skewed than the zones, most queries wait, and the
  *            fetch capacity (a few thousand zones a second) is what the server's speed depends on.
  *   ERROR    memory-limit cannot hold the zones of fetch-concurrency reads at once: nearly every query for a database zone waits or is refused.
+ *
+ * The default (0.7.x, docs/karidns.md "Memory limit"): a database block with the zone store and without memory-limit gets one derived from the RAM, half of
+ * what is above MA_DEFAULT_RESERVE, at least MA_DEFAULT_MIN (ma_default_limit()); without the store (`store none`) it keeps none, as before; `memory-limit unlimited;` keeps every zone in memory as before.  The server reads
+ * hw.physmem before the sandbox, karicheck on the host it runs on (ma_host_ram(), the one function of this file that asks the system).
  */
 
 #include <stdint.h>
@@ -52,6 +56,12 @@
 #define MA_SAMPLE_ZONES     100             /* the average size of the zones in memory is trusted from this many zones (or when every zone is in memory) */
 #define MA_MIN_FETCH_ZONES  16              /* ERROR: the limit must hold the zones of the reads in flight: fetch-concurrency (at least this many) ... */
 #define MA_FETCH_FACTOR     4               /* ... times this (a read takes room before the manager makes it, and a zone that came in is kept for 100 ms) */
+/* the default memory-limit (0.7.x small-VPS defaults): (RAM - reserve) / 2, at least MA_DEFAULT_MIN, rounded down to a MiB.  512 MB of RAM: 128M; 1 GB: 384M; 16 GB: about 7.9G
+ * (the 1B run on a 16 GB host: memory-limit 8G kept the Backend at 10.3 GB beside a 4 GB ARC, 11G was the highest that did not swap; without a limit the Backend grew to 14.7 GB in 70 s).
+ * RAM not known: as for 1 GB. */
+#define MA_DEFAULT_RESERVE  (256ull << 20)  /* the kernel, the other processes, the routers, the loader and the zones of karidns.conf on a small host */
+#define MA_DEFAULT_MIN      (64ull << 20)
+#define MA_DEFAULT_RAM_UNKNOWN (1ull << 30)
 
 enum { MA_BASIS_ASSUMED = 0, MA_BASIS_RESIDENT, MA_BASIS_RECORDS, MA_BASIS_STORE };
 enum { MA_STORE_NONE = 0, MA_STORE_MAP, MA_STORE_COPY };       /* ma_in_t.store_mode */
@@ -68,6 +78,8 @@ typedef struct {
     int store_mode;             /* MA_STORE_*: the zone store (0.7) keeps the zones that are not in memory; MAP maps the images of the zones in memory, COPY reads them into the heap */
     uint64_t stored_zones;      /* the zones with an image in the store and the bytes of those images (the store counts them: the size of a zone without reading a record) */
     uint64_t stored_image_bytes;
+    bool limit_default;         /* the limit is the default from the RAM (memory-limit not written) */
+    uint64_t ram;               /* the RAM it was derived from (bytes; 0 = not known) */
 } ma_in_t;
 
 typedef struct {
@@ -90,9 +102,20 @@ typedef struct {
     uint64_t backend_limit;     /* the Backend under the limit (0 without a limit) */
     uint64_t loader_limit;      /* the loader under the limit (0 without a limit) */
     int level;                  /* MA_LEVEL_* (always INFO without a limit) */
+    bool limit_default;         /* from ma_in_t: the limit is the default from the RAM */
+    uint64_t ram;
 } ma_est_t;
 
 void ma_estimate(const ma_in_t *in, ma_est_t *out);
+
+/* The default memory-limit for `ram` bytes of RAM (0 = not known: MA_DEFAULT_RAM_UNKNOWN), and the limit in force for a database block: `configured` when it is set
+ * (not 0), 0 (no limit) for `memory-limit unlimited` and for a database without the zone store (`store none`: a limit there makes the loader
+ * send every zone the Backend does not have as a summary, so a start would read no zone until a query asks for it), else the default (*is_default true).  ma_host_ram(): hw.physmem, 0 when it cannot be read (or not on FreeBSD). */
+uint64_t ma_default_limit(uint64_t ram);
+uint64_t ma_effective_limit(uint64_t configured, bool unlimited, bool store, uint64_t ram, bool *is_default);
+uint64_t ma_host_ram(void);
+/* the start line of the server and the information line of karicheck: "memory-limit is not set: 384M is used (half of the 1.0 GB of RAM above 256 MB) ..." */
+size_t ma_text_default(char *buf, size_t n, uint64_t limit, uint64_t ram);
 
 /* "512M", "3G", "2688M": a value memory-limit accepts (K, M, G suffix), the exact value when it is a multiple of 1 MiB */
 size_t ma_fmt_limit(char *buf, size_t n, uint64_t bytes);
