@@ -87,6 +87,8 @@ A manual run of the release workflow (`workflow_dispatch`, with a version typed 
 
 **The zone store's format.** A release that changes the format of the zone store (`STORE_FORMAT_VERSION` in `dns_store.h`) or of `settings.dat` says so in its release notes and its upgrade notes: the first start quarantines the old store, so the secondaries lose their stored copies, their expire clocks and the settings their primaries sent (they start as before 0.7: their file or nothing, then a transfer), and the database zones are read from the database again (karidns(8) "Secondary zones: the copies in the zone store", "The store is the only copy").
 
+**Release notes.** Every release updates [CHANGES.md](../CHANGES.md) and [UPGRADING.md](UPGRADING.md) (what changes, what breaks, how to fix it, and the checklist for operators). Every pull request that changes behaviour adds its line to CHANGES.md (with its number) in the same pull request; a release that changes a default, a configuration statement, the database schema or the store format also updates UPGRADING.md.
+
 ## SEE ALSO
 
 [distribution.md](distribution.md) (the packages and how to install them), [building.md](building.md) (`make install`), `tests/run_version_test.sh`, `tools/set_version.sh`, `packaging/version.sh`, `man/generate.sh`, `tests/run_install_test.sh`, `tests/run_md2man_test.sh`.
