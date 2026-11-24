@@ -7945,6 +7945,11 @@ static void test_bulk_basic(void) {
   store_stats(s, &st);
   CHECK_EQ(st.bulk_checkpoints, 1);
   CHECK_EQ(st.checkpoints, ck0 + 1);
+  {                                                                       /* the state a failed wait prints: whole in its buffer (the last field is there) */
+    char dbuf[1024];
+    store_test_bulk_dump(s, dbuf, sizeof dbuf);
+    CHECK(strncmp(dbuf, "bulk=", 5) == 0 && strstr(dbuf, " fl_on=") != NULL);
+  }
   const uint64_t seg1 = store_test_seg_bytes(s);
   CHECK(st.bulk_next_bytes >= 2 * seg1 - 4096 && st.bulk_next_bytes >= seg1 + (256u << 10));
   CHECK(st.journal_bytes_written <= jb0 + 64);                            /* (the header of the journal file the checkpoint switched to) */
