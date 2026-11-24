@@ -223,7 +223,9 @@ $RC onestart > "$T/rc_start.out" 2>&1 && ok "onestart" || bad "onestart" "$(cat 
 same "...owned by the service user" "$(stat -f %Su "$KEYDIR")" nobody
 i=0; while [ $i -lt 100 ] && ! $NODE -e "fetch('http://127.0.0.1:$PORT/api/v1/health').then((r) => process.exit(r.status === 200 ? 0 : 1), () => process.exit(1))"; do sleep 0.2; i=$((i + 1)); done
 $NODE -e "fetch('http://127.0.0.1:$PORT/api/v1/health').then((r) => process.exit(r.status === 200 ? 0 : 1), () => process.exit(1))" && ok "the daemon answers /health" || bad "the daemon does not answer" "$(cat "$T/rc_start.out")"
-SUP=$(cat /var/run/karidns_webadmin/supervisor.pid 2> /dev/null); CHILD=$(cat /var/run/karidns_webadmin/child.pid 2> /dev/null)
+# both pid files through a bounded wait, as in run_signer_pkg_test.sh (CI flake row 60)
+SUP=""; CHILD=""
+i=0; while [ $i -lt 100 ] && { [ -z "$SUP" ] || [ -z "$CHILD" ]; }; do SUP=$(cat /var/run/karidns_webadmin/supervisor.pid 2> /dev/null); CHILD=$(cat /var/run/karidns_webadmin/child.pid 2> /dev/null); [ -n "$SUP" ] && [ -n "$CHILD" ] && break; sleep 0.1; i=$((i + 1)); done
 { [ -n "$SUP" ] && kill -0 "$SUP" 2> /dev/null; } && ok "the supervisor pid file names a live process" || bad "no live supervisor ($SUP)"
 { [ -n "$CHILD" ] && kill -0 "$CHILD" 2> /dev/null; } && ok "the child pid file names a live process" || bad "no live child ($CHILD)"
 same "the pid directory is the service user's" "$(stat -f %Su /var/run/karidns_webadmin)" nobody
