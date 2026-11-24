@@ -2,7 +2,8 @@
 # udp_router_split_client.pl - the load of tests/run_udp_router_split_test.sh: N UDP queries (q<i>.example.test. A, DNS id = i & 0xffff, so N <= 65536) from
 # NSOCK sockets of their own (NSOCK source ports: the router that gets a query is chosen by the kernel from the 4-tuple, so every router needs several), the
 # query i going from socket i % NSOCK to the server address IPS[i % @IPS], at most WINDOW unanswered at a time, BATCH queries and then a pause of PAUSE_MS
-# milliseconds.  No query is sent again: an answer that does not come is a loss, and it is counted as one.
+# milliseconds.  No query is sent again: an answer that does not come is a loss, and it is counted as one.  A query unanswered for LOST_S (3) seconds
+# is given up (it stays a loss) and frees its place in the window: with WINDOW 1 one datagram the kernel drops must not stop the rest of the load.
 # Every answer is checked: QR set, the id of a query of that socket, NOERROR, one A record 192.0.2.1, and the datagram comes from the address and port that
 # the query went to (a wildcard socket of the server has to answer from the address the query came to, a socket bound to an address from that address).
 # Usage: perl udp_router_split_client.pl PORT N NSOCK WINDOW WAIT_S IP[,IP...] [BATCH [PAUSE_MS]]
@@ -44,6 +45,9 @@ sub pkt {
 
 my %pending;                                   # id => the number of the socket it went from
 my %want_ip;                                   # id => the index in @dest of the address it went to
+my %sent_at;                                   # id => the time it was sent (a query unanswered for $lost_s seconds is given up)
+my $lost_s = 3;
+my %given_up;                                  # id => the socket of a query given up
 my ($sent, $received, $answered, $bad, $senderr) = (0, 0, 0, 0, 0);
 my (%seen, %socks_ok);
 my $buf;
@@ -59,13 +63,14 @@ sub drain {
             if (length($buf) < 12) { $bad++; next; }
             my ($id, $fl, $qd, $an) = unpack("nnnn", $buf);
             my ($fport, $faddr) = sockaddr_in($from);
-            my $want = $pending{$id};
+            my $want = $pending{$id} // $given_up{$id};       # (a late answer to a query given up is still checked and counted)
             # (the A record 192.0.2.1 is in the answer: RDLENGTH 4 and the address; the datagram comes from the address the query went to, at the server's port)
             my $ok = ($fl & 0x8000) && ($fl & 0xf) == 0 && $an == 1 && $fport == $port && defined $want && $want == $k
                 && index($buf, pack("nC4", 4, 192, 0, 2, 1)) > 12 && $faddr eq $dest[$want_ip{$id}];
             $bad++ unless $ok;
             if (!$seen{$id}++) { $answered++; $socks_ok{$k} = 1; }
             delete $pending{$id};
+            delete $sent_at{$id};
         }
     }
     return $got;
@@ -82,6 +87,7 @@ while (1) {
         my $d = $i % @dest;
         $pending{$i & 0xffff} = $k;
         $want_ip{$i & 0xffff} = $d;
+        $sent_at{$i & 0xffff} = time;
         # (a send the kernel refuses for a moment, ENOBUFS on a loaded host, is tried again: a loss of the client is not one of the server)
         my $tries = 0;
         until (defined send($sock[$k], pkt($i), 0, sockaddr_in($port, $dest[$d]))) { $senderr++; last if ++$tries >= 200; sleep(0.005); }
@@ -89,6 +95,7 @@ while (1) {
         $moved++;
     }
     $moved += drain();
+    for my $id (keys %pending) { next if time - $sent_at{$id} < $lost_s; $given_up{$id} = delete $pending{$id}; delete $sent_at{$id}; $moved++; }   # (given up: counted as unanswered)
     $end_sent = time if $next > $n && !defined $end_sent;
     last if time - $t0 > 120;                    # (a server that does not answer at all: do not run for ever)
     last if $next > $n && !%pending;

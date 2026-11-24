@@ -129,7 +129,7 @@ run class-mismatch +qid=1893; has "$MAL" && has 'class-mismatch.anomaly.test. 30
 run rcode-dsotypeni;    has "status: RESERVED11" && ok
 run rcode-badkey;       has "status: ?17" && ok
 run rcode-badcookie;    has "status: BADCOOKIE" && hasnt "retrying" && ok
-run ede-all;            has "; EDE: 0 (Other): (EDE code 0 test description)" && has "; EDE: 19 (Stale NXDOMAIN Answer):" && has "; EDE: 25: (EDE code 25 test description)" && ok
+run ede-all;            has "; EDE: 0 (Other): (EDE code 0 test description)" && has "; EDE: 19 (Stale NXDOMAIN Answer):" && has "; EDE: 25 (Signature Expired before Valid): (EDE code 25 test description)" && ok
 # truncation (intentional difference from dig, docs/dag.md "Note on TC (Truncation) Retries"): the UDP answer is
 # shown, then the TCP retry, and both are rows of the comparison summary. This mock sets TC=1 over TCP too, so no
 # response is complete: the first one (UDP) is the base and the identical TCP answer matches it exactly.
@@ -184,6 +184,7 @@ if command -v dig >/dev/null 2>&1 && dig -v 2>&1 | grep -q "DiG 9\.20\."; then
             -e 's/(query_time|response_time): !!timestamp .*/\1: T/' \
             -e 's/id: [0-9]+/id: X/' -e 's/expected ID [0-9]+, got [0-9]+/expected ID X, got Y/' \
             -e 's/^(.. .. .. .. .. .. .. .. .. .. .. .. .. .. .. ..) .*/\1/' -e 's/^[0-9a-f]{2} [0-9a-f]{2} (8[0-9a-f] )/XX XX \1/' \
+            -e 's/EDE: (2[5-9]) [(][^)]*[)]:/EDE: \1:/' -e 's/INFO-CODE: (2[5-9]) [(][^)]*[)]/INFO-CODE: \1/' \
             -e 's/[[:space:]]+/ /g' -e 's/ $//' | grep -v '^$'
     }
     # Every scenario in the default format, +short, +yaml (X-44) and over TCP (X-43), exit codes included.

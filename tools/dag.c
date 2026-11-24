@@ -122,7 +122,14 @@ const char *get_ede_error_string(uint16_t code) {
         case 22: return "No Reachable Authority";
         case 23: return "Network Error";
         case 24: return "Invalid Data";
-        /* dig 9.20 names codes 0-24 only; later ones are printed by number ("; EDE: 25: (text)") */
+        /* 25-29: the IANA EDE registry (RFC 8914 section 5.2); dig 9.20.31 names them with these strings,
+         * earlier 9.20 releases print them by number */
+        case 25: return "Signature Expired before Valid";
+        case 26: return "Too Early";
+        case 27: return "Unsupported NSEC3 Iterations Value";
+        case 28: return "Unable to conform to policy";
+        case 29: return "Synthesized";
+        /* later codes are printed by number ("; EDE: 30: (text)") */
         default: return NULL;
     }
 }
