@@ -356,10 +356,12 @@ kernel refuses a request above its limit instead of clipping it\fR: the limit is
 \fBkern.ipc.maxsockbuf\fR, which is 2 MiB on a stock FreeBSD, so the \fB4M\fR
 default is refused there. Since 0.7 the server then asks for the most the kernel
 takes (about 1.8 MB on a stock system; the socket never gets less than it had)
-and logs a \fBWARNING\fR at start-up: \fB[IPC] WARNING: ... asked N, got M
-(limited by kern.ipc.maxsockbuf=X; set it to Y to get N, or lower
-udp\-recvbuf\-size / udp\-sndbuf\-size)\fR and, for each UDP socket,
-\fB[Network] WARNING: UDP SO_RCVBUF: asked N, got M (limited by
+and logs it at start-up, as a \fBNOTICE\fR when the size is the default (not
+written: \fBasked N (the default), got M ...\fR) and as a \fBWARNING\fR when
+\fBudp\-recvbuf\-size\fR / \fBudp\-sndbuf\-size\fR asked for it (0.7, #256):
+\fB[IPC] WARNING: ... asked N, got M (limited by kern.ipc.maxsockbuf=X; set it
+to Y to get N, or lower udp\-recvbuf\-size / udp\-sndbuf\-size)\fR and, for each
+UDP socket, \fB[Network] WARNING: UDP SO_RCVBUF: asked N, got M (limited by
 kern.ipc.maxsockbuf=X; set it to Y to get N ...)\fR. To get the full size set
 the sysctl to Y (\fBsysctl kern.ipc.maxsockbuf=8388608\fR, and in
 \fB/etc/sysctl.conf\fR) or write a size that fits. Before 0.7 the refused
