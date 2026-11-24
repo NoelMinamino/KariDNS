@@ -52,6 +52,7 @@ static size_t blk_need_max(void) { return (((size_t)PARK_ZONE_MAX + PARK_VIEW_MA
 
 bool park_init(park_table_t *t, uint32_t cap) {
   memset(t, 0, sizeof(*t));
+  t->att_w = -1;
   if (cap == 0 || cap > (1u << 20)) return false;
   uint32_t nbig = cap / 8 < 16 ? (cap < 16 ? cap : 16) : cap / 8;
   uint32_t nb = 16;
@@ -504,9 +505,28 @@ static void pend_abandon(park_table_t *t, park_entry_t *e) {
   else if (e->pend == PARK_PEND_ATTACH_ZID) (void)park_att_leave((uint16_t)(e->preq >> 32), (uint32_t)e->preq, (int)e->prio);       /* (prio: the worker that waits) */
 }
 
+void park_set_worker(park_table_t *t, int w) { t->att_w = w >= 0 && w < PARK_MAX_WORKERS ? w : -1; }
+
+/* 0.7: the entry that waited for the attach of a stored zone (azid) goes without the zone (its time is up, its connection went, or it was answered after the zone came: the claim is gone then and the
+ * leave finds nothing).  Another query of this table that waits for the same zone takes its part (the zone's claim still has this worker's bit and is woken for it); with none, the worker leaves the claim, and
+ * a claim that nobody is left in goes: the request in the ring is then dropped unread by the store thread that comes to it (park_attach_next()).  A pending request has its own rule (pend_abandon()). */
+static void att_wait_end(park_table_t *t, park_entry_t *e) {
+  for (uint32_t r = t->bucket[e->key & t->bmask]; r; r = ENT(t, r)->hnext) {
+    park_entry_t *o = ENT(t, r);
+    if (o == e || o->key != e->key) continue;
+    if (!o->azid) {
+      o->azid = 1;
+      o->preq = e->preq;
+    }
+    return;
+  }
+  if (t->att_w >= 0) (void)park_att_leave((uint16_t)(e->preq >> 32), (uint32_t)e->preq, t->att_w);
+}
+
 void park_release(park_table_t *t, park_entry_t *e) {
   if (!t->e || e < t->e || e >= t->e + t->cap || e->state == PARK_FREE) return;
   if (e->pend) pend_abandon(t, e);
+  else if (e->azid) att_wait_end(t, e);
   lookup_unmark(t, e);
   if (e->state == PARK_WAIT) {
     wait_leave(t, e);
@@ -793,9 +813,17 @@ void park_wake_broadcast(const char *view, const char *zone, bool failed) {
 }
 
 /* ------------------------------------------------------------------ ATTACH requests (0.7 store; the idea is in dns_park.h) */
-/* One request is a zone of the store: the view's id (16 bits), the zone's (32), a priority (8), in one word.  The ring has one producer (its worker) and any number of
- * consumers (the store threads): a consumer reads the slot and moves the tail with a compare-and-swap; when it loses the race the word it read is dropped, and a producer
- * cannot have overwritten a slot before the tail went past it. */
+/* One request is one word: bit 63 says that the slot holds a request (0: free or taken), bit 62 that it was made with the zone's claim (park_attach_claimed()), bits 48..61 the time it was made
+ * (CLOCK_MONOTONIC ms / 4, modulo 2^14), bits 32..47 the view's id (with PARK_ATT_ADOPT), bits 0..31 the zone's id.  The ring has one producer (its worker) and any number of consumers (the store
+ * threads).  A consumer takes a request by a compare-and-swap of its slot to 0, the oldest or the newest one (PARK_ATT_LIFO_MS in dns_park.h), and moves the tail past the slots that are 0 with a
+ * compare-and-swap of the tail.  The producer writes the slot at the head only while the head is less than a ring ahead of the tail: the tail has gone past that slot's last request, which was taken
+ * then (the tail passes a slot only when it is 0, and only the producer makes a slot non-zero).  A consumer that read a slot before the tail went past it, and the slot was written again since, takes
+ * the new request with its swap or fails: the word it swaps is the request itself (view, zone, time), so whatever it takes is a request that waits, and taken once. */
+#define ATT_V_LIVE (1ull << 63)
+#define ATT_V_CLAIMED (1ull << 62)
+#define ATT_V_TSHIFT 48
+#define ATT_V_TMASK 0x3FFFull
+#define ATT_SCAN_MAX 1024u              /* the slots a newest-first take looks through at the most (a ring whose newest slots were all taken gives its oldest request) */
 typedef struct {
   _Atomic uint64_t q[PARK_ATTACH_RING];
   _Atomic uint32_t head, tail;
@@ -804,7 +832,18 @@ static att_ring_t g_attach[PARK_MAX_WORKERS];
 static _Atomic int g_attach_kq = -1;
 static _Atomic int g_attach_asleep;                      /* the store threads that are about to wait for events, or wait */
 static _Atomic uint32_t g_attach_rr;
+static _Atomic uint32_t g_attach_turn;                   /* the takes from the rings: one in PARK_ATT_FIFO_EVERY takes the oldest request */
 static _Atomic int g_attach_wmax;                        /* the highest worker that asked, plus one */
+static _Atomic uint64_t g_att_shed, g_att_newest;
+
+static int64_t att_now_ms(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+/* the age of the request v at now_ms, in ms (4 ms units; modulo 65.5 s) */
+static uint64_t att_age_ms(uint64_t v, int64_t now_ms) { return ((((uint64_t)now_ms >> 2) - ((v >> ATT_V_TSHIFT) & ATT_V_TMASK)) & ATT_V_TMASK) << 2; }
 
 void park_attach_set_notify(int kq) { atomic_store_explicit(&g_attach_kq, kq, memory_order_relaxed); }
 
@@ -813,27 +852,52 @@ static void trigger_attach(void) {
   if (atomic_load_explicit(&g_attach_asleep, memory_order_relaxed) > 0) trigger(atomic_load_explicit(&g_attach_kq, memory_order_relaxed), PARK_ATTACH_IDENT);
 }
 
+/* the tail goes past the slots at its end that are taken (0); returns the tail and the head it saw */
+static uint32_t att_ring_settle(att_ring_t *r, uint32_t *head) {
+  uint32_t tail = atomic_load_explicit(&r->tail, memory_order_acquire);
+  for (;;) {
+    *head = atomic_load_explicit(&r->head, memory_order_acquire);
+    if (tail == *head || atomic_load_explicit(&r->q[tail % PARK_ATTACH_RING], memory_order_acquire) != 0) return tail;
+    if (atomic_compare_exchange_weak_explicit(&r->tail, &tail, tail + 1, memory_order_acq_rel, memory_order_acquire)) tail++;
+  }
+}
+
+/* the ring has room for one more request (its producer asks: *head is its head); a ring that looks full has the slots at its tail that were taken passed first (a take of the newest request leaves its slot
+ * behind the tail until the older ones are gone) */
+static bool head_room(att_ring_t *r, uint32_t *head) {
+  *head = atomic_load_explicit(&r->head, memory_order_relaxed);
+  if (*head - atomic_load_explicit(&r->tail, memory_order_acquire) < PARK_ATTACH_RING) return true;
+  uint32_t h;
+  return *head - att_ring_settle(r, &h) < PARK_ATTACH_RING;
+}
+
 bool park_attach_room(int w) {
   if (w < 0 || w >= PARK_MAX_WORKERS) return false;
-  const att_ring_t *r = &g_attach[w];
-  return atomic_load_explicit(&r->head, memory_order_relaxed) - atomic_load_explicit(&r->tail, memory_order_acquire) < PARK_ATTACH_RING;
+  att_ring_t *r = &g_attach[w];
+  uint32_t head;
+  return head_room(r, &head);
 }
 
 bool park_attach_adopt(int w, uint16_t sview, uint32_t zid) { return park_attach_zid(w, (uint16_t)(sview | PARK_ATT_ADOPT), zid); }
 
-bool park_attach_zid(int w, uint16_t sview, uint32_t zid) {
+bool park_attach_zid_at(int w, uint16_t sview, uint32_t zid, bool claimed, int64_t now_ms) {
   if (w < 0 || w >= PARK_MAX_WORKERS) return false;
   att_ring_t *r = &g_attach[w];
   int cur = atomic_load_explicit(&g_attach_wmax, memory_order_relaxed);
   while (cur < w + 1 && !atomic_compare_exchange_weak_explicit(&g_attach_wmax, &cur, w + 1, memory_order_relaxed, memory_order_relaxed)) {}
-  uint32_t head = atomic_load_explicit(&r->head, memory_order_relaxed);
-  uint32_t tail = atomic_load_explicit(&r->tail, memory_order_acquire);
-  if (head - tail >= PARK_ATTACH_RING) return false;                     /* (full: the query stays parked and the worker asks again) */
-  atomic_store_explicit(&r->q[head % PARK_ATTACH_RING], ((uint64_t)sview << 32) | zid, memory_order_relaxed);
+  uint32_t head;
+  if (!head_room(r, &head)) return false;                                 /* (full: the query stays parked and the worker asks again) */
+  const uint64_t v = ATT_V_LIVE | (claimed ? ATT_V_CLAIMED : 0) | ((((uint64_t)now_ms >> 2) & ATT_V_TMASK) << ATT_V_TSHIFT) | ((uint64_t)sview << 32) | zid;
+  atomic_store_explicit(&r->q[head % PARK_ATTACH_RING], v, memory_order_release);
   atomic_store_explicit(&r->head, head + 1, memory_order_release);
   trigger_attach();
   return true;
 }
+
+bool park_attach_zid(int w, uint16_t sview, uint32_t zid) { return park_attach_zid_at(w, sview, zid, false, att_now_ms()); }
+/* (a worker from 15 up shares the bit of its claim with the others of its group, which leave it without clearing it and drop a claim of only that bit with no request in a ring: whether one of them
+ * still waits cannot be told, so its request is made as one without a claim and never dropped) */
+bool park_attach_claimed(int w, uint16_t sview, uint32_t zid) { return park_attach_zid_at(w, sview, zid, w < 15, att_now_ms()); }
 
 /* 0.7 store S3: attach requests of threads that are not parked-query workers (the engine's background attach for a CNAME or glue that leads into a stored zone, a DoT / DoH thread),
  * and of a worker that cannot name the zone's id (the cell was being written): a few slots, as the transfer threads' fetch slots, taken by compare-and-swap */
@@ -883,21 +947,56 @@ bool park_attach_sleep_prepare(void) {
 
 void park_attach_sleep_done(void) { atomic_fetch_sub_explicit(&g_attach_asleep, 1, memory_order_relaxed); }
 
-static bool att_ring_pop(att_ring_t *r, uint16_t *sview, uint32_t *zid) {
-  for (;;) {
-    uint32_t tail = atomic_load_explicit(&r->tail, memory_order_acquire);
-    uint32_t head = atomic_load_explicit(&r->head, memory_order_acquire);
-    if (tail == head) return false;
-    uint64_t v = atomic_load_explicit(&r->q[tail % PARK_ATTACH_RING], memory_order_relaxed);
-    if (atomic_compare_exchange_weak_explicit(&r->tail, &tail, tail + 1, memory_order_acq_rel, memory_order_relaxed)) {
-      *sview = (uint16_t)(v >> 32);
-      *zid = (uint32_t)v;
+/* the request in the slot of position p is taken (*v); false: the slot is empty, or another store thread took it */
+static bool att_slot_take(att_ring_t *r, uint32_t p, uint64_t *v) {
+  _Atomic uint64_t *s = &r->q[p % PARK_ATTACH_RING];
+  uint64_t x = atomic_load_explicit(s, memory_order_acquire);
+  while (x & ATT_V_LIVE) {
+    if (atomic_compare_exchange_weak_explicit(s, &x, 0, memory_order_acq_rel, memory_order_acquire)) {
+      *v = x;
       return true;
     }
   }
+  return false;
 }
 
-bool park_attach_next(park_attach_req_t *out) {
+/* nobody waits for the request v: it was made with the zone's claim and the claim is gone (dns_park.h park_attach_claimed()) */
+static bool att_nobody_waits(uint64_t v) {
+  const uint16_t sv = (uint16_t)(v >> 32);
+  uint32_t set;
+  bool req;
+  return (v & ATT_V_CLAIMED) && !(sv & PARK_ATT_ADOPT) && !park_att_peek(sv, (uint32_t)v, &set, &req);
+}
+
+/* One request of the ring r, by the order of dns_park.h (PARK_ATT_LIFO_MS); oldest: this take is the one in PARK_ATT_FIFO_EVERY that takes the oldest.  A request that nobody waits for is dropped
+ * on the way, without a read of the store (counted): the oldest one whenever it is looked at, any other when it is taken.  false: the ring has none. */
+static bool att_ring_take(att_ring_t *r, int64_t now_ms, bool oldest, uint64_t *out) {
+  for (;;) {
+    uint32_t head;
+    const uint32_t tail = att_ring_settle(r, &head);
+    if (tail == head) return false;
+    const uint64_t o = atomic_load_explicit(&r->q[tail % PARK_ATTACH_RING], memory_order_acquire);
+    if (!(o & ATT_V_LIVE)) continue;                     /* (taken meanwhile) */
+    uint64_t v = 0;
+    bool newest = false;
+    if (oldest || att_age_ms(o, now_ms) <= PARK_ATT_LIFO_MS || att_nobody_waits(o)) {
+      if (!att_slot_take(r, tail, &v)) continue;
+    } else {                                             /* the store threads are behind: the newest request, looked for in the last ATT_SCAN_MAX slots (taken ones are skipped), else the oldest */
+      const uint32_t stop = head - tail > ATT_SCAN_MAX ? head - ATT_SCAN_MAX : tail;
+      for (uint32_t p = head; p != stop && !newest; p--) newest = att_slot_take(r, p - 1, &v);
+      if (!newest && !att_slot_take(r, tail, &v)) continue;
+    }
+    if (att_nobody_waits(v)) {
+      atomic_fetch_add_explicit(&g_att_shed, 1, memory_order_relaxed);
+      continue;
+    }
+    if (newest) atomic_fetch_add_explicit(&g_att_newest, 1, memory_order_relaxed);
+    *out = v;
+    return true;
+  }
+}
+
+bool park_attach_next_at(park_attach_req_t *out, int64_t now_ms) {
   bool got = false;
   for (int k = 0; k < PARK_ATTACH_ANY_SLOTS && !got; k++) {
     uint8_t ready = 2;
@@ -905,7 +1004,6 @@ bool park_attach_next(park_attach_req_t *out) {
     const park_fetch_req_t *q = &g_att_q[k];
     out->by_name = true;
     out->adopt = false;
-    out->by_name = true;
     out->prio = q->prio;
     out->worker = -1;
     out->sview = 0;
@@ -917,22 +1015,34 @@ bool park_attach_next(park_attach_req_t *out) {
   }
   int wm = atomic_load_explicit(&g_attach_wmax, memory_order_relaxed);
   uint32_t start = got || wm == 0 ? 0 : atomic_fetch_add_explicit(&g_attach_rr, 1, memory_order_relaxed);
+  const bool oldest = !got && wm > 0 && atomic_fetch_add_explicit(&g_attach_turn, 1, memory_order_relaxed) % PARK_ATT_FIFO_EVERY == 0;
   for (int i = 0; i < wm && !got; i++) {
     int w = (int)((start + (uint32_t)i) % (uint32_t)wm);
-    uint16_t sv;
-    uint32_t zid;
-    if (att_ring_pop(&g_attach[w], &sv, &zid)) {
+    uint64_t v;
+    if (att_ring_take(&g_attach[w], now_ms, oldest, &v)) {
+      const uint16_t sv = (uint16_t)(v >> 32);
       out->by_name = false;
       out->prio = 0;
       out->worker = (int16_t)w;
       out->adopt = (sv & PARK_ATT_ADOPT) != 0;
       out->sview = (uint16_t)(sv & ~PARK_ATT_ADOPT);
-      out->zid = zid;
+      out->zid = (uint32_t)v;
       got = true;
     }
   }
   if (got && park_attach_pending()) trigger_attach();    /* (another store thread may be asleep while more wait) */
   return got;
+}
+
+bool park_attach_next(park_attach_req_t *out) { return park_attach_next_at(out, att_now_ms()); }
+
+void park_attach_counts(uint64_t *shed, uint64_t *newest_first, uint64_t *queued) {
+  *shed = atomic_load_explicit(&g_att_shed, memory_order_relaxed);
+  *newest_first = atomic_load_explicit(&g_att_newest, memory_order_relaxed);
+  uint64_t n = 0;
+  const int wm = atomic_load_explicit(&g_attach_wmax, memory_order_relaxed);
+  for (int w = 0; w < wm; w++) n += (uint32_t)(atomic_load_explicit(&g_attach[w].head, memory_order_acquire) - atomic_load_explicit(&g_attach[w].tail, memory_order_acquire));
+  *queued = n;
 }
 
 /* ---- the attach claims: one request for a stored zone across the workers (see dns_park.h) ----
@@ -1058,6 +1168,7 @@ bool park_att_leave(uint16_t sview, uint32_t zid, int w) {
     _Atomic uint64_t *s = &g_aclaim[acl_slot(id, j)];
     uint64_t v = atomic_load_explicit(s, memory_order_acquire);
     while (v != 0 && (v & ACL_IDMASK) == id) {
+      if (w < 15 && !(v & bit)) return true;          /* (0.7: not in the set: nothing changes; a claim of others that has no request in a ring yet is theirs) */
       uint64_t nv = w >= 15 ? v : v & ~bit;
       if (!(nv & ACL_SET)) nv = 0;
       else if (!(nv & ACL_REQ) && !(nv & 0x7FFFu)) nv = 0;

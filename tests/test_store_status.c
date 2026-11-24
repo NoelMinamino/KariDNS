@@ -164,6 +164,7 @@ static bool extra_fn(store_extra_t *x) {
   x->folded = 11; x->fold_rows = 5; x->fold_replaced = 2; x->err_texts = 4; x->err_noted = 9; x->err_dropped = 1; x->sampled_detaches = 6;
   x->wa_ok = 100; x->wa_cold = 7; x->wa_over = 2; x->wa_claim = 3; x->wa_fail = 4; x->wa_decline = 5; x->wa_full = 6; x->wa_adopted = 98; x->wa_lost = 2; x->wa_ns = 1500000; x->build_n = 8; x->build_ns = 200000;
   x->hot_state = 2; x->hot_listed = 1000; x->hot_attached = 990; x->hot_skipped = 10; x->hot_written = 1234; x->hot_threads = 6; x->hot_per_s = 123456;
+  x->att_shed = 41; x->att_newest = 42; x->att_queued = 43;
   return true;
 }
 static bool g_mem_ok = true;
@@ -620,6 +621,9 @@ static void test_store(int mode, const char *base) {
   CHECK_EQ(kv_num("store.attach.worker.full"), 6);
   CHECK_EQ(kv_num("store.attach.worker.registered"), 98);
   CHECK_EQ(kv_num("store.attach.worker.dropped"), 2);
+  CHECK_EQ(kv_num("store.attach.shed"), 41);
+  CHECK_EQ(kv_num("store.attach.newest_first"), 42);
+  CHECK_EQ(kv_num("store.attach.queued"), 43);
   CHECK(strcmp(kv_str("store.hot.state"), "done") == 0);
   CHECK_EQ(kv_num("store.hot.listed"), 1000);
   CHECK_EQ(kv_num("store.hot.attached"), 990);

@@ -633,6 +633,9 @@ static void add_extra(list_t *l) {
   U("store.attach.worker.full", x.wa_full);
   U("store.attach.worker.registered", x.wa_adopted);
   U("store.attach.worker.dropped", x.wa_lost);
+  U("store.attach.shed", x.att_shed);
+  U("store.attach.newest_first", x.att_newest);
+  U("store.attach.queued", x.att_queued);
   {
     static const char *const hs[] = { "none", "attaching", "done", "high-mark", "off" };
     add_s(l, "store.hot.state", x.hot_state < 5 ? hs[x.hot_state] : "none");

@@ -1,4 +1,4 @@
-.TH KARIDNS.CONF 5 "2026-11-23" "KariDNS" "KariDNS Manual"
+.TH KARIDNS.CONF 5 "2026-11-24" "KariDNS" "KariDNS Manual"
 .\" Generated from docs/karidns.md by man/md2man.pl (make man): edit the Markdown manual, not this page.
 .SH NAME
 karidns.conf \- the configuration file of karidns(8)
@@ -3889,8 +3889,14 @@ them read more at once (a few per disk queue: the disk of the measurements gave
 5,200 reads a second at depth 1 and 38,700 at depth 16); a thread that has
 nothing to do costs nothing. Before 0.7.0 the default was 2. In MAP mode a query
 for a stored zone whose image is in the page cache does not wait for them at all
-(see "Attach on the worker" below). One more thread writes the zones to the
-store.
+(see "Attach on the worker" below). When more first touches are asked for than
+they attach (a flood of random names, a small \fBmemory\-limit\fR), the answers
+stay near what they attach instead of falling: a request whose queries have all
+ended at \fBpark\-timeout\fR is dropped unread, and while the oldest request
+waits more than 400 ms the newest are taken first (one take in eight the
+oldest), so that the answers go to clients that still wait (0.7; \fBkarictl
+store\fR \fBstore.attach.shed\fR, \fB.newest_first\fR). One more thread writes
+the zones to the store.
 .TP 8
 \fBstore\-hot\-list <yes|no>;\fR
 \fIDefault:\fR \fByes\fR

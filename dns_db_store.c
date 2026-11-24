@@ -1845,6 +1845,7 @@ static bool extra_status_cb(store_extra_t *x) {
   x->hot_written = atomic_load(&G.hot_written);
   x->hot_threads = atomic_load(&G.hot_nthr);
   x->hot_per_s = hot_rate(x->hot_attached);
+  park_attach_counts(&x->att_shed, &x->att_newest, &x->att_queued);
   return true;
 }
 
