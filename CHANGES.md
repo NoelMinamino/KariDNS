@@ -8,7 +8,7 @@ A pull request that changes behaviour adds its line here (docs/RELEASING.md).
 
 ## 0.7.0 (unreleased)
 
-The pull requests of this section are #178 to #252 (the 0.6.2 tag is at #177). Figures are the ones the pull
+The pull requests of this section are #178 to #256 (the 0.6.2 tag is at #177). Figures are the ones the pull
 request bodies report; the host, load and method are in the pull request.
 
 ### Upgrade notes / incompatible changes
@@ -36,6 +36,16 @@ What changes, what it breaks, and what to do. The step-by-step version is [docs/
     the replies. There is one socket per worker and listen address; the start is refused above 4096 sockets or
     `RLIMIT_NOFILE`. `udp-receive frontend` is the 0.6 behaviour.
   - `store-threads` defaults to 8 (it was 2, docs/karidns.md).
+- **A default `memory-limit` for database zones in the store** (#256). A `database { }` block whose zones go to the
+  zone store and that does not write `memory-limit` gets one from the RAM: half of the RAM above 256 MB, at least
+  `64M` (512 MB: `128M`, 1 GB: `384M`, 16 GB: `8064M`). The coldest zones above it are taken out of memory and read
+  again from the store when asked for; before, every attached zone stayed in memory and a database larger than the
+  host grew the Backend until the kernel killed it. The start logs it at NOTICE (`[DB] memory-limit is not set: 384M
+  is used (the default: half of the 1.0 GB of RAM above 256 MB, at least 64M) ...`), `karictl dbstatus` shows
+  `memory-limit=384M (default)` and `limit_default=1`, and `karicheck db` says the default of its host. Keep the old
+  behaviour with `memory-limit unlimited;`. Without the store (`store none;`, `zone-store none;`) an unset
+  `memory-limit` is still no limit. In a jail or container whose memory is limited below the host's RAM, write
+  `memory-limit` (hw.physmem is the host's).
 - **Socket buffers**: the kernel refuses (does not clip) a `SO_RCVBUF` / `SO_SNDBUF` above about 8/9 of
   `kern.ipc.maxsockbuf`. On a stock system the `4M` default of `udp-recvbuf-size` was refused and the sockets stayed
   at 16 KiB. 0.7 asks for the most the kernel gives and logs a WARNING that names the sysctl to raise (#224).
