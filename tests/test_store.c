@@ -129,8 +129,10 @@ static void tdir_free(tdir_t *d) {
 }
 static void fpath(const tdir_t *d, const char *name, char *out, size_t n) { snprintf(out, n, "%s/%s", d->path, name); }
 
+static uint64_t g_priv_max;                                  /* (0.7: the bound of the private memory of the tables for the stores of small_opts(): 0 = the default; the kpriv cases set a small one) */
 static void small_opts(store_opts_t *o) {
   store_opts_default(o);
+  o->tables_private_max = g_priv_max;
   o->create = true;
   o->seg_size = 1u << 20;
   o->mode = STORE_MODE_MAP;
@@ -2986,7 +2988,8 @@ static void test_reserve_survives_growth(void) {
   tdir_free(&d);
 }
 
-static void *ix_wait_thread(void *arg) { atomic_store(&g_ix_ret, (int)(store_index_wait(arg) ? 1 : 2)); return NULL; }
+static _Atomic uint64_t g_ix_call_us;   /* the time the waiting call took, measured around it (the wait it counts is inside) */
+static void *ix_wait_thread(void *arg) { const uint64_t t0 = now_ms(); const int r = store_index_wait(arg) ? 1 : 2; atomic_store(&g_ix_call_us, (now_ms() - t0 + 1) * 1000); atomic_store(&g_ix_ret, r); return NULL; }
 static void test_index_wait(void) {
   printf("[the producer waits for the build of the next index past 7/16 of the index instead of growing it inside the mutex]\n");
   for (int run = 0; run < 2; run++) {                                    /* run 1: the wait is bounded, the build ends later */
@@ -3033,7 +3036,11 @@ static void test_index_wait(void) {
       CHECK_EQ(st.growths_background, 1);
       CHECK_EQ(st.growths, 1);                                           /* (no growth inside the mutex) */
       CHECK_EQ(st.index_waits, 1);
-      CHECK(st.index_wait_us >= 100000);
+      {                                                                  /* (counted, within the call: the thread may start late on a loaded host, so not >= the 100 ms the main thread slept) */
+        const bool iw_ok = st.index_wait_us > 0 && st.index_wait_us <= atomic_load(&g_ix_call_us);
+        if (!iw_ok) printf("  index_wait_us %llu, call %llu us\n", (unsigned long long)st.index_wait_us, (unsigned long long)atomic_load(&g_ix_call_us));
+        CHECK(iw_ok);
+      }
       CHECK_EQ(st.index_wait_giveups, 0);
       CHECK(st.ix_slots > 1024);
     } else {
@@ -7865,6 +7872,28 @@ static bool wait_stat(store_t *s, uint64_t (*get)(const store_stats_t *), uint64
 }
 static uint64_t get_bulk_ck(const store_stats_t *st) { return st->bulk_checkpoints; }
 
+static uint64_t fsync_probe_ms(void) {
+  char p[600];
+  snprintf(p, sizeof p, "%s/probe.%d", g_base, (int)getpid());
+  const uint64_t t0 = now_ms();
+  int fd = open(p, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+  if (fd >= 0) { char b[4096] = { 1 }; if (write(fd, b, sizeof b) < 0) {} fsync(fd); close(fd); unlink(p); }
+  return now_ms() - t0;
+}
+/* A bulk checkpoint is a flush of several files, each with an fsync(): on a loaded disk one fsync() took 3.3 to 3.8 s here (a 4 KiB file, probed when the wait failed; iostat: 1.2 s a write and 2.3 s a cache
+ * flush on the SSD after the kill loops before this case), CI VMs stall for 3 s as well, and a checkpoint made 4.5 s + more than 5.7 s: 10 s was too short (flake row 61).  The wait is for a
+ * state that the checkpoint thread reaches, so it is long (60 s) and a failure prints the state of the store and the disk's fsync() time. */
+#define CK_WAIT_MS 60000
+static bool wait_ckpt(store_t *s, uint64_t (*get)(const store_stats_t *), uint64_t want) {
+  if (wait_stat(s, get, want, CK_WAIT_MS)) return true;
+  char dbuf[1024];
+  store_stats_t st;
+  store_test_bulk_dump(s, dbuf, sizeof dbuf);
+  store_stats(s, &st);
+  printf("  bulk checkpoint wait failed (%d s): %s; checkpoints %llu, bulk %llu; fsync() of a 4 KiB file now %llu ms\n", CK_WAIT_MS / 1000, dbuf, (unsigned long long)st.checkpoints, (unsigned long long)st.bulk_checkpoints, (unsigned long long)fsync_probe_ms());
+  return false;
+}
+#define CK_WAIT(s, get, want) CHECK(wait_ckpt((s), (get), (want)))
 static void test_bulk_basic(void) {
   printf("[a bulk fill: no journal record, no commit, no checkpoint by size or interval; bulk checkpoints in the body fill only, by the segment bytes; its end logs again]\n");
   tdir_t d;
@@ -7917,17 +7946,22 @@ static void test_bulk_basic(void) {
   /* 2. the body fill: a bulk checkpoint at once (the segments are past 256 KiB), the next one at twice the bytes of that one */
   store_bulk_phase(s, STORE_BULK_PASSED);
   CHECK_EQ(store_bulk(s), 2);
-  CHECK(wait_stat(s, get_bulk_ck, 1, 10000));
+  CK_WAIT(s, get_bulk_ck, 1);
   store_stats(s, &st);
   CHECK_EQ(st.bulk_checkpoints, 1);
   CHECK_EQ(st.checkpoints, ck0 + 1);
+  {                                                                       /* the state a failed wait prints: whole in its buffer (the last field is there) */
+    char dbuf[1024];
+    store_test_bulk_dump(s, dbuf, sizeof dbuf);
+    CHECK(strncmp(dbuf, "bulk=", 5) == 0 && strstr(dbuf, " fl_on=") != NULL);
+  }
   const uint64_t seg1 = store_test_seg_bytes(s);
   CHECK(st.bulk_next_bytes >= 2 * seg1 - 4096 && st.bulk_next_bytes >= seg1 + (256u << 10));
   CHECK(st.journal_bytes_written <= jb0 + 64);                            /* (the header of the journal file the checkpoint switched to) */
   CHECK_EQ(log_count(6, "bulk checkpoint 1 of the fill"), 1);
   uint32_t k = 600;
   for (uint64_t seg = store_test_seg_bytes(s); seg < st.bulk_next_bytes && k < 20000; seg = store_test_seg_bytes(s)) CHECK_EQ(put_i(s, 0, k++, 2, NULL), 0);
-  CHECK(wait_stat(s, get_bulk_ck, 2, 10000));
+  CK_WAIT(s, get_bulk_ck, 2);
   usleep(300000);
   store_stats(s, &st);
   CHECK_EQ(st.bulk_checkpoints, 2);                                       /* (no more: the segments have not doubled again) */
@@ -8870,6 +8904,257 @@ static void test_reserve_ceiling(bool lng) {
   tdir_free(&d);
 }
 
+/* ---- 0.7: the private memory of the tables is bounded (the 100M-zone first fill was killed by the kernel at 13.5 GB of private table pages) ---- */
+static uint64_t pr_ver(uint32_t i) { return i % 7 == 0 ? 4 : i % 5 == 0 ? 3 : i % 3 == 0 ? 2 : 1; }
+static uint64_t pr_tab(const store_stats_t *st) { return st->table_private_bytes - st->table_private_index_bytes; }
+static void test_priv_release(void) {
+  printf("[a checkpoint maps the pages it wrote from their files again: the private memory of the tables goes back to the page cache]\n");
+  tdir_t d;
+  tdir_new(&d, "prel");
+  store_opts_t o;
+  small_opts(&o);
+  o.tables_private_max = UINT64_MAX;                                     /* (no checkpoint for the bound: the calls below make them) */
+  o.checkpoint_interval_ms = UINT32_MAX;
+  o.journal_max_bytes = 64u << 20;
+  o.log = log_cb;
+  log_clear();
+  store_t *s = NULL;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (!s) { tdir_free(&d); return; }
+  store_view_add(s, "default");
+  for (uint32_t i = 0; i < 3000; i++) CHECK_EQ(put_i(s, 0, i, 1, NULL), 0);
+  CHECK_EQ(store_reserve(s, 0), 0);                                     /* (a growth of the index built outside the mutex is in before the checkpoint) */
+  store_stats_t st;
+  store_stats(s, &st);
+  const uint64_t p0 = st.table_private_bytes;
+  const uint64_t rel0 = st.table_released_bytes;                        /* (the checkpoints a growth asked for (ck_want) may have given pages back already: slow builds) */
+  CHECK(p0 + rel0 > 3000u * 128u);
+  CHECK_EQ(st.table_private_max, UINT64_MAX);
+  CHECK_EQ(store_checkpoint(s), 0);                                     /* (fuzzy: written, then given back) */
+  store_stats(s, &st);
+  printf("  3000 zones: %" PRIu64 " private bytes before the checkpoint, %" PRIu64 " after it, %" PRIu64 " given back, longest step %" PRIu64 " us\n", p0, st.table_private_bytes,
+         st.table_released_bytes, st.table_release_max_us);
+  CHECK_EQ(st.table_private_bytes, 0);
+  CHECK_EQ(st.table_private_index_bytes, 0);
+  CHECK(st.table_released_bytes > rel0);
+  CHECK(store_test_files_match(s));
+  for (uint32_t i = 0; i < 3000; i++) CHECK(verify_i(s, 0, i, 1));       /* (read from the pages of the files) */
+  /* a store into a page given back makes a private copy again; the next checkpoint writes it and gives it back */
+  for (uint32_t i = 0; i < 3000; i += 3) CHECK_EQ(put_i(s, 0, i, 2, NULL), 0);
+  store_stats(s, &st);
+  CHECK(st.table_private_bytes > 0);
+  CHECK_EQ(store_checkpoint(s), 0);
+  store_stats(s, &st);
+  CHECK_EQ(st.table_private_bytes, 0);
+  CHECK(store_test_files_match(s));
+  /* a run that cannot be mapped from its file again (the fault leaves it unmapped, the worst a failed MAP_FIXED can do): it is made again from the file, and from then on the tables keep their
+   * private pages (no checkpoint for the bound either) until the next start */
+  for (uint32_t i = 0; i < 3000; i += 5) CHECK_EQ(put_i(s, 0, i, 3, NULL), 0);
+  store_test_fail_release = 1;
+  CHECK_EQ(store_checkpoint(s), 0);
+  store_test_fail_release = 0;
+  store_stats(s, &st);
+  CHECK_EQ(st.table_release_errors, 1);
+  CHECK_EQ(log_count(3, "could not be mapped from its file again"), 1);
+  CHECK(st.table_private_bytes > 0);
+  for (uint32_t i = 0; i < 3000; i += 7) CHECK_EQ(put_i(s, 0, i, 4, NULL), 0);
+  const uint64_t rel = st.table_released_bytes;
+  CHECK_EQ(store_checkpoint(s), 0);
+  store_stats(s, &st);
+  CHECK_EQ(st.table_released_bytes, rel);
+  CHECK_EQ(st.table_release_errors, 1);
+  CHECK(st.table_private_bytes > 0);
+  for (uint32_t i = 0; i < 3000; i++) CHECK(verify_i(s, 0, i, pr_ver(i)));
+  check_consistent(s, "pages given back");
+  CHECK_EQ(store_checkpoint_clean(s), 0);
+  CHECK(store_test_files_match(s));
+  CHECK_EQ(store_close(s), 0);
+  o.create = false;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (s) {
+    store_stats(s, &st);
+    CHECK_EQ(st.table_private_bytes, 0);
+    CHECK_EQ(st.table_release_errors, 0);
+    for (uint32_t i = 0; i < 3000; i++) CHECK(verify_i(s, 0, i, pr_ver(i)));
+    check_consistent(s, "pages given back, reopened");
+    CHECK_EQ(store_close(s), 0);
+  }
+  tdir_free(&d);
+}
+/* The bound: a checkpoint is due when the private pages grew by tables_private_max since the last one gave its pages back.  No flusher: the checkpoint is the writer's call that finds it due,
+ * so the private pages of zt / zc / nx never pass the bound by more than one call's pages (before 0.7's fix they grew by 128 bytes a zone for the whole session) */
+static void test_priv_bound(void) {
+  printf("[the private memory of the tables stays within tables_private_max: checkpoints for the bound]\n");
+  const uint64_t B = 256u << 10;
+  tdir_t d;
+  tdir_new(&d, "pbnd");
+  store_opts_t o;
+  small_opts(&o);
+  o.tables_private_max = B;
+  o.checkpoint_interval_ms = UINT32_MAX;
+  o.journal_max_bytes = 64u << 20;                                       /* (no checkpoint by the journal's size) */
+  atomic_store(&store_test_no_flusher, true);
+  store_t *s = NULL;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (!s) { atomic_store(&store_test_no_flusher, false); tdir_free(&d); return; }
+  store_view_add(s, "default");
+  store_stats_t st;
+  uint64_t mtab = 0, mall = 0;
+  const uint32_t N = 30000;
+  for (uint32_t i = 0; i < N; i++) {
+    CHECK_EQ(put_i(s, 0, i, 1, NULL), 0);
+    if (i % 8) continue;
+    store_stats(s, &st);
+    if (pr_tab(&st) > mtab) mtab = pr_tab(&st);
+    if (st.table_private_bytes > mall) mall = st.table_private_bytes;
+  }
+  store_stats(s, &st);
+  printf("  %u zones (%u KiB of zt and zc): at most %" PRIu64 " KiB private in zt / zc / nx, %" PRIu64 " KiB in all; %" PRIu64 " checkpoints for the bound, %" PRIu64 " KiB given back\n", N,
+         N * 128u >> 10, mtab >> 10, mall >> 10, st.table_private_checkpoints, st.table_released_bytes >> 10);
+  CHECK_EQ(st.table_private_max, B);
+  CHECK(st.table_private_checkpoints >= 5);
+  CHECK(mtab <= B + (64u << 10));
+  CHECK(mall <= B + (st.ix_slots + st.sx_slots) * 8 + (64u << 10));      /* (a generation made by a growth is private whole until the next checkpoint writes it) */
+  CHECK_EQ(st.table_release_errors, 0);
+  for (uint32_t i = 0; i < N; i++) CHECK(verify_i(s, 0, i, 1));
+  check_consistent(s, "bound");
+  CHECK_EQ(store_checkpoint_clean(s), 0);
+  CHECK(store_test_files_match(s));
+  CHECK_EQ(store_close(s), 0);
+  atomic_store(&store_test_no_flusher, false);
+  o.create = false;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (s) {
+    for (uint32_t i = 0; i < N; i++) CHECK(verify_i(s, 0, i, 1));
+    CHECK_EQ(store_close(s), 0);
+  }
+  tdir_free(&d);
+}
+/* A bulk fill: the manifest pass gets bulk checkpoints for the bound (it had none: 100M KNOWN records were 13.5 GB), which do not take ix / sx (the pass inserts into every page of them); the
+ * first checkpoint after the pass takes them whole and gives them back; the end gives back the rest */
+static void test_priv_bulk(void) {
+  printf("[a bulk fill: checkpoints for the bound during the pass (not ix / sx), ix / sx given back after it]\n");
+  const uint64_t B = 256u << 10;
+  tdir_t d;
+  tdir_new(&d, "pblk");
+  store_opts_t o;
+  bulk_opts(&o);
+  o.tables_private_max = B;
+  atomic_store(&store_test_no_flusher, true);
+  store_t *s = NULL;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (!s) { atomic_store(&store_test_no_flusher, false); tdir_free(&d); return; }
+  CHECK_EQ(store_view_add(s, "default"), 0);
+  CHECK_EQ(store_bulk_begin(s), 0);
+  store_bulk_phase(s, STORE_BULK_PASS);
+  const uint32_t N = 30000;
+  CHECK_EQ(store_reserve(s, N), 0);                                     /* (as db_recon_begin() does: one generation made for the fill, private whole) */
+  store_stats_t st;
+  uint64_t mtab = 0;
+  for (uint32_t i = 0; i < N; i++) {
+    CHECK_EQ(known_i(s, 0, i, 1), 0);
+    if (i % 8) continue;
+    store_stats(s, &st);
+    if (pr_tab(&st) > mtab) mtab = pr_tab(&st);
+  }
+  store_stats(s, &st);
+  const uint64_t ck_pass = st.bulk_checkpoints, ixb = st.table_private_index_bytes;
+  printf("  pass of %u zones: %" PRIu64 " bulk checkpoints, at most %" PRIu64 " KiB private in zt / zc / nx, %" PRIu64 " KiB in ix / sx\n", N, ck_pass, mtab >> 10, ixb >> 10);
+  CHECK(ck_pass >= 5);
+  CHECK_EQ(st.table_private_checkpoints, ck_pass);
+  CHECK(mtab <= B + (64u << 10));
+  CHECK(ixb >= (st.ix_slots + st.sx_slots) * 8 - (64u << 10));          /* (not written during the pass) */
+  /* the body fill: the next call finds the index generations over the bound; that checkpoint writes them and gives them back */
+  store_bulk_phase(s, STORE_BULK_BODY);
+  uint64_t mall = 0;
+  for (uint32_t i = 0; i < N; i++) {
+    CHECK_EQ(put_i(s, 0, i, 2, NULL), 0);
+    if (i % 8) continue;
+    store_stats(s, &st);
+    if (i > 0 && st.table_private_bytes > mall) mall = st.table_private_bytes;
+  }
+  store_stats(s, &st);
+  printf("  body fill: at most %" PRIu64 " KiB private in all after the first put, %" PRIu64 " KiB in ix / sx now, %" PRIu64 " bulk checkpoints\n", mall >> 10, st.table_private_index_bytes >> 10,
+         st.bulk_checkpoints);
+  CHECK(st.bulk_checkpoints > ck_pass);
+  CHECK(st.table_private_index_bytes < (64u << 10));
+  CHECK(mall <= B + (64u << 10));
+  store_bulk_phase(s, STORE_BULK_PASSED);
+  CHECK_EQ(store_bulk_end(s, STORE_BULK_END_WAIT), 0);
+  store_stats(s, &st);
+  CHECK(st.table_private_bytes < (64u << 10));
+  CHECK_EQ(st.table_release_errors, 0);
+  for (uint32_t i = 0; i < N; i++) CHECK(verify_i(s, 0, i, 2));
+  check_consistent(s, "bulk with the bound");
+  CHECK_EQ(store_checkpoint_clean(s), 0);
+  CHECK(store_test_files_match(s));
+  CHECK_EQ(store_close(s), 0);
+  atomic_store(&store_test_no_flusher, false);
+  o.create = false;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (s) {
+    for (uint32_t i = 0; i < N; i++) CHECK(verify_i(s, 0, i, 2));
+    check_consistent(s, "bulk with the bound, reopened");
+    CHECK_EQ(store_close(s), 0);
+  }
+  tdir_free(&d);
+}
+/* Lock-free readers while the pages they read are given back again and again: every read is right (zones 0..1999 are never changed; a writer and the checkpoints change and release the pages
+ * around them) */
+static _Atomic bool g_pc_stop;
+static _Atomic uint64_t g_pc_bad, g_pc_reads;
+static void *pc_reader(void *arg) {
+  store_t *s = arg;
+  for (uint32_t k = 0; !atomic_load(&g_pc_stop); k++) {
+    const uint32_t i = (k * 7919u) % 2000;
+    if (!verify_i(s, 0, i, 1)) atomic_fetch_add(&g_pc_bad, 1);
+    atomic_fetch_add(&g_pc_reads, 1);
+  }
+  return NULL;
+}
+static void *pc_ckpt(void *arg) {
+  store_t *s = arg;
+  while (!atomic_load(&g_pc_stop)) { (void)store_checkpoint(s); usleep(2000); }
+  return NULL;
+}
+static void test_priv_conc(void) {
+  printf("[lock-free readers while the pages they read are given back to the page cache]\n");
+  tdir_t d;
+  tdir_new(&d, "pconc");
+  store_opts_t o;
+  small_opts(&o);
+  o.tables_private_max = 64u << 10;
+  store_t *s = NULL;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (!s) { tdir_free(&d); return; }
+  store_view_add(s, "default");
+  for (uint32_t i = 0; i < 2000; i++) CHECK_EQ(put_i(s, 0, i, 1, NULL), 0);
+  atomic_store(&g_pc_stop, false);
+  atomic_store(&g_pc_bad, 0);
+  atomic_store(&g_pc_reads, 0);
+  pthread_t rd[2], ck;
+  for (int t = 0; t < 2; t++) CHECK_EQ(pthread_create(&rd[t], NULL, pc_reader, s), 0);
+  CHECK_EQ(pthread_create(&ck, NULL, pc_ckpt, s), 0);
+  const uint32_t W = UNDER_TSAN ? 6000 : 30000;
+  for (uint32_t k = 0; k < W; k++) CHECK_EQ(put_i(s, 0, 2000 + (k * 31u) % 4000, 2 + k / 4000, NULL), 0);
+  atomic_store(&g_pc_stop, true);
+  for (int t = 0; t < 2; t++) pthread_join(rd[t], NULL);
+  pthread_join(ck, NULL);
+  store_stats_t st;
+  store_stats(s, &st);
+  printf("  %" PRIu64 " reads, %" PRIu64 " wrong; %" PRIu64 " KiB given back, %" PRIu64 " checkpoints for the bound, longest step %" PRIu64 " us\n", atomic_load(&g_pc_reads),
+         atomic_load(&g_pc_bad), st.table_released_bytes >> 10, st.table_private_checkpoints, st.table_release_max_us);
+  CHECK_EQ(atomic_load(&g_pc_bad), 0);
+  CHECK(atomic_load(&g_pc_reads) > 0);
+  CHECK(st.table_released_bytes > 0);
+  CHECK_EQ(st.table_release_errors, 0);
+  check_consistent(s, "readers during releases");
+  CHECK_EQ(store_checkpoint_clean(s), 0);
+  CHECK(store_test_files_match(s));
+  CHECK_EQ(store_close(s), 0);
+  tdir_free(&d);
+}
+
 int main(void) {
   const char *base = getenv("KARIDNS_STORE_TESTDIR");
   snprintf(g_base, sizeof(g_base), "%s/store_test.%d", base && *base ? base : ".", (int)getpid());
@@ -8938,7 +9223,13 @@ int main(void) {
   if (WANT("kjsw")) { test_kill_loop(UNDER_TSAN ? 20 : 50, 5); test_commit_switch(); }
   if (WANT("kjr")) test_kill_loop(UNDER_TSAN ? 20 : 60, 6);
   if (WANT("jring")) { test_jr_ack(); test_jr_kill_after_return(); test_jr_states(true); test_jr_states(false); test_jr_rule_t(); test_jr_ring(); test_jr_space(); test_jr_multi(); test_jr_edges(); test_jr_estimate(); test_jr_partial(); test_jr_flusher_states(); test_jr_seg_pending(); test_jr_defer_more(); test_jr_group_torn(); }
-  if (WANT("priv")) test_private_tables();
+  if (WANT("priv")) { test_private_tables(); test_priv_release(); test_priv_bound(); test_priv_bulk(); test_priv_conc(); }
+  if (WANT("kpriv")) {                                    /* (0.7: the kill -9 loops with a bound so small that nearly every checkpoint is one for the bound and gives its pages back) */
+    g_priv_max = 64u << 10;
+    test_kill_loop(UNDER_TSAN ? 20 : 50, 3);
+    test_bulk_kill_loop(UNDER_TSAN ? 8 : 24);
+    g_priv_max = 0;
+  }
   if (WANT("bulk")) {
     test_bulk_basic();
     for (int m = BK_PREFILL; m <= BK_CLEAN_CRASH; m++) test_bulk_crash(m);

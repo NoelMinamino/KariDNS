@@ -787,6 +787,12 @@ static void add_store(list_t *l, const store_t *s, const store_attach_stats_t *a
   U("store.checkpoint.table_last_bytes", st->checkpoint_table_last_bytes);
   U("store.checkpoint.paced_us", st->checkpoint_paced_us);
   U("store.tables.private_bytes", st->table_private_bytes);
+  U("store.tables.private_index_bytes", st->table_private_index_bytes);
+  U("store.tables.private_max", st->table_private_max);
+  U("store.tables.released_bytes", st->table_released_bytes);
+  U("store.tables.release_max_us", st->table_release_max_us);
+  U("store.tables.private_checkpoints", st->table_private_checkpoints);
+  U("store.tables.release_errors", st->table_release_errors);
   U("store.writes.commits", st->commits);
   U("store.writes.puts", st->puts);
   U("store.writes.replaces", st->replaces);
