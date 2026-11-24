@@ -5,8 +5,12 @@
 # more: it was removed before it was released).  It parks like any other query, the ingest thread takes the coldest zones out of memory on demand (the minimum residency only
 # relaxed for zones whose queries have been answered) and fetches the zone, and the query is answered when the zone is there.  Checked:
 #   - rounds of parallel queries for zones that do not fit memory-limit (24 zones of about 100 KB, memory-limit 1m, 4 queries at a time, each round at once after the last):
-#     every query is answered on the first try (no EDE 14), nothing is shed, room_evictions > 0 (the zones were taken out on demand), dbstatus has no over_limit field,
+#     every query is answered on the first try (no EDE 14), nothing is shed, dbstatus has no over_limit field,
 #     nothing waits, is in flight or holds a place afterwards, and the zones in memory stay within a bound
+#   - room on demand for certain: 3 zones larger than the hard line (about 1.6 MB each), asked for at once with fetch-concurrency 2 (its least): the third request comes to the
+#     ingest thread when the first zone is just installed: it is in memory and its query not answered yet (the cache manager cannot take it), so the zones are above the hard
+#     line whatever the speed of the host and the request waits for room: room_evictions > 0 and every query is answered (the rounds above make room on demand only
+#     when the host is fast enough that the 50 ms cache manager does not keep up: 0 under load, CI flakes row 51)
 #   - the same with fetch-concurrency 2 and fetch-rate 100 (the requests wait for a place and for the bucket as well as for room)
 #   - reloads (karictl reconfig, changing fetch-concurrency and fetch-rate) while the rounds run: every query is still answered, nothing is lost or left behind (places,
 #     the queue, the claim marks: dbstatus is idle afterwards and the server answers)
@@ -62,6 +66,18 @@ WITH RECURSIVE m(j) AS (SELECT 0 UNION ALL SELECT j + 1 FROM m WHERE j < 999)
 INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled)
   SELECT d.id, 'h' || m.j || '.' || d.name, 'A', '192.0.2.' || (m.j % 250 + 1), 300, 0, 0 FROM domains d, m;
 SQL
+# 3 zones larger than the hard line of memory-limit 1m (110 %): b1.test .. b3.test, 14000 A records each
+sqlite3 "$T/db/z.db" <<SQL
+WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 3)
+INSERT INTO domains (name, type) SELECT printf('b%d.test', i), 'NATIVE' FROM n;
+INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled)
+  SELECT id, name, 'SOA', 'ns1.' || name || ' host.' || name || ' 1 3600 600 86400 300', 300, 0, 0 FROM domains WHERE name LIKE 'b%';
+INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT id, name, 'NS', 'ns1.' || name, 300, 0, 0 FROM domains WHERE name LIKE 'b%';
+INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT id, 'www.' || name, 'A', '192.0.2.80', 300, 0, 0 FROM domains WHERE name LIKE 'b%';
+WITH RECURSIVE m(j) AS (SELECT 0 UNION ALL SELECT j + 1 FROM m WHERE j < 13999)
+INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled)
+  SELECT d.id, 'h' || m.j || '.' || d.name, 'A', '192.0.2.' || (m.j % 250 + 1), 300, 0, 0 FROM domains d, m WHERE d.name LIKE 'b%';
+SQL
 chown -R nobody "$T/db"; chmod 600 "$T/db/z.db"*
 install -o root -g wheel -m 755 "$LOADER" "$T/karidns-dbloader" 2>/dev/null || { cp "$LOADER" "$T/karidns-dbloader"; chown 0:0 "$T/karidns-dbloader"; chmod 755 "$T/karidns-dbloader"; }
 cat > "$T/karictl.conf" <<EOF
@@ -100,31 +116,45 @@ waitfor() {   # waitfor SECONDS COMMAND...
 }
 idle() { [ "$(field fetchq in_flight)" = "0" ] && [ "$(field fetchq places)" = "0" ] && [ "$(field fetchq queued)" = "0" ] && [ "$(field cache room_waiting)" = "0" ]; }
 # rounds(): ROUNDS rounds of P parallel queries for the next P zones (round after round at once), the zones in turn: the zones that do not fit memory-limit are read again and again.
-# GOOD, REFUSED and ODD count the answers: the right address, SERVFAIL with EDE 14, anything else
+# GOOD, REFUSED and ODD count the answers: the right address, SERVFAIL with EDE 14, anything else.  Every other answer is printed (its status, EDE and timeout lines, the time
+# the dag took) and, for a round with a query that got no answer, kari_noanswer_diag (tests/lib_proc.sh) says where it went: the loopback queue, a worker that read it
+# (ipcworker.N.queries), a park drop (store.park.drop.*: 0.7 drops a query whose park-timeout is up, it does not answer it), the log (CI flakes row 51)
 rounds() {
     GOOD=0; REFUSED=0; ODD=0
     r=0; z=0
     while [ $r -lt "$ROUNDS" ]; do
         k=0; PIDS=""
+        kari_try_snap "$T/nad" "$KCTL"
+        t0=$(kari_now)
         while [ $k -lt $P ]; do
             z=$((z % NZ + 1))
-            ./dag @127.0.0.1 -p "$PORT" "www.$(printf 'z%04d' $z).test" A +nohexdump +time=8 +tries=1 > "$T/a.$k" 2>/dev/null &
+            echo "www.$(printf 'z%04d' $z).test" > "$T/n.$k"
+            ( s=$(date +%s); ./dag @127.0.0.1 -p "$PORT" "$(cat "$T/n.$k")" A +nohexdump +time=8 +tries=1 > "$T/a.$k" 2>&1; echo "took $(($(date +%s) - s)) s" >> "$T/a.$k" ) &
             PIDS="$PIDS $!"
             k=$((k + 1))
         done
         wait $PIDS
-        k=0
+        k=0; LOST=""
         while [ $k -lt $P ]; do
             o=$(cat "$T/a.$k")
             case "$o" in
                 *"192.0.2.80"*) GOOD=$((GOOD + 1)) ;;
                 *"status: SERVFAIL"*"EDE: 14"*) REFUSED=$((REFUSED + 1)) ;;
-                *) ODD=$((ODD + 1)) ;;
+                *)  ODD=$((ODD + 1))
+                    echo "  [other] round $((r + 1)) (from $t0 UTC) $(cat "$T/n.$k") A: $(grep -E 'status:|EDE|timed out|no servers|error|^took' "$T/a.$k" | head -4 | tr '\n' ' ')"
+                    grep -q 'status:' "$T/a.$k" || LOST=$(cat "$T/n.$k") ;;
             esac
             k=$((k + 1))
         done
+        [ -n "$LOST" ] && kari_noanswer_diag "$T/nad" "$KCTL" "$T/srv.log" "$PORT" "$LOST" A
         r=$((r + 1))
     done
+}
+# the state of the server for a failed check: the dbstatus lines, the queries dropped without an answer, the IPC counters that are not 0
+state() {
+    dbs | grep -E '^(cache|fetchq|fetch):' | sed 's/^/    /'
+    $KCTL store -k 2>/dev/null | grep -E '^store\.(park\.drop\.|lookup\.(drop\.|shed=|expired=|servfail=))' | grep -v '=0$' | sed 's/^/    /'
+    $KCTL ipcstats 2>/dev/null | grep -E 'drop|lost|full' | grep -v '=0$' | sed 's/^/    ipc /'
 }
 
 echo "== above the hard limit every query waits for room and is answered on the first try"
@@ -132,11 +162,11 @@ conf ""
 start_srv
 dbs | grep -q 'over_limit' && fail "dbstatus still has an over_limit field: $(dbs | grep '^cache:')" || pass "dbstatus has no over_limit field (there is one behaviour)"
 rounds
-echo "  answered $GOOD, refused $REFUSED, other $ODD of $((ROUNDS * P)); $(dbs | grep '^cache:' | sed 's/.*evictions=/evictions=/')"
-[ "$GOOD" = "$((ROUNDS * P))" ] && pass "all $GOOD queries were answered on the first try" || fail "answered $GOOD of $((ROUNDS * P)), refused $REFUSED, other $ODD"
+echo "  answered $GOOD, refused $REFUSED, other $ODD of $((ROUNDS * P)); $(dbs | grep '^cache:' | sed 's/^cache: *//')"
+[ "$GOOD" = "$((ROUNDS * P))" ] && pass "all $GOOD queries were answered on the first try" || { fail "answered $GOOD of $((ROUNDS * P)), refused $REFUSED, other $ODD"; state; }
 [ "$(field cache shed)" = "0" ] && pass "nothing was shed" || fail "shed=$(field cache shed)"
 RE=$(field cache room_evictions)
-[ "${RE:-0}" -gt 0 ] && pass "zones were taken out of memory on demand ($RE, $(field cache room_relaxed) of them younger than the minimum residency)" || fail "no zone was taken out on demand: $(dbs | grep '^cache:')"
+echo "  zones taken out on demand in the rounds: ${RE:-0}, $(field cache room_relaxed) of them younger than the minimum residency (0 on a slow host: the cache manager kept up; checked for certain below)"
 waitfor 10 idle && pass "nothing waits for room, is in flight or holds a place afterwards" || fail "fetchq: $(dbs | grep '^fetchq:'); $(dbs | grep '^cache:')"
 LIM=$(field cache limit); PEAK=$(field cache peak)
 [ "${PEAK:-0}" -lt $((LIM * 3)) ] && pass "the zones in memory stayed within a bound (peak $PEAK bytes, limit $LIM)" || fail "peak $PEAK against a limit of $LIM"
@@ -144,12 +174,31 @@ LIM=$(field cache limit); PEAK=$(field cache peak)
 [ "$(field fetchq queue_full)" = "0" ] && pass "the queue never filled up" || fail "queue_full=$(field fetchq queue_full)"
 stop_srv
 
+echo "== room on demand for certain: 3 zones larger than the hard line at once, fetch-concurrency 2"
+conf "fetch-concurrency 2;"
+start_srv
+kari_try_snap "$T/nad" "$KCTL"
+PIDS=""
+for b in 1 2 3; do ( ./dag @127.0.0.1 -p "$PORT" "www.b$b.test" A +nohexdump +time=8 +tries=1 > "$T/b.$b" 2>&1 ) & PIDS="$PIDS $!"; done
+wait $PIDS
+BG=0; BL=""
+for b in 1 2 3; do
+    grep -q '192.0.2.80' "$T/b.$b" && BG=$((BG + 1)) || echo "  [other] www.b$b.test A: $(grep -E 'status:|EDE|timed out|no servers|error' "$T/b.$b" | head -3 | tr '\n' ' ')"
+    grep -q 'status:' "$T/b.$b" || BL="www.b$b.test"
+done
+[ "$BG" = 3 ] && pass "the 3 queries for zones larger than the hard line were answered" || { fail "answered $BG of 3"; [ -n "$BL" ] && kari_noanswer_diag "$T/nad" "$KCTL" "$T/srv.log" "$PORT" "$BL" A; state; }
+RE=$(field cache room_evictions)
+[ "${RE:-0}" -gt 0 ] && pass "zones were taken out of memory on demand ($RE, $(field cache room_relaxed) of them younger than the minimum residency; room_waits=$(field cache room_waits))" || { fail "no zone was taken out on demand"; state; }
+[ "$(field cache room_timeouts)" = "0" ] && [ "$(field cache shed)" = "0" ] && pass "no request ran out of time waiting for room, nothing was shed" || fail "room_timeouts=$(field cache room_timeouts) shed=$(field cache shed)"
+waitfor 10 idle && pass "nothing waits for room, is in flight or holds a place afterwards" || fail "fetchq: $(dbs | grep '^fetchq:'); $(dbs | grep '^cache:')"
+stop_srv
+
 echo "== the same with fetch-concurrency 2 and fetch-rate 100: the requests wait for a place and for the bucket as well"
 conf "fetch-concurrency 2; fetch-rate 100;"
 start_srv
 rounds
 echo "  answered $GOOD, refused $REFUSED, other $ODD of $((ROUNDS * P)); fetchq: $(dbs | grep '^fetchq:' | sed 's/.*queued=/queued=/')"
-[ "$GOOD" = "$((ROUNDS * P))" ] && pass "all $GOOD queries were answered on the first try" || fail "answered $GOOD of $((ROUNDS * P)), refused $REFUSED, other $ODD"
+[ "$GOOD" = "$((ROUNDS * P))" ] && pass "all $GOOD queries were answered on the first try" || { fail "answered $GOOD of $((ROUNDS * P)), refused $REFUSED, other $ODD"; state; }
 [ "$(field cache shed)" = "0" ] && [ "$(dbs | grep '^fetch:' | sed -n 's/.* refused_by_rate=\([0-9]*\).*/\1/p')" = "0" ] && pass "nothing was shed or refused by rate" || fail "shed=$(field cache shed); $(dbs | grep '^fetch:')"
 [ "$(field fetchq peak)" -le 2 ] 2>/dev/null && pass "never more than 2 fetches in flight (peak $(field fetchq peak))" || fail "peak=$(field fetchq peak) with fetch-concurrency 2"
 waitfor 10 idle && pass "nothing waits, is in flight or holds a place afterwards" || fail "fetchq: $(dbs | grep '^fetchq:')"
@@ -173,12 +222,12 @@ RLP=$!
 rounds
 wait "$RLP"
 echo "  answered $GOOD, refused $REFUSED, other $ODD of $((ROUNDS * P)) (eight reloads meanwhile)"
-[ "$GOOD" = "$((ROUNDS * P))" ] && pass "all $GOOD queries were answered on the first try although the configuration was reloaded eight times meanwhile" || fail "answered $GOOD of $((ROUNDS * P)), refused $REFUSED, other $ODD"
+[ "$GOOD" = "$((ROUNDS * P))" ] && pass "all $GOOD queries were answered on the first try although the configuration was reloaded eight times meanwhile" || { fail "answered $GOOD of $((ROUNDS * P)), refused $REFUSED, other $ODD"; state; }
 [ "$(field cache shed)" = "0" ] && pass "nothing was shed" || fail "shed=$(field cache shed)"
 waitfor 10 idle && pass "nothing waits for room, is in flight or holds a place afterwards (the places, the queue and the claims are clean)" || fail "fetchq: $(dbs | grep '^fetchq:'); $(dbs | grep '^cache:')"
 [ "$(./dag @127.0.0.1 -p "$PORT" www.z0001.test A +short +nohexdump +time=8 +tries=1 2>/dev/null | head -1)" = "192.0.2.80" ] && pass "the server answers after the reloads" || fail "no answer after the reloads"
 rounds
-[ "$GOOD" = "$((ROUNDS * P))" ] && pass "and a second set of rounds is answered on the first try ($GOOD): no claim mark was left behind" || fail "second rounds: answered $GOOD of $((ROUNDS * P)), refused $REFUSED, other $ODD"
+[ "$GOOD" = "$((ROUNDS * P))" ] && pass "and a second set of rounds is answered on the first try ($GOOD): no claim mark was left behind" || { fail "second rounds: answered $GOOD of $((ROUNDS * P)), refused $REFUSED, other $ODD"; state; }
 waitfor 10 idle && pass "idle again" || fail "fetchq: $(dbs | grep '^fetchq:')"
 stop_srv
 
