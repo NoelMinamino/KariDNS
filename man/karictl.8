@@ -1,4 +1,4 @@
-.TH KARICTL 8 "2026-11-24" "KariDNS" "KariDNS Manual"
+.TH KARICTL 8 "2026-11-25" "KariDNS" "KariDNS Manual"
 .\" Generated from docs/karictl.md by man/md2man.pl (make man): edit the Markdown manual, not this page.
 .SH NAME
 karictl \- Remote Control and Management Utility for KariDNS
@@ -1073,9 +1073,10 @@ back to the page cache yet: memory of the process that the kernel cannot drop (0
 after a restart until a zone changes); \fB.private_index_bytes\fR is the share
 of \fBix\fR and \fBsx\fR (an index made by a growth or for a first fill is
 counted whole until a checkpoint wrote it, and a checkpoint during the listing
-pass of a first fill does not write it). \fBmemory\-limit\fR counts it: the
-zones in memory get the limit less this, at least a tenth of the limit
-(docs/karidns.md, "The tables in memory")
+pass of a first fill does not write it, so in that pass the figure is not
+bounded by \fB.private_max\fR: it grows with the number of names, a known limit
+of 0.7). \fBmemory\-limit\fR counts it: the zones in memory get the limit less
+this, at least a tenth of the limit (docs/karidns.md, "The tables in memory")
 .TP 8
 \fBstore.tables.private_max\fR, \fB.private_checkpoints\fR, \fB.released_bytes\fR, \fB.release_max_us\fR, \fB.release_errors\fR
 0.7: the bound of that memory (a 32nd of the RAM, at least 64 MiB and at most 1
