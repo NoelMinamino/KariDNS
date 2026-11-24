@@ -1301,6 +1301,19 @@ Zones that a worker attached and a store thread then registered / found in
 memory already, changed or gone (dropped: the answer the worker gave was the
 version the record had)
 .TP 8
+\fBstore.attach.shed\fR, \fB.newest_first\fR, \fB.queued\fR
+0.7: the attach requests of the workers that the store threads dropped unread
+because nobody waited for them any more (every worker that had a query for the
+zone had left the zone's claim: the queries ended at \fBpark\-timeout\fR, or
+another request did the zone); the requests taken newest first because the store
+threads were behind (the oldest request of a ring was over 400 ms old: the
+queries that came last have the most time left; one take in eight is still the
+oldest); the slots of the workers' attach rings in use now (waiting requests and
+the slots of requests taken out of order). A request that a query still waits
+for is never dropped. A \fB.shed\fR that rises with \fBstore.cold.timeout\fR
+means more first touches of stored zones are asked for than the store threads
+attach (\fBstore\-threads\fR, a larger \fBmemory\-limit\fR)
+.TP 8
 \fBstore.lookup.available\fR, \fB.ready\fR
 0.7, the lookups of the first start (a query for a name that no stored zone
 covers while a view's first pass has not listed every zone): 1 when the figures

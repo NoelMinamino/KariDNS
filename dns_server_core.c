@@ -2904,7 +2904,7 @@ static void park_ask(park_table_t *pt, int widx, int32_t pi, const park_plan_t *
       park_entry_attach_zid(e, sv, pel->zid);               /* (a store thread that cannot name the zone says it by the id) */
       const int c = park_att_claim_tag(sv, pel->zid, widx, e->key);          /* (the key of the zone this query waits for: a store thread that finds another zone under the id wakes the waiters, dns_db_store.c att_take()) */
       if (c == 0) return;                                /* (the request of another worker's claim is in a ring: this entry is woken with it) */
-      if (park_attach_zid(widx, sv, pel->zid)) park_att_requested(sv, pel->zid);
+      if (c > 0 ? park_attach_claimed(widx, sv, pel->zid) : park_attach_zid(widx, sv, pel->zid)) park_att_requested(sv, pel->zid);      /* (with the claim: a store thread drops the request unread once every worker of the claim has left it) */
       else park_pending_set(pt, e, PARK_PEND_ATTACH_ZID, ((uint64_t)sv << 32) | pel->zid, (uint8_t)widx);
     } else if (!park_attach_request_any(pp->hv, pp->name)) {
       park_pending_set(pt, e, PARK_PEND_ATTACH_NAME, 0, 0);
@@ -2924,7 +2924,9 @@ static void park_ask_again(park_table_t *pt, int widx) {
     case PARK_PEND_ATTACH_ZID: {
       const uint16_t sv = (uint16_t)(e->preq >> 32);
       const uint32_t zid = (uint32_t)e->preq;
-      ok = park_attach_zid(widx, sv, zid);
+      uint32_t set;
+      bool req;
+      ok = park_att_peek(sv, zid, &set, &req) ? park_attach_claimed(widx, sv, zid) : park_attach_zid(widx, sv, zid);     /* (the claim the entry made or joined, unless there was no room for one) */
       if (ok) park_att_requested(sv, zid);
       break;
     }
@@ -3538,6 +3540,7 @@ void *worker_thread_func(void *arg) {
       park_on = kevent(kq, &ev_park, 1, NULL, 0, NULL) == 0;
       if (park_on) {
         park_register_worker(ctx->thread_id, kq);
+        park_set_worker(&park, ctx->thread_id);
         t_park_tbl = &park;
       }
     }
