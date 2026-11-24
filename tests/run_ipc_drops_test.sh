@@ -12,7 +12,8 @@
 #      and the ones that were queued are answered
 #   D  an IPC / UDP buffer above kern.ipc.maxsockbuf: the kernel refuses it, every buffer gets the most the kernel takes, the warning says "asked N, got M (limited by kern.ipc.maxsockbuf=X; set it to Y)"
 #   E  (0.7 IPC backpressure) the router stopped while 400 queries come, with a small reply queue (test switches KARIDNS_TEST_IPC_REPLY_QUEUE, _BUDGET_US):
-#      with no wait (the worker before 0.7) the replies that do not fit are dropped and counted; with the wait every query is answered, none dropped
+#      with no wait (the worker before 0.7) the replies that do not fit are dropped and counted; with the wait every query is answered, none dropped.
+#      The switches exist only in the test build (./karidns of make coverage, or ./karidns-evict): E is skipped without one; a release ./karidns has none (E0)
 #
 # SKIP (exit 0, with the reason) without karidns, karictl, perl.  About 30 s.  See docs/karictl.md (ipcstats), docs/karidns.md (udp-recvbuf-size).
 # ==============================================================================
@@ -248,10 +249,21 @@ EOF
 }
 # the router: the last single-threaded child of the manager (forked after the Backend; the first one is the broker)
 router_pid() { ps -ax -o pid= -o ppid= -o nlwp= | awk -v p="$SERVER_PID" -v b="$BACKEND" '$2 == p && $3 == 1 && $1 != b { r = $1 } END { print r }'; }
+# The test switches exist only in the test build (review 2026-11-23 F-B3, -DKARIDNS_TEST_EVICT): ./karidns of `make coverage`, else ./karidns-evict (make evict;
+# tests/run_all_suite.sh builds it).  A release ./karidns has none of them: it is checked that it does not, and E runs on the test build or is skipped.
+has_ipc_knobs() { [ -x "$1" ] && grep -q 'KARIDNS_TEST_IPC_REPLY_QUEUE' "$1" 2>/dev/null; }
+KARIDNS_E=""
+if has_ipc_knobs "$KARIDNS"; then KARIDNS_E=$KARIDNS
+else
+    ok "E0: $KARIDNS (no test build) does not read the IPC test switches from its environment"
+    has_ipc_knobs "$ROOT_DIR/karidns-evict" && KARIDNS_E=$ROOT_DIR/karidns-evict
+fi
 run_e() {   # run_e LABEL BUDGET_US
     write_conf_e
     export KARIDNS_TEST_IPC_REPLY_QUEUE=4096 KARIDNS_TEST_IPC_REPLY_BUDGET_US=$2
+    KARIDNS_REL=$KARIDNS; KARIDNS=$KARIDNS_E
     start_server
+    KARIDNS=$KARIDNS_REL
     unset KARIDNS_TEST_IPC_REPLY_QUEUE KARIDNS_TEST_IPC_REPLY_BUDGET_US
     ROUTER=$(router_pid)
     if [ -z "$BACKEND" ] || [ -z "$ROUTER" ]; then
@@ -270,6 +282,10 @@ run_e() {   # run_e LABEL BUDGET_US
     F1=$(ipcv worker.reply.dropped_full); R1=$(ipcv worker.reply.retried)
     echo "  $1: worker.reply.dropped_full +$((F1 - F0)), worker.reply.retried +$((R1 - R0)); not 0: $(ctl ipcstats | grep '^ipc\.' | grep -v '=0$' | tr '\n' ' ')"
 }
+if [ -z "$KARIDNS_E" ]; then
+    echo "  SKIP: E needs the test build with the IPC test switches (./karidns of make coverage, or make evict)"
+else
+[ "$KARIDNS_E" != "$KARIDNS" ] && export ASAN_OPTIONS="${ASAN_OPTIONS:-detect_leaks=0:abort_on_error=0}"      # (karidns-evict is a sanitizer build)
 run_e "E1 (no wait)" 0 && {
     [ "$((F1 - F0))" -gt 0 ] && ok "E1: without the wait the replies that do not fit the queue are dropped: worker.reply.dropped_full +$((F1 - F0))" || bad "E1: worker.reply.dropped_full did not move ($F0 -> $F1): the reply queue did not fill" "$OUT"
     account "E1" "$OUT" "$D0" "$U0"
@@ -281,6 +297,7 @@ run_e "E2 (wait)" 10000000 && {
     [ "$((R1 - R0))" -gt 0 ] && ok "E2: the worker waited for the queue: worker.reply.retried +$((R1 - R0))" || bad "E2: worker.reply.retried did not move: the queue did not fill" "$OUT"
     stop_server
 }
+fi
 
 echo
 echo "run_ipc_drops_test: $PASS ok, $FAILS failed"

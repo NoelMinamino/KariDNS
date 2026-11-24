@@ -68,7 +68,7 @@ void cleanup_pid_file(void);
 void setup_ipc_tables(int num_workers);
 void *worker_thread_func(void *arg);
 void *async_io_worker_func(void *arg);
-void start_connect_broker(void);
+bool start_connect_broker(void);
 extern pid_t g_broker_pid;
 extern _Atomic bool g_privilege_drop_complete;
 extern _Atomic bool g_control_signals_ready;
@@ -6296,8 +6296,8 @@ static void test_perform_config_reload_valid_and_diff(void) {
 
 static void test_active_broker_connect_loop(void) {
     printf("[TEST] Server Core: active start_connect_broker process loop...\n");
-    start_connect_broker();
-    if (g_broker_sock >= 0) {
+    if (start_connect_broker()) {
+        assert(g_broker_sock >= 0);
         struct sockaddr_in sin;
         memset(&sin, 0, sizeof(sin));
         sin.sin_family = AF_INET;
@@ -6530,7 +6530,7 @@ static void test_broker_connect_opts_and_xfr_tcp_sockopts(void) {
     char id_err[256];
     if (geteuid() == 0)
         assert(resolve_run_identity("nobody", NULL, &g_run_identity, id_err, sizeof(id_err)));
-    start_connect_broker();
+    assert(start_connect_broker());
     g_run_identity = saved_id;
     assert(g_broker_sock >= 0);
 

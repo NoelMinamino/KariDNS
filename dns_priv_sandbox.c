@@ -76,6 +76,40 @@ static bool dir_key(const char *in, char *out, size_t cap) {
   return true;
 }
 
+/* The rights of a directory fd of the cache: a writable one (the log directories) or a read-only one (zones, configuration). */
+static void dir_rights(cap_rights_t *rights, bool writable) {
+  if (writable) {
+    cap_rights_init(rights, CAP_LOOKUP, CAP_READ, CAP_WRITE, CAP_CREATE,
+                    CAP_FSTAT, CAP_FSTATFS, CAP_FTRUNCATE, CAP_SEEK,
+                    CAP_RENAMEAT_SOURCE, CAP_RENAMEAT_TARGET, CAP_UNLINKAT,
+                    CAP_FCNTL);
+    /* A log file opened at startup inherits this fd's rights and is handed to the run user with fchown()
+     * (hand_off_logging_channels()); dir_fd_cache_drop_fchown() takes the right away again after that. */
+    if (!g_dir_fd_fchown_dropped) cap_rights_set(rights, CAP_FCHOWN);
+  } else
+    cap_rights_init(rights, CAP_LOOKUP, CAP_READ, CAP_FSTAT, CAP_FSTATFS,
+                    CAP_SEEK, CAP_FCNTL);
+}
+
+/* fd limited to the rights of its kind and put into the cache under the key dirpath.  On false fd is closed.  g_dir_fd_lock is held. */
+static bool dir_entry_add_locked(int fd, const char *dirpath, bool writable, bool is_root) {
+  cap_rights_t rights;
+  dir_rights(&rights, writable);
+  dir_fd_entry_t *ne = NULL;
+  if ((cap_rights_limit(fd, &rights) != 0 && errno != ENOSYS) || !(ne = calloc(1, sizeof(*ne))) || !(ne->dirpath = strdup(dirpath))) {
+    free(ne);
+    close(fd);
+    return false;
+  }
+  limit_fd_fcntls(fd, CAP_FCNTL_GETFL, "directory");   /* fdopen() of a file opened through it asks F_GETFL */
+  ne->fd = fd;
+  ne->is_writable = writable;
+  ne->is_root = is_root;
+  ne->next = g_dir_fd_table;
+  g_dir_fd_table = ne;
+  return true;
+}
+
 /* Capability mode, directory not cached: open it through the fd of a root registered with dir_fd_cache_add_root() that contains it
  * (the longest such root), as a read-only directory below it.  Only a plain relative remainder is accepted ("a/b", no "..", no leading
  * '/'), and O_RESOLVE_BENEATH keeps symbolic links from leading out.  The new fd is cached like any other.  g_dir_fd_lock is held. */
@@ -95,20 +129,7 @@ static int open_dir_below_root_locked(const char *dirpath) {
   while (*rem == '/') rem++;
   if (!*rem || path_has_dotdot_component(rem)) return -1;
   int fd = openat(best->fd, rem, O_DIRECTORY | O_CLOEXEC | O_RDONLY | O_RESOLVE_BENEATH);
-  if (fd < 0) return -1;
-  cap_rights_t rights;
-  cap_rights_init(&rights, CAP_LOOKUP, CAP_READ, CAP_FSTAT, CAP_FSTATFS, CAP_SEEK, CAP_FCNTL);
-  dir_fd_entry_t *ne = calloc(1, sizeof(*ne));
-  if ((cap_rights_limit(fd, &rights) != 0 && errno != ENOSYS) || !ne || !(ne->dirpath = strdup(dirpath))) {
-    if (ne) free(ne->dirpath);
-    free(ne);
-    close(fd);
-    return -1;
-  }
-  limit_fd_fcntls(fd, CAP_FCNTL_GETFL, "directory");   /* fdopen() of a file opened through it asks F_GETFL */
-  ne->fd = fd;
-  ne->next = g_dir_fd_table;
-  g_dir_fd_table = ne;
+  if (fd < 0 || !dir_entry_add_locked(fd, dirpath, false, false)) return -1;
   return fd;
 }
 
@@ -135,7 +156,7 @@ static int get_or_open_dir_fd(const char *dirpath_in, bool writable) {
     return -1;
   }
   pthread_mutex_lock(&g_dir_fd_lock);
-  int writable_hit = -1;
+  const dir_fd_entry_t *writable_hit = NULL;
   for (dir_fd_entry_t *e = g_dir_fd_table; e; e = e->next) {
     if (strcmp(e->dirpath, dirpath) == 0) {
       if (writable ? e->is_writable : !e->is_writable) {
@@ -143,12 +164,17 @@ static int get_or_open_dir_fd(const char *dirpath_in, bool writable) {
         pthread_mutex_unlock(&g_dir_fd_lock);
         return fd;
       }
-      if (!writable) writable_hit = e->fd;   /* a read-only request gets a read-only entry when there is one, else this */
+      if (!writable) writable_hit = e;
     }
   }
-  if (writable_hit >= 0) {
+  /* review 2026-11-23 A-L3: a read-only request for a directory that the cache holds only as writable (a log directory that also holds a zone
+   * or an included file) gets a read-only fd of its own: a dup() of the writable one, limited to the read-only rights (dup() works in capability
+   * mode, and the rights only shrink).  It used to get the writable fd itself: the kernel enforces the rights of the fd, not what the caller meant. */
+  if (writable_hit) {
+    int fd = dup(writable_hit->fd);
+    if (fd >= 0 && !dir_entry_add_locked(fd, dirpath, false, writable_hit->is_root)) fd = -1;
     pthread_mutex_unlock(&g_dir_fd_lock);
-    return writable_hit;
+    return fd;
   }
   if (atomic_load_explicit(&g_capsicum_enabled, memory_order_acquire)) {
     int bfd = writable ? -1 : open_dir_below_root_locked(dirpath);
@@ -157,45 +183,7 @@ static int get_or_open_dir_fd(const char *dirpath_in, bool writable) {
     return bfd;
   }
   int fd = open_dir_by_path(dirpath);
-  if (fd < 0) {
-    pthread_mutex_unlock(&g_dir_fd_lock);
-    return -1;
-  }
-  cap_rights_t rights;
-  if (writable) {
-    cap_rights_init(&rights, CAP_LOOKUP, CAP_READ, CAP_WRITE, CAP_CREATE,
-                    CAP_FSTAT, CAP_FSTATFS, CAP_FTRUNCATE, CAP_SEEK,
-                    CAP_RENAMEAT_SOURCE, CAP_RENAMEAT_TARGET, CAP_UNLINKAT,
-                    CAP_FCNTL);
-    /* A log file opened at startup inherits this fd's rights and is handed to the run user with fchown()
-     * (hand_off_logging_channels()); dir_fd_cache_drop_fchown() takes the right away again after that. */
-    if (!g_dir_fd_fchown_dropped) cap_rights_set(&rights, CAP_FCHOWN);
-  } else
-    cap_rights_init(&rights, CAP_LOOKUP, CAP_READ, CAP_FSTAT, CAP_FSTATFS,
-                    CAP_SEEK, CAP_FCNTL);
-  if (cap_rights_limit(fd, &rights) != 0 && errno != ENOSYS) {
-    close(fd);
-    pthread_mutex_unlock(&g_dir_fd_lock);
-    return -1;
-  }
-  limit_fd_fcntls(fd, CAP_FCNTL_GETFL, "directory");   /* fdopen() of a file opened through it asks F_GETFL */
-  dir_fd_entry_t *e = calloc(1, sizeof(*e));
-  if (!e) {
-    close(fd);
-    pthread_mutex_unlock(&g_dir_fd_lock);
-    return -1;
-  }
-  e->dirpath = strdup(dirpath);
-  if (!e->dirpath) {
-    free(e);
-    close(fd);
-    pthread_mutex_unlock(&g_dir_fd_lock);
-    return -1;
-  }
-  e->fd = fd;
-  e->is_writable = writable;
-  e->next = g_dir_fd_table;
-  g_dir_fd_table = e;
+  if (fd >= 0 && !dir_entry_add_locked(fd, dirpath, writable, false)) fd = -1;
   pthread_mutex_unlock(&g_dir_fd_lock);
   return fd;
 }
@@ -270,9 +258,9 @@ bool dir_fd_cache_add_root(const char *dirpath) {
   return true;
 }
 
-/* cap_rights_limit() with the failure logged.  ENOSYS (a kernel without CAPABILITY_MODE) is not a failure: there are no rights to keep.
+/* cap_rights_limit() with the failure logged (dns_priv_sandbox.h).  ENOSYS (a kernel without CAPABILITY_MODE) is not a failure: there are no rights to keep.
  * On false errno is the cause. */
-static bool limit_fd_rights(int fd, const cap_rights_t *rights, const char *what) {
+bool limit_fd_rights(int fd, const cap_rights_t *rights, const char *what) {
   if (cap_rights_limit(fd, rights) == 0 || errno == ENOSYS) return true;
   int e = errno;
   syslog(LOG_ERR, "[Sandbox] cap_rights_limit(%s, fd %d) failed: %s; the descriptor keeps its wider rights", what, fd, strerror(e));

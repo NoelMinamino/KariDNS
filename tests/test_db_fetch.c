@@ -235,6 +235,7 @@ static void send_failed(int fd, kdb_enc_t *e, uint16_t view, const char *zone, u
 
 /* ---------------------------------------------------------------- the worker's side */
 extern int64_t g_ing_fetch_timeout_ms;                                 /* dns_db_ingest.c: 30 s, shortened here */
+extern int64_t g_ing_zone_stall_ms;                                    /* dns_db_ingest.c: 120 s, shortened here (review 2026-11-23 D-L4) */
 
 static bool wake_next(park_key_t *k, int ms) {
     park_wake_ring_t *r = park_wake_ring(0);
@@ -1891,6 +1892,54 @@ int main(void) {
     CHECK(!ch_next(&fetch3, &m, 5000) && fetch3.eof);
     CHECK(park_fetch_request(0, "default", "r.test.", KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL));
     CHECK(wake_next(&k, 5000) && k.failed);
+
+    /* -- review 2026-11-23 D-L4: a zone begun (ZONE_BEGIN and the first piece of its image) and never finished, on the batch stream and on the fetch stream.
+     *    The streams stay open while the stall time has not passed; past it (shortened from 120 s) both are closed (the partial image is freed with the job);
+     *    the fetch that was out is failed when the next loader comes */
+    {
+        printf("[D-L4: a zone begun and never finished]\n");
+        int a6[2], f6[2], a7[2];
+        CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, a6) == 0 && socketpair(AF_UNIX, SOCK_STREAM, 0, f6) == 0 && socketpair(AF_UNIX, SOCK_STREAM, 0, a7) == 0);
+        hand_over(c[0], a6[1], f6[1]);
+        static ch_t main6, fetch6;
+        ch_init(&main6, a6[0], KDB_FROM_BACKEND);
+        ch_init(&fetch6, f6[0], KDB_FROM_BACKEND);
+        kdb_enc_begin(&e, KDB_T_HELLO);
+        kdb_enc_u16(&e, 1, 1); kdb_enc_str(&e, 2, "test-loader"); kdb_enc_str(&e, 3, "sqlite3"); kdb_enc_u32(&e, 4, 4243); kdb_enc_u32(&e, 5, KDB_FEAT_IMAGE); kdb_enc_u32(&e, 6, ZONE_IMAGE_VERSION);
+        kdb_enc_end(&e);
+        ch_send(a6[0], &e);
+        CHECK(ch_next(&main6, &m, 5000) && m.type == KDB_T_CONFIG);
+        CHECK(ch_next(&main6, &m, 5000) && m.type == KDB_T_DEBUG);
+        zone_image_t *img = zi_zone("stall.test.", 3, NULL, NULL, 0);
+        CHECK(img && img->total_size > sizeof(zone_image_t));
+        kdb_enc_begin(&e, KDB_T_BATCH_BEGIN);
+        kdb_enc_u64(&e, 1, 77); kdb_enc_u8(&e, 2, KDB_BATCH_DIFF); kdb_enc_u64(&e, 3, 0);
+        kdb_enc_end(&e);
+        zi_begin(&e, 0, "stall.test.", 77, 3, 3, 0, 0, NULL, NULL, img->n_rrs, img->total_size);
+        zi_chunks(&e, img, sizeof(zone_image_t), 0);                              /* (the header only: the rest never comes) */
+        ch_send(a6[0], &e);
+        CHECK(park_fetch_request(0, "default", "r.test.", KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL));
+        CHECK(ch_next(&fetch6, &m, 5000) && m.type == KDB_T_FETCH_REQ);
+        zone_image_t *rimg = zi_zone("r.test.", 14, NULL, NULL, 0);
+        CHECK(rimg && rimg->total_size > sizeof(zone_image_t));
+        zi_begin(&e, 0, "r.test.", 11, 14, 14, 0, m.u.fetch_req.request_id, NULL, NULL, rimg->n_rrs, rimg->total_size);
+        zi_chunks(&e, rimg, sizeof(zone_image_t), 0);
+        ch_send(f6[0], &e);
+        zone_image_free(img);
+        zone_image_free(rimg);
+        /* within the stall time nothing happens (the default, 120 s) */
+        CHECK_MSG(!ch_next(&main6, &m, 700) && !main6.eof, "the batch stream: a message or the end before the stall time (eof %d)", (int)main6.eof);
+        CHECK_MSG(!ch_next(&fetch6, &m, 10) && !fetch6.eof, "the fetch stream: a message or the end before the stall time (eof %d)", (int)fetch6.eof);
+        g_ing_zone_stall_ms = 300;
+        CHECK_MSG(!ch_next(&main6, &m, 10000) && main6.eof, "the batch stream was not closed after the stall time (eof %d)", (int)main6.eof);
+        CHECK_MSG(!ch_next(&fetch6, &m, 10000) && fetch6.eof, "the fetch stream was not closed after the stall time (eof %d)", (int)fetch6.eof);
+        g_ing_zone_stall_ms = 120000;
+        CHECK(dbreg_lookup_entry("default", "stall.test.") == NULL);              /* (nothing of the zone was installed) */
+        hand_over(c[0], a7[1], -1);                                                 /* a loader without a fetch stream: the fetch that was out is failed */
+        CHECK(wake_next(&k, 5000) && park_key_is(&k, "default", "r.test.") && k.failed);
+        close(a6[0]);
+        close(f6[0]);
+    }
 
     /* ======================================================================================================================================
      * 0.7 P-B: the wait queue.  A worker marks the zone as claimed and asks (fetch_gate(), PARK_PRIO_CLAIMED on the request); it is never refused.  The ingest thread takes a

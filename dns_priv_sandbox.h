@@ -10,6 +10,11 @@
 extern bool g_bypass_cap_enter;
 
 void enter_capsicum_sandbox(void);
+/* cap_rights_limit(fd, rights) with the failure logged ("[Sandbox] cap_rights_limit(<what>, fd N) failed: ..."); ENOSYS (no CAPABILITY_MODE in the
+ * kernel) is true.  false (errno set) = the descriptor keeps its wider rights: the caller does not use it (review 2026-11-23 A-L1: every limit of the
+ * server is checked; a start-up descriptor that keeps its rights refuses the start). */
+struct cap_rights;
+bool limit_fd_rights(int fd, const struct cap_rights *rights, const char *what);
 /* false (logged, errno set) = cap_rights_limit() failed and the descriptor keeps its wider rights; ENOSYS (no CAPABILITY_MODE in the kernel) is true */
 bool limit_server_socket_rights(int fd, bool is_listening_tcp);
 bool limit_client_socket_rights(int fd);

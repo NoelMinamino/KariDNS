@@ -2024,7 +2024,7 @@ zone_image_t *pdns_zone_build_image(pdns_zone_t *z, char *err, size_t errlen) {
     image_wire_form_flags(img);
     /* what the Backend will check of what it receives, checked here: a zone it would refuse is the loader's failure, with the row's zone named */
     char why[300];
-    zone_image_policy_t pol = { z->name, z->serial, img->n_rrs, img->total_size, z->opts.max_zone_bytes, z->opts.max_records, z->has_ext, tinydns };
+    zone_image_policy_t pol = { z->name, z->serial, img->n_rrs, img->total_size, z->opts.max_zone_bytes, z->opts.max_records, z->has_ext, tinydns, false };
     if (zone_image_validate_ex(img, img->total_size, &pol, why, sizeof(why)) != 0) {
         snprintf(err, errlen, "zone '%s': %s", z->name, why);
         zone_image_free(img);

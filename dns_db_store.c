@@ -2208,7 +2208,7 @@ static int attach_build(const char *view, const char *zone, uint32_t zid, const 
     /* the rules of the zone and of every source of a zone (RFC 9276 iterations are in the structure check; the owners under the apex, the RRs, the SOA, ALIAS and singleton rules): an image that an older build wrote,
      * or that was stored before a rule was made, is looked at as an image that comes from the loader now.  The limits of the configuration follow below, when the settings of the zone are known. */
     if (vr == 0) {
-      const zone_image_policy_t pol = { zone, sz->serial, UINT64_MAX, 0, 0, 0, true, (zi->flags & ZONE_IMAGE_F_TINYDNS) != 0 };
+      const zone_image_policy_t pol = { zone, sz->serial, UINT64_MAX, 0, 0, 0, true, (zi->flags & ZONE_IMAGE_F_TINYDNS) != 0, false };
       vr = zone_image_check_policy(img.data, img.len, &pol, vw, sizeof(vw));
     }
     if (timed) atomic_fetch_add(&G.validate_ns, (uint64_t)(mono_ns() - tv0) * VAL_SAMPLE);
@@ -4380,8 +4380,9 @@ static bool recon_status_cb(store_recon_t *o) {
 }
 
 /* 0.7 (secondary store 10): the core of the store, with or without a database block: open (quarantine, create), the rights of the directory, settings.dat, the ticker, the reserved view
- * of the secondaries' copies and their restore thread, the status binding.  NULL: no store (logged; the server runs without one) */
-static store_t *core_start(const server_config_t *cfg, bool *created_out) {
+ * of the secondaries' copies and their restore thread, the status binding.  NULL: no store (logged; the server runs without one), or with *refused set: the start is refused */
+static store_t *core_start(const server_config_t *cfg, bool *created_out, bool *refused) {
+  (void)refused;                                             /* (set on FreeBSD only: the rights of the directory) */
   const database_config_t *db = &cfg->database;
   const bool dbz = db->enabled;
   store_opts_t o;
@@ -4428,8 +4429,14 @@ static store_t *core_start(const server_config_t *cfg, bool *created_out) {
     cap_rights_t rights;
     cap_rights_init(&rights, CAP_LOOKUP, CAP_CREATE, CAP_READ, CAP_WRITE, CAP_SEEK, CAP_MMAP_RW, CAP_FSYNC, CAP_FTRUNCATE, CAP_FSTAT,
                     CAP_FSTATFS, CAP_UNLINKAT);
-    if (cap_rights_limit(g_dir.dirfd, &rights) != 0 && errno != ENOSYS)
-      syslog(LOG_ERR, "[Store] cannot limit the rights of the store directory: %s; it keeps its rights", strerror(errno));
+    if (cap_rights_limit(g_dir.dirfd, &rights) != 0 && errno != ENOSYS) {
+      /* review 2026-11-23 A-L2: it used to go on with the directory's full rights (create, write, mmap and unlink beneath it, the strongest descriptor in the
+       * sandbox).  Every descriptor of its kind is fail-closed: the start is refused (db_store_start() false: the Backend stops) */
+      syslog(LOG_CRIT, "[Store] cannot limit the rights of the store directory: %s; the start is refused", strerror(errno));
+      (void)store_close(st);
+      *refused = true;
+      return NULL;
+    }
   }
 #endif
   store_open_segments(st);                                   /* (0.7 fix 7: the worker's attach looks at pages of segments that are open) */
@@ -4455,8 +4462,9 @@ bool db_store_start(const server_config_t *cfg) {
     xfr_store_core_off();
     return true;
   }
-  bool created = false;
-  store_t *st = core_start(cfg, &created);
+  bool created = false, refused = false;
+  store_t *st = core_start(cfg, &created, &refused);
+  if (refused) return false;
   {                                                          /* (0.7: secondaries whose copies this store keeps: a first fill keeps its journal, db_recon_begin()) */
     bool sec = false;
     for (const view_config_t *v = cfg->views; v && !sec && xfr_store_active(); v = v->next)

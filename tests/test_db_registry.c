@@ -284,7 +284,7 @@ static int install_msgs_x(zone_db_entry_t *e, const char *zone, uint64_t declare
     }
     if (rc == 0) {
         const uint64_t want = declared - 1 - s.ext_records;
-        const zone_image_policy_t pol = { zone, serial, want, img->total_size, 0, 0, (flags & KDB_ZF_EXTENDED) != 0, (flags & KDB_ZF_TINYDNS) != 0 };
+        const zone_image_policy_t pol = { zone, serial, want, img->total_size, 0, 0, (flags & KDB_ZF_EXTENDED) != 0, (flags & KDB_ZF_TINYDNS) != 0, false };
         if (zone_image_validate_ex(img, img->total_size, &pol, why, whylen) != 0) rc = -1;
     }
     if (rc == 0 && db_zone_install_image(e, img, notified, why, whylen) != 0) rc = -1;

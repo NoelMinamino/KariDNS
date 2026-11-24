@@ -422,7 +422,7 @@ static void run_install(const uint8_t *p, size_t n, uint8_t sel) {
             } else if (is_image && img && !failed) {
                 /* what the ingest thread does: the image against what ZONE_BEGIN said (and the limits of the stream), then the entry */
                 const zone_image_policy_t pol = { zone, zb.serial, zb.rr_count, zb.image_size, sm.lim.max_zone_bytes, sm.lim.max_zone_records, (zb.flags & KDB_ZF_EXTENDED) != 0,
-                                                  (zb.flags & KDB_ZF_TINYDNS) != 0 };
+                                                  (zb.flags & KDB_ZF_TINYDNS) != 0, false };
                 bool valid = img_have == zb.image_size && zone_image_validate_ex(img, img_have, &pol, why, sizeof(why)) == 0;
                 zone_db_entry_t *e = valid ? dbreg_lookup_entry(view, zone) : NULL;
                 bool created = false;

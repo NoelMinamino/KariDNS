@@ -110,6 +110,17 @@ Fixes from the external reviews and audits of the 0.7 cycle. Each has a test tha
   serial 0 (a secondary at serial 0 accepted an older first SOA); the dnstap socket rights are cut where it is
   connected; a length from `snprintf()` is clamped before `write()` (loader child, supervisor, control channel,
   karicheck, karictl, dag DoH request header); the Backend's IPC `addr_len` is clamped on every router use.
+- **Capsicum review, server core** (#PRNUM): every `cap_rights_limit()` of the server is checked: a start-up descriptor
+  that would keep wider rights (connect broker socket, worker IPC, NOTIFY pairs, control socket, standard I/O, the
+  zone store directory) refuses the start, a control connection is closed; a broker that cannot be started refuses
+  the start (transfers, forward zones and dnstap failed quietly before). A read-only request for a directory that the
+  cache held only as writable gets a read-only descriptor. The IPC socket pairs are `SOCK_CLOEXEC`. The IPC test
+  switches `KARIDNS_TEST_IPC_REPLY_*` exist only in the test build. The forwarder warnings are rate-limited event
+  lines. A zone that the loader begins and does not finish within 120 s closes its stream (the partial image is
+  freed). A secondary's stored copy is checked against the zone rules and the current `max-records` & co. before it
+  is restored, as a database zone's stored image is. A loader log line cannot pass for a server line (it always
+  carries `[DB] `) and is never above `LOG_ERR`. docs/karidns.md "Trust boundaries" describes what a compromised
+  process can still do.
 - **Zone parse, import and export review, group 2** (#247): `$GENERATE` amplification (a 350 KB file could ask for
   10^9 records), NUL bytes, presigned-row empty non-terminals dropped silently, tinydns IPv4 parsing, and the low
   items listed in the pull request.

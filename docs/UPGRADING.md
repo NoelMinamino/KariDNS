@@ -103,6 +103,9 @@ change the options that need a restart (`OK reloaded (restart needed for: ...)`)
 | `alias-max-refresh-time` | a forged TTL of 86400 stayed about 16 h | 3600 s cap (#234) | `alias-max-refresh-time 1d;` |
 | DNS Cookies to forwarders and ALIAS resolvers | none | sent and checked (#234, #238) | none; a resolver that never sends a server cookie is accepted |
 | `secondary-stale-max` | n/a | `0` (unlimited), new (#203) | already the default |
+| Forwarder warnings (`[Forward] ...`) | one line per event, written at once | event lines: rate-limited per category and second, a summary says how many were left out (#PRNUM) | none |
+| Loader log lines | the loader chose the priority and the prefix | always `[DB] ...`, at most `LOG_ERR` (#PRNUM) | none |
+| `KARIDNS_TEST_IPC_REPLY_BUDGET_US` / `_QUEUE` | read from the environment by every build | test build only (#PRNUM) | none (test switches) |
 | `memory-limit` | none | none (**TODO: change this row when the small-VPS default lands**; it is not in main yet) | `memory-limit` set explicitly |
 
 Memory notes: the Backend holds about 70 MB fixed plus about 0.45 KB for every database zone in the directory;

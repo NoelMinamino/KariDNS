@@ -553,6 +553,23 @@ static void test_hook(int cat, int prio, const char *fmt, va_list ap, int saved_
     collect(prio, 0, msg, &g_logged);
 }
 
+/* review 2026-11-23 D-L2: a loader line that does not start with "[DB] " gets one (it cannot pass for a line of the server), and no loader line is logged above LOG_ERR */
+static void test_log_sink_spoof(void) {
+    printf("db_log_sink: what the loader cannot pretend\n");
+    memset(&g_logged, 0, sizeof(g_logged));
+    klog_set_hook(test_hook);
+    db_log_sink(LOG_EMERG, 0, "[Sandbox] cap_enter failed", NULL);
+    db_log_sink(LOG_CRIT, 0, "[DB] a loader line", NULL);
+    db_log_sink(LOG_WARNING, 0, "[DB]x", NULL);
+    db_log_sink(LOG_ERR, 0, "plain", NULL);
+    klog_set_hook(NULL);
+    CHECK(g_logged.n == 4);
+    CHECK_MSG(g_logged.prio[0] == LOG_ERR && strcmp(g_logged.text[0], "[DB] [Sandbox] cap_enter failed") == 0, "%d %s", g_logged.prio[0], g_logged.text[0]);
+    CHECK_MSG(g_logged.prio[1] == LOG_ERR && strcmp(g_logged.text[1], "[DB] a loader line") == 0, "%d %s", g_logged.prio[1], g_logged.text[1]);
+    CHECK_MSG(g_logged.prio[2] == LOG_WARNING && strcmp(g_logged.text[2], "[DB] [DB]x") == 0, "%d %s", g_logged.prio[2], g_logged.text[2]);
+    CHECK_MSG(g_logged.prio[3] == LOG_ERR && strcmp(g_logged.text[3], "[DB] plain") == 0, "%d %s", g_logged.prio[3], g_logged.text[3]);
+}
+
 static int count_open_fds(void) {
     int n = 0;
     for (int fd = 0; fd < 200; fd++)
@@ -984,6 +1001,7 @@ int main(void) {
     signal(SIGPIPE, SIG_IGN);
     test_init();
     test_log_reader();
+    test_log_sink_spoof();
     test_spawn_and_restart();
     test_log_pipe();
     test_exec_failure_long_path();

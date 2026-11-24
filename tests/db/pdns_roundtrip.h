@@ -211,7 +211,7 @@ static bool pdns_roundtrip(pdns_zone_t *z, rt_info_t *info, char *why, size_t wh
     if (!begun || !ended) RT_FAIL("stream without ZONE_BEGIN / ZONE_END");
     if (have != want_size) RT_FAIL("%zu image octets, ZONE_BEGIN announced %zu", have, want_size);
     {
-        zone_image_policy_t pol = { z->name, z->serial, zrr, inf.image_size, z->opts.max_zone_bytes, z->opts.max_records, (zflags & KDB_ZF_EXTENDED) != 0, (zflags & KDB_ZF_TINYDNS) != 0 };
+        zone_image_policy_t pol = { z->name, z->serial, zrr, inf.image_size, z->opts.max_zone_bytes, z->opts.max_records, (zflags & KDB_ZF_EXTENDED) != 0, (zflags & KDB_ZF_TINYDNS) != 0, false };
         char vw[300];
         if (zone_image_validate_ex(img, have, &pol, vw, sizeof(vw)) != 0) RT_FAIL("the Backend's validation refuses the image: %s", vw);
     }
