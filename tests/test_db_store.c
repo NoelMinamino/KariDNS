@@ -1382,7 +1382,7 @@ static int run_mode(const char *mode) {
         batch_begin(a[0], &e, 25, KDB_BATCH_DIFF);
         send_zone(a[0], &e, "cold1.test.", 1, 0, 170);
         batch_end(a[0], &e, &mainc, 25, 1, 0);
-        for (int w = 0; w < 500; w++) {                                     /* (the install runs on a builder thread: the limit stays until the zone is in the store, or a slow host installs it after the limit is gone) */
+        for (int w = 0; w < 3000; w++) {                                    /* (the install runs on a builder thread: the limit stays until the zone is in the store; 30 s, an ASan build on a loaded CI VM took more than 5) */
             if (dbdir()->rec_get("default", "cold1.test.", &rec) && rec.state == STORE_STATE_STORED && dbreg_lookup_entry("default", "cold1.test.") == NULL) break;
             usleep(10000);
         }
