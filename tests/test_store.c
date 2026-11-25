@@ -10095,6 +10095,49 @@ static void test_regrow_inlock(void) {
   tdir_free(&d);
 }
 
+/* store_bulk_end(WAIT) with a delta while the checkpoint thread's end-of-fill checkpoint is slow (its flush held 11 s, longer than the 10 s the call waited before): one checkpoint ends
+ * the fill, the call does not force a second one (CI 2026-11-25: 6 checkpoints, not 5) */
+static _Atomic int g_ck_slow;
+static void ck_slow_hook(int step) {
+  if (step == 2 && atomic_exchange(&g_ck_slow, 0)) usleep(11000000);
+}
+static void test_bulk_end_slow(void) {
+  printf("[the end of a fill with a delta and a slow checkpoint: one checkpoint, not two]\n");
+  tdir_t d;
+  tdir_new(&d, "bkslow");
+  store_opts_t o;
+  bulk_opts(&o);
+  o.log = log_cb;
+  log_clear();
+  store_t *s = NULL;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (!s) { tdir_free(&d); return; }
+  CHECK_EQ(store_view_add(s, "default"), 0);
+  CHECK_EQ(store_bulk_begin(s), 0);
+  store_bulk_phase(s, STORE_BULK_PASS);
+  for (uint32_t i = 0; i < 300; i++) CHECK_EQ(known_w(s, i, 1), 0);
+  store_stats_t st;
+  store_stats(s, &st);
+  const uint64_t ck0 = st.checkpoints;
+  atomic_store(&g_ck_slow, 1);
+  atomic_store(&store_test_ckpt_hook, ck_slow_hook);
+  const uint64_t t0 = now_ms();
+  CHECK_EQ(store_bulk_end(s, STORE_BULK_END_WAIT), 0);  /* (with the delta of the pass: its build, then the checkpoint thread's end of the fill) */
+  const uint64_t ms = now_ms() - t0;
+  atomic_store(&store_test_ckpt_hook, NULL);
+  store_stats(s, &st);
+  printf("  the end took %llu ms, %llu checkpoint(s)\n", (unsigned long long)ms, (unsigned long long)(st.checkpoints - ck0));
+  CHECK(ms >= 11000);                                   /* (the call waited for the slow one) */
+  CHECK_EQ(atomic_load(&g_ck_slow), 0);
+  CHECK_EQ(st.checkpoints, ck0 + 1);
+  CHECK_EQ(store_bulk(s), 0);
+  CHECK_EQ(st.bulk_end_pending, 0);
+  CHECK_EQ(log_count(6, "the unlogged bulk fill is over"), 1);
+  CHECK_EQ(ix_unreached(s, 0, 300), 0);
+  CHECK_EQ(store_close(s), 0);
+  tdir_free(&d);
+}
+
 /* the builder with buckets larger than one read (a bucket is read in pieces of whole entries) and more than one window: 40000 zones in windows of 32768 slots */
 static void test_fb_buckets(void) {
   printf("[the file builder with buckets of several reads: 40000 zones, windows of 32768 slots]\n");
@@ -10294,6 +10337,7 @@ int main(void) {
     test_dx_budget();
     test_dx_hold();
     test_dx_clean_exit();
+    test_bulk_end_slow();
     test_fb_wrap();
     test_fb_growth();
     test_regrow_inlock();

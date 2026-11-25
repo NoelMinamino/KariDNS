@@ -5666,10 +5666,20 @@ int store_bulk_end(store_t *s, unsigned how) {
     }
   }
   if (deferred && s->fl_on) {
-    /* (the build ended the fill and woke the checkpoint thread, bulk_end_said(): its checkpoint is the end, a second one forced here would write every table again; if it has not
-     * made it in a while, the forced one below does) */
-    const uint64_t t1 = st_now_ms();
-    while (atomic_load_explicit(&s->bulk_end_pending, memory_order_relaxed) && st_now_ms() - t1 < 10000u && !atomic_load_explicit(&s->rg_stop, memory_order_relaxed)) usleep(1000);
+    /* The build ended the fill and woke the checkpoint thread (bulk_end_said()): its checkpoint is the end, and a second one forced here would write every table again (at 100M zones
+     * gigabytes; CI 2026-11-25: the first one took more than the 10 s this waited before).  So this waits for it with no time bound: it is due until it is on disk (ckpt_due()).  The
+     * caller makes its own attempt only when that one failed or found no room (its back-off began: bulk_end_backoff_ms) or the flusher stops (a close).  bg_mu only (innermost, no
+     * writer mutex); the condition is looked at again every 50 ms, as the back-off is set after the end of the checkpoint wakes the waiters (bg_release()). */
+    pthread_mutex_lock(&s->bg_mu);
+    const uint64_t b0 = atomic_load_explicit(&s->bulk_end_backoff_ms, memory_order_relaxed);
+    while (atomic_load_explicit(&s->bulk_end_pending, memory_order_relaxed) && !s->bg_stop && atomic_load_explicit(&s->bulk_end_backoff_ms, memory_order_relaxed) == b0) {
+      struct timespec ts;
+      clock_gettime(CLOCK_MONOTONIC, &ts);
+      ts.tv_nsec += 50000000;
+      if (ts.tv_nsec >= 1000000000) { ts.tv_sec++; ts.tv_nsec -= 1000000000; }
+      (void)pthread_cond_timedwait(&s->bg_cv, &s->bg_mu, &ts);
+    }
+    pthread_mutex_unlock(&s->bg_mu);
   }
   const bool pending = atomic_load_explicit(&s->bulk_end_pending, memory_order_relaxed);
   if (!pending) return 0;
