@@ -4618,6 +4618,9 @@ bool db_store_start(const server_config_t *cfg) {
 void db_store_stop(void) {
   store_t *st = atomic_load_explicit(&G.st, memory_order_acquire);
   if (!st) return;
+  /* (0.7: the time of each part of the stop: the Manager kills a Backend that has not ended in SHUTDOWN_KILL_MS, and a kill before the clean checkpoint is a crash of the store (an unlogged first
+   * fill goes back to its last bulk checkpoint; run_db_store_test 2026-11-25: a stop of 10.1 s and an empty store at the next start).  Said when the stop takes a second or more) */
+  const int64_t t0 = mono_ns();
   xfr_store_stop();                                           /* 0.7 (secondary store 10): the restore thread first */
   atomic_store(&G.hstop, true);                               /* 0.7 fix 8: the background attach of hot.list ends first */
   for (int i = 0; G.hthr_started && i < G.hot_nstarted; i++) pthread_join(G.hthr[i], NULL);
@@ -4638,6 +4641,7 @@ void db_store_stop(void) {
 #endif
   for (int i = 0; i < G.nathr; i++) pthread_join(G.athr[i], NULL);
   G.nathr = 0;
+  const int64_t t1 = mono_ns();
   att_prep_wait();                                            /* (the threads that register zones are gone: the growth that was in progress is done before the store goes) */
   (void)rcu_writer_wait_until_safe(rcu_writer_advance_epoch(), 5000);          /* (the staged elements that were registered are freed when the readers that may have found them have left) */
   stgr_run(false);
@@ -4647,9 +4651,15 @@ void db_store_stop(void) {
   pthread_mutex_unlock(&G.wlock);
   if (G.wthr_started) pthread_join(G.wthr, NULL);
   G.wthr_started = false;
+  const int64_t t2 = mono_ns();
   if (G.hot_on) hot_write(st);                                /* 0.7 fix 8: what is in memory, the most used first, for the next start (the attach threads are gone: nothing registers a zone meanwhile) */
   /* a clean stop: the flag says so on disk, so the next start does not log an unclean stop and (after a reboot) does not rebuild the tables.  The store stays open, as
    * workers may still look; a write after this (a straggler) clears the flag again before it changes anything. */
+  const int64_t t3 = mono_ns();
   int r = store_checkpoint_clean(st);
   if (r < 0) syslog(LOG_WARNING, "[Store] the clean checkpoint at the stop failed: %s; the next start recovers from the journal", strerror(-r));
+  const int64_t t4 = mono_ns();
+  if (t4 - t0 >= 1000000000ll)
+    syslog(LOG_NOTICE, "[Store] the stop took %lld ms: the attach threads %lld ms, the ticker %lld ms, hot.list %lld ms, the clean checkpoint %lld ms", (long long)((t4 - t0) / 1000000),
+           (long long)((t1 - t0) / 1000000), (long long)((t2 - t1) / 1000000), (long long)((t3 - t2) / 1000000), (long long)((t4 - t3) / 1000000));
 }

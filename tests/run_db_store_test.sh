@@ -44,9 +44,23 @@ chmod 755 "$T"
 SRV=""; REF=""
 stop_one() {
     p=$1
+    # the configuration of the instance (its other processes, the Backend, have the same arguments): the next start reuses the control socket and the ports, so the stop waits until
+    # none of them is left (CI 2026-11-25: after a stop the next server's checks read stored=0 and the RSS of an empty store, as from an instance that was still there)
+    pc=""
+    [ -n "$p" ] && pc=$(ps -ww -o command= -p "$p" 2>/dev/null | awk '{ for (i = 1; i < NF; i++) if ($i == "-c") { print $(i + 1); exit } }')
     [ -n "$p" ] && kill -TERM "$p" 2>/dev/null
     i=0; while [ -n "$p" ] && [ $i -lt 200 ] && kill -0 "$p" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
+    # (a server that does not stop in 20 s is killed: a stop that cut a first fill off makes the next start go back to its last bulk checkpoint; say so, the checks after it read that state)
+    [ -n "$p" ] && kill -0 "$p" 2>/dev/null && echo "  (the server $p did not stop in 20 s after SIGTERM: killed)"
     [ -n "$p" ] && kill -KILL "$p" 2>/dev/null
+    j=0
+    while [ -n "$pc" ] && [ -n "$(kari_conf_pids "$pc")" ]; do
+        j=$((j + 1))
+        [ $j -lt 100 ] || { echo "  (processes of $pc left 10 s after the stop: $(kari_conf_pids "$pc" | tr '\n' ' ')killed)"; kari_kill_conf "$pc"; break; }
+        sleep 0.1
+    done
+    [ -n "$p" ] && echo "  (stop of $p: $((i / 10)).$((i % 10)) s, the rest of the instance $((j / 10)).$((j % 10)) s)" >> "$T/stops.log"
+    return 0
 }
 ZFS_DS=""
 cleanup() {
@@ -111,6 +125,7 @@ control-channel { socket "$T/$1.sock"; secret "$SECRET"; };
 EOF
 }
 start_one() {   # start_one a|b : sets SRV / REF
+    [ -f "$T/$1.log" ] && cat "$T/$1.log" >> "$T/$1.all"
     : > "$T/$1.log"
     "$KARIDNS" -c "$T/$1.conf" -f > "$T/$1.log" 2>&1 &
     p=$!
@@ -385,6 +400,7 @@ backend_rss() {
 }
 # start_cold a|b: a server whose loader never says anything (an idle program in its place): up when the store is open
 start_cold() {
+    [ -f "$T/$1.log" ] && cat "$T/$1.log" >> "$T/$1.all"
     : > "$T/$1.log"
     "$KARIDNS" -c "$T/$1.conf" -f > "$T/$1.log" 2>&1 &
     p=$!
@@ -447,6 +463,8 @@ INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT
     start_one a
     stored3() { [ "$(sf store.zones.stored)" -ge "$HEAP_N" ] 2>/dev/null; }
     waitfor 300 stored3 && pass "the store holds all $HEAP_N zones" || fail "the store holds $(sf store.zones.stored) of $HEAP_N zones"
+    HEAP_STATE=$($KA store -k 2>/dev/null | grep -E '^store\.(bulk\.(active|end_pending|checkpoints)|index\.delta\.(active|full|spills)|zones\.(known|stored)|checkpoint\.count)=' | tr '\n' ' ')
+    echo "  at the stop: $HEAP_STATE"
     stop_one "$SRV"; SRV=""
     # a server with an empty store is the base: the same process with one zone
     mkdir "$T/db4"; sh tests/db/gen_sqlite3_zones.sh "$T/db4/z.db" 1 7 > /dev/null 2>&1; chown -R nobody "$T/db4"; chmod 600 "$T/db4/z.db"*
@@ -462,7 +480,9 @@ INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT
     ./dag @127.0.0.1 -p "$PA" www.z77.test A +short +nohexdump +time=5 +tries=1 > /dev/null 2>&1
     R1=$(backend_rss)
     EL=$($KA dbstatus | sed -n 's/^zone directory: .*the heap holds \([0-9]*\) elements.*/\1/p' | head -1)
-    [ "$(sf store.zones.stored)" -ge "$HEAP_N" ] 2>/dev/null && pass "the restarted server has all $HEAP_N zones in its store ($(sf store.zones.stored))" || fail "stored=$(sf store.zones.stored)"
+    # (the stop before this restart was a clean one: a start that takes it for a crash sends an unlogged fill back to its last bulk checkpoint, here the empty store)
+    [ "$(sf store.recovery.was_clean)" = 1 ] && [ "$(sf store.bulk.recoveries)" = 0 ] && pass "the restart after the clean stop found the store clean (no bulk recovery)" || fail "the restart after the clean stop: was_clean=$(sf store.recovery.was_clean) bulk recoveries=$(sf store.bulk.recoveries) (the clean checkpoint of the stop did not end: see the stop times and the log of the stop below)"
+    [ "$(sf store.zones.stored)" -ge "$HEAP_N" ] 2>/dev/null && pass "the restarted server has all $HEAP_N zones in its store ($(sf store.zones.stored))" || { fail "stored=$(sf store.zones.stored)"; $KA store -k 2>/dev/null | grep -E '^store\.(zones\.(known|stored)|recovery\.|bulk\.)' | tr '\n' ' '; echo; tail -5 "$T/stops.log" 2>/dev/null; grep -E 'checkpoint at close|the clean checkpoint|did not stop|the stop took|cut off|recovered|bulk fill|ERROR|WARNING' "$T/a.all" 2>/dev/null | tail -12; grep -v '^\s*$' "$T/a.log" | tail -15; }
     [ "${EL:-99999}" -le 2 ] && pass "the heap holds $EL registry element(s) for $HEAP_N stored zones (only the zone that was asked for)" || fail "registry elements: ${EL:-?}"
     DR=$((R1 - R0))
     echo "  Backend RSS: $R0 KiB with an empty store, $R1 KiB with $HEAP_N stored zones (the store's mapped pages are in it): $DR KiB more"
