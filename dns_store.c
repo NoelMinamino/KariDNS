@@ -3845,13 +3845,14 @@ static uint64_t ix_budget(const store_t *s) {
   if (ml) return ml / 8 < (256u << 10) ? 256u << 10 : ml / 8;
   return s->priv_max == UINT64_MAX ? 1ull << 30 : s->priv_max;
 }
-/* the largest memtable: a sixteenth of ix_budget(), 4 KiB .. 128 MiB (memory-limit 256M: 2 MiB; 2G: 16 MiB) */
+/* the largest memtable: a sixteenth of ix_budget(), 64 KiB .. 128 MiB (memory-limit 256M: 2 MiB; 2G: 16 MiB) */
 static uint64_t dx_mem_cap(const store_t *s) {
 #ifdef KARIDNS_UNIT_TEST
   if (atomic_load_explicit(&store_test_dx_mem_bytes, memory_order_relaxed)) return atomic_load_explicit(&store_test_dx_mem_bytes, memory_order_relaxed);
 #endif
   const uint64_t c = ix_budget(s) / 16;
-  uint64_t b = 4096;
+  uint64_t b = 64u << 10;                               /* (at least 64 KiB: a writer that does not wait for the spill (not the pass) meets a full delta only past five of them; the smallest
+                                                         * memory-limit, 1M, still has them within half of it) */
   while (b * 2 <= c && b < (128ull << 20)) b <<= 1;      /* (a power of two: the doubling of dx_room_locked() reaches it) */
   return b;
 }
