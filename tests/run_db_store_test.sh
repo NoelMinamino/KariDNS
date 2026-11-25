@@ -154,11 +154,14 @@ pass_all() {
     PASS_BAD=$bad
     if [ "$bad" != 0 ]; then echo "  $bad queries not answered right: $(park_drops)"; kari_lost_diag "$KA" "$PA" $BADZ; kari_ipc_diag "$KA" "$T/a.log"; fi
 }
-# the answers of the subset on a port, normalised, into FILE
-subset_answers() {   # subset_answers PORT FILE
-    sp=$1; sout=$2
+# the answers of the subset on a port, normalised, into FILE.  ref: the reference server (every zone in memory, no store): a query of it that got no answer at all (dag: "no servers could
+# be reached", after its own tries) is asked again, up to 5 times, so that one lost datagram of the reference does not show as a difference of the server under test (CI 2026-11-25:
+# z1882.test SOA timed out on the reference only); a reference that keeps not answering is a FAIL of its own.  The server under test is asked once: a query it does not answer is a difference.
+subset_answers() {   # subset_answers PORT FILE [ref]
+    sp=$1; sout=$2; sref=${3:-}
     kari_udp_snap "$T/udp.snap"; sysctl -n net.inet.ip.intr_queue_drops > "$T/iqd.snap" 2>/dev/null || echo 0 > "$T/iqd.snap"
     : > "$sout.tmp"
+    sretried=0
     z=1
     while [ $z -le "$NZ" ]; do
         zn=$(zname $z)
@@ -166,10 +169,19 @@ subset_answers() {   # subset_answers PORT FILE
         for q in "$zn SOA" "$zn NS" "$zn MX" "$zn TXT" "www.$zn A" "alias.$zn CNAME" "x.w.$zn A" "nx.$zn A" "$zn DNSKEY" "ns2.$zn AAAA" "WWW.$zu A"; do
             qn=${q% *}; qt=${q##* }
             echo "## $q" >> "$sout.tmp"
-            ./dag @127.0.0.1 -p "$sp" "$qn" "$qt" +noall +answer +authority +additional +nohexdump 2> /dev/null | tr 'A-Z' 'a-z' | sort >> "$sout.tmp"
+            stry=1
+            while :; do
+                ./dag @127.0.0.1 -p "$sp" "$qn" "$qt" +noall +answer +authority +additional +nohexdump 2> /dev/null | tr 'A-Z' 'a-z' | sort > "$sout.one"
+                if [ -n "$sref" ] && grep -q "no servers could be reached" "$sout.one" && [ $stry -lt 5 ]; then stry=$((stry + 1)); sretried=$((sretried + 1)); continue; fi
+                break
+            done
+            [ -n "$sref" ] && grep -q "no servers could be reached" "$sout.one" && fail "the reference server did not answer $q in 5 tries: $(cat "$sout.one" | tr '\n' ' ')"
+            cat "$sout.one" >> "$sout.tmp"
         done
         z=$((z + STEP))
     done
+    rm -f "$sout.one"
+    [ "$sretried" -gt 0 ] && echo "  the reference was asked again $sretried time(s) after it gave no answer"
     mv "$sout.tmp" "$sout"
 }
 # subset_diff REF FILE: why the answers of the subset differ.  The diff; the queries whose answers differ (a ";; communications error ... timed out" line in one is a try that got no answer: dag tried again)
@@ -233,7 +245,7 @@ ST_ATT=$(sf store.zones.attached)
 [ "$ST_ROWS" -gt "$ST_ATT" ] 2>/dev/null && [ "$ST_ROWS" -le $(( ST_ATT + 128 )) ] 2>/dev/null && pass "karictl stats lists the zones in memory ($ST_ATT) and, after them, the busiest zones that left it ($((ST_ROWS - ST_ATT)) of at most 128)" || fail "karictl stats lists $ST_ROWS zones with $ST_ATT in memory"
 [ "$(sf store.attach.failed)" = 0 ] && pass "no attach failed" || fail "attach failures: $(sf store.attach.failed)"
 echo "  answers on the subset: the server with the store against the reference"
-subset_answers "$PB" "$T/ref.ans"
+subset_answers "$PB" "$T/ref.ans" ref
 subset_answers "$PA" "$T/a1.ans"
 if cmp -s "$T/ref.ans" "$T/a1.ans" && [ -s "$T/ref.ans" ]; then pass "the answers are the reference's ($(grep -c '^##' "$T/ref.ans") queries, $(wc -l < "$T/ref.ans" | tr -d ' ') lines)"; else fail "the answers differ from the reference"; subset_diff "$T/ref.ans" "$T/a1.ans"; fi
 waitfor 30 stored_all >/dev/null
@@ -488,7 +500,7 @@ UB=$(sf store.segments.used_bytes); LB=$(sf store.segments.live_bytes)
 FILES0=$(ls "$T/storeC" | grep -c '^seg\.')
 echo "  after the rounds: segments used $UB live $LB bytes (dead ${maxdead}% at the most seen), $FILES0 segment files, the cleaner has copied ${MV0:-0} bytes and removed ${FR0:-0} segments by itself"
 sleep 1
-subset_answers "$PB" "$T/cl.ref"
+subset_answers "$PB" "$T/cl.ref" ref
 subset_answers "$PA" "$T/cl.a1"
 cmp -s "$T/cl.ref" "$T/cl.a1" && [ -s "$T/cl.ref" ] && pass "the answers are the reference's (before the cleaner is asked to finish)" || { fail "the answers differ from the reference before compaction"; diff "$T/cl.ref" "$T/cl.a1" | head -6; }
 $KA store compact > "$T/compact.out" 2>&1
@@ -501,7 +513,11 @@ FILES1=$(ls "$T/storeC" | grep -c '^seg\.')
 echo "  after: segments used $UB1 live $LB1 bytes (dead ${DP1}%), $FILES1 segment files; copied $(sf store.compact.moved_bytes) bytes, removed $(sf store.compact.segments_freed) segments, $(sf store.segments.free_numbers) segment numbers free"
 [ "${DP1:-100}" -lt 40 ] && pass "the dead share of the segments is ${DP1}%" || fail "the dead share is still ${DP1}% after the cleaner"
 [ "$(sf store.compact.segments_freed)" -ge 1 ] 2>/dev/null && pass "segments were removed ($(sf store.compact.segments_freed))" || fail "no segment was removed"
-[ "$UB1" -lt "$UB" ] 2>/dev/null || [ "$(sf store.compact.segments_freed)" -gt "${FR0:-0}" ] 2>/dev/null && pass "the segments hold less than before (used $UB -> $UB1, files $FILES0 -> $FILES1)" || fail "used bytes did not fall: $UB -> $UB1"
+# (the cleaner may have done all of its work by itself before the request: then it removed segments before UB was read, the dead share is low already and nothing is left to remove;
+# CI 2026-11-25: 40 segments removed before, 21% dead, used unchanged)
+if [ "$UB1" -lt "$UB" ] 2>/dev/null || [ "$(sf store.compact.segments_freed)" -gt "${FR0:-0}" ] 2>/dev/null; then pass "the segments hold less than before (used $UB -> $UB1, files $FILES0 -> $FILES1)"
+elif [ "${FR0:-0}" -ge 1 ] 2>/dev/null && [ "${DP1:-100}" -lt 40 ] && [ "$UB1" = "$UB" ]; then pass "the cleaner had finished by itself before the request ($FR0 segments removed before it, ${DP1}% dead, used $UB1)"
+else fail "used bytes did not fall: $UB -> $UB1 (segments removed ${FR0:-0} before the request, $(sf store.compact.segments_freed) after, ${DP1}% dead)"; fi
 [ "$FILES1" -le $(( (LB1 + 1048575) / 1048576 + 3 )) ] && pass "the number of segment files ($FILES1) is about what the live bytes need ($LB1)" || fail "$FILES1 segment files for $LB1 live bytes"
 [ "$(sf store.zones.stored)" = "$NZ" ] && [ "$LB1" -ge "$LB" ] 2>/dev/null && pass "every zone is still stored, nothing live was lost ($LB -> $LB1 bytes live)" || fail "stored=$(sf store.zones.stored) live $LB -> $LB1"
 [ "$(sf store.compact.bad_records)" = 0 ] && pass "no record was found damaged by the cleaner" || fail "the cleaner found $(sf store.compact.bad_records) damaged records"

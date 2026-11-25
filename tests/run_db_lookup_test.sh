@@ -132,10 +132,11 @@ scenario() {
     [ "$(lk none)" -ge 2 ] 2>/dev/null && pass "[$SNAME] dbstatus counts the lookups that found nothing ($(lkall))" || fail "[$SNAME] dbstatus: $(lkall)"
 
     echo "== [$SNAME] a flood of names that no zone has"
+    kari_udp_snap "$T/udp.flood.snap"
     FOUT=$(perl tests/db/udp_lookup_probe.pl flood "$PA" "$FLOOD" nothing.test 30)
     echo "  $FOUT"
     fv() { echo "$FOUT" | tr ' ' '\n' | sed -n "s/^$1=//p" | head -1; }
-    [ "$(fv refused)" -ge $((FLOOD - FLOOD / 100)) ] 2>/dev/null && [ "$(fv servfail)" = 0 ] && [ "$(fv noerror)" = 0 ] && pass "[$SNAME] the flood: $(fv refused) of $FLOOD names REFUSED, 0 SERVFAIL, 0 NOERROR" || fail "[$SNAME] the flood: $FOUT"
+    [ "$(fv refused)" -ge $((FLOOD - FLOOD / 100)) ] 2>/dev/null && [ "$(fv servfail)" = 0 ] && [ "$(fv noerror)" = 0 ] && pass "[$SNAME] the flood: $(fv refused) of $FLOOD names REFUSED, 0 SERVFAIL, 0 NOERROR" || { fail "[$SNAME] the flood: $FOUT"; echo "  the lookups: $(lkall)"; echo "  the kernel during the flood (netstat -s -p udp: a query lost with no lookup counted for it was dropped before the server read it):"; kari_udp_delta "$T/udp.flood.snap"; }
     waitfor 20 none_in_flight && pass "[$SNAME] no lookup is left in flight (in_flight=0)" || fail "[$SNAME] in_flight=$(lk in_flight)"
     [ "$(fq places)" = 0 ] && [ "$(lk pending)" = 0 ] && pass "[$SNAME] no place of fetch-concurrency is left taken, no lookup waits for one (places=$(fq places) pending=$(lk pending))" || fail "[$SNAME] places=$(fq places) pending=$(lk pending)"
     echo "  $(lkall)"
