@@ -5028,13 +5028,15 @@ static int rg_build(store_t *s) {
   }
   /* The build of an index delta in an unlogged fill writes no record and changes no cell: what the files hold is the same before and after its publish (a superblock that a checkpoint
    * wrote while the delta was there says SBF_BULK_CK: the open rebuilds ix / sx from zt).  So it does not clear a clean flag on disk: the stop of the server (db_store_stop()) makes a clean
-   * checkpoint and _exit()s with the store open, and a build that ended after it made the store unclean, and the next start take the fill for a crash (CI 2026-11-25: a restart found
-   * the filled store empty; test_dx_clean_exit).  Every other build: a clean flag on disk is cleared first, with the mutex given up while the flags are waited for, as for every writer:
+   * checkpoint and _exit()s with the store open, and a build that ended after it made the store unclean and the next start took the fill for a crash, back to its last
+   * bulk checkpoint (test_dx_clean_exit).  Every other build: a clean flag on disk is cleared first, with the mutex given up while the flags are waited for, as for every writer:
    * the OP_GEN record is a change after it; journal_append()'s guard would only try the flags, and fail the growth when a commit or a checkpoint has them. */
-  const bool unlogged = s->rg_dx && atomic_load_explicit(&s->bulk, memory_order_relaxed);      /* (rg_dx is set before this thread began; the fill cannot end while its delta is there) */
   int lr = 0;
-  if (unlogged) wr_lock_raw(s);
-  else lr = wr_lock(s);
+  wr_lock_raw(s);                                     /* (rg_dx is the mutex's: set in the hold that began this build; the fill cannot end while its delta is there) */
+  if (!(s->rg_dx && atomic_load_explicit(&s->bulk, memory_order_relaxed))) {
+    wr_unlock_raw(s);
+    lr = wr_lock(s);
+  }
   if (lr < 0) {
     wr_lock_raw(s);
     if (r == 0) r = lr;
