@@ -298,7 +298,7 @@ enum {
 enum { OP_ZREC = 1, OP_NX, OP_IX, OP_SX, OP_V, OP_VIEW, OP_SRC, OP_GEN, OP_REBUILD, OP_NXMOVE };
 
 /* file kinds */
-enum { FK_ZT = 1, FK_ZC, FK_NX, FK_IX, FK_SX, FK_SEG, FK_JRN };
+enum { FK_ZT = 1, FK_ZC, FK_NX, FK_IX, FK_SX, FK_SEG, FK_JRN, FK_IXR, FK_IXB };      /* (FK_IXR, FK_IXB: scratch files of the index delta and of the file builder, never named by a superblock and never read across an open) */
 
 typedef struct {
   char     magic[8];
@@ -413,6 +413,7 @@ typedef struct ixgen {                 /* one generation of ix or sx */
   uint64_t nslots;
   _Atomic uint64_t *slots;
   size_t   maplen;
+  _Atomic bool needs_sync;              /* made by the file builder (fb_*): written with pwrite and not synced; the checkpoint that names it syncs the file (ck_io_tables()) */
 } ixgen_t;
 
 typedef struct seg {
@@ -440,8 +441,38 @@ typedef struct retire {
   uint64_t epoch;
   ixgen_t *g;
   seg_t *sg;                           /* a segment that was removed: closed and unmapped after the grace period */
+  void (*fn)(store_t *, void *);       /* anything else (the index delta: a view, a memtable, a run, a Bloom filter): fn(s, p) after the grace period */
+  void *p;
   struct retire *next;
 } retire_t;
+
+/* ---- 0.7: the index delta of a bulk pass (see "THE INDEX DELTA" at dx_begin_locked()) ----
+ * Hints (hash, zone id, which index) that the pass inserted: a memtable that the writers fill in place (two words a slot: the hash, then the zone id | which << 32 | DX_VALID, the second
+ * stored last with release), memtables frozen when full and waiting for their spill, and sorted runs in files (16 B entries, a fence of the first hash of every 4 KiB page in memory).
+ * A Bloom filter covers the keys of the runs (the spill thread is its only writer).  A view is immutable but for the slots of its memtable m; a change publishes a new one (s->dv). */
+#define DX_MAXF 4                             /* frozen memtables waiting for the spill (4 x the memtable bound: planning 3.1) */
+#define DX_MAXR 64                            /* runs of one view */
+#define DX_FAN 8                              /* runs of one tier merged into one run of the next (size-tiered) */
+#define DX_RSLOTS 128                         /* the names of the run files: ixr.0 .. ixr.127 (the open removes every one) */
+#define DX_VALID (1ull << 63)
+#define DX_PG 256u                            /* run entries in a page of 4 KiB: one fence each */
+typedef struct { uint64_t h; uint32_t z, w; } dent_t;          /* a run entry: hash, zone id, which index (0 ix, 1 sx) */
+_Static_assert(sizeof(dent_t) == 16, "dent_t");
+typedef struct dmem { _Atomic uint64_t *w; uint64_t nslots, n; size_t bytes; } dmem_t;
+typedef struct drun { unsigned slot, tier; uint64_t n; const dent_t *e; void *map; size_t maplen; uint64_t *fence; uint64_t nfence; } drun_t;
+typedef struct dbloom { _Atomic uint64_t *w; uint64_t nlines, keys, cap; size_t bytes; } dbloom_t;
+typedef struct dview { dmem_t *m; unsigned nf, nr; dmem_t *f[DX_MAXF]; drun_t *r[DX_MAXR]; dbloom_t *bl; } dview_t;
+typedef struct dx {
+  store_t *s;
+  dview_t *v;                                 /* (the writer mutex) the view in force: s->dv */
+  pthread_mutex_t mu;                         /* the spill thread's wake-ups (innermost: nothing is waited for under it but its condition) */
+  pthread_cond_t cv;
+  bool kick, stop, dead;                      /* (mu) work was asked for; the store closes; the delta was retired (the thread retires what is left of it and ends) */
+  bool thr;                                   /* a spill thread runs for it (false: the writer spills nothing, and retires the delta itself) */
+  uint64_t slots[DX_RSLOTS / 64];             /* (the writer mutex) the run file names in use */
+  uint64_t est;                               /* the zones announced for the fill (store_reserve()): the size of the first memtable and of the Bloom filter */
+  uint64_t retry_ms;                          /* (the spill thread) after a failed write: not again before this */
+} dx_t;
 
 /* the journal ring (0.7) */
 #define JR_CAP_DEF (64ull << 20)                 /* bytes of records that may wait for their write (D4: fixed; counted in memory-limit with the tables) */
@@ -610,7 +641,7 @@ struct store {
     ixgen_t *ix, *sx;
     uint32_t nseg;
     seg_t *seg[ST_MAXSEG];
-    struct { uint64_t *dirty; uint64_t npages, bytes; bool all, cow; uint64_t grow; } t[5];   /* zt, zc, nx, ix, sx as of P: the pages to write (taken from the writers), the bytes of P;
+    struct { uint64_t *dirty; uint64_t npages, bytes; bool all, cow, sync; uint64_t grow; } t[5];   /* zt, zc, nx, ix, sx as of P: the pages to write (taken from the writers), the bytes of P;
                                                        * cow: every write allocates (ZFS, a sparse file); grow: the bytes past what the file holds (allocated by this checkpoint) */
   } ck;
   uint8_t *ck_buf;                                    /* (ck_busy) the copy of a run of pages that the checkpoint writes */
@@ -625,7 +656,6 @@ struct store {
   struct { uint32_t nseg; seg_t *seg[ST_MAXSEG]; } cm;   /* (baton) the segments of the commit being made */
   /* growth of ix / sx outside the mutex (rg_*; wlock, except the flags the build thread reads) */
   bool rg_active, rg_bad;
-  bool rg_noalloc;                                     /* the running build is a reserve (store_reserve()): its files get their size and no blocks when they are made */
   _Atomic bool rg_cancel, rg_stop;
   _Atomic int rg_live;                                /* build threads that may still touch the store: a count, not a flag (a build clears rg_active under the mutex before its thread ends, so
                                                        * the next one can start while the last is still on its way out; with a flag the first one's end let store_close() free the store under the second) */
@@ -639,6 +669,19 @@ struct store {
   rgent_t *rg_ch[RG_NCH];                             /* the build's log of index changes, in chunks that never move (the build reads the part before rg_n with no lock while the writers append) */
   _Atomic size_t rg_n;                                /* (written under the mutex, after the entries it covers: release) */
   _Atomic uint64_t n_growths_bg;
+  /* ---- 0.7: the index delta of a bulk pass and the file builder (dx_*, fb_*) ---- */
+  _Atomic(dview_t *) dv;                              /* the delta's view (NULL: none); a reader loads it before ix / sx (acquire): the build puts the new generations in first, then clears it */
+  dx_t *dx;                                           /* (the writer mutex) the delta: from the begin of a pass of an unlogged fill to the build that puts its generations in */
+  bool rg_dx;                                         /* (the writer mutex) the running build replaces the delta (its end retires it) */
+  bool dx_end_want;                                   /* (the writer mutex) store_bulk_end() came while a delta was there: the build's end ends the fill */
+  bool dx_end_ifp;                                    /* (the writer mutex) ... only if the passes had ended (STORE_BULK_END_IF_PASSED): a pass that begins drops it */
+  uint64_t dx_retry_ms;                               /* (the writer mutex) a build for the delta failed: the next one is begun by the tick after this */
+  _Atomic uint32_t dx_nf;                             /* the frozen memtables of the delta's view (store_index_wait() reads it with no read section) */
+  _Atomic int dx_live;                                /* spill threads that may still touch the store (store_close() waits for them) */
+  _Atomic uint64_t dx_bytes;                          /* anonymous memory of the delta: memtables, the Bloom filter, fences, the spill's sort buffer (store.index.delta.bytes; counted in memory-limit) */
+  _Atomic uint64_t dx_peak, n_dx, n_dx_spills, n_dx_merges, n_dx_spill_err, n_dx_full, n_dx_waits, dx_runs, dx_run_ents, dx_bloom_bytes, n_dx_spill_us, n_dx_scratch_bytes;
+  _Atomic uint64_t fb_bytes, fb_peak;                 /* the file builder's anonymous memory (its window and bucket buffers), now and the most */
+  _Atomic uint64_t n_fb, n_fb_us, fb_max_us, n_fb_written, n_fb_buckets, n_fb_carry, n_fb_inlock;
   /* holds of the writer mutex */
   uint64_t wl_t0;
   const char *wl_site;                                /* (the mutex) the function that took it */
@@ -1636,6 +1679,17 @@ static void retire_add(store_t *s, ixgen_t *g) {
   if (s->rq_tail) s->rq_tail->next = r; else s->rq_head = r;
   s->rq_tail = r;
 }
+/* (writer mutex) anything else that readers may still look at: fn(s, p) after the grace period, with no lock held (retire_free()) */
+static void retire_add_fn(store_t *s, void (*fn)(store_t *, void *), void *p) {
+  if (!p) return;
+  retire_t *r = calloc(1, sizeof(*r));
+  if (!r) return;   /* (leaked rather than freed under a reader) */
+  r->fn = fn;
+  r->p = p;
+  r->epoch = rcu_writer_advance_epoch();
+  if (s->rq_tail) s->rq_tail->next = r; else s->rq_head = r;
+  s->rq_tail = r;
+}
 /* a segment that was removed: its descriptor (fd, mapping) is freed when the readers that could have looked at it are gone */
 static void retire_add_seg(store_t *s, seg_t *g) {
   retire_t *r = calloc(1, sizeof(*r));
@@ -1661,7 +1715,6 @@ static void retire_run(store_t *s, bool force) {
 void (*store_test_retire_free)(store_t *s) = NULL;
 #endif
 static void retire_free(store_t *s, retire_t *r) {
-  (void)s;
   while (r) {
     retire_t *n = r->next;
 #ifdef KARIDNS_UNIT_TEST
@@ -1669,6 +1722,7 @@ static void retire_free(store_t *s, retire_t *r) {
 #endif
     ixgen_free(r->g);
     if (r->sg) seg_free(r->sg);
+    if (r->fn) r->fn(s, r->p);
     free(r);
     r = n;
   }
@@ -1753,6 +1807,111 @@ static uint32_t sx_lookup(const store_t *s, const ixgen_t *g, uint16_t source, u
     if (z != STORE_NONE && (uint32_t)(v >> 32) == tag && sx_match(s, z, source, view, dom)) return z;
     if (++pos == n) pos = 0;
   }
+  return STORE_NONE;
+}
+
+/* ---- the index delta of a bulk pass: the lookups (THE INDEX DELTA at dx_begin_locked()) ----
+ * No lock, no allocation, no wait: a reader probes the structures of the view it loaded (inside its read section), and every hint it finds is a candidate that the caller verifies against zt
+ * (st_name_eq(), sx_match()) as it verifies a slot of ix / sx: a hint of a zone that was deleted, renamed or whose id was reused fails there.  Order: the view first, then ix / sx (acquire both):
+ * the build puts its generations in before it clears the view, so a reader that finds no view finds the new generations. */
+#define DX_CAND 8                             /* hints of one key a lookup takes at most (several only after deletes and reinserts of one name during the pass) */
+static bool bloom_maybe(const dbloom_t *b, uint64_t h) {          /* (one line of 64 B a key, six bits from the low 54 bits of the hash; the line from its high bits) */
+  const _Atomic uint64_t *l = b->w + st_pos(h, b->nlines) * 8;
+  for (unsigned j = 0; j < 6; j++) {
+    const unsigned bit = (unsigned)(h >> (9 * j)) & 511u;
+    if (!((atomic_load_explicit(&l[bit >> 6], memory_order_relaxed) >> (bit & 63)) & 1)) return false;
+  }
+  return true;
+}
+/* the first i of fence[0, n) with fence[i] >= h (n: none), n >= 1: the guess is interpolated (the hashes are uniform: st_pos()), the bracket around it found by doubling steps, then halved */
+static uint64_t dx_fence_lb(const uint64_t *f, uint64_t n, uint64_t h) {
+  const uint64_t g = st_pos(h, n);
+  uint64_t lo, hi, step = 1;
+  if (f[g] < h) {
+    for (lo = g + 1;; step <<= 1) {
+      hi = g + step;
+      if (hi >= n) { hi = n; break; }
+      if (f[hi] >= h) break;
+      lo = hi + 1;
+    }
+  } else {
+    for (hi = g;; step <<= 1) {
+      if (step > g) { lo = 0; break; }
+      lo = g - step;
+      if (f[lo] < h) { lo++; break; }
+      hi = lo;
+    }
+  }
+  while (lo < hi) {
+    const uint64_t m = lo + (hi - lo) / 2;
+    if (f[m] < h) lo = m + 1; else hi = m;
+  }
+  return lo;
+}
+#ifdef KARIDNS_UNIT_TEST
+uint64_t store_test_fence_lb(const uint64_t *f, uint64_t n, uint64_t h) { return dx_fence_lb(f, n, h); }
+#endif
+static unsigned dx_add(uint32_t *out, unsigned got, uint32_t z) {
+  for (unsigned i = 0; i < got; i++)
+    if (out[i] == z) return got;
+  out[got] = z;
+  return got + 1;
+}
+static unsigned dx_mem_cand(const dmem_t *m, unsigned which, uint64_t h, uint32_t *out, unsigned got, unsigned max) {
+  const uint64_t n = m->nslots;
+  uint64_t pos = st_pos(h, n);
+  for (uint64_t i = 0; i < n && got < max; i++) {
+    const uint64_t w1 = atomic_load_explicit(&m->w[2 * pos + 1], memory_order_acquire);       /* (stored after the hash, with release: dx_mem_put()) */
+    if (!w1) break;
+    if (atomic_load_explicit(&m->w[2 * pos], memory_order_relaxed) == h && ((w1 >> 32) & 1u) == which) got = dx_add(out, got, (uint32_t)w1);
+    if (++pos == n) pos = 0;
+  }
+  return got;
+}
+static unsigned dx_run_cand(const drun_t *r, unsigned which, uint64_t h, uint32_t *out, unsigned got, unsigned max) {
+  if (!r->n) return got;
+  const uint64_t i = dx_fence_lb(r->fence, r->nfence, h);
+  for (uint64_t k = (i ? i - 1 : 0) * DX_PG; k < r->n && got < max; k++) {       /* (the page before the first fence >= h may end with entries of h) */
+    const dent_t *e = &r->e[k];
+    if (e->h > h) break;
+    if (e->h == h && e->w == which) got = dx_add(out, got, e->z);
+  }
+  return got;
+}
+/* the hints of (which, h) in a view: the memtable, the frozen ones, and the runs when the Bloom filter does not rule them out */
+static unsigned dx_cand(const dview_t *v, unsigned which, uint64_t h, uint32_t *out, unsigned got, unsigned max) {
+  if (v->m) got = dx_mem_cand(v->m, which, h, out, got, max);         /* (none before the first insert of the pass) */
+  for (unsigned i = 0; i < v->nf; i++) got = dx_mem_cand(v->f[i], which, h, out, got, max);
+  if (v->nr && (!v->bl || bloom_maybe(v->bl, h)))
+    for (unsigned i = v->nr; i-- > 0; ) got = dx_run_cand(v->r[i], which, h, out, got, max);
+  return got;
+}
+static bool dx_has(const dview_t *v, unsigned which, uint64_t h, uint32_t z) {
+  uint32_t c[DX_CAND];
+  const unsigned n = dx_cand(v, which, h, c, 0, DX_CAND);
+  for (unsigned i = 0; i < n; i++)
+    if (c[i] == z) return true;
+  return false;
+}
+/* The lookups that every reader and writer uses: the current generation, then the delta's hints, verified */
+static uint32_t ix_find(const store_t *s, uint16_t view, const uint8_t *fn, size_t len, uint64_t h) {
+  const dview_t *v = atomic_load_explicit(&s->dv, memory_order_acquire);
+  const uint32_t z = ix_lookup(s, atomic_load_explicit(&s->ix, memory_order_acquire), view, fn, len, h);
+  if (z != STORE_NONE || !v) return z;
+  uint32_t c[DX_CAND];
+  const unsigned n = dx_cand(v, 0, h, c, 0, DX_CAND);
+  for (unsigned i = 0; i < n; i++)
+    if (st_name_eq(s, c[i], view, fn, len)) return c[i];
+  return STORE_NONE;
+}
+static uint32_t sx_find(const store_t *s, uint16_t source, uint16_t view, int64_t dom, uint64_t h) {
+  const dview_t *v = atomic_load_explicit(&s->dv, memory_order_acquire);
+  const uint32_t z = sx_lookup(s, atomic_load_explicit(&s->sx, memory_order_acquire), source, view, dom, h);
+  if (z != STORE_NONE || !v) return z;
+  uint32_t c[DX_CAND];
+  const unsigned n = dx_cand(v, 1, h, c, 0, DX_CAND);
+  for (unsigned i = 0; i < n; i++)
+    if (sx_match(s, c[i], source, view, dom)) return c[i];
   return STORE_NONE;
 }
 
@@ -2421,6 +2580,7 @@ static bool ck_try_locked(store_t *s);
 static void bg_release(store_t *s, bool io, bool ck);
 static int unclean_now_locked(store_t *s);
 static void rg_note_locked(store_t *s, const jb_t *j);
+static void dx_apply_locked(store_t *s, const jb_t *j);
 static int wr_lock_at(store_t *s, const char *site);
 static int wr_unlock_w(store_t *s);
 #define wr_lock(s) wr_lock_at((s), __func__)
@@ -2531,6 +2691,7 @@ static int journal_commit_apply(store_t *s) {
   if (r < 0) return r;
   rg_note_locked(s, &s->jb);
   r = apply_ops(s, s->jb.p + ST_JREC_HDR, s->jb.len - ST_JREC_HDR);
+  if (r == 0) dx_apply_locked(s, &s->jb);              /* (the hints of the new entries, after their cells: THE INDEX DELTA) */
   CRASH_POINT();
   return r;
 }
@@ -2923,7 +3084,8 @@ static int ck_begin_locked(store_t *s, bool clean, bool fuzzy) {
   s->ck.bulk = fuzzy && atomic_load_explicit(&s->bulk, memory_order_relaxed);
   s->ck.bulk_seg = s->ck.bulk ? st_seg_bytes(s) : 0;
   s->ck.by_priv = fuzzy && priv_due(s);
-  const bool noix = s->ck.bulk && !atomic_load_explicit(&s->bulk_body, memory_order_relaxed);
+  const bool dx = s->dx != NULL;                     /* (an index delta: ix / sx are not whole without it; every checkpoint then says SBF_BULK_CK, the clean one of a close too, and the open rebuilds them: Q4) */
+  const bool noix = dx || (s->ck.bulk && !atomic_load_explicit(&s->bulk_body, memory_order_relaxed));
   s->ck.ix = noix ? NULL : atomic_load_explicit(&s->ix, memory_order_relaxed);
   s->ck.sx = noix ? NULL : atomic_load_explicit(&s->sx, memory_order_relaxed);
   int r = ck_take_locked(s);                         /* (the pages the writers changed up to P) */
@@ -2935,7 +3097,7 @@ static int ck_begin_locked(store_t *s, bool clean, bool fuzzy) {
   s->ck.epos = s->jr_head;                          /* (rule F: the records <= P and the new file's header are below it; ck_io_commit() waits for it) */
   ck_alloc_plan_locked(s);
   atomic_store_explicit(&s->ck_want, false, memory_order_relaxed);
-  sb_fill(s, s->sbbuf, clean, s->sb_seq + 1, s->jrn_gen, s->ck.bulk);
+  sb_fill(s, s->sbbuf, clean, s->sb_seq + 1, s->jrn_gen, s->ck.bulk || dx);
   s->ck.nseg = commit_capture_locked(s, s->ck.seg, &s->ck.dir);           /* (io_hold + 1) */
   s->ck.lsn = P;
   s->ck.t0 = st_now_us();
@@ -2999,11 +3161,13 @@ static int ck_take_locked(store_t *s) {
     dmap_t *d = ck_dmap(s, i);
     s->ck.t[i].dirty = NULL;
     s->ck.t[i].npages = s->ck.t[i].bytes = 0;
+    s->ck.t[i].sync = false;
     s->ck.t[i].all = false;
     if (!d) continue;
     s->ck.t[i].dirty = d->dirty;
     s->ck.t[i].npages = d->npages;
     s->ck.t[i].all = d->all;
+    s->ck.t[i].sync = i >= 3 && atomic_load_explicit(&(i == 3 ? s->ck.ix : s->ck.sx)->needs_sync, memory_order_relaxed);   /* (a generation of the file builder: its file is synced by this checkpoint) */
     s->ck.t[i].bytes = i < 3 ? atomic_load_explicit(&tabs[i]->mapped, memory_order_relaxed) : (i == 3 ? s->ck.ix : s->ck.sx)->maplen;
     d->dirty = fresh[i];
     d->all = false;
@@ -3104,7 +3268,7 @@ static int ck_write_tab(store_t *s, int i, int fd, const uint8_t *base, const _A
   uint64_t np = bytes >> s->pgshift;
   if (!all && np > s->ck.t[i].npages) np = s->ck.t[i].npages;
   const uint64_t run_max = ST_CK_RUN >> s->pgshift;
-  bool wrote = false;
+  bool wrote = s->ck.t[i].sync;
   if (!s->ck.t[i].cow) ck_charge(s, s->ck.t[i].grow);    /* (an overwrite takes no blocks here: only the growth past the file's end does) */
   for (uint64_t p = 0; p < np; ) {
     if (!all && dirty[p >> 6] == 0) { p = (p | 63) + 1; continue; }
@@ -3256,8 +3420,9 @@ static int ck_io_tables(store_t *s, const _Atomic bool *cancel) {
       r = ck_write_tab(s, i, tabs[i]->fd, tabs[i]->base, cancel, &done);
       if (r == 0) mtab_note_extended(tabs[i], s->ck.t[i].bytes);
     } else {
-      const ixgen_t *g = i == 3 ? s->ck.ix : s->ck.sx;
+      ixgen_t *g = i == 3 ? s->ck.ix : s->ck.sx;
       if (g) r = ck_write_tab(s, i, g->fd, (const uint8_t *)g->slots, cancel, &done);
+      if (g && r == 0 && s->ck.t[i].sync) atomic_store_explicit(&g->needs_sync, false, memory_order_relaxed);
     }
   }
   atomic_fetch_add_explicit(&s->n_ck_bytes, done, memory_order_relaxed);
@@ -3616,6 +3781,964 @@ static void ck_after(store_t *s) {
 }
 
 /* ------------------------------------------------------------------------------------------------------------------ */
+/* THE INDEX DELTA of a bulk pass (0.7: planning/ixsx bulk build, plan B + C)                                          */
+/* ------------------------------------------------------------------------------------------------------------------ */
+/* THE INDEX DELTA.  The pass of a first fill lists every zone: 10M to 100M new names at 300k a second.  Before, every one went into ix / sx, which grew by builds of a whole new generation in
+ * anonymous memory (up to three of them resident at 100M zones, 15 GB) and stopped the pass in store_index_wait() for up to 30 s.  Now, from the begin of a pass of an unlogged fill
+ * (store_bulk_phase(PASS)) to the build that ends it, ix / sx are frozen for inserts (G0: deletes still tombstone in place) and every new entry goes into the delta D as a hint (hash, zone id):
+ *   - a memtable M that the writers fill in place (open addressing, 16 B a slot, full at one half); a full M is frozen (at most DX_MAXF wait) and a new one, twice as big up to dx_mem_cap(),
+ *     takes the inserts;
+ *   - the spill thread (one per delta: dx_main()) sorts a frozen memtable by hash and writes it as a run, a file ixr.<n> beneath the store directory mapped read only (page cache, not
+ *     anonymous memory), with a fence (the first hash of each 4 KiB page) in memory; runs of one tier are merged DX_FAN at a time into one of the next (sequential reads and writes);
+ *   - one Bloom filter over the keys of the runs, so that a miss (the pass's own check of every new name) does not touch the runs.
+ * A hint is not the truth: every reader verifies a candidate against zt (ix_find(), sx_find(), the callers of store_find_cand()), so a delete, a rename or a reused zone id needs nothing in D.
+ * The one invariant: every zone inserted during the pass has a hint in M, a frozen memtable or a run.  The writer makes room in M before it plans a change (dx_room_locked(); the memtable is
+ * the only thing the record's apply touches: dx_apply_locked()), so the apply never fails.  When the pass ends (phase BODY / PASSED, or a cut pass) the one build of the file builder (fb_*,
+ * rg_build()) makes G1 / S1 from a pass over zt and puts them in; the delta is retired with them (dx_end_locked()).  No growth runs during the pass, and never two generations are made in
+ * anonymous memory (C).  A checkpoint takes no ix / sx while a delta is there and says SBF_BULK_CK: the open after any stop or crash rebuilds them from zt with the same builder.
+ * The run files are scratch: never named by a superblock, never read across an open (the open removes every name ixr.0 .. ixr.<DX_RSLOTS - 1>: dx_remove_scratch()), so no parser reads them. */
+
+#ifdef KARIDNS_UNIT_TEST
+_Atomic uint64_t store_test_dx_mem_bytes;     /* the memtable bytes (every memtable: 0 = the default) */
+_Atomic unsigned store_test_dx_fan;           /* runs merged at once (0: DX_FAN) */
+_Atomic uint64_t store_test_fb_window;        /* the builder's window in slots (0: FB_WIN / 8) */
+void (*_Atomic store_test_dx_hook)(store_t *s, int step);  /* the steps of the delta and of the builder (DXS_*): a test kills the process there */
+int (*_Atomic store_test_ix_fault)(int what);              /* a write of a run (1), a bucket (2), a generation (3) fails with the -errno this returns (0: none) */
+#define DX_HOOK(s, k) do { void (*h_)(store_t *, int) = atomic_load_explicit(&store_test_dx_hook, memory_order_acquire); if (h_) h_((s), (k)); } while (0)
+#define IX_FAULT(w) (atomic_load_explicit(&store_test_ix_fault, memory_order_acquire) ? atomic_load_explicit(&store_test_ix_fault, memory_order_acquire)(w) : 0)
+#define DX_FAN_NOW() (atomic_load_explicit(&store_test_dx_fan, memory_order_relaxed) >= 2 ? atomic_load_explicit(&store_test_dx_fan, memory_order_relaxed) : (unsigned)DX_FAN)
+#else
+#define DX_HOOK(s, k) ((void)0)
+#define IX_FAULT(w) 0
+#define DX_FAN_NOW() ((unsigned)DX_FAN)
+#endif
+#ifdef KARIDNS_UNIT_TEST
+#define DXS_SPILL_SORTED STORE_DXS_SPILL_SORTED
+#define DXS_SPILL_WRITTEN STORE_DXS_SPILL_WRITTEN
+#define DXS_SPILL_PUBLISHED STORE_DXS_SPILL_PUBLISHED
+#define DXS_MERGE_WRITTEN STORE_DXS_MERGE_WRITTEN
+#define DXS_MERGE_PUBLISHED STORE_DXS_MERGE_PUBLISHED
+#define FBS_SCANNED STORE_FBS_SCANNED
+#define FBS_PLACED STORE_FBS_PLACED
+#define FBS_MAPPED STORE_FBS_MAPPED
+#define FBS_CAUGHT_UP STORE_FBS_CAUGHT_UP
+#define FBS_PUBLISHED STORE_FBS_PUBLISHED
+_Atomic uint64_t store_test_rg_small;
+#define RG_SMALL_NOW() (atomic_load_explicit(&store_test_rg_small, memory_order_relaxed) ? atomic_load_explicit(&store_test_rg_small, memory_order_relaxed) : RG_SMALL)
+#else
+#define RG_SMALL_NOW() RG_SMALL
+#endif
+
+static void dx_acct(store_t *s, size_t n, bool add) {
+  if (!add) { atomic_fetch_sub_explicit(&s->dx_bytes, n, memory_order_relaxed); return; }
+  const uint64_t b = atomic_fetch_add_explicit(&s->dx_bytes, n, memory_order_relaxed) + n;
+  uint64_t m = atomic_load_explicit(&s->dx_peak, memory_order_relaxed);
+  while (b > m && !atomic_compare_exchange_weak_explicit(&s->dx_peak, &m, b, memory_order_relaxed, memory_order_relaxed)) {}
+}
+/* the largest memtable: an eighth of the bound of the private tables, 1 MiB .. 128 MiB (pc31: 64 MiB; a VPS of 1 GB: 8 MiB; Q7) */
+static uint64_t dx_mem_cap(const store_t *s) {
+#ifdef KARIDNS_UNIT_TEST
+  if (atomic_load_explicit(&store_test_dx_mem_bytes, memory_order_relaxed)) return atomic_load_explicit(&store_test_dx_mem_bytes, memory_order_relaxed);
+#endif
+  const uint64_t c = s->priv_max == UINT64_MAX ? (128ull << 20) : s->priv_max / 8;
+  return c < (1ull << 20) ? 1ull << 20 : c > (128ull << 20) ? 128ull << 20 : c;
+}
+/* the first memtable (made at the first insert of the pass): room for the announced zones (two hints each, full at one half), a page at least (64 KiB when none were announced), at most the
+ * bound (a fill of 100 zones: 8 KiB; before, its reserve made 16 KiB of anonymous index) */
+static uint64_t dx_first_bytes(const store_t *s, uint64_t est) {
+  const uint64_t cap = dx_mem_cap(s);
+  uint64_t b = est ? 4096u : 64u << 10;
+  while (b < cap && b / 16 < est * 4) b <<= 1;
+  return b < cap ? b : cap;
+}
+static dmem_t *dmem_new(store_t *s, uint64_t bytes) {
+  dmem_t *m = calloc(1, sizeof(*m));
+  if (!m) return NULL;
+  void *p = mmap(NULL, (size_t)bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | ST_NOCORE, -1, 0);
+  if (p == MAP_FAILED) { free(m); return NULL; }
+  m->w = p;
+  m->bytes = (size_t)bytes;
+  m->nslots = bytes / 16;
+  dx_acct(s, m->bytes, true);
+  return m;
+}
+static void dmem_free(store_t *s, void *p) {
+  dmem_t *m = p;
+  munmap((void *)m->w, m->bytes);
+  dx_acct(s, m->bytes, false);
+  free(m);
+}
+/* (writer mutex) one hint into the memtable: the hash first, then the word that makes the slot used (release: dx_mem_cand() reads it with acquire); a hint that is there already is not doubled */
+static void dx_mem_put(dmem_t *m, uint64_t h, uint32_t z, unsigned which) {
+  const uint64_t n = m->nslots, w1 = (uint64_t)z | (uint64_t)which << 32 | DX_VALID;
+  uint64_t pos = st_pos(h, n);
+  for (uint64_t i = 0; i < n; i++) {
+    const uint64_t cur = atomic_load_explicit(&m->w[2 * pos + 1], memory_order_relaxed);
+    if (!cur) {
+      atomic_store_explicit(&m->w[2 * pos], h, memory_order_relaxed);
+      atomic_store_explicit(&m->w[2 * pos + 1], w1, memory_order_release);
+      m->n++;
+      return;
+    }
+    if (cur == w1 && atomic_load_explicit(&m->w[2 * pos], memory_order_relaxed) == h) return;
+    if (++pos == n) pos = 0;
+  }
+}
+/* the Bloom filter of the runs: 10 bits a key, one 64 B line a key (bloom_maybe()), at most a quarter of the bound of the private tables (pc31: 128 MiB; past its count the false positives
+ * rise: a cost in speed, never in correctness) */
+static dbloom_t *dbloom_new(store_t *s, uint64_t keys) {
+  const uint64_t capb = s->priv_max == UINT64_MAX ? (128ull << 20) : s->priv_max / 4 < (64u << 10) ? 64u << 10 : s->priv_max / 4;
+  uint64_t bytes = (keys * 10 / 8 + 63) & ~63ull;
+  if (bytes < 4096) bytes = 4096;
+  if (bytes > capb) bytes = capb & ~63ull;
+  dbloom_t *b = calloc(1, sizeof(*b));
+  if (!b) return NULL;
+  void *p = mmap(NULL, (size_t)bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | ST_NOCORE, -1, 0);
+  if (p == MAP_FAILED) { free(b); return NULL; }
+  b->w = p;
+  b->bytes = (size_t)bytes;
+  b->nlines = bytes / 64;
+  b->cap = b->nlines * 512 / 10;
+  b->keys = 0;
+  dx_acct(s, b->bytes, true);
+  atomic_store_explicit(&s->dx_bloom_bytes, b->bytes, memory_order_relaxed);
+  return b;
+}
+static void dbloom_free(store_t *s, void *p) {
+  dbloom_t *b = p;
+  munmap((void *)b->w, b->bytes);
+  dx_acct(s, b->bytes, false);
+  free(b);
+}
+static void dbloom_put(dbloom_t *b, uint64_t h) {        /* (the spill thread is the only writer; readers see the bits of a run before its view: the view is published after them) */
+  _Atomic uint64_t *l = b->w + st_pos(h, b->nlines) * 8;
+  for (unsigned j = 0; j < 6; j++) {
+    const unsigned bit = (unsigned)(h >> (9 * j)) & 511u;
+    atomic_fetch_or_explicit(&l[bit >> 6], 1ull << (bit & 63), memory_order_relaxed);
+  }
+  b->keys++;
+}
+static void dbloom_put_run(dbloom_t *b, const drun_t *r) {
+  for (uint64_t k = 0; k < r->n; k++) dbloom_put(b, r->e[k].h);
+}
+static void drun_name(char *buf, size_t n, unsigned slot) { snprintf(buf, n, "ixr.%u", slot); }
+static void drun_free(store_t *s, void *p) {              /* (the file is gone already: unlinked when the run left its view, or with the delta) */
+  drun_t *r = p;
+  if (r->map) munmap(r->map, r->maplen);
+  dx_acct(s, (size_t)r->nfence * 8, false);
+  free(r->fence);
+  free(r);
+}
+static void dview_free(store_t *s, void *p) { (void)s; free(p); }
+/* (writer mutex) a new view is in force; the old one is freed after the grace period (its memtables and runs are retired by the caller when they left) */
+static void dx_publish_locked(store_t *s, dx_t *x, dview_t *nv) {
+  dview_t *old = x->v;
+  x->v = nv;
+  atomic_store_explicit(&s->dv, nv, memory_order_release);
+  uint64_t ents = 0;
+  for (unsigned i = 0; i < nv->nr; i++) ents += nv->r[i]->n;
+  atomic_store_explicit(&s->dx_runs, nv->nr, memory_order_relaxed);
+  atomic_store_explicit(&s->dx_run_ents, ents, memory_order_relaxed);
+  atomic_store_explicit(&s->dx_nf, nv->nf, memory_order_relaxed);
+  retire_add_fn(s, dview_free, old);
+}
+static void dx_kick(dx_t *x) {
+  pthread_mutex_lock(&x->mu);
+  x->kick = true;
+  pthread_cond_signal(&x->cv);
+  pthread_mutex_unlock(&x->mu);
+}
+static int dx_slot_get(dx_t *x) {                         /* (writer mutex) */
+  for (unsigned i = 0; i < DX_RSLOTS; i++)
+    if (!((x->slots[i >> 6] >> (i & 63)) & 1)) { x->slots[i >> 6] |= 1ull << (i & 63); return (int)i; }
+  return -1;
+}
+static void dx_unlink_slot(store_t *s, unsigned slot) {
+  char name[32];
+  drun_name(name, sizeof(name), slot);
+  if (unlinkat(s->dirfd, name, 0) == 0) s->dir_dirty = true;
+}
+/* (writer mutex) room in the memtable for `add` more hints: a full one is frozen and a new one takes the inserts; with DX_MAXF frozen ones waiting for the spill, the memtable fills on to 7/8,
+ * and past that the change is refused (-ENOSPC, store.index.delta.full: the zone stays unrecorded and the next pass lists it again; the disk-full rule of the tables).  0: room. */
+static int dx_room_locked(store_t *s, unsigned add) {
+  dx_t *x = s->dx;
+  if (!x) return 0;
+  dview_t *v = x->v;
+  dmem_t *m = v->m;
+  if (!m) {                                           /* (the first insert of the pass: the memtable is made for the zones announced, store_reserve()) */
+    dview_t *nv = malloc(sizeof(*nv));
+    if (nv) *nv = *v;
+    if (nv && !(nv->m = dmem_new(s, dx_first_bytes(s, x->est)))) { free(nv); nv = NULL; }
+    if (!nv) return -ENOMEM;
+    dx_publish_locked(s, x, nv);
+    v = nv;
+    m = v->m;
+  }
+  if ((m->n + add) * 2 <= m->nslots) return 0;
+  if (v->nf < DX_MAXF && m->n > 0) {
+    const uint64_t cap = dx_mem_cap(s);
+    dmem_t *nm = dmem_new(s, m->bytes * 2 <= cap ? m->bytes * 2 : m->bytes > cap ? m->bytes : cap);
+    dview_t *nv = nm ? malloc(sizeof(*nv)) : NULL;
+    if (nv) {
+      *nv = *v;
+      nv->f[nv->nf++] = m;
+      nv->m = nm;
+      dx_publish_locked(s, x, nv);
+      if (x->thr) dx_kick(x);
+      return 0;
+    }
+    if (nm) dmem_free(s, nm);
+  }
+  if ((m->n + add) * 8 <= m->nslots * 7) return 0;
+  atomic_fetch_add_explicit(&s->n_dx_full, 1, memory_order_relaxed);
+  return -ENOSPC;
+}
+/* (writer mutex) the record was applied: its new index entries (jb_t.pl) become hints of the memtable, after the cells they lead to */
+static void dx_apply_locked(store_t *s, const jb_t *j) {
+  if (!s->dx) return;
+  dmem_t *m = s->dx->v->m;
+  if (!m) return;                                     /* (never: dx_room_locked() made it before the change was planned) */
+  for (unsigned k = 0; k < j->npl; k++)
+    if (j->pl[k].ins) dx_mem_put(m, j->pl[k].h, j->pl[k].z, j->pl[k].which);
+}
+
+/* ---- the runs ---- */
+#define RW_BUF 65536u                         /* entries the run writer keeps before a write (1 MiB) */
+typedef struct { store_t *s; int fd; drun_t *r; dent_t *buf, last; size_t nb, acct; uint64_t off, cap; int err; } rw_t;
+static int rw_begin(store_t *s, rw_t *w, unsigned slot, unsigned tier, uint64_t nmax) {
+  memset(w, 0, sizeof(*w));
+  w->s = s;
+  w->fd = -1;
+  w->r = calloc(1, sizeof(*w->r));
+  w->buf = malloc((size_t)RW_BUF * sizeof(dent_t));
+  w->cap = (nmax + DX_PG - 1) / DX_PG + 1;
+  if (w->r) w->r->fence = malloc((size_t)w->cap * 8);
+  if (!w->r || !w->buf || !w->r->fence) return w->err = -ENOMEM;
+  w->acct = (size_t)w->cap * 8;
+  dx_acct(s, w->acct, true);
+  w->r->slot = slot;
+  w->r->tier = tier;
+  char name[32];
+  drun_name(name, sizeof(name), slot);
+  w->fd = st_openat(s, name, O_RDWR | O_CREAT | O_TRUNC);
+  if (w->fd < 0) return w->err = w->fd;
+  s->dir_dirty = true;
+  w->off = ST_HDR_PAGE;
+  return 0;
+}
+static void rw_flush(rw_t *w) {
+  if (!w->nb || w->err) return;
+  const size_t len = w->nb * sizeof(dent_t);
+  const int f = IX_FAULT(1);
+  w->err = f ? f : st_pwrite_all(w->fd, w->buf, len, (off_t)w->off);
+  w->off += len;
+  w->nb = 0;
+  if (!w->err) atomic_fetch_add_explicit(&w->s->n_dx_scratch_bytes, len, memory_order_relaxed);
+}
+static void rw_put(rw_t *w, const dent_t *e) {
+  drun_t *r = w->r;
+  if (w->err || (r->n && memcmp(&w->last, e, sizeof(*e)) == 0)) return;     /* (a hint twice in a row, from two runs: kept once) */
+  if (r->n % DX_PG == 0) r->fence[r->n / DX_PG] = e->h;
+  w->last = *e;
+  w->buf[w->nb++] = *e;
+  r->n++;
+  if (w->nb == RW_BUF) rw_flush(w);
+}
+/* the run is written: its header, then the mapping (read only: page cache).  NULL: failed (w->err), the file is gone */
+static drun_t *rw_end(rw_t *w) {
+  rw_flush(w);
+  drun_t *r = w->r;
+  if (!w->err) {
+    fhdr_t h;
+    uint8_t page[512];
+    memset(page, 0, sizeof(page));
+    fhdr_make(w->s, &h, FK_IXR, 0, sizeof(dent_t), r->n);
+    memcpy(page, &h, sizeof(h));
+    w->err = st_pwrite_all(w->fd, page, sizeof(page), 0);
+  }
+  if (!w->err) {
+    r->maplen = (size_t)((ST_HDR_PAGE + r->n * sizeof(dent_t) + w->s->pagesz - 1) & ~((uint64_t)w->s->pagesz - 1));
+    if (ftruncate(w->fd, (off_t)r->maplen) != 0) w->err = -errno;
+  }
+  if (!w->err) {
+    void *p = mmap(NULL, r->maplen, PROT_READ, MAP_SHARED | ST_NOCORE, w->fd, 0);
+    if (p == MAP_FAILED) w->err = -errno;
+    else { r->map = p; r->e = (const dent_t *)(const void *)((const uint8_t *)p + ST_HDR_PAGE); }
+  }
+  if (w->fd >= 0) close(w->fd);
+  free(w->buf);
+  if (w->err) {
+    if (r) {
+      dx_unlink_slot(w->s, r->slot);
+      free(r->fence);
+      free(r);
+    }
+    dx_acct(w->s, w->acct, false);
+    return NULL;
+  }
+  r->nfence = (r->n + DX_PG - 1) / DX_PG;
+  uint64_t *f = realloc(r->fence, (size_t)(r->nfence ? r->nfence : 1) * 8);       /* (the fences in use; drun_free() gives back nfence x 8) */
+  if (f) r->fence = f;
+  dx_acct(w->s, w->acct - (size_t)r->nfence * 8, false);
+  return r;
+}
+static int dent_cmp(const void *a, const void *b) {
+  const dent_t *x = a, *y = b;
+  if (x->h != y->h) return x->h < y->h ? -1 : 1;
+  if (x->w != y->w) return x->w < y->w ? -1 : 1;
+  return x->z < y->z ? -1 : x->z > y->z;
+}
+/* The entries of a frozen memtable in hash order.  The slot of an entry is monotonic in its hash but for the local displacement of linear probing and the wrap at the end, so: from the first
+ * empty slot e0, the entries of the slots before it whose home is not past them (low hashes), then those of the slots after it, then the ones before it that wrapped (high hashes); an
+ * insertion sort fixes the displacements in O(n) (a qsort if it does not: it never should, the hashes are keyed). */
+static uint64_t dx_extract(const dmem_t *m, dent_t *out) {
+  const uint64_t n = m->nslots;
+  uint64_t e0 = 0, k = 0;
+  while (e0 < n && atomic_load_explicit(&m->w[2 * e0 + 1], memory_order_relaxed)) e0++;
+  for (int part = 0; part < 3; part++) {
+    const uint64_t a = part == 1 ? e0 + 1 : 0, b = part == 1 ? n : e0;
+    for (uint64_t i = a; i < b; i++) {
+      const uint64_t w1 = atomic_load_explicit(&m->w[2 * i + 1], memory_order_relaxed);
+      if (!w1) continue;
+      const uint64_t h = atomic_load_explicit(&m->w[2 * i], memory_order_relaxed);
+      const bool wrapped = part != 1 && st_pos(h, n) > i;
+      if ((part == 0 && wrapped) || (part == 2 && !wrapped)) continue;
+      out[k].h = h;
+      out[k].z = (uint32_t)w1;
+      out[k].w = (uint32_t)((w1 >> 32) & 1u);
+      k++;
+    }
+  }
+  uint64_t moves = 0;
+  for (uint64_t i = 1; i < k && moves <= 32 * k; i++) {
+    const dent_t e = out[i];
+    uint64_t j = i;
+    while (j > 0 && dent_cmp(&out[j - 1], &e) > 0) { out[j] = out[j - 1]; j--; moves++; }
+    out[j] = e;
+  }
+  if (moves > 32 * k) qsort(out, (size_t)k, sizeof(*out), dent_cmp);
+  return k;
+}
+/* the Bloom filter for a view with one more run: the one in force (bits added; NULL: none could be made) or a bigger one with every key of the runs (*grown) */
+static dbloom_t *dx_bloom_for(store_t *s, dx_t *x, const dview_t *v, const drun_t *nr, bool *grown) {
+  dbloom_t *b = v->bl;
+  *grown = false;
+  if (b && b->keys + nr->n <= b->cap) { dbloom_put_run(b, nr); return b; }
+  uint64_t keys = nr->n;
+  for (unsigned i = 0; i < v->nr; i++) keys += v->r[i]->n;
+  const uint64_t want = 2 * keys > 2 * x->est ? 2 * keys : 2 * x->est;
+  if (b && want * 10 / 8 <= b->bytes) { dbloom_put_run(b, nr); return b; }   /* (it is at its bound already) */
+  dbloom_t *nb = dbloom_new(s, want);
+  if (!nb) {
+    if (b) dbloom_put_run(b, nr);
+    return b;
+  }
+  for (unsigned i = 0; i < v->nr; i++) dbloom_put_run(nb, v->r[i]);
+  dbloom_put_run(nb, nr);
+  *grown = true;
+  return nb;
+}
+static void dx_note_error(store_t *s, dx_t *x, int r, const char *what) {
+  atomic_fetch_add_explicit(&s->n_dx_spill_err, 1, memory_order_relaxed);
+  x->retry_ms = st_now_ms() + 1000u;
+  note_error(s, r);
+  st_log(s, 4, "store: the index delta could not write a run (%s: %s): the memtable stays in memory and the write is tried again in a second (store.index.delta.spill_errors)", what, strerror(-r));
+}
+/* the spill of the oldest frozen memtable (the spill thread): 1 done, 0 nothing to do, < 0 failed (the memtable stays, tried again later) */
+static int dx_spill(store_t *s, dx_t *x) {
+  dview_t snap = { 0 };                                     /* (the view may be retired while the thread works; its runs and its Bloom filter are only changed by this thread) */
+  wr_lock_raw(s);
+  const dview_t *v = x->dead ? NULL : x->v;
+  if (v) snap = *v;
+  dmem_t *f = v && v->nf ? v->f[0] : NULL;
+  const int slot = f ? dx_slot_get(x) : -1;
+  wr_unlock_raw(s);
+  v = &snap;
+  if (!f) return 0;
+  if (slot < 0) return -ENOSPC;
+  const uint64_t t0 = st_now_us();
+  const size_t bb = (size_t)(f->n ? f->n : 1) * sizeof(dent_t);
+  dent_t *buf = malloc(bb);
+  if (!buf) { wr_lock_raw(s); x->slots[slot >> 6] &= ~(1ull << (slot & 63)); wr_unlock_raw(s); return -ENOMEM; }
+  dx_acct(s, bb, true);
+  const uint64_t n = dx_extract(f, buf);
+  DX_HOOK(s, DXS_SPILL_SORTED);
+  rw_t w;
+  int r = rw_begin(s, &w, (unsigned)slot, 0, n);
+  for (uint64_t k = 0; k < n && r == 0; k++) rw_put(&w, &buf[k]);
+  drun_t *run = rw_end(&w);
+  dx_acct(s, bb, false);
+  free(buf);
+  if (!run) {
+    wr_lock_raw(s);
+    x->slots[slot >> 6] &= ~(1ull << (slot & 63));
+    wr_unlock_raw(s);
+    dx_note_error(s, x, w.err ? w.err : -EIO, "spill");
+    return w.err ? w.err : -EIO;
+  }
+  DX_HOOK(s, DXS_SPILL_WRITTEN);
+  bool grown = false;
+  dbloom_t *bl = dx_bloom_for(s, x, v, run, &grown);
+  wr_lock_raw(s);
+  dview_t *cur = x->dead ? NULL : x->v;
+  dview_t *nv = cur && cur->nr < DX_MAXR ? malloc(sizeof(*nv)) : NULL;
+  if (!nv) {
+    x->slots[slot >> 6] &= ~(1ull << (slot & 63));
+    wr_unlock_raw(s);
+    dx_unlink_slot(s, (unsigned)slot);
+    drun_free(s, run);
+    if (grown) dbloom_free(s, bl);
+    return cur ? -ENOMEM : 0;
+  }
+  *nv = *cur;
+  for (unsigned i = 1; i < nv->nf; i++) nv->f[i - 1] = nv->f[i];
+  nv->nf--;
+  nv->r[nv->nr++] = run;
+  nv->bl = bl;
+  dx_publish_locked(s, x, nv);
+  retire_add_fn(s, dmem_free, f);
+  if (grown && cur->bl) retire_add_fn(s, dbloom_free, cur->bl);
+  atomic_fetch_add_explicit(&s->n_dx_spills, 1, memory_order_relaxed);
+  atomic_fetch_add_explicit(&s->n_dx_spill_us, st_now_us() - t0, memory_order_relaxed);
+  wr_unlock_raw(s);
+  DX_HOOK(s, DXS_SPILL_PUBLISHED);
+  return 1;
+}
+/* the merge of DX_FAN runs of the lowest tier that has them into one of the next tier (the spill thread): 1 done, 0 nothing to do, < 0 failed */
+static int dx_merge(store_t *s, dx_t *x) {
+  const unsigned fan = DX_FAN_NOW();
+  drun_t *in[DX_MAXR];
+  unsigned k = 0, tier = 0;
+  wr_lock_raw(s);
+  const dview_t *v = x->dead ? NULL : x->v;
+  for (unsigned t = 0; v && t < 16 && k < fan; t++) {
+    k = 0;
+    for (unsigned i = 0; i < v->nr && k < fan; i++)
+      if (v->r[i]->tier == t) in[k++] = v->r[i];
+    tier = t;
+  }
+  const int slot = v && k == fan ? dx_slot_get(x) : -1;
+  wr_unlock_raw(s);
+  if (!v || k < fan) return 0;
+  if (slot < 0) return -ENOSPC;
+  uint64_t total = 0, pos[DX_MAXR];
+  for (unsigned i = 0; i < k; i++) { total += in[i]->n; pos[i] = 0; }
+  rw_t w;
+  int r = rw_begin(s, &w, (unsigned)slot, tier + 1, total);
+  while (r == 0 && !w.err) {                          /* (k-way: the smallest head; k is small) */
+    int best = -1;
+    for (unsigned i = 0; i < k; i++)
+      if (pos[i] < in[i]->n && (best < 0 || dent_cmp(&in[i]->e[pos[i]], &in[best]->e[pos[best]]) < 0)) best = (int)i;
+    if (best < 0) break;
+    rw_put(&w, &in[best]->e[pos[best]++]);
+  }
+  drun_t *out = rw_end(&w);
+  if (!out) {
+    wr_lock_raw(s);
+    x->slots[slot >> 6] &= ~(1ull << (slot & 63));
+    wr_unlock_raw(s);
+    dx_note_error(s, x, w.err ? w.err : -EIO, "merge");
+    return w.err ? w.err : -EIO;
+  }
+  DX_HOOK(s, DXS_MERGE_WRITTEN);
+  for (unsigned i = 0; i < k; i++) dx_unlink_slot(s, in[i]->slot);      /* (the mappings stay for the readers of the views that hold them) */
+  wr_lock_raw(s);
+  dview_t *cur = x->dead ? NULL : x->v;
+  dview_t *nv = cur ? malloc(sizeof(*nv)) : NULL;
+  if (nv) {
+    *nv = *cur;
+    nv->nr = 0;
+    for (unsigned i = 0; i < cur->nr; i++) {
+      bool gone = false;
+      for (unsigned j = 0; j < k && !gone; j++) gone = cur->r[i] == in[j];
+      if (!gone) nv->r[nv->nr++] = cur->r[i];
+    }
+    nv->r[nv->nr++] = out;
+    dx_publish_locked(s, x, nv);
+    for (unsigned j = 0; j < k; j++) {
+      x->slots[in[j]->slot >> 6] &= ~(1ull << (in[j]->slot & 63));
+      retire_add_fn(s, drun_free, in[j]);
+    }
+    atomic_fetch_add_explicit(&s->n_dx_merges, 1, memory_order_relaxed);
+  } else if (cur) {                                   /* (no memory for the view: the inputs stay in it, their files are gone but mapped; the output goes) */
+    x->slots[slot >> 6] &= ~(1ull << (slot & 63));
+  }
+  wr_unlock_raw(s);
+  if (!nv) {
+    dx_unlink_slot(s, (unsigned)slot);
+    drun_free(s, out);
+    return cur ? -ENOMEM : 0;
+  }
+  DX_HOOK(s, DXS_MERGE_PUBLISHED);
+  return 1;
+}
+/* What is left of a delta that was retired: its view and everything in it after the grace period, its run files now.  locked: the caller holds the writer mutex (no spill thread). */
+static void dx_cleanup(store_t *s, dx_t *x, bool locked) {
+  if (!locked) wr_lock_raw(s);
+  dview_t *v = x->v;
+  x->v = NULL;
+  if (v) {
+    for (unsigned i = 0; i < v->nr; i++) retire_add_fn(s, drun_free, v->r[i]);
+    for (unsigned i = 0; i < v->nf; i++) retire_add_fn(s, dmem_free, v->f[i]);
+    if (v->m) retire_add_fn(s, dmem_free, v->m);
+    if (v->bl) retire_add_fn(s, dbloom_free, v->bl);
+    retire_add_fn(s, dview_free, v);
+  }
+  uint64_t slots[DX_RSLOTS / 64];
+  memcpy(slots, x->slots, sizeof(slots));
+  if (!locked) wr_unlock_raw(s);
+  for (unsigned i = 0; i < DX_RSLOTS; i++)
+    if ((slots[i >> 6] >> (i & 63)) & 1) dx_unlink_slot(s, i);
+  pthread_mutex_destroy(&x->mu);
+  pthread_cond_destroy(&x->cv);
+  free(x);
+}
+/* the spill thread of one delta: spills and merges when kicked (and a second after a failed write); a retired delta is cleaned up here, and the thread ends */
+static void *dx_main(void *arg) {
+  dx_t *x = arg;
+  store_t *s = x->s;
+  for (;;) {
+    pthread_mutex_lock(&x->mu);
+    while (!x->kick && !x->stop && !x->dead) {
+      if (!x->retry_ms) { pthread_cond_wait(&x->cv, &x->mu); continue; }
+      struct timespec ts;
+      clock_gettime(CLOCK_MONOTONIC, &ts);
+      ts.tv_sec += 1;
+      (void)pthread_cond_timedwait(&x->cv, &x->mu, &ts);
+      if (st_now_ms() >= x->retry_ms) break;
+    }
+    const bool stop = x->stop, dead = x->dead;
+    x->kick = false;
+    pthread_mutex_unlock(&x->mu);
+    if (stop) break;                                  /* (the close: it frees the delta after its clean checkpoint) */
+    if (dead) {
+      dx_cleanup(s, x, false);
+      atomic_fetch_sub_explicit(&s->dx_live, 1, memory_order_release);
+      return NULL;
+    }
+    x->retry_ms = 0;
+    for (;;) {                                         /* (a merge after every spill: a pass faster than the merges would pile up runs otherwise) */
+      const int a = dx_spill(s, x), b = dx_merge(s, x);
+      if (atomic_load_explicit(&s->rg_stop, memory_order_relaxed)) break;     /* (the store closes: the rest is left to the next open) */
+      if (a > 0 || b > 0) continue;
+      if ((a < 0 || b < 0) && !x->retry_ms) x->retry_ms = st_now_ms() + 1000u;
+      break;
+    }
+  }
+  atomic_fetch_sub_explicit(&s->dx_live, 1, memory_order_release);
+  return NULL;
+}
+/* (writer mutex) a pass of an unlogged fill begins: the delta takes the new index entries until the build at the pass's end */
+static void dx_begin_locked(store_t *s) {
+  if (s->dx || !atomic_load_explicit(&s->bulk, memory_order_relaxed) || atomic_load_explicit(&s->bulk_body, memory_order_relaxed) || s->dx_end_want ||
+      atomic_load_explicit(&s->rg_stop, memory_order_relaxed)) return;
+  dx_t *x = calloc(1, sizeof(*x));
+  dview_t *v = x ? calloc(1, sizeof(*v)) : NULL;
+  if (!v) {                                  /* (no memory: the pass inserts into ix / sx as before, with their growth) */
+    free(v);
+    free(x);
+    st_log(s, 4, "store: no memory for the index delta of the pass: the index grows as it fills");
+    return;
+  }
+  x->s = s;
+  x->v = v;
+  pthread_mutex_init(&x->mu, NULL);
+  pthread_condattr_t ca;
+  pthread_condattr_init(&ca);
+  pthread_condattr_setclock(&ca, CLOCK_MONOTONIC);
+  pthread_cond_init(&x->cv, &ca);
+  pthread_condattr_destroy(&ca);
+  pthread_attr_t at;
+  pthread_t th;
+  if (pthread_attr_init(&at) == 0) {                   /* (the thread waits for the writer mutex before it looks at the delta) */
+    pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
+    atomic_fetch_add_explicit(&s->dx_live, 1, memory_order_release);
+    x->thr = pthread_create(&th, &at, dx_main, x) == 0;
+    if (!x->thr) atomic_fetch_sub_explicit(&s->dx_live, 1, memory_order_release);
+    pthread_attr_destroy(&at);
+  }
+  if (!x->thr) {                                       /* (no spill thread: no delta, the pass inserts into ix / sx with their growth as before) */
+    pthread_mutex_destroy(&x->mu);
+    pthread_cond_destroy(&x->cv);
+    free(v);
+    free(x);
+    st_log(s, 4, "store: no thread for the index delta of the pass: the index grows as it fills");
+    return;
+  }
+  s->dx = x;
+  atomic_store_explicit(&s->dx_nf, 0, memory_order_relaxed);
+  atomic_store_explicit(&s->dv, v, memory_order_release);
+  atomic_fetch_add_explicit(&s->n_dx, 1, memory_order_relaxed);
+}
+/* (writer mutex) the delta is retired: the build put its entries into the new generations (or the store closes) */
+static void dx_end_locked(store_t *s) {
+  dx_t *x = s->dx;
+  if (!x) return;
+  s->dx = NULL;
+  atomic_store_explicit(&s->dv, NULL, memory_order_release);
+  atomic_store_explicit(&s->dx_nf, 0, memory_order_relaxed);
+  atomic_store_explicit(&s->dx_runs, 0, memory_order_relaxed);
+  atomic_store_explicit(&s->dx_run_ents, 0, memory_order_relaxed);
+  if (!x->thr) { dx_cleanup(s, x, true); return; }
+  pthread_mutex_lock(&x->mu);
+  x->dead = true;
+  pthread_cond_signal(&x->cv);
+  pthread_mutex_unlock(&x->mu);
+}
+/* (writer mutex) generations that hold every entry of the delta were put in (the build, a rebuild): the delta goes; the end of the fill asked for meanwhile is made now (true: the caller says
+ * it, bulk_end_said()), and a pass that runs gets a new delta on the new generations */
+static bool bulk_end_locked(store_t *s);
+static bool dx_replaced_locked(store_t *s) {
+  dx_end_locked(s);
+  if (s->dx_end_want) return bulk_end_locked(s);
+  dx_begin_locked(s);
+  return false;
+}
+/* (writer mutex) the zones of the fill are announced (store_reserve()): a memtable that is still empty is made the size they need (the Bloom filter is made for them at the first spill) */
+static void dx_estimate_locked(store_t *s, uint64_t zones) {
+  dx_t *x = s->dx;
+  if (!x) return;
+  x->est = zones;
+  dview_t *v = x->v;
+  const uint64_t want = dx_first_bytes(s, zones);
+  if (!v->m || v->m->n || v->nf || v->nr || want <= v->m->bytes) return;
+  dmem_t *nm = dmem_new(s, want);
+  dview_t *nv = nm ? malloc(sizeof(*nv)) : NULL;
+  if (!nv) { if (nm) dmem_free(s, nm); return; }
+  *nv = *v;
+  nv->m = nm;
+  dx_publish_locked(s, x, nv);
+  retire_add_fn(s, dmem_free, v->m);
+}
+/* store_close(): the spill thread ends (the delta stays for the clean checkpoint, which takes no ix / sx while it is there; it is freed after it) */
+static void dx_stop_join(store_t *s) {
+  wr_lock_raw(s);
+  dx_t *x = s->dx;
+  if (x && x->thr) {
+    pthread_mutex_lock(&x->mu);
+    x->stop = true;
+    pthread_cond_signal(&x->cv);
+    pthread_mutex_unlock(&x->mu);
+  }
+  wr_unlock_raw(s);
+  while (atomic_load_explicit(&s->dx_live, memory_order_acquire)) usleep(1000);
+  if (x) x->thr = false;
+}
+/* the open: the scratch files of a session that ended (runs, the builder's buckets) are removed by name (the store never lists its directory) */
+#define FB_MAXP 128                           /* bucket files of one index in one build: the window grows to keep the count below this */
+static void fb_bucket_name(char *buf, size_t n, uint32_t kind, unsigned inst, unsigned b) { snprintf(buf, n, "%s.%u.%u", kind == FK_IX ? "ixb" : "sxb", inst, b); }
+static void dx_remove_scratch(store_t *s) {
+  char name[40];
+  for (unsigned i = 0; i < DX_RSLOTS; i++) dx_unlink_slot(s, i);
+  for (unsigned k = 0; k < 2; k++)
+    for (unsigned inst = 0; inst < 2; inst++)
+      for (unsigned b = 0; b < FB_MAXP; b++) {
+        fb_bucket_name(name, sizeof(name), k ? FK_SX : FK_IX, inst, b);
+        if (unlinkat(s->dirfd, name, 0) == 0) s->dir_dirty = true;
+      }
+}
+
+/* ------------------------------------------------------------------------------------------------------------------ */
+/* THE FILE BUILDER: a generation of ix / sx made as a file (0.7, planning/ixsx bulk build 3.4)                         */
+/* ------------------------------------------------------------------------------------------------------------------ */
+/* The entries (hash, zone id) of one pass over zt go into P bucket files by the top of their home slot (P = the table over a window of FB_WIN bytes; a table that fits one window is made in
+ * memory with no bucket at all).  Each bucket is placed in an anonymous window of its slots (linear probing from the home slot; an entry that probes past the window's end is carried to the
+ * start of the next, and the carry of the last one wraps to slot 0), and the window is written to ix.<g> / sx.<g> at its offset, strictly in order (an empty window is left a hole of the file).
+ * The file is then mapped MAP_PRIVATE as an opened generation: page cache, shared with the file; a page becomes private only when a writer changes it.  It is not synced: the checkpoint that
+ * names it syncs it (ixgen_t.needs_sync).  Anonymous memory: one window and the bucket buffers, never a second generation (C).  dedup (the rebuild): an entry whose key a placed one has (an
+ * equal tag, then the name or the source key) is not placed: the earlier zone id wins (the buckets keep the order of the pass), and the zone is dropped by the caller (fb_t.drop). */
+#define FB_WIN (64ull << 20)
+#define FB_BUF (64u << 10)                    /* the buffer of a bucket: 5461 entries */
+typedef struct __attribute__((packed)) { uint64_t h; uint32_t z; } fbent_t;
+typedef struct {
+  store_t *s;
+  uint32_t kind, gen;
+  unsigned inst, P;
+  uint64_t n, W;
+  int fd;
+  bool dedup;
+  int *bfd;
+  uint32_t *blen;
+  uint64_t *boff;
+  uint8_t *bbuf;
+  uint64_t *win;
+  size_t winbytes, membytes;
+  fbent_t *carry;
+  size_t nc, cc;
+  uint32_t *drop;
+  size_t nd, cd;
+  uint64_t used;
+  bool any;
+} fb_t;
+static void fb_acct(store_t *s, size_t n, bool add) {
+  if (!add) { atomic_fetch_sub_explicit(&s->fb_bytes, n, memory_order_relaxed); return; }
+  const uint64_t b = atomic_fetch_add_explicit(&s->fb_bytes, n, memory_order_relaxed) + n;
+  uint64_t m = atomic_load_explicit(&s->fb_peak, memory_order_relaxed);
+  while (b > m && !atomic_compare_exchange_weak_explicit(&s->fb_peak, &m, b, memory_order_relaxed, memory_order_relaxed)) {}
+}
+static uint64_t fb_window(void) {
+#ifdef KARIDNS_UNIT_TEST
+  if (atomic_load_explicit(&store_test_fb_window, memory_order_relaxed)) return atomic_load_explicit(&store_test_fb_window, memory_order_relaxed);
+#endif
+  return FB_WIN / 8;
+}
+static void fb_free(fb_t *b) {
+  if (b->bfd) for (unsigned i = 0; i < b->P; i++) if (b->bfd[i] >= 0) close(b->bfd[i]);
+  if (b->win) munmap(b->win, b->winbytes);
+  free(b->bfd);
+  free(b->blen);
+  free(b->boff);
+  free(b->bbuf);
+  free(b->carry);
+  if (b->membytes) fb_acct(b->s, b->membytes, false);
+  if (b->fd >= 0) close(b->fd);
+  b->bfd = NULL;
+  b->blen = NULL;
+  b->boff = NULL;
+  b->bbuf = NULL;
+  b->carry = NULL;
+  b->win = NULL;
+  b->membytes = 0;
+  b->fd = -1;
+}
+/* a build of generation `gen` of kind (FK_IX / FK_SX) with n slots; inst: 0 the build outside the mutex, 1 one inside it (their bucket files have names of their own) */
+static int fb_begin(store_t *s, fb_t *b, uint32_t kind, uint32_t gen, uint64_t n, bool dedup, unsigned inst) {
+  memset(b, 0, sizeof(*b));
+  b->s = s;
+  b->fd = -1;
+  b->kind = kind;
+  b->gen = gen;
+  b->n = n;
+  b->dedup = dedup;
+  b->inst = inst;
+  uint64_t W = fb_window();
+  if (W > n) W = n;
+  if ((n + W - 1) / W > FB_MAXP) W = (n + FB_MAXP - 1) / FB_MAXP;
+  b->W = W;
+  b->P = (unsigned)((n + W - 1) / W);
+  b->winbytes = (size_t)((W * 8 + s->pagesz - 1) & ~((uint64_t)s->pagesz - 1));
+  void *p = mmap(NULL, b->winbytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | ST_NOCORE, -1, 0);
+  if (p == MAP_FAILED) return -ENOMEM;
+  b->win = p;
+  b->membytes = b->winbytes;
+  fb_acct(s, b->membytes, true);
+  if (b->P > 1) {
+    b->bfd = malloc(b->P * sizeof(int));
+    b->blen = calloc(b->P, sizeof(uint32_t));
+    b->boff = calloc(b->P, sizeof(uint64_t));
+    b->bbuf = malloc((size_t)b->P * FB_BUF);
+    for (unsigned i = 0; b->bfd && i < b->P; i++) b->bfd[i] = -1;
+    if (!b->bfd || !b->blen || !b->boff || !b->bbuf) { fb_free(b); return -ENOMEM; }
+    b->membytes += (size_t)b->P * FB_BUF;
+    fb_acct(s, (size_t)b->P * FB_BUF, true);
+  }
+  char name[32];
+  st_name_ix(name, sizeof(name), kind == FK_IX ? "ix" : "sx", gen);
+  b->fd = st_openat(s, name, O_RDWR | O_CREAT | O_TRUNC);
+  if (b->fd < 0) { const int r = b->fd; b->fd = -1; fb_free(b); return r; }
+  s->dir_dirty = true;
+  fhdr_t h;
+  uint8_t page[512];
+  memset(page, 0, sizeof(page));
+  fhdr_make(s, &h, kind, gen, 8, n);
+  memcpy(page, &h, sizeof(h));
+  int r = st_pwrite_all(b->fd, page, sizeof(page), 0);
+  const off_t fsize = (off_t)(ST_HDR_PAGE + ((n * 8 + s->pagesz - 1) & ~((uint64_t)s->pagesz - 1)));
+  if (r == 0 && ftruncate(b->fd, fsize) != 0) r = -errno;
+  if (r < 0) { fb_free(b); (void)unlinkat(s->dirfd, name, 0); }
+  return r;
+}
+/* the generation is not made: its buffers and files go */
+static void fb_abort(fb_t *b) {
+  free(b->drop);                                      /* (the duplicates a dedup build kept for its caller) */
+  b->drop = NULL;
+  b->nd = b->cd = 0;
+  if (!b->s) return;
+  store_t *s = b->s;
+  char name[40];
+  for (unsigned i = 0; b->bfd && i < b->P; i++)
+    if (b->bfd[i] >= 0) { fb_bucket_name(name, sizeof(name), b->kind, b->inst, i); (void)unlinkat(s->dirfd, name, 0); }
+  fb_free(b);
+  st_name_ix(name, sizeof(name), b->kind == FK_IX ? "ix" : "sx", b->gen);
+  if (unlinkat(s->dirfd, name, 0) == 0) s->dir_dirty = true;
+  b->s = NULL;
+}
+/* do za and zb have the same key? (the rebuild's duplicates: the writer mutex is held) */
+static bool fb_same(store_t *s, uint32_t kind, uint32_t za, uint32_t zb) {
+  r64_t at, ac, bt, bc;
+  if (zrec_read_locked(s, za, &at, &ac) < 0 || zrec_read_locked(s, zb, &bt, &bc) < 0) return false;
+  zt_t ta, tb;
+  zc_t ca, cb;
+  zt_unpack(&at, &ta);
+  zt_unpack(&bt, &tb);
+  zc_unpack(&ac, &ca);
+  zc_unpack(&bc, &cb);
+  if (ta.view != tb.view) return false;
+  if (kind == FK_SX) return ca.source == cb.source && ca.source_id == cb.source_id;
+  uint8_t fa[256], fz[256];
+  return ta.klen == tb.klen && zt_fullname(s, &ta, fa) && zt_fullname(s, &tb, fz) && memcmp(fa, fz, ta.klen) == 0;
+}
+static int fb_push(void **arr, size_t *n, size_t *cap, size_t esz, const void *e) {
+  if (*n == *cap) {
+    const size_t nc = *cap ? *cap * 2 : 256;
+    void *a = realloc(*arr, nc * esz);
+    if (!a) return -ENOMEM;
+    *arr = a;
+    *cap = nc;
+  }
+  memcpy((uint8_t *)*arr + *n * esz, e, esz);
+  (*n)++;
+  return 0;
+}
+/* place (h, z) into the window of slots [base, base + len), probing from window slot `at`; past its end the entry is carried (one window: it wraps) */
+static int fb_place(fb_t *b, uint64_t base, uint64_t len, uint64_t h, uint32_t z, uint64_t at) {
+  const uint32_t tag = st_tag(h);
+  for (uint64_t i = 0; i < b->n; i++, at++) {
+    if (at == len) {
+      if (b->P > 1) {
+        const fbent_t e = { h, z };
+        atomic_fetch_add_explicit(&b->s->n_fb_carry, 1, memory_order_relaxed);
+        return fb_push((void **)&b->carry, &b->nc, &b->cc, sizeof(e), &e);
+      }
+      at = 0;
+    }
+    const uint64_t v = b->win[at];
+    if (v == 0) {
+      b->win[at] = st_slotval(tag, z);
+      b->used++;
+      b->any = true;
+      return 0;
+    }
+    if (b->dedup && (uint32_t)(v >> 32) == tag && fb_same(b->s, b->kind, (uint32_t)v, z)) return fb_push((void **)&b->drop, &b->nd, &b->cd, sizeof(z), &z);
+  }
+  (void)base;
+  return -ENOSPC;
+}
+static int fb_bflush(fb_t *b, unsigned i) {
+  if (!b->blen[i]) return 0;
+  if (b->bfd[i] < 0) {
+    char name[40];
+    fb_bucket_name(name, sizeof(name), b->kind, b->inst, i);
+    b->bfd[i] = st_openat(b->s, name, O_RDWR | O_CREAT | O_TRUNC);
+    if (b->bfd[i] < 0) { const int r = b->bfd[i]; b->bfd[i] = -1; return r; }
+    atomic_fetch_add_explicit(&b->s->n_fb_buckets, 1, memory_order_relaxed);
+  }
+  const int f = IX_FAULT(2);
+  const int r = f ? f : st_pwrite_all(b->bfd[i], b->bbuf + (size_t)i * FB_BUF, b->blen[i], (off_t)b->boff[i]);
+  if (r < 0) return r;
+  b->boff[i] += b->blen[i];
+  atomic_fetch_add_explicit(&b->s->n_fb_written, b->blen[i], memory_order_relaxed);
+  b->blen[i] = 0;
+  return 0;
+}
+/* one entry of the pass */
+static int fb_add(fb_t *b, uint64_t h, uint32_t z) {
+  const uint64_t home = st_pos(h, b->n);
+  if (b->P == 1) return fb_place(b, 0, b->n, h, z, home);
+  const unsigned i = (unsigned)(home / b->W);
+  const fbent_t e = { h, z };
+  memcpy(b->bbuf + (size_t)i * FB_BUF + b->blen[i], &e, sizeof(e));
+  b->blen[i] += sizeof(e);
+  return b->blen[i] + sizeof(e) > FB_BUF ? fb_bflush(b, i) : 0;
+}
+static int fb_wwin(fb_t *b, uint64_t base, uint64_t len) {
+  if (!b->any) return 0;
+  const int f = IX_FAULT(3);
+  const int r = f ? f : st_pwrite_all(b->fd, b->win, (size_t)(len * 8), (off_t)(ST_HDR_PAGE + base * 8));
+  if (r == 0) atomic_fetch_add_explicit(&b->s->n_fb_written, len * 8, memory_order_relaxed);
+  return r;
+}
+/* the carry of the last window wraps to slot 0: placed into the first slots of the file, a piece at a time */
+static int fb_wrap(fb_t *b) {
+  const uint64_t piece = b->W < 8192 ? b->W : 8192;
+  for (uint64_t base = 0; b->nc && base < b->n; base += piece) {
+    const uint64_t len = b->n - base < piece ? b->n - base : piece;
+    int r = st_pread_all(b->fd, b->win, (size_t)(len * 8), (off_t)(ST_HDR_PAGE + base * 8));
+    if (r < 0) return r;
+    fbent_t *c = b->carry;
+    const size_t nc = b->nc;
+    b->carry = NULL;
+    b->nc = b->cc = 0;
+    b->any = false;
+    for (size_t k = 0; k < nc && r == 0; k++) r = fb_place(b, base, len, c[k].h, c[k].z, 0);
+    free(c);
+    if (r == 0) { b->any = true; r = fb_wwin(b, base, len); }
+    if (r < 0) return r;
+  }
+  return b->nc ? -ENOSPC : 0;
+}
+/* the generation is made: placed, written, mapped (*out; not synced) */
+static int fb_finish(fb_t *b, ixgen_t **out) {
+  store_t *s = b->s;
+  int r = 0;
+  if (b->P == 1) r = fb_wwin(b, 0, b->n);
+  for (unsigned i = 0; r == 0 && b->P > 1 && i < b->P; i++) r = fb_bflush(b, i);
+  for (unsigned i = 0; r == 0 && b->P > 1 && i < b->P; i++) {
+    const uint64_t base = (uint64_t)i * b->W, len = b->n - base < b->W ? b->n - base : b->W;
+    memset(b->win, 0, (size_t)(len * 8));
+    b->any = false;
+    fbent_t *c = b->carry;
+    const size_t nc = b->nc;
+    b->carry = NULL;
+    b->nc = b->cc = 0;
+    for (size_t k = 0; k < nc && r == 0; k++) r = fb_place(b, base, len, c[k].h, c[k].z, 0);
+    free(c);
+    const size_t rd = FB_BUF - FB_BUF % sizeof(fbent_t);   /* (whole entries a read: a bucket is a run of 12 B entries) */
+    for (uint64_t off = 0; r == 0 && off < b->boff[i]; off += rd) {
+      const size_t m = b->boff[i] - off < rd ? (size_t)(b->boff[i] - off) : rd;
+      if ((r = st_pread_all(b->bfd[i], b->bbuf, m, (off_t)off)) < 0) break;
+      for (size_t k = 0; k + sizeof(fbent_t) <= m && r == 0; k += sizeof(fbent_t)) {
+        fbent_t e;
+        memcpy(&e, b->bbuf + k, sizeof(e));
+        r = fb_place(b, base, len, e.h, e.z, st_pos(e.h, b->n) - base);
+      }
+    }
+    if (b->bfd[i] >= 0) {
+      char name[40];
+      fb_bucket_name(name, sizeof(name), b->kind, b->inst, i);
+      close(b->bfd[i]);
+      b->bfd[i] = -1;
+      (void)unlinkat(s->dirfd, name, 0);
+    }
+    if (r == 0) r = fb_wwin(b, base, len);
+  }
+  if (r == 0 && b->nc) r = fb_wrap(b);
+  DX_HOOK(s, FBS_PLACED);
+  if (r == 0 && b->fd >= 0) { close(b->fd); b->fd = -1; }
+  ixgen_t *g = NULL;
+  if (r == 0) r = ixgen_open(s, b->kind, b->gen, b->n, &g);
+  if (r < 0) return r;
+  atomic_store_explicit(&g->needs_sync, true, memory_order_relaxed);
+  fb_free(b);
+  b->s = NULL;                                        /* (fb_abort() frees only the duplicates now) */
+  *out = g;
+  return 0;
+}
+static void ixgen_drop(store_t *s, ixgen_t *g, uint32_t kind);
+#ifdef KARIDNS_UNIT_TEST
+/* the builder on given hashes (tests: the carry into the next window and the wrap at the end need hashes that crowd one place): a generation of nslots in windows of `window` slots, made,
+ * copied out (out[nslots]) and removed again; 0 or -errno */
+int store_test_fb_place(store_t *s, const uint64_t *h, const uint32_t *z, size_t n, uint64_t nslots, uint64_t window, uint64_t *out) {
+  const uint64_t w0 = atomic_load_explicit(&store_test_fb_window, memory_order_relaxed);
+  atomic_store_explicit(&store_test_fb_window, window, memory_order_relaxed);
+  wr_lock_raw(s);
+  fb_t b;
+  ixgen_t *g = NULL;
+  int r = fb_begin(s, &b, FK_IX, s->ix_gen_next++, nslots, false, 1);
+  for (size_t i = 0; r == 0 && i < n; i++) r = fb_add(&b, h[i], z[i]);
+  if (r == 0) r = fb_finish(&b, &g);
+  fb_abort(&b);
+  if (r == 0) {
+    for (uint64_t k = 0; k < nslots; k++) out[k] = atomic_load_explicit(&g->slots[k], memory_order_relaxed);
+    ixgen_drop(s, g, FK_IX);
+  }
+  wr_unlock_raw(s);
+  atomic_store_explicit(&store_test_fb_window, w0, memory_order_relaxed);
+  return r;
+}
+#endif
+
+/* ------------------------------------------------------------------------------------------------------------------ */
 /* index (re)build: growth and repair                                                                                   */
 /* ------------------------------------------------------------------------------------------------------------------ */
 
@@ -3654,7 +4777,10 @@ static void ixgen_drop(store_t *s, ixgen_t *g, uint32_t kind) {         /* a gen
 /* Insert every live zone of zt[0, hwm) into the new generations nix / nsx (either may be NULL).  lockfree: the writers go on meanwhile (a cell is read under its sequence counter, a long
  * name checked against it as store_zone_get() does; what the writers change is in the build's log); otherwise the writer mutex is held.  A damaged cell stays invisible.  *live_ix /
  * *live_sx: the entries made (into empty slots: as many used).  -ENOSPC: a generation is too small; -ECANCELED: the build was dropped meanwhile. */
-static int rg_fill(store_t *s, ixgen_t *nix, ixgen_t *nsx, uint64_t hwm, bool lockfree, uint64_t *live_ix, uint64_t *live_sx) {
+/* where the entries of a pass over zt go: a generation in anonymous memory (the growth of a small index inside the mutex) or the file builder */
+typedef struct { ixgen_t *g; fb_t *fb; } ixsink_t;
+static int sink_add(ixsink_t *k, uint64_t h, uint32_t z) { return k->fb ? fb_add(k->fb, h, z) : ix_raw_insert(k->g, h, z); }
+static int rg_fill(store_t *s, ixsink_t *nix, ixsink_t *nsx, uint64_t hwm, bool lockfree, uint64_t *live_ix, uint64_t *live_sx) {
   uint64_t li = 0, ls = 0;
   for (uint64_t z = 0; z < hwm; z++) {
     if (lockfree && (z & 0x3fffu) == 0 &&
@@ -3679,11 +4805,13 @@ static int rg_fill(store_t *s, ixgen_t *nix, ixgen_t *nsx, uint64_t hwm, bool lo
     }
     if (!ok) continue;
     if (nix) {
-      if (ix_raw_insert(nix, st_hash_name(s, t.view, fn, t.klen), (uint32_t)z) < 0) return -ENOSPC;
+      const int r = sink_add(nix, st_hash_name(s, t.view, fn, t.klen), (uint32_t)z);
+      if (r < 0) return r;
       li++;
     }
     if (nsx && c.source_id != 0) {
-      if (ix_raw_insert(nsx, st_hash_src(s, c.source, t.view, c.source_id), (uint32_t)z) < 0) return -ENOSPC;
+      const int r = sink_add(nsx, st_hash_src(s, c.source, t.view, c.source_id), (uint32_t)z);
+      if (r < 0) return r;
       ls++;
     }
   }
@@ -3731,16 +4859,56 @@ static int rg_publish_locked(store_t *s, ixgen_t *nix, ixgen_t *nsx, uint64_t ix
 
 /* Replace ix and / or sx (a non-zero slot count) by new generations built from a pass over zt, inside the writer mutex: the index filled up to one half before a build outside the mutex
  * ended (or none could be started).  A build in progress is dropped (its generation numbers are not used again).  Readers continue on the old generation. */
+/* The generations of ix_slots / sx_slots (0: not that one) from a pass over zt[0, hwm): in anonymous memory (anon: a small index grown inside the writer mutex) or by the file builder (inst 0
+ * outside the mutex, 1 inside it).  *li / *ls: the entries made.  On failure nothing is left (files, memory). */
+static int ix_build(store_t *s, uint32_t ixg, uint64_t ix_slots, uint32_t sxg, uint64_t sx_slots, uint64_t hwm, bool lockfree, bool anon, unsigned inst, ixgen_t **nix, ixgen_t **nsx,
+                    uint64_t *li, uint64_t *ls) {
+  fb_t bi, bs;
+  ixsink_t ki = { NULL, NULL }, ks = { NULL, NULL };
+  memset(&bi, 0, sizeof(bi));
+  memset(&bs, 0, sizeof(bs));
+  *nix = *nsx = NULL;
+  int r = 0;
+  if (anon) {
+    if (ix_slots && (r = ixgen_create(s, FK_IX, ixg, ix_slots, true, nix)) < 0) return r;
+    if (sx_slots && (r = ixgen_create(s, FK_SX, sxg, sx_slots, true, nsx)) < 0) { ixgen_drop(s, *nix, FK_IX); *nix = NULL; return r; }
+    ki.g = *nix;
+    ks.g = *nsx;
+  } else {
+    if (ix_slots && (r = fb_begin(s, &bi, FK_IX, ixg, ix_slots, false, inst)) < 0) return r;
+    if (sx_slots && (r = fb_begin(s, &bs, FK_SX, sxg, sx_slots, false, inst)) < 0) { fb_abort(&bi); return r; }
+    ki.fb = &bi;
+    ks.fb = &bs;
+  }
+  r = rg_fill(s, ix_slots ? &ki : NULL, sx_slots ? &ks : NULL, hwm, lockfree, li, ls);
+  CRASH_POINT();
+  DX_HOOK(s, FBS_SCANNED);
+  if (r == 0 && !anon && ix_slots) r = fb_finish(&bi, nix);
+  if (r == 0 && !anon && sx_slots) r = fb_finish(&bs, nsx);
+  if (r == 0) DX_HOOK(s, FBS_MAPPED);
+  if (r < 0) {
+    ixgen_drop(s, *nix, FK_IX);
+    ixgen_drop(s, *nsx, FK_SX);
+    *nix = *nsx = NULL;
+  }
+  fb_abort(&bi);                                      /* (a builder that finished is empty: nothing) */
+  fb_abort(&bs);
+  return r;
+}
+
+/* Replace ix and / or sx (a non-zero slot count) by new generations built from a pass over zt, inside the writer mutex: the index filled up before a build outside the mutex ended (or none could
+ * be started).  A small index (RG_SMALL bytes or less) is grown at one half, in anonymous memory, where it is cheap; a bigger one only at 3/4 (Q3: the build outside the mutex has the time from 3/8
+ * on) and with the file builder: never a big generation in anonymous memory.  A build in progress is dropped (its generation numbers are not used again).  Readers continue on the old generation. */
+#define RG_SMALL (64ull << 20)
 static int regrow_locked(store_t *s, uint64_t ix_slots, uint64_t sx_slots) {
   if (s->rg_active) atomic_store_explicit(&s->rg_cancel, true, memory_order_relaxed);
   uint64_t hwm = VG(s, V_HWM), live_ix = 0, live_sx = 0;
   if (hwm > st_zt_cap(s)) hwm = st_zt_cap(s);
+  const bool anon = ix_slots * 8 <= RG_SMALL_NOW() && sx_slots * 8 <= RG_SMALL_NOW();
+  if (!anon) atomic_fetch_add_explicit(&s->n_fb_inlock, 1, memory_order_relaxed);
   ixgen_t *nix = NULL, *nsx = NULL;
-  int r = 0;
-  if (ix_slots && (r = ixgen_create(s, FK_IX, s->ix_gen_next++, ix_slots, true, &nix)) < 0) return r;
-  if (sx_slots && (r = ixgen_create(s, FK_SX, s->sx_gen_next++, sx_slots, true, &nsx)) < 0) { ixgen_drop(s, nix, FK_IX); return r; }
-  r = rg_fill(s, nix, nsx, hwm, false, &live_ix, &live_sx);
-  CRASH_POINT();
+  const uint32_t ig = ix_slots ? s->ix_gen_next++ : 0, sg = sx_slots ? s->sx_gen_next++ : 0;
+  int r = ix_build(s, ig, ix_slots, sg, sx_slots, hwm, false, anon, 1, &nix, &nsx, &live_ix, &live_sx);
   if (r == 0) r = rg_publish_locked(s, nix, nsx, live_ix, live_ix, live_sx, live_sx);
   if (r < 0) { ixgen_drop(s, nix, FK_IX); ixgen_drop(s, nsx, FK_SX); }
   return r;
@@ -3791,10 +4959,12 @@ static int rg_apply(ixgen_t *g, const rgent_t *e, uint64_t *used, uint64_t *live
     const uint64_t at = slot_find_insert(g, e->h, &was_empty, NULL, 0);
     if (at == UINT64_MAX) return -ENOSPC;
     atomic_store_explicit(&g->slots[at], st_slotval(st_tag(e->h), e->z), memory_order_relaxed);
+    dm_mark(&g->d, at * 8, 8);                        /* (a generation of the file builder is not written whole: the pages of the catch-up are) */
     (*live)++;
     if (was_empty) (*used)++;
   } else if (pos != UINT64_MAX) {
     atomic_store_explicit(&g->slots[pos], st_slotval(st_tag(e->h), STORE_NONE), memory_order_relaxed);
+    dm_mark(&g->d, pos * 8, 8);
     if (*live) (*live)--;
   }
   return 0;
@@ -3812,16 +4982,15 @@ static int rg_catch_up(const store_t *s, ixgen_t *nix, ixgen_t *nsx, size_t from
   return r;
 }
 
+static bool bulk_end_locked(store_t *s);
+static void bulk_end_said(store_t *s);
 /* The build (the thread of rg_start_locked(), or the caller of store_reserve()): 0 put in, -ECANCELED dropped, or -errno. */
 static int rg_build(store_t *s) {
   ixgen_t *nix = NULL, *nsx = NULL;
   uint64_t li = 0, ls = 0;
   int r = 0;
-  if (s->rg_nix) r = ixgen_create(s, FK_IX, s->rg_ixgen, s->rg_nix, !s->rg_noalloc, &nix);
-  if (r == 0 && s->rg_nsx) r = ixgen_create(s, FK_SX, s->rg_sxgen, s->rg_nsx, !s->rg_noalloc, &nsx);
-  if (r == 0) r = rg_fill(s, nix, nsx, s->rg_hwm, true, &li, &ls);
-  /* (no flush here: the build has to end before the writers fill the old index to one half, and the checkpoint that follows the growth flushes the new files) */
-  CRASH_POINT();
+  const uint64_t t0 = st_now_us();
+  r = ix_build(s, s->rg_ixgen, s->rg_nix, s->rg_sxgen, s->rg_nsx, s->rg_hwm, true, false, 0, &nix, &nsx, &li, &ls);      /* (the file builder: page cache, not anonymous memory; synced by the checkpoint that names it) */
   st_hook(&store_test_regrow_hook, 1);
   rg_cnt_t c = { li, li, ls, ls };
   size_t done = 0;
@@ -3843,11 +5012,19 @@ static int rg_build(store_t *s) {
   if (r == 0 && (atomic_load_explicit(&s->rg_cancel, memory_order_relaxed) || atomic_load_explicit(&s->rg_stop, memory_order_relaxed) || s->tabgen != s->rg_tabgen || s->rg_bad))
     r = -ECANCELED;
   if (r == 0) r = rg_catch_up(s, nix, nsx, done, atomic_load_explicit(&s->rg_n, memory_order_relaxed), &c);
+  if (r == 0) DX_HOOK(s, FBS_CAUGHT_UP);
   if (r == 0) r = rg_publish_locked(s, nix, nsx, c.iu, c.il, c.su, c.sl);
+  bool ended = false;
   if (r == 0) {
     atomic_fetch_add_explicit(&s->n_growths_bg, 1, memory_order_relaxed);
     nix = nsx = NULL;
+    if (s->rg_dx) {                                   /* (the delta's entries are in the new generations: it goes; the end of the fill asked for meanwhile is made now; a pass that began meanwhile gets a new one) */
+      ended = dx_replaced_locked(s);
+    }
+  } else if (s->rg_dx) {
+    s->dx_retry_ms = st_now_ms() + 1000u;             /* (the tick begins it again: dx_build_kick()) */
   }
+  s->rg_dx = false;
   s->rg_active = false;
   atomic_store_explicit(&s->rg_press, false, memory_order_release);     /* (the producers that wait for the build, store_index_wait(), go on) */
   atomic_store_explicit(&s->rg_n, 0, memory_order_relaxed);
@@ -3858,8 +5035,14 @@ static int rg_build(store_t *s) {
   if (r == 0 && w < 0) r = w;
   for (unsigned k = 1; k < RG_NCH; k++) free(spare[k]);
   if (r == 0) st_hook(&store_test_regrow_hook, 2);
+  if (r == 0) DX_HOOK(s, FBS_PUBLISHED);
   ixgen_drop(s, nix, FK_IX);
   ixgen_drop(s, nsx, FK_SX);
+  const uint64_t us = st_now_us() - t0;
+  atomic_fetch_add_explicit(&s->n_fb, 1, memory_order_relaxed);
+  atomic_fetch_add_explicit(&s->n_fb_us, us, memory_order_relaxed);
+  if (us > atomic_load_explicit(&s->fb_max_us, memory_order_relaxed)) atomic_store_explicit(&s->fb_max_us, us, memory_order_relaxed);     /* (one build at a time) */
+  if (ended) bulk_end_said(s);
   if (r == 0) bg_signal(s);                           /* (a checkpoint names the new generation soon: the old one's file can go) */
   else if (r != -ECANCELED) note_error(s, r);
   return r;
@@ -3881,7 +5064,6 @@ static bool rg_start_locked(store_t *s, uint64_t nix, uint64_t nsx, bool spawn) 
   s->rg_ixgen = nix ? s->ix_gen_next++ : 0;
   s->rg_sxgen = nsx ? s->sx_gen_next++ : 0;
   s->rg_hwm = hwm;
-  s->rg_noalloc = !spawn;
   s->rg_tabgen = s->tabgen;
   atomic_store_explicit(&s->rg_n, 0, memory_order_relaxed);
   s->rg_bad = false;
@@ -3904,19 +5086,26 @@ static bool rg_start_locked(store_t *s, uint64_t nix, uint64_t nsx, bool spawn) 
   return ok;
 }
 
-/* would ix_make_room() grow a table inside the mutex if pix (psx) more index slots were in use? (the entries of a group commit have claimed slots that the counters do not show yet) */
+/* is a growth inside the mutex due with `used` slots in use (tombstones count)?  A small generation at one half, a bigger one at 3/4 (Q3) */
+static bool ix_over(const ixgen_t *g, uint64_t used) {
+  return g->nslots * 8 <= RG_SMALL_NOW() ? used * 2 > g->nslots : used * 4 > g->nslots * 3;
+}
+/* would ix_make_room() grow a table inside the mutex if pix (psx) more index slots were in use? (the entries of a group commit have claimed slots that the counters do not show yet; none with a delta) */
 static bool ix_room_short(const store_t *s, bool need_sx, uint64_t pix, uint64_t psx) {
+  if (s->dx) return false;
   const ixgen_t *ix = atomic_load_explicit(&s->ix, memory_order_relaxed), *sx = atomic_load_explicit(&s->sx, memory_order_relaxed);
-  return (VG(s, V_IX_USED) + pix + 1) * 2 > ix->nslots || (need_sx && (VG(s, V_SX_USED) + psx + 1) * 2 > sx->nslots);
+  return ix_over(ix, VG(s, V_IX_USED) + pix + 1) || (need_sx && ix_over(sx, VG(s, V_SX_USED) + psx + 1));
 }
 
-/* room for one more entry (writer mutex held): at 3/8 in use a build outside the mutex begins (the new size is four times the live entries: 1/4 in use, so that the writers have 1/8 of the old size to fill before the build has to be done, and the next build comes after 1.5 times the entries); at 1/2 the growth is made here */
+/* room for one more entry (writer mutex held): at 3/8 in use a build outside the mutex begins (the new size is four times the live entries: 1/4 in use, so that the writers have 1/8 of the old size to fill before the build has to be done, and the next build comes after 1.5 times the entries); at
+ * 1/2 (a small index) or 3/4 the growth is made here (ix_over()).  With a delta (a pass of an unlogged fill) nothing grows: the new entries are the delta's (dx_room_locked()) */
 static int ix_make_room(store_t *s, bool need_sx) {
+  if (s->dx) return 0;
   ixgen_t *ix = atomic_load_explicit(&s->ix, memory_order_relaxed), *sx = atomic_load_explicit(&s->sx, memory_order_relaxed);
   const uint64_t iu = VG(s, V_IX_USED), su = VG(s, V_SX_USED), il = VG(s, V_IX_LIVE), sl = VG(s, V_SX_LIVE);
   uint64_t nix = 0, nsx = 0;
-  if ((iu + 1) * 2 > ix->nslots) nix = ix_slots_for(il + il / 3 + 1);
-  if (need_sx && (su + 1) * 2 > sx->nslots) nsx = ix_slots_for(sl + sl / 3 + 1);
+  if (ix_over(ix, iu + 1)) nix = ix_slots_for(il + il / 3 + 1);
+  if (need_sx && ix_over(sx, su + 1)) nsx = ix_slots_for(sl + sl / 3 + 1);
   if (nix || nsx) return regrow_locked(s, nix, nsx);
   if (!s->rg_active && ((iu + 1) * 8 > ix->nslots * 3 || (su + 1) * 8 > sx->nslots * 3))
     (void)rg_start_locked(s, (iu + 1) * 8 > ix->nslots * 3 ? ix_slots_for(il + il / 3 + 1) : 0, (su + 1) * 8 > sx->nslots * 3 ? ix_slots_for(sl + sl / 3 + 1) : 0, true);
@@ -3940,7 +5129,17 @@ _Atomic long store_test_rg_wait_ms = -1;
 #else
 #define RG_WAIT_NOW() ((uint64_t)RG_WAIT_MS)
 #endif
+#define DX_WAIT_MS 200u
 uint64_t store_index_wait(store_t *s) {
+  if (s && atomic_load_explicit(&s->dx_nf, memory_order_relaxed) >= DX_MAXF) {
+    /* a pass with a delta never waits for a build (none runs during it); only when DX_MAXF frozen memtables wait for the spill (the disk is behind) the producer gives it a short time, with no
+     * lock held, before the memtable fills on towards 7/8 (dx_room_locked()) */
+    const uint64_t t0 = st_now_us();
+    while (atomic_load_explicit(&s->dx_nf, memory_order_relaxed) >= DX_MAXF && st_now_us() - t0 < DX_WAIT_MS * 1000u && !atomic_load_explicit(&s->rg_stop, memory_order_relaxed)) usleep(1000);
+    atomic_fetch_add_explicit(&s->n_dx_waits, 1, memory_order_relaxed);
+    const uint64_t us = st_now_us() - t0;
+    return us ? us : 1;
+  }
   if (!s || !atomic_load_explicit(&s->rg_press, memory_order_acquire) || atomic_load_explicit(&s->rg_nowait, memory_order_relaxed)) return 0;
   const uint64_t t0 = st_now_us(), lim = RG_WAIT_NOW() * 1000u;
   bool gave_up = false;
@@ -4324,12 +5523,31 @@ int store_bulk_begin(store_t *s) {
   return r;
 }
 
+/* (writer mutex) the build that replaces the delta begins (the pass ended, or the end of the fill was asked for): generations of four times the live zones, as a growth (planning 3.4 step 1) */
+static void dx_build_start_locked(store_t *s) {
+  if (!s->dx || s->rg_active || atomic_load_explicit(&s->rg_stop, memory_order_relaxed)) return;
+  const uint64_t zones = VG(s, V_KNOWN) + VG(s, V_STORED), n = ix_slots_for(zones + zones / 3 + 1);
+  if (rg_start_locked(s, n, n, true)) s->rg_dx = true;
+  else s->dx_retry_ms = st_now_ms() + 1000u;
+}
+/* the tick: a build for the delta that failed, or that could not begin (another build ran), is begun again */
+static void dx_build_kick(store_t *s) {
+  wr_lock_raw(s);
+  if (s->dx && (atomic_load_explicit(&s->bulk_body, memory_order_relaxed) || s->dx_end_want) && !s->rg_active && st_now_ms() >= s->dx_retry_ms) dx_build_start_locked(s);
+  wr_unlock_raw(s);
+}
 void store_bulk_phase(store_t *s, int phase) {
   if (!s || (phase != STORE_BULK_PASS && phase != STORE_BULK_BODY && phase != STORE_BULK_PASSED)) return;
   wr_lock_raw(s);
   if (atomic_load_explicit(&s->bulk, memory_order_relaxed)) {
     atomic_store_explicit(&s->bulk_body, phase != STORE_BULK_PASS, memory_order_relaxed);
     atomic_store_explicit(&s->bulk_passed, phase == STORE_BULK_PASSED, memory_order_relaxed);     /* (a pass that begins, or that was cut off or failed: the fill needs one more that ends complete) */
+    if (phase == STORE_BULK_PASS) {
+      if (s->dx_end_ifp) s->dx_end_want = false;      /* (an end only if the passes had ended: a pass began meanwhile) */
+      dx_begin_locked(s);                             /* (THE INDEX DELTA: the new entries of the pass are its hints) */
+    } else {
+      dx_build_start_locked(s);                       /* (the one build of the pass: its generations replace the delta) */
+    }
   }
   wr_unlock_raw(s);
   if (phase != STORE_BULK_PASS && s->fl_on) bg_signal(s);              /* (a bulk checkpoint may be due now: the pass took long) */
@@ -4355,22 +5573,54 @@ void store_bulk_cut_done(store_t *s) {
  * after this writes the tables (every page marked since the last full write, ix / sx included: a generation made during the fill whole) and a superblock without BULK (ck_finish() clears it).  That
  * checkpoint is the checkpoint thread's (ckpt_due(): due until it is on disk, after a failure again when the flusher's back-off is over), unless the caller waits (STORE_BULK_END_WAIT: made here; no
  * flusher: here too).  Until it is on disk a crash goes back to the last bulk checkpoint: the commits acknowledged meanwhile are lost with the fill (decision 1 of the plan). */
+/* (writer mutex) the fill ends: the writers log from now on.  false: no fill (or an end only if the passes had ended, and a pass began) */
+static bool bulk_end_locked(store_t *s) {
+  const bool ifp = s->dx_end_ifp;
+  s->dx_end_want = s->dx_end_ifp = false;
+  if (!atomic_load_explicit(&s->bulk, memory_order_relaxed) || (ifp && !atomic_load_explicit(&s->bulk_passed, memory_order_relaxed))) return false;
+  atomic_store_explicit(&s->bulk_end_pending, true, memory_order_relaxed);      /* (before the flag goes: st_bulk_busy() never sees neither) */
+  atomic_store_explicit(&s->bulk, false, memory_order_relaxed);
+  atomic_store_explicit(&s->bulk_body, false, memory_order_relaxed);
+  atomic_store_explicit(&s->bulk_passed, false, memory_order_relaxed);
+  atomic_store_explicit(&s->bulk_ended, (uint64_t)time(NULL), memory_order_relaxed);
+  return true;
+}
+static void bulk_end_said(store_t *s) {
+  st_log(s, 6, "store: the unlogged bulk fill is over (%" PRIu64 " unlogged records, %" PRIu64 " bulk checkpoints): the writers keep the journal again; the checkpoint that ends it writes every table",
+         atomic_load_explicit(&s->n_bulk_unlogged, memory_order_relaxed), atomic_load_explicit(&s->n_bulk_ckpts, memory_order_relaxed));
+  if (s->fl_on) bg_signal(s);                         /* (the checkpoint thread: ckpt_due() is true while the end is pending) */
+}
 int store_bulk_end(store_t *s, unsigned how) {
   if (!s) return -EINVAL;
   wr_lock_raw(s);
-  const bool was = atomic_load_explicit(&s->bulk, memory_order_relaxed) && (!(how & STORE_BULK_END_IF_PASSED) || atomic_load_explicit(&s->bulk_passed, memory_order_relaxed));
-  if (was) {
-    atomic_store_explicit(&s->bulk_end_pending, true, memory_order_relaxed);      /* (before the flag goes: st_bulk_busy() never sees neither) */
-    atomic_store_explicit(&s->bulk, false, memory_order_relaxed);
-    atomic_store_explicit(&s->bulk_body, false, memory_order_relaxed);
-    atomic_store_explicit(&s->bulk_passed, false, memory_order_relaxed);
-    atomic_store_explicit(&s->bulk_ended, (uint64_t)time(NULL), memory_order_relaxed);
+  bool was = atomic_load_explicit(&s->bulk, memory_order_relaxed) && (!(how & STORE_BULK_END_IF_PASSED) || atomic_load_explicit(&s->bulk_passed, memory_order_relaxed));
+  const bool deferred = was && s->dx != NULL;
+  if (deferred) {                                     /* (an index delta: its build puts the generations in first and ends the fill then, rg_build(); a checkpoint without SBF_BULK needs whole ix / sx) */
+    if (!s->dx_end_want) s->dx_end_ifp = (how & STORE_BULK_END_IF_PASSED) != 0;
+    else if (!(how & STORE_BULK_END_IF_PASSED)) s->dx_end_ifp = false;
+    s->dx_end_want = true;
+    dx_build_start_locked(s);
+    was = false;
+  } else if (was) {
+    s->dx_end_ifp = false;
+    was = bulk_end_locked(s);
+  }
+  wr_unlock_raw(s);
+  if (was) bulk_end_said(s);
+  if (deferred) {
+    if (!(how & STORE_BULK_END_WAIT) && s->fl_on) return 0;
+    const uint64_t t0 = st_now_ms();
+    for (;;) {                                        /* (the caller waits: for the build, then for the checkpoint below) */
+      wr_lock_raw(s);
+      const bool w = s->dx_end_want && s->dx;
+      if (w && !s->rg_active) dx_build_start_locked(s);
+      wr_unlock_raw(s);
+      if (!w) break;
+      if (atomic_load_explicit(&s->rg_stop, memory_order_relaxed) || st_now_ms() - t0 > ST_BULK_END_MAX_MS) return -EAGAIN;
+      usleep(1000);
+    }
   }
   const bool pending = atomic_load_explicit(&s->bulk_end_pending, memory_order_relaxed);
-  wr_unlock_raw(s);
-  if (was)
-    st_log(s, 6, "store: the unlogged bulk fill is over (%" PRIu64 " unlogged records, %" PRIu64 " bulk checkpoints): the writers keep the journal again; the checkpoint that ends it writes every table",
-           atomic_load_explicit(&s->n_bulk_unlogged, memory_order_relaxed), atomic_load_explicit(&s->n_bulk_ckpts, memory_order_relaxed));
   if (!pending) return 0;
   if (!(how & STORE_BULK_END_WAIT) && s->fl_on) {
     bg_signal(s);                                     /* (the checkpoint thread: ckpt_due() is true while the end is pending) */
@@ -4651,7 +5901,7 @@ static bool st_prewrite(store_t *s, uint16_t view, const char *name, size_t nlen
   bool ok = false;
   wr_lock_raw(s);
   const uint64_t h = st_hash_name(s, view, fn, nlen);
-  const uint32_t z = ix_lookup(s, atomic_load_explicit(&s->ix, memory_order_relaxed), view, fn, nlen, h);
+  const uint32_t z = ix_find(s, view, fn, nlen, h);
   r64_t rt, rc;
   if (z != STORE_NONE && zrec_read_locked(s, z, &rt, &rc) == 0) {
     zt_t t;
@@ -4742,7 +5992,7 @@ static int put_locked(store_t *s, uint16_t view, const char *name, size_t nlen, 
   for (size_t i = 0; i < nlen; i++) fn[i] = st_lc((uint8_t)name[i]);
   uint64_t h = st_hash_name(s, view, fn, nlen);
   ixgen_t *ix = atomic_load_explicit(&s->ix, memory_order_relaxed);
-  uint32_t z = ix_lookup(s, ix, view, fn, nlen, h);
+  uint32_t z = ix_find(s, view, fn, nlen, h);
   bool exists = z != STORE_NONE;
   r64_t ort, orc;
   zt_t ot;
@@ -4765,7 +6015,7 @@ static int put_locked(store_t *s, uint16_t view, const char *name, size_t nlen, 
   uint64_t sxh = 0;
   if (m->source_id != 0) {
     sxh = st_hash_src(s, m->source, view, m->source_id);
-    uint32_t o = sx_lookup(s, atomic_load_explicit(&s->sx, memory_order_relaxed), m->source, view, m->source_id, sxh);
+    uint32_t o = sx_find(s, m->source, view, m->source_id, sxh);
     if (o != STORE_NONE && o != z) return -EEXIST;
   }
   /* room: zid, nx, index slots */
@@ -4775,6 +6025,10 @@ static int put_locked(store_t *s, uint16_t view, const char *name, size_t nlen, 
     ix = atomic_load_explicit(&s->ix, memory_order_relaxed);
   } else if (sx_new) {
     int r = ix_make_room(s, true);
+    if (r < 0) return r;
+  }
+  if (s->dx && (!exists || sx_new)) {                         /* (a delta: room in its memtable for the hints of this entry and of the pending ones of the group, before anything is planned) */
+    const int r = dx_room_locked(s, (unsigned)(!exists) + (unsigned)sx_new + (ck ? ck->nix + ck->nsx : 0u));
     if (r < 0) return r;
   }
   if (!ck || ck->n == 0) jb_reset(j);
@@ -4875,6 +6129,7 @@ static int put_locked(store_t *s, uint16_t view, const char *name, size_t nlen, 
   }
   if ((r = count_zone(s, view, state, m->flags, rlen, +1)) < 0) return r;
   /* source index */
+  const dview_t *dxv = s->dx ? s->dx->v : NULL;               /* (a delta: new entries are its hints, planned as index changes of the record only, jb_pl(); dx_apply_locked() puts them in) */
   if (sx_old || sx_new) {
     ixgen_t *sx = atomic_load_explicit(&s->sx, memory_order_relaxed);
     if (sx_old) {
@@ -4883,10 +6138,14 @@ static int put_locked(store_t *s, uint16_t view, const char *name, size_t nlen, 
       if (pos != UINT64_MAX) {
         if ((r = jb_slot(j, OP_SX, pos, st_slotval(st_tag(oh), STORE_NONE))) < 0) return r;
         if ((r = jb_vadd(s, j, V_SX_LIVE, -1)) < 0) return r;
+      } else if (dxv && dx_has(dxv, 1, oh, z) && (r = jb_vadd(s, j, V_SX_LIVE, -1)) < 0) {
+        return r;                                               /* (its hint stays: sx_match() no longer takes it) */
       }
       if ((r = jb_pl(j, 1, false, oh, z)) < 0) return r;
     }
-    if (sx_new) {
+    if (sx_new && dxv) {
+      if ((r = jb_pl(j, 1, true, sxh, nz)) < 0 || (r = jb_vadd(s, j, V_SX_LIVE, 1)) < 0) return r;
+    } else if (sx_new) {
       bool was_empty;
       uint64_t pos = slot_find_insert(sx, sxh, &was_empty, ck ? ck->sxpos : NULL, ck ? ck->nsx : 0);
       if (pos == UINT64_MAX) return -ENOSPC;
@@ -4898,7 +6157,9 @@ static int put_locked(store_t *s, uint16_t view, const char *name, size_t nlen, 
     }
   }
   /* name index last: it publishes a new zone */
-  if (!exists) {
+  if (!exists && dxv) {
+    if ((r = jb_pl(j, 0, true, h, nz)) < 0 || (r = jb_vadd(s, j, V_IX_LIVE, 1)) < 0) return r;
+  } else if (!exists) {
     bool was_empty;
     uint64_t pos = slot_find_insert(ix, h, &was_empty, ck ? ck->ixpos : NULL, ck ? ck->nix : 0);
     if (pos == UINT64_MAX) return -ENOSPC;
@@ -5632,6 +6893,8 @@ static int delete_locked(store_t *s, uint32_t z) {
     if (pos != UINT64_MAX) {
       if ((r = jb_slot(j, OP_IX, pos, st_slotval(st_tag(h), STORE_NONE))) < 0) return r;
       if ((r = jb_vadd(s, j, V_IX_LIVE, -1)) < 0) return r;
+    } else if (s->dx && dx_has(s->dx->v, 0, h, z) && (r = jb_vadd(s, j, V_IX_LIVE, -1)) < 0) {
+      return r;                                     /* (a zone of the delta: its hint stays, the verification drops it) */
     }
     if ((r = jb_pl(j, 0, false, h, z)) < 0) return r;
   }
@@ -5642,6 +6905,8 @@ static int delete_locked(store_t *s, uint32_t z) {
     if (pos != UINT64_MAX) {
       if ((r = jb_slot(j, OP_SX, pos, st_slotval(st_tag(oh), STORE_NONE))) < 0) return r;
       if ((r = jb_vadd(s, j, V_SX_LIVE, -1)) < 0) return r;
+    } else if (s->dx && dx_has(s->dx->v, 1, oh, z) && (r = jb_vadd(s, j, V_SX_LIVE, -1)) < 0) {
+      return r;
     }
     if ((r = jb_pl(j, 1, false, oh, z)) < 0) return r;
   }
@@ -5686,8 +6951,7 @@ int store_delete_name(store_t *s, uint16_t view, const char *name, size_t len) {
   for (size_t i = 0; i < len; i++) fn[i] = st_lc((uint8_t)name[i]);
   int r = wr_lock(s);
   if (r < 0) return r;
-  ixgen_t *ix = atomic_load_explicit(&s->ix, memory_order_relaxed);
-  uint32_t z = ix_lookup(s, ix, view, fn, len, st_hash_name(s, view, fn, len));
+  uint32_t z = ix_find(s, view, fn, len, st_hash_name(s, view, fn, len));
   r = z == STORE_NONE ? -ENOENT : delete_locked(s, z);
   if (r < 0 && r != -ENOENT) note_error(s, r); else if (r == 0) { note_ok(s); r = post_write(s); }
   return wr_done(s, r);
@@ -5771,8 +7035,7 @@ int store_set_digest(store_t *s, uint16_t view, const char *name, size_t len, ui
   for (size_t i = 0; i < len; i++) fn[i] = st_lc((uint8_t)name[i]);
   int r = wr_lock(s);
   if (r < 0) return r;
-  ixgen_t *ix = atomic_load_explicit(&s->ix, memory_order_relaxed);
-  const uint32_t zid = ix_lookup(s, ix, view, fn, len, st_hash_name(s, view, fn, len));
+  const uint32_t zid = ix_find(s, view, fn, len, st_hash_name(s, view, fn, len));
   r64_t rt, rc;
   if (zid == STORE_NONE || (uint64_t)zid >= st_zt_cap(s) || zt_state_fast(s, zid) == STORE_STATE_FREE) r = -ENOENT;
   else if ((r = zrec_read_locked(s, zid, &rt, &rc)) == 0) {
@@ -5886,6 +7149,10 @@ int store_reserve(store_t *s, uint64_t zones) {
     ixgen_t *ix = atomic_load_explicit(&s->ix, memory_order_relaxed), *sx = atomic_load_explicit(&s->sx, memory_order_relaxed);
     uint64_t want = zones * 8 / 3 + 16;                 /* (the announced zones stay below the 3/8 at which a growth begins) */
     uint64_t nix = want > ix->nslots ? want : 0, nsx = want > sx->nslots ? want : 0;
+    if (s->dx) {                                     /* (an unlogged fill with a delta: no index is reserved, the delta absorbs the pass and its build sizes the generations; only zt / zc are) */
+      dx_estimate_locked(s, zones);
+      nix = nsx = 0;
+    }
     if (nix || nsx) {
       if (attempt < RESERVE_TRIES - 1 && rg_start_locked(s, nix, nsx, false)) {
         built = true;
@@ -6219,6 +7486,7 @@ int store_compact(store_t *s, uint64_t max_bytes, bool finish, store_compact_rep
 
 /* What the tick does besides the commit and the checkpoint: the cleaner, the removal of empty segments, the nx pass, the free space, the scrub.  Never inside a read section. */
 static void maintenance(store_t *s) {
+  dx_build_kick(s);                                   /* (the build that replaces an index delta, when it failed or could not begin) */
   if (st_bulk_busy(s)) {         /* (a bulk fill: the cleaner, the removals, the nx pass and the scrub wait for its end, THE BULK FILL) */
     bad_drain(s);
     return;
@@ -6355,6 +7623,29 @@ void store_test_poke(store_t *s, int which, uint64_t off, uint64_t v) {
   }
   wr_unlock_raw(s);
 }
+/* a duplicate for the rebuild (0.7): the cell of zone `to` gets the name and view of zone `from` (source: its source key instead), with a valid CRC */
+int store_test_forge_dup(store_t *s, uint32_t from, uint32_t to, bool source) {
+  wr_lock_raw(s);
+  r64_t ft, fc, tt, tc;
+  int r = zrec_read_locked(s, from, &ft, &fc);
+  if (r == 0) r = zrec_read_locked(s, to, &tt, &tc);
+  if (r == 0) {
+    zt_t a, b;
+    zc_t ca, cb;
+    zt_unpack(&ft, &a);
+    zt_unpack(&tt, &b);
+    zc_unpack(&fc, &ca);
+    zc_unpack(&tc, &cb);
+    if (source) { cb.source = ca.source; cb.source_id = ca.source_id; }
+    else { b.klen = a.klen; b.view = a.view; memcpy(b.name, a.name, ST_NAME_INL); }
+    zt_pack(&b, &tt);
+    zc_pack(&cb, &tc);
+    zrec_seal(&tt, &tc);
+    zrec_write(s, to, &tt, &tc);
+  }
+  wr_unlock_raw(s);
+  return r;
+}
 void store_test_hold(store_t *s, const char *site, uint64_t us) {
   wr_lock_raw_at(s, site);
   s->wl_t0 -= us;
@@ -6384,11 +7675,11 @@ uint32_t store_find(const store_t *s, uint16_t view, const char *name, size_t le
   if (len > STORE_NAME_MAX) return STORE_NONE;
   uint8_t fn[256];
   for (size_t i = 0; i < len; i++) fn[i] = st_lc((uint8_t)name[i]);
-  const ixgen_t *g = atomic_load_explicit(&s->ix, memory_order_acquire);
-  return ix_lookup(s, g, view, fn, len, st_hash_name(s, view, fn, len));
+  return ix_find(s, view, fn, len, st_hash_name(s, view, fn, len));
 }
 unsigned store_find_cand(const store_t *s, uint16_t view, const char *fname, size_t len, uint32_t *zids, unsigned max) {
   if (len > STORE_NAME_MAX || !max) return 0;
+  const dview_t *dv = atomic_load_explicit(&s->dv, memory_order_acquire);      /* (before ix: ix_find()) */
   const ixgen_t *g = atomic_load_explicit(&s->ix, memory_order_acquire);
   uint64_t h = st_hash_name(s, view, (const uint8_t *)fname, len);
   uint32_t tag = st_tag(h);
@@ -6401,6 +7692,7 @@ unsigned store_find_cand(const store_t *s, uint16_t view, const char *fname, siz
     if (z != STORE_NONE && (uint32_t)(v >> 32) == tag) zids[got++] = z;
     if (++pos == n) pos = 0;
   }
+  if (dv && got < max) got = dx_cand(dv, 0, h, zids, got, max);    /* (the hints of the delta: candidates like the slots, verified by the caller) */
   return got;
 }
 bool store_zid_is(const store_t *s, uint32_t zid, uint16_t view, const char *name, size_t len) {
@@ -6410,8 +7702,7 @@ bool store_zid_is(const store_t *s, uint32_t zid, uint16_t view, const char *nam
   return st_name_eq(s, zid, view, fn, len);
 }
 uint32_t store_find_source(const store_t *s, uint16_t source, int64_t domain_id, uint16_t view) {
-  const ixgen_t *g = atomic_load_explicit(&s->sx, memory_order_acquire);
-  return sx_lookup(s, g, source, view, domain_id, st_hash_src(s, source, view, domain_id));
+  return sx_find(s, source, view, domain_id, st_hash_src(s, source, view, domain_id));
 }
 
 static void zone_fill(const store_t *s, uint32_t z, const zt_t *t, const zc_t *c, store_zone_t *out, bool *name_ok) {
@@ -6994,6 +8285,32 @@ void store_stats(const store_t *s, store_stats_t *o) {
   o->index_wait_us = atomic_load_explicit(&s->iw_us, memory_order_relaxed);
   o->index_wait_max_us = atomic_load_explicit(&s->iw_max_us, memory_order_relaxed);
   o->index_wait_giveups = atomic_load_explicit(&s->iw_giveups, memory_order_relaxed);
+#define LD(f) atomic_load_explicit(&s->f, memory_order_relaxed)
+  o->index_delta_active = atomic_load_explicit(&s->dv, memory_order_relaxed) != NULL;
+  o->index_delta_frozen = LD(dx_nf);
+  o->index_deltas = LD(n_dx);
+  o->index_delta_bytes = LD(dx_bytes);
+  o->index_delta_peak_bytes = LD(dx_peak);
+  o->index_delta_bloom_bytes = LD(dx_bloom_bytes);
+  o->index_delta_runs = LD(dx_runs);
+  o->index_delta_run_entries = LD(dx_run_ents);
+  o->index_delta_spills = LD(n_dx_spills);
+  o->index_delta_spill_us = LD(n_dx_spill_us);
+  o->index_delta_merges = LD(n_dx_merges);
+  o->index_delta_scratch_bytes = LD(n_dx_scratch_bytes);
+  o->index_delta_spill_errors = LD(n_dx_spill_err);
+  o->index_delta_full = LD(n_dx_full);
+  o->index_delta_waits = LD(n_dx_waits);
+  o->index_builds = LD(n_fb);
+  o->index_build_us = LD(n_fb_us);
+  o->index_build_max_us = LD(fb_max_us);
+  o->index_builds_in_lock = LD(n_fb_inlock);
+  o->index_build_bytes = LD(fb_bytes);
+  o->index_build_peak_bytes = LD(fb_peak);
+  o->index_build_written_bytes = LD(n_fb_written);
+  o->index_build_buckets = LD(n_fb_buckets);
+  o->index_build_carries = LD(n_fb_carry);
+#undef LD
   o->journal_commit_switches = atomic_load_explicit(&s->n_jswitch, memory_order_relaxed);
   o->image_prewrites = atomic_load_explicit(&s->n_prew, memory_order_relaxed);
   o->image_prewrite_misses = atomic_load_explicit(&s->n_prew_miss, memory_order_relaxed);
@@ -7188,12 +8505,10 @@ int store_check(store_t *s, store_check_report_t *rep) {
     uint8_t fn[256];
     if (!zt_fullname(s, &t, fn)) { CHK_FAIL("zone %" PRIu64 ": name outside nx", z); continue; }
     if (t.klen > ST_NAME_INL) nxlive += t.klen;
-    const ixgen_t *ix = atomic_load_explicit(&s->ix, memory_order_relaxed);
-    if (ix_lookup(s, ix, t.view, fn, t.klen, st_hash_name(s, t.view, fn, t.klen)) != (uint32_t)z) CHK_FAIL("zone %" PRIu64 ": not reachable by name (or duplicate)", z);
+    if (ix_find(s, t.view, fn, t.klen, st_hash_name(s, t.view, fn, t.klen)) != (uint32_t)z) CHK_FAIL("zone %" PRIu64 ": not reachable by name (or duplicate)", z);
     else live_ix++;
     if (c.source_id != 0) {
-      const ixgen_t *sx = atomic_load_explicit(&s->sx, memory_order_relaxed);
-      if (sx_lookup(s, sx, c.source, t.view, c.source_id, st_hash_src(s, c.source, t.view, c.source_id)) != (uint32_t)z) CHK_FAIL("zone %" PRIu64 ": not reachable by source", z);
+      if (sx_find(s, c.source, t.view, c.source_id, st_hash_src(s, c.source, t.view, c.source_id)) != (uint32_t)z) CHK_FAIL("zone %" PRIu64 ": not reachable by source", z);
       else live_sx++;
     }
     depth[t.view][depth_bucket(name_labels(fn, t.klen))]++;
@@ -7241,8 +8556,8 @@ int store_check(store_t *s, store_check_report_t *rep) {
   for (uint32_t n = 1; n <= VG(s, V_NSEGS) && n <= ST_MAXSEG; n++)
     if (seglive[n] != VG(s, V_SEG(n, 1))) { CHK_FAIL("segment %u live %" PRIu64 " vs %" PRIu64, n, seglive[n], VG(s, V_SEG(n, 1))); break; }
   const ixgen_t *ix = atomic_load_explicit(&s->ix, memory_order_relaxed), *sx = atomic_load_explicit(&s->sx, memory_order_relaxed);
-  if ((VG(s, V_IX_USED)) * 2 > ix->nslots + 1 || VG(s, V_IX_USED) < VG(s, V_IX_LIVE)) CHK_FAIL("ix used %" PRIu64 " slots %" PRIu64, VG(s, V_IX_USED), ix->nslots);
-  if (VG(s, V_SX_USED) < VG(s, V_SX_LIVE) || VG(s, V_SX_USED) * 2 > sx->nslots + 1) CHK_FAIL("sx used %" PRIu64 " slots %" PRIu64, VG(s, V_SX_USED), sx->nslots);
+  if (ix_over(ix, VG(s, V_IX_USED) > 0 ? VG(s, V_IX_USED) - 1 : 0) || (!s->dx && VG(s, V_IX_USED) < VG(s, V_IX_LIVE)))      /* (with a delta the live entries are also its hints) */ CHK_FAIL("ix used %" PRIu64 " slots %" PRIu64, VG(s, V_IX_USED), ix->nslots);
+  if ((!s->dx && VG(s, V_SX_USED) < VG(s, V_SX_LIVE)) || ix_over(sx, VG(s, V_SX_USED) > 0 ? VG(s, V_SX_USED) - 1 : 0)) CHK_FAIL("sx used %" PRIu64 " slots %" PRIu64, VG(s, V_SX_USED), sx->nslots);
   wr_unlock_raw(s);
   return rep->errors ? -EBADMSG : 0;
 }
@@ -7264,6 +8579,46 @@ int store_check(store_t *s, store_check_report_t *rep) {
  * the cell.  Any other bytes are taken (escapes, 8-bit bytes, labels of any length): the rebuild never drops a name that the way in accepted.  The hash of the name cannot be checked against
  * its index slot here: the index the rebuild replaces is a copy of its own (fuzzy, or not written by a bulk checkpoint), so a slot that is missing proves nothing. */
 static bool st_name_text_ok(const uint8_t *n, size_t len) { return memchr(n, 0, len) == NULL; }
+/* the counters of one live zone, added (+1) or taken out again (-1: a duplicate the builder found) */
+static void rb_count(store_t *s, uint64_t *nv, const zt_t *t, const uint8_t *fn, int sign, uint64_t *nxlive) {
+  const uint64_t d1 = (uint64_t)(int64_t)sign;
+#define NA(i, x) (nv[(i)] += (x))
+  if (t->state == STORE_STATE_KNOWN) { NA(V_KNOWN, d1); NA(V_VIEW(t->view, 0), d1); }
+  else {
+    const uint64_t rl = st_reclen(t->klen, t->img_len) * d1;
+    NA(V_STORED, d1);
+    NA(V_VIEW(t->view, 1), d1);
+    NA(V_IMG_BYTES, rl);
+    NA(V_VIEW(t->view, 3), rl);
+    NA(V_SEG((uint32_t)(t->loc >> ST_LOC_SHIFT), 1), rl);
+  }
+  if (t->flags & STORE_F_REJECTED_NEW) { NA(V_REJECTED, d1); NA(V_VIEW(t->view, 2), d1); }
+  if (t->flags & STORE_F_NONSTORE) NA(V_NONSTORE, d1);
+  NA(V_DEPTH(t->view, depth_bucket(name_labels(fn, t->klen))), d1);
+  if (t->klen > ST_NAME_INL) *nxlive += (uint64_t)t->klen * d1;
+#undef NA
+  (void)s;
+}
+/* a cell becomes FREE (linked by the free-list pass) */
+static void rb_free_cell(store_t *s, uint32_t z) {
+  zt_t ft;
+  zc_t fc;
+  memset(&ft, 0, sizeof(ft));
+  memset(&fc, 0, sizeof(fc));
+  r64_t frt, frc;
+  zc_pack(&fc, &frc);
+  zt_pack(&ft, &frt);
+  zrec_seal(&frt, &frc);
+  zrec_write(s, z, &frt, &frc);
+}
+/* the slot of (h, z) in a generation the builder made becomes a tombstone (the page is marked: the checkpoint writes it); false: none */
+static bool rb_tomb(ixgen_t *g, uint64_t h, uint32_t z) {
+  const uint64_t pos = slot_find_zid(g, h, z);
+  if (pos == UINT64_MAX) return false;
+  atomic_store_explicit(&g->slots[pos], st_slotval(st_tag(h), STORE_NONE), memory_order_relaxed);
+  dm_mark(&g->d, pos * 8, 8);
+  return true;
+}
 static int rebuild_locked(store_t *s, unsigned how) {
   uint64_t *nv = malloc(ST_NV * sizeof(*nv));
   if (!nv) return -ENOMEM;
@@ -7278,9 +8633,13 @@ static int rebuild_locked(store_t *s, unsigned how) {
   ixgen_t *nix = NULL, *nsx = NULL;
   uint64_t slots = ix_slots_for(hwm);
   if (s->rg_active) atomic_store_explicit(&s->rg_cancel, true, memory_order_relaxed);       /* (a build in progress is dropped: the generations change here) */
-  int r = ixgen_create(s, FK_IX, s->ix_gen_next++, slots, true, &nix);
-  if (r == 0) r = ixgen_create(s, FK_SX, s->sx_gen_next++, slots, true, &nsx);
-  if (r < 0) { ixgen_free(nix); free(nv); return r; }
+  /* (0.7: the file builder, inside the mutex: the new generations are files in the page cache, not anonymous memory (C; 100M zones: 4.8 GB before); the duplicates are found where equal keys
+   * meet, in their window: fb_t.dedup) */
+  fb_t bi, bs;
+  memset(&bs, 0, sizeof(bs));
+  int r = fb_begin(s, &bi, FK_IX, s->ix_gen_next++, slots, true, 1);
+  if (r == 0) r = fb_begin(s, &bs, FK_SX, s->sx_gen_next++, slots, true, 1);
+  if (r < 0) { fb_abort(&bi); free(nv); return r; }
   /* counters are recomputed: clear everything except the segment tables, which are recomputed below too */
   uint64_t nsegs = NG(V_NSEGS), cur_seg = NG(V_CUR_SEG), nx_used = NG(V_NX_USED);
   uint64_t seg_used[ST_MAXSEG + 1];
@@ -7291,8 +8650,8 @@ static int rebuild_locked(store_t *s, unsigned how) {
   NS(V_NX_USED, nx_used);
   NS(V_HWM, hwm);
   for (uint32_t n = 1; n <= nsegs && n <= ST_MAXSEG; n++) NS(V_SEG(n, 0), seg_used[n]);
-  uint64_t nxlive = 0, live_ix = 0, live_sx = 0, nx_end = nx_used;
-  for (uint64_t z = 0; z < hwm; z++) {
+  uint64_t nxlive = 0, nx_end = nx_used;
+  for (uint64_t z = 0; z < hwm && r == 0; z++) {
     r64_t rt, rc;
     uint8_t st0 = zt_state_fast(s, (uint32_t)z);
     bool ok = false;
@@ -7327,51 +8686,49 @@ static int rebuild_locked(store_t *s, unsigned how) {
       }
     }
     if (ok) {
-      uint64_t h = st_hash_name(s, t.view, fn, t.klen);
-      if (ix_lookup(s, nix, t.view, fn, t.klen, h) != STORE_NONE) ok = false;         /* duplicate name */
-      if (ok && c.source_id != 0 &&
-          sx_lookup(s, nsx, c.source, t.view, c.source_id, st_hash_src(s, c.source, t.view, c.source_id)) != STORE_NONE)
-        ok = false;                                                                    /* duplicate source key */
-      if (ok && ix_raw_insert(nix, h, (uint32_t)z) < 0) ok = false;
-      if (ok) {
-        live_ix++;
-        s->rec.rebuilt_zones++;                      /* (live zones only: not the free cells, not the dropped ones) */
-        if (c.source_id != 0) {
-          ix_raw_insert(nsx, st_hash_src(s, c.source, t.view, c.source_id), (uint32_t)z);
-          live_sx++;
-        }
-        if (t.klen > ST_NAME_INL) {
-          uint64_t no;
-          memcpy(&no, t.name, 8);
-          nxlive += t.klen;
-          if (no + t.klen > nx_end) nx_end = no + t.klen;      /* (a name past the counter, RB_OPEN: nx ends after it, the next name goes behind it) */
-        }
-        if (t.state == STORE_STATE_KNOWN) { NS(V_KNOWN, NG(V_KNOWN) + 1); NS(V_VIEW(t.view, 0), NG(V_VIEW(t.view, 0)) + 1); }
-        else {
-          uint64_t rl = st_reclen(t.klen, t.img_len);
-          NS(V_STORED, NG(V_STORED) + 1);
-          NS(V_VIEW(t.view, 1), NG(V_VIEW(t.view, 1)) + 1);
-          NS(V_IMG_BYTES, NG(V_IMG_BYTES) + rl);
-          NS(V_VIEW(t.view, 3), NG(V_VIEW(t.view, 3)) + rl);
-          uint32_t sn = (uint32_t)(t.loc >> ST_LOC_SHIFT);
-          NS(V_SEG(sn, 1), NG(V_SEG(sn, 1)) + rl);
-        }
-        if (t.flags & STORE_F_REJECTED_NEW) { NS(V_REJECTED, NG(V_REJECTED) + 1); NS(V_VIEW(t.view, 2), NG(V_VIEW(t.view, 2)) + 1); }
-        if (t.flags & STORE_F_NONSTORE) NS(V_NONSTORE, NG(V_NONSTORE) + 1);
-        uint32_t d = V_DEPTH(t.view, depth_bucket(name_labels(fn, t.klen)));
-        NS(d, NG(d) + 1);
+      r = fb_add(&bi, st_hash_name(s, t.view, fn, t.klen), (uint32_t)z);
+      if (r == 0 && c.source_id != 0) r = fb_add(&bs, st_hash_src(s, c.source, t.view, c.source_id), (uint32_t)z);
+      s->rec.rebuilt_zones++;                        /* (live zones only: not the free cells, not the dropped ones) */
+      if (t.klen > ST_NAME_INL) {
+        uint64_t no;
+        memcpy(&no, t.name, 8);
+        if (no + t.klen > nx_end) nx_end = no + t.klen;        /* (a name past the counter, RB_OPEN: nx ends after it, the next name goes behind it) */
       }
+      rb_count(s, nv, &t, fn, +1, &nxlive);
+    } else {                /* drop: the cell becomes FREE (linked below) */
+      rb_free_cell(s, (uint32_t)z);
+      s->rec.dropped_zones++;
     }
-    if (!ok) {              /* drop: the cell becomes FREE (linked below) */
-      zt_t ft;
-      zc_t fc;
-      memset(&ft, 0, sizeof(ft));
-      memset(&fc, 0, sizeof(fc));
-      r64_t frt, frc;
-      zc_pack(&fc, &frc);
-      zt_pack(&ft, &frt);
-      zrec_seal(&frt, &frc);
-      zrec_write(s, (uint32_t)z, &frt, &frc);
+  }
+  if (r == 0) r = fb_finish(&bi, &nix);
+  if (r == 0) r = fb_finish(&bs, &nsx);
+  if (r < 0) {                                        /* (the cells it changed are the cells a rebuild changes: a later one makes the same changes again) */
+    fb_abort(&bi);
+    fb_abort(&bs);
+    ixgen_drop(s, nix, FK_IX);
+    ixgen_drop(s, nsx, FK_SX);
+    free(nv);
+    return r;
+  }
+  /* the duplicates (a name or a source key that an earlier zone id has): dropped, and their entry in the other index made a tombstone */
+  uint64_t live_ix = bi.used, live_sx = bs.used;
+  for (int k = 0; k < 2; k++) {
+    const fb_t *b = k ? &bs : &bi;
+    for (size_t i = 0; i < b->nd; i++) {
+      const uint32_t z = b->drop[i];
+      r64_t rt, rc;
+      if (zt_state_fast(s, z) == STORE_STATE_FREE || zrec_read_locked(s, z, &rt, &rc) < 0) continue;     /* (dropped by the other index already) */
+      zt_t t;
+      zc_t c;
+      uint8_t fn[256];
+      zt_unpack(&rt, &t);
+      zc_unpack(&rc, &c);
+      if (!zt_fullname(s, &t, fn)) continue;
+      if (rb_tomb(nix, st_hash_name(s, t.view, fn, t.klen), z)) live_ix--;
+      if (c.source_id != 0 && rb_tomb(nsx, st_hash_src(s, c.source, t.view, c.source_id), z)) live_sx--;
+      rb_count(s, nv, &t, fn, -1, &nxlive);
+      rb_free_cell(s, z);
+      s->rec.rebuilt_zones--;
       s->rec.dropped_zones++;
     }
   }
@@ -7395,19 +8752,22 @@ static int rebuild_locked(store_t *s, unsigned how) {
   }
   NS(V_FREE_HEAD, head);
   NS(V_FREE_COUNT, nfree);
-  NS(V_IX_USED, live_ix);
+  NS(V_IX_USED, bi.used);
   NS(V_IX_LIVE, live_ix);
-  NS(V_SX_USED, live_sx);
+  NS(V_SX_USED, bs.used);
   NS(V_SX_LIVE, live_sx);
   NS(V_NX_USED, nx_end);
   NS(V_NX_DEAD, nx_end >= nxlive ? nx_end - nxlive : 0);
   /* the segment counters of segments no record uses stay 0 live; V_SEG(n, 0) were restored above */
-  /* (the new generations are anonymous memory: the checkpoint that follows the rebuild writes them whole, ck_write_tab()) */
+  /* (the new generations are files the builder wrote: the checkpoint that follows the rebuild writes the pages of its tombstones and syncs them) */
+  fb_abort(&bi);
+  fb_abort(&bs);
   for (uint32_t i = 0; i < ST_NV; i++) VS(s, i, nv[i]);
   free(nv);
   if ((how & RB_OPEN) || nx_end > atomic_load_explicit(&s->nx_avail, memory_order_relaxed)) atomic_store_explicit(&s->nx_avail, nx_end, memory_order_release);
   index_publish(s, 0, nix);
   index_publish(s, 1, nsx);
+  if (dx_replaced_locked(s)) bulk_end_said(s);       /* (a delta of a pass: its entries are in the new generations; store_repair() during a pass) */
   s->free_epoch = rcu_writer_advance_epoch();         /* (cells that were dropped are reused after the readers of the old tables are gone) */
   s->rec.rebuilt = true;
   atomic_fetch_or(&s->state, STORE_ST_REPAIRED);
@@ -8108,6 +9468,7 @@ int store_open(int dirfd, const store_opts_t *opts, store_t **out) {
   if (!cand[0] || !cand[1]) { r = -ENOMEM; goto fail; }
   int rc[2];
   for (int i = 0; i < 2; i++) rc[i] = sb_read(s, i, cand[i]);
+  if (rc[0] != -ENOENT || rc[1] != -ENOENT) dx_remove_scratch(s);      /* (0.7: the runs of an index delta and the buckets of a build of the session before: scratch, never read) */
 
   if (rc[0] == -ENOENT && rc[1] == -ENOENT) {
     /* nothing there: create (the superblock files exist already, empty, when create is set) */
@@ -8259,10 +9620,12 @@ int store_close(store_t *s) {
   if (!s) return -EINVAL;
   ra_stop_join(s);
   bg_stop_join(s);
+  dx_stop_join(s);                                    /* (the delta stays for the clean checkpoint: SBF_BULK_CK, the next open rebuilds ix / sx: Q4) */
   seg_pre_drop(s);
   wr_lock_ck(s);
   int r = ck_full_locked(s, true);
   if (r < 0) st_log(s, 3, "store: clean checkpoint at close failed: %d", r);
+  dx_end_locked(s);                                   /* (its runs go: no scratch is left) */
   /* wait (bounded) for readers of retired generations; the caller has stopped them */
   uint64_t e = rcu_writer_advance_epoch();
   rcu_writer_wait_until_safe(e, 2000);

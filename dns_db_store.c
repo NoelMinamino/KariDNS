@@ -1901,10 +1901,12 @@ static void tables_charge(uint64_t priv, int64_t now_ms, int64_t *warned_ms) {
  * fill does not end before it).  The end itself is the checkpoint thread's (store_bulk_end() does not wait), and only while no pass began meanwhile (STORE_BULK_END_IF_PASSED).  Ticker thread only */
 static void bulk_end_check(store_t *st) {
   static bool armed;
+  static bool asked;                                         /* (0.7: with an index delta the end waits for its build: the call is repeated, the line said once) */
   static uint64_t idle0;
   static unsigned quiet;
   if (store_bulk(st) != 2) {
     armed = false;
+    asked = false;
     return;
   }
   db_recon_status_t r;
@@ -1921,7 +1923,8 @@ static void bulk_end_check(store_t *st) {
     return;
   }
   if (++quiet < 2) return;
-  syslog(LOG_INFO, "[Store] the first fill is over (%llu zone(s) without a body that the fill does not fetch): the store keeps its journal again", (unsigned long long)r.known_now);
+  if (!asked) syslog(LOG_INFO, "[Store] the first fill is over (%llu zone(s) without a body that the fill does not fetch): the store keeps its journal again", (unsigned long long)r.known_now);
+  asked = true;
   (void)store_bulk_end(st, STORE_BULK_END_IF_PASSED);
   armed = false;
 }
@@ -1945,7 +1948,7 @@ static void *ticker_thread(void *arg) {
       bulk_end_check(st);
       store_stats_t ss;
       store_stats(st, &ss);
-      tables_charge(ss.table_private_bytes + ss.ring_bytes, mono_ns() / 1000000, &warned_ms);      /* (0.7: the journal ring is the store's memory too, D4) */
+      tables_charge(ss.table_private_bytes + ss.ring_bytes + ss.index_delta_bytes + ss.index_build_bytes, mono_ns() / 1000000, &warned_ms);      /* (0.7: the journal ring is the store's memory too, D4; and the index delta of a pass and the builder's window) */
       pthread_mutex_lock(&G.wlock);
     }
   }

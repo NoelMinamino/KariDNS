@@ -41,9 +41,10 @@
  *
  *  Capsicum.  Everything is done through the directory fd: openat (O_CREAT, O_TRUNC; O_RESOLVE_BENEATH when available), pread, pwrite,
  *  pwritev, mmap (rw shared for the tables, ro for segments), msync, madvise, mincore, fsync, fsync, ftruncate, posix_fallocate, fstat, fstatfs,
- *  unlinkat (the cleaner removes segments, the open removes old generations); renameat and mkdirat (and readdir) only in store_quarantine(), which the Frontend runs before it hands the fd over.
+ *  unlinkat (the cleaner removes segments, the open removes old generations and the scratch files of the index delta and of the builder by name); renameat and mkdirat (and readdir) only in store_quarantine(), which the Frontend runs before it hands the fd over.
  *  The store starts a detached thread for the zt read-ahead after the open, the flusher thread (commits and checkpoints) and, while an index
- *  grows, a detached thread that builds the bigger index; store_close() waits for all of them.
+ *  grows, a detached thread that builds the bigger index (0.7: with the file builder), and during a pass of an unlogged first fill the spill thread of its index delta
+ *  (its runs: files ixr.N mapped read only); store_close() waits for all of them.
  *  So the rights to limit the fd to: CAP_LOOKUP, CAP_CREATE, CAP_READ, CAP_WRITE, CAP_SEEK, CAP_MMAP_RW, CAP_FSYNC, CAP_FTRUNCATE,
  *  CAP_FALLOCATE, CAP_FSTAT, CAP_FSTATFS, CAP_UNLINKAT.  The boot id (opts.boot_id) must be passed in: sysctl is not available there.
  *
@@ -328,6 +329,24 @@ typedef struct store_stats {
   uint64_t index_waits;             /* store_index_wait() calls that waited for the build of the next index (0.7 round 10) */
   uint64_t index_wait_us, index_wait_max_us;   /* the total and the longest of those waits */
   uint64_t index_wait_giveups;      /* waits that ended at their bound with the build still running (the growth inside the writer mutex is the last resort) */
+  /* ---- 0.7: the index delta of a bulk pass and the file builder (dns_store.c: THE INDEX DELTA, THE FILE BUILDER) ---- */
+  uint32_t index_delta_active;      /* 1 while a pass of an unlogged fill puts its new index entries into the delta (no index growth until its build) */
+  uint32_t index_delta_frozen;      /* memtables that wait for their spill */
+  uint64_t index_deltas;            /* deltas begun since the open */
+  uint64_t index_delta_bytes;       /* its anonymous memory now: memtables, Bloom filter, fences, a spill's sort buffer (counted in memory-limit) */
+  uint64_t index_delta_peak_bytes;  /* ... the most since the open */
+  uint64_t index_delta_bloom_bytes; /* the Bloom filter of its runs (the last one made) */
+  uint64_t index_delta_runs, index_delta_run_entries;   /* its runs (files beneath the store directory, in the page cache) and their entries */
+  uint64_t index_delta_spills, index_delta_spill_us, index_delta_merges;   /* memtables written as runs (their total time), merges of runs */
+  uint64_t index_delta_scratch_bytes;   /* bytes the spills and merges wrote */
+  uint64_t index_delta_spill_errors;    /* writes of a run that failed (the memtable stayed in memory; tried again) */
+  uint64_t index_delta_full;        /* changes refused because the memtable was full and the spill behind (-ENOSPC: the zone is listed again by the next pass) */
+  uint64_t index_delta_waits;       /* store_index_wait() calls that gave the spill a short time */
+  uint64_t index_builds, index_build_us, index_build_max_us;   /* builds of ix / sx outside the writer mutex by the file builder: number, total and longest time */
+  uint64_t index_builds_in_lock;    /* growths of a big index inside the writer mutex (at 3/4: the build outside it did not end in time) */
+  uint64_t index_build_bytes, index_build_peak_bytes;   /* the builder's anonymous memory (its window and bucket buffers): now, the most */
+  uint64_t index_build_written_bytes;   /* bytes it wrote (windows of the generation files, buckets) */
+  uint64_t index_build_buckets, index_build_carries;   /* bucket files it made; entries carried into the next window */
   uint64_t journal_commit_switches; /* the journal file switched by a commit (0.7: the writers append to a file that no sync holds) */
   uint64_t image_prewrites;         /* image records store_put() wrote before the writer mutex and the change took (0.7) */
   uint64_t image_prewrite_misses;   /* ... that the change wrote again inside the mutex (the zone, its record or the open segment changed in between) */
@@ -740,6 +759,20 @@ uint64_t store_test_seg_bytes(store_t *s);
 void store_test_bulk_dump(store_t *s, char *buf, size_t n);
 /* the first back-off of the checkpoint that ends a bulk fill after a failure (0: 1 s; it doubles up to 5 min) */
 extern _Atomic uint32_t store_test_bulk_end_ms;
+/* 0.7, the index delta and the file builder (THE INDEX DELTA in dns_store.c): the memtable bytes (0: the default), the runs merged at once (0: 8), the builder's window in slots (0: 64 MiB / 8),
+ * the index size up to which a growth inside the mutex is made at one half in anonymous memory (0: 64 MiB); the steps of a spill, a merge and a build (a test kills the process there); a write
+ * of a run (1), a bucket (2) or a generation (3) fails with the -errno that the fault returns (0: none); the fence search of a run */
+extern _Atomic uint64_t store_test_dx_mem_bytes;
+extern _Atomic unsigned store_test_dx_fan;
+extern _Atomic uint64_t store_test_fb_window;
+extern _Atomic uint64_t store_test_rg_small;
+extern void (*_Atomic store_test_dx_hook)(store_t *s, int step);
+extern int (*_Atomic store_test_ix_fault)(int what);
+enum { STORE_DXS_SPILL_SORTED = 1, STORE_DXS_SPILL_WRITTEN, STORE_DXS_SPILL_PUBLISHED, STORE_DXS_MERGE_WRITTEN, STORE_DXS_MERGE_PUBLISHED, STORE_FBS_SCANNED, STORE_FBS_PLACED,
+       STORE_FBS_MAPPED, STORE_FBS_CAUGHT_UP, STORE_FBS_PUBLISHED };
+uint64_t store_test_fence_lb(const uint64_t *f, uint64_t n, uint64_t h);
+int store_test_forge_dup(store_t *s, uint32_t from, uint32_t to, bool source);
+int store_test_fb_place(store_t *s, const uint64_t *h, const uint32_t *z, size_t n, uint64_t nslots, uint64_t window, uint64_t *out);
 #endif
 #if defined(KARIDNS_UNIT_TEST) || defined(KARIDNS_TEST_EVICT)
 /* an append of an image record fails with the errno this returns (not 0) before it writes anything: the disk fills up between the free-space check and the write.  Also in the test build
