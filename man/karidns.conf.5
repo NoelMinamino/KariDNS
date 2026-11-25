@@ -5084,12 +5084,15 @@ the most, and registers what it has made) (it attaches the hottest zones and
 never takes one out for the rest of the list; \fBstore.hot.state\fR says
 \fBhigh\-mark\fR). The file is trusted only whole (its checksums and the store's
 uuid must be right; a damaged, torn or foreign file is ignored with a WARNING
-and the zones are attached when they are asked for, as before); after \fBkill
-\-9\fR the list of the last clean stop is still used (its ids are only
-candidates: a zone that is not stored any more is skipped). \fBstore\-hot\-list
-no;\fR turns both the writing and the attaching off. \fBkarictl store\fR shows
-\fBstore.hot.*\fR (\fBstore.hot.threads\fR, and \fBstore.hot.attached_per_s\fR
-from the start of the list to now).
+and the zones are attached when they are asked for, as before); it is written
+after the clean checkpoint of the stop, and with no fsync (a hint: two fsyncs of
+it made a stop take seconds while a fill wrote, before the checkpoint; a power
+cut may lose the file or leave it torn, and then the start attaches the zones
+when they are asked for); after \fBkill \-9\fR the list of the last clean stop
+is still used (its ids are only candidates: a zone that is not stored any more
+is skipped). \fBstore\-hot\-list no;\fR turns both the writing and the attaching
+off. \fBkarictl store\fR shows \fBstore.hot.*\fR (\fBstore.hot.threads\fR, and
+\fBstore.hot.attached_per_s\fR from the start of the list to now).
 .PP
 \fBAttach on the worker (MAP mode, 0.7).\fR A query for a stored zone that is
 not in memory used to wait for a store thread (the worker parks it, asks through

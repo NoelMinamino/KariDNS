@@ -3827,7 +3827,10 @@ int (*_Atomic store_test_ix_fault)(int what);              /* a write of a run (
 _Atomic uint64_t store_test_rg_small;
 #define RG_SMALL_NOW() (atomic_load_explicit(&store_test_rg_small, memory_order_relaxed) ? atomic_load_explicit(&store_test_rg_small, memory_order_relaxed) : RG_SMALL)
 #else
-#define RG_SMALL_NOW() RG_SMALL
+/* (the same ?: as above, on a constant: the functions that use it have the same body with and without KARIDNS_UNIT_TEST, so their coverage counts add up across the binaries.  llvm-cov
+ * keeps one record of a static function per name, the first object's (karidns), and finds its counts only under that hash: CI coverage gate, regrow_locked() was run by test_store only) */
+static const uint64_t store_test_rg_small = 0;
+#define RG_SMALL_NOW() (store_test_rg_small ? store_test_rg_small : RG_SMALL)
 #endif
 
 static void dx_acct(store_t *s, size_t n, bool add) {
@@ -5036,7 +5039,8 @@ static int rg_build(store_t *s) {
    * the OP_GEN record is a change after it; journal_append()'s guard would only try the flags, and fail the growth when a commit or a checkpoint has them. */
   int lr = 0;
   wr_lock_raw(s);                                     /* (rg_dx is the mutex's: set in the hold that began this build; the fill cannot end while its delta is there) */
-  if (!(s->rg_dx && atomic_load_explicit(&s->bulk, memory_order_relaxed))) {
+  const bool dropped = r < 0 || atomic_load_explicit(&s->rg_cancel, memory_order_relaxed) || atomic_load_explicit(&s->rg_stop, memory_order_relaxed);   /* (a dropped build writes no record: it clears no clean flag either, as after the clean checkpoint of a stop) */
+  if (!dropped && !(s->rg_dx && atomic_load_explicit(&s->bulk, memory_order_relaxed))) {
     wr_unlock_raw(s);
     lr = wr_lock(s);
   }
@@ -7635,6 +7639,7 @@ int store_checkpoint_clean(store_t *s) {
   if (!s) return -EINVAL;
   atomic_store_explicit(&s->ck_cancel, true, memory_order_relaxed);       /* (a fuzzy checkpoint in progress is left between two pieces of its flush: this one flushes everything, and a stop does not wait for the rest of the other) */
   wr_lock_ck(s);
+  if (s->rg_active) atomic_store_explicit(&s->rg_cancel, true, memory_order_relaxed);      /* (a growth that runs is dropped: at the stop its writes compete with this checkpoint's, and its publish after it would add a journal record and clear the clean flag again; one still due begins again at the next insert, a delta's build at the next tick, or the next open rebuilds) */
   atomic_store_explicit(&s->ck_cancel, false, memory_order_relaxed);      /* (ck_busy is this call's: no fuzzy one runs; the later ones run to their end) */
   int r = ck_full_locked(s, true);
   if (r < 0) note_error(s, r);
@@ -8488,8 +8493,13 @@ _Static_assert(sizeof(hothdr_t) == ST_HOT_HDR, "hothdr_t");
 
 static uint64_t hot_hsum(const hothdr_t *h) { return st_sum64(h, ST_HOT_HDR - 8, 0x686F746C697374ull); }
 
+/* hot.list is a hint (0.7): it is written with no fsync (two of them made a stop of the server take up to 5.4 s on ZFS while a first fill wrote, with the Manager's kill at 10 s,
+ * planning/results/2026-11-25_slow_stop_gemini.md).  A crash may leave the file the old, the new, or a mix of both: store_hot_read() takes it only when its header, its size and the sum
+ * of its ids agree (the header, with the sum, is written last), so a mix is never used.  It is written in place, not renamed: the store's directory descriptor has no CAP_RENAMEAT in
+ * the Backend's sandbox.  An empty list: the file goes. */
 int store_hot_write(store_t *s, const uint32_t *zids, size_t n) {
   if (!s || (n && !zids) || n > STORE_HOT_MAX) return -EINVAL;
+  if (n == 0) return unlinkat(s->dirfd, "hot.list", 0) == 0 || errno == ENOENT ? 0 : -errno;
   int fd = st_openat(s, "hot.list", O_RDWR | O_CREAT);
   if (fd < 0) return fd;
   hothdr_t h;
@@ -8497,7 +8507,6 @@ int store_hot_write(store_t *s, const uint32_t *zids, size_t n) {
   int r = st_pwrite_all(fd, &h, sizeof(h), 0);                       /* (invalid until the ids are written) */
   if (r == 0 && n) r = st_pwrite_all(fd, zids, n * sizeof(uint32_t), ST_HOT_HDR);
   if (r == 0 && ftruncate(fd, (off_t)(ST_HOT_HDR + n * sizeof(uint32_t))) != 0) r = -errno;
-  if (r == 0 && fsync(fd) != 0) r = -errno;
   if (r == 0) {
     h.magic = ST_HOT_MAGIC;
     h.version = 1;
@@ -8506,7 +8515,6 @@ int store_hot_write(store_t *s, const uint32_t *zids, size_t n) {
     h.sum = st_sum64(zids, n * sizeof(uint32_t), 0);
     h.hsum = hot_hsum(&h);
     r = st_pwrite_all(fd, &h, sizeof(h), 0);
-    if (r == 0 && fsync(fd) != 0) r = -errno;
   }
   close(fd);
   return r;

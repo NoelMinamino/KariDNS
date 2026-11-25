@@ -2391,8 +2391,9 @@ static int fill_to_build(store_t *s, uint32_t *next, uint32_t limit, bool (*at_h
   }
 }
 
-/* A growth built outside the mutex is put in after a clean checkpoint was made meanwhile (the stop of a server that a straggler follows): its record is a change after the clean flag,
- * so the flag is cleared on disk first, as for any writer (the open after a reboot then rebuilds, as after every unclean stop). */
+/* A clean checkpoint made while a growth is built outside the mutex (the stop of a server) drops that build (0.7: its writes competed with the checkpoint's at the stop, and its record
+ * after the checkpoint cleared the clean flag): the flag stays set.  A straggler that writes after it clears the flag, as any writer, and the growth that is due begins again and is
+ * put in (the open after a reboot then rebuilds, as after every unclean stop). */
 static store_t *g_cg_store;
 static _Atomic int g_cg_done, g_cg_want, g_cg_idle;
 static void cg_hook(int step) {
@@ -2422,13 +2423,21 @@ static void test_clean_then_growth(void) {
     atomic_store(&g_cg_idle, 1);
     for (int w = 0; w < 10000 && atomic_load(&g_cg_done) == 0; w++) usleep(1000);
     if (atomic_load(&g_cg_done) != 1) _exit(4);
+    atomic_store(&store_test_regrow_hook, NULL);
     store_stats_t st;
     store_stats(s, &st);
-    for (int w = 0; w < 5000 && st.growths_background == 0; w++) { usleep(1000); store_stats(s, &st); }
-    if (st.growths_background == 0) _exit(5);
-    if (st.clean_flag) _exit(6);                                         /* (the growth's record cleared the flag on disk) */
-    atomic_store(&store_test_regrow_hook, NULL);
-    _exit(i > 255 ? 0 : 7);                                              /* no close */
+    for (int w = 0; w < 5000 && st.index_build_active; w++) { usleep(1000); store_stats(s, &st); }
+    if (st.index_build_active || st.growths_background != 0) _exit(5);  /* (the build that ran at the clean checkpoint was dropped, not put in) */
+    if (!st.clean_flag) _exit(6);                                        /* (and nothing changed the store after the checkpoint) */
+    const uint64_t g0 = st.growths;
+    for (uint32_t k = 0; k < 20000 && st.growths == g0; k++) {          /* (a straggler: its put clears the flag; the growth that is due begins again and is put in) */
+      if (put_i(s, 0, i++, 1, NULL) != 0) _exit(3);
+      if ((k & 63) == 0) store_stats(s, &st);
+    }
+    for (int w = 0; w < 5000 && st.growths == g0; w++) { usleep(1000); store_stats(s, &st); }
+    if (st.growths == g0) _exit(7);
+    if (st.clean_flag) _exit(8);
+    _exit(i > 255 ? 0 : 9);                                              /* no close */
   }
   int stt = 0;
   waitpid(pid, &stt, 0);
@@ -5780,8 +5789,8 @@ static void test_hot_list(void) {
   size_t n = 99;
   CHECK_EQ(store_hot_read(s, &ids, &n), -ENOENT);                       /* (no file: a first start) */
   CHECK(ids == NULL && n == 0);
-  CHECK_EQ(store_hot_write(s, NULL, 0), 0);                             /* (an empty list is a list) */
-  CHECK_EQ(store_hot_read(s, &ids, &n), 0);
+  CHECK_EQ(store_hot_write(s, NULL, 0), 0);                             /* (an empty list: no file, no error) */
+  CHECK_EQ(store_hot_read(s, &ids, &n), -ENOENT);
   CHECK(ids == NULL && n == 0);
   enum { N = 5000 };
   uint32_t *w = malloc(N * sizeof(*w));
@@ -5834,6 +5843,43 @@ static void test_hot_list(void) {
     memset(zero, 0, sizeof(zero));
     CHECK_EQ(write_at(hp, 0, zero, sizeof(zero)), 0);                   /* (the state of a write that did not finish) */
     CHECK_EQ(store_hot_read(s, &ids, &n), -EBADMSG);
+  }
+  /* 0.7: hot.list is written in place with no fsync, so a crash can leave any mix of the old file and the new one on disk: only the old or the new list is taken.
+   * Old list A (N ids), new list B (N other ids): B's header on A's ids, A's header on B's ids, and B's header with A's length (a cut that did not reach the disk) */
+  {
+    uint32_t *b = malloc(N * sizeof(*b));
+    for (uint32_t i = 0; i < N; i++) b[i] = w[i] ^ 0x5a5a5u;
+    static uint8_t fa[48 + N * 4], fb[48 + N * 4];
+    CHECK_EQ(store_hot_write(s, w, N), 0);
+    CHECK_EQ(read_at(hp, 0, fa, sizeof(fa)), 0);
+    CHECK_EQ(store_hot_write(s, b, N), 0);
+    CHECK_EQ(read_at(hp, 0, fb, sizeof(fb)), 0);
+    CHECK_EQ(store_hot_read(s, &ids, &n), 0);                           /* (the new one) */
+    CHECK(n == N && ids && memcmp(ids, b, N * sizeof(*b)) == 0);
+    free(ids);
+    ids = NULL;
+    CHECK_EQ(write_at(hp, 48, fa + 48, N * 4), 0);                      /* (B's header, A's ids) */
+    CHECK_EQ(store_hot_read(s, &ids, &n), -EBADMSG);
+    CHECK(ids == NULL && n == 0);
+    CHECK_EQ(write_at(hp, 0, fa, 48), 0);                               /* (all of A: the old one) */
+    CHECK_EQ(store_hot_read(s, &ids, &n), 0);
+    CHECK(n == N && ids && memcmp(ids, w, N * sizeof(*w)) == 0);
+    free(ids);
+    ids = NULL;
+    CHECK_EQ(write_at(hp, 48, fb + 48, N * 4), 0);                      /* (A's header, B's ids) */
+    CHECK_EQ(store_hot_read(s, &ids, &n), -EBADMSG);
+    CHECK_EQ(store_hot_write(s, b, 3), 0);                              /* (B cut to 3 ids, but the file keeps the length of A) */
+    CHECK_EQ(write_at(hp, 48 + 3 * 4, fa + 48 + 3 * 4, (N - 3) * 4), 0);
+    CHECK_EQ(store_hot_read(s, &ids, &n), -EBADMSG);
+    CHECK_EQ(store_hot_write(s, b, 3), 0);
+    CHECK_EQ(store_hot_read(s, &ids, &n), 0);
+    CHECK(n == 3 && ids && memcmp(ids, b, 3 * sizeof(*b)) == 0);
+    free(ids);
+    ids = NULL;
+    CHECK_EQ(store_hot_write(s, NULL, 0), 0);                           /* (an empty list removes the file, twice is fine) */
+    CHECK_EQ(store_hot_write(s, NULL, 0), 0);
+    CHECK_EQ(store_hot_read(s, &ids, &n), -ENOENT);
+    free(b);
   }
   free(w);
   CHECK_EQ(store_close(s), 0);
