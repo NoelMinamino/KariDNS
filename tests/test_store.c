@@ -9698,7 +9698,7 @@ static void test_dx_faults(void) {
   g_ix_fault_what = 1;
   atomic_store(&store_test_ix_fault, ix_fault);
   uint32_t n = 0, refused = 0;
-  for (; n < 600; n++) refused += known_i(s, 0, n, 1) == -ENOSPC;          /* (no wait: the spill cannot write, the memtables fill and the writes past them are refused) */
+  for (; n < 4000; n++) refused += known_i(s, 0, n, 1) == -ENOSPC;          /* (no wait: the spill cannot write, the memtables fill and the writes past them are refused) */
   store_stats_t st;
   for (int w = 0; w < 5000; w++) { store_stats(s, &st); if (st.index_delta_spill_errors >= 1) break; usleep(1000); }
   store_stats(s, &st);
@@ -9871,6 +9871,165 @@ static void test_dx_budget(void) {
   CHECK_EQ(store_bulk_end(s, STORE_BULK_END_WAIT), 0);
   CHECK_EQ(store_close(s), 0);
   CHECK_EQ(ix_scratch(&d), 0);
+  tdir_free(&d);
+}
+
+/* The spill held (a disk that stalls) under the budget of memory-limit 4m: the memtables fill and the delta refuses zones (-ENOSPC).  Every zone it took is there, during the pass, after a
+ * clean stop and the open (its rebuild), and the refused ones are not; after a kill -9 the fill goes back to its last bulk checkpoint (the zones of the body phase before it are there) */
+static _Atomic int g_dx_hold;
+static void dx_hold_hook(store_t *s, int step) {
+  (void)s;
+  if (step == STORE_DXS_SPILL_SORTED) while (atomic_load(&g_dx_hold)) usleep(1000);
+}
+static uint32_t ix_hold_fill(store_t *s, uint32_t from, uint32_t n, uint8_t *took) {
+  uint32_t refused = 0;
+  for (uint32_t i = from; i < from + n; i++) {
+    const int r = known_i(s, 0, i, 1);
+    took[i] = r == 0;
+    if (r == -ENOSPC) refused++;
+    else CHECK_EQ(r, 0);
+  }
+  return refused;
+}
+static void test_dx_hold(void) {
+  printf("[the spill held under memory-limit 4m: refused zones, the zones taken survive a clean stop; a kill -9 goes back to the last bulk checkpoint]\n");
+  enum { NH = 12000 };
+  static uint8_t took[2 * NH];
+  for (int variant = 0; variant < 2; variant++) {
+    tdir_t d;
+    tdir_new(&d, "dxhold");
+    store_opts_t o;
+    bulk_opts(&o);
+    o.mem_limit = 4u << 20;
+    o.no_readahead = true;
+    fflush(stdout);
+    const pid_t pid = variant ? fork() : 0;
+    if (pid == 0) {
+      store_t *s = NULL;
+      if (store_open(d.fd, &o, &s) != 0) { if (variant) _exit(10); CHECK(0); tdir_free(&d); continue; }
+      store_view_add(s, "default");
+      store_bulk_begin(s);
+      store_bulk_phase(s, STORE_BULK_PASS);
+      for (uint32_t i = 0; i < 500; i++) (void)known_w(s, i, 1);
+      store_bulk_phase(s, STORE_BULK_BODY);              /* (a build, then images and a bulk checkpoint: the durable point of a crash) */
+      for (int w = 0; w < 60000; w++) { store_stats_t st; store_stats(s, &st); if (!st.index_delta_active) break; usleep(1000); }
+      for (uint32_t i = 0; i < 500; i++) (void)put_i(s, 0, i, 2, NULL);
+      if (store_checkpoint(s) != 0 && variant) _exit(11);
+      atomic_store(&g_dx_hold, 1);
+      atomic_store(&store_test_dx_hook, dx_hold_hook);
+      store_bulk_phase(s, STORE_BULK_PASS);
+      const uint32_t refused = ix_hold_fill(s, NH, NH, took);
+      store_stats_t st;
+      store_stats(s, &st);
+      if (!variant) {
+        printf("  %u of %u zones refused with the spill held (store.index.delta.full %llu, %u memtables frozen)\n", refused, (unsigned)NH, (unsigned long long)st.index_delta_full, st.index_delta_frozen);
+        CHECK(refused > 0);
+        CHECK_EQ(st.index_delta_full, refused);
+        uint32_t bad = 0;
+        for (uint32_t i = NH; i < 2 * NH; i++) bad += (find_i(s, 0, i) != STORE_NONE) != took[i];
+        CHECK_EQ(bad, 0);
+      }
+      atomic_store(&g_dx_hold, 0);
+      if (variant) kill(getpid(), SIGKILL);
+      atomic_store(&store_test_dx_hook, NULL);
+      CHECK(ix_wait(s, get_dx_settled, "the spills"));
+      CHECK_EQ(store_close(s), 0);
+      o.create = false;
+      CHECK_EQ(store_open(d.fd, &o, &s), 0);
+      if (s) {
+        store_stats(s, &st);
+        uint32_t bad = 0, kept = 0;
+        for (uint32_t i = NH; i < 2 * NH; i++) { const bool there = find_i(s, 0, i) != STORE_NONE; kept += there; bad += there != took[i]; }
+        for (uint32_t i = 0; i < 500; i++) bad += !verify_i(s, 0, i, 2);
+        printf("  clean stop: the open rebuilt %d, %u zones of the pass there, %llu known + %llu stored, %u wrong\n", (int)st.recovery.rebuilt, kept, (unsigned long long)st.zones_known,
+               (unsigned long long)st.zones_stored, bad);
+        CHECK_EQ(bad, 0);
+        CHECK_EQ(st.zones_stored, 500);
+        check_consistent(s, "the spill held, a clean stop");
+        CHECK_EQ(store_close(s), 0);
+      }
+      tdir_free(&d);
+      continue;
+    }
+    int status = 0;
+    CHECK(waitpid(pid, &status, 0) == pid);
+    CHECK(WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL);
+    store_t *s = NULL;
+    o.create = false;
+    CHECK_EQ(store_open(d.fd, &o, &s), 0);
+    if (s) {
+      store_stats_t st;
+      store_stats(s, &st);
+      uint32_t bad = 0;
+      for (uint32_t i = 0; i < 500; i++) bad += !verify_i(s, 0, i, 2);           /* (the bulk checkpoint's images) */
+      printf("  kill -9: bulk recovered %d, %llu known + %llu stored, %u of the checkpoint's 500 zones wrong\n", (int)st.recovery.bulk_recovered, (unsigned long long)st.zones_known,
+             (unsigned long long)st.zones_stored, bad);
+      CHECK(st.recovery.bulk_recovered);
+      CHECK_EQ(bad, 0);
+      CHECK_EQ(st.zones_stored, 500);
+      check_consistent(s, "the spill held, kill -9");
+      CHECK_EQ(store_close(s), 0);
+    }
+    tdir_free(&d);
+  }
+  atomic_store(&store_test_dx_hook, NULL);
+  atomic_store(&g_dx_hold, 0);
+}
+
+/* The stop of the server (db_store_stop()): store_checkpoint_clean(), then _exit() with the store open.  The build of a delta that ends after that clean checkpoint must not make the store
+ * unclean on disk: the next start of an unlogged fill would take it for a crash and go back to the last bulk checkpoint (CI and pc31: a restart found a filled store empty) */
+static void test_dx_clean_exit(void) {
+  printf("[a clean checkpoint, then the build of the delta ends, then _exit(): the next open finds the fill as the clean stop left it]\n");
+  tdir_t d;
+  tdir_new(&d, "dxclean");
+  store_opts_t o;
+  bulk_opts(&o);
+  o.no_readahead = true;
+  fflush(stdout);
+  const pid_t pid = fork();
+  if (pid == 0) {
+    store_t *s = NULL;
+    if (store_open(d.fd, &o, &s) != 0) _exit(10);
+    if (store_view_add(s, "default") != 0 || store_bulk_begin(s) != 0) _exit(11);
+    store_bulk_phase(s, STORE_BULK_PASS);
+    for (uint32_t i = 0; i < 3000; i++) if (known_w(s, i, 1) != 0) _exit(12);
+    atomic_store(&g_ix_hold, 1);
+    atomic_store(&store_test_regrow_hook, ix_hold_hook);
+    store_bulk_phase(s, STORE_BULK_PASSED);              /* (the build begins and waits after its scan) */
+    for (uint32_t i = 0; i < 1000; i++) if (put_i(s, 0, i, 2, NULL) != 0) _exit(13);
+    if (store_checkpoint_clean(s) != 0) _exit(14);       /* (the stop: a delta is there, the superblock says SBF_BULK_CK | SBF_CLEAN) */
+    atomic_store(&g_ix_hold, 0);
+    for (int w = 0; w < 60000; w++) {                    /* (the build ends and puts its generations in after the clean checkpoint) */
+      store_stats_t st;
+      store_stats(s, &st);
+      if (!st.index_delta_active) break;
+      usleep(1000);
+    }
+    _exit(0);                                             /* (backend_exit(): the store is not closed) */
+  }
+  int status = 0;
+  CHECK(waitpid(pid, &status, 0) == pid);
+  CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+  atomic_store(&store_test_regrow_hook, NULL);
+  atomic_store(&g_ix_hold, 0);
+  store_t *s = NULL;
+  o.create = false;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (s) {
+    store_stats_t st;
+    store_stats(s, &st);
+    printf("  open: clean %d, bulk recovered %d, rebuilt %d, %llu stored + %llu known\n", (int)st.recovery.was_clean, (int)st.recovery.bulk_recovered, (int)st.recovery.rebuilt,
+           (unsigned long long)st.zones_stored, (unsigned long long)st.zones_known);
+    CHECK(st.recovery.was_clean && !st.recovery.bulk_recovered);
+    CHECK_EQ(st.zones_stored, 1000);
+    CHECK_EQ(st.zones_known, 2000);
+    uint32_t bad = 0;
+    for (uint32_t i = 0; i < 1000; i++) bad += !verify_i(s, 0, i, 2);
+    CHECK_EQ(bad, 0);
+    CHECK_EQ(ix_unreached(s, 1000, 3000), 0);
+    check_consistent(s, "clean checkpoint, then the build");
+    CHECK_EQ(store_close(s), 0);
+  }
   tdir_free(&d);
 }
 
@@ -10071,6 +10230,8 @@ int main(void) {
     test_dx_small();
     test_fb_buckets();
     test_dx_budget();
+    test_dx_hold();
+    test_dx_clean_exit();
     test_fb_wrap();
     test_fb_growth();
     test_dx_faults();

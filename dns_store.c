@@ -4856,7 +4856,8 @@ static int rg_publish_locked(store_t *s, ixgen_t *nix, ixgen_t *nsx, uint64_t ix
     if (!p) r = -ENOMEM; else { memcpy(p, &w, 4); memcpy(p + 4, &g, 4); memcpy(p + 8, &nsx->nslots, 8); }
     if (r == 0 && ((r = jb_vset(&s->jb, V_SX_USED, sx_used)) < 0 || (r = jb_vset(&s->jb, V_SX_LIVE, sx_live)) < 0)) {}
   }
-  if (r == 0) r = journal_append(s);
+  if (r == 0 && atomic_load_explicit(&s->bulk, memory_order_relaxed)) atomic_fetch_add_explicit(&s->n_bulk_unlogged, 1, memory_order_relaxed);   /* (an unlogged fill: no record, and no clean flag cleared for one: rg_build()) */
+  else if (r == 0) r = journal_append(s);
   if (r < 0) return r;
   CRASH_POINT();
   if (nix) {
@@ -5025,8 +5026,15 @@ static int rg_build(store_t *s) {
     CRASH_POINT();
     st_hook(&store_test_regrow_hook, 3);
   }
-  const int lr = wr_lock(s);                          /* (a clean flag on disk is cleared first, with the mutex given up while the flags are waited for, as for every writer: the OP_GEN record is a
-                                                       * change after it; journal_append()'s guard would only try the flags, and fail the growth when a commit or a checkpoint has them) */
+  /* The build of an index delta in an unlogged fill writes no record and changes no cell: what the files hold is the same before and after its publish (a superblock that a checkpoint
+   * wrote while the delta was there says SBF_BULK_CK: the open rebuilds ix / sx from zt).  So it does not clear a clean flag on disk: the stop of the server (db_store_stop()) makes a clean
+   * checkpoint and _exit()s with the store open, and a build that ended after it made the store unclean, and the next start take the fill for a crash (CI 2026-11-25: a restart found
+   * the filled store empty; test_dx_clean_exit).  Every other build: a clean flag on disk is cleared first, with the mutex given up while the flags are waited for, as for every writer:
+   * the OP_GEN record is a change after it; journal_append()'s guard would only try the flags, and fail the growth when a commit or a checkpoint has them. */
+  const bool unlogged = s->rg_dx && atomic_load_explicit(&s->bulk, memory_order_relaxed);      /* (rg_dx is set before this thread began; the fill cannot end while its delta is there) */
+  int lr = 0;
+  if (unlogged) wr_lock_raw(s);
+  else lr = wr_lock(s);
   if (lr < 0) {
     wr_lock_raw(s);
     if (r == 0) r = lr;
