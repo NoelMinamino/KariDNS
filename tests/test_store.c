@@ -7958,6 +7958,7 @@ static void test_bulk_basic(void) {
   const uint64_t seg1 = store_test_seg_bytes(s);
   CHECK(st.bulk_next_bytes >= 2 * seg1 - 4096 && st.bulk_next_bytes >= seg1 + (256u << 10));
   CHECK(st.journal_bytes_written <= jb0 + 64);                            /* (the header of the journal file the checkpoint switched to) */
+  for (int w = 0; w < 10000 && log_count(6, "bulk checkpoint 1 of the fill") == 0; w++) usleep(1000);     /* (the checkpoint thread counts it, then says it: CI 2026-11-25) */
   CHECK_EQ(log_count(6, "bulk checkpoint 1 of the fill"), 1);
   uint32_t k = 600;
   for (uint64_t seg = store_test_seg_bytes(s); seg < st.bulk_next_bytes && k < 20000; seg = store_test_seg_bytes(s)) CHECK_EQ(put_i(s, 0, k++, 2, NULL), 0);
@@ -9595,6 +9596,17 @@ static void ix_priv_hook(int step) {
   }
   while (atomic_load(&g_ix_hold) == 1) usleep(1000);
 }
+/* no build of ix / sx runs (a build that the writers began may end after the call that began it: a checkpoint before its end does not hold the generation it puts in) */
+static bool ix_build_idle(store_t *s) {
+  store_stats_t st;
+  for (int w = 0; w < 60000; w++) {
+    store_stats(s, &st);
+    if (!st.index_build_active) return true;
+    usleep(1000);
+  }
+  printf("  a build of the index still runs after 60 s (builds %llu, in the mutex %llu)\n", (unsigned long long)st.index_builds, (unsigned long long)st.index_builds_in_lock);
+  return false;
+}
 static void test_fb_growth(void) {
   printf("[growth through the file builder: no generation in private memory, the growth inside the mutex at 3/4 for a big index, the duplicates of a rebuild]\n");
   atomic_store(&store_test_fb_window, 256u);
@@ -9632,6 +9644,7 @@ static void test_fb_growth(void) {
   for (uint32_t i = n; i < n + 2000; i++) CHECK_EQ(known_i(s, 0, i, 1), 0);
   n += 2000;
   CHECK_EQ(ix_unreached(s, 0, n), 0);
+  CHECK(ix_build_idle(s));                            /* (CI 2026-11-25: the build of the last growth put its generation in after the checkpoint: the files did not match) */
   check_consistent(s, "growth by the builder");
   CHECK_EQ(store_checkpoint(s), 0);
   CHECK(store_test_files_match(s));
@@ -9648,14 +9661,8 @@ static void test_fb_growth(void) {
   }
   store_stats(s, &st);
   CHECK(st.index_builds_in_lock > inlock0);
-  const uint64_t nb0 = st.index_builds;
   atomic_store(&g_ix_hold, 0);
-  for (int w = 0; w < 60000; w++) {                   /* (the build that waited ends: dropped, its files gone) */
-    store_stats(s, &st);
-    if (st.index_builds > nb0) break;
-    usleep(1000);
-  }
-  CHECK(st.index_builds > nb0);
+  CHECK(ix_build_idle(s));                            /* (the build that waited ends: dropped, its files gone) */
   atomic_store(&store_test_regrow_hook, NULL);
   atomic_store(&store_test_rg_small, 0);
   CHECK_EQ(ix_unreached(s, 0, n), 0);
@@ -10033,6 +10040,61 @@ static void test_dx_clean_exit(void) {
   tdir_free(&d);
 }
 
+/* The growth inside the writer mutex, for sure (no build is begun on a thread of its own): a small index grows at one half in memory, a big one at 3/4 with the file builder (Q3) */
+static void test_regrow_inlock(void) {
+  printf("[the growth inside the writer mutex: a small index at one half (memory), a big one at 3/4 (the file builder)]\n");
+  tdir_t d;
+  tdir_new(&d, "regrow");
+  store_opts_t o;
+  small_opts(&o);
+  o.checkpoint_interval_ms = UINT32_MAX;
+  store_t *s = NULL;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (!s) { tdir_free(&d); return; }
+  CHECK_EQ(store_view_add(s, "default"), 0);
+  atomic_store(&store_test_no_rg_spawn, true);
+  store_stats_t st;
+  uint32_t n = 0;
+  for (; n < 50000; n++) {                             /* (a small index: the growths are made inside the mutex at one half, in memory) */
+    CHECK_EQ(known_i(s, 0, n, 1), 0);
+    if ((n & 127) == 0) { store_stats(s, &st); if (st.growths >= 2) break; }
+  }
+  store_stats(s, &st);
+  CHECK(st.growths >= 2);
+  CHECK_EQ(st.growths_background, 0);
+  CHECK_EQ(st.index_builds_in_lock, 0);
+  CHECK(st.ix_used * 2 <= st.ix_slots);
+  const uint64_t g0 = st.growths;
+  atomic_store(&store_test_rg_small, 4096u);            /* (every index is big now: not before 3/4, and with the builder) */
+  for (uint32_t k = 0; k < 200000; k++, n++) {
+    CHECK_EQ(known_i(s, 0, n, 1), 0);
+    if ((k & 127) == 0) { store_stats(s, &st); if (st.index_builds_in_lock >= 1) break; }
+  }
+  store_stats(s, &st);
+  printf("  %u zones: %llu growths (%llu with the file builder inside the mutex), ix %llu slots, %llu used\n", n, (unsigned long long)st.growths, (unsigned long long)st.index_builds_in_lock,
+         (unsigned long long)st.ix_slots, (unsigned long long)st.ix_used);
+  CHECK(st.index_builds_in_lock >= 1);
+  CHECK(st.growths > g0);
+  CHECK_EQ(st.growths_background, 0);
+  atomic_store(&store_test_no_rg_spawn, false);
+  atomic_store(&store_test_rg_small, 0);
+  CHECK_EQ(ix_unreached(s, 0, n), 0);
+  check_consistent(s, "grown inside the mutex");
+  CHECK_EQ(store_checkpoint(s), 0);
+  CHECK(store_test_files_match(s));
+  CHECK_EQ(store_close(s), 0);
+  o.create = false;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (s) {
+    store_stats(s, &st);
+    CHECK(st.recovery.was_clean && !st.recovery.rebuilt);
+    CHECK_EQ(ix_unreached(s, 0, n), 0);
+    CHECK_EQ(store_close(s), 0);
+  }
+  CHECK_EQ(ix_scratch(&d), 0);
+  tdir_free(&d);
+}
+
 /* the builder with buckets larger than one read (a bucket is read in pieces of whole entries) and more than one window: 40000 zones in windows of 32768 slots */
 static void test_fb_buckets(void) {
   printf("[the file builder with buckets of several reads: 40000 zones, windows of 32768 slots]\n");
@@ -10234,6 +10296,7 @@ int main(void) {
     test_dx_clean_exit();
     test_fb_wrap();
     test_fb_growth();
+    test_regrow_inlock();
     test_dx_faults();
     test_dx_kill();
   }

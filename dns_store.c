@@ -4951,6 +4951,9 @@ static int regrow_locked(store_t *s, uint64_t ix_slots, uint64_t sx_slots) {
 #define RG_ROUNDS 16
 #define RG_PRESS 7u                           /* store_index_wait() waits while a build runs and the index is past RG_PRESS / 16 of its slots (the build began at 3/8 = 6/16, the growth inside the mutex is at 8/16) */
 #ifdef KARIDNS_UNIT_TEST
+_Atomic bool store_test_no_rg_spawn;
+#endif
+#ifdef KARIDNS_UNIT_TEST
 _Atomic long store_test_rg_tail = -1;
 #define RG_TAIL_NOW() (atomic_load_explicit(&store_test_rg_tail, memory_order_relaxed) >= 0 ? (size_t)atomic_load_explicit(&store_test_rg_tail, memory_order_relaxed) : (size_t)RG_TAIL)
 #else
@@ -5089,6 +5092,9 @@ static void *rg_main(void *arg) {
  * false: none was started (one runs, the store closes, no thread). */
 static bool rg_start_locked(store_t *s, uint64_t nix, uint64_t nsx, bool spawn) {
   if (s->rg_active || atomic_load_explicit(&s->rg_stop, memory_order_relaxed) || (!nix && !nsx)) return false;
+#ifdef KARIDNS_UNIT_TEST
+  if (spawn && atomic_load_explicit(&store_test_no_rg_spawn, memory_order_relaxed)) return false;     /* (tests: the growth inside the mutex, for sure) */
+#endif
   uint64_t hwm = VG(s, V_HWM);
   if (hwm > st_zt_cap(s)) hwm = st_zt_cap(s);
   s->rg_nix = nix;
@@ -5658,6 +5664,12 @@ int store_bulk_end(store_t *s, unsigned how) {
       if (atomic_load_explicit(&s->rg_stop, memory_order_relaxed) || st_now_ms() - t0 > ST_BULK_END_MAX_MS) return -EAGAIN;
       usleep(1000);
     }
+  }
+  if (deferred && s->fl_on) {
+    /* (the build ended the fill and woke the checkpoint thread, bulk_end_said(): its checkpoint is the end, a second one forced here would write every table again; if it has not
+     * made it in a while, the forced one below does) */
+    const uint64_t t1 = st_now_ms();
+    while (atomic_load_explicit(&s->bulk_end_pending, memory_order_relaxed) && st_now_ms() - t1 < 10000u && !atomic_load_explicit(&s->rg_stop, memory_order_relaxed)) usleep(1000);
   }
   const bool pending = atomic_load_explicit(&s->bulk_end_pending, memory_order_relaxed);
   if (!pending) return 0;
@@ -8341,6 +8353,7 @@ void store_stats(const store_t *s, store_stats_t *o) {
   o->index_delta_full = LD(n_dx_full);
   o->index_delta_waits = LD(n_dx_waits);
   o->index_builds = LD(n_fb);
+  o->index_build_active = atomic_load_explicit(&s->rg_live, memory_order_acquire) > 0;
   o->index_build_us = LD(n_fb_us);
   o->index_build_max_us = LD(fb_max_us);
   o->index_builds_in_lock = LD(n_fb_inlock);

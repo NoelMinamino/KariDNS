@@ -348,6 +348,7 @@ typedef struct store_stats {
   uint64_t index_delta_full;        /* changes refused because the memtable was full and the spill behind (-ENOSPC: the zone is listed again by the next pass) */
   uint64_t index_delta_waits;       /* store_index_wait() calls that gave the spill a short time */
   uint64_t index_builds, index_build_us, index_build_max_us;   /* builds of ix / sx outside the writer mutex by the file builder: number, total and longest time */
+  uint32_t index_build_active;      /* 1 while a build of ix / sx runs (outside the writer mutex) */
   uint64_t index_builds_in_lock;    /* growths of a big index inside the writer mutex (at 3/4: the build outside it did not end in time) */
   uint64_t index_build_bytes, index_build_peak_bytes;   /* the builder's anonymous memory (its window and bucket buffers): now, the most */
   uint64_t index_build_written_bytes;   /* bytes it wrote (windows of the generation files, buckets) */
@@ -771,6 +772,7 @@ extern _Atomic uint64_t store_test_dx_mem_bytes;
 extern _Atomic unsigned store_test_dx_fan;
 extern _Atomic uint64_t store_test_fb_window;
 extern _Atomic uint64_t store_test_rg_small;
+extern _Atomic bool store_test_no_rg_spawn;
 extern void (*_Atomic store_test_dx_hook)(store_t *s, int step);
 extern int (*_Atomic store_test_ix_fault)(int what);
 enum { STORE_DXS_SPILL_SORTED = 1, STORE_DXS_SPILL_WRITTEN, STORE_DXS_SPILL_PUBLISHED, STORE_DXS_MERGE_WRITTEN, STORE_DXS_MERGE_PUBLISHED, STORE_FBS_SCANNED, STORE_FBS_PLACED,
