@@ -4527,15 +4527,16 @@ tables (0.7):\fR the pages of \fBzt\fR, \fBzc\fR, \fBnx\fR, \fBix\fR and
 yet are memory of the process that the kernel cannot drop (see "The tables in
 memory" under the zone store), at most about \fBstore.tables.private_max\fR (a
 32nd of the RAM, 64 MiB to 1 GiB) plus, during the listing pass of a first fill,
-the indexes made for it (not bounded yet: 43 bytes a zone when they are built
-once, measured up to about 165 bytes per name at 100 million zones when the
-growths overlap, so a first fill of 100 million zones does not fit on a 16 GB
-host; a known limit), shown as \fBstore.tables.private_bytes\fR by \fBkarictl
-store\fR; the zones in memory get the limit less those bytes, and at least a
-tenth of the limit. Raise \fBmemory\-limit\fR by that much when you move to the
-store; a WARNING says so (at most once an hour) while the tables hold half of
-the limit or more. A reload of \fBkaridns.conf\fR changes it: within 50 ms when
-a limit is set, within a second when there was none.
+its index delta and, after the pass, the window of the build of the indexes
+(0.7, \fBstore.index.delta.bytes\fR, \fBstore.index.build.bytes\fR: together
+within an eighth of the limit; before, the indexes grew with the names, about
+165 bytes per name at 100 million zones), shown as
+\fBstore.tables.private_bytes\fR by \fBkarictl store\fR; the zones in memory get
+the limit less those bytes, and at least a tenth of the limit. Raise
+\fBmemory\-limit\fR by that much when you move to the store; a WARNING says so
+(at most once an hour) while the tables hold half of the limit or more. A reload
+of \fBkaridns.conf\fR changes it: within 50 ms when a limit is set, within a
+second when there was none.
 .IP \(bu 2
 \fBThe default (0.7.x).\fR A database block whose zones go to the zone store
 (\fBstore\fR, the default of a production server) and that does not write
@@ -5481,72 +5482,78 @@ least 64 MiB and at most 1 GiB) since the last one gave its pages back
 listing pass. Without the bound every page stayed private for the life of the
 process, about 180 to 225 bytes a zone during a first fill: 2.7 GB at 15 million
 zones, and the first fill of 100 million zones on a 16 GB host was killed by the
-kernel at 57 million. What stays above the bound for a while: an index made for
-a first fill or by a growth (\fBix.N\fR, \fBsx.N\fR, about 21 bytes a zone each
-for a first fill, 43 for both; \fBstore.tables.private_index_bytes\fR) is
-private whole until a checkpoint after the listing pass wrote it, and the bound
-does not hold them: in the listing pass of a first fill they grow with the
-number of names (measured 14.9 GB at 90 million names, three generations alive
-at once), a known limit of 0.7 that a later version removes by building them
-once after the pass; \fBmemory\-limit\fR counts the private pages (see "Memory
-limit"). A restart writes nothing until a zone changes, so after a restart the
-figure starts at 0. Recovery is unchanged: the last checkpoint and the replay of
-the journal; a crash between a growth of an index and the next checkpoint (the
-new \fBix.N\fR / \fBsx.N\fR holds nothing yet) makes the next start rebuild the
-indexes from \fBzt.1\fR, a few seconds at 10 million zones. The files stay in
-the format of earlier versions; go back to an earlier version only after a clean
-stop. \fBThe first fill without a journal (0.7).\fR The first fill of an empty
-store (the first pass finds no zone record in any view and no bytes in the
-segments, and reserves the tables for the zones the loader announces) keeps no
-journal: the database holds every zone, so a fill that a crash cuts off can be
-read again. A configuration with secondary zones whose copies the store keeps
-fills with the journal, as before: their copies must be durable when they are
-acknowledged. Before the first change the store makes a superblock durable that
-says so; from then on the writers (the pass, the bodies) change the tables as
-before but write no journal record, nothing is synced by a commit, and no
-checkpoint is made by the size of the journal or by its interval; the cleaner,
-the removal of empty segments and the scrub wait until the end of the fill is on
-disk (\fBkarictl store compact\fR and \fBstore scrub\fR say it is busy). A
-secondary's copy that is to be stored meanwhile (a secondary added by a
-reconfiguration) asks for the end of the fill and is stored once that end is on
-disk (the zone is served from memory meanwhile, without a new transfer). While
-the bodies are fetched the store makes \fIbulk checkpoints\fR, its durable
-points: the segments are synced, the changed pages of the zone table and the
-long names are written (and of the indexes once the pass is over: the pass
-inserts into every page of them; a recovery rebuilds them in any case), each
-time the segments have doubled since the last one and grew by 4 GiB or more, and
-15 minutes after the last one at the latest; and, also during the pass, whenever
-the private memory of the tables grew by \fBstore.tables.private_max\fR (see
-"The tables in memory": without this the pass of a fill of 100 million zones
-kept 13.5 GB of table pages in memory and the kernel killed the server). The
-fill ends by itself when every view has had its pass end complete (a pass that
-failed or was cut off keeps it for the next pass), no body of the fill is on its
-way and the fill has nothing more to fetch (the zones left without a body are
-the ones it does not fetch: refused, or not kept in the store): from then on
-every change is logged again, and one checkpoint, on the store's checkpoint
-thread, writes every table, the indexes included; until it is on disk
-(\fBstore.bulk.end_pending\fR) it is tried again after a failure, with a
-back-off of 1 s that doubles up to 5 minutes, and it is not tried at all while
-the free space is below what it would write; a crash meanwhile is a crash of the
-fill. What it saves: a logged fill of 10 million zones on ZFS wrote about 25 GB
-to the device for 3.5 GB of images (lz4), most of it the journal, the
-checkpoints of the pass and the fsyncs of the commits, which ZFS writes twice
-(through the ZIL); the unlogged fill writes the images, its bulk checkpoints (2
-or 3 by the segments at 10 million zones, and the ones for the bound of the
-private memory, each writing about \fBstore.tables.private_max\fR of table
-pages) and the last one. The cost: \fBa crash during the first fill goes back to
-the last bulk checkpoint\fR (or to the empty store, before the first one):
-nothing is replayed, the tables are rebuilt from the zone table (seconds at 10
-million zones), a zone whose image is past that checkpoint is kept as a known
-zone and fetched again, the cursors of the views are dropped and the loader
-lists every zone again (also at a later start if the next one has no database
-block: \fBstore.bulk.cut\fR), and a WARNING says to what point the store went
-back; the zones after it are read from the database again, and the server
-answers meanwhile as for any zone that is not in the store. Changes made after
-the end of the fill and before its checkpoint is on disk go back with it. A
-clean stop in the middle of the fill keeps it: the next start needs no rebuild
-and the rest of the fill is unlogged as well. A pass over a store that holds
-zones already is logged as before, with the larger journal of
+kernel at 57 million. The indexes (0.7): a new generation of \fBix.N\fR /
+\fBsx.N\fR (a growth, the rebuild of a start) is made by the file builder as a
+file and mapped from it, so it is page cache and only the pages changed after it
+count (\fBstore.tables.private_index_bytes\fR); a small one (64 MiB or less)
+that fills up before the build outside the writer mutex ends is still grown
+inside the mutex in memory, private whole until a checkpoint wrote it. During
+the listing pass of a first fill no index grows: the new names go into an index
+delta (memtables, sorted runs in scratch files \fBixr.N\fR, a Bloom filter:
+\fBstore.index.delta.*\fR, counted in \fBmemory\-limit\fR) and the indexes are
+built once after the pass (before, they grew with the names: 14.9 GB at 90
+million names, three generations alive at once); \fBmemory\-limit\fR counts the
+private pages (see "Memory limit"). A restart writes nothing until a zone
+changes, so after a restart the figure starts at 0. Recovery is unchanged: the
+last checkpoint and the replay of the journal; a crash between a growth of an
+index and the next checkpoint (the new \fBix.N\fR / \fBsx.N\fR holds nothing
+yet) makes the next start rebuild the indexes from \fBzt.1\fR, a few seconds at
+10 million zones. The files stay in the format of earlier versions; go back to
+an earlier version only after a clean stop. \fBThe first fill without a journal
+(0.7).\fR The first fill of an empty store (the first pass finds no zone record
+in any view and no bytes in the segments, and reserves the tables for the zones
+the loader announces) keeps no journal: the database holds every zone, so a fill
+that a crash cuts off can be read again. A configuration with secondary zones
+whose copies the store keeps fills with the journal, as before: their copies
+must be durable when they are acknowledged. Before the first change the store
+makes a superblock durable that says so; from then on the writers (the pass, the
+bodies) change the tables as before but write no journal record, nothing is
+synced by a commit, and no checkpoint is made by the size of the journal or by
+its interval; the cleaner, the removal of empty segments and the scrub wait
+until the end of the fill is on disk (\fBkarictl store compact\fR and \fBstore
+scrub\fR say it is busy). A secondary's copy that is to be stored meanwhile (a
+secondary added by a reconfiguration) asks for the end of the fill and is stored
+once that end is on disk (the zone is served from memory meanwhile, without a
+new transfer). While the bodies are fetched the store makes \fIbulk
+checkpoints\fR, its durable points: the segments are synced, the changed pages
+of the zone table and the long names are written (not of the indexes while the
+pass's index delta is there, nor of the generations of the build after the pass
+before it ends; a recovery rebuilds them in any case), each time the segments
+have doubled since the last one and grew by 4 GiB or more, and 15 minutes after
+the last one at the latest; and, also during the pass, whenever the private
+memory of the tables grew by \fBstore.tables.private_max\fR (see "The tables in
+memory": without this the pass of a fill of 100 million zones kept 13.5 GB of
+table pages in memory and the kernel killed the server). The fill ends by itself
+when every view has had its pass end complete (a pass that failed or was cut off
+keeps it for the next pass), no body of the fill is on its way and the fill has
+nothing more to fetch (the zones left without a body are the ones it does not
+fetch: refused, or not kept in the store): from then on every change is logged
+again, and one checkpoint, on the store's checkpoint thread, writes every table,
+the indexes included; until it is on disk (\fBstore.bulk.end_pending\fR) it is
+tried again after a failure, with a back-off of 1 s that doubles up to 5
+minutes, and it is not tried at all while the free space is below what it would
+write; a crash meanwhile is a crash of the fill. What it saves: a logged fill of
+10 million zones on ZFS wrote about 25 GB to the device for 3.5 GB of images
+(lz4), most of it the journal, the checkpoints of the pass and the fsyncs of the
+commits, which ZFS writes twice (through the ZIL); the unlogged fill writes the
+images, its bulk checkpoints (2 or 3 by the segments at 10 million zones, and
+the ones for the bound of the private memory, each writing about
+\fBstore.tables.private_max\fR of table pages) and the last one. The cost: \fBa
+crash during the first fill goes back to the last bulk checkpoint\fR (or to the
+empty store, before the first one): nothing is replayed, the tables are rebuilt
+from the zone table (seconds at 10 million zones), a zone whose image is past
+that checkpoint is kept as a known zone and fetched again, the cursors of the
+views are dropped and the loader lists every zone again (also at a later start
+if the next one has no database block: \fBstore.bulk.cut\fR), and a WARNING says
+to what point the store went back; the zones after it are read from the database
+again, and the server answers meanwhile as for any zone that is not in the
+store. Changes made after the end of the fill and before its checkpoint is on
+disk go back with it. A clean stop in the middle of the fill keeps it and the
+rest of the fill is unlogged as well; the next start needs no rebuild, unless
+the stop came during a listing pass or the build after it (the index delta is
+not written: the start rebuilds the indexes from the zone table with the file
+builder, about a minute at 100 million zones, and answers after it). A pass over
+a store that holds zones already is logged as before, with the larger journal of
 \fBstore.journal.boost\fR. \fBkarictl store\fR shows it as \fBstore.bulk.*\fR
 and \fBstore.journal.bytes_written\fR. \fBThe ARC and a restart with many zones
 (COPY mode).\fR A restart is fast when the records of the zones the queries want

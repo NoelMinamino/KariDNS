@@ -1071,12 +1071,13 @@ writers' journal appends do not queue behind a burst of it)
 0.7: the pages of the tables that the server changed and no checkpoint has given
 back to the page cache yet: memory of the process that the kernel cannot drop (0
 after a restart until a zone changes); \fB.private_index_bytes\fR is the share
-of \fBix\fR and \fBsx\fR (an index made by a growth or for a first fill is
-counted whole until a checkpoint wrote it, and a checkpoint during the listing
-pass of a first fill does not write it, so in that pass the figure is not
-bounded by \fB.private_max\fR: it grows with the number of names, a known limit
-of 0.7). \fBmemory\-limit\fR counts it: the zones in memory get the limit less
-this, at least a tenth of the limit (docs/karidns.md, "The tables in memory")
+of \fBix\fR and \fBsx\fR (0.7: a generation that a growth or a rebuild makes is
+a file written by the builder and mapped from it, so it counts only the pages
+changed since; during the listing pass of a first fill no generation grows at
+all: the new names go into the index delta, \fBstore.index.delta.*\fR; a small
+index grown inside the writer mutex is counted whole until a checkpoint wrote
+it). \fBmemory\-limit\fR counts it: the zones in memory get the limit less this,
+at least a tenth of the limit (docs/karidns.md, "The tables in memory")
 .TP 8
 \fBstore.tables.private_max\fR, \fB.private_checkpoints\fR, \fB.released_bytes\fR, \fB.release_max_us\fR, \fB.release_errors\fR
 0.7: the bound of that memory (a 32nd of the RAM, at least 64 MiB and at most 1
@@ -1207,6 +1208,55 @@ and those that ended at their bound (30 s) with the build still running: the
 pass goes on then and the growth inside the mutex is the last resort (a
 WARNING). A first fill that announces its size (the loader's estimate, up to a
 quarter of \fBmemory\-limit\fR) makes its index once and waits for nothing
+.TP 8
+\fBstore.index.delta.active\fR, \fB.frozen\fR, \fB.count\fR
+0.7: 1 while the listing pass of an unlogged first fill puts its new names into
+the index delta instead of \fBix\fR / \fBsx\fR (no index growth and no wait for
+one during the pass; the indexes are built once after it, see
+\fBstore.index.build.*\fR); the memtables of the delta that wait for their spill
+(more than a few: the disk is behind; the pass then gives the spill up to 200 ms
+between two groups, \fB.waits\fR); deltas begun since the start
+.TP 8
+\fBstore.index.delta.bytes\fR, \fB.peak_bytes\fR, \fB.bloom_bytes\fR
+0.7: the anonymous memory of the delta now and at most since the start: its
+memtables, the Bloom filter of its runs (\fB.bloom_bytes\fR), the fences of the
+runs. The delta and a build beside it stay within an eighth of
+\fBmemory\-limit\fR (without a limit: within \fBstore.tables.private_max\fR): a
+memtable is a sixteenth of that (at most five alive; \fBmemory\-limit\fR 256M: 2
+MiB each), the Bloom filter at most a quarter, the window and the bucket buffers
+of a build a sixteenth each per index; a small limit makes small memtables and
+more spills. \fBmemory\-limit\fR counts it
+.TP 8
+\fBstore.index.delta.runs\fR, \fB.run_entries\fR, \fB.spills\fR, \fB.spill_us\fR, \fB.merges\fR, \fB.scratch_bytes\fR
+0.7: the runs of the delta (files \fBixr.N\fR beneath the store directory,
+sorted by hash, read through the page cache), their entries, the memtables
+written as runs and their total time, the merges of runs, the bytes the spills
+and merges wrote. The runs are scratch: removed with the delta, and by the next
+start after a crash
+.TP 8
+\fBstore.index.delta.spill_errors\fR, \fB.full\fR, \fB.waits\fR
+0.7: writes of a run that failed (ENOSPC, EIO: the memtable stays in memory and
+keeps answering; tried again a second later); changes refused because every
+memtable was full (\fB\-ENOSPC\fR, the zone is listed again by the next pass);
+waits of the pass for the spill
+.TP 8
+\fBstore.index.build.count\fR, \fB.us\fR, \fB.max_us\fR, \fB.in_lock\fR
+0.7: the builds of \fBix\fR / \fBsx\fR outside the writer mutex (the growth of
+an index, and the one build after the listing pass of a first fill) by the file
+builder: the entries of a pass over the zone table go into bucket files by the
+slot they belong to, each bucket is placed in a window (a sixteenth of an eighth
+of \fBmemory\-limit\fR, at most 64 MiB) and the window written into the new
+generation file in order, which is then mapped from the file (page cache) and
+synced by the next checkpoint; their number, total and longest time;
+\fB.in_lock\fR: growths of an index of more than 64 MiB made inside the writer
+mutex (at 3/4 of it, when the build outside the mutex did not end in time; also
+by the builder; a WARNING each time)
+.TP 8
+\fBstore.index.build.bytes\fR, \fB.peak_bytes\fR, \fB.written_bytes\fR, \fB.buckets\fR, \fB.carries\fR
+0.7: the builder's anonymous memory (its window and the bucket buffers of 64 KiB
+each) now and at most, the bytes it wrote (windows and buckets), the bucket
+files it made (none for an index that fits one window: a small store writes its
+generation files and nothing else), the entries carried into the next window
 .TP 8
 \fBstore.flusher\fR
 1: the store's flusher threads make the commits (every 100 ms while records
