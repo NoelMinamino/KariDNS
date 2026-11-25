@@ -153,10 +153,15 @@ typedef struct store_opts {
    * writes grew by this much since the last one gave its pages back (also during the manifest pass of a bulk fill), and every checkpoint maps the pages it wrote from their files again.
    * 0 = the RAM / 32 (physmem), at least 64 MiB and at most 1 GiB; UINT64_MAX = no checkpoint for it (the pages are still given back). */
   uint64_t tables_private_max;
+  /* 0.7: the memory-limit the server applies (database { memory-limit }; 0 = none given): the index delta of a first fill and the builder of ix / sx stay within an eighth of it (with none given:
+   * within tables_private_max).  store_set_mem_limit() changes it (a reload) */
+  uint64_t mem_limit;
 } store_opts_t;
 
 /* The zones the tables are reserved room for: `opt` (store-max-zones) when not 0, else the RAM (physmem / 256 bytes, a power of two, 1M .. 2^25; physmem 0 = unknown: 2^25). */
 uint32_t store_reserve_zones(uint64_t physmem, uint32_t opt);
+
+void store_set_mem_limit(store_t *s, uint64_t bytes);
 
 /* defaults of every field above (mode AUTO, create false, ...) */
 void store_opts_default(store_opts_t *o);

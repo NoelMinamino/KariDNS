@@ -680,6 +680,7 @@ struct store {
   _Atomic int dx_live;                                /* spill threads that may still touch the store (store_close() waits for them) */
   _Atomic uint64_t dx_bytes;                          /* anonymous memory of the delta: memtables, the Bloom filter, fences, the spill's sort buffer (store.index.delta.bytes; counted in memory-limit) */
   _Atomic uint64_t dx_peak, n_dx, n_dx_spills, n_dx_merges, n_dx_spill_err, n_dx_full, n_dx_waits, dx_runs, dx_run_ents, dx_bloom_bytes, n_dx_spill_us, n_dx_scratch_bytes;
+  _Atomic uint64_t mem_limit;                         /* the memory-limit of the server (store_opts_t.mem_limit, store_set_mem_limit()): ix_budget() */
   _Atomic uint64_t fb_bytes, fb_peak;                 /* the file builder's anonymous memory (its window and bucket buffers), now and the most */
   _Atomic uint64_t n_fb, n_fb_us, fb_max_us, n_fb_written, n_fb_buckets, n_fb_carry, n_fb_inlock;
   /* holds of the writer mutex */
@@ -3835,13 +3836,24 @@ static void dx_acct(store_t *s, size_t n, bool add) {
   uint64_t m = atomic_load_explicit(&s->dx_peak, memory_order_relaxed);
   while (b > m && !atomic_compare_exchange_weak_explicit(&s->dx_peak, &m, b, memory_order_relaxed, memory_order_relaxed)) {}
 }
-/* the largest memtable: an eighth of the bound of the private tables, 1 MiB .. 128 MiB (pc31: 64 MiB; a VPS of 1 GB: 8 MiB; Q7) */
+/* The memory of the index delta and of the builder (0.7): an eighth of the memory-limit the server applies (store_opts_t.mem_limit, store_set_mem_limit(); 256M: 32 MiB), or, with no
+ * limit given, the bound of the private tables (tables_private_max).  Of it: each memtable a sixteenth (at most five alive: M and DX_MAXF frozen ones), the Bloom filter a quarter, the window
+ * and the bucket buffers of each index of a build a sixteenth each: so the delta and a build that runs beside it stay within it.  A limit too small for a useful memtable makes small ones:
+ * more spills, never more memory. */
+static uint64_t ix_budget(const store_t *s) {
+  const uint64_t ml = atomic_load_explicit(&s->mem_limit, memory_order_relaxed);
+  if (ml) return ml / 8 < (256u << 10) ? 256u << 10 : ml / 8;
+  return s->priv_max == UINT64_MAX ? 1ull << 30 : s->priv_max;
+}
+/* the largest memtable: a sixteenth of ix_budget(), 4 KiB .. 128 MiB (memory-limit 256M: 2 MiB; 2G: 16 MiB) */
 static uint64_t dx_mem_cap(const store_t *s) {
 #ifdef KARIDNS_UNIT_TEST
   if (atomic_load_explicit(&store_test_dx_mem_bytes, memory_order_relaxed)) return atomic_load_explicit(&store_test_dx_mem_bytes, memory_order_relaxed);
 #endif
-  const uint64_t c = s->priv_max == UINT64_MAX ? (128ull << 20) : s->priv_max / 8;
-  return c < (1ull << 20) ? 1ull << 20 : c > (128ull << 20) ? 128ull << 20 : c;
+  const uint64_t c = ix_budget(s) / 16;
+  uint64_t b = 4096;
+  while (b * 2 <= c && b < (128ull << 20)) b <<= 1;      /* (a power of two: the doubling of dx_room_locked() reaches it) */
+  return b;
 }
 /* the first memtable (made at the first insert of the pass): room for the announced zones (two hints each, full at one half), a page at least (64 KiB when none were announced), at most the
  * bound (a fill of 100 zones: 8 KiB; before, its reserve made 16 KiB of anonymous index) */
@@ -3887,7 +3899,7 @@ static void dx_mem_put(dmem_t *m, uint64_t h, uint32_t z, unsigned which) {
 /* the Bloom filter of the runs: 10 bits a key, one 64 B line a key (bloom_maybe()), at most a quarter of the bound of the private tables (pc31: 128 MiB; past its count the false positives
  * rise: a cost in speed, never in correctness) */
 static dbloom_t *dbloom_new(store_t *s, uint64_t keys) {
-  const uint64_t capb = s->priv_max == UINT64_MAX ? (128ull << 20) : s->priv_max / 4 < (64u << 10) ? 64u << 10 : s->priv_max / 4;
+  const uint64_t capb = ix_budget(s) / 4 < 4096 ? 4096 : ix_budget(s) / 4;
   uint64_t bytes = (keys * 10 / 8 + 63) & ~63ull;
   if (bytes < 4096) bytes = 4096;
   if (bytes > capb) bytes = capb & ~63ull;
@@ -4448,7 +4460,7 @@ static void dx_remove_scratch(store_t *s) {
  * names it syncs it (ixgen_t.needs_sync).  Anonymous memory: one window and the bucket buffers, never a second generation (C).  dedup (the rebuild): an entry whose key a placed one has (an
  * equal tag, then the name or the source key) is not placed: the earlier zone id wins (the buckets keep the order of the pass), and the zone is dropped by the caller (fb_t.drop). */
 #define FB_WIN (64ull << 20)
-#define FB_BUF (64u << 10)                    /* the buffer of a bucket: 5461 entries */
+#define FB_BUF (64u << 10)                    /* the largest buffer of a bucket (fb_t.bb: by the budget) */
 typedef struct __attribute__((packed)) { uint64_t h; uint32_t z; } fbent_t;
 typedef struct {
   store_t *s;
@@ -4467,6 +4479,7 @@ typedef struct {
   size_t nc, cc;
   uint32_t *drop;
   size_t nd, cd;
+  uint32_t bb;                                        /* the bytes of a bucket's buffer */
   uint64_t used;
   bool any;
 } fb_t;
@@ -4476,11 +4489,13 @@ static void fb_acct(store_t *s, size_t n, bool add) {
   uint64_t m = atomic_load_explicit(&s->fb_peak, memory_order_relaxed);
   while (b > m && !atomic_compare_exchange_weak_explicit(&s->fb_peak, &m, b, memory_order_relaxed, memory_order_relaxed)) {}
 }
-static uint64_t fb_window(void) {
+/* the window of one index in slots: a sixteenth of ix_budget(), at most FB_WIN (memory-limit 256M: 2 MiB, 262144 slots) */
+static uint64_t fb_window(const store_t *s) {
 #ifdef KARIDNS_UNIT_TEST
   if (atomic_load_explicit(&store_test_fb_window, memory_order_relaxed)) return atomic_load_explicit(&store_test_fb_window, memory_order_relaxed);
 #endif
-  return FB_WIN / 8;
+  const uint64_t w = ix_budget(s) / 16;
+  return (w > FB_WIN ? FB_WIN : w < 4096 ? 4096 : w) / 8;
 }
 static void fb_free(fb_t *b) {
   if (b->bfd) for (unsigned i = 0; i < b->P; i++) if (b->bfd[i] >= 0) close(b->bfd[i]);
@@ -4511,7 +4526,7 @@ static int fb_begin(store_t *s, fb_t *b, uint32_t kind, uint32_t gen, uint64_t n
   b->n = n;
   b->dedup = dedup;
   b->inst = inst;
-  uint64_t W = fb_window();
+  uint64_t W = fb_window(s);
   if (W > n) W = n;
   if ((n + W - 1) / W > FB_MAXP) W = (n + FB_MAXP - 1) / FB_MAXP;
   b->W = W;
@@ -4526,11 +4541,13 @@ static int fb_begin(store_t *s, fb_t *b, uint32_t kind, uint32_t gen, uint64_t n
     b->bfd = malloc(b->P * sizeof(int));
     b->blen = calloc(b->P, sizeof(uint32_t));
     b->boff = calloc(b->P, sizeof(uint64_t));
-    b->bbuf = malloc((size_t)b->P * FB_BUF);
+    const uint64_t bb = ix_budget(s) / 16 / b->P;     /* (the buffers of a bucket: a sixteenth of the budget over the buckets, 4 KiB .. FB_BUF, whole entries) */
+    b->bb = (uint32_t)((bb < 4096 ? 4096 : bb > FB_BUF ? FB_BUF : bb) / sizeof(fbent_t) * sizeof(fbent_t));
+    b->bbuf = malloc((size_t)b->P * b->bb);
     for (unsigned i = 0; b->bfd && i < b->P; i++) b->bfd[i] = -1;
     if (!b->bfd || !b->blen || !b->boff || !b->bbuf) { fb_free(b); return -ENOMEM; }
-    b->membytes += (size_t)b->P * FB_BUF;
-    fb_acct(s, (size_t)b->P * FB_BUF, true);
+    b->membytes += (size_t)b->P * b->bb;
+    fb_acct(s, (size_t)b->P * b->bb, true);
   }
   char name[32];
   st_name_ix(name, sizeof(name), kind == FK_IX ? "ix" : "sx", gen);
@@ -4624,7 +4641,7 @@ static int fb_bflush(fb_t *b, unsigned i) {
     atomic_fetch_add_explicit(&b->s->n_fb_buckets, 1, memory_order_relaxed);
   }
   const int f = IX_FAULT(2);
-  const int r = f ? f : st_pwrite_all(b->bfd[i], b->bbuf + (size_t)i * FB_BUF, b->blen[i], (off_t)b->boff[i]);
+  const int r = f ? f : st_pwrite_all(b->bfd[i], b->bbuf + (size_t)i * b->bb, b->blen[i], (off_t)b->boff[i]);
   if (r < 0) return r;
   b->boff[i] += b->blen[i];
   atomic_fetch_add_explicit(&b->s->n_fb_written, b->blen[i], memory_order_relaxed);
@@ -4637,9 +4654,9 @@ static int fb_add(fb_t *b, uint64_t h, uint32_t z) {
   if (b->P == 1) return fb_place(b, 0, b->n, h, z, home);
   const unsigned i = (unsigned)(home / b->W);
   const fbent_t e = { h, z };
-  memcpy(b->bbuf + (size_t)i * FB_BUF + b->blen[i], &e, sizeof(e));
+  memcpy(b->bbuf + (size_t)i * b->bb + b->blen[i], &e, sizeof(e));
   b->blen[i] += sizeof(e);
-  return b->blen[i] + sizeof(e) > FB_BUF ? fb_bflush(b, i) : 0;
+  return b->blen[i] + sizeof(e) > b->bb ? fb_bflush(b, i) : 0;
 }
 static int fb_wwin(fb_t *b, uint64_t base, uint64_t len) {
   if (!b->any) return 0;
@@ -4683,7 +4700,7 @@ static int fb_finish(fb_t *b, ixgen_t **out) {
     b->nc = b->cc = 0;
     for (size_t k = 0; k < nc && r == 0; k++) r = fb_place(b, base, len, c[k].h, c[k].z, 0);
     free(c);
-    const size_t rd = FB_BUF - FB_BUF % sizeof(fbent_t);   /* (whole entries a read: a bucket is a run of 12 B entries) */
+    const size_t rd = b->bb;                          /* (whole entries a read: a bucket is a run of 12 B entries, b->bb a multiple of them) */
     for (uint64_t off = 0; r == 0 && off < b->boff[i]; off += rd) {
       const size_t m = b->boff[i] - off < rd ? (size_t)(b->boff[i] - off) : rd;
       if ((r = st_pread_all(b->bfd[i], b->bbuf, m, (off_t)off)) < 0) break;
@@ -4905,7 +4922,11 @@ static int regrow_locked(store_t *s, uint64_t ix_slots, uint64_t sx_slots) {
   uint64_t hwm = VG(s, V_HWM), live_ix = 0, live_sx = 0;
   if (hwm > st_zt_cap(s)) hwm = st_zt_cap(s);
   const bool anon = ix_slots * 8 <= RG_SMALL_NOW() && sx_slots * 8 <= RG_SMALL_NOW();
-  if (!anon) atomic_fetch_add_explicit(&s->n_fb_inlock, 1, memory_order_relaxed);
+  if (!anon) {
+    atomic_fetch_add_explicit(&s->n_fb_inlock, 1, memory_order_relaxed);
+    st_log(s, 4, "store: the index reached 3/4 of its slots before its build outside the writer mutex ended: it is grown inside the mutex by the file builder (%" PRIu64 " slots; store.index.build.in_lock)",
+           ix_slots > sx_slots ? ix_slots : sx_slots);
+  }
   ixgen_t *nix = NULL, *nsx = NULL;
   const uint32_t ig = ix_slots ? s->ix_gen_next++ : 0, sg = sx_slots ? s->sx_gen_next++ : 0;
   int r = ix_build(s, ig, ix_slots, sg, sx_slots, hwm, false, anon, 1, &nix, &nsx, &live_ix, &live_sx);
@@ -5539,6 +5560,9 @@ static void dx_build_kick(store_t *s) {
   wr_lock_raw(s);
   if (s->dx && (atomic_load_explicit(&s->bulk_body, memory_order_relaxed) || s->dx_end_want) && !s->rg_active && st_now_ms() >= s->dx_retry_ms) dx_build_start_locked(s);
   wr_unlock_raw(s);
+}
+void store_set_mem_limit(store_t *s, uint64_t bytes) {
+  if (s) atomic_store_explicit(&s->mem_limit, bytes, memory_order_relaxed);
 }
 void store_bulk_phase(store_t *s, int phase) {
   if (!s || (phase != STORE_BULK_PASS && phase != STORE_BULK_BODY && phase != STORE_BULK_PASSED)) return;
@@ -9398,6 +9422,7 @@ int store_open(int dirfd, const store_opts_t *opts, store_t **out) {
   if (s->o.sync_interval_ms == 0) s->o.sync_interval_ms = 100;
   if (s->o.checkpoint_interval_ms == 0) s->o.checkpoint_interval_ms = 30000;
   if (s->o.journal_max_bytes == 0) s->o.journal_max_bytes = 100ull << 20;
+  atomic_store_explicit(&s->mem_limit, s->o.mem_limit, memory_order_relaxed);
   s->priv_max = s->o.tables_private_max;              /* (0.7, the bound of the private memory of the tables, priv_due(): a 32nd of the RAM, 64 MiB .. 1 GiB) */
   if (!s->priv_max) {
     const uint64_t pm = (s->o.physmem ? s->o.physmem : st_physmem()) / 32;

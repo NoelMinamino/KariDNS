@@ -1945,6 +1945,7 @@ static void *ticker_thread(void *arg) {
     if (st) {
       pthread_mutex_unlock(&G.wlock);
       (void)store_tick(st);
+      store_set_mem_limit(st, dbreg_cache_limit());
       bulk_end_check(st);
       store_stats_t ss;
       store_stats(st, &ss);
@@ -3906,6 +3907,7 @@ bool db_recon_begin(const char *view, uint64_t estimate, bool force, char *why, 
    * space of zt / zc: 1 << 25 records) and by what memory-limit can give the two indexes: 8 bytes a slot, 8/3 slots a zone, in ix and in sx = 43 bytes a zone, a quarter of memory-limit
    * at the most (10M zones: 430 MB, 11 percent of 3840M).  Beyond that the tables grow by themselves, with the pass waiting for the build, store_index_wait()) */
   const uint64_t lim = dbreg_cache_limit();
+  store_set_mem_limit(st, lim);                             /* (0.7: the index delta of the pass sizes itself from memory-limit: in force before its first insert) */
   uint64_t cap = (1ull << 25) - 1;
   if (lim && lim / 4 / 43 < cap) cap = lim / 4 / 43;
   const uint64_t want = estimate < cap ? estimate : cap;
@@ -4412,6 +4414,7 @@ static store_t *core_start(const server_config_t *cfg, bool *created_out, bool *
     if (bb && *bb) o.bulk_ckpt_bytes = strtoull(bb, NULL, 10);
     if (bm && *bm) o.bulk_ckpt_interval_ms = (uint32_t)strtoul(bm, NULL, 10);
   }
+  o.mem_limit = dbreg_cache_limit();                        /* (0.7: the index delta of a first fill and the build of ix / sx stay within an eighth of memory-limit; the ticker follows a reload) */
 #endif
   store_t *st = NULL;
   bool quarantined = false;

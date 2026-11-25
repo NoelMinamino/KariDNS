@@ -9835,6 +9835,45 @@ static void test_fb_wrap(void) {
   tdir_free(&d);
 }
 
+/* the delta and the builder within the memory-limit the server gives (an eighth of it): memory-limit 8 MiB, a pass of 20000 zones and its build */
+static void test_dx_budget(void) {
+  printf("[the index delta and the builder within an eighth of memory-limit: 8 MiB, 20000 zones]\n");
+  tdir_t d;
+  tdir_new(&d, "dxbudget");
+  store_opts_t o;
+  bulk_opts(&o);
+  o.mem_limit = 64u << 20;
+  store_t *s = NULL;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (!s) { tdir_free(&d); return; }
+  store_set_mem_limit(s, 8u << 20);                    /* (a reload: from now on 1 MiB for the delta and the builder) */
+  const uint64_t B = (8u << 20) / 8;
+  CHECK_EQ(store_view_add(s, "default"), 0);
+  CHECK_EQ(store_bulk_begin(s), 0);
+  store_bulk_phase(s, STORE_BULK_PASS);
+  const uint32_t N = 20000;
+  CHECK_EQ(store_reserve(s, N), 0);
+  for (uint32_t i = 0; i < N; i++) CHECK_EQ(known_w(s, i, 1), 0);
+  CHECK(ix_wait(s, get_dx_settled, "the spills"));
+  store_bulk_phase(s, STORE_BULK_PASSED);
+  CHECK(ix_wait(s, get_dx_done, "the build"));
+  store_stats_t st;
+  store_stats(s, &st);
+  printf("  delta peak %llu bytes (%llu spills, %llu merges, Bloom %llu), build peak %llu bytes (%llu buckets); bound %llu\n", (unsigned long long)st.index_delta_peak_bytes,
+         (unsigned long long)st.index_delta_spills, (unsigned long long)st.index_delta_merges, (unsigned long long)st.index_delta_bloom_bytes, (unsigned long long)st.index_build_peak_bytes,
+         (unsigned long long)st.index_build_buckets, (unsigned long long)B);
+  CHECK(st.index_delta_peak_bytes + st.index_build_peak_bytes <= B);
+  CHECK(st.index_delta_spills >= 10);
+  CHECK(st.index_build_buckets >= 2);
+  CHECK_EQ(st.index_delta_full, 0);
+  CHECK_EQ(ix_unreached(s, 0, N), 0);
+  check_consistent(s, "within the budget");
+  CHECK_EQ(store_bulk_end(s, STORE_BULK_END_WAIT), 0);
+  CHECK_EQ(store_close(s), 0);
+  CHECK_EQ(ix_scratch(&d), 0);
+  tdir_free(&d);
+}
+
 /* the builder with buckets larger than one read (a bucket is read in pieces of whole entries) and more than one window: 40000 zones in windows of 32768 slots */
 static void test_fb_buckets(void) {
   printf("[the file builder with buckets of several reads: 40000 zones, windows of 32768 slots]\n");
@@ -10031,6 +10070,7 @@ int main(void) {
     test_dx_end_and_stop();
     test_dx_small();
     test_fb_buckets();
+    test_dx_budget();
     test_fb_wrap();
     test_fb_growth();
     test_dx_faults();
