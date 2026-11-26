@@ -119,7 +119,9 @@ static void test_defaults(void) {
     CHECK(cfg.tcp_connection_reuse == false);
     CHECK(cfg.tcp_idle_timeout == 10000);
     CHECK(cfg.minimal_responses == false);
-    CHECK(cfg.minimal_any == false);
+    CHECK(cfg.minimal_any == true);         /* 0.7: yes, as BIND */
+    CHECK(cfg.answer_rrsig_queries == false);
+    CHECK(cfg.nocookie_udp_size == 0 && config_nocookie_udp_size(&cfg, NULL) == 4096);
     CHECK(cfg.minimal_any_ttl == 86400);
     CHECK(cfg.query_log_max_qps == 5000);
     CHECK(cfg.query_log_buffer_size == 32768);
@@ -152,7 +154,8 @@ static void test_boolean_directives(void) {
         { "tcp-connection-reuse", offsetof(server_config_t, tcp_connection_reuse),   false },
         { "allow-program-zones",  offsetof(server_config_t, allow_program_zones),    false },
         { "minimal-responses",    offsetof(server_config_t, minimal_responses),      false },
-        { "minimal-any",          offsetof(server_config_t, minimal_any),            false },
+        { "minimal-any",          offsetof(server_config_t, minimal_any),            true  },   /* (0.7: yes, as BIND) */
+        { "answer-rrsig-queries", offsetof(server_config_t, answer_rrsig_queries),   false },
     };
     /* D-02: BIND と同じく yes/true/1 と no/false/0、大文字小文字は区別しない */
     static const struct { const char *word; bool value; } words[] = {
@@ -193,6 +196,22 @@ static void test_boolean_directives(void) {
 static void test_numeric_directives(void) {
     printf("[TEST] numeric options directives: valid values and boundaries...\n");
     server_config_t cfg;
+
+    /* nocookie-udp-size (0.7, BIND 9.20): options and view; below 128 raised to 128, above 4096 kept as 4096; not a number, negative or above
+     * INT_MAX: an error */
+    if (parse_ok("options { nocookie-udp-size 300; };\n"
+                 "view \"a\" { match-clients { 192.0.2.0/24; }; nocookie-udp-size 1000; };\n"
+                 "view \"b\" { match-clients { any; }; };", &cfg)) {
+        CHECK(cfg.nocookie_udp_size == 300 && cfg.any_view_nocookie);
+        CHECK(config_nocookie_udp_size(&cfg, "a") == 1000 && config_nocookie_udp_size(&cfg, "b") == 300 && config_nocookie_udp_size(&cfg, NULL) == 300);
+        free_server_config_fields(&cfg);
+    }
+    if (parse_ok("options { nocookie-udp-size 10; };", &cfg)) { CHECK(cfg.nocookie_udp_size == 128); free_server_config_fields(&cfg); }
+    if (parse_ok("options { nocookie-udp-size 65535; };", &cfg)) { CHECK(cfg.nocookie_udp_size == 4096); free_server_config_fields(&cfg); }
+    expect_reject("nocookie-udp-size not a number", "options { nocookie-udp-size big; };");
+    expect_reject("nocookie-udp-size negative", "options { nocookie-udp-size -5; };");
+    expect_reject("nocookie-udp-size above INT_MAX", "options { nocookie-udp-size 2147483648; };");
+    CHECK(config_nocookie_udp_size(NULL, NULL) == 4096);
 
     if (parse_ok("options { tcp-initial-timeout 1500ms; tcp-idle-timeout 4294967295ms; };", &cfg)) {
         CHECK(cfg.tcp_initial_timeout == 1500);

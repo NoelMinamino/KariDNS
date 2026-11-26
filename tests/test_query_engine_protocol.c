@@ -1137,6 +1137,22 @@ static void test_any_udp_tc_and_rrsig_formerr(void) {
     ask(&q, "alias.s.example.", 46, ip, true, &r);
     CHECK(&r, r.rcode == 0 && r.aa && gr_count(&r, 1, 46) == 1 && gr_count(&r, 1, 5) == 0 && gr_count(&r, 1, 1) == 0);
     g_gr.cfg.answer_rrsig_queries = false;
+
+    /* nocookie-udp-size (BIND 9.20 client_allocsendbuf()): host A with DO=1 (A + RRSIG A, about 170 octets) over UDP is TC=1 under a limit
+     * of 128 without a valid server cookie, answered whole with one, and over TCP */
+    g_gr.cfg.nocookie_udp_size = 128;
+    put_hdr(&q, 0x4592, 0x0000, 1, 0, 0, 1); put_question(&q, "host.s.example.", 1, 1); put_opt(&q, 0, 0, 0x8000, opt_cc, sizeof(opt_cc));
+    ask(&q, "host.s.example.", 1, ip, false, &r);
+    CHECK(&r, r.rcode == 0 && TC(r) && r.len <= 128 && gr_count(&r, 1, 46) == 0);
+    ask(&q, "host.s.example.", 1, ip, true, &r);
+    CHECK(&r, r.rcode == 0 && !TC(r) && gr_count(&r, 1, 1) == 1 && gr_count(&r, 1, 46) == 1);
+    put_hdr(&q, 0x4592, 0x0000, 1, 0, 0, 1); put_question(&q, "host.s.example.", 1, 1); put_opt(&q, 0, 0, 0x8000, opt_full, sizeof(opt_full));
+    ask(&q, "host.s.example.", 1, ip, false, &r);
+    CHECK(&r, r.rcode == 0 && !TC(r) && r.len > 128 && gr_count(&r, 1, 1) == 1 && gr_count(&r, 1, 46) == 1);
+    g_gr.cfg.nocookie_udp_size = 0;                   /* (0 = not written: 4096, the answer fits) */
+    put_hdr(&q, 0x4592, 0x0000, 1, 0, 0, 1); put_question(&q, "host.s.example.", 1, 1); put_opt(&q, 0, 0, 0x8000, opt_cc, sizeof(opt_cc));
+    ask(&q, "host.s.example.", 1, ip, false, &r);
+    CHECK(&r, r.rcode == 0 && !TC(r) && gr_count(&r, 1, 46) == 1);
 #undef TC
     zone_arena_destroy(&g_gr.arena);
     printf("  -> ANY over UDP and RRSIG questions passed.\n");

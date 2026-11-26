@@ -467,14 +467,10 @@ set, \fBno\fR for the others. Negative answers keep their SOA.
 whose ACLs apply to the requests that come through a view for a zone it shares
 with an earlier view. See Zones shared between views.
 .TP 8
-\fBminimal\-any yes|no;\fR
-\fIDefault:\fR \fBno\fR
+`minimal-any yes
+\fIDefault:\fR no;`
 .br
-\fIDescription:\fR RFC 8482: answer \fBQTYPE=ANY\fR with a synthesized \fBHINFO
-"RFC8482" ""\fR record instead of all RRsets. When the query has DO=1 and the
-name has RRSIG records, a single RRset is returned instead (RFC 8482
-\[u00A7]4.2). Since 0.7 it only shapes the ANY queries that are answered: over
-TCP, and over UDP with a valid server cookie (see "ANY and RRSIG queries").
+\fIDescription:\fR \fByes\fR (0.7; \fBno\fR before)
 .TP 8
 \fBanswer\-rrsig\-queries yes|no;\fR
 \fIDefault:\fR \fBno\fR
@@ -741,6 +737,19 @@ to carry the extended RCODE bits of BADCOOKIE on their own RCODE, RFC 6891
 silently); with \fBudp\-bufsize\fR written too, the two must agree. Can be
 overridden per view. \fBedns\-udp\-size\fR is the size of the queries a resolver
 sends; it is read and has no effect.
+.TP 8
+\fBnocookie\-udp\-size <n>;\fR
+\fIDefault:\fR \fB4096\fR
+.br
+\fIDescription:\fR 0.7, BIND 9.20 (\fBlib/ns/client.c\fR): the largest UDP
+answer to a query without a valid server cookie (RFC 7873 section 5.2); a larger
+answer is truncated (TC=1). The other UDP limits (\fBmax\-udp\-size\fR, the
+client's EDNS size, a \fBserver\fR statement's \fBmax\-udp\-size\fR) still
+apply, and the smallest wins: with the default and \fBmax\-udp\-size 1232\fR
+nothing changes. A value below 128 is raised to 128 with a warning, as BIND does
+(silently there); above 4096 it is the same as 4096; not a number, negative or
+above 2147483647 is a configuration error. Also in \fBview\fR. Not for TCP, and
+not for forward or program zones.
 .TP 8
 \fBudp\-receive\-buffer <n>;\fR \fBudp\-send\-buffer <n>;\fR \fBtcp\-receive\-buffer <n>;\fR \fBtcp\-send\-buffer <n>;\fR
 \fIDefault:\fR see below
@@ -1197,35 +1206,62 @@ element is an error.
 .SS ANY and RRSIG queries (0.7)
 KariDNS follows the changes ISC announced on 2026-11-24 for BIND 9 ("Upcoming
 changes to ANY and RRSIG query processing in BIND 9"; BIND main,
-\fBlib/ns/query.c\fR):
+\fBlib/ns/query.c\fR) for the answers it makes from its own data. Forward and
+program zones are not changed (see the last item).
 .IP \(bu 2
 \fBANY over UDP\fR is answered with an empty response with TC=1 (NOERROR, AA=0,
 AD=0, the question and the OPT record), as RFC 8482 section 4.4 allows, so that
-ANY cannot be used to reflect and amplify traffic towards a spoofed address. A
-client retries over TCP (RFC 7766 section 5); \fBdig\fR and \fBdag\fR already
-send ANY over TCP. The exception is a query that carries a valid server cookie
-of this server (RFC 7873 section 5.2.4, RFC 9018): its source address is known,
-and it is answered over UDP as before. A client cookie alone is not enough (the
-TC response gives the client its server cookie, and its next query is then
-answered). This applies to every name and class (built-in CHAOS zones, program
-and forward zones too) and to database zones that are not in memory, which are
-neither waited for nor read for such a query. It comes after \fBallow\-query\fR
-(REFUSED) and the BADCOOKIE answer of RFC 7873 section 5.2.3, before any answer;
-\fBminimal\-any\fR only shapes the ANY queries that are answered. There is no
-option to turn it off, as in BIND.
+ANY cannot be used to reflect and amplify traffic towards a spoofed address.
+.RS 2
 .IP \(bu 2
-\fBANY over TCP\fR is unchanged: all RRsets with \fBminimal\-any no\fR (the
-default), the RFC 8482 answer with \fBminimal\-any yes\fR.
+A client retries over TCP (RFC 7766 section 5); \fBdig\fR and \fBdag\fR already
+send ANY over TCP.
+.IP \(bu 2
+The exception is a query that carries a valid server cookie of this server (RFC
+7873 section 5.2.4, RFC 9018): its source address is known, and it is answered
+over UDP. A client cookie alone is not enough: the TC response gives the client
+its server cookie, and its next query is then answered.
+.IP \(bu 2
+It applies to every zone of this server, the built-in CHAOS zones, names in no
+zone, and database zones that are not in memory (which are neither waited for
+nor read for such a query).
+.IP \(bu 2
+It comes after \fBallow\-query\fR (REFUSED) and the BADCOOKIE answer of RFC 7873
+section 5.2.3, before any answer.
+.IP \(bu 2
+There is no option to turn it off, as in BIND.
+.RE
+.IP \(bu 2
+\fBANY over TCP, and over UDP with a valid server cookie\fR, is answered as
+\fBminimal\-any\fR says. Since 0.7 the default is \fByes\fR, as in BIND: the
+synthesized \fBHINFO "RFC8482" ""\fR of RFC 8482 section 4.2 (with DO=1 at a
+signed name, one RRset and its RRSIGs). \fBminimal\-any no;\fR gives every RRset
+at the name.
 .IP \(bu 2
 \fBA question for type RRSIG\fR is answered FORMERR with EDE 30 Invalid Query
-Type ("RRSIG queries are not supported"; IANA Extended DNS Error registry), the
-question echoed, as BIND 9.20.31 and later do: signatures come with the RRsets
-they cover when the query has DO=1 (RFC 4035 section 3.1.1). It is checked
-before the zone, the ACLs, the cookies and the response cache, for every
-transport, class, DO bit and zone type (zone files, tinydns, database zones),
-and also for an RRSIG listed in an MQTYPE-Query option (RFC
-10029). \fBanswer\-rrsig\-queries yes;\fR keeps the 0.6 answer (the name's RRSIG
-RRset; at a CNAME owner its own RRSIGs, RFC 4035 section 2.5).
+Type ("RRSIG queries are not supported"; IANA Extended DNS Error registry), with
+the question echoed, as BIND 9.20.31 and later do. Signatures come with the
+RRsets they cover when the query has DO=1 (RFC 4035 section 3.1.1).
+.RS 2
+.IP \(bu 2
+It is checked before the zone data, the ACLs, the cookies and the response
+cache, for every transport, class and DO bit, and for zone files, tinydns zones
+and database zones alike.
+.IP \(bu 2
+An RRSIG listed in an MQTYPE-Query option (RFC 10029) is refused the same way.
+.IP \(bu 2
+\fBanswer\-rrsig\-queries yes;\fR keeps the 0.6 answer: the name's RRSIG RRset,
+and at a CNAME owner its own RRSIGs (RFC 4035 section 2.5).
+.RE
+.IP \(bu 2
+\fB\fBnocookie\-udp\-size\fB\fR (BIND 9.20): a UDP answer to a query without a
+valid server cookie is no larger than this value (RFC 7873 section 5.2); a
+larger one is truncated (TC=1). See the options table.
+.IP \(bu 2
+\fBForward and program zones\fR relay or answer every query as before: ANY over
+UDP is relayed, RRSIG questions are relayed, and \fBnocookie\-udp\-size\fR does
+not limit their answers. BIND's refusal of recursive ANY queries (REFUSED with
+EDE 21) is not followed.
 .SS rate-limit { ... } (in options or zone)
 A \fBrate\-limit\fR block in a zone replaces the server-wide block for that
 zone. \fB0\fR means no limit for that class. Only UDP responses are limited.

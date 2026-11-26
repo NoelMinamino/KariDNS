@@ -4,7 +4,7 @@
 # ANY over UDP: an empty response with TC=1 (RFC 8482 section 4.4; NOERROR, AA=0), unless the query carries a valid
 # server cookie of this server (RFC 7873 section 5.2.4, RFC 9018): a client cookie alone gets TC=1 with a server
 # cookie, and the query repeated with that cookie is answered over UDP.  ANY over TCP is answered as before, with
-# minimal-any no (all RRsets) and yes (HINFO "RFC8482", RFC 8482 section 4.2).
+# minimal-any no (all RRsets) and the default, yes since 0.7 (HINFO "RFC8482", RFC 8482 section 4.2).
 # RRSIG: FORMERR with EDE 30 Invalid Query Type, the question echoed, over UDP and TCP, DO=0 and DO=1, at a CNAME
 # owner, for a tinydns zone and for a name in no zone (BIND 9.20.31 lib/ns/query.c ns_query_start()).
 # answer-rrsig-queries yes keeps the 0.6 answer: the name's RRSIG RRset (at a CNAME owner its own, RFC 4035 2.5).
@@ -16,8 +16,9 @@ BASE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 KARIDNS="${KARIDNS:-$BASE_DIR/karidns-asan}"
 DAG="$BASE_DIR/dag"
 KARICHECK="$BASE_DIR/karicheck"
-PORT=$(kari_port 0 15490)      # default options
-OPORT=$(kari_port 100 15491)   # answer-rrsig-queries yes; minimal-any yes
+PORT=$(kari_port 0 15490)      # minimal-any no (every RRset), else the defaults
+OPORT=$(kari_port 100 15491)   # answer-rrsig-queries yes; minimal-any not written (the default, yes)
+FPORT=$(kari_port 200 15492)   # tests/mock_alias_upstream.pl: the forwarder of the forward zone fw.test
 
 echo "=== ANY over UDP (RFC 8482 4.4) and RRSIG questions ==="
 
@@ -29,8 +30,9 @@ TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/karidns_anyrrsig.XXXXXX")"
 chmod 755 "$TMP_DIR"
 PID=""
 OPID=""
+MPID=""
 cleanup() {
-    kari_kill_tree "$PID" "$OPID"
+    kari_kill_tree "$PID" "$OPID" "$MPID"
     kari_kill_conf "$TMP_DIR/k.conf" "$TMP_DIR/o.conf"
     rm -rf "$TMP_DIR"
 }
@@ -56,6 +58,10 @@ host IN RRSIG A 13 3 300 20300101000000 20260101000000 12345 ar.test. $SIG
 host IN RRSIG TXT 13 3 300 20300101000000 20260101000000 12345 ar.test. $SIG
 alias IN CNAME host
 alias IN RRSIG CNAME 13 3 300 20300101000000 20260101000000 12345 ar.test. $SIG
+big IN TXT "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+big IN TXT "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+big IN TXT "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+big IN TXT "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
 EOF
 cat > "$TMP_DIR/td.data" <<EOF
 Ztd.test:ns1.td.test.:hostmaster.td.test.:1:3600:900:604800:300:300
@@ -63,6 +69,7 @@ Ztd.test:ns1.td.test.:hostmaster.td.test.:1:3600:900:604800:300:300
 +ns1.td.test:192.0.2.1:300
 +www.td.test:192.0.2.20:300
 EOF
+{ echo "a.fw.test A 300 192.0.2.5"; i=1; while [ $i -le 24 ]; do echo "big.fw.test A 300 192.0.2.$i"; i=$((i + 1)); done; } > "$TMP_DIR/fw.data"
 chmod 644 "$TMP_DIR/ar.zone" "$TMP_DIR/td.data"
 
 write_conf() {
@@ -70,10 +77,11 @@ write_conf() {
 options { port $2; bind-address { 127.0.0.1; }; pid-file "none"; send-extended-errors yes; $3 $USER_OPT };
 zone "ar.test" { type master; file "$TMP_DIR/ar.zone"; };
 zone "td.test" { type master; file "$TMP_DIR/td.data"; file-format tinydns; };
+zone "fw.test" { type forward; forwarders { 127.0.0.1 port $FPORT; }; forward-timeout 3000; };
 EOF
 }
-write_conf "$TMP_DIR/k.conf" $PORT ""
-write_conf "$TMP_DIR/o.conf" $OPORT "answer-rrsig-queries yes; minimal-any yes;"
+write_conf "$TMP_DIR/k.conf" $PORT "minimal-any no;"
+write_conf "$TMP_DIR/o.conf" $OPORT "answer-rrsig-queries yes; nocookie-udp-size 256;"
 
 for c in k o; do
     if "$KARICHECK" conf "$TMP_DIR/$c.conf" > "$TMP_DIR/$c.check" 2>&1; then
@@ -88,7 +96,20 @@ if "$KARICHECK" conf "$TMP_DIR/bad.conf" > "$TMP_DIR/bad.check" 2>&1; then
 else
     pass "karicheck conf refuses answer-rrsig-queries maybe"
 fi
+# nocookie-udp-size: an integer (BIND: uint32; here 0..2147483647), below 128 raised to 128 with a warning, in options and view
+for v in maybe -1 2147483648; do
+    printf 'options { nocookie-udp-size %s; };\n' "$v" > "$TMP_DIR/nc.conf"
+    if "$KARICHECK" conf "$TMP_DIR/nc.conf" > "$TMP_DIR/nc.check" 2>&1; then fail "karicheck conf accepts nocookie-udp-size $v"; else pass "karicheck conf refuses nocookie-udp-size $v"; fi
+done
+printf 'options { nocookie-udp-size 100; };\nview "v" { nocookie-udp-size 512; };\n' > "$TMP_DIR/nc.conf"
+if "$KARICHECK" conf "$TMP_DIR/nc.conf" > "$TMP_DIR/nc.check" 2>&1 && grep -q "raising to 128" "$TMP_DIR/nc.check"; then
+    pass "karicheck conf: nocookie-udp-size 100 is raised to 128 with a warning (as BIND), the view's accepted"
+else
+    fail "karicheck conf nocookie-udp-size 100 / view: $(cat "$TMP_DIR/nc.check")"
+fi
 
+perl "$BASE_DIR/tests/mock_alias_upstream.pl" --port "$FPORT" --data "$TMP_DIR/fw.data" --log "$TMP_DIR/fw.log" > "$TMP_DIR/fw.out" 2>&1 &
+MPID=$!
 "$KARIDNS" -f "$TMP_DIR/k.conf" > "$TMP_DIR/k.log" 2>&1 &
 PID=$!
 "$KARIDNS" -f "$TMP_DIR/o.conf" > "$TMP_DIR/o.log" 2>&1 &
@@ -129,9 +150,9 @@ expect "ANY over TCP: every RRset (minimal-any no)" "$OUT" " tc[ ;]" "flags: qr 
 OUT=$(ask $PORT host.ar.test ANY)
 expect "dag ANY (TCP by default, RD=0): answered" "$OUT" "" "flags: qr aa; QUERY: 1, ANSWER: 4,"
 OUT=$(ask $OPORT host.ar.test ANY +notcp +ignore +nocookie)
-expect "minimal-any yes, ANY over UDP: still TC=1" "$OUT" "" ";; flags: qr tc; QUERY: 1, ANSWER: 0"
+expect "minimal-any yes (default), ANY over UDP: still TC=1" "$OUT" "" ";; flags: qr tc; QUERY: 1, ANSWER: 0"
 OUT=$(ask $OPORT host.ar.test ANY +tcp +nodnssec)
-expect "minimal-any yes, ANY over TCP: HINFO RFC8482" "$OUT" "" "ANSWER: 1," 'HINFO[[:space:]]+"RFC8482"'
+expect "minimal-any yes (default), ANY over TCP: HINFO RFC8482" "$OUT" "" "ANSWER: 1," 'HINFO[[:space:]]+"RFC8482"'
 
 # --- RRSIG ---
 for a in "host.ar.test RRSIG +notcp" "host.ar.test RRSIG +tcp +dnssec" "alias.ar.test RRSIG +dnssec" "www.td.test RRSIG" \
@@ -144,6 +165,36 @@ OUT=$(ask $OPORT host.ar.test RRSIG +notcp)
 expect "answer-rrsig-queries yes: the RRSIG RRset" "$OUT" "" "status: NOERROR" "flags: qr aa rd; QUERY: 1, ANSWER: 2,"
 OUT=$(ask $OPORT alias.ar.test RRSIG +tcp)
 expect "answer-rrsig-queries yes, CNAME owner: its own RRSIG, the CNAME not followed" "$OUT" "IN[[:space:]]+CNAME[[:space:]]" "status: NOERROR" "ANSWER: 1," "RRSIG[[:space:]]+CNAME"
+
+# --- a forward zone relays ANY and RRSIG as before (the forwarder's answer, no TC=1 / FORMERR of this server) ---
+for p in $PORT $OPORT; do
+    : > "$TMP_DIR/fw.log"
+    OUT=$(ask $p a.fw.test ANY +notcp +ignore +nocookie)
+    expect "forward zone ($p): ANY over UDP without a cookie is relayed, no TC=1" "$OUT" " tc[ ;]" "status: NOERROR" "SERVER: .*\(UDP\)"
+    OUT=$(ask $p a.fw.test RRSIG +notcp)
+    expect "forward zone ($p): RRSIG is relayed, not FORMERR" "$OUT" "status: FORMERR" "status: NOERROR"
+    if grep -q "^a\.fw\.test\.\{0,1\} 255 udp" "$TMP_DIR/fw.log" && grep -q "^a\.fw\.test\.\{0,1\} 46 udp" "$TMP_DIR/fw.log"; then   # (the mock logs the type as a number)
+        pass "forward zone ($p): the forwarder got the ANY and the RRSIG questions"
+    else
+        fail "forward zone ($p): forwarder log: $(tr '\n' '|' < "$TMP_DIR/fw.log")"
+    fi
+done
+
+# --- nocookie-udp-size (BIND 9.20; RFC 7873 5.2): a UDP answer without a valid server cookie is no larger than it ---
+OUT=$(ask $PORT big.ar.test TXT +notcp +ignore +nocookie)
+expect "default nocookie-udp-size (4096): the 400-octet TXT answer is not truncated" "$OUT" " tc[ ;]" "flags: qr aa rd; QUERY: 1, ANSWER: 4,"
+OUT=$(ask $OPORT big.ar.test TXT +notcp +ignore +nocookie)
+expect "nocookie-udp-size 256, no cookie: TC=1" "$OUT" "" "flags: qr aa tc rd;" "MSG SIZE  rcvd: ([0-9]|[0-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-6])$"
+OUT=$(ask $OPORT host.ar.test A +notcp +ignore)
+CK=$(echo "$OUT" | awk '$1 == ";" && $2 == "COOKIE:" { print $3; exit }')
+OUT=$(ask $OPORT big.ar.test TXT +notcp +ignore +cookie="$CK")
+expect "nocookie-udp-size 256, a valid server cookie: the full answer over UDP" "$OUT" " tc[ ;]" "flags: qr aa rd; QUERY: 1, ANSWER: 4," "COOKIE: .* \(good\)"
+OUT=$(ask $OPORT big.ar.test TXT +notcp +ignore +cookie=$FORGED +nobadcookie)
+expect "nocookie-udp-size 256, a forged server cookie: BADCOOKIE" "$OUT" "" "status: BADCOOKIE"
+OUT=$(ask $OPORT big.ar.test TXT +tcp +nocookie)
+expect "nocookie-udp-size 256: TCP is not limited" "$OUT" " tc[ ;]" "ANSWER: 4,"
+OUT=$(ask $OPORT big.fw.test A +notcp +ignore +nocookie)
+expect "nocookie-udp-size 256: a forward zone's answer is relayed whole" "$OUT" " tc[ ;]" "ANSWER: 24,"
 
 kill -0 "$PID" 2>/dev/null || fail "the default server exited during the test"
 kill -0 "$OPID" 2>/dev/null || fail "the second server exited during the test"

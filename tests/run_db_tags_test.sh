@@ -106,19 +106,19 @@ sq "INSERT INTO domainmetadata (domain_id, kind, content) SELECT id, 'X-KARIDNS-
 chown -R nobody "$T/db"; chmod 600 "$T/db/z.db"*
 
 {
-    printf 'options {\n    user "nobody"; pid-file "none"; ecs-enable yes; listen-on { 127.0.0.1; }; port %s;\n};\n' "$PA"
+    printf 'options {\n    user "nobody"; pid-file "none"; ecs-enable yes; listen-on { 127.0.0.1; }; port %s; minimal-any no;\n};\n' "$PA"
     printf 'zone "tagz.test" { type primary; file "%s/z/tagz.test.zone"; allow-transfer { 127.0.0.1; }; ecs-trusted-resolvers { 127.0.0.2; 127.0.0.5; }; };\n' "$T"
     printf 'zone "tdz.test" { type primary; file "%s/z/tdz.test.data"; file-format tinydns; allow-transfer { 127.0.0.1; }; };\n' "$T"
 } > "$T/a.conf"
 dbconf() {   # dbconf PORT CEILING CTLSOCKET
-    printf 'options {\n    user "nobody"; pid-file "none"; ecs-enable yes; listen-on { 127.0.0.1; }; port %s;\n' "$1"
+    printf 'options {\n    user "nobody"; pid-file "none"; ecs-enable yes; listen-on { 127.0.0.1; }; port %s; minimal-any no;\n' "$1"
     printf '    database { driver sqlite3; database-file "%s/db/z.db"; loader-user "nobody"; loader-path "%s/karidns-dbloader"; acl-ceiling { %s; }; db-reload-timeout 4; };\n};\n' "$T" "$T" "$2"
     [ -n "${3:-}" ] && printf 'control-channel { socket "%s"; secret "%s"; };\n' "$3" "$SECRET"
 }
 dbconf "$PB" "127.0.0.0/24" "$T/ctl.sock" > "$T/b.conf"
 dbconf "$PD" "127.0.0.2" > "$T/d.conf"
 {
-    printf 'options {\n    user "nobody"; pid-file "none"; ecs-enable yes; listen-on { 127.0.0.1; }; port %s;\n};\n' "$PC"
+    printf 'options {\n    user "nobody"; pid-file "none"; ecs-enable yes; listen-on { 127.0.0.1; }; port %s; minimal-any no;\n};\n' "$PC"
     printf 'zone "tagz.test" { type slave; masters { 127.0.0.1 port %s; }; allow-transfer { 127.0.0.1; }; };\n' "$PB"
     printf 'zone "tdz.test" { type slave; masters { 127.0.0.1 port %s; }; allow-transfer { 127.0.0.1; }; };\n' "$PB"
 } > "$T/c.conf"

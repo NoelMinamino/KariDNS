@@ -3246,6 +3246,12 @@ static cookie_check_t qe_cookie_check(server_config_t *cfg, const char *client_i
  * queries are only answered to clients whose address is known not to be spoofed"): NOERROR, TC=1, AA=0, AD=0, the question and the OPT (with
  * the client's server cookie, which makes its next UDP query an answered one), whatever the answer would be and whatever minimal-any says.
  * The question is already copied to res[0..q_offset). */
+/* 0.7: a forward or a program zone: the queries for it are relayed to the forwarders or answered by the plugin, so the ANY / RRSIG rules
+ * of this server's own answers (TC=1 for ANY over UDP, FORMERR for RRSIG) and nocookie-udp-size do not apply to them */
+static bool qe_relayed_zone(const zone_config_t *z) {
+  return z && z->type && (strcasecmp(z->type, "forward") == 0 || strcasecmp(z->type, "program") == 0);
+}
+
 static int build_any_udp_tc_response(uint8_t *res, size_t max_res_len, uint16_t q_offset, edns_info_t *edns, server_config_t *cfg) {
   uint16_t offset = q_offset, arcount = 0;
   res[2] = (uint8_t)((res[2] & ~0x04) | 0x02);   /* AA=0, TC=1 */
@@ -3467,6 +3473,19 @@ static size_t edns_udp_limit(edns_info_t *edns, bool is_tcp, const server_config
     if (res_cap != 0 && max_res_len > res_cap) max_res_len = res_cap;
   }
   return max_res_len;
+}
+
+/* edns_udp_limit() for an answer to a query whose server cookie has not been found valid (the answers from a zone's summary while the zone
+ * is not in memory: build_apex_soa_answer() leaves every query with a COOKIE option to the zone): over UDP, nocookie-udp-size limits it too
+ * (BIND 9.20 client_allocsendbuf(); a zone in the directory is never a forward or program zone). */
+static size_t edns_udp_limit_nocookie(edns_info_t *edns, bool is_tcp, const server_config_t *cfg, const view_snapshot_t *view, const char *client_ip,
+                                      size_t max_res_len, size_t res_cap) {
+  size_t l = edns_udp_limit(edns, is_tcp, cfg, view, client_ip, max_res_len, res_cap);
+  if (!is_tcp) {
+    const size_t nc = config_nocookie_udp_size(cfg, view ? view->name : NULL);
+    if (l > nc) l = nc;
+  }
+  return l;
 }
 
 /* May this client transfer the zone (allow-transfer, the TSIG key, the zone's tsig-key, transfer-acl-match, acl-ceiling of a database zone)?  The question of an IXFR
@@ -3939,7 +3958,9 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
    * name, which is an ANY by another name (RFC 4035 2.5 and RFC 2181 10.1 still apply with answer-rrsig-queries yes: at a CNAME owner the
    * name's own RRSIG RRset is the answer).  Before the zone, the ACLs, the cookie checks and the response cache, as BIND checks it before
    * its zone lookup: nothing is read, waited for or cached for it.  An MQTYPE-Query option that lists RRSIG is refused the same way below. */
-  if (opcode == 0 && qdcount == 1 && qtype == 46 && !(cfg_for_ede && cfg_for_ede->answer_rrsig_queries)) {
+  /* A forward or program zone is not this server's data: such a question goes to the forwarders or the plugin as before, which answer it
+   * (BIND's refusal of a recursive ANY is not followed either).  The rule is for the answers this server makes itself. */
+  if (opcode == 0 && qdcount == 1 && qtype == 46 && !(cfg_for_ede && cfg_for_ede->answer_rrsig_queries) && !qe_relayed_zone(zone_cfg_any)) {
     qe_why("a question for type RRSIG (standalone RRSIG queries are not supported; answer-rrsig-queries)");
     add_ede(&edns, send_ede, 30, "RRSIG queries are not supported");
     return dns_build_error_response(req, req_len, res, max_res_len, 1, 0, dns_error_qd_echo(req, req_len), &edns, is_tcp, cfg); // FORMERR
@@ -4008,7 +4029,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
      * waits for the zone nor makes the server read it */
     if (opcode == 0 && qtype == 255 && !is_tcp && !(edns.has_cookie && qe_cookie_check(cfg, client_ip, &edns) == QE_COOKIE_VALID)) {
       const size_t q_end = get_question_end_offset(req, req_len, 1);
-      const size_t alimit = edns_udp_limit(&edns, is_tcp, cfg, view, client_ip, max_res_len, res_cap);
+      const size_t alimit = edns_udp_limit_nocookie(&edns, is_tcp, cfg, view, client_ip, max_res_len, res_cap);
       if (q_end > DNS_HEADER_SIZE && q_end <= alimit) {
         memcpy(res, req, q_end);
         dns_init_response_header(res, req, 0, true);
@@ -4019,7 +4040,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
       const zdir_apex_t *ap = (not_ready_zone->el ? atomic_load_explicit(&not_ready_zone->el->apex, memory_order_acquire) : NULL);
       if (ap) {
         /* the size the zone in memory would answer with (the EDNS size of the client on UDP), and the TSIG signing needs the same limit */
-        const size_t alimit = edns_udp_limit(&edns, is_tcp, cfg, view, client_ip, max_res_len, res_cap);
+        const size_t alimit = edns_udp_limit_nocookie(&edns, is_tcp, cfg, view, client_ip, max_res_len, res_cap);
         const size_t tsig_limit = tsig ? tsig->res_limit : 0;
         if (tsig) tsig->res_limit = alimit;
         const additional_from_auth_t apolicy = zext(&zc)->additional_from_auth_specified ? zext(&zc)->additional_from_auth
@@ -4062,7 +4083,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
       }
       const zdir_apex_t *iap = (not_ready_zone->el ? atomic_load_explicit(&not_ready_zone->el->apex, memory_order_acquire) : NULL);
       if (iap) {
-        const size_t alimit = edns_udp_limit(&edns, is_tcp, cfg, view, client_ip, max_res_len, res_cap);
+        const size_t alimit = edns_udp_limit_nocookie(&edns, is_tcp, cfg, view, client_ip, max_res_len, res_cap);
         const size_t tsig_limit = tsig ? tsig->res_limit : 0;
         if (tsig) tsig->res_limit = alimit;
         int ilen = build_apex_soa_answer(req, req_len, res, alimit, not_ready_zone->el, iap, &edns, is_tcp, MINIMAL_YES, ADDITIONAL_AUTH_YES, view, comp_ctx, tsig, cfg, &cs);
@@ -4259,14 +4280,6 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
   }
   compress_ctx_init_packet(comp_ctx);
 
-  max_res_len = edns_udp_limit(&edns, is_tcp, cfg, view, client_ip, max_res_len, res_cap);
-  /* RFC 8945 §5.3: 署名する応答は、上限から TSIG RR の分を空けて組み立てる (切り詰めは TC=1 で表す) */
-  if (tsig) {
-    tsig->res_limit = max_res_len;
-    size_t reserve = tsig_response_reserve(tsig);
-    if (reserve > 0 && max_res_len > reserve + DNS_HEADER_SIZE) max_res_len -= reserve;
-  }
-
   uint8_t ext_rcode_out = 0;
   bool is_badcookie = false;
   bool server_cookie_ok = false;   /* the query carried a valid server cookie of this server (RFC 7873 §5.2.4, RFC 9018 §4.3): its source is not spoofed */
@@ -4281,6 +4294,21 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
           is_badcookie = true;
           ext_rcode_out = 1;
       }
+  }
+
+  max_res_len = edns_udp_limit(&edns, is_tcp, cfg, view, client_ip, max_res_len, res_cap);
+  /* 0.7: nocookie-udp-size (BIND 9.20 lib/ns/client.c client_allocsendbuf(); RFC 7873 §5.2): a UDP answer to a query without a valid server
+   * cookie is no larger than it, with the other UDP limits above (the smallest wins); larger answers are truncated (TC=1) as for those.  Not
+   * for TCP, and not for a forward or program zone (their answers are relayed as they come, qe_relayed_zone()). */
+  if (!is_tcp && !server_cookie_ok && !qe_relayed_zone(zone_cfg_any)) {
+    const size_t nc = config_nocookie_udp_size(cfg, view ? view->name : NULL);
+    if (max_res_len > nc) max_res_len = nc;
+  }
+  /* RFC 8945 §5.3: 署名する応答は、上限から TSIG RR の分を空けて組み立てる (切り詰めは TC=1 で表す) */
+  if (tsig) {
+    tsig->res_limit = max_res_len;
+    size_t reserve = tsig_response_reserve(tsig);
+    if (reserve > 0 && max_res_len > reserve + DNS_HEADER_SIZE) max_res_len -= reserve;
   }
 
   /* RFC 6891 §7: OPT 付きの問い合わせには、切り詰め (TC=1) 応答でも OPT を返す。
@@ -4397,8 +4425,10 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
    * extended RCODE 0. */
   if (is_badcookie) return build_badcookie_response(res, max_res_len, (uint16_t)q_offset, &edns, ext_rcode_out, is_tcp, cfg);
   /* 0.7: ANY over UDP without a valid server cookie: empty, TC=1 (RFC 8482 §4.4, build_any_udp_tc_response()), after BADCOOKIE as in BIND, before
-   * every answer that follows (a class or a name without a zone, program and forward zones, the response cache, minimal-any) */
-  if (qtype == 255 && !is_tcp && !server_cookie_ok) return build_any_udp_tc_response(res, max_res_len, (uint16_t)q_offset, &edns, cfg);
+   * every answer this server makes itself (a class or a name without a zone, the response cache, minimal-any).  A forward or program zone
+   * relays it as before: the forwarder's or the plugin's answer is the client's (qe_relayed_zone()). */
+  if (qtype == 255 && !is_tcp && !server_cookie_ok && !qe_relayed_zone(zone_cfg_any))
+    return build_any_udp_tc_response(res, max_res_len, (uint16_t)q_offset, &edns, cfg);
   if (qclass == 3 && !ch_zone_here) {
     add_ede(&edns, send_ede, 20, "This server is not authoritative for the queried zone");
     return dns_build_error_response(req, req_len, res, max_res_len, 5, 0, 1, &edns, is_tcp, cfg);

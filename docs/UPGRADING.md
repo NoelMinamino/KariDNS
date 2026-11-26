@@ -124,9 +124,11 @@ change the options that need a restart (`OK reloaded (restart needed for: ...)`)
 | Loader log lines | the loader chose the priority and the prefix | always `[DB] ...`, at most `LOG_ERR` (#260) | none |
 | `KARIDNS_TEST_IPC_REPLY_BUDGET_US` / `_QUEUE` | read from the environment by every build | test build only (#260) | none (test switches) |
 | `database { memory-limit }` not written | none: every database zone stays in memory | with the zone store: half of the RAM above 256 MB, at least `64M` (512 MB: `128M`, 1 GB: `384M`, 16 GB: `8064M`; #256); the coldest zones above it are taken out and read again from the store; the start logs `[DB] memory-limit is not set: 362M is used (the default: half of the 980 MB of RAM above 256 MB, at least 64M) ...` at NOTICE. Without the store (`store none;`, `zone-store none;`) still none | `memory-limit unlimited;` (or a size) |
-| ANY over UDP | answered (all RRsets, or the `minimal-any` answer) | empty, TC=1, unless the query has a valid server cookie (RFC 8482 4.4, #266); TCP unchanged | none (as BIND); clients retry over TCP |
-| Query for type RRSIG | the RRSIG RRset of the name | FORMERR + EDE 30 (#266) | `answer-rrsig-queries yes;` |
+| ANY over UDP | answered (all RRsets, or the `minimal-any` answer) | empty, TC=1, unless the query has a valid server cookie (RFC 8482 4.4, #266); TCP unchanged; forward and program zones relay it as before | none (as BIND); clients retry over TCP |
+| `minimal-any` | `no`: every RRset | `yes` (#266, as BIND): ANY over TCP (or UDP with a valid cookie) gets `HINFO "RFC8482" ""` | `minimal-any no;` |
+| Query for type RRSIG | the RRSIG RRset of the name | FORMERR + EDE 30 (#266); forward and program zones relay it | `answer-rrsig-queries yes;` |
 | `dag ... ANY` | RD=1 | RD=0 unless `+recurse` / `+rdflag` (#266, as dig from BIND main) | `dag +recurse ... ANY` |
+| `nocookie-udp-size` | accepted, no effect | UDP answers without a valid server cookie are limited to it (default 4096: no change with `max-udp-size 1232`; #266) | remove the statement, or raise it |
 
 Memory notes: the Backend holds about 70 MB fixed plus about 0.45 KB for every database zone in the directory;
 `memory-limit` bounds the zones in memory, not that part (docs/karidns.md "Memory limit"). The store's tables are

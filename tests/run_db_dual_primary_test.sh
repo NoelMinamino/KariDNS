@@ -207,7 +207,7 @@ pfz "$T/sql/vschema.sql" > /dev/null 2>&1 && {
 conf() {   # conf FILE PORT "DATABASE-OPTIONS" SERVER-ID [EXTRA TOP-LEVEL]
     cat > "$1" <<EOF
 options {
-    user "nobody"; pid-file "none"; listen-on { 127.0.0.1; }; port $2;
+    user "nobody"; pid-file "none"; listen-on { 127.0.0.1; }; port $2; minimal-any no;
     database { driver postgresql; conninfo-file "$T/ci"; loader-user "$PG_AS"; loader-path "$T/karidns-dbloader"; db-reload-timeout 10; poll-interval 2; coalesce 300; acl-ceiling { 127.0.0.0/24; }; server-id "$4"; $3 };
 };
 ${5:-}
