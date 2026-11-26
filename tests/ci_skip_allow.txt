@@ -7,6 +7,7 @@
 tests/run_dnsqps_xdp_test.sh	^SKIP: not Linux
 # PowerDNS (pdns_server and its schema files) is not installed: the KariDNS side of these tests runs, the comparison with PowerDNS does not (no CI job)
 tests/run_db_alias_lua_test.sh	^\[SKIP\] default mode against PowerDNS: pdns_server
+tests/run_db_alias_lua_test.sh	^\[SKIP\] (expansion against|standard AXFR from) PowerDNS: not available
 tests/run_db_ddl_test.sh	^\[SKIP\] the PowerDNS schema file is not installed
 # dnsperf is not installed: the NSEC3 answers are checked by run_nsec3_owner_query_test.sh and the DNSSEC tests; the speed is not checked in CI
 tests/run_nsec3_nxdomain_perf_test.sh	^\[SKIP\] dnsperf is not installed
@@ -18,3 +19,6 @@ tests/run_db_store_test.sh	^SKIP: disk full on a small ZFS dataset needs STORE_Z
 # run_rcu_tsan_test.sh part 5 runs tests/run_db_xfer_test.sh with karidns-tsan: its parts E and F need the test-only evict hook, which no TSan build
 # has (the instrumented karidns of the coverage suite runs them).  Job tsan of .github/workflows/freebsd.yml
 tests/run_rcu_tsan_test.sh	^SKIP: part [EF]: no server with the test hooks
+# djbdns 1.05 as the oracle of the tinydns location SOA rules (DJBDNS_DIR, built by hand; no package): the rules are checked against RFC 2308 and the
+# expected answers of the test itself
+tests/run_tinydns_soa_location_test.sh	^SKIP djbdns reference \(set DJBDNS_DIR

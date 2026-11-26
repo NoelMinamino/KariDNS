@@ -248,8 +248,10 @@ jobs:
           run: |
             set -e
 
-            echo "::group::📦 [Setup] perl5, sqlite3 (parts 4 to 7 of run_rcu_tsan_test.sh: database zones on SQLite3)"
-            pkg install -y perl5 sqlite3
+            echo "::group::📦 [Setup] perl5, sqlite3 (parts 4 to 7 of run_rcu_tsan_test.sh: database zones on SQLite3), the libraries the build linked"
+            # libidn2 (dag, --with-idn2=yes) and libpq (karidns-dbloader and karidns-dbloader-tsan have the PostgreSQL driver): the build job has them
+            # through bind-tools and postgresql17-client
+            pkg install -y perl5 sqlite3 libidn2 postgresql17-client
             echo "::endgroup::"
 
             echo "::group::📦 [Unpack] the build of the job build"

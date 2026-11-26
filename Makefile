@@ -18,9 +18,11 @@ HARDEN_LDFLAGS_PROBE != case "`uname -s 2>/dev/null`" in Darwin) echo "-pie" ;; 
 HARDEN_LDFLAGS ?= $(HARDEN_LDFLAGS_PROBE)
 
 # libidn2 detection (portable for BSD make & GNU make)
-IDN_CFLAGS_PROBE != (pkg-config --exists libidn2 2>/dev/null && echo "-DHAVE_LIBIDN2 `pkg-config --cflags libidn2 2>/dev/null`") || (pkg info -e libidn2 >/dev/null 2>&1 && echo "-DHAVE_LIBIDN2") || ([ -f /usr/include/idn2.h ] || [ -f /usr/local/include/idn2.h ] && echo "-DHAVE_LIBIDN2") || true
+# MinGW links dag statically (WIN_LDFLAGS): libidn2.a needs the libraries of pkg-config --static (libunistring, iconv)
+PKGC_STATIC != case "`uname -s 2>/dev/null`" in MINGW*|MSYS*|CYGWIN*) echo "--static" ;; *) echo "" ;; esac
+IDN_CFLAGS_PROBE != (pkg-config --exists libidn2 2>/dev/null && echo "-DHAVE_LIBIDN2 `pkg-config $(PKGC_STATIC) --cflags libidn2 2>/dev/null`") || (pkg info -e libidn2 >/dev/null 2>&1 && echo "-DHAVE_LIBIDN2") || ([ -f /usr/include/idn2.h ] || [ -f /usr/local/include/idn2.h ] && echo "-DHAVE_LIBIDN2") || true
 IDN_CFLAGS ?= $(IDN_CFLAGS_PROBE)
-IDN_LDFLAGS_PROBE != [ -z "$(IDN_CFLAGS)" ] || (pkg-config --libs libidn2 2>/dev/null || (pkg info -e libidn2 >/dev/null 2>&1 && echo "-L/usr/local/lib -lidn2") || ([ -f /usr/lib/libidn2.so ] || [ -f /usr/local/lib/libidn2.so ] || [ -f /usr/lib64/libidn2.so ] && echo "-lidn2")) || true
+IDN_LDFLAGS_PROBE != [ -z "$(IDN_CFLAGS)" ] || (pkg-config $(PKGC_STATIC) --libs libidn2 2>/dev/null || (pkg info -e libidn2 >/dev/null 2>&1 && echo "-L/usr/local/lib -lidn2") || ([ -f /usr/lib/libidn2.so ] || [ -f /usr/local/lib/libidn2.so ] || [ -f /usr/lib64/libidn2.so ] && echo "-lidn2")) || true
 IDN_LDFLAGS ?= $(IDN_LDFLAGS_PROBE)
 
 # Windows / MinGW detection (static single-binary build)

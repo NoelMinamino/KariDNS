@@ -76,7 +76,8 @@ fi
 "$Z2K" --ref "$T/ref.kdb" --list "$T/list.txt" $(kari_lab_zones) > "$T/ref.log" 2>&1
 RC=$?
 grep -c "^  \[ OK \]" "$T/ref.log" | sed 's/^/  zones taken: /'
-grep "^SKIP" "$T/ref.log" | sed 's/^/  /'
+# the files zone2kdb leaves out of the lab set (it prints "SKIP <file>: why"): the choice of the input, not a check that did not run
+grep "^SKIP" "$T/ref.log" | sed 's/^SKIP /  not an input: /'
 if [ $RC -ne 0 ]; then
     bad "zone2kdb --ref"
     cat "$T/ref.log"

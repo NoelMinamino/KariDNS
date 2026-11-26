@@ -35,13 +35,14 @@ UPDATES=${UPDATES:-15}
 echo "=== R-25 RCU TSan test ==="
 
 # Build as the invoking user (kari_make: running make as root leaves root-owned objects).
-if ! kari_make karidns karidns-tsan dag >/dev/null 2>&1; then
-    echo "FAIL: could not build karidns / karidns-tsan / dag"
-    exit 1
-fi
-
 # Set KEEP=1 to keep the work directory (server logs) for debugging.
 WORK="$(mktemp -d /tmp/karidns-rcu-tsan.XXXXXX)" || exit 1
+if ! kari_make karidns karidns-tsan dag > "$WORK/make.log" 2>&1; then
+    echo "FAIL: could not build karidns / karidns-tsan / dag; the end of the make output:"
+    tail -n 40 "$WORK/make.log"
+    rm -rf "$WORK"
+    exit 1
+fi
 
 kill_ours() {
     # Match only this test's config paths (the backend is a forked child).
