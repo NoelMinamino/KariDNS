@@ -6,7 +6,8 @@
 #      every counter (all 0 at the start), `karictl stats` has them as karidns_ipc_events_total (and "ipc" in JSON), `karictl status` the total
 #   B  the same server under load (a CPU burner on every CPU, 400 queries in flight, a query that is not answered in 1 s is sent again): every one
 #      of 20000 queries is answered within the resend window, and the accounting holds: the datagrams that were sent and did not come back are
-#      the drops that the server counted (karictl ipcstats), plus the datagrams the kernel dropped at a full UDP socket (netstat -s)
+#      the drops that the server counted (karictl ipcstats), plus the datagrams the kernel dropped at a full UDP socket (netstat -s) and at the
+#      full loopback IP input queue (net.inet.ip.intr_queue_drops: a datagram dropped there never reached a socket; CI flake row 43)
 #   C  the Backend is stopped (SIGSTOP) while 2000 queries come, paced so that the router can read them all: the queues to the workers fill up
 #      and every query that did not fit is counted (router.worker.dropped_full > 0), none is lost without a count; the Backend goes on (SIGCONT)
 #      and the ones that were queued are answered
@@ -114,23 +115,37 @@ ipcv() { ctl ipcstats 2>/dev/null | sed -n "s/^ipc\\.$1=//p" | head -1; }   # ip
 udp_full_drops() { netstat -s -p udp 2>/dev/null | awk '/dropped due to full socket buffers/ { print $1; exit }'; }
 kv() { echo "$1" | tr ' ' '\012' | sed -n "s/^$2=//p" | head -1; }   # kv "sent=3 received=2" received
 
-# account LABEL CLIENT-OUTPUT DROPPED-BEFORE UDPFULL-BEFORE: sent - received is what was lost; the server's counted drops (and the kernel's at a
-# full UDP socket, when netstat says) must account for all of it, and none of them may be a loss that did not happen
+# loopback output does not reach UDP at once: if_simloop() puts every datagram (the queries to the server and the replies to the client) on the one
+# netisr IP input queue (net.inet.ip.intr_queue_maxlen, 256), and a datagram that does not fit is dropped there and counted only in
+# net.inet.ip.intr_queue_drops (netstat -Q, "ip" Drops); the sender's sendto() still returned success (CI flakes rows 43 and 49).  Host-wide: other
+# tests on the host add to it, so it is a bound, not an exact count.
+ip_queue_drops() { sysctl -n net.inet.ip.intr_queue_drops 2>/dev/null; }
+
+# account LABEL CLIENT-OUTPUT DROPPED-BEFORE UDPFULL-BEFORE IPQUEUE-BEFORE: sent - received is what was lost; the server's counted drops, the kernel's at
+# a full UDP socket (netstat -s) and the kernel's at the full loopback IP input queue (intr_queue_drops) must account for all of it, and the server's
+# counted drops may not be more than what was lost.  A loss that no counter explains fails, with the counters, the UDP statistics and ipcstats
 account() {
     s=$(kv "$2" sent); r=$(kv "$2" received)
-    d1=$(ipcv dropped.total); u1=$(udp_full_drops)
+    d1=$(ipcv dropped.total); u1=$(udp_full_drops); q1=$(ip_queue_drops)
     lost=$((s - r)); counted=$((d1 - $3))
     if [ -n "$u1" ] && [ -n "$4" ]; then udp=$((u1 - $4)); else udp=""; fi
+    if [ -n "$q1" ] && [ -n "$5" ]; then ipq=$((q1 - $5)); else ipq=""; fi
+    kern=$((${udp:-0} + ${ipq:-0}))
+    rq1=$(rtq); rq=""; [ -n "$rq1" ] && [ -n "${RQ0:-}" ] && rq=$((rq1 - RQ0))
+    detail="router 0 read ${rq:-?} of the $s datagrams sent, the server counted $counted, the kernel ${udp:-?} at full UDP sockets and ${ipq:-?} at the full loopback IP input queue (net.inet.ip.intr_queue_drops $5 -> $q1)"
     if [ "$counted" -gt "$lost" ]; then
         bad "$1: the server counted $counted drops but only $lost datagrams were lost (sent $s, received $r)"
-    elif [ -n "$udp" ] && [ "$lost" -gt $((counted + udp)) ]; then
-        bad "$1: $lost datagrams were lost (sent $s, received $r), the server counted $counted and the kernel $udp at full UDP sockets: $((lost - counted - udp)) are not counted anywhere"
-    elif [ -z "$udp" ] && [ "$lost" -gt "$counted" ]; then
+    elif [ -n "$udp$ipq" ] && [ "$lost" -gt $((counted + kern)) ]; then
+        bad "$1: $lost datagrams were lost (sent $s, received $r), $detail: $((lost - counted - kern)) are not counted anywhere" "$(kari_udp_delta "$T/udp.snap" 2>/dev/null)"
+    elif [ -z "$udp$ipq" ] && [ "$lost" -gt "$counted" ]; then
         bad "$1: $lost datagrams were lost (sent $s, received $r), the server counted only $counted"
     else
-        ok "$1: sent $s - received $r = $lost lost; counted by the server $counted${udp:+, by the kernel at a full UDP socket $udp}"
+        ok "$1: sent $s - received $r = $lost lost; counted by the server $counted${udp:+, by the kernel at a full UDP socket $udp}${ipq:+, at the full loopback IP input queue $ipq}${rq:+ (router 0 read $rq)}"
     fi
 }
+# snap: the counters account() starts from (D0 U0 Q0, and the UDP statistics for its failure message)
+rtq() { ctl ipcstats 2>/dev/null | sed -n "s/^ipcrouter\.0\.queries=//p" | head -1; }   # the queries router 0 read (udp-receive frontend: every one that reached the server)
+snap() { D0=$(ipcv dropped.total); U0=$(udp_full_drops); Q0=$(ip_queue_drops); RQ0=$(rtq); kari_udp_snap "$T/udp.snap"; }
 
 # ---------------------------------------------------------------- A. the counters are there
 echo "== A. karictl ipcstats / stats / status, buffers of 16K"
@@ -163,17 +178,17 @@ while [ "$i" -lt "$NCPU" ]; do
     BURNERS="$BURNERS $!"
     i=$((i + 1))
 done
-D0=$(ipcv dropped.total); U0=$(udp_full_drops)
+snap
 OUT=$(perl "$CLIENT" "$PORT" 20000 400 1 30 16 0)
 echo "  $OUT"
 stop_burners
 [ "$(kv "$OUT" unanswered)" = 0 ] && ok "every one of 20000 queries was answered within the resend window" || bad "unanswered: $(kv "$OUT" unanswered)" "$OUT"
-account "under load" "$OUT" "$D0" "$U0"
+account "under load" "$OUT" "$D0" "$U0" "$Q0"
 echo "  counted so far: $(ctl ipcstats | grep -v '=0$' | tr '\n' ' ')"
 
 # ---------------------------------------------------------------- C. the Backend is stopped
 echo "== C. the Backend is stopped while 2000 queries come (8 at a time, 2 ms apart): the queues to the workers fill up"
-D0=$(ipcv dropped.total); F0=$(ipcv router.worker.dropped_full); U0=$(udp_full_drops)
+snap; F0=$(ipcv router.worker.dropped_full)
 kill -STOP "$BACKEND"
 OUT=$(perl "$CLIENT" "$PORT" 2000 2000 0 20 8 2 "$BACKEND")
 kill -CONT "$BACKEND" 2>/dev/null
@@ -181,7 +196,7 @@ echo "  $OUT"
 F1=$(ipcv router.worker.dropped_full)
 [ "${F1:-0}" -gt "${F0:-0}" ] && ok "queries that did not fit the queues are counted: router.worker.dropped_full +$((F1 - F0))" || bad "router.worker.dropped_full did not move ($F0 -> $F1)" "$OUT"
 [ "$(kv "$OUT" answered)" -gt 0 ] && ok "the queries that were queued were answered after SIGCONT ($(kv "$OUT" answered))" || bad "no query was answered after SIGCONT" "$OUT"
-account "the stopped Backend" "$OUT" "$D0" "$U0"
+account "the stopped Backend" "$OUT" "$D0" "$U0" "$Q0"
 ctl ipcstats > "$T/ipc1.txt"
 [ "$(sed -n 's/^ipc\.router\.rx\.short=//p' "$T/ipc1.txt")" = 0 ] && [ "$(sed -n 's/^ipc\.worker\.rx\.bad_length=//p' "$T/ipc1.txt")" = 0 ] && ok "no message was dropped as malformed (rx.short, bad_length 0)" || bad "malformed-message counters moved" "$(cat "$T/ipc1.txt")"
 # what the DB tests print when a query is lost (tests/lib_proc.sh kari_ipc_diag)
@@ -284,7 +299,7 @@ run_e() {   # run_e LABEL BUDGET_US
     fi
     OUT=$(perl "$CLIENT" "$PORT" 1 1 1 5)
     [ "$(kv "$OUT" answered)" = 1 ] || { bad "$1: no answer before the test" "$OUT"; stop_server; return 1; }
-    D0=$(ipcv dropped.total); F0=$(ipcv worker.reply.dropped_full); R0=$(ipcv worker.reply.retried); U0=$(udp_full_drops)
+    snap; F0=$(ipcv worker.reply.dropped_full); R0=$(ipcv worker.reply.retried)
     kill -STOP "$ROUTER"
     OUT=$(perl "$CLIENT" "$PORT" 400 400 0 5 8 2 "$ROUTER")
     kill -CONT "$ROUTER" 2>/dev/null
@@ -300,11 +315,17 @@ else
 [ "$KARIDNS_E" != "$KARIDNS" ] && export ASAN_OPTIONS="${ASAN_OPTIONS:-detect_leaks=0:abort_on_error=0}"      # (karidns-evict is a sanitizer build)
 run_e "E1 (no wait)" 0 && {
     [ "$((F1 - F0))" -gt 0 ] && ok "E1: without the wait the replies that do not fit the queue are dropped: worker.reply.dropped_full +$((F1 - F0))" || bad "E1: worker.reply.dropped_full did not move ($F0 -> $F1): the reply queue did not fill" "$OUT"
-    account "E1" "$OUT" "$D0" "$U0"
+    account "E1" "$OUT" "$D0" "$U0" "$Q0"
     stop_server
 }
 run_e "E2 (wait)" 10000000 && {
-    [ "$(kv "$OUT" answered)" = 400 ] && [ "$(kv "$OUT" sent)" = "$(kv "$OUT" received)" ] && ok "E2: every one of the 400 queries was answered, none sent twice" || bad "E2: not every query was answered" "$OUT"
+    # (a query or reply the kernel dropped at the full loopback IP input queue is not the server's: no resends here, so it stays unanswered;
+    # it is accepted only when the queue dropped at least that many during this load, as in tests/run_udp_router_split_test.sh)
+    a=$(kv "$OUT" answered); q1=$(ip_queue_drops); ipq=$((${q1:-0} - ${Q0:-0}))
+    if [ "$a" = 400 ] && [ "$(kv "$OUT" sent)" = "$(kv "$OUT" received)" ]; then ok "E2: every one of the 400 queries was answered, none sent twice"
+    elif [ "$(kv "$OUT" sent)" = 400 ] && [ "$(kv "$OUT" received)" = "$a" ] && [ $((400 - a)) -le "$ipq" ]; then
+        ok "E2: $a of the 400 queries answered, none sent twice; the other $((400 - a)) lost in the kernel's loopback IP input queue (net.inet.ip.intr_queue_drops +$ipq)"
+    else bad "E2: not every query was answered (net.inet.ip.intr_queue_drops +$ipq during this load)" "$OUT"; fi
     [ "$F1" = "$F0" ] && [ "$(ipcv dropped.total)" = "$D0" ] && ok "E2: nothing dropped (worker.reply.dropped_full and ipc.dropped.total unchanged)" || bad "E2: dropped: worker.reply.dropped_full $F0 -> $F1, ipc.dropped.total $D0 -> $(ipcv dropped.total)" "$OUT"
     [ "$((R1 - R0))" -gt 0 ] && ok "E2: the worker waited for the queue: worker.reply.retried +$((R1 - R0))" || bad "E2: worker.reply.retried did not move: the queue did not fill" "$OUT"
     stop_server
