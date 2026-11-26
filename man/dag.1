@@ -1,4 +1,4 @@
-.TH DAG 1 "2026-11-24" "KariDNS" "KariDNS Manual"
+.TH DAG 1 "2026-11-26" "KariDNS" "KariDNS Manual"
 .\" Generated from docs/dag.md by man/md2man.pl (make man): edit the Markdown manual, not this page.
 .SH NAME
 dag \- DNS Anomaly Generator, Protocol Inspector, and Multi-Server Verification
@@ -506,7 +506,9 @@ again with the transitional mapping (\fB\[u2603].example\fR \[u2192]
 \fBxn\-\-strae\-oqa.example\fR). A name with no IDNA2008 form (a misplaced
 hyphen or joiner, the bidi rule of RFC 5893, a label over 63 octets) is sent as
 its UTF-8 octets, with \fB;; IDN conversion failed: <reason>\fR on standard
-error.
+error.  On Windows \fBdag\fR reads its arguments as UTF-8 (from the UTF-16
+command line), as dig reads them in a UTF-8 locale, and a name is converted from
+UTF-8 only (no second try in the ANSI code page).
 .SH EDNS0 EXTENSIONS
 Queries carry an EDNS0 OPT record and a client cookie by default (like
 \fBdig\fR). UPDATE and NOTIFY messages get an OPT record only when one of the

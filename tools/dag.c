@@ -2089,9 +2089,13 @@ KARIDNS_TOOL_FN const char *idn_to_ascii(const char *name, bool *allocated) {
     char *p = NULL;
     int rc = dag_idn_lookup(name, false, &p, NULL, NULL);
     int rc_utf8 = rc;
+#ifndef _WIN32
+    /* Windows: no second try in the locale's charset.  main() gives dag its arguments in UTF-8 there, and the ANSI code page read the octets of a
+     * name with no IDNA2008 form as other characters (١٢٣.example became xn--7acd55abb.example where dig sends the UTF-8 octets) */
     if (rc != IDN2_OK) {
         rc = dag_idn_lookup(name, true, &p, NULL, NULL);
     }
+#endif
     if (rc == IDN2_OK) {
         if (allocated) *allocated = true;
         return p;
