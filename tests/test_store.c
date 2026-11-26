@@ -8030,7 +8030,11 @@ static void test_bulk_basic(void) {
   CHECK_EQ(store_bulk(s), 0);
   CHECK_EQ(st.bulk_active, 0);
   CHECK(st.bulk_ended_unix > 0);
-  CHECK_EQ(st.checkpoints, ck2 + 1);
+  /* (one checkpoint ends the fill; the store logs again from here, and a checkpoint of the 200 ms interval may follow it at once when the end took longer:
+   * the coverage build, CI 2026-11-27 "6 vs 5".  So the end's own line is counted, not every checkpoint; it comes right after the flag the wait reads) */
+  CHECK(st.checkpoints >= ck2 + 1);
+  for (int w = 0; w < 10000 && log_count(6, "the end of the bulk fill is on disk") == 0; w++) usleep(1000);
+  CHECK_EQ(log_count(6, "the end of the bulk fill is on disk"), 1);
   CHECK_EQ(log_count(6, "the unlogged bulk fill is over"), 1);
   CHECK_EQ(store_bulk_end(s, STORE_BULK_END_WAIT), 0);
   const uint64_t jb1 = st.journal_bytes_written, un = st.bulk_unlogged_records;
