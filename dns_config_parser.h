@@ -924,6 +924,7 @@ typedef struct server_config_s {
   bool any_view_minimal;        /* some view writes minimal-responses (the query path then looks the view up) */
   bool minimal_any;
   uint32_t minimal_any_ttl;
+  bool answer_rrsig_queries;   /* `answer-rrsig-queries` (0.7): answer a question for type RRSIG with the RRSIG RRset (the 0.6 behaviour); default no = FORMERR + EDE 30, as BIND 9.20.31 / 9.21 */
   uint32_t wire_cache_max_records;
   uint32_t router_threads;     /* `router-threads` (restart-only): the Frontend routers, 1..KARIDNS_ROUTER_THREADS_MAX; 0 = by the CPUs this process may run on */
   uint32_t worker_threads;     /* `worker-threads` (restart-only): the Backend workers, 1..KARIDNS_WORKER_THREADS_MAX; 0 = by the CPUs this process may run on */

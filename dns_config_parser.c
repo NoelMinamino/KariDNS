@@ -8508,6 +8508,7 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
   config->minimal_responses = false;
   config->minimal_any = false;
   config->minimal_any_ttl = 86400;
+  config->answer_rrsig_queries = false;
   config->wire_cache_max_records = 0;
   config->router_threads = 0;
   config->worker_threads = 0;
@@ -8857,6 +8858,11 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
           }
         } else if (strcmp(key, "minimal-any") == 0) {
           if (parse_bool_statement(ctx, NULL, key, &config->minimal_any) != 0) {
+            free(key);
+            return -1;
+          }
+        } else if (strcmp(key, "answer-rrsig-queries") == 0) {
+          if (parse_bool_statement(ctx, NULL, key, &config->answer_rrsig_queries) != 0) {
             free(key);
             return -1;
           }

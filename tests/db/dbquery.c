@@ -18,7 +18,8 @@
  * OUT: one line per query, "key<TAB>strict<TAB>folded", the key being the list line.  strict is the response as
  * lower-case hex with the 16-bit ID zeroed; folded is the same with ASCII letters of the question name and of the
  * owner names of the RRs folded to lower case (PowerDNS stores owners in lower case, a zone file may not).  A query
- * that gets no answer (timeout) writes "TIMEOUT" in both columns.  The UDP answer is taken as it is, truncated or not.
+ * that gets no answer (timeout) writes "TIMEOUT" in both columns.  The UDP answer is taken as it is, truncated or not, except
+ * for an ANY with TC=1 (0.7, RFC 8482 section 4.4), which is asked again over TCP.
  *
  * Exit status 0 when every query was answered, 1 on timeouts, 2 on usage or I/O errors.
  */
@@ -34,6 +35,7 @@
 #include <string.h>
 #include <strings.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 static const struct { const char *name; uint16_t code; } k_types[] = {
@@ -179,6 +181,41 @@ static int add_ecs(uint8_t *q, size_t *np, const char *spec) {
     return 0;
 }
 
+/* One query over TCP (RFC 1035 section 4.2.2: a two-octet length before the message), from SRC when given; the length of the
+ * answer in r, or -1 (no connection, timeout, short read). */
+static ssize_t tcp_query(const struct sockaddr_in *sa, const char *src, const uint8_t *q, size_t n, uint8_t *r, size_t cap, int tmo) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    struct timeval tv = { tmo, 0 };
+    (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    (void)setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    if (src) {
+        struct sockaddr_in bsa;
+        memset(&bsa, 0, sizeof(bsa));
+        bsa.sin_family = AF_INET;
+        if (inet_pton(AF_INET, src, &bsa.sin_addr) != 1 || bind(fd, (struct sockaddr *)&bsa, sizeof(bsa)) != 0) { close(fd); return -1; }
+    }
+    uint8_t m[2 + 1600];
+    if (n > sizeof(m) - 2 || connect(fd, (const struct sockaddr *)sa, sizeof(*sa)) != 0) { close(fd); return -1; }
+    m[0] = (uint8_t)(n >> 8); m[1] = (uint8_t)n;
+    memcpy(m + 2, q, n);
+    if (send(fd, m, n + 2, 0) != (ssize_t)(n + 2)) { close(fd); return -1; }
+    size_t got = 0, want = 2;
+    uint8_t lp[2];
+    while (got < want) {                                     /* the length, then the message */
+        ssize_t k = recv(fd, want == 2 ? lp + got : r + got, want - got, 0);
+        if (k <= 0) { close(fd); return -1; }
+        got += (size_t)k;
+        if (want == 2 && got == 2) {
+            want = (size_t)((lp[0] << 8) | lp[1]);
+            got = 0;
+            if (want == 0 || want > cap) { close(fd); return -1; }
+        }
+    }
+    close(fd);
+    return (ssize_t)want;
+}
+
 int main(int argc, char **argv) {
     int port = 0, tmo = 2;
     const char *addr = "127.0.0.1", *src = NULL;
@@ -286,6 +323,12 @@ int main(int argc, char **argv) {
                 ssize_t got = recv(fd, r, sizeof(r), 0);
                 if (got >= 12 && r[0] == q[0] && r[1] == q[1]) rn = got;
             }
+        }
+        /* 0.7: an ANY over UDP is answered empty with TC=1 (RFC 8482 section 4.4, docs/karidns.md "ANY and RRSIG queries"):
+         * the query is asked again over TCP, as a client does (RFC 7766 section 5), so that the ANY answers are compared */
+        if (rn >= 12 && (r[2] & 0x02) && qt == 255) {
+            ssize_t tn = tcp_query(&sa, src, q, n, r, sizeof(r), tmo);
+            rn = (tn >= 12 && r[0] == q[0] && r[1] == q[1]) ? tn : -1;
         }
         fprintf(out, "%s\t", line);
         if (rn < 0) {

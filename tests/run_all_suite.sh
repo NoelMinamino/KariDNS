@@ -555,6 +555,7 @@ register_test "dnssec" "sh" "tests/run_ds_delegation_test.sh" "RFC 4035 3.1.4.1 
 register_test "dnssec" "sh" "tests/run_dnssec_answer_sections_test.sh" "DNSSEC answers on signed zones: RRSIGs in Authority/Additional, grouped RRsets, NSEC3PARAM choice and 255-octet salt, DS from the parent, delv validation (R-03, R-04, O-16, O-17, R-31, R-32; SKIP without dnssec-signzone)"
 register_test "dnssec" "sh" "tests/run_dnssec_denial_gap_test.sh" "DNSSEC: a gap in the NSEC / NSEC3 chain of a signed zone is logged once a minute per zone, whole zones log nothing (0.7, audit Low; SKIP without dnssec-signzone)"
 register_test "dnssec" "sh" "tests/run_nsec3_owner_query_test.sh" "RFC 5155 7.2.8 queries for NSEC3 owner names: NXDOMAIN with the NSEC3 proof for every QTYPE (UDP/TCP, MQTYPE, minimal-any), apex wildcard answers them as BIND does, RCODE/Answer equal to named, AXFR keeps the NSEC3 RRs (SKIP without dnssec-signzone)"
+register_test "dnssec" "sh" "tests/run_any_rrsig_query_test.sh" "ANY over UDP: empty with TC=1 unless a valid server cookie (RFC 8482 4.4); RRSIG questions: FORMERR + EDE 30, answer-rrsig-queries yes keeps the RRSIG RRset (0.7, BIND 2026-11-24)"
 
 # 4. Dynamic Update (RFC 2136)
 register_test "update" "sh" "tests/run_dynamic_update_test.sh" "RFC 2136 Prerequisites & Update Section handling"

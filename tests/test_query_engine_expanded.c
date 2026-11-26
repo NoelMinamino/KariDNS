@@ -215,7 +215,7 @@ static void test_all_rr_types_and_resolution(void) {
         { "_443._tcp.example.com.", 52 /* TLSA */, 1, 0 },
         { "dsrec.example.com.", 43 /* DS */, 1, 0 },
         { "dkey.example.com.", 48 /* DNSKEY */, 1, 0 },
-        { "rrsigrec.example.com.", 46 /* RRSIG */, 1, 0 },
+        { "rrsigrec.example.com.", 46 /* RRSIG */, 0, 1 /* FORMERR: no standalone RRSIG queries (0.7, answer-rrsig-queries) */ },
         { "nsec1.example.com.", 47 /* NSEC */, 1, 0 },
         // RFC 5155 §7.2.8: a name that owns only an NSEC3 RR does not exist for queries (Name Error)
         { "nsec3rec.example.com.", 50 /* NSEC3 */, 0, 3 },
@@ -252,7 +252,7 @@ static void test_all_rr_types_and_resolution(void) {
         int res_len = process_dns_query_impl(req, req_len, res, sizeof(res),
                                              tests[i].qname, tests[i].qtype,
                                              "192.0.2.100", &comp_ctx,
-                                             false, &rrl_out, &snap, &cfg, &matched_entry);
+                                             tests[i].qtype == 255 /* (ANY over TCP: over UDP it is TC=1, RFC 8482 4.4) */, &rrl_out, &snap, &cfg, &matched_entry);
         assert(res_len >= DNS_HEADER_SIZE);
         uint8_t rcode = res[3] & 0x0F;
         uint16_t ancount = (res[6] << 8) | res[7];
@@ -527,7 +527,7 @@ static int soa_set_query(zone_db_snapshot_t *snap, server_config_t *cfg, const c
     compress_ctx_init_packet(&comp_ctx);
     const rate_limit_config_t *rrl_out = NULL;
     zone_db_entry_t *matched = NULL;
-    return process_dns_query_impl(req, req_len, res, res_cap, qname, qtype, client, &comp_ctx, false, &rrl_out, snap, cfg, &matched);
+    return process_dns_query_impl(req, req_len, res, res_cap, qname, qtype, client, &comp_ctx, qtype == 255, &rrl_out, snap, cfg, &matched);   /* (ANY over TCP: over UDP it is TC=1, RFC 8482 4.4) */
 }
 
 static size_t gr_build_cookie_query(uint8_t *req, const char *qname, uint16_t qtype, const uint8_t *cookie, size_t cookie_len);
@@ -1616,7 +1616,7 @@ static void gr_query(const char *qname, uint16_t qtype, bool dnssec_ok, gr_resp_
     uint8_t req[512];
     size_t req_len = 0;
     build_dns_query(req, &req_len, 0x4592, qname, qtype, dnssec_ok);
-    gr_query_raw(req, req_len, qname, qtype, "192.0.2.100", false, out);
+    gr_query_raw(req, req_len, qname, qtype, "192.0.2.100", qtype == 255, out);   /* (ANY over TCP: over UDP it is TC=1, RFC 8482 4.4) */
 }
 
 static void gr_query_raw(const uint8_t *req, size_t req_len, const char *qname, uint16_t qtype,
@@ -3032,7 +3032,7 @@ static void test_non_data_rrtypes_and_special_qtypes(void) {
         size_t qlen = 0;
         build_dns_query(qbuf, &qlen, 0x1000 + qt, "special.example.", qt, false);
         compress_ctx_init(&comp_ctx);
-        int rlen = process_dns_query(qbuf, qlen, rbuf, sizeof(rbuf), "special.example.", qt, "192.0.2.100", &comp_ctx, false, &rrl_cfg, &snap);
+        int rlen = process_dns_query(qbuf, qlen, rbuf, sizeof(rbuf), "special.example.", qt, "192.0.2.100", &comp_ctx, qt == 255, &rrl_cfg, &snap);   /* (ANY over TCP, RFC 8482 4.4) */
         assert(rlen >= 12);
         if (qt == 255 /* ANY */) {
             // ANY query on apex should return all records (SOA, NS, A, TXT)
@@ -3888,7 +3888,7 @@ static void test_any_query_with_dnssec_rrsigs(void) {
     size_t qlen = 0;
     build_dns_query(qbuf, &qlen, 0xBBBB, "anydnssec.example.", 255 /* ANY */, true);
     const rate_limit_config_t *rrl_cfg = NULL;
-    int rlen = process_dns_query(qbuf, qlen, rbuf, sizeof(rbuf), "anydnssec.example.", 255, "127.0.0.1", &comp_ctx, false, &rrl_cfg, &snap);
+    int rlen = process_dns_query(qbuf, qlen, rbuf, sizeof(rbuf), "anydnssec.example.", 255, "127.0.0.1", &comp_ctx, true, &rrl_cfg, &snap);   /* (ANY over TCP, RFC 8482 4.4) */
     assert(rlen >= 12);
     uint16_t ancount = (rbuf[6] << 8) | rbuf[7];
     assert(ancount >= 4); // SOA, NS, A, TXT + RRSIGs
@@ -7948,7 +7948,7 @@ static void test_query_engine_feature_case_202(void) {
     size_t req_len = 0;
     build_dns_query(req, &req_len, 202, "any.example.", 255 /* ANY */, false);
     compress_ctx_init_packet(&comp_ctx);
-    int res_len = process_dns_query(req, req_len, res, sizeof(res), "any.example.", 255, "192.0.2.1", &comp_ctx, false, &rrl_cfg, &snap);
+    int res_len = process_dns_query(req, req_len, res, sizeof(res), "any.example.", 255, "192.0.2.1", &comp_ctx, true, &rrl_cfg, &snap);   /* (ANY over TCP, RFC 8482 4.4) */
     assert(res_len >= 12);
     assert((res[3] & 0x0F) == 0);
     assert(((res[6] << 8) | res[7]) >= 3); // Multiple answer records
@@ -10014,7 +10014,7 @@ static void b9_ask(b9_zone_t *z, server_config_t *cfg, const char *qname, uint16
     compress_ctx_init_packet(&comp_ctx);
     const rate_limit_config_t *rrl = NULL;
     zone_db_entry_t *matched = NULL;
-    int n = process_dns_query_impl(req, req_len, res, sizeof(res), qname, qtype, "192.0.2.100", &comp_ctx, false, &rrl, &z->snap, cfg, &matched);
+    int n = process_dns_query_impl(req, req_len, res, sizeof(res), qname, qtype, "192.0.2.100", &comp_ctx, qtype == 255, &rrl, &z->snap, cfg, &matched);   /* (ANY over TCP, RFC 8482 4.4) */
     assert(n >= DNS_HEADER_SIZE);
     b9_parse(res, n, o);
 }
@@ -11275,6 +11275,7 @@ static void test_alias_max_refresh_sched(void) {
  * Expectations from BIND 9.20.4 bin/named/builtin.c (version_lookup(), hostname_lookup(), id_lookup(), builtin_authority(): SOA
  * "<zone> hostmaster.<zone> 0 28800 7200 604800 86400" TTL 86400, NS <zone> TTL 0, TXT TTL 0), bin/named/config.c (the _bind view),
  * lib/ns/query.c (NOAUTHORITY / NOADDITIONAL for minimal-responses) and RFC 4892. ---- */
+static bool ch_tcp;   /* ch_query() over TCP (an ANY over UDP is TC=1, RFC 8482 4.4) */
 static int ch_query(server_config_t *cfg, const char *qname, uint16_t qtype, uint16_t qclass, bool edns, const char *client, size_t res_cap,
                     uint8_t *res) {
     uint8_t req[512];
@@ -11294,7 +11295,7 @@ static int ch_query(server_config_t *cfg, const char *qname, uint16_t qtype, uin
     compress_ctx_init_packet(&cc);
     const rate_limit_config_t *rrl = NULL;
     zone_db_entry_t *m = NULL;
-    return process_dns_query_impl(req, off, res, res_cap, qname, qtype, client, &cc, false, &rrl, NULL, cfg, &m);
+    return process_dns_query_impl(req, off, res, res_cap, qname, qtype, client, &cc, ch_tcp, &rrl, NULL, cfg, &m);
 }
 
 /* the first RR of a section of a response: skips the question; returns the offset after it (or 0), fills type/class/ttl/rdata */
@@ -11384,7 +11385,11 @@ static void test_chaos_builtin_zones(void) {
         assert(t == 2 && ttl == 0 && rl == 11 && memcmp(rd, "\2id\6server\0", 11) == 0);
     }
     n = ch_query(&cfg, "hostname.bind.", 255, 3, false, "192.0.2.9", sizeof(res), res);
-    assert((res[3] & 0x0F) == 0 && res[7] == 3 && res[9] == 0);   /* TXT, SOA, NS */
+    assert((res[3] & 0x0F) == 0 && (res[2] & 0x02) && !(res[2] & 0x04) && res[7] == 0 && res[9] == 0);   /* over UDP: empty, TC=1, AA=0 (RFC 8482 4.4) */
+    ch_tcp = true;
+    n = ch_query(&cfg, "hostname.bind.", 255, 3, false, "192.0.2.9", sizeof(res), res);
+    assert((res[3] & 0x0F) == 0 && !(res[2] & 0x02) && res[7] == 3 && res[9] == 0);   /* over TCP: TXT, SOA, NS */
+    ch_tcp = false;
 
     /* EDNS: the OPT is added, and the answer is unchanged */
     n = ch_query(&cfg, "version.bind.", 16, 3, true, "192.0.2.9", sizeof(res), res);
@@ -11400,8 +11405,10 @@ static void test_chaos_builtin_zones(void) {
     assert((res[3] & 0x0F) == 5);
 
     /* a response that does not fit in the buffer is cut to the question with TC=1 */
+    ch_tcp = true;   /* (over UDP an ANY is TC=1 whatever the buffer, RFC 8482 4.4) */
     n = ch_query(&cfg, "hostname.bind.", 255, 3, false, "192.0.2.9", 60, res);
     assert(n == 12 + 15 + 4 + 0 && (res[2] & 0x02) && res[7] == 0 && res[9] == 0);
+    ch_tcp = false;
     free_server_config_fields(&cfg);
 
     /* not written: version.bind is the product version, hostname.bind the host name, id.server has no TXT */

@@ -1,4 +1,4 @@
-.TH KARIDNS.CONF 5 "2026-11-25" "KariDNS" "KariDNS Manual"
+.TH KARIDNS.CONF 5 "2026-11-26" "KariDNS" "KariDNS Manual"
 .\" Generated from docs/karidns.md by man/md2man.pl (make man): edit the Markdown manual, not this page.
 .SH NAME
 karidns.conf \- the configuration file of karidns(8)
@@ -473,7 +473,17 @@ with an earlier view. See Zones shared between views.
 \fIDescription:\fR RFC 8482: answer \fBQTYPE=ANY\fR with a synthesized \fBHINFO
 "RFC8482" ""\fR record instead of all RRsets. When the query has DO=1 and the
 name has RRSIG records, a single RRset is returned instead (RFC 8482
-\[u00A7]4.2).
+\[u00A7]4.2). Since 0.7 it only shapes the ANY queries that are answered: over
+TCP, and over UDP with a valid server cookie (see "ANY and RRSIG queries").
+.TP 8
+\fBanswer\-rrsig\-queries yes|no;\fR
+\fIDefault:\fR \fBno\fR
+.br
+\fIDescription:\fR 0.7, KariDNS only (BIND has no such option). \fBno\fR: a
+question for type RRSIG is answered FORMERR with EDE 30 Invalid Query Type, as
+BIND 9.20.31 and later do (see "ANY and RRSIG queries"). \fByes\fR: the 0.6
+behaviour, the RRSIG RRset of the name (at a CNAME owner the name's own RRSIGs,
+RFC 4035 \[u00A7]2.5).
 .TP 8
 \fBminimal\-any\-ttl <seconds>;\fR
 \fIDefault:\fR \fB86400\fR
@@ -1184,6 +1194,38 @@ alone only exempts \fBaddress\fR and drops nothing (nothing else matches);
 requests received are affected: this server does not apply the list to the
 NOTIFY messages and SOA queries it sends or the transfers it starts. A \fBkey\fR
 element is an error.
+.SS ANY and RRSIG queries (0.7)
+KariDNS follows the changes ISC announced on 2026-11-24 for BIND 9 ("Upcoming
+changes to ANY and RRSIG query processing in BIND 9"; BIND main,
+\fBlib/ns/query.c\fR):
+.IP \(bu 2
+\fBANY over UDP\fR is answered with an empty response with TC=1 (NOERROR, AA=0,
+AD=0, the question and the OPT record), as RFC 8482 section 4.4 allows, so that
+ANY cannot be used to reflect and amplify traffic towards a spoofed address. A
+client retries over TCP (RFC 7766 section 5); \fBdig\fR and \fBdag\fR already
+send ANY over TCP. The exception is a query that carries a valid server cookie
+of this server (RFC 7873 section 5.2.4, RFC 9018): its source address is known,
+and it is answered over UDP as before. A client cookie alone is not enough (the
+TC response gives the client its server cookie, and its next query is then
+answered). This applies to every name and class (built-in CHAOS zones, program
+and forward zones too) and to database zones that are not in memory, which are
+neither waited for nor read for such a query. It comes after \fBallow\-query\fR
+(REFUSED) and the BADCOOKIE answer of RFC 7873 section 5.2.3, before any answer;
+\fBminimal\-any\fR only shapes the ANY queries that are answered. There is no
+option to turn it off, as in BIND.
+.IP \(bu 2
+\fBANY over TCP\fR is unchanged: all RRsets with \fBminimal\-any no\fR (the
+default), the RFC 8482 answer with \fBminimal\-any yes\fR.
+.IP \(bu 2
+\fBA question for type RRSIG\fR is answered FORMERR with EDE 30 Invalid Query
+Type ("RRSIG queries are not supported"; IANA Extended DNS Error registry), the
+question echoed, as BIND 9.20.31 and later do: signatures come with the RRsets
+they cover when the query has DO=1 (RFC 4035 section 3.1.1). It is checked
+before the zone, the ACLs, the cookies and the response cache, for every
+transport, class, DO bit and zone type (zone files, tinydns, database zones),
+and also for an RRSIG listed in an MQTYPE-Query option (RFC
+10029). \fBanswer\-rrsig\-queries yes;\fR keeps the 0.6 answer (the name's RRSIG
+RRset; at a CNAME owner its own RRSIGs, RFC 4035 section 2.5).
 .SS rate-limit { ... } (in options or zone)
 A \fBrate\-limit\fR block in a zone replaces the server-wide block for that
 zone. \fB0\fR means no limit for that class. Only UDP responses are limited.

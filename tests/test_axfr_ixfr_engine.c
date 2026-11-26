@@ -28,6 +28,8 @@
 #include "dns_snapshot_rcu.h"
 #include "dns_epoch_rcu.h"
 #include "dns_axfr_ixfr.h"
+#include "dns_query_engine.h"
+#include "dns_server_internal.h"
 #include "dns_utils.h"
 #include "test_zone_slots.h"
 
@@ -1487,6 +1489,43 @@ static void test_axfr_worker_recheck_acl(void) {
     free(apex);
     free(el);
     printf("  -> the recheck of the zone's own allow-transfer passed.\n");
+}
+
+/* 0.7: an ANY over UDP for a zone that is not in memory is answered empty with TC=1 (RFC 8482 4.4) at once: the query neither waits
+ * for the zone nor makes the server read it (the probe gets the final answer, not DNS_NR_PERMITTED).  Over TCP it may wait as before. */
+static void test_not_ready_any_udp_tc(void) {
+    printf("[TEST] Query engine: ANY over UDP for a zone that is not in memory -> TC=1, nothing waited for...\n");
+    zdir_apex_t *apex = nr_apex(4242);
+    zdir_elem_t *el = nr_elem("nr.example.com.", 4242, apex);
+    view_snapshot_t v;
+    memset(&v, 0, sizeof(v));
+    v.name = "default";
+    query_route_t route = { &v, NULL, NULL };
+    zref_t z;
+    zref_clear(&z);
+    z.el = el;
+    z.zid = ZREF_NOZID;
+    z.hview = "default";
+    zone_db_snapshot_t snap;
+    memset(&snap, 0, sizeof(snap));
+    uint8_t req[512], res[1024];
+    for (int edns = 0; edns < 2; edns++) {
+        size_t n = nr_request(req, sizeof(req), "nr.example.com.", 255, -1, edns != 0, false);
+        compress_ctx_t cc;
+        compress_ctx_init(&cc);
+        int len = process_dns_not_ready_routed(req, n, res, 512, sizeof(res), "nr.example.com.", 255, "127.0.0.1", &cc, false, NULL, &snap,
+                                               &route, &z, true);
+        assert(len == (int)(12 + 16 + 4 + (edns ? 11 : 0)));                                      /* the question (and the OPT) only */
+        assert(res[0] == 0x55 && res[1] == 0x66 && (res[2] & 0x80) && (res[2] & 0x02) && !(res[2] & 0x04) && (res[3] & 0x0F) == 0);
+        assert(res[5] == 1 && res[7] == 0 && res[9] == 0 && res[11] == (edns ? 1 : 0));
+        compress_ctx_init(&cc);
+        len = process_dns_not_ready_routed(req, n, res, 65535 < sizeof(res) ? 65535 : sizeof(res), sizeof(res), "nr.example.com.", 255, "127.0.0.1",
+                                           &cc, true, NULL, &snap, &route, &z, true);
+        assert(len == DNS_NR_PERMITTED);                                                          /* TCP: may wait for the zone */
+    }
+    free(apex);
+    free(el);
+    printf("  -> ANY over UDP for a zone out of memory passed.\n");
 }
 
 static void test_axfr_worker_zone_out_of_memory(void) {
@@ -8896,6 +8935,7 @@ int main(void) {
     test_handle_axfr_event_intermediate_unsigned_flow();
     test_handle_axfr_event_and_worker_thread();
     test_axfr_worker_zone_out_of_memory();
+    test_not_ready_any_udp_tc();
     test_axfr_worker_recheck_acl();
     test_r11_stalled_transfer_holds_nothing_but_its_version();
     test_r11_apex_answer_copies_before_send();

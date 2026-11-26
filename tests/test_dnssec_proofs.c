@@ -293,7 +293,7 @@ static void gr_query(const char *qname, uint16_t qtype, bool dnssec_ok, gr_resp_
     uint8_t req[512];
     size_t req_len = 0;
     build_dns_query(req, &req_len, 0x4592, qname, qtype, dnssec_ok);
-    gr_query_raw(req, req_len, qname, qtype, "192.0.2.100", false, out);
+    gr_query_raw(req, req_len, qname, qtype, "192.0.2.100", qtype == 255, out);   /* (ANY over TCP: over UDP it is TC=1, RFC 8482 4.4) */
 }
 
 static void gr_query_raw(const uint8_t *req, size_t req_len, const char *qname, uint16_t qtype,
@@ -1393,7 +1393,11 @@ static void test_dnssec_rrsig_sections(void) {
     p9_expect_grouped(&r, 1, "wildcard ANY answer");
     EXPECT_NS(&r, "wildcard ANY proof", "*.wild.sig.test.");
 
-    /* QTYPE RRSIG: all RRSIGs at the name, each once, nothing else in the Answer */
+    /* QTYPE RRSIG (0.7): FORMERR by default; with answer-rrsig-queries yes all RRSIGs at the name, each once, nothing else in the Answer.
+     * The option stays on for the MQTYPE RRSIG check below (R-04 sibling), which is a FORMERR too without it. */
+    gr_query("ns1.sig.test.", 46, true, &r);
+    CHECK(&r, r.rcode == 1 && gr_count(&r, 1, -1) == 0);
+    g_gr.cfg.answer_rrsig_queries = true;
     gr_query("ns1.sig.test.", 46, true, &r);
     CHECK(&r, gr_count(&r, 1, -1) == 3 && gr_count(&r, 1, 46) == 3);
 
@@ -1412,6 +1416,7 @@ static void test_dnssec_rrsig_sections(void) {
         g_gr.cfg.rfc10029_mqtype_enable = false;
         CHECK(&r, r.rcode == 0 && gr_count(&r, 1, 1) == 1 && gr_count(&r, 1, 46) == 3 && gr_count(&r, 1, -1) == 4);
         p9_expect_grouped(&r, 2, "MQTYPE authority");
+        g_gr.cfg.answer_rrsig_queries = false;
     }
 
     /* referral to sub: NS unsigned; the NSEC proving the missing DS; glue without RRSIG */
@@ -1810,8 +1815,12 @@ static void test_cname_owner_nsec_rrsig_questions(void) {
         CHECK(&r, p9_count_owner(&r, 1, 47, names[i]) == 1);
         gr_query(names[i], 47, false, &r);
         CHECK(&r, r.rcode == 0 && gr_count(&r, 1, 47) == 1 && gr_count(&r, 1, -1) == 1);
-        gr_query(names[i], 46, true, &r);               /* RRSIG: the signatures of the CNAME and of the NSEC, nothing else */
+        gr_query(names[i], 46, true, &r);               /* RRSIG (0.7 default): FORMERR, no answer (BIND 9.20.31) */
+        CHECK(&r, r.rcode == 1 && gr_count(&r, 1, -1) == 0);
+        g_gr.cfg.answer_rrsig_queries = true;           /* answer-rrsig-queries yes: the signatures of the CNAME and of the NSEC, nothing else */
+        gr_query(names[i], 46, true, &r);
         CHECK(&r, r.rcode == 0 && gr_count(&r, 1, 46) == 2 && gr_count(&r, 1, -1) == 2);
+        g_gr.cfg.answer_rrsig_queries = false;
         gr_query(names[i], 1, true, &r);                /* any other type follows the CNAME */
         CHECK(&r, gr_count(&r, 1, 5) == 1 && gr_count(&r, 1, 1) == 1);
         gr_query(names[i], 5, true, &r);                /* CNAME itself: the CNAME only */

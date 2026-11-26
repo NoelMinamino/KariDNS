@@ -3216,6 +3216,48 @@ static int build_badcookie_response(uint8_t *res, size_t max_res_len, uint16_t q
   return offset;
 }
 
+/* The COOKIE option of a query (edns->has_cookie): the server cookie it carried checked (RFC 9018 §4.2-4.4: SipHash-2-4, Reserved hashed as
+ * received, RFC 1982 timestamp window), and the server cookie of the answer made in edns: a fresh one for a client cookie alone (RFC 7873
+ * §5.2.3), for one that is not valid, and for one older than 30 minutes (RFC 9018 §4.3); the valid one kept otherwise.  When no cookie can be
+ * made the answer carries none (has_cookie = false).  The policy (BADCOOKIE, TC for ANY) is the caller's. */
+typedef enum { QE_COOKIE_CLIENT_ONLY, QE_COOKIE_INVALID, QE_COOKIE_VALID } cookie_check_t;
+static cookie_check_t qe_cookie_check(server_config_t *cfg, const char *client_ip, edns_info_t *edns) {
+  cookie_check_t ck = QE_COOKIE_CLIENT_ONLY;
+  bool need_new_cookie = true;
+  if (edns->server_cookie_len != 0) {
+    server_cookie_status_t cst = verify_server_cookie(cfg, client_ip, edns->client_cookie, edns->server_cookie, edns->server_cookie_len, (uint32_t)time(NULL));
+    ck = cst == SERVER_COOKIE_INVALID ? QE_COOKIE_INVALID : QE_COOKIE_VALID;
+    need_new_cookie = cst != SERVER_COOKIE_VALID;
+  }
+  if (need_new_cookie) {
+    if (!generate_server_cookie(cfg, client_ip, edns->client_cookie, edns->server_cookie, (uint32_t)time(NULL))) {
+      edns->server_cookie_len = 0;
+      edns->has_cookie = false;
+    } else {
+      edns->server_cookie_len = SERVER_COOKIE_LEN;
+    }
+  }
+  return ck;
+}
+
+/* 0.7: RFC 8482 §4.4: an ANY query over UDP whose source is not known to be genuine (no valid server cookie of this server, RFC 7873 §5.2.4) is
+ * answered with an empty, truncated response, so that ANY cannot be used to reflect and amplify traffic towards a spoofed address; a client
+ * retries over TCP (RFC 7766 §5, RFC 1035 §4.2.1), where ANY is answered as before.  As BIND (main, lib/ns/query.c ns__query_start(): "ANY
+ * queries are only answered to clients whose address is known not to be spoofed"): NOERROR, TC=1, AA=0, AD=0, the question and the OPT (with
+ * the client's server cookie, which makes its next UDP query an answered one), whatever the answer would be and whatever minimal-any says.
+ * The question is already copied to res[0..q_offset). */
+static int build_any_udp_tc_response(uint8_t *res, size_t max_res_len, uint16_t q_offset, edns_info_t *edns, server_config_t *cfg) {
+  uint16_t offset = q_offset, arcount = 0;
+  res[2] = (uint8_t)((res[2] & ~0x04) | 0x02);   /* AA=0, TC=1 */
+  res[3] &= (uint8_t)~0x2F;                      /* AD=0, RCODE NOERROR (RA, CD stay as the header was made) */
+  if (edns->present) assemble_edns_opt(res, max_res_len, &offset, &arcount, edns, 0, false, cfg);
+  res[6] = 0; res[7] = 0;
+  res[8] = 0; res[9] = 0;
+  res[10] = (uint8_t)(arcount >> 8);
+  res[11] = (uint8_t)(arcount & 0xFF);
+  return offset;
+}
+
 /* ---- Built-in CHAOS zones: version.bind, hostname.bind, id.server (BIND 9.20: bin/named/config.c defines them in the "_bind" view of class
  * CHAOS; bin/named/builtin.c answers them).  A zone has an SOA (MNAME = the zone, RNAME = hostmaster.<zone>, serial 0, 28800 7200 604800
  * 86400, TTL 86400), an NS at the apex (the zone itself, TTL 0) and, at the apex, a TXT of TTL 0 with the text of the option (version_lookup(),
@@ -3891,6 +3933,18 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
     }
   }
 
+  /* 0.7: a question for type RRSIG alone is a FORMERR with EDE 30 Invalid Query Type (IANA EDE registry), whatever the name, the class, the
+   * transport, DO or the zone, as BIND (9.20.31 / main, lib/ns/query.c ns_query_start(): "Standalone RRSIG queries are not supported"):
+   * the signatures come with the RRsets they cover when DO=1 (RFC 4035 3.1.1), and an RRSIG question only collects every signature at a
+   * name, which is an ANY by another name (RFC 4035 2.5 and RFC 2181 10.1 still apply with answer-rrsig-queries yes: at a CNAME owner the
+   * name's own RRSIG RRset is the answer).  Before the zone, the ACLs, the cookie checks and the response cache, as BIND checks it before
+   * its zone lookup: nothing is read, waited for or cached for it.  An MQTYPE-Query option that lists RRSIG is refused the same way below. */
+  if (opcode == 0 && qdcount == 1 && qtype == 46 && !(cfg_for_ede && cfg_for_ede->answer_rrsig_queries)) {
+    qe_why("a question for type RRSIG (standalone RRSIG queries are not supported; answer-rrsig-queries)");
+    add_ede(&edns, send_ede, 30, "RRSIG queries are not supported");
+    return dns_build_error_response(req, req_len, res, max_res_len, 1, 0, dns_error_qd_echo(req, req_len), &edns, is_tcp, cfg); // FORMERR
+  }
+
   if (not_ready_zone && qdcount == 1) {
     /* D1a: the zone is in the directory and its data is not in memory, and the caller cannot wait for it (or has waited in vain).  After the
      * checks of the message above (a malformed request is still a FORMERR), before any work on the zone.  The answer is an error answer of that
@@ -3949,6 +4003,17 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
     if (opcode == 0 && view && cfg && cfg->acl_query_active && !zone_query_permitted(cfg, &zc, view->name, client_ip)) {
       add_ede(&edns, send_ede, 18, "Query refused due to access control");
       return dns_build_error_response(req, req_len, res, max_res_len, 5, 0, 1, &edns, is_tcp, cfg);
+    }
+    /* 0.7: ANY over UDP without a valid server cookie is answered empty with TC=1 (RFC 8482 §4.4, as for a zone in memory below): it neither
+     * waits for the zone nor makes the server read it */
+    if (opcode == 0 && qtype == 255 && !is_tcp && !(edns.has_cookie && qe_cookie_check(cfg, client_ip, &edns) == QE_COOKIE_VALID)) {
+      const size_t q_end = get_question_end_offset(req, req_len, 1);
+      const size_t alimit = edns_udp_limit(&edns, is_tcp, cfg, view, client_ip, max_res_len, res_cap);
+      if (q_end > DNS_HEADER_SIZE && q_end <= alimit) {
+        memcpy(res, req, q_end);
+        dns_init_response_header(res, req, 0, true);
+        return build_any_udp_tc_response(res, alimit, (uint16_t)q_end, &edns, cfg);
+      }
     }
     if (opcode == 0 && qtype == 6 && qdcount == 1 && view && domain_names_match_ci(zref_name(not_ready_zone), current_qname)) {
       const zdir_apex_t *ap = (not_ready_zone->el ? atomic_load_explicit(&not_ready_zone->el->apex, memory_order_acquire) : NULL);
@@ -4204,40 +4269,17 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
 
   uint8_t ext_rcode_out = 0;
   bool is_badcookie = false;
-  
+  bool server_cookie_ok = false;   /* the query carried a valid server cookie of this server (RFC 7873 §5.2.4, RFC 9018 §4.3): its source is not spoofed */
+
   if (edns.has_cookie) {
-      bool need_new_cookie = false;
-      if (edns.server_cookie_len == 0) {
-          need_new_cookie = true;               // client-only cookie: hand out a Server Cookie
-          /* require-server-cookie (BIND lib/ns/query.c ns__query_start()): a UDP query that carries a client cookie but no valid server cookie gets
-           * BADCOOKIE, with a new server cookie to repeat the query with (RFC 7873 §5.2.3); a query without a cookie option is answered as usual */
-          if (!is_tcp && config_require_server_cookie(cfg, view ? view->name : NULL)) {
-              is_badcookie = true;
-              ext_rcode_out = 1;
-          }
-      } else {
-          // RFC 9018 §4.2-4.4: SipHash-2-4, Reserved hashed as received, RFC 1982 timestamp window
-          server_cookie_status_t cst = verify_server_cookie(cfg, client_ip, edns.client_cookie,
-                                                            edns.server_cookie, edns.server_cookie_len,
-                                                            (uint32_t)time(NULL));
-          if (cst == SERVER_COOKIE_INVALID) {
-              if (!is_tcp) {
-                  is_badcookie = true;
-                  ext_rcode_out = 1; // BADCOOKIE = combined RCODE 23 = (ext=1 << 4) | base=7
-              }
-              need_new_cookie = true;
-          } else if (cst == SERVER_COOKIE_VALID_REFRESH) {
-              need_new_cookie = true;           // RFC 9018 §4.3: renew cookies older than 30 minutes
-          }
-      }
-      if (need_new_cookie) {
-          if (!generate_server_cookie(cfg, client_ip, edns.client_cookie, edns.server_cookie,
-                                      (uint32_t)time(NULL))) {
-              edns.server_cookie_len = 0;
-              edns.has_cookie = false;
-          } else {
-              edns.server_cookie_len = SERVER_COOKIE_LEN;
-          }
+      cookie_check_t ck = qe_cookie_check(cfg, client_ip, &edns);
+      server_cookie_ok = ck == QE_COOKIE_VALID;
+      /* require-server-cookie (BIND lib/ns/query.c ns__query_start()): a UDP query that carries a client cookie but no valid server cookie gets
+       * BADCOOKIE, with a new server cookie to repeat the query with (RFC 7873 §5.2.3); a query without a cookie option is answered as usual.
+       * A server cookie that is not valid is BADCOOKIE over UDP (§5.2.3); BADCOOKIE = combined RCODE 23 = (ext=1 << 4) | base=7 */
+      if (!is_tcp && (ck == QE_COOKIE_INVALID || (ck == QE_COOKIE_CLIENT_ONLY && config_require_server_cookie(cfg, view ? view->name : NULL)))) {
+          is_badcookie = true;
+          ext_rcode_out = 1;
       }
   }
 
@@ -4324,6 +4366,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
         return dns_build_error_response(req, req_len, res, max_res_len, 1, 0, dns_error_qd_echo(req, req_len), &edns, is_tcp, cfg); // FORMERR
       }
       if (is_badcookie) return build_badcookie_response(res, max_res_len, (uint16_t)q_offset, &edns, ext_rcode_out, is_tcp, cfg);
+      if (qtype == 255 && !is_tcp && !server_cookie_ok) return build_any_udp_tc_response(res, max_res_len, (uint16_t)q_offset, &edns, cfg);   /* RFC 8482 §4.4 */
       return chaos_build_response(cfg, res, body_max_len, max_res_len, q_offset, zi, at_apex, qtype, &edns, is_tcp, ext_rcode_out, cfg);
     }
   }
@@ -4353,6 +4396,9 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
    * (Only a built-in CHAOS zone is answered first, after its ACL and the UDP AXFR FORMERR, above.)  Below this, every OPT RR carries
    * extended RCODE 0. */
   if (is_badcookie) return build_badcookie_response(res, max_res_len, (uint16_t)q_offset, &edns, ext_rcode_out, is_tcp, cfg);
+  /* 0.7: ANY over UDP without a valid server cookie: empty, TC=1 (RFC 8482 §4.4, build_any_udp_tc_response()), after BADCOOKIE as in BIND, before
+   * every answer that follows (a class or a name without a zone, program and forward zones, the response cache, minimal-any) */
+  if (qtype == 255 && !is_tcp && !server_cookie_ok) return build_any_udp_tc_response(res, max_res_len, (uint16_t)q_offset, &edns, cfg);
   if (qclass == 3 && !ch_zone_here) {
     add_ede(&edns, send_ede, 20, "This server is not authoritative for the queried zone");
     return dns_build_error_response(req, req_len, res, max_res_len, 5, 0, 1, &edns, is_tcp, cfg);
@@ -4680,6 +4726,12 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
        if (is_non_data_rrtype(mq)) {
           qe_why("invalid MQTYPE-Query option: a type that is not data (RFC 10029 3.3)");
           // RFC 10029 §3.3 / RFC 6891 §7: FORMERR (OPT 付き、AA=0)
+          return dns_build_error_response(req, req_len, res, max_res_len, 1, 0, dns_error_qd_echo(req, req_len), &edns, is_tcp, cfg);
+       }
+       if (mq == 46 && !(cfg_for_ede && cfg_for_ede->answer_rrsig_queries)) {
+          /* (an RRSIG question inside MQTYPE-Query is the standalone RRSIG query refused before the zone above) */
+          qe_why("MQTYPE-Query option that asks for RRSIG (standalone RRSIG queries are not supported; answer-rrsig-queries)");
+          add_ede(&edns, send_ede, 30, "RRSIG queries are not supported");
           return dns_build_error_response(req, req_len, res, max_res_len, 1, 0, dns_error_qd_echo(req, req_len), &edns, is_tcp, cfg);
        }
        bool dup = false;
