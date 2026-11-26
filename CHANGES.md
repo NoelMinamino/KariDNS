@@ -54,7 +54,7 @@ What changes, what it breaks, and what to do. The step-by-step version is [docs/
 - **Socket buffers**: the kernel refuses (does not clip) a `SO_RCVBUF` / `SO_SNDBUF` above about 8/9 of
   `kern.ipc.maxsockbuf`. On a stock system the `4M` default of `udp-recvbuf-size` was refused and the sockets stayed
   at 16 KiB. 0.7 asks for the most the kernel gives and logs a line that names the sysctl to raise (#224): a NOTICE for the default size, a WARNING for a size the configuration wrote (#256).
-- **ANY and RRSIG queries follow BIND's 2026 changes** (#PRNUM; docs/karidns.md "ANY and RRSIG queries").
+- **ANY and RRSIG queries follow BIND's 2026 changes** (#266; docs/karidns.md "ANY and RRSIG queries").
   - ANY over UDP is answered empty with TC=1 (RFC 8482 section 4.4) unless the query carries a valid server cookie
     (RFC 7873, RFC 9018); over TCP it is answered as before. A client that cannot use TCP and sends no cookies no
     longer gets ANY answers over UDP. No option turns this off (BIND has none).
