@@ -15,6 +15,8 @@ done
 export LC_ALL
 q() { awk '/QUESTION SECTION/ { getline; sub(/^;/, ""); print $1; exit }'; }
 if "$DAG" +idnin +qr +nohexdump +tries=1 +timeout=1 -p 1 @127.0.0.1 -q "$(printf 'r\303\251.test')" A 2>&1 | grep -q 'without libidn2'; then
+    # KARIDNS_TEST_REQUIRE=1 (CI): a dag without libidn2 is a failure, not a SKIP
+    [ "${KARIDNS_TEST_REQUIRE:-0}" = 1 ] && { echo "FAIL: dag was built without libidn2 (KARIDNS_TEST_REQUIRE=1)"; exit 1; }
     echo "SKIP: dag was built without libidn2"
     exit 0
 fi

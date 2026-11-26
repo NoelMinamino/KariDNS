@@ -25,6 +25,11 @@
 #                           time next to the others, "serial" ones alone, after the batch. See tests/TEST_MATRIX.md.
 #   -t, --tests <list>      Run exactly the listed tests (comma-separated; unknown name = error).
 #   --fail-on-skip          A test that exits 0 but prints a SKIP line counts as failed.
+#   --skip-allow FILE       Like --fail-on-skip, except for the SKIP lines FILE allows: lines "<test><TAB><ERE>" (the test as the suite names it,
+#                           tests/x.sh or test_x; # starts a comment).  A SKIP line no entry of its test matches fails the test; so does a whole-test
+#                           SKIP whose reason no entry matches.  tests/ci_skip_allow.txt is the list of the coverage jobs.
+#   A SKIP line is one of the forms the tests print (skip_lines below): "SKIP:", "[SKIP]", "... SKIP (reason)", a line that starts with SKIP,
+#   "Skipping ", "# SKIP" (node --test); not the counts ("2 skipped").  The summary lists every one of them.
 #   --full-log              Print the whole log of a failed test.
 #   --test-timeout SECONDS  A test still running after SECONDS is stopped (its process group) and fails with "*** TIMEOUT" in its log.
 #   --asan                  Run the unit test binaries as their -asan builds (like make unit-tests-asan).
@@ -121,6 +126,7 @@ SKIP_DAG=0
 JOBS=""
 TEST_LIST=""
 FAIL_ON_SKIP=0
+SKIP_ALLOW=""       # --skip-allow FILE
 TEST_TIMEOUT=0
 FULL_LOG=0
 ASAN_UNITS=0
@@ -212,6 +218,11 @@ while [ $# -gt 0 ]; do
         --fail-on-skip)
             FAIL_ON_SKIP=1
             ;;
+        --skip-allow)
+            shift
+            [ -f "${1:-}" ] || { echo "--skip-allow needs a file: '${1:-}'" >&2; exit 1; }
+            SKIP_ALLOW=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")   # the suite changes directory
+            ;;
         --full-log)
             FULL_LOG=1
             ;;
@@ -272,6 +283,7 @@ while [ $# -gt 0 ]; do
             echo "  -t, --tests <list>      Run exactly the listed tests (comma-separated, repeatable): the name of the"
             echo "                          script or binary, with or without tests/ and .sh; an unknown name is an error"
             echo "  --fail-on-skip          A test that exits 0 but prints a SKIP line counts as failed"
+            echo "  --skip-allow FILE       Like --fail-on-skip, but the SKIP lines FILE allows (<test><TAB><ERE> per line) do not fail the test"
             echo "  --full-log              Print the whole log (up to 2000 lines) of a failed test, not the failed checks and the tail"
             echo "  --test-timeout SECONDS  Stop a test still running after SECONDS (its process group); it fails with *** TIMEOUT in its log"
             echo "  --asan                  Run the unit test binaries as their -asan builds (make unit-test-bins-asan) under"
@@ -1056,6 +1068,10 @@ pg_init_slot() {
     if [ "$(id -u)" = "0" ]; then chown "${PG_CLUSTER_USER}" "${_pd}" || return 1; fi
     chmod 700 "${_pd}"
     pg_run "'${PG_INITDB}' -D '${_pd}' -U postgres --auth=trust -E UTF8 --no-locale --no-sync" < /dev/null > "${SUITE_TMP}/pg$1.init.log" 2>&1 || return 1
+    # the role of tests/run_db_pg_role_test.sh logs in with a password (scram-sha-256) over 127.0.0.1, so that its wrong-password case runs here;
+    # every other role keeps trust (the first matching line of pg_hba.conf wins)
+    { printf 'host all /^karidns_test_ro_ 127.0.0.1/32 scram-sha-256\n'; cat "${_pd}/pg_hba.conf"; } > "${_pd}/pg_hba.conf.new" &&
+        cat "${_pd}/pg_hba.conf.new" > "${_pd}/pg_hba.conf" && rm -f "${_pd}/pg_hba.conf.new" || return 1
     {
         echo ""
         echo "# run_all_suite.sh --pg-clusters (slot $1)"
@@ -1398,6 +1414,22 @@ else
 fi
 rm -f "${SUMMARY_FILE}"
 touch "${SUMMARY_FILE}"
+SKIP_LINES_FILE="${LOG_DIR}/skip_lines.tsv"
+
+# The SKIP lines of a test's log: the forms the tests print ("SKIP: why", "[SKIP] why", "Test: x ... SKIP (why)", a line that starts with SKIP,
+# "Skipping ...", "# SKIP" of node --test).  Not "(SKIP without ...)" of a description, not the counts ("=== SKIPPED", "2 skipped"): the lines with the reasons say it
+SKIP_RE='SKIP(:|\]| \()|^[[:space:]]*SKIP([^A-Za-z_=]|$)|(^|[^A-Za-z])Skipping |#[[:space:]]*SKIP'
+# skip_lines LOG: every SKIP line, without leading blanks and "=", '|' made '/' (the field separator of summary.tsv), at most 200 characters
+skip_lines() {
+    grep -E "${SKIP_RE}" "$1" 2>/dev/null | sed 's/^[ =]*//' | tr '|' '/' | cut -c1-200
+}
+# skip_unexpected TEST LINES_FILE: the lines that no entry "<TEST><TAB><ERE>" of --skip-allow matches (all of them without --skip-allow)
+skip_unexpected() {
+    if [ -z "${SKIP_ALLOW}" ]; then cat "$2"; return 0; fi
+    awk -F'\t' -v t="$1" '!/^#/ && $1 == t && $2 != "" { print $2 }' "${SKIP_ALLOW}" > "$2.allow"
+    if [ -s "$2.allow" ]; then grep -v -E -f "$2.allow" "$2"; else cat "$2"; fi
+    return 0
+}
 
 # run_job INDEX SLOT: run test INDEX of the plan in slot SLOT; the result line
 # (the line of summary.tsv) goes to ${RES_DIR}/INDEX.res.  Runs in a subshell
@@ -1486,18 +1518,37 @@ EOF
             _exit_code=$?
         fi
         [ ${_exit_code} -ne 0 ] && _status="FAIL"
-        # A test that SKIPs a part (no PostgreSQL driver in the loader, no PostgreSQL server, ...) and exits 0 is a PASS; the first of its
-        # SKIP lines is kept as the note of the PASS, so that a run which silently lost its PostgreSQL tests shows it.
+        # A test that SKIPs a part (no PostgreSQL driver in the loader, no PostgreSQL server, ...) and exits 0 is a PASS; all its SKIP lines are kept
+        # (the summary lists them), the first one and their number are the note of the PASS, so that a run which silently lost its PostgreSQL tests shows it.
         if [ "${_status}" = "PASS" ] && [ -f "${_log}" ]; then
-            _skip_reason=$(grep -m1 -E 'SKIP(:|\])' "${_log}" | sed 's/^[ =]*//' | cut -c1-150 | tr '|' '/')
-        fi
-        # --fail-on-skip (CI): a skipped part is a failure.  The test prints "SKIP" at the start of a line (what CI has always grepped for in the signer and WebAdmin tests)
-        if [ "${FAIL_ON_SKIP}" -eq 1 ] && [ "${_status}" = "PASS" ] && [ -f "${_log}" ] && grep -Eq '^[[:space:]]*SKIP' "${_log}"; then
-            _status="FAIL"
-            _exit_code=98
-            { echo "*** FAIL: --fail-on-skip: the test skipped a part (first SKIP line):"; grep -m1 -E '^[[:space:]]*SKIP' "${_log}"; } >> "${_log}"
+            skip_lines "${_log}" > "${RES_DIR}/${_ji}.skips"
+            _nskip=$(wc -l < "${RES_DIR}/${_ji}.skips" | tr -d ' ')
+            if [ "${_nskip}" -gt 0 ]; then
+                _skip_reason=$(head -n 1 "${RES_DIR}/${_ji}.skips" | cut -c1-150)
+                [ "${_nskip}" -gt 1 ] && _skip_reason="${_skip_reason} (+$((_nskip - 1)) more)"
+            fi
+            # --fail-on-skip (CI): a skipped part is a failure; --skip-allow: one that the list does not allow
+            if [ "${FAIL_ON_SKIP}" -eq 1 ] || [ -n "${SKIP_ALLOW}" ]; then
+                skip_unexpected "${_cmd}" "${RES_DIR}/${_ji}.skips" > "${RES_DIR}/${_ji}.bad"
+                if [ -s "${RES_DIR}/${_ji}.bad" ]; then
+                    _status="FAIL"
+                    _exit_code=98
+                    { echo "*** FAIL: ${SKIP_ALLOW:+--skip-allow ${SKIP_ALLOW}: }the test skipped a part; the SKIP lines${SKIP_ALLOW:+ the list does not allow}:"
+                      sed 's/^/    /' "${RES_DIR}/${_ji}.bad"; } >> "${_log}"
+                fi
+            fi
         fi
     fi
+    # a test that did not run at all (no binary, no script): with --fail-on-skip, or --skip-allow without an entry that allows its reason, a failure
+    if [ "${_status}" = "SKIP" ] && { [ "${FAIL_ON_SKIP}" -eq 1 ] || [ -n "${SKIP_ALLOW}" ]; }; then
+        printf 'SKIP: %s\n' "${_skip_reason}" > "${RES_DIR}/${_ji}.skips"
+        if [ -n "$(skip_unexpected "${_cmd}" "${RES_DIR}/${_ji}.skips")" ]; then
+            _status="FAIL"
+            _exit_code=98
+            echo "*** FAIL: the test did not run (${_skip_reason})${SKIP_ALLOW:+ and --skip-allow ${SKIP_ALLOW} does not allow it}" > "${_log}"
+        fi
+    fi
+    _desc=$(printf '%s' "${_desc}" | tr '|' '/')   # '|' is the field separator of summary.tsv (a description with "rows|summary" moved the columns)
 
     T_END=$(date +%s 2>/dev/null || perl -e 'print time')
     T_ELAPSED=$((T_END - T_START))
@@ -1543,9 +1594,15 @@ print_result() {
 # write_summary: summary.tsv in registration order, whatever the finishing order
 write_summary() {
     : > "${SUMMARY_FILE}"
+    : > "${SKIP_LINES_FILE}"
     _wi=1
     while [ "${_wi}" -le "${TOTAL_RUN}" ]; do
         [ -f "${RES_DIR}/${_wi}.res" ] && cat "${RES_DIR}/${_wi}.res" >> "${SUMMARY_FILE}"
+        # every SKIP line of every test, "<test><TAB><line>" (the summary lists them; summary.tsv keeps the first one as the note)
+        if [ -s "${RES_DIR}/${_wi}.skips" ]; then
+            _wc=$(cut -d'|' -f2 "${RES_DIR}/${_wi}.res")
+            sed "s|^|${_wc}	|" "${RES_DIR}/${_wi}.skips" >> "${SKIP_LINES_FILE}"
+        fi
         _wi=$((_wi + 1))
     done
 }
@@ -1723,12 +1780,13 @@ PASSED_COUNT=0
 FAILED_COUNT=0
 SKIPPED_COUNT=0
 FAILED_TESTS=""
+PARTLY_SKIPPED_COUNT=0   # passed with a SKIP line
 
 while IFS='|' read -r _s _c _cat _t _code _d _skip_r; do
     [ -z "${_s}" ] && continue
     TOTAL_COUNT=$((TOTAL_COUNT + 1))
     case "${_s}" in
-        PASS) PASSED_COUNT=$((PASSED_COUNT + 1)) ;;
+        PASS) PASSED_COUNT=$((PASSED_COUNT + 1)); [ -z "${_skip_r}" ] || PARTLY_SKIPPED_COUNT=$((PARTLY_SKIPPED_COUNT + 1)) ;;
         FAIL) FAILED_COUNT=$((FAILED_COUNT + 1)); FAILED_TESTS="${FAILED_TESTS:+${FAILED_TESTS} }${_c}" ;;
         SKIP) SKIPPED_COUNT=$((SKIPPED_COUNT + 1)) ;;
     esac
@@ -1737,7 +1795,7 @@ done < "${SUMMARY_FILE}"
 # KARI_SUITE_STATUS=<file>: the counts are written there once every test has run, so a caller that ignores the exit status (make
 # coverage-run) can tell a suite that finished, with or without failing tests, from one that stopped before running them (the file is missing).
 if [ -n "${KARI_SUITE_STATUS:-}" ]; then
-    printf 'total=%d passed=%d failed=%d skipped=%d\nfailed_tests=%s\ngui_not_run=%d\nshard=%d/%d\nselected=%d\n' "${TOTAL_COUNT}" "${PASSED_COUNT}" "${FAILED_COUNT}" "${SKIPPED_COUNT}" "${FAILED_TESTS}" "${GUI_LEFT_OUT_COUNT}" "${SHARD_I}" "${SHARD_N}" "${SELECTED_TOTAL}" > "${KARI_SUITE_STATUS}" ||
+    printf 'total=%d passed=%d failed=%d skipped=%d\nfailed_tests=%s\ngui_not_run=%d\nshard=%d/%d\nselected=%d\npartly_skipped=%d\n' "${TOTAL_COUNT}" "${PASSED_COUNT}" "${FAILED_COUNT}" "${SKIPPED_COUNT}" "${FAILED_TESTS}" "${GUI_LEFT_OUT_COUNT}" "${SHARD_I}" "${SHARD_N}" "${SELECTED_TOTAL}" "${PARTLY_SKIPPED_COUNT}" >"${KARI_SUITE_STATUS}" ||
         echo "WARN: could not write ${KARI_SUITE_STATUS}" >&2
 fi
 
@@ -1762,6 +1820,9 @@ fi
 if [ "${SKIPPED_COUNT}" -gt 0 ]; then
     printf "  Skipped              : ${C_YELLOW}%d${C_RESET}\n" "${SKIPPED_COUNT}"
 fi
+if [ "${PARTLY_SKIPPED_COUNT}" -gt 0 ]; then
+    printf "  Passed, part skipped : ${C_YELLOW}%d${C_RESET} (%d SKIP lines, listed below)\n" "${PARTLY_SKIPPED_COUNT}" "$(wc -l < "${SKIP_LINES_FILE}" | tr -d ' ')"
+fi
 if [ "${GUI_LEFT_OUT_COUNT}" -gt 0 ]; then
     printf "  Not run (browser)    : ${C_YELLOW}%d${C_RESET} (category gui; --with-gui)\n" "${GUI_LEFT_OUT_COUNT}"
 fi
@@ -1784,10 +1845,11 @@ fi
 
 if grep -q '^PASS|[^|]*|[^|]*|[^|]*|[^|]*|.*|.' "${SUMMARY_FILE}"; then
     echo ""
-    echo "${C_YELLOW}Passed with a skipped part (the first SKIP line of the log):${C_RESET}"
+    echo "${C_YELLOW}Passed with a skipped part ($(grep -c '^PASS|[^|]*|[^|]*|[^|]*|[^|]*|.*|.' "${SUMMARY_FILE}") tests; every SKIP line of their logs, also in ${SKIP_LINES_FILE}):${C_RESET}"
     while IFS='|' read -r _s _c _cat _t _code _d _skip_r; do
         if [ "${_s}" = "PASS" ] && [ -n "${_skip_r}" ]; then
-            printf "  - ${C_YELLOW}%-45s${C_RESET} %s\n" "${_c}" "${_skip_r}"
+            printf "  - ${C_YELLOW}%s${C_RESET}\n" "${_c}"
+            awk -F'\t' -v t="${_c}" '$1 == t { sub(/^[^\t]*\t/, ""); print "      " $0 }' "${SKIP_LINES_FILE}"
         fi
     done < "${SUMMARY_FILE}"
 fi
