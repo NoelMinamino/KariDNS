@@ -990,7 +990,7 @@ static void test_rfc8482_minimal_any_synthesis(void) {
     // 1. DO=0 ANY query on "host.any.example." -> synthesizes HINFO "RFC8482"
     put_hdr(&q, 0x4592, 0x0000, 1, 0, 0, 0);
     put_question(&q, "host.any.example.", 255, 1); // ANY
-    ask(&q, "host.any.example.", 255, "192.0.2.10", false, &r);
+    ask(&q, "host.any.example.", 255, "192.0.2.10", true, &r);   /* (TCP: over UDP an ANY is TC=1, RFC 8482 4.4) */
     CHECK(&r, r.rcode == 0 && r.aa && r.counts[0] == 1);
     const gr_rr_t *hinfo = gr_first(&r, 1, 13); // HINFO in ANSWER
     assert(hinfo != NULL);
@@ -999,7 +999,7 @@ static void test_rfc8482_minimal_any_synthesis(void) {
     // 2. ANY query on CNAME record "alias.any.example." -> CNAME followed, no HINFO synthesis
     put_hdr(&q, 0x4592, 0x0000, 1, 0, 0, 0);
     put_question(&q, "alias.any.example.", 255, 1);
-    ask(&q, "alias.any.example.", 255, "192.0.2.10", false, &r);
+    ask(&q, "alias.any.example.", 255, "192.0.2.10", true, &r);   /* (TCP: over UDP an ANY is TC=1, RFC 8482 4.4) */
     CHECK(&r, r.rcode == 0 && r.aa);
     const gr_rr_t *cname = gr_first(&r, 1, 5); // CNAME in ANSWER
     assert(cname != NULL);
@@ -1007,11 +1007,238 @@ static void test_rfc8482_minimal_any_synthesis(void) {
     // 3. ANY query on apex "any.example."
     put_hdr(&q, 0x4592, 0x0000, 1, 0, 0, 0);
     put_question(&q, "any.example.", 255, 1);
-    ask(&q, "any.example.", 255, "192.0.2.10", false, &r);
+    ask(&q, "any.example.", 255, "192.0.2.10", true, &r);
     CHECK(&r, r.rcode == 0 && r.aa);
 
     zone_arena_destroy(&g_gr.arena);
     printf("  -> RFC 8482 minimal-any synthesis passed.\n");
+}
+
+/* The EDE INFO-CODE of the response's OPT RR (RFC 8914 2), -1 when there is none */
+static int gr_ede_code(const gr_resp_t *r) {
+    for (int i = 0; i < r->nrr; i++) {
+        if (r->rr[i].sect != 3 || r->rr[i].type != 41) continue;
+        size_t off = r->rr[i].rdoff, end = off + r->rr[i].rdlen;
+        while (off + 4 <= end) {
+            uint16_t code = (uint16_t)((r->msg[off] << 8) | r->msg[off + 1]);
+            uint16_t len = (uint16_t)((r->msg[off + 2] << 8) | r->msg[off + 3]);
+            if (off + 4 + len > end) return -1;
+            if (code == 15 && len >= 2) return (r->msg[off + 4] << 8) | r->msg[off + 5];
+            off += 4 + (size_t)len;
+        }
+    }
+    return -1;
+}
+
+/* 0.7: ANY over UDP (RFC 8482 4.4: empty, TC=1, unless a valid server cookie) and RRSIG questions (FORMERR + EDE 30 unless
+ * answer-rrsig-queries yes), as BIND main / 9.20.31 lib/ns/query.c */
+static void test_any_udp_tc_and_rrsig_formerr(void) {
+    printf("[TEST] Query Engine: ANY over UDP -> TC=1 (cookie exception), RRSIG question -> FORMERR...\n");
+    static const char *zone_s =
+        "$ORIGIN s.example.\n"
+        "$TTL 3600\n"
+        "@ IN SOA ns1.s.example. admin.s.example. 100 7200 3600 1209600 300\n"
+        "@ IN NS ns1.s.example.\n"
+        "ns1 IN A 192.0.2.1\n"
+        "host IN A 192.0.2.53\n"
+        "host IN TXT \"hello\"\n"
+        "host IN RRSIG A 13 3 3600 20300101000000 20260101000000 12345 s.example. AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==\n"
+        "host IN RRSIG TXT 13 3 3600 20300101000000 20260101000000 12345 s.example. AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==\n"
+        "alias IN CNAME host.s.example.\n"
+        "alias IN RRSIG CNAME 13 3 3600 20300101000000 20260101000000 12345 s.example. AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==\n";
+    gr_setup("s.example.", zone_s);
+    g_gr.cfg.send_extended_errors = true;
+    req_t q;
+    gr_resp_t r;
+    const char *ip = "192.0.2.10";
+#define TC(r) (((r).msg[2] & 0x02) != 0)
+
+    /* ANY over UDP without EDNS: empty, TC=1, AA=0, NOERROR, the question kept, no OPT */
+    put_hdr(&q, 0x4592, 0x0100, 1, 0, 0, 0); put_question(&q, "host.s.example.", 255, 1);
+    ask(&q, "host.s.example.", 255, ip, false, &r);
+    CHECK(&r, r.rcode == 0 && TC(r) && !r.aa && r.counts[0] == 0 && r.counts[1] == 0 && r.counts[2] == 0);
+    CHECK(&r, r.msg[5] == 1 && (r.msg[2] & 0x01));                                    /* QDCOUNT 1, RD copied */
+    /* the same over TCP: answered, every RRset (minimal-any no), RRSIGs as records of their own with DO=0 */
+    ask(&q, "host.s.example.", 255, ip, true, &r);
+    CHECK(&r, r.rcode == 0 && !TC(r) && r.aa && gr_count(&r, 1, 1) == 1 && gr_count(&r, 1, 16) == 1);
+    /* a name in no zone, and class ANY: TC=1 too (before the REFUSED), as BIND's check comes before its zone lookup */
+    put_hdr(&q, 0x4592, 0x0100, 1, 0, 0, 0); put_question(&q, "nosuch.invalid.", 255, 1);
+    ask(&q, "nosuch.invalid.", 255, ip, false, &r);
+    CHECK(&r, r.rcode == 0 && TC(r) && r.counts[0] == 0);
+    ask(&q, "nosuch.invalid.", 255, ip, true, &r);
+    CHECK(&r, r.rcode == 5 && !TC(r));
+    put_hdr(&q, 0x4592, 0x0000, 1, 0, 0, 0); put_question(&q, "host.s.example.", 255, 255);
+    ask(&q, "host.s.example.", 255, ip, false, &r);
+    CHECK(&r, r.rcode == 0 && TC(r) && r.counts[0] == 0);
+    /* a built-in CHAOS zone (version.bind) */
+    put_hdr(&q, 0x4592, 0x0000, 1, 0, 0, 0); put_question(&q, "version.bind.", 255, 3);
+    ask(&q, "version.bind.", 255, ip, false, &r);
+    CHECK(&r, r.rcode == 0 && TC(r) && r.counts[0] == 0);
+
+    /* EDNS with DO=1 and a client cookie alone: TC=1, AD=0, and the OPT carries the client cookie with a new server cookie */
+    uint8_t opt_cc[12] = { 0, 10, 0, 8, 1, 2, 3, 4, 5, 6, 7, 8 };
+    put_hdr(&q, 0x4592, 0x0120, 1, 0, 0, 1); put_question(&q, "host.s.example.", 255, 1); put_opt(&q, 0, 0, 0x8000, opt_cc, sizeof(opt_cc));
+    ask(&q, "host.s.example.", 255, ip, false, &r);
+    size_t clen = 0; uint32_t ottl = 0;
+    const uint8_t *ck = gr_find_cookie(&r, &clen, &ottl);
+    CHECK(&r, r.rcode == 0 && TC(r) && !r.aa && !(r.msg[3] & 0x20) && r.counts[0] == 0 && r.counts[2] == 1 && ck && clen == 24);
+    CHECK(&r, (ottl & 0xFF000000u) == 0 && (ottl & 0x8000u));                          /* extended RCODE 0, DO echoed */
+    /* the query again with that server cookie: answered over UDP, DO=1, each RRset with its RRSIG */
+    uint8_t opt_full[28] = { 0, 10, 0, 24 };
+    memcpy(opt_full + 4, ck, 24);
+    put_hdr(&q, 0x4592, 0x0100, 1, 0, 0, 1); put_question(&q, "host.s.example.", 255, 1); put_opt(&q, 0, 0, 0x8000, opt_full, sizeof(opt_full));
+    ask(&q, "host.s.example.", 255, ip, false, &r);
+    CHECK(&r, r.rcode == 0 && !TC(r) && r.aa && gr_count(&r, 1, 1) == 1 && gr_count(&r, 1, 16) == 1 && gr_count(&r, 1, 46) == 2);
+    /* the cookie from another address is not valid: BADCOOKIE (RFC 7873 5.2.3), not TC */
+    ask(&q, "host.s.example.", 255, "192.0.2.11", false, &r);
+    CHECK(&r, r.rcode == 7 && !TC(r) && r.counts[0] == 0);
+
+    /* minimal-any yes: UDP without a cookie is still TC; TCP and the valid cookie get the RFC 8482 answers */
+    g_gr.cfg.minimal_any = true;
+    g_gr.cfg.minimal_any_ttl = 300;
+    put_hdr(&q, 0x4592, 0x0000, 1, 0, 0, 0); put_question(&q, "host.s.example.", 255, 1);
+    ask(&q, "host.s.example.", 255, ip, false, &r);
+    CHECK(&r, r.rcode == 0 && TC(r) && r.counts[0] == 0);
+    ask(&q, "host.s.example.", 255, ip, true, &r);
+    CHECK(&r, r.rcode == 0 && !TC(r) && r.counts[0] == 1 && gr_first(&r, 1, 13) != NULL);   /* HINFO "RFC8482" */
+    put_hdr(&q, 0x4592, 0x0000, 1, 0, 0, 1); put_question(&q, "host.s.example.", 255, 1); put_opt(&q, 0, 0, 0x8000, opt_full, sizeof(opt_full));
+    ask(&q, "host.s.example.", 255, ip, false, &r);
+    CHECK(&r, r.rcode == 0 && !TC(r) && r.aa && gr_count(&r, 1, 46) == 1 && gr_count(&r, 1, 13) == 0);   /* DO=1, signed: one RRset + its RRSIG */
+    g_gr.cfg.minimal_any = false;
+
+    /* RRSIG questions: FORMERR + EDE 30, the question echoed, AA=0, over UDP and TCP, DO=0 and DO=1, class IN and ANY, any name */
+    struct { const char *name; uint16_t cls; bool tcp; bool edns_do; } rq[] = {
+        { "host.s.example.", 1, false, false }, { "host.s.example.", 1, true, true }, { "alias.s.example.", 1, false, true },
+        { "host.s.example.", 255, true, false }, { "nosuch.invalid.", 1, false, false }, { "version.bind.", 3, false, false },
+    };
+    for (size_t i = 0; i < sizeof(rq) / sizeof(rq[0]); i++) {
+        put_hdr(&q, 0x4592, 0x0000, 1, 0, 0, 1); put_question(&q, rq[i].name, 46, rq[i].cls); put_opt(&q, 0, 0, rq[i].edns_do ? 0x8000 : 0, NULL, 0);
+        ask(&q, rq[i].name, 46, ip, rq[i].tcp, &r);
+        CHECK(&r, r.rcode == 1 && !r.aa && !TC(r) && r.counts[0] == 0 && r.msg[5] == 1 && gr_ede_code(&r) == 30);
+    }
+    /* an MQTYPE-Query option that asks for RRSIG (RFC 10029) */
+    g_gr.cfg.rfc10029_mqtype_enable = true;
+    static const uint8_t mq_rrsig[] = { 0, 20, 0, 2, 0, 46 };   /* MQTYPE-Query (option 20) asking for RRSIG besides A */
+    put_hdr(&q, 0x4592, 0x0000, 1, 0, 0, 1); put_question(&q, "host.s.example.", 1, 1); put_opt(&q, 0, 0, 0, mq_rrsig, sizeof(mq_rrsig));
+    ask(&q, "host.s.example.", 1, ip, true, &r);
+    CHECK(&r, r.rcode == 1 && r.counts[0] == 0 && gr_ede_code(&r) == 30);
+    static const uint8_t mq_txt[] = { 0, 20, 0, 2, 0, 16 };     /* (another type is still answered) */
+    put_hdr(&q, 0x4592, 0x0000, 1, 0, 0, 1); put_question(&q, "host.s.example.", 1, 1); put_opt(&q, 0, 0, 0, mq_txt, sizeof(mq_txt));
+    ask(&q, "host.s.example.", 1, ip, true, &r);
+    CHECK(&r, r.rcode == 0 && gr_count(&r, 1, 1) == 1 && gr_count(&r, 1, 16) == 1);
+    g_gr.cfg.rfc10029_mqtype_enable = false;
+
+    /* answer-rrsig-queries yes: the 0.6 answer, the RRSIG RRset; at a CNAME owner its own RRSIG (RFC 4035 2.5), the CNAME not followed */
+    g_gr.cfg.answer_rrsig_queries = true;
+    put_hdr(&q, 0x4592, 0x0000, 1, 0, 0, 0); put_question(&q, "host.s.example.", 46, 1);
+    ask(&q, "host.s.example.", 46, ip, false, &r);
+    CHECK(&r, r.rcode == 0 && r.aa && gr_count(&r, 1, 46) == 2 && gr_count(&r, 1, 1) == 0);
+    put_hdr(&q, 0x4592, 0x0000, 1, 0, 0, 0); put_question(&q, "alias.s.example.", 46, 1);
+    ask(&q, "alias.s.example.", 46, ip, true, &r);
+    CHECK(&r, r.rcode == 0 && r.aa && gr_count(&r, 1, 46) == 1 && gr_count(&r, 1, 5) == 0 && gr_count(&r, 1, 1) == 0);
+    g_gr.cfg.answer_rrsig_queries = false;
+
+    /* nocookie-udp-size (BIND 9.20 client_allocsendbuf()): host A with DO=1 (A + RRSIG A, about 170 octets) over UDP is TC=1 under a limit
+     * of 128 without a valid server cookie, answered whole with one, and over TCP */
+    g_gr.cfg.nocookie_udp_size = 128;
+    put_hdr(&q, 0x4592, 0x0000, 1, 0, 0, 1); put_question(&q, "host.s.example.", 1, 1); put_opt(&q, 0, 0, 0x8000, opt_cc, sizeof(opt_cc));
+    ask(&q, "host.s.example.", 1, ip, false, &r);
+    CHECK(&r, r.rcode == 0 && TC(r) && r.len <= 128 && gr_count(&r, 1, 46) == 0);
+    ask(&q, "host.s.example.", 1, ip, true, &r);
+    CHECK(&r, r.rcode == 0 && !TC(r) && gr_count(&r, 1, 1) == 1 && gr_count(&r, 1, 46) == 1);
+    put_hdr(&q, 0x4592, 0x0000, 1, 0, 0, 1); put_question(&q, "host.s.example.", 1, 1); put_opt(&q, 0, 0, 0x8000, opt_full, sizeof(opt_full));
+    ask(&q, "host.s.example.", 1, ip, false, &r);
+    CHECK(&r, r.rcode == 0 && !TC(r) && r.len > 128 && gr_count(&r, 1, 1) == 1 && gr_count(&r, 1, 46) == 1);
+    g_gr.cfg.nocookie_udp_size = 0;                   /* (0 = not written: 4096, the answer fits) */
+    put_hdr(&q, 0x4592, 0x0000, 1, 0, 0, 1); put_question(&q, "host.s.example.", 1, 1); put_opt(&q, 0, 0, 0x8000, opt_cc, sizeof(opt_cc));
+    ask(&q, "host.s.example.", 1, ip, false, &r);
+    CHECK(&r, r.rcode == 0 && !TC(r) && gr_count(&r, 1, 46) == 1);
+#undef TC
+    zone_arena_destroy(&g_gr.arena);
+    printf("  -> ANY over UDP and RRSIG questions passed.\n");
+}
+
+/* 0.7: minimal-any no | hinfo (yes) | rrset over TCP and over UDP with a valid server cookie: DO=0/1, a signed and an unsigned name, a CNAME
+ * owner, a wildcard (RFC 8482 4.1 / 4.2, RFC 4592 3.3.1) */
+static void test_minimal_any_styles(void) {
+    printf("[TEST] Query Engine: minimal-any no / hinfo / rrset (TCP, UDP with a server cookie, DO, CNAME, wildcard)...\n");
+    static const char *zone_m =
+        "$ORIGIN m.example.\n"
+        "$TTL 3600\n"
+        "@ IN SOA ns1.m.example. admin.m.example. 100 7200 3600 1209600 300\n"
+        "@ IN NS ns1.m.example.\n"
+        "ns1 IN A 192.0.2.1\n"
+        "ns1 IN TXT \"plain\"\n"
+        "sig IN A 192.0.2.53\n"
+        "sig IN TXT \"hello\"\n"
+        "sig IN RRSIG A 13 3 3600 20300101000000 20260101000000 12345 m.example. AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==\n"
+        "sig IN RRSIG TXT 13 3 3600 20300101000000 20260101000000 12345 m.example. AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==\n"
+        "alias IN CNAME ns1.m.example.\n"
+        "*.w IN A 192.0.2.77\n"
+        "*.w IN TXT \"w\"\n";
+    gr_setup("m.example.", zone_m);
+    g_gr.cfg.minimal_any_ttl = 300;
+    req_t q;
+    gr_resp_t r;
+    const char *ip = "192.0.2.10";
+    /* ask NAME DO STYLE over TCP */
+#define M_ASK(name, dobit, style) do { \
+        g_gr.cfg.minimal_any = (style); \
+        put_hdr(&q, 0x4592, 0x0000, 1, 0, 0, 1); put_question(&q, (name), 255, 1); put_opt(&q, 0, 0, (dobit) ? 0x8000 : 0, NULL, 0); \
+        ask(&q, (name), 255, ip, true, &r); \
+        CHECK(&r, r.rcode == 0 && r.aa && !(r.msg[2] & 0x02)); \
+    } while (0)
+    /* no: every RRset */
+    M_ASK("sig.m.example.", false, MINIMAL_ANY_NO);
+    CHECK(&r, gr_count(&r, 1, 1) == 1 && gr_count(&r, 1, 16) == 1 && gr_count(&r, 1, 46) == 2 && gr_count(&r, 1, 13) == 0);
+    M_ASK("sig.m.example.", true, MINIMAL_ANY_NO);
+    CHECK(&r, gr_count(&r, 1, 1) == 1 && gr_count(&r, 1, 16) == 1 && gr_count(&r, 1, 46) == 2);
+    /* hinfo: the HINFO (TTL minimal-any-ttl); with DO=1 at a signed name one RRset and its RRSIG; unsigned with DO=1: the HINFO */
+    M_ASK("sig.m.example.", false, MINIMAL_ANY_HINFO);
+    CHECK(&r, r.counts[0] == 1 && gr_first(&r, 1, 13) && gr_first(&r, 1, 13)->ttl == 300);
+    M_ASK("sig.m.example.", true, MINIMAL_ANY_HINFO);
+    CHECK(&r, r.counts[0] == 2 && gr_count(&r, 1, 46) == 1 && gr_count(&r, 1, 13) == 0);
+    M_ASK("ns1.m.example.", true, MINIMAL_ANY_HINFO);
+    CHECK(&r, r.counts[0] == 1 && gr_first(&r, 1, 13));
+    /* rrset: one RRset whatever DO and signing; its RRSIG only with DO=1 */
+    M_ASK("sig.m.example.", false, MINIMAL_ANY_RRSET);
+    CHECK(&r, r.counts[0] == 1 && gr_count(&r, 1, 13) == 0 && gr_count(&r, 1, 46) == 0 && (gr_count(&r, 1, 1) + gr_count(&r, 1, 16)) == 1);
+    M_ASK("sig.m.example.", true, MINIMAL_ANY_RRSET);
+    CHECK(&r, r.counts[0] == 2 && gr_count(&r, 1, 46) == 1 && (gr_count(&r, 1, 1) + gr_count(&r, 1, 16)) == 1);
+    M_ASK("ns1.m.example.", true, MINIMAL_ANY_RRSET);
+    CHECK(&r, r.counts[0] == 1 && gr_count(&r, 1, 13) == 0 && (gr_count(&r, 1, 1) + gr_count(&r, 1, 16)) == 1);
+    /* a CNAME owner: hinfo keeps the CNAME (no HINFO, the CNAME is not followed for ANY); rrset gives the CNAME alone */
+    M_ASK("alias.m.example.", false, MINIMAL_ANY_HINFO);
+    CHECK(&r, gr_count(&r, 1, 5) == 1 && gr_count(&r, 1, 13) == 0 && r.counts[0] == 1);
+    M_ASK("alias.m.example.", false, MINIMAL_ANY_RRSET);
+    CHECK(&r, gr_count(&r, 1, 5) == 1 && r.counts[0] == 1);
+    /* a wildcard: the same rules, the QNAME as owner (before 0.7 a wildcard ANY was never minimized) */
+    M_ASK("x.w.m.example.", false, MINIMAL_ANY_NO);
+    CHECK(&r, gr_count(&r, 1, 1) == 1 && gr_count(&r, 1, 16) == 1);
+    M_ASK("x.w.m.example.", false, MINIMAL_ANY_HINFO);
+    CHECK(&r, r.counts[0] == 1 && gr_first(&r, 1, 13) && strcasecmp(gr_first(&r, 1, 13)->name, "x.w.m.example.") == 0);
+    M_ASK("x.w.m.example.", true, MINIMAL_ANY_RRSET);
+    CHECK(&r, r.counts[0] == 1 && gr_count(&r, 1, 13) == 0 && strcasecmp(r.rr[0].name, "x.w.m.example.") == 0);
+#undef M_ASK
+    /* over UDP: TC=1 without a cookie whatever the style; with a valid server cookie the style's answer */
+    uint8_t opt_cc[12] = { 0, 10, 0, 8, 1, 2, 3, 4, 5, 6, 7, 8 };
+    g_gr.cfg.minimal_any = MINIMAL_ANY_RRSET;
+    put_hdr(&q, 0x4592, 0x0000, 1, 0, 0, 1); put_question(&q, "sig.m.example.", 255, 1); put_opt(&q, 0, 0, 0, opt_cc, sizeof(opt_cc));
+    ask(&q, "sig.m.example.", 255, ip, false, &r);
+    size_t clen = 0;
+    const uint8_t *ck = gr_find_cookie(&r, &clen, NULL);
+    CHECK(&r, (r.msg[2] & 0x02) && r.counts[0] == 0 && ck && clen == 24);
+    uint8_t opt_full[28] = { 0, 10, 0, 24 };
+    memcpy(opt_full + 4, ck, 24);
+    for (int st = MINIMAL_ANY_NO; st <= MINIMAL_ANY_RRSET; st++) {
+        g_gr.cfg.minimal_any = (uint8_t)st;
+        put_hdr(&q, 0x4592, 0x0000, 1, 0, 0, 1); put_question(&q, "sig.m.example.", 255, 1); put_opt(&q, 0, 0, 0, opt_full, sizeof(opt_full));
+        ask(&q, "sig.m.example.", 255, ip, false, &r);
+        CHECK(&r, r.rcode == 0 && !(r.msg[2] & 0x02) && r.counts[0] == (st == MINIMAL_ANY_NO ? 4 : 1) && (gr_count(&r, 1, 13) == 1) == (st == MINIMAL_ANY_HINFO));
+    }
+    g_gr.cfg.minimal_any = MINIMAL_ANY_NO;
+    zone_arena_destroy(&g_gr.arena);
+    printf("  -> minimal-any styles passed.\n");
 }
 
 static void test_sibling_zone_additional_glue_and_limits(void) {
@@ -1554,6 +1781,8 @@ int main(void) {
     test_notify_server_stmt_key();
     test_signed_query();
     test_rfc8482_minimal_any_synthesis();
+    test_any_udp_tc_and_rrsig_formerr();
+    test_minimal_any_styles();
     test_sibling_zone_additional_glue_and_limits();
     test_eff_ttl_resolution_and_clamp();
     test_response_header_and_error_builder();

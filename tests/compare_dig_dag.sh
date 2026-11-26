@@ -244,7 +244,7 @@ else
     compare_query "Reverse IPv6 lookup (-x)" "-x 2001:db8::1 +noedns"
     compare_query "NXDOMAIN response" "nonexistent.example.com A +noedns"
     compare_query "NODATA response" "www.example.com TXT +noedns"
-    compare_query "ANY query" "example.com ANY +noedns"
+    compare_query "ANY query" "example.com ANY +noedns +norec"   # (+norec: dig 9.20 sets RD on ANY, dig from BIND main and dag do not)
 
     echo "--------------------------------------------------------"
     echo "2. Format & Layout Options"

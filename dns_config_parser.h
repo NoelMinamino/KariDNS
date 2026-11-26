@@ -701,6 +701,7 @@ typedef struct view_config {
   xfr_opts_t xo;                /* view { notify-source, transfer-source, min-refresh-time, ... }: replaces options' for the zones of this view that have none of their own */
   zone_vopts_t zv;              /* view { max-records, max-zone-ttl, check-*, ... }: replaces options' for the zones of this view that have none of their own */
   uint16_t max_udp_size;        /* view { max-udp-size }: the UDP response size limit of this view's clients (512..4096), 0 = not written (zone, else options) */
+  uint16_t nocookie_udp_size;   /* view { nocookie-udp-size } (128..4096), 0 = not written (options) */
   uint8_t minimal_responses;    /* view { minimal-responses }: MINIMAL_*, valid when minimal_set (the clients of a view get their view's value: lib/ns/query.c uses client->view->minimalresponses) */
   bool minimal_set;
   uint8_t in_view_settings;     /* view { in-view-settings }: IVS_*, 0 = not written (options', else IVS_OWNER) */
@@ -864,6 +865,10 @@ typedef struct {
 /* options { minimal-responses } (bin/named/server.c dns_minimal_*; lib/ns/query.c ns_query_start()): MINIMAL_NO_AUTH_RECURSIVE is the
  * written value, the query path turns it into MINIMAL_NO_AUTH (RD set) or MINIMAL_NO */
 enum { MINIMAL_NO = 0, MINIMAL_YES = 1, MINIMAL_NO_AUTH = 2, MINIMAL_NO_AUTH_RECURSIVE = 3 };
+/* options { minimal-any } (0.7): the answer to an ANY that is answered (over TCP, or UDP with a valid server cookie).  NO: every RRset; HINFO (`yes`,
+ * `hinfo`, the default): the synthesized HINFO "RFC8482" "" of RFC 8482 4.2, or with DO=1 at a signed name one RRset and its RRSIGs; RRSET: one
+ * RRset of the name (RFC 8482 4.1), as BIND 9.20.31 answers: the first, with its covering RRSIGs when DO=1. */
+enum { MINIMAL_ANY_NO = 0, MINIMAL_ANY_HINFO = 1, MINIMAL_ANY_RRSET = 2 };
 
 typedef struct server_config_s {
   int port;
@@ -925,8 +930,10 @@ typedef struct server_config_s {
   uint8_t in_view_settings;     /* options { in-view-settings }: IVS_*, 0 = not written (IVS_OWNER) */
   bool any_in_view;             /* some view has a zone { in-view } stub */
   bool any_view_minimal;        /* some view writes minimal-responses (the query path then looks the view up) */
-  bool minimal_any;
+  uint8_t minimal_any;           /* MINIMAL_ANY_* */
   uint32_t minimal_any_ttl;
+  bool answer_rrsig_queries;   /* `answer-rrsig-queries` (0.7): answer a question for type RRSIG with the RRSIG RRset (the 0.6 behaviour); default no = FORMERR + EDE 30, as BIND 9.20.31 / 9.21 */
+  uint16_t nocookie_udp_size;     /* `nocookie-udp-size` (0.7, BIND 9.20): the largest UDP answer to a query without a valid server cookie, 128..4096; 0 = not written (4096) */
   uint32_t wire_cache_max_records;
   uint32_t router_threads;     /* `router-threads` (restart-only): the Frontend routers, 1..KARIDNS_ROUTER_THREADS_MAX; 0 = by the CPUs this process may run on */
   uint32_t worker_threads;     /* `worker-threads` (restart-only): the Backend workers, 1..KARIDNS_WORKER_THREADS_MAX; 0 = by the CPUs this process may run on */
@@ -969,6 +976,7 @@ typedef struct server_config_s {
   bool require_server_cookie;   /* options { require-server-cookie }: a UDP query with a client cookie but no valid server cookie gets BADCOOKIE (RFC 7873 §5.2.3) */
   char **catz_names; int catz_count;   /* options { catalog-zones { zone "name"; } }: names of zones (of every view) that are catalog zones */
   bool any_view_max_udp, any_view_cookie;   /* some view writes max-udp-size / require-server-cookie (set when the parse ends): the query path then looks the view up */
+  bool any_view_nocookie;        /* some view writes nocookie-udp-size (set when the parse ends) */
   int tcp_mss;              /* TCP_MAXSEG。accept 直後に各接続へ設定 (送信 MSS を下げる方向のみ) */
   int tcp_window;           /* SO_RCVBUF と SO_SNDBUF。listen() 前に設定し accept 済みソケットへ
                              * 継承させる。listen ソケットは reload で作り直さないため再起動が必要 */
@@ -997,6 +1005,8 @@ static inline int cfg_tcp_sndbuf(const server_config_t *c) { return c->tcp_sndbu
 const view_config_t *config_find_view(const server_config_t *cfg, const char *name);
 /* require-server-cookie for the clients of a view: the view's statement, else options' */
 bool config_require_server_cookie(const server_config_t *cfg, const char *view_name);
+/* nocookie-udp-size of the view (else options', else 4096): the largest UDP answer to a query without a valid server cookie (BIND 9.20 lib/ns/client.c client_allocsendbuf()) */
+uint16_t config_nocookie_udp_size(const server_config_t *cfg, const char *view_name);
 
 /* B7a: the first TSIG key name that the settings x of a DB zone name (allow-transfer key, allow-update name, tsig-key) and
  * cfg does not define in a key {} block, or NULL when all exist */

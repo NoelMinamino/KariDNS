@@ -48,6 +48,7 @@ cat << EOF > karidns.conf
 options {
     port $PORT;
     bind-address { 127.0.0.1; };
+    minimal-any no;   # (the ANY check below wants every RRset; 0.7 defaults to yes)
     user "nobody";
     group "nobody";
     rfc10029-mqtype yes;

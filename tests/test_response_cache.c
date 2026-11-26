@@ -1185,6 +1185,110 @@ static void test_rcache_cut_additional_not_cached(void) {
 
 /* Review query_engine [5]: an answer synthesized from a wildcard keeps its wildcard mark when it comes from the cache,
  * so that RRL counts it under "*.<zone>" (D-05) on a hit as on the first query. */
+/* 0.7: an answer the shared cache holds is never served where the question is no longer answered: an RRSIG question that was
+ * answered (answer-rrsig-queries yes) and cached is FORMERR once the option is off, and an ANY answer cached from TCP is not
+ * served to an ANY over UDP without a server cookie (TC=1, RFC 8482 4.4).  Both checks come before the cache lookup. */
+static void test_rcache_any_rrsig_not_served(void) {
+    printf("[TEST] Shared response cache: no cached RRSIG answer after FORMERR, no cached ANY over UDP...\n");
+    static char text[] =
+        "rs.example. 3600 IN SOA ns.rs.example. h.rs.example. 1 7200 3600 1209600 3600\n"
+        "rs.example. 3600 IN NS ns.rs.example.\n"
+        "ns.rs.example. 3600 IN A 192.0.2.1\n"
+        "www.rs.example. 3600 IN A 192.0.2.9\n"
+        "www.rs.example. 3600 IN RRSIG A 13 3 3600 20300101000000 20260101000000 12345 rs.example. AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==\n";
+    zone_arena_t arena;
+    zone_arena_init(&arena);
+    parse_error_t err = {0};
+    parse_context_t ctx = { .base_dir = ".", .default_origin = "rs.example.", .is_standalone_mode = true, .err_out = &err };
+    assert(parse_zone_fast(text, strlen(text), &arena, &ctx) >= 0);
+    assert(test_build_index(&arena, true) == 0);
+    server_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    build_zone_response_cache(&arena.ver, &cfg, tst_entry(NULL, "rs.example."));
+    assert(arena.rcache_ok);
+    zone_db_entry_t e;
+    memset(&e, 0, sizeof(e));
+    e.domain = "rs.example.";
+    atomic_store_explicit(&e.rcu.active, &arena.ver, memory_order_release);
+    zone_db_entry_t *entries[1] = { &e };
+    char *any_acl[1] = { (char *)"any" };
+    view_snapshot_t view;
+    memset(&view, 0, sizeof(view));
+    view.name = "default";
+    view_set_entries(&view, entries, 1);
+    view.match_clients = any_acl;
+    view.match_clients_count = 1;
+    zone_db_snapshot_t snap;
+    memset(&snap, 0, sizeof(snap));
+    snap.views = &view;
+    snap.view_count = 1;
+
+    uint8_t req[512], res[4096];
+    size_t req_len = 0;
+    compress_ctx_t cc = {0};
+    zone_db_entry_t *matched = NULL;
+    /* RRSIG answered (the 0.6 behaviour) and cached: the second is a hit */
+    cfg.answer_rrsig_queries = true;
+    for (int round = 0; round < 2; round++) {
+        uint64_t hits0 = atomic_load(&zone_x_need(&e)->obs.wirecache_hits);
+        build_simple_query(req, &req_len, (uint16_t)(0x5301 + round), "www.rs.example.", 46);
+        compress_ctx_init_packet(&cc);
+        int len = process_dns_query_impl(req, req_len, res, 512, "www.rs.example.", 46, "127.0.0.1", &cc, false, NULL, &snap, &cfg, &matched);
+        assert(len > 12 && (res[3] & 0x0F) == 0 && res[7] == 1);
+        assert(atomic_load(&zone_x_need(&e)->obs.wirecache_hits) == hits0 + (uint64_t)round);
+    }
+    /* the option off (same configuration generation, so the entry is still there): FORMERR, not the cached answer */
+    cfg.answer_rrsig_queries = false;
+    {
+        uint64_t hits0 = atomic_load(&zone_x_need(&e)->obs.wirecache_hits);
+        build_simple_query(req, &req_len, 0x5311, "www.rs.example.", 46);
+        compress_ctx_init_packet(&cc);
+        int len = process_dns_query_impl(req, req_len, res, 512, "www.rs.example.", 46, "127.0.0.1", &cc, false, NULL, &snap, &cfg, &matched);
+        assert(len > 12 && (res[3] & 0x0F) == 1 && res[7] == 0 && !(res[2] & 0x04));
+        assert(atomic_load(&zone_x_need(&e)->obs.wirecache_hits) == hits0);
+    }
+    /* ANY over TCP, answered and cached (the second is a hit) */
+    for (int round = 0; round < 2; round++) {
+        uint64_t hits0 = atomic_load(&zone_x_need(&e)->obs.wirecache_hits);
+        build_simple_query(req, &req_len, (uint16_t)(0x5321 + round), "www.rs.example.", 255);
+        compress_ctx_init_packet(&cc);
+        int len = process_dns_query_impl(req, req_len, res, 4096, "www.rs.example.", 255, "127.0.0.1", &cc, true, NULL, &snap, &cfg, &matched);
+        assert(len > 12 && (res[3] & 0x0F) == 0 && res[7] == 2 && !(res[2] & 0x02));
+        assert(atomic_load(&zone_x_need(&e)->obs.wirecache_hits) == hits0 + (uint64_t)round);
+    }
+    /* ... over UDP: TC=1, empty, the cache not consulted */
+    {
+        uint64_t hits0 = atomic_load(&zone_x_need(&e)->obs.wirecache_hits);
+        uint64_t miss0 = atomic_load(&zone_x_need(&e)->obs.wirecache_misses);
+        build_simple_query(req, &req_len, 0x5331, "www.rs.example.", 255);
+        compress_ctx_init_packet(&cc);
+        int len = process_dns_query_impl(req, req_len, res, 512, "www.rs.example.", 255, "127.0.0.1", &cc, false, NULL, &snap, &cfg, &matched);
+        assert(len == (int)req_len && (res[3] & 0x0F) == 0 && (res[2] & 0x02) && !(res[2] & 0x04) && res[7] == 0);
+        assert(atomic_load(&zone_x_need(&e)->obs.wirecache_hits) == hits0 && atomic_load(&zone_x_need(&e)->obs.wirecache_misses) == miss0);
+    }
+    /* minimal-any style (0.7): the ANY answer cached above (every RRset, minimal-any no) is not served once the style changes: a reload
+     * makes a new configuration generation, which is in the key (rcache_tag()).  Each style is cached under its own generation. */
+    static const struct { uint8_t style; uint16_t an; uint16_t first_type; } st[] = {
+        { MINIMAL_ANY_HINFO, 1, 13 }, { MINIMAL_ANY_RRSET, 1, 1 }, { MINIMAL_ANY_NO, 2, 0 },
+    };
+    for (size_t i = 0; i < sizeof(st) / sizeof(st[0]); i++) {
+        cfg.minimal_any = st[i].style;
+        cfg.generation++;
+        for (int round = 0; round < 2; round++) {
+            uint64_t hits0 = atomic_load(&zone_x_need(&e)->obs.wirecache_hits);
+            build_simple_query(req, &req_len, (uint16_t)(0x5341 + round), "www.rs.example.", 255);
+            compress_ctx_init_packet(&cc);
+            int len = process_dns_query_impl(req, req_len, res, 4096, "www.rs.example.", 255, "127.0.0.1", &cc, true, NULL, &snap, &cfg, &matched);
+            assert(len > (int)req_len + 10 && (res[3] & 0x0F) == 0 && res[7] == st[i].an);
+            if (st[i].first_type) assert(res[req_len + 2] == 0 && res[req_len + 3] == st[i].first_type);   /* (the first answer RR's TYPE, after its compressed owner) */
+            assert(atomic_load(&zone_x_need(&e)->obs.wirecache_hits) == hits0 + (uint64_t)round);   /* the first of each generation is built, not served from the cache */
+        }
+    }
+    cfg.minimal_any = MINIMAL_ANY_NO;
+    zone_arena_destroy(&arena);
+    printf("  [PASS] no cached RRSIG / ANY answer served\n");
+}
+
 static void test_rcache_wildcard_mark_kept(void) {
     printf("[TEST] Shared response cache: a cached wildcard answer is still counted by RRL as a wildcard...\n");
     static char text[] =
@@ -1908,6 +2012,7 @@ int main(void) {
     test_rcache_cross_zone_cname_not_cached();
     test_rcache_cut_additional_not_cached();
     test_rcache_wildcard_mark_kept();
+    test_rcache_any_rrsig_not_served();
     test_rcache_sibling_glue_not_cached();
     test_rcache_sibling_tagged_glue_not_cached();
     test_referral_tc_only_for_in_domain_glue();

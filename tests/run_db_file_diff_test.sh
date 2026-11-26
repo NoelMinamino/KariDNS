@@ -192,15 +192,15 @@ while [ $k -le $R ]; do
     sqlite3 "$D/z.db" < "$SCHEMA" > /dev/null
     sqlite3 "$D/z.db" < db/karidns_ext.sqlite3.sql > /dev/null
     {
-        printf 'options {\n    user "nobody"; pid-file "none"; listen-on { 127.0.0.1; }; port %s;\n};\n' "$PA"
+        printf 'options {\n    user "nobody"; pid-file "none"; listen-on { 127.0.0.1; }; port %s; minimal-any no;\n};\n' "$PA"
     } > "$D/a.conf"
     # odd rounds build the DB zones on the stream thread, even rounds on 4 builder threads (ingest-threads, D10)
     if [ $((k % 2)) -eq 0 ]; then TH=4; else TH=1; fi
     {
-        printf 'options {\n    user "nobody"; pid-file "none"; listen-on { 127.0.0.1; }; port %s;\n' "$PB"
+        printf 'options {\n    user "nobody"; pid-file "none"; listen-on { 127.0.0.1; }; port %s; minimal-any no;\n' "$PB"
         printf '    database { driver sqlite3; database-file "%s/z.db"; loader-user "nobody"; loader-path "%s/karidns-dbloader"; ingest-threads %s; acl-ceiling { 127.0.0.1; }; %s };\n};\n' "$D" "$T" "$TH" "$(store_stmt "$D")"
     } > "$D/b.conf"
-    printf 'options {\n    user "nobody"; pid-file "none"; listen-on { 127.0.0.1; }; port %s;\n};\n' "$PC" > "$D/c.conf"
+    printf 'options {\n    user "nobody"; pid-file "none"; listen-on { 127.0.0.1; }; port %s; minimal-any no;\n};\n' "$PC" > "$D/c.conf"
     while IFS="$TAB" read -r apex f sqlf; do
         if [ "$IMPORTER" = karidns-zone ]; then      # the zone is written by the product's importer, not by the SQL zone2sql prints
             case $f in /*) zf0=$f ;; *) zf0="$ROOT/$f" ;; esac

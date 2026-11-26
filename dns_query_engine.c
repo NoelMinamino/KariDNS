@@ -1205,14 +1205,30 @@ static bool qn_visit(qn_visited_t *v, const char *current, const char *target) {
   return false;
 }
 
-static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16_t *qtypes, int num_qtypes,
+/* RFC 8482 4.2: the synthesized HINFO "RFC8482" "" (CPU "RFC8482", OS empty) at OWNER with the TTL of minimal-any-ttl.  -1: it does not fit. */
+static int write_rfc8482_hinfo(uint8_t *res, size_t max_res_len, uint16_t *offset, compress_ctx_t *comp_ctx, const char *owner, uint32_t ttl) {
+  dns_record_t hinfo_rec;
+  memset(&hinfo_rec, 0, sizeof(hinfo_rec));
+  hinfo_rec.name = (char *)owner;
+  hinfo_rec.type_code = 13; // HINFO
+  char ttl_str[32];
+  snprintf(ttl_str, sizeof(ttl_str), "%u", ttl);
+  hinfo_rec.ttl = ttl_str;
+  char *hinfo_rd[2] = { "RFC8482", "" };
+  hinfo_rec.rdata = hinfo_rd;
+  hinfo_rec.rdata_count = 2;
+  return serialize_dns_record(res, max_res_len, offset, &hinfo_rec, comp_ctx, NULL, 0xFFFFFFFF) < 0 ? -1 : 0;
+}
+
+static void resolve_name_answer(
+const char *qname, uint16_t qclass, const uint16_t *qtypes, int num_qtypes,
                          zone_db_entry_t **db_entry_ptr,
                          zone_version_t **current_zone_ptr, uint8_t *res,
                          size_t max_res_len, uint16_t *offset,
                          compress_ctx_t *comp_ctx, uint16_t *ancount,
                          uint16_t *nscount, uint16_t *arcount,
                          int minimal_mode,
-                         bool minimal_any, uint32_t minimal_any_ttl, bool dnssec_ok,
+                         int minimal_any, uint32_t minimal_any_ttl, bool dnssec_ok,
                          view_snapshot_t *view, uint32_t *qtx_included_out,
                          const char *client_ip, server_config_t *cfg,
                          bool ecs_trusted, const uint8_t *ecs_addr, uint16_t ecs_family,
@@ -1310,20 +1326,11 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
         if (img_rrs[k].type == 5) has_cname = true;   // CNAME
         if (img_rrs[k].type == 46) has_rrsig = true;  // RRSIG
       }
-      skip_synthesis = dnssec_ok && has_rrsig;
+      /* minimal-any rrset (RFC 8482 4.1, as BIND 9.20.31): one RRset of the name whatever DO and signing; hinfo: the HINFO of 4.2, except
+       * with DO=1 at a signed name (one RRset and its RRSIGs) and at a CNAME owner (every RRset) */
+      skip_synthesis = minimal_any == MINIMAL_ANY_RRSET || (dnssec_ok && has_rrsig);
       if (name_exists && !has_cname && !skip_synthesis) {
-        dns_record_t hinfo_rec;
-        memset(&hinfo_rec, 0, sizeof(hinfo_rec));
-        hinfo_rec.name = (char *)current_qname;
-        hinfo_rec.type_code = 13; // HINFO
-        char ttl_str[32];
-        snprintf(ttl_str, sizeof(ttl_str), "%u", minimal_any_ttl);
-        hinfo_rec.ttl = ttl_str;
-        char *hinfo_rd[2] = { "RFC8482", "" };
-        hinfo_rec.rdata = hinfo_rd;
-        hinfo_rec.rdata_count = 2;
-        if (serialize_dns_record(res, max_res_len, offset, &hinfo_rec, comp_ctx,
-                                 NULL, 0xFFFFFFFF) < 0) {
+        if (write_rfc8482_hinfo(res, max_res_len, offset, comp_ctx, current_qname, minimal_any_ttl) < 0) {
           res[2] |= 0x02;
           return;
         }
@@ -1537,6 +1544,36 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
             int wc_written_count = 0;
             uint32_t k = img_names[wc_id].first_rr;
             uint32_t wend = k + (img_names[wc_id].rr_count_flags & ZONE_IMAGE_NAME_COUNT_MASK);
+            /* 0.7: minimal-any for an answer from a wildcard (RFC 4592 3.3.1: the records of the wildcard with the QNAME as owner), the same
+             * rules as at an existing name above: hinfo gives the HINFO at the QNAME, rrset (and hinfo with DO=1 at a signed wildcard) one
+             * RRset; a CNAME at the wildcard keeps every RRset with hinfo.  (Before 0.7 a wildcard ANY was never minimized.) */
+            bool wc_single = false;
+            uint16_t wc_chosen_type = 0;
+            if (has_any && minimal_any) {
+              bool wc_exists = false, wc_cname = false, wc_rrsig = false;
+              for (uint32_t s = k; s < wend; s++) {
+                if (!(qclass == 255 || qclass == img_rrs[s].class_val) || rr_not_served(img, s)) continue;
+                uint32_t s_ttl;
+                note_ecs_variant(img, s, 255, zone_scope, answer_scope);
+                if (!rr_valid(img, s, tinydns_now, client_loc, client_ecs_tag, client_loc_tag, &s_ttl)) continue;
+                wc_exists = true;
+                if (img_rrs[s].type == 5) wc_cname = true;
+                if (img_rrs[s].type == 46) wc_rrsig = true;
+              }
+              wc_single = minimal_any == MINIMAL_ANY_RRSET || (dnssec_ok && wc_rrsig);
+              if (wc_exists && !wc_cname && !wc_single) {
+                if (write_rfc8482_hinfo(res, max_res_len, offset, comp_ctx, current_qname, minimal_any_ttl) < 0) {
+                  res[2] |= 0x02;
+                  return;
+                }
+                (*ancount)++;
+                found = true;
+                wc_found = true;
+                type_matched = true;
+                t_query_rrl_info.wildcard = true; /* D-05 */
+                k = wend;                         /* (the wildcard's own records are not listed) */
+              }
+            }
             for (; k < wend; k++) {
               uint16_t r_class = img_rrs[k].class_val;
               bool class_matches = (qclass == 255 || qclass == r_class);
@@ -1579,6 +1616,11 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
                 }
                 break;
               } else {
+                if (has_any && wc_single) {             /* minimal-any: the first RRset only (RRSIGs come with it when DO=1) */
+                  if (rec_type == 46) continue;
+                  if (wc_chosen_type == 0) wc_chosen_type = rec_type;
+                  else if (wc_chosen_type != rec_type) continue;
+                }
                 if (qtypes[0] == 255 || qtypes[0] == rec_type) {
                   // R-04 / O-16: exact-name の場合と同じ (RRSIG は各 RRset の後ろ、RRset ごとに 1 回)
                   if (has_any && dnssec_ok && rec_type == 46) continue;
@@ -2088,7 +2130,7 @@ void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qtypes, in
                          compress_ctx_t *comp_ctx, uint16_t *ancount,
                          uint16_t *nscount, uint16_t *arcount,
                          int minimal_mode,
-                         bool minimal_any, uint32_t minimal_any_ttl, bool dnssec_ok,
+                         int minimal_any, uint32_t minimal_any_ttl, bool dnssec_ok,
                          view_snapshot_t *view, uint32_t *qtx_included_out,
                          const char *client_ip, server_config_t *cfg,
                          bool ecs_trusted, const uint8_t *ecs_addr, uint16_t ecs_family,
@@ -3216,6 +3258,54 @@ static int build_badcookie_response(uint8_t *res, size_t max_res_len, uint16_t q
   return offset;
 }
 
+/* The COOKIE option of a query (edns->has_cookie): the server cookie it carried checked (RFC 9018 §4.2-4.4: SipHash-2-4, Reserved hashed as
+ * received, RFC 1982 timestamp window), and the server cookie of the answer made in edns: a fresh one for a client cookie alone (RFC 7873
+ * §5.2.3), for one that is not valid, and for one older than 30 minutes (RFC 9018 §4.3); the valid one kept otherwise.  When no cookie can be
+ * made the answer carries none (has_cookie = false).  The policy (BADCOOKIE, TC for ANY) is the caller's. */
+typedef enum { QE_COOKIE_CLIENT_ONLY, QE_COOKIE_INVALID, QE_COOKIE_VALID } cookie_check_t;
+static cookie_check_t qe_cookie_check(server_config_t *cfg, const char *client_ip, edns_info_t *edns) {
+  cookie_check_t ck = QE_COOKIE_CLIENT_ONLY;
+  bool need_new_cookie = true;
+  if (edns->server_cookie_len != 0) {
+    server_cookie_status_t cst = verify_server_cookie(cfg, client_ip, edns->client_cookie, edns->server_cookie, edns->server_cookie_len, (uint32_t)time(NULL));
+    ck = cst == SERVER_COOKIE_INVALID ? QE_COOKIE_INVALID : QE_COOKIE_VALID;
+    need_new_cookie = cst != SERVER_COOKIE_VALID;
+  }
+  if (need_new_cookie) {
+    if (!generate_server_cookie(cfg, client_ip, edns->client_cookie, edns->server_cookie, (uint32_t)time(NULL))) {
+      edns->server_cookie_len = 0;
+      edns->has_cookie = false;
+    } else {
+      edns->server_cookie_len = SERVER_COOKIE_LEN;
+    }
+  }
+  return ck;
+}
+
+/* 0.7: RFC 8482 §4.4: an ANY query over UDP whose source is not known to be genuine (no valid server cookie of this server, RFC 7873 §5.2.4) is
+ * answered with an empty, truncated response, so that ANY cannot be used to reflect and amplify traffic towards a spoofed address; a client
+ * retries over TCP (RFC 7766 §5, RFC 1035 §4.2.1), where ANY is answered as before.  As BIND (main, lib/ns/query.c ns__query_start(): "ANY
+ * queries are only answered to clients whose address is known not to be spoofed"): NOERROR, TC=1, AA=0, AD=0, the question and the OPT (with
+ * the client's server cookie, which makes its next UDP query an answered one), whatever the answer would be and whatever minimal-any says.
+ * The question is already copied to res[0..q_offset). */
+/* 0.7: a forward or a program zone: the queries for it are relayed to the forwarders or answered by the plugin, so the ANY / RRSIG rules
+ * of this server's own answers (TC=1 for ANY over UDP, FORMERR for RRSIG) and nocookie-udp-size do not apply to them */
+static bool qe_relayed_zone(const zone_config_t *z) {
+  return z && z->type && (strcasecmp(z->type, "forward") == 0 || strcasecmp(z->type, "program") == 0);
+}
+
+static int build_any_udp_tc_response(uint8_t *res, size_t max_res_len, uint16_t q_offset, edns_info_t *edns, server_config_t *cfg) {
+  uint16_t offset = q_offset, arcount = 0;
+  res[2] = (uint8_t)((res[2] & ~0x04) | 0x02);   /* AA=0, TC=1 */
+  res[3] &= (uint8_t)~0x2F;                      /* AD=0, RCODE NOERROR (RA, CD stay as the header was made) */
+  if (edns->present) assemble_edns_opt(res, max_res_len, &offset, &arcount, edns, 0, false, cfg);
+  res[6] = 0; res[7] = 0;
+  res[8] = 0; res[9] = 0;
+  res[10] = (uint8_t)(arcount >> 8);
+  res[11] = (uint8_t)(arcount & 0xFF);
+  return offset;
+}
+
 /* ---- Built-in CHAOS zones: version.bind, hostname.bind, id.server (BIND 9.20: bin/named/config.c defines them in the "_bind" view of class
  * CHAOS; bin/named/builtin.c answers them).  A zone has an SOA (MNAME = the zone, RNAME = hostmaster.<zone>, serial 0, 28800 7200 604800
  * 86400, TTL 86400), an NS at the apex (the zone itself, TTL 0) and, at the apex, a TXT of TTL 0 with the text of the option (version_lookup(),
@@ -3425,6 +3515,19 @@ static size_t edns_udp_limit(edns_info_t *edns, bool is_tcp, const server_config
     if (res_cap != 0 && max_res_len > res_cap) max_res_len = res_cap;
   }
   return max_res_len;
+}
+
+/* edns_udp_limit() for an answer to a query whose server cookie has not been found valid (the answers from a zone's summary while the zone
+ * is not in memory: build_apex_soa_answer() leaves every query with a COOKIE option to the zone): over UDP, nocookie-udp-size limits it too
+ * (BIND 9.20 client_allocsendbuf(); a zone in the directory is never a forward or program zone). */
+static size_t edns_udp_limit_nocookie(edns_info_t *edns, bool is_tcp, const server_config_t *cfg, const view_snapshot_t *view, const char *client_ip,
+                                      size_t max_res_len, size_t res_cap) {
+  size_t l = edns_udp_limit(edns, is_tcp, cfg, view, client_ip, max_res_len, res_cap);
+  if (!is_tcp) {
+    const size_t nc = config_nocookie_udp_size(cfg, view ? view->name : NULL);
+    if (l > nc) l = nc;
+  }
+  return l;
 }
 
 /* May this client transfer the zone (allow-transfer, the TSIG key, the zone's tsig-key, transfer-acl-match, acl-ceiling of a database zone)?  The question of an IXFR
@@ -3891,6 +3994,20 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
     }
   }
 
+  /* 0.7: a question for type RRSIG alone is a FORMERR with EDE 30 Invalid Query Type (IANA EDE registry), whatever the name, the class, the
+   * transport, DO or the zone, as BIND (9.20.31 / main, lib/ns/query.c ns_query_start(): "Standalone RRSIG queries are not supported"):
+   * the signatures come with the RRsets they cover when DO=1 (RFC 4035 3.1.1), and an RRSIG question only collects every signature at a
+   * name, which is an ANY by another name (RFC 4035 2.5 and RFC 2181 10.1 still apply with answer-rrsig-queries yes: at a CNAME owner the
+   * name's own RRSIG RRset is the answer).  Before the zone, the ACLs, the cookie checks and the response cache, as BIND checks it before
+   * its zone lookup: nothing is read, waited for or cached for it.  An MQTYPE-Query option that lists RRSIG is refused the same way below. */
+  /* A forward or program zone is not this server's data: such a question goes to the forwarders or the plugin as before, which answer it
+   * (BIND's refusal of a recursive ANY is not followed either).  The rule is for the answers this server makes itself. */
+  if (opcode == 0 && qdcount == 1 && qtype == 46 && !(cfg_for_ede && cfg_for_ede->answer_rrsig_queries) && !qe_relayed_zone(zone_cfg_any)) {
+    qe_why("a question for type RRSIG (standalone RRSIG queries are not supported; answer-rrsig-queries)");
+    add_ede(&edns, send_ede, 30, "RRSIG queries are not supported");
+    return dns_build_error_response(req, req_len, res, max_res_len, 1, 0, dns_error_qd_echo(req, req_len), &edns, is_tcp, cfg); // FORMERR
+  }
+
   if (not_ready_zone && qdcount == 1) {
     /* D1a: the zone is in the directory and its data is not in memory, and the caller cannot wait for it (or has waited in vain).  After the
      * checks of the message above (a malformed request is still a FORMERR), before any work on the zone.  The answer is an error answer of that
@@ -3950,11 +4067,22 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
       add_ede(&edns, send_ede, 18, "Query refused due to access control");
       return dns_build_error_response(req, req_len, res, max_res_len, 5, 0, 1, &edns, is_tcp, cfg);
     }
+    /* 0.7: ANY over UDP without a valid server cookie is answered empty with TC=1 (RFC 8482 §4.4, as for a zone in memory below): it neither
+     * waits for the zone nor makes the server read it */
+    if (opcode == 0 && qtype == 255 && !is_tcp && !(edns.has_cookie && qe_cookie_check(cfg, client_ip, &edns) == QE_COOKIE_VALID)) {
+      const size_t q_end = get_question_end_offset(req, req_len, 1);
+      const size_t alimit = edns_udp_limit_nocookie(&edns, is_tcp, cfg, view, client_ip, max_res_len, res_cap);
+      if (q_end > DNS_HEADER_SIZE && q_end <= alimit) {
+        memcpy(res, req, q_end);
+        dns_init_response_header(res, req, 0, true);
+        return build_any_udp_tc_response(res, alimit, (uint16_t)q_end, &edns, cfg);
+      }
+    }
     if (opcode == 0 && qtype == 6 && qdcount == 1 && view && domain_names_match_ci(zref_name(not_ready_zone), current_qname)) {
       const zdir_apex_t *ap = (not_ready_zone->el ? atomic_load_explicit(&not_ready_zone->el->apex, memory_order_acquire) : NULL);
       if (ap) {
         /* the size the zone in memory would answer with (the EDNS size of the client on UDP), and the TSIG signing needs the same limit */
-        const size_t alimit = edns_udp_limit(&edns, is_tcp, cfg, view, client_ip, max_res_len, res_cap);
+        const size_t alimit = edns_udp_limit_nocookie(&edns, is_tcp, cfg, view, client_ip, max_res_len, res_cap);
         const size_t tsig_limit = tsig ? tsig->res_limit : 0;
         if (tsig) tsig->res_limit = alimit;
         const additional_from_auth_t apolicy = zext(&zc)->additional_from_auth_specified ? zext(&zc)->additional_from_auth
@@ -3997,7 +4125,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
       }
       const zdir_apex_t *iap = (not_ready_zone->el ? atomic_load_explicit(&not_ready_zone->el->apex, memory_order_acquire) : NULL);
       if (iap) {
-        const size_t alimit = edns_udp_limit(&edns, is_tcp, cfg, view, client_ip, max_res_len, res_cap);
+        const size_t alimit = edns_udp_limit_nocookie(&edns, is_tcp, cfg, view, client_ip, max_res_len, res_cap);
         const size_t tsig_limit = tsig ? tsig->res_limit : 0;
         if (tsig) tsig->res_limit = alimit;
         int ilen = build_apex_soa_answer(req, req_len, res, alimit, not_ready_zone->el, iap, &edns, is_tcp, MINIMAL_YES, ADDITIONAL_AUTH_YES, view, comp_ctx, tsig, cfg, &cs);
@@ -4194,51 +4322,35 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
   }
   compress_ctx_init_packet(comp_ctx);
 
+  uint8_t ext_rcode_out = 0;
+  bool is_badcookie = false;
+  bool server_cookie_ok = false;   /* the query carried a valid server cookie of this server (RFC 7873 §5.2.4, RFC 9018 §4.3): its source is not spoofed */
+
+  if (edns.has_cookie) {
+      cookie_check_t ck = qe_cookie_check(cfg, client_ip, &edns);
+      server_cookie_ok = ck == QE_COOKIE_VALID;
+      /* require-server-cookie (BIND lib/ns/query.c ns__query_start()): a UDP query that carries a client cookie but no valid server cookie gets
+       * BADCOOKIE, with a new server cookie to repeat the query with (RFC 7873 §5.2.3); a query without a cookie option is answered as usual.
+       * A server cookie that is not valid is BADCOOKIE over UDP (§5.2.3); BADCOOKIE = combined RCODE 23 = (ext=1 << 4) | base=7 */
+      if (!is_tcp && (ck == QE_COOKIE_INVALID || (ck == QE_COOKIE_CLIENT_ONLY && config_require_server_cookie(cfg, view ? view->name : NULL)))) {
+          is_badcookie = true;
+          ext_rcode_out = 1;
+      }
+  }
+
   max_res_len = edns_udp_limit(&edns, is_tcp, cfg, view, client_ip, max_res_len, res_cap);
+  /* 0.7: nocookie-udp-size (BIND 9.20 lib/ns/client.c client_allocsendbuf(); RFC 7873 §5.2): a UDP answer to a query without a valid server
+   * cookie is no larger than it, with the other UDP limits above (the smallest wins); larger answers are truncated (TC=1) as for those.  Not
+   * for TCP, and not for a forward or program zone (their answers are relayed as they come, qe_relayed_zone()). */
+  if (!is_tcp && !server_cookie_ok && !qe_relayed_zone(zone_cfg_any)) {
+    const size_t nc = config_nocookie_udp_size(cfg, view ? view->name : NULL);
+    if (max_res_len > nc) max_res_len = nc;
+  }
   /* RFC 8945 §5.3: 署名する応答は、上限から TSIG RR の分を空けて組み立てる (切り詰めは TC=1 で表す) */
   if (tsig) {
     tsig->res_limit = max_res_len;
     size_t reserve = tsig_response_reserve(tsig);
     if (reserve > 0 && max_res_len > reserve + DNS_HEADER_SIZE) max_res_len -= reserve;
-  }
-
-  uint8_t ext_rcode_out = 0;
-  bool is_badcookie = false;
-  
-  if (edns.has_cookie) {
-      bool need_new_cookie = false;
-      if (edns.server_cookie_len == 0) {
-          need_new_cookie = true;               // client-only cookie: hand out a Server Cookie
-          /* require-server-cookie (BIND lib/ns/query.c ns__query_start()): a UDP query that carries a client cookie but no valid server cookie gets
-           * BADCOOKIE, with a new server cookie to repeat the query with (RFC 7873 §5.2.3); a query without a cookie option is answered as usual */
-          if (!is_tcp && config_require_server_cookie(cfg, view ? view->name : NULL)) {
-              is_badcookie = true;
-              ext_rcode_out = 1;
-          }
-      } else {
-          // RFC 9018 §4.2-4.4: SipHash-2-4, Reserved hashed as received, RFC 1982 timestamp window
-          server_cookie_status_t cst = verify_server_cookie(cfg, client_ip, edns.client_cookie,
-                                                            edns.server_cookie, edns.server_cookie_len,
-                                                            (uint32_t)time(NULL));
-          if (cst == SERVER_COOKIE_INVALID) {
-              if (!is_tcp) {
-                  is_badcookie = true;
-                  ext_rcode_out = 1; // BADCOOKIE = combined RCODE 23 = (ext=1 << 4) | base=7
-              }
-              need_new_cookie = true;
-          } else if (cst == SERVER_COOKIE_VALID_REFRESH) {
-              need_new_cookie = true;           // RFC 9018 §4.3: renew cookies older than 30 minutes
-          }
-      }
-      if (need_new_cookie) {
-          if (!generate_server_cookie(cfg, client_ip, edns.client_cookie, edns.server_cookie,
-                                      (uint32_t)time(NULL))) {
-              edns.server_cookie_len = 0;
-              edns.has_cookie = false;
-          } else {
-              edns.server_cookie_len = SERVER_COOKIE_LEN;
-          }
-      }
   }
 
   /* RFC 6891 §7: OPT 付きの問い合わせには、切り詰め (TC=1) 応答でも OPT を返す。
@@ -4324,6 +4436,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
         return dns_build_error_response(req, req_len, res, max_res_len, 1, 0, dns_error_qd_echo(req, req_len), &edns, is_tcp, cfg); // FORMERR
       }
       if (is_badcookie) return build_badcookie_response(res, max_res_len, (uint16_t)q_offset, &edns, ext_rcode_out, is_tcp, cfg);
+      if (qtype == 255 && !is_tcp && !server_cookie_ok) return build_any_udp_tc_response(res, max_res_len, (uint16_t)q_offset, &edns, cfg);   /* RFC 8482 §4.4 */
       return chaos_build_response(cfg, res, body_max_len, max_res_len, q_offset, zi, at_apex, qtype, &edns, is_tcp, ext_rcode_out, cfg);
     }
   }
@@ -4353,6 +4466,11 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
    * (Only a built-in CHAOS zone is answered first, after its ACL and the UDP AXFR FORMERR, above.)  Below this, every OPT RR carries
    * extended RCODE 0. */
   if (is_badcookie) return build_badcookie_response(res, max_res_len, (uint16_t)q_offset, &edns, ext_rcode_out, is_tcp, cfg);
+  /* 0.7: ANY over UDP without a valid server cookie: empty, TC=1 (RFC 8482 §4.4, build_any_udp_tc_response()), after BADCOOKIE as in BIND, before
+   * every answer this server makes itself (a class or a name without a zone, the response cache, minimal-any).  A forward or program zone
+   * relays it as before: the forwarder's or the plugin's answer is the client's (qe_relayed_zone()). */
+  if (qtype == 255 && !is_tcp && !server_cookie_ok && !qe_relayed_zone(zone_cfg_any))
+    return build_any_udp_tc_response(res, max_res_len, (uint16_t)q_offset, &edns, cfg);
   if (qclass == 3 && !ch_zone_here) {
     add_ede(&edns, send_ede, 20, "This server is not authoritative for the queried zone");
     return dns_build_error_response(req, req_len, res, max_res_len, 5, 0, 1, &edns, is_tcp, cfg);
@@ -4682,6 +4800,12 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
           // RFC 10029 §3.3 / RFC 6891 §7: FORMERR (OPT 付き、AA=0)
           return dns_build_error_response(req, req_len, res, max_res_len, 1, 0, dns_error_qd_echo(req, req_len), &edns, is_tcp, cfg);
        }
+       if (mq == 46 && !(cfg_for_ede && cfg_for_ede->answer_rrsig_queries)) {
+          /* (an RRSIG question inside MQTYPE-Query is the standalone RRSIG query refused before the zone above) */
+          qe_why("MQTYPE-Query option that asks for RRSIG (standalone RRSIG queries are not supported; answer-rrsig-queries)");
+          add_ede(&edns, send_ede, 30, "RRSIG queries are not supported");
+          return dns_build_error_response(req, req_len, res, max_res_len, 1, 0, dns_error_qd_echo(req, req_len), &edns, is_tcp, cfg);
+       }
        bool dup = false;
        for (int j = 0; j < num_qtypes; j++) { if (qtypes[j] == mq) { dup = true; break; } }
        if (dup) {
@@ -4705,7 +4829,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
   resolve_name(current_qname, qclass, qtypes, num_qtypes, &db_entry, &current_zone, res, body_max_len,
                &offset, comp_ctx, &ancount, &nscount, &arcount,
                minimal_mode,
-               cfg_for_ede ? cfg_for_ede->minimal_any : false,
+               cfg_for_ede ? (int)cfg_for_ede->minimal_any : MINIMAL_ANY_NO,
                cfg_for_ede ? cfg_for_ede->minimal_any_ttl : 86400,
                edns.dnssec_ok, view, &qtx_included, client_ip,
                cfg, ecs_trusted, edns.ecs_addr, edns.ecs_family,

@@ -3904,7 +3904,7 @@ KARIDNS_TOOL_FN void usage(const char *prog) {
         "  +[no]dns64prefix             Query IPv4-only prefix from ipv4only.arpa (RFC 7050)\n"
         "  +timeout=N, +time=N          Query timeout in seconds [5]\n"
         "  +tries=N / +retry=N          Number of query attempts [1]\n"
-        "  +[no]rec, +[no]recurse      Set / clear RD (Recursion Desired) bit (+[no]rdflag)\n"
+        "  +[no]rec, +[no]recurse      Set / clear RD (Recursion Desired) bit (+[no]rdflag) [on; off for ANY unless given]\n"
         "  +[no]adflag                  Set / clear AD (Authenticated Data) bit in query\n"
         "  +[no]cdflag                  Set / clear CD (Checking Disabled) bit in query\n"
         "  +[no]aaflag                  Set / clear AA (Authoritative Answer) bit in query (+[no]aaonly)\n"
@@ -4292,7 +4292,8 @@ KARIDNS_TOOL_FN int run_single_job(const char *qname, const char *qtype_s, const
     }
 
     // AXFR, IXFRまたはANYの場合は自動的にTCPモードに昇格（+udpが明示されていない場合、BIND 9 dig / RFC 8482 / RFC 1995準拠）
-    if ((strcasecmp(qtype_s, "AXFR") == 0 || strncasecmp(qtype_s, "IXFR", 4) == 0 || strcasecmp(qtype_s, "ANY") == 0) && !force_udp) {
+    uint16_t xfr_any_t = 0;   /* (TYPE252 / TYPE251 / TYPE255 too: dig parses them to the same types, dns_rdatatype_fromtext()) */
+    if ((strncasecmp(qtype_s, "IXFR", 4) == 0 || (resolve_qtype(qtype_s, &xfr_any_t) && (xfr_any_t == 251 || xfr_any_t == 252 || xfr_any_t == 255))) && !force_udp) {
         use_tcp = true;
     }
 
@@ -5683,6 +5684,14 @@ int execute_query_spec(query_spec_t *spec) {
     if (dag_is_update_message(&spec->qo)) {
         if (!spec->qo.rd_explicit) { spec->qo.rd_flag = false; spec->norecurse = true; }
         if (!spec->qo.ad_explicit) { spec->qo.ad_flag = false; spec->adflag = false; }
+    }
+    /* dig (BIND main fce5bf80, 2026-11-24, bin/dig/dig.c adjust_lookup_for_rdtype()): an ANY query is sent with RD=0 unless the RD bit was
+     * set or cleared explicitly (+[no]recurse / +[no]rdflag, anywhere on the line or in ~/.digrc), as a resolver no longer answers a
+     * recursive ANY.  +trace / +nssearch set it in dig (recurse_set) and keep their own handling here; a --hex packet keeps its own header. */
+    uint16_t any_t = 0;
+    if (!spec->hex_payload && spec->qtype_s && resolve_qtype(spec->qtype_s, &any_t) && any_t == 255 && !spec->qo.rd_explicit && !spec->do_trace && !spec->do_trace2 && !spec->do_nssearch) {
+        spec->qo.rd_flag = false;
+        spec->norecurse = true;
     }
     if ((spec->qo.want_tsig || spec->qo.tsig_specified) && (spec->qo.want_sig0 || spec->qo.sig0_specified)) {
         fprintf(stderr, "error: TSIG (-k/-y) and SIG(0) (+sig0-pkey) cannot be combined in this version of dag\n");

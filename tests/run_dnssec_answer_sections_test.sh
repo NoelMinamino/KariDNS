@@ -150,7 +150,7 @@ for z in an.test s255.test two.test; do
 done > "$W/anchors.conf"
 
 cat > "$W/k.conf" <<EOF
-options { port $PORT; bind-address { 127.0.0.1; }; pid-file "none"; $USER_OPT };
+options { port $PORT; bind-address { 127.0.0.1; }; pid-file "none"; minimal-any no; $USER_OPT };
 zone "an.test" { type master; file "$W/an.test.signed"; };
 zone "sec.an.test" { type master; file "$W/sec.an.test.zone"; };
 zone "ins.an.test" { type master; file "$W/ins.an.test.zone"; };

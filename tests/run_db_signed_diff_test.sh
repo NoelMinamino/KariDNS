@@ -155,15 +155,15 @@ done
 chown -R nobody "$T/db"; chmod 600 "$T/db/z.db"*
 
 {
-    printf 'options {\n    user "nobody"; pid-file "none"; listen-on { 127.0.0.1; }; port %s;\n};\n' "$PA"
+    printf 'options {\n    user "nobody"; pid-file "none"; listen-on { 127.0.0.1; }; port %s; minimal-any no; answer-rrsig-queries yes;\n};\n' "$PA"
     for z in $ZONES; do printf 'zone "%s" { type primary; file "%s/signed/%s.signed"; allow-transfer { 127.0.0.1; }; };\n' "$z" "$T" "$z"; done
 } > "$T/a.conf"
 {
-    printf 'options {\n    user "nobody"; pid-file "none"; listen-on { 127.0.0.1; }; port %s;\n' "$PB"
+    printf 'options {\n    user "nobody"; pid-file "none"; listen-on { 127.0.0.1; }; port %s; minimal-any no; answer-rrsig-queries yes;\n' "$PB"
     printf '    database { driver sqlite3; database-file "%s/db/z.db"; loader-user "nobody"; loader-path "%s/karidns-dbloader"; acl-ceiling { 127.0.0.1; }; %s };\n};\n' "$T" "$T" "$(store_stmt "$T")"
 } > "$T/b.conf"
 {   # C: no zone file, no database; a secondary of B for every zone (B7b)
-    printf 'options {\n    user "nobody"; pid-file "none"; listen-on { 127.0.0.1; }; port %s;\n};\n' "$PC"
+    printf 'options {\n    user "nobody"; pid-file "none"; listen-on { 127.0.0.1; }; port %s; minimal-any no; answer-rrsig-queries yes;\n};\n' "$PC"
     for z in $ZONES; do printf 'zone "%s" { type slave; masters { 127.0.0.1 port %s; }; allow-transfer { 127.0.0.1; }; };\n' "$z" "$PB"; done
 } > "$T/c.conf"
 "$KARIDNS" -c "$T/a.conf" -f > "$T/a.log" 2>&1 &

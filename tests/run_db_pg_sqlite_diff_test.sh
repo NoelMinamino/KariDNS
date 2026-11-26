@@ -326,11 +326,11 @@ while [ $k -le $R ]; do
     if [ $SERVERS -eq 1 ]; then
         chown -R nobody "$D"; chmod 600 "$D/z.db"*
         {
-            printf 'options {\n    user "nobody"; pid-file "none"; listen-on { 127.0.0.1; }; port %s;\n' "$PA"
+            printf 'options {\n    user "nobody"; pid-file "none"; listen-on { 127.0.0.1; }; port %s; minimal-any no;\n' "$PA"
             printf '    database { driver sqlite3; database-file "%s/z.db"; loader-user "nobody"; loader-path "%s/karidns-dbloader"; acl-ceiling { 127.0.0.1; }; };\n};\n' "$D" "$T"
         } > "$D/a.conf"
         {
-            printf 'options {\n    user "nobody"; pid-file "none"; listen-on { 127.0.0.1; }; port %s;\n' "$PB"
+            printf 'options {\n    user "nobody"; pid-file "none"; listen-on { 127.0.0.1; }; port %s; minimal-any no;\n' "$PB"
             printf '    database { driver postgresql; conninfo-file "%s/ci"; schema "%s"; loader-user "%s"; loader-path "%s/karidns-dbloader"; acl-ceiling { 127.0.0.1; }; };\n};\n' "$T" "$SCH" "$PG_AS" "$T"
         } > "$D/b.conf"
         "$KARIDNS" -c "$D/a.conf" -f > "$D/a.log" 2>&1 &

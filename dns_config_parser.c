@@ -1605,6 +1605,44 @@ static int parse_bool_statement(token_ctx_t *ctx, const char *zone, const char *
   return 0;
 }
 
+/* minimal-any yes|no|hinfo|rrset (0.7; BIND takes a boolean): yes = hinfo (MINIMAL_ANY_*).  Any other word is an error with the place
+ * (report_bad_value()), as for a boolean. */
+static int parse_minimal_any(token_ctx_t *ctx, uint8_t *out) {
+  char db[80];
+  conf_token_t tok = get_next_token(ctx);
+  if (tok.type != TOKEN_STRING) {
+    conf_error(ctx, "minimal-any", "expected yes, no, hinfo or rrset but found %s", tok_desc(&tok, db, sizeof(db)));
+    free_token(&tok);
+    return -1;
+  }
+  bool b = false;
+  if (strcasecmp(tok.value, "hinfo") == 0) *out = MINIMAL_ANY_HINFO;
+  else if (strcasecmp(tok.value, "rrset") == 0) *out = MINIMAL_ANY_RRSET;
+  else if (parse_config_bool(tok.value, &b)) *out = b ? MINIMAL_ANY_HINFO : MINIMAL_ANY_NO;
+  else {
+    if (!ctx || ctx->restricted) {
+      report_bad_value(ctx, NULL, "minimal-any", tok.value, "yes, no, hinfo or rrset");   /* (hostile settings text: the value is not echoed) */
+    } else {
+      char loc[300];
+      ctx_location(ctx, loc, sizeof(loc));
+      syslog(LOG_ERR, "[Config] %s: invalid minimal-any value '%s' (expected yes, no, hinfo or rrset)", loc, tok.value);
+      dns_diag_at(DIAG_ERROR, DC_CONF_VALUE_INVALID, loc, "%s: invalid minimal-any value '%s' (expected yes, no, hinfo or rrset)\n", loc, tok.value);
+      ctx->error_occurred = true;
+    }
+    free_token(&tok);
+    return -1;
+  }
+  free_token(&tok);
+  tok = get_next_token(ctx);
+  if (tok.type != TOKEN_SEMICOLON) {
+    conf_error(ctx, "minimal-any", "expected ';' after the value but found %s", tok_desc(&tok, db, sizeof(db)));
+    free_token(&tok);
+    return -1;
+  }
+  free_token(&tok);
+  return 0;
+}
+
 bool match_cidr(const char *client_ip_str, const char *cidr_str) {
   if (!client_ip_str || !cidr_str)
     return false;
@@ -2308,6 +2346,7 @@ static int chaos_finish(token_ctx_t *ctx, server_config_t *cfg) {
   }
   for (const view_config_t *v = cfg->views; v; v = v->next) {
     if (v->max_udp_size) cfg->any_view_max_udp = true;
+    if (v->nocookie_udp_size) cfg->any_view_nocookie = true;
     if (v->require_cookie_set) cfg->any_view_cookie = true;
     if (v->minimal_set) cfg->any_view_minimal = true;
   }
@@ -3673,6 +3712,29 @@ const view_config_t *config_find_view(const server_config_t *cfg, const char *na
   for (const view_config_t *v = cfg->views; v; v = v->next)
     if (strcasecmp(v->name, name) == 0) return v;
   return NULL;
+}
+
+/* nocookie-udp-size (BIND 9.20: cfg_type_uint32 in options and view; bin/named/server.c raises a value below 128 to 128 and holds it to the
+ * view's max-udp-size, which the query path does here by taking the smallest of the UDP limits).  BIND takes a uint32; 0..INT_MAX here (a larger
+ * value is an error).  A value above 4096 is kept as 4096: no UDP answer of this server is larger (udp-bufsize, max-udp-size: 512..4096), so it is the same limit. */
+static int parse_nocookie_udp_size(token_ctx_t *ctx, const char *what, uint16_t *out) {
+  int v = 0;
+  if (parse_transport_param(ctx, NULL, "nocookie-udp-size", false, 0, INT_MAX, &v) != 0) return -1;
+  if (v < 128) {
+    conf_warn_here(ctx, what, "nocookie-udp-size %d is below 128: raising to 128 (as BIND)", v);
+    v = 128;
+  }
+  *out = (uint16_t)(v > 4096 ? 4096 : v);
+  return 0;
+}
+
+uint16_t config_nocookie_udp_size(const server_config_t *cfg, const char *view_name) {
+  if (!cfg) return 4096;
+  if (cfg->any_view_nocookie) {
+    const view_config_t *v = config_find_view(cfg, view_name);
+    if (v && v->nocookie_udp_size) return v->nocookie_udp_size;
+  }
+  return cfg->nocookie_udp_size ? cfg->nocookie_udp_size : 4096;
 }
 
 bool config_require_server_cookie(const server_config_t *cfg, const char *view_name) {
@@ -5072,7 +5134,7 @@ static const char *const k_bind_view_options[] = {
   "max-ixfr-ratio", "max-journal-size", "max-ncache-ttl", "max-records", "max-recursion-depth", "max-recursion-queries",
   "max-refresh-time", "max-retry-time", "max-stale-ttl", "max-udp-size", "max-zone-ttl", "message-compression",
   "min-cache-ttl", "min-ncache-ttl", "min-refresh-time", "min-retry-time", "min-transfer-rate-in", "minimal-any", "minimal-responses",
-  "notify-delay", "notify-source", "notify-source-v6", "notify-to-soa", "nocookie-udp-size", "nosit-udp-size",
+  "notify-delay", "notify-source", "notify-source-v6", "notify-to-soa", "nosit-udp-size",
   "nta-lifetime", "nta-recheck", "nxdomain-redirect", "parental-source", "parental-source-v6", "preferred-glue",
   "prefetch", "provide-ixfr", "qname-minimization", "query-source", "query-source-v6", "rate-limit", "recursion",
   "request-expire", "request-ixfr", "request-nsid", "require-server-cookie", "resolver-nonbackoff-tries",
@@ -5153,7 +5215,7 @@ static const char *const k_bind_options_options[] = {
   "max-types-per-name", "max-udp-size", "max-validation-failures-per-fetch", "max-validations-per-fetch",
   "max-zone-ttl", "memstatistics", "memstatistics-file", "message-compression", "min-cache-ttl", "min-ncache-ttl",
   "min-refresh-time", "min-retry-time", "min-transfer-rate-in", "multi-master", "named-xfer", "new-zones-directory", "no-case-compress",
-  "nocookie-udp-size", "nosit-udp-size", "notify-delay", "notify-rate", "notify-source", "notify-source-v6",
+  "nosit-udp-size", "notify-delay", "notify-rate", "notify-source", "notify-source-v6",
   "notify-to-soa", "nsec3-test-zone", "nta-lifetime", "nta-recheck", "nxdomain-redirect", "parental-source",
   "parental-source-v6", "preferred-glue", "prefetch", "provide-ixfr", "qname-minimization", "query-source",
   "query-source-v6", "queryport-pool-ports", "queryport-pool-updateinterval", "random-device",
@@ -8508,8 +8570,9 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
   config->tcp_idle_timeout = 10000;
   config->tcp_initial_timeout = 10000;
   config->minimal_responses = false;
-  config->minimal_any = false;
+  config->minimal_any = MINIMAL_ANY_HINFO;   /* 0.7: yes (hinfo), as BIND's default yes (named.conf ARM: "The default is yes") */
   config->minimal_any_ttl = 86400;
+  config->answer_rrsig_queries = false;
   config->wire_cache_max_records = 0;
   config->router_threads = 0;
   config->worker_threads = 0;
@@ -8858,7 +8921,12 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
             return -1;
           }
         } else if (strcmp(key, "minimal-any") == 0) {
-          if (parse_bool_statement(ctx, NULL, key, &config->minimal_any) != 0) {
+          if (parse_minimal_any(ctx, &config->minimal_any) != 0) {
+            free(key);
+            return -1;
+          }
+        } else if (strcmp(key, "answer-rrsig-queries") == 0) {
+          if (parse_bool_statement(ctx, NULL, key, &config->answer_rrsig_queries) != 0) {
             free(key);
             return -1;
           }
@@ -9146,6 +9214,11 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
           }
           if (rcv) { config->tcp_rcvbuf = v; config->tcp_rcvbuf_set = true; }
           else { config->tcp_sndbuf = v; config->tcp_sndbuf_set = true; }
+        } else if (strcmp(key, "nocookie-udp-size") == 0) {
+          if (parse_nocookie_udp_size(ctx, "options", &config->nocookie_udp_size) != 0) {
+            free(key);
+            return -1;
+          }
         } else if (strcmp(key, "max-udp-size") == 0) {
           if (parse_udp_size_option(ctx, config, "options max-udp-size", key, &config->udp_bufsize) != 0) {
             free(key);
@@ -9431,15 +9504,18 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
           char cwhat[KARIDNS_VIEW_NAME_MAX + 16];
           snprintf(cwhat, sizeof(cwhat), "view '%s'", view->name);
           if (parse_catalog_zones(ctx, cwhat, &view->catz_names, &view->catz_count) != 0) { free_partial_view(view); return -1; }
-        } else if (strcmp(tok.value, "max-udp-size") == 0 || strcmp(tok.value, "require-server-cookie") == 0) {
+        } else if (strcmp(tok.value, "max-udp-size") == 0 || strcmp(tok.value, "require-server-cookie") == 0 || strcmp(tok.value, "nocookie-udp-size") == 0) {
           /* batch 7: replaces options' for the clients of this view */
           bool is_udp = tok.value[0] == 'm';
+          bool is_nocookie = tok.value[0] == 'n';
           free_token(&tok);
           char vwhat[KARIDNS_VIEW_NAME_MAX + 16];
           snprintf(vwhat, sizeof(vwhat), "view '%s'", view->name);
           int vrc;
           if (is_udp) {
             vrc = parse_udp_size_option(ctx, NULL, vwhat, "max-udp-size", &view->max_udp_size);
+          } else if (is_nocookie) {
+            vrc = parse_nocookie_udp_size(ctx, vwhat, &view->nocookie_udp_size);
           } else {
             vrc = parse_bool_statement(ctx, NULL, "require-server-cookie", &view->require_cookie);
             view->require_cookie_set = vrc == 0;
