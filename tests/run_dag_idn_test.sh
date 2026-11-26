@@ -25,7 +25,9 @@ if [ "${KARIDNS_TEST_NO_DIG:-0}" != 1 ] && command -v dig >/dev/null 2>&1 && dig
 pass=0
 fail=0
 TAB=$(printf '\t')
+CR=$(printf '\r')
 while IFS="$TAB" read -r dir name want; do
+    want=${want%"$CR"}   # a checkout with CRLF line ends (Windows, core.autocrlf)
     case $dir in in) opts='+idnin +noidnout' ;; out) opts='+noidnin +idnout' ;; *) continue ;; esac
     # shellcheck disable=SC2086
     got=$("$DAG" $opts +qr +nohexdump +tries=1 +timeout=1 -p 1 @127.0.0.1 -q "$name" A 2>/dev/null | q)

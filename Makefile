@@ -26,7 +26,7 @@ IDN_LDFLAGS_PROBE != [ -z "$(IDN_CFLAGS)" ] || (pkg-config $(PKGC_STATIC) --libs
 IDN_LDFLAGS ?= $(IDN_LDFLAGS_PROBE)
 
 # Windows / MinGW detection (static single-binary build)
-WIN_LDFLAGS_PROBE != case "`uname -s 2>/dev/null`" in MINGW*|MSYS*|CYGWIN*) echo "-static -lws2_32 -liphlpapi -lcrypt32 -lbcrypt" ;; *) echo "" ;; esac
+WIN_LDFLAGS_PROBE != case "`uname -s 2>/dev/null`" in MINGW*|MSYS*|CYGWIN*) echo "-static -lws2_32 -liphlpapi -lcrypt32 -lbcrypt -lshell32" ;; *) echo "" ;; esac
 WIN_LDFLAGS ?= $(WIN_LDFLAGS_PROBE)
 
 # Homebrew & standard paths for macOS (Apple Silicon /opt/homebrew & Intel /usr/local) and BSD; a plain assignment on purpose:
