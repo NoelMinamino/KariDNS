@@ -5425,7 +5425,9 @@ static void test_readahead_close(void) {
   store_test_ra_page = ra_slow_page;                                                  /* (a page that waits for the disk: 0.3 s each, 25 of them) */
   CHECK_EQ(store_open(d.fd, &o, &s), 0);
   if (s) {
-    usleep(100000);
+    /* (the thread is in its pass over the pages when the close comes: wait for its first page, up to 5 s; a fixed 0.1 s was not always enough on a busy
+     * host, pc31 2026-11-27: 2 of 5 runs with test_store running beside another one) */
+    for (int w = 0; w < 500 && atomic_load(&g_ra_calls) == 0; w++) usleep(10000);
     double t0 = mono_s();
     CHECK_EQ(store_close(s), 0);                                                       /* (before: gave up after 5 s with the thread still running over the unmapped table; the stop flag was looked at every 1 MiB) */
     double dt = mono_s() - t0;
@@ -5433,7 +5435,9 @@ static void test_readahead_close(void) {
     usleep(1000000);
     CHECK_EQ(atomic_load(&g_ra_calls), at_close);                                      /* (the thread is gone when the close returns) */
     printf("  close %.2f s, %d pages read\n", dt, at_close);
-    CHECK(dt < 2.0 && at_close >= 1 && at_close < 25);
+    CHECK(at_close >= 1);                                                              /* (the close came while the thread read) */
+    CHECK(dt < 2.0);                                                                   /* (the close waited for one page at most, not for the pass) */
+    CHECK(at_close < 25);
   }
   store_test_ra_page = NULL;
   tdir_free(&d);
@@ -9239,6 +9243,7 @@ static bool ix_scratch_gone(const tdir_t *d) {
   return false;
 }
 static uint64_t get_dx_done(const store_stats_t *st) { return !st->index_delta_active; }
+static uint64_t get_dx_built(const store_stats_t *st) { return !st->index_delta_active && st->index_builds >= 1; }
 static uint64_t get_dx_settled(const store_stats_t *st) { return st->index_delta_frozen == 0; }
 static bool ix_wait(store_t *s, uint64_t (*get)(const store_stats_t *), const char *what) {
   if (wait_stat(s, get, 1, 60000)) return true;
@@ -9394,7 +9399,7 @@ static void test_dx_pass(void) {
   check_consistent(s, "delta pass, deletes and reuse");
   /* the end of the pass: one build replaces the delta */
   store_bulk_phase(s, STORE_BULK_PASSED);
-  CHECK(ix_wait(s, get_dx_done, "the build"));
+  CHECK(ix_wait(s, get_dx_built, "the build"));        /* (the delta goes inside the mutex at the publish; the build is counted after it, once the old generations are dropped: CI 14.4 2026-11-26 read 0 builds between) */
   store_stats(s, &st);
   printf("  build: %llu builds, %llu buckets, %llu carries, %llu bytes written, peak %llu bytes, %llu us; ix %llu slots, %llu live\n", (unsigned long long)st.index_builds,
          (unsigned long long)st.index_build_buckets, (unsigned long long)st.index_build_carries, (unsigned long long)st.index_build_written_bytes, (unsigned long long)st.index_build_peak_bytes,
