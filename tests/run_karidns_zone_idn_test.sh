@@ -2,7 +2,7 @@
 # run_karidns_zone_idn_test.sh - karidns-zone idn --json (0.7, the WebAdmin): names converted exactly as dig 9.20 converts them (+idnin, +idnout), against
 # webadmin/test/idn_dig_vectors.json (what dig 9.20.30 / libidn2 2.3.8 sent and showed on the build host; webadmin/test/idn_dig_vectors_gen.mjs makes it).
 # Also the usage errors, a line that is no request, and the example of --help.  A karidns-zone built without libidn2 must say db.idn.unavailable (the rest
-# is then skipped: the coverage build has no libidn2).  SKIP without perl.
+# is then skipped with a SKIP line; KARIDNS_TEST_REQUIRE=1 makes that a failure).  SKIP without perl.
 set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 ZONE=${ZONE:-$ROOT/karidns-zone}
@@ -31,6 +31,10 @@ expect_rc 2 "idn with a database option" "$ZONE" idn --json --sqlite3 "$T/x.sqli
 printf 'u\txn--r8jz45g.test\n' | "$ZONE" idn --json > "$T/probe.json" 2>&1
 if grep -q 'db.idn.unavailable' "$T/probe.json"; then
     ok "built without libidn2: db.idn.unavailable"
+    # KARIDNS_TEST_REQUIRE=1: a karidns-zone without libidn2 is a failure (the conversions are what this test is for)
+    [ "${KARIDNS_TEST_REQUIRE:-0}" = 1 ] && bad "karidns-zone was built without libidn2 (KARIDNS_TEST_REQUIRE=1)"
+    # a SKIP line, so that tests/run_all_suite.sh shows the part that did not run
+    echo "SKIP: the conversions against dig 9.20 (karidns-zone was built without libidn2)"
     echo "=== run_karidns_zone_idn_test: $pass passed, $fail failed (without libidn2: the conversions are not checked) ==="
     [ "$fail" -eq 0 ]
     exit

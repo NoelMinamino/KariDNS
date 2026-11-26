@@ -24,6 +24,9 @@
 #include "dag_edns_client.h"
 #include "dag_transport.h"
 #include "karidns_tool_linkage.h"
+#ifdef _WIN32
+#include <shellapi.h>   /* CommandLineToArgvW: the arguments in UTF-8 (main) */
+#endif
 #ifndef _WIN32
 #include "../dns_log.h"
 #undef syslog   /* dag calls no syslog() of its own; dns_log.h is here for klog_set_hook() */
@@ -2086,9 +2089,13 @@ KARIDNS_TOOL_FN const char *idn_to_ascii(const char *name, bool *allocated) {
     char *p = NULL;
     int rc = dag_idn_lookup(name, false, &p, NULL, NULL);
     int rc_utf8 = rc;
+#ifndef _WIN32
+    /* Windows: no second try in the locale's charset.  main() gives dag its arguments in UTF-8 there, and the ANSI code page read the octets of a
+     * name with no IDNA2008 form as other characters (١٢٣.example became xn--7acd55abb.example where dig sends the UTF-8 octets) */
     if (rc != IDN2_OK) {
         rc = dag_idn_lookup(name, true, &p, NULL, NULL);
     }
+#endif
     if (rc == IDN2_OK) {
         if (allocated) *allocated = true;
         return p;
@@ -5901,6 +5908,22 @@ int main(int argc, char **argv) {
         return 1;
     }
     srand((unsigned int)time(NULL) ^ (unsigned int)GetCurrentProcessId());
+    /* The C runtime hands main() the arguments in the ANSI code page: 例え.test arrived as "??.test" and +idnin had nothing to convert.  dig
+     * reads its arguments as UTF-8 (the locale of the shell), so take the UTF-16 command line and give dag each argument in UTF-8 (CP_UTF8). */
+    {
+        int wargc = 0;
+        LPWSTR *wargv = CommandLineToArgvW(GetCommandLineW(), &wargc);
+        char **u8 = (wargv && wargc == argc) ? calloc((size_t)wargc + 1, sizeof(*u8)) : NULL;
+        if (u8) {
+            int i;
+            for (i = 0; i < wargc; i++) {
+                int n = WideCharToMultiByte(CP_UTF8, 0, wargv[i], -1, NULL, 0, NULL, NULL);
+                if (n <= 0 || !(u8[i] = malloc((size_t)n)) || WideCharToMultiByte(CP_UTF8, 0, wargv[i], -1, u8[i], n, NULL, NULL) != n) break;
+            }
+            if (i == wargc) argv = u8;   /* kept for the life of the process, as the runtime's own argv */
+        }
+        if (wargv) LocalFree(wargv);
+    }
 #else
     srand((unsigned int)time(NULL) ^ (unsigned int)getpid());
 #endif

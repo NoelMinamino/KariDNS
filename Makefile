@@ -18,13 +18,15 @@ HARDEN_LDFLAGS_PROBE != case "`uname -s 2>/dev/null`" in Darwin) echo "-pie" ;; 
 HARDEN_LDFLAGS ?= $(HARDEN_LDFLAGS_PROBE)
 
 # libidn2 detection (portable for BSD make & GNU make)
-IDN_CFLAGS_PROBE != (pkg-config --exists libidn2 2>/dev/null && echo "-DHAVE_LIBIDN2 `pkg-config --cflags libidn2 2>/dev/null`") || (pkg info -e libidn2 >/dev/null 2>&1 && echo "-DHAVE_LIBIDN2") || ([ -f /usr/include/idn2.h ] || [ -f /usr/local/include/idn2.h ] && echo "-DHAVE_LIBIDN2") || true
+# MinGW links dag statically (WIN_LDFLAGS): libidn2.a needs the libraries of pkg-config --static (libunistring, iconv)
+PKGC_STATIC != case "`uname -s 2>/dev/null`" in MINGW*|MSYS*|CYGWIN*) echo "--static" ;; *) echo "" ;; esac
+IDN_CFLAGS_PROBE != (pkg-config --exists libidn2 2>/dev/null && echo "-DHAVE_LIBIDN2 `pkg-config $(PKGC_STATIC) --cflags libidn2 2>/dev/null`") || (pkg info -e libidn2 >/dev/null 2>&1 && echo "-DHAVE_LIBIDN2") || ([ -f /usr/include/idn2.h ] || [ -f /usr/local/include/idn2.h ] && echo "-DHAVE_LIBIDN2") || true
 IDN_CFLAGS ?= $(IDN_CFLAGS_PROBE)
-IDN_LDFLAGS_PROBE != [ -z "$(IDN_CFLAGS)" ] || (pkg-config --libs libidn2 2>/dev/null || (pkg info -e libidn2 >/dev/null 2>&1 && echo "-L/usr/local/lib -lidn2") || ([ -f /usr/lib/libidn2.so ] || [ -f /usr/local/lib/libidn2.so ] || [ -f /usr/lib64/libidn2.so ] && echo "-lidn2")) || true
+IDN_LDFLAGS_PROBE != [ -z "$(IDN_CFLAGS)" ] || (pkg-config $(PKGC_STATIC) --libs libidn2 2>/dev/null || (pkg info -e libidn2 >/dev/null 2>&1 && echo "-L/usr/local/lib -lidn2") || ([ -f /usr/lib/libidn2.so ] || [ -f /usr/local/lib/libidn2.so ] || [ -f /usr/lib64/libidn2.so ] && echo "-lidn2")) || true
 IDN_LDFLAGS ?= $(IDN_LDFLAGS_PROBE)
 
 # Windows / MinGW detection (static single-binary build)
-WIN_LDFLAGS_PROBE != case "`uname -s 2>/dev/null`" in MINGW*|MSYS*|CYGWIN*) echo "-static -lws2_32 -liphlpapi -lcrypt32 -lbcrypt" ;; *) echo "" ;; esac
+WIN_LDFLAGS_PROBE != case "`uname -s 2>/dev/null`" in MINGW*|MSYS*|CYGWIN*) echo "-static -lws2_32 -liphlpapi -lcrypt32 -lbcrypt -lshell32" ;; *) echo "" ;; esac
 WIN_LDFLAGS ?= $(WIN_LDFLAGS_PROBE)
 
 # Homebrew & standard paths for macOS (Apple Silicon /opt/homebrew & Intel /usr/local) and BSD; a plain assignment on purpose:
@@ -1343,9 +1345,12 @@ COV_DIR     = coverage_raw
 # run alone afterwards, see tests/TEST_MATRIX.md).
 COV_JOBS != (sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 2) | head -n 1
 # Suites that only exercise ASan/TSan/libFuzzer binaries. Those binaries are not
-# coverage-instrumented, so the suites add ~5 minutes and no coverage; the
-# regular CI job still runs them.
+# coverage-instrumented, so the suites add ~5 minutes and no coverage.  Where CI runs them instead: run_sanitizer_smoke_test
+# in build-and-test of .github/workflows/freebsd.yml, run_rcu_tsan_test and run_rcu_tsan_units_test in its job tsan; run_stress_test and
+# run_fuzz_smoke_test in no CI job (the sanitizer smoke test runs the fuzz harnesses on their seeds).
 COV_SUITE_EXCLUDE ?= run_sanitizer_smoke_test,run_stress_test,run_rcu_tsan_test,run_rcu_tsan_units_test,run_fuzz_smoke_test
+# More options of tests/run_all_suite.sh for coverage-run (CI: --skip-allow tests/ci_skip_allow.txt)
+COV_SUITE_OPTS ?=
 COV_HTML_DIR = coverage_html
 COV_DATA    = coverage.profdata
 # CI runs the suite in parts, one per VM (.github/workflows/ci.yml, tests/TEST_MATRIX.md "Shards"): make coverage-run COV_SHARD=I/N runs part I of N
@@ -1595,7 +1600,7 @@ coverage-run:
 	@chmod 1777 $(COV_DIR)
 	@rm -f coverage_suite.status
 	@shard_opts=''; [ -z "$(COV_SHARD)" ] || shard_opts="--shard $(COV_SHARD) --pg-clusters"; \
-	KARI_SUITE_STATUS="$$(pwd)/coverage_suite.status" LLVM_PROFILE_FILE="$$(pwd)/$(COV_DIR)/$(COV_PROFILE_PAT_$(COV_CONTINUOUS))" sh tests/run_all_suite.sh -j $(COV_JOBS) --test-timeout 1200 --full-log --exclude "$(COV_SUITE_EXCLUDE)" $$shard_opts || true
+	KARI_SUITE_STATUS="$$(pwd)/coverage_suite.status" LLVM_PROFILE_FILE="$$(pwd)/$(COV_DIR)/$(COV_PROFILE_PAT_$(COV_CONTINUOUS))" sh tests/run_all_suite.sh -j $(COV_JOBS) --test-timeout 1200 --full-log --exclude "$(COV_SUITE_EXCLUDE)" $(COV_SUITE_OPTS) $$shard_opts || true
 	@# A failing test does not stop the coverage run (the gate judges the numbers), but a suite that stopped before running its tests
 	@# (no status file: e.g. a shell error while registering them) would only show up as very low coverage: fail here with the reason.
 	@test -s coverage_suite.status || { echo "Error: tests/run_all_suite.sh stopped before it ran the tests (no coverage_suite.status); see its output above."; exit 1; }

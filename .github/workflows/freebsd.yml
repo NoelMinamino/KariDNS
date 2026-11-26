@@ -80,8 +80,8 @@ jobs:
             # The list is the union of what the test jobs use: the server, the tools, the loader, karidns-zone, the helpers of the DB tests, karidns-evict, the
             # sanitizer builds, the fuzz builds (fuzz_dag_all: run_dag_fuzzer_test.sh), test_response_cache (run_response_cache_test.sh runs the binary; its own
             # fallback compile line lacks sources the engine needs now and does not link) and the unit test binaries, plain and ASan
-            ./configure --march=none --with-db-drivers="sqlite3 postgresql"
-            make -j"$NCPU" all karicheck-codelog test_coverage_sweep_tools-codelog karidns-dbloader karidns-zone karidns-zone-asan zone2sql zone2kdb asan tsan tools-asan dnsqps-tsan fuzz_all fuzz_dag_all asan_test tinydns_test hash_test include_test response_cache_test test_response_cache vulnerability_test bench_serialize fetch_backend fake_dbloader karidns-evict test_store_status
+            ./configure --march=none --with-db-drivers="sqlite3 postgresql" --with-idn2=yes
+            make -j"$NCPU" all karicheck-codelog test_coverage_sweep_tools-codelog karidns-dbloader karidns-zone karidns-zone-asan zone2sql zone2kdb asan tsan tools-asan dnsqps-tsan fuzz_all fuzz_dag_all asan_test tinydns_test hash_test include_test response_cache_test test_response_cache vulnerability_test bench_serialize fetch_backend fake_dbloader karidns-evict test_store_status tsan-test-bins karidns-dbloader-tsan
             # stdin from /dev/null: no test may block reading the VM session's stdin
             make -j"$NCPU" unit-test-bins unit-test-bins-asan < /dev/null
             echo "::endgroup::"
@@ -218,6 +218,58 @@ jobs:
 
             echo ""
             echo "🎉 All FreeBSD unit and smoke tests passed!"
+
+  # ---------------------------------------------------------------------------
+  # ThreadSanitizer (15.1): the RCU and lock-free tests the coverage suite leaves out (Makefile: COV_SUITE_EXCLUDE): tests/run_rcu_tsan_units_test.sh (the
+  # unit tests of the lock-free parts, the -tsan binaries of make tsan-test-bins) and tests/run_rcu_tsan_test.sh (karidns-tsan under queries, reloads,
+  # UPDATE, AXFR / IXFR, the DB cache, transfers of zones out of memory, the loader's fetch workers with karidns-dbloader-tsan, stalled transfers; root and
+  # SQLite3 for parts 4 to 7).  Any ThreadSanitizer report fails the test.  A job of its own: about 10 minutes next to the other test jobs.
+  # ---------------------------------------------------------------------------
+  tsan:
+    name: ThreadSanitizer RCU tests on FreeBSD ${{ inputs.release }}
+    if: inputs.release == '15.1'
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download the build
+        uses: actions/download-artifact@v4
+        with:
+          name: freebsd-bins-${{ inputs.release }}
+
+      - name: TSan tests inside FreeBSD VM
+        uses: vmactions/freebsd-vm@v1.4.8
+        with:
+          release: ${{ inputs.release }}
+          copyback: false
+          run: |
+            set -e
+
+            echo "::group::📦 [Setup] perl5, sqlite3 (parts 4 to 7 of run_rcu_tsan_test.sh: database zones on SQLite3), the libraries the build linked"
+            # libidn2 (dag, --with-idn2=yes) and libpq (karidns-dbloader and karidns-dbloader-tsan have the PostgreSQL driver): the build job has them
+            # through bind-tools and postgresql17-client
+            pkg install -y perl5 sqlite3 libidn2 postgresql17-client
+            echo "::endgroup::"
+
+            echo "::group::📦 [Unpack] the build of the job build"
+            sh tests/coverage_pack.sh unpack freebsd-bins.tar.zst
+            rm -f freebsd-bins.tar.zst
+            touch .unpack_stamp
+            echo "::endgroup::"
+
+            echo "::group::🧵 [TSan] run_rcu_tsan_units_test, run_rcu_tsan_test (one after the other: the server half has time bounds)"
+            # --skip-allow: a part that SKIPs (not root, no SQLite3, a missing -tsan build) fails the job; tests/ci_skip_allow.txt names the two parts that cannot run here
+            sh ./tests/run_all_suite.sh -j 1 --test-timeout 1500 --full-log --skip-allow tests/ci_skip_allow.txt --tests run_rcu_tsan_units_test,run_rcu_tsan_test < /dev/null
+            # the log of a passing test is not printed: the parts that ran
+            grep -h -E '^--- part|^PASS: no ThreadSanitizer report' tests/.test_logs/test_*.log || true
+            echo "::endgroup::"
+
+            echo "::group::🔨 [Check] no test built anything"
+            sh tests/freebsd_no_rebuild_check.sh .unpack_stamp
+            echo "::endgroup::"
 
   # ---------------------------------------------------------------------------
   # The functional and protocol tests and the karidns-signer / karidns-webadmin tests, which need the server, the tools, the database tools and the ASan

@@ -43,7 +43,7 @@ jobs:
     if: github.event_name != 'schedule' && github.event.action != 'labeled'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
-    continue-on-error: ${{ matrix.experimental }}
+    # blocking on both: a failing unit test fails the job (macOS was non-blocking until its first green run, 0.6; green since)
     strategy:
       fail-fast: false
       matrix:
@@ -51,11 +51,8 @@ jobs:
           # glibc >= 2.36 is required for arc4random_buf(); ubuntu-24.04 ships 2.39.
           - os: ubuntu-24.04
             name: Linux (Ubuntu 24.04)
-            experimental: false
-          # macOS is verified only by CI itself (not locally): non-blocking until the first green run.
           - os: macos-15
             name: macOS 15 (ARM64)
-            experimental: true
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -150,6 +147,7 @@ jobs:
       - name: Unit tests with the coverage gate (functions 100%, lines 90%)
         if: steps.paths.outputs.run == 'true'
         run: |
+          set -o pipefail   # the default shell of a run step is bash -e without pipefail: the exit status of the test must survive the tee
           node --version
           sh tests/run_signer_unit_test.sh < /dev/null | tee /tmp/signer_unit.out
           # a SKIP (no Node 22.13, say) is a failure here: the gate did not run
@@ -218,6 +216,7 @@ jobs:
       - name: Unit tests with the coverage gate (functions 100%, lines 90%)
         if: steps.paths.outputs.run == 'true'
         run: |
+          set -o pipefail   # the default shell of a run step is bash -e without pipefail: the exit status of the test must survive the tee
           node --version
           sh tests/run_webadmin_unit_test.sh < /dev/null | tee /tmp/webadmin_unit.out
           # a SKIP (no Node 22.13, say) is a failure here: the gate did not run
@@ -257,17 +256,23 @@ jobs:
 
       - name: Build dag
         run: |
-          ./configure --with-db-drivers=none
+          ./configure --with-db-drivers=none --with-idn2=yes
           make clean
           make dag
 
       - name: Smoke Test dag queries
         run: |
           echo "::group::🔍 Test dag execution"
-          ./dag --help || true
+          ./dag --help   # exit 0, as dig -h (no "|| true": a dag that cannot print its help fails here)
           # X-09: queries a local mock server (no real domains or public resolvers)
           sh ./tests/run_ci_dag_smoke.sh
           echo "::endgroup::"
+
+      # +idnin / +idnout end to end against the conversions of dig 9.20 (tests/dag_idn_vectors.tsv); KARIDNS_TEST_REQUIRE=1: a dag without libidn2 fails
+      # here instead of SKIPping.  KARIDNS_TEST_NO_DIG=1: the dig of the runner (9.18 on Ubuntu) is not the dig 9.20 the table was made with
+      - name: dag IDN (+idnin, +idnout) against dig 9.20
+        run: |
+          KARIDNS_TEST_REQUIRE=1 KARIDNS_TEST_NO_DIG=1 sh tests/run_dag_idn_test.sh
 
       - name: Build and test dnsqps (warnings fail; unit tests plain and under ASan/UBSan; CLI and engine test)
         run: |
@@ -304,13 +309,15 @@ jobs:
             mingw-w64-x86_64-openssl
             mingw-w64-x86_64-zlib
             mingw-w64-x86_64-libidn2
+            mingw-w64-x86_64-pkgconf
             make
             perl
 
+      # --with-idn2=yes: dag must convert IDNs as dig does on every OS; without pkgconf ./configure did not find libidn2 and built dag without it
       - name: Build dag.exe
         shell: msys2 {0}
         run: |
-          ./configure --with-db-drivers=none
+          ./configure --with-db-drivers=none --with-idn2=yes
           make clean
           make dag
 
@@ -318,10 +325,15 @@ jobs:
         shell: msys2 {0}
         run: |
           echo "::group::🔍 Test dag.exe execution"
-          ./dag.exe --help || true
+          ./dag.exe --help   # exit 0, as dig -h
           # X-09: queries a local mock server (no real domains or public resolvers)
           DAG=./dag.exe sh ./tests/run_ci_dag_smoke.sh
           echo "::endgroup::"
+
+      - name: dag.exe IDN (+idnin, +idnout) against dig 9.20
+        shell: msys2 {0}
+        run: |
+          DAG=./dag.exe KARIDNS_TEST_REQUIRE=1 KARIDNS_TEST_NO_DIG=1 sh tests/run_dag_idn_test.sh
 
       - name: Build and test dnsqps.exe
         shell: msys2 {0}
@@ -368,9 +380,10 @@ jobs:
             # everything the build makes is newer than this file (tests/coverage_pack.sh pack: no git in the VM needed)
             touch .cov_stamp
 
-            echo "::group::📦 [Setup] perl5, sqlite3 and libpq"
+            echo "::group::📦 [Setup] perl5, sqlite3, libpq and libidn2"
             # libpq (postgresql17-client) decides the database drivers of the instrumented loader (COV_DB_DRIVERS: sqlite3 and postgresql, config.mk: DBPG_HAVE)
-            pkg install -y perl5 sqlite3 postgresql17-client
+            # libidn2: dag +idnin / +idnout and karidns-zone idn (tests/run_dag_idn_test.sh, tests/run_karidns_zone_idn_test.sh; ./configure --with-idn2=yes)
+            pkg install -y perl5 sqlite3 postgresql17-client libidn2
             echo "::endgroup::"
 
             echo "::group::🔨 [Coverage] make coverage-build"
@@ -378,7 +391,7 @@ jobs:
             # the compiler and the libraries as config.mk says (libpq, when it is installed, decides COV_DB_DRIVERS).  --march=none: the build runs on
             # other runners (coverage-shard), whose CPUs differ from this one's; the helpers and ASan builds made with the plain CFLAGS (zone2sql,
             # fetch_backend, ...) had -march=native and died with SIGILL there (status 132)
-            ./configure --march=none
+            ./configure --march=none --with-idn2=yes
             make coverage-clean coverage-build < /dev/null
             # the helpers tests/run_all_suite.sh builds when they are missing (zone2sql, zone2kdb: the DB tests, fetch_backend: run_db_fetch_test.sh; fake_dbloader: the hostile and lifecycle loader tests);
             # built here once, so that the 4 VMs of coverage-shard do not.  karidns-evict is not needed: the instrumented karidns has the test command
@@ -438,7 +451,9 @@ jobs:
             pkg install -y perl5 sqlite3 "llvm${V}-lite"
             # the suite runs the karidns-signer tests (tests/run_signer_*.sh): Node.js, BIND tools, signer/node_modules and webadmin/node_modules (run_webadmin_*.sh), or they SKIP (shown as a note in the suite output)
             # curl: tests/run_release_roundtrip_test.sh talks to the karidns-webadmin API with it
-            pkg install -y node24 npm-node24 bind-tools curl
+            # bind920 (named, with bind-tools and libidn2): the differential checks against BIND (tests/run_bind_differential_test.sh,
+            # tests/run_nsec3_owner_query_test.sh); ldns (ldns-signzone): tests/run_karicheck_zonemd_ldns_test.sh
+            pkg install -y node24 npm-node24 bind-tools bind920 ldns curl
             (cd signer && npm ci --ignore-scripts)
             (cd webadmin && npm ci --ignore-scripts)
             echo "::endgroup::"
@@ -459,15 +474,24 @@ jobs:
             START=$(date +%s)
             # the suite runs with -j $(sysctl -n hw.ncpu) (Makefile: COV_JOBS).  A failing test does not stop the run (the gate judges the numbers
             # and coverage-gate the suite); a suite that stopped early has no coverage_suite.status, which coverage-gate reports as a missing part
+            # --skip-allow tests/ci_skip_allow.txt: a SKIP line that the list does not name fails its test (what this suite checks is fixed there);
+            # KARIDNS_TEST_REQUIRE=1: the tests that know it fail instead of SKIPping (libidn2, mandoc)
+            export KARIDNS_TEST_REQUIRE=1
             RUN=0
-            make coverage-run COV_SHARD="$SHARD/4" < /dev/null || RUN=$?
+            make coverage-run COV_SHARD="$SHARD/4" COV_SUITE_OPTS="--skip-allow tests/ci_skip_allow.txt" < /dev/null || RUN=$?
             echo "make coverage-run took $(( $(date +%s) - START ))s (exit $RUN)"
+            echo "::endgroup::"
+
+            echo "::group::🔎 [Evidence] the checks of this part that SKIPped before 0.7 (IDN, BIND, ldns, the PostgreSQL wrong password)"
+            # the log of a passing test is not printed: the lines that show these checks ran (a part has only the tests of its shard)
+            grep -h -E '^=== run_(dag|karidns_zone)_idn_test:|a wrong password: exit 4|BIND differential tests matched|equal to BIND named for|karicheck ZONEMD vs ldns: all checks passed' tests/.test_logs/test_*.log || true
             echo "::endgroup::"
 
             echo "::group::📦 [Result] the profile data and the status of this part"
             mkdir -p shard-out
             [ ! -f coverage_suite.status ] || cp coverage_suite.status "shard-out/shard-$SHARD.status"
             [ ! -f tests/.test_logs/summary.tsv ] || cp tests/.test_logs/summary.tsv "shard-out/shard-$SHARD.summary.tsv"
+            [ ! -f tests/.test_logs/skip_lines.tsv ] || cp tests/.test_logs/skip_lines.tsv "shard-out/shard-$SHARD.skip_lines.tsv"
             if [ "$RUN" -eq 0 ]; then
               make coverage-shard-merge COV_SHARD_PROFDATA="shard-out/shard-$SHARD.profdata" < /dev/null
             fi

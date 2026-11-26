@@ -34,14 +34,19 @@ UPDATES=${UPDATES:-15}
 
 echo "=== R-25 RCU TSan test ==="
 
-# Build as the invoking user (kari_make: running make as root leaves root-owned objects).
-if ! kari_make karidns karidns-tsan dag >/dev/null 2>&1; then
-    echo "FAIL: could not build karidns / karidns-tsan / dag"
-    exit 1
-fi
-
+# Build as the invoking user (kari_make: running make as root leaves root-owned objects).  dag, karidns-dbloader and karidns-dbloader-tsan are .PHONY
+# targets (make relinks them every time): built only when missing, so the CI job that unpacked a build makes nothing (tests/freebsd_no_rebuild_check.sh).
+have_bins() { for _b in "$@"; do [ -x "./$_b" ] || return 1; done; }
+loader_ok() { have_bins karictl karidns-dbloader || kari_make_dbloader >/dev/null 2>&1; }
+loader_tsan_ok() { have_bins karidns-dbloader-tsan || kari_make_dbloader_tsan >/dev/null 2>&1; }
 # Set KEEP=1 to keep the work directory (server logs) for debugging.
 WORK="$(mktemp -d /tmp/karidns-rcu-tsan.XXXXXX)" || exit 1
+if ! { kari_make karidns karidns-tsan && { have_bins dag || kari_make dag; }; } > "$WORK/make.log" 2>&1; then
+    echo "FAIL: could not build karidns / karidns-tsan / dag; the end of the make output:"
+    tail -n 40 "$WORK/make.log"
+    rm -rf "$WORK"
+    exit 1
+fi
 
 kill_ours() {
     # Match only this test's config paths (the backend is a forked child).
@@ -329,7 +334,7 @@ echo "secondary: transfers logged: $xfrs, catalog passes: $members, reloads: $re
 check_tsan "$WORK/secondary.log" "secondary"
 
 echo "--- part 4: karidns-tsan with a memory limit (D1a step 5): the cache manager, the fetch stream and the workers (tests/run_db_cache_test.sh; root, SQLite3)"
-if [ "$(id -u)" = "0" ] && kari_make_dbloader >/dev/null 2>&1; then
+if [ "$(id -u)" = "0" ] && loader_ok; then
     out=$(env KARIDNS=./karidns-tsan CACHE_TEST_DELAY_MS=10 CACHE_TEST_QUERIES=800 sh tests/run_db_cache_test.sh 2>&1)
     cr=$?
     echo "$out" | tail -5
@@ -342,7 +347,7 @@ else
 fi
 
 echo "--- part 5: karidns-tsan with zone transfers of zones that are out of memory (D1a step 7): AXFR / IXFR clients and queries while the cache manager takes zones out (tests/run_db_xfer_test.sh; root, SQLite3)"
-if [ "$(id -u)" = "0" ] && kari_make_dbloader >/dev/null 2>&1; then
+if [ "$(id -u)" = "0" ] && loader_ok; then
     out=$(env KARIDNS=./karidns-tsan XFER_TEST_SECONDS=10 XFER_TEST_DELAY_MS=10 XFER_TEST_QUERIES=600 sh tests/run_db_xfer_test.sh 2>&1)
     cr=$?
     echo "$out" | tail -5
@@ -355,7 +360,7 @@ else
 fi
 
 echo "--- part 6: karidns-tsan and karidns-dbloader-tsan: the loader's pool of fetch workers under bursts, eviction and reloads (D1a; tests/run_db_fetchconc_test.sh; root, SQLite3)"
-if [ "$(id -u)" = "0" ] && kari_make_dbloader >/dev/null 2>&1 && kari_make_dbloader_tsan >/dev/null 2>&1; then
+if [ "$(id -u)" = "0" ] && loader_ok && loader_tsan_ok; then
     out=$(env KARIDNS=./karidns-tsan LOADER=./karidns-dbloader-tsan FETCHCONC_STRESS_ROUNDS=2 sh tests/run_db_fetchconc_test.sh 2>&1)
     cr=$?
     echo "$out" | tail -5

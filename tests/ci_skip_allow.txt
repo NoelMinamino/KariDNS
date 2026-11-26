@@ -1,0 +1,24 @@
+# The SKIP lines CI allows (tests/run_all_suite.sh --skip-allow this file: job coverage-shard of .github/workflows/ci.yml, job tsan of freebsd.yml).
+# A SKIP line of a test that no entry of that test matches fails the test, so this list is what the coverage suite does NOT check.
+# Format: <test, as the suite names it><TAB><extended regular expression matched against the SKIP line>.  Every entry says where it is checked instead.
+# Keep it short: remove an entry when the check runs (install the tool, set the variable), never widen one to hide a new SKIP.
+
+# dnsqps --io=xdp is Linux only: the job "Build & Smoke Test dag on Linux" runs it with DNSQPS_TEST_REQUIRE=1
+tests/run_dnsqps_xdp_test.sh	^SKIP: not Linux
+# PowerDNS (pdns_server and its schema files) is not installed: the KariDNS side of these tests runs, the comparison with PowerDNS does not (no CI job)
+tests/run_db_alias_lua_test.sh	^\[SKIP\] default mode against PowerDNS: pdns_server
+tests/run_db_alias_lua_test.sh	^\[SKIP\] (expansion against|standard AXFR from) PowerDNS: not available
+tests/run_db_ddl_test.sh	^\[SKIP\] the PowerDNS schema file is not installed
+# dnsperf is not installed: the NSEC3 answers are checked by run_nsec3_owner_query_test.sh and the DNSSEC tests; the speed is not checked in CI
+tests/run_nsec3_nxdomain_perf_test.sh	^\[SKIP\] dnsperf is not installed
+# an old KariDNS as primary (OLD_KARIDNS): 0.7 need not stay compatible with 0.6
+tests/run_ext_axfr_v3_test.sh	^SKIP old primary
+# run_db_store_test.sh part S6 (disk full) needs a small ZFS dataset (STORE_ZFS_PARENT, as root): no CI VM has a pool; run it by hand on a FreeBSD host with ZFS.
+# (run_db_store_bulk_test.sh and run_db_store_stop_wait_test.sh run in the coverage suite with the instrumented ./karidns, which has the test knobs: no entry)
+tests/run_db_store_test.sh	^SKIP: disk full on a small ZFS dataset needs STORE_ZFS_PARENT
+# run_rcu_tsan_test.sh part 5 runs tests/run_db_xfer_test.sh with karidns-tsan: its parts E and F need the test-only evict hook, which no TSan build
+# has (the instrumented karidns of the coverage suite runs them).  Job tsan of .github/workflows/freebsd.yml
+tests/run_rcu_tsan_test.sh	^SKIP: part [EF]: no server with the test hooks
+# djbdns 1.05 as the oracle of the tinydns location SOA rules (DJBDNS_DIR, built by hand; no package): the rules are checked against RFC 2308 and the
+# expected answers of the test itself
+tests/run_tinydns_soa_location_test.sh	^SKIP djbdns reference \(set DJBDNS_DIR
