@@ -119,7 +119,7 @@ static void test_defaults(void) {
     CHECK(cfg.tcp_connection_reuse == false);
     CHECK(cfg.tcp_idle_timeout == 10000);
     CHECK(cfg.minimal_responses == false);
-    CHECK(cfg.minimal_any == true);         /* 0.7: yes, as BIND */
+    CHECK(cfg.minimal_any == MINIMAL_ANY_HINFO);   /* 0.7: yes (hinfo), as BIND's default yes */
     CHECK(cfg.answer_rrsig_queries == false);
     CHECK(cfg.nocookie_udp_size == 0 && config_nocookie_udp_size(&cfg, NULL) == 4096);
     CHECK(cfg.minimal_any_ttl == 86400);
@@ -187,9 +187,25 @@ static void test_boolean_directives(void) {
     server_config_t cfg;
     if (parse_ok("options { minimal-responses yes; minimal-any yes; };", &cfg)) {
         CHECK(cfg.minimal_responses == true);
-        CHECK(cfg.minimal_any == true);
+        CHECK(cfg.minimal_any == MINIMAL_ANY_HINFO);
         free_server_config_fields(&cfg);
     }
+    /* 0.7: minimal-any yes|no|hinfo|rrset (yes = hinfo); another word is an error */
+    static const struct { const char *word; uint8_t style; } styles[] = {
+        { "hinfo", MINIMAL_ANY_HINFO }, { "HINFO", MINIMAL_ANY_HINFO }, { "rrset", MINIMAL_ANY_RRSET }, { "RRset", MINIMAL_ANY_RRSET },
+        { "yes", MINIMAL_ANY_HINFO }, { "no", MINIMAL_ANY_NO }, { "false", MINIMAL_ANY_NO },
+    };
+    for (size_t i = 0; i < sizeof(styles) / sizeof(styles[0]); i++) {
+        char t[96];
+        snprintf(t, sizeof(t), "options { minimal-any %s; };", styles[i].word);
+        if (parse_ok(t, &cfg)) {
+            CHECK(cfg.minimal_any == styles[i].style);
+            free_server_config_fields(&cfg);
+        }
+    }
+    expect_reject("minimal-any with value 'single'", "options { minimal-any single; };");
+    expect_reject("minimal-any without a value", "options { minimal-any; };");
+    expect_reject("minimal-any without ';'", "options { minimal-any rrset };");
 }
 
 /* ------------------------------------------------------------------------ */

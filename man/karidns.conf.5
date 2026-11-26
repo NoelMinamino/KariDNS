@@ -468,9 +468,7 @@ whose ACLs apply to the requests that come through a view for a zone it shares
 with an earlier view. See Zones shared between views.
 .TP 8
 `minimal-any yes
-\fIDefault:\fR no;`
-.br
-\fIDescription:\fR \fByes\fR (0.7; \fBno\fR before)
+\fIDescription:\fR `minimal-any yes
 .TP 8
 \fBanswer\-rrsig\-queries yes|no;\fR
 \fIDefault:\fR \fBno\fR
@@ -1233,10 +1231,12 @@ There is no option to turn it off, as in BIND.
 .RE
 .IP \(bu 2
 \fBANY over TCP, and over UDP with a valid server cookie\fR, is answered as
-\fBminimal\-any\fR says. Since 0.7 the default is \fByes\fR, as in BIND: the
-synthesized \fBHINFO "RFC8482" ""\fR of RFC 8482 section 4.2 (with DO=1 at a
-signed name, one RRset and its RRSIGs). \fBminimal\-any no;\fR gives every RRset
-at the name.
+\fBminimal\-any\fR says. Since 0.7 the default is \fByes\fR (= \fBhinfo\fR), as
+BIND's default \fByes\fR: the synthesized \fBHINFO "RFC8482" ""\fR of RFC 8482
+section 4.2 (with DO=1 at a signed name, one RRset and its
+RRSIGs). \fBminimal\-any rrset;\fR gives one RRset, as BIND answers;
+\fBminimal\-any no;\fR every RRset at the name. Over UDP without a valid cookie
+the TC=1 answer comes first, whatever the style.
 .IP \(bu 2
 \fBA question for type RRSIG\fR is answered FORMERR with EDE 30 Invalid Query
 Type ("RRSIG queries are not supported"; IANA Extended DNS Error registry), with

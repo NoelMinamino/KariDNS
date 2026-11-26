@@ -62,6 +62,8 @@ What changes, what it breaks, and what to do. The step-by-step version is [docs/
   - **`minimal-any` defaults to `yes`** (it was `no`), as in BIND: an ANY over TCP (or with a valid cookie) gets the
     RFC 8482 `HINFO "RFC8482" ""` (with DO=1 at a signed name, one RRset and its RRSIGs), not every RRset.
     `minimal-any no;` keeps the 0.6 answer.
+    `minimal-any` also takes `hinfo` (= `yes`) and `rrset`: one RRset of the name with its RRSIGs when DO=1, as
+    BIND 9.20.31 answers (RFC 8482 section 4.1). A wildcard ANY is minimized too (it never was).
   - A question for type RRSIG is answered FORMERR with EDE 30 (it was the RRSIG RRset of the name), as BIND 9.20.31.
     `answer-rrsig-queries yes;` (new, options) keeps the 0.6 answer.
   - `nocookie-udp-size` (BIND 9.20; options and view) is implemented: it was accepted with a warning and had no

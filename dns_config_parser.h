@@ -862,6 +862,10 @@ typedef struct {
 /* options { minimal-responses } (bin/named/server.c dns_minimal_*; lib/ns/query.c ns_query_start()): MINIMAL_NO_AUTH_RECURSIVE is the
  * written value, the query path turns it into MINIMAL_NO_AUTH (RD set) or MINIMAL_NO */
 enum { MINIMAL_NO = 0, MINIMAL_YES = 1, MINIMAL_NO_AUTH = 2, MINIMAL_NO_AUTH_RECURSIVE = 3 };
+/* options { minimal-any } (0.7): the answer to an ANY that is answered (over TCP, or UDP with a valid server cookie).  NO: every RRset; HINFO (`yes`,
+ * `hinfo`, the default): the synthesized HINFO "RFC8482" "" of RFC 8482 4.2, or with DO=1 at a signed name one RRset and its RRSIGs; RRSET: one
+ * RRset of the name (RFC 8482 4.1), as BIND 9.20.31 answers: the first, with its covering RRSIGs when DO=1. */
+enum { MINIMAL_ANY_NO = 0, MINIMAL_ANY_HINFO = 1, MINIMAL_ANY_RRSET = 2 };
 
 typedef struct server_config_s {
   int port;
@@ -923,7 +927,7 @@ typedef struct server_config_s {
   uint8_t in_view_settings;     /* options { in-view-settings }: IVS_*, 0 = not written (IVS_OWNER) */
   bool any_in_view;             /* some view has a zone { in-view } stub */
   bool any_view_minimal;        /* some view writes minimal-responses (the query path then looks the view up) */
-  bool minimal_any;
+  uint8_t minimal_any;           /* MINIMAL_ANY_* */
   uint32_t minimal_any_ttl;
   bool answer_rrsig_queries;   /* `answer-rrsig-queries` (0.7): answer a question for type RRSIG with the RRSIG RRset (the 0.6 behaviour); default no = FORMERR + EDE 30, as BIND 9.20.31 / 9.21 */
   uint16_t nocookie_udp_size;     /* `nocookie-udp-size` (0.7, BIND 9.20): the largest UDP answer to a query without a valid server cookie, 128..4096; 0 = not written (4096) */

@@ -1158,6 +1158,89 @@ static void test_any_udp_tc_and_rrsig_formerr(void) {
     printf("  -> ANY over UDP and RRSIG questions passed.\n");
 }
 
+/* 0.7: minimal-any no | hinfo (yes) | rrset over TCP and over UDP with a valid server cookie: DO=0/1, a signed and an unsigned name, a CNAME
+ * owner, a wildcard (RFC 8482 4.1 / 4.2, RFC 4592 3.3.1) */
+static void test_minimal_any_styles(void) {
+    printf("[TEST] Query Engine: minimal-any no / hinfo / rrset (TCP, UDP with a server cookie, DO, CNAME, wildcard)...\n");
+    static const char *zone_m =
+        "$ORIGIN m.example.\n"
+        "$TTL 3600\n"
+        "@ IN SOA ns1.m.example. admin.m.example. 100 7200 3600 1209600 300\n"
+        "@ IN NS ns1.m.example.\n"
+        "ns1 IN A 192.0.2.1\n"
+        "ns1 IN TXT \"plain\"\n"
+        "sig IN A 192.0.2.53\n"
+        "sig IN TXT \"hello\"\n"
+        "sig IN RRSIG A 13 3 3600 20300101000000 20260101000000 12345 m.example. AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==\n"
+        "sig IN RRSIG TXT 13 3 3600 20300101000000 20260101000000 12345 m.example. AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==\n"
+        "alias IN CNAME ns1.m.example.\n"
+        "*.w IN A 192.0.2.77\n"
+        "*.w IN TXT \"w\"\n";
+    gr_setup("m.example.", zone_m);
+    g_gr.cfg.minimal_any_ttl = 300;
+    req_t q;
+    gr_resp_t r;
+    const char *ip = "192.0.2.10";
+    /* ask NAME DO STYLE over TCP */
+#define M_ASK(name, dobit, style) do { \
+        g_gr.cfg.minimal_any = (style); \
+        put_hdr(&q, 0x4592, 0x0000, 1, 0, 0, 1); put_question(&q, (name), 255, 1); put_opt(&q, 0, 0, (dobit) ? 0x8000 : 0, NULL, 0); \
+        ask(&q, (name), 255, ip, true, &r); \
+        CHECK(&r, r.rcode == 0 && r.aa && !(r.msg[2] & 0x02)); \
+    } while (0)
+    /* no: every RRset */
+    M_ASK("sig.m.example.", false, MINIMAL_ANY_NO);
+    CHECK(&r, gr_count(&r, 1, 1) == 1 && gr_count(&r, 1, 16) == 1 && gr_count(&r, 1, 46) == 2 && gr_count(&r, 1, 13) == 0);
+    M_ASK("sig.m.example.", true, MINIMAL_ANY_NO);
+    CHECK(&r, gr_count(&r, 1, 1) == 1 && gr_count(&r, 1, 16) == 1 && gr_count(&r, 1, 46) == 2);
+    /* hinfo: the HINFO (TTL minimal-any-ttl); with DO=1 at a signed name one RRset and its RRSIG; unsigned with DO=1: the HINFO */
+    M_ASK("sig.m.example.", false, MINIMAL_ANY_HINFO);
+    CHECK(&r, r.counts[0] == 1 && gr_first(&r, 1, 13) && gr_first(&r, 1, 13)->ttl == 300);
+    M_ASK("sig.m.example.", true, MINIMAL_ANY_HINFO);
+    CHECK(&r, r.counts[0] == 2 && gr_count(&r, 1, 46) == 1 && gr_count(&r, 1, 13) == 0);
+    M_ASK("ns1.m.example.", true, MINIMAL_ANY_HINFO);
+    CHECK(&r, r.counts[0] == 1 && gr_first(&r, 1, 13));
+    /* rrset: one RRset whatever DO and signing; its RRSIG only with DO=1 */
+    M_ASK("sig.m.example.", false, MINIMAL_ANY_RRSET);
+    CHECK(&r, r.counts[0] == 1 && gr_count(&r, 1, 13) == 0 && gr_count(&r, 1, 46) == 0 && (gr_count(&r, 1, 1) + gr_count(&r, 1, 16)) == 1);
+    M_ASK("sig.m.example.", true, MINIMAL_ANY_RRSET);
+    CHECK(&r, r.counts[0] == 2 && gr_count(&r, 1, 46) == 1 && (gr_count(&r, 1, 1) + gr_count(&r, 1, 16)) == 1);
+    M_ASK("ns1.m.example.", true, MINIMAL_ANY_RRSET);
+    CHECK(&r, r.counts[0] == 1 && gr_count(&r, 1, 13) == 0 && (gr_count(&r, 1, 1) + gr_count(&r, 1, 16)) == 1);
+    /* a CNAME owner: hinfo keeps the CNAME (no HINFO, the CNAME is not followed for ANY); rrset gives the CNAME alone */
+    M_ASK("alias.m.example.", false, MINIMAL_ANY_HINFO);
+    CHECK(&r, gr_count(&r, 1, 5) == 1 && gr_count(&r, 1, 13) == 0 && r.counts[0] == 1);
+    M_ASK("alias.m.example.", false, MINIMAL_ANY_RRSET);
+    CHECK(&r, gr_count(&r, 1, 5) == 1 && r.counts[0] == 1);
+    /* a wildcard: the same rules, the QNAME as owner (before 0.7 a wildcard ANY was never minimized) */
+    M_ASK("x.w.m.example.", false, MINIMAL_ANY_NO);
+    CHECK(&r, gr_count(&r, 1, 1) == 1 && gr_count(&r, 1, 16) == 1);
+    M_ASK("x.w.m.example.", false, MINIMAL_ANY_HINFO);
+    CHECK(&r, r.counts[0] == 1 && gr_first(&r, 1, 13) && strcasecmp(gr_first(&r, 1, 13)->name, "x.w.m.example.") == 0);
+    M_ASK("x.w.m.example.", true, MINIMAL_ANY_RRSET);
+    CHECK(&r, r.counts[0] == 1 && gr_count(&r, 1, 13) == 0 && strcasecmp(r.rr[0].name, "x.w.m.example.") == 0);
+#undef M_ASK
+    /* over UDP: TC=1 without a cookie whatever the style; with a valid server cookie the style's answer */
+    uint8_t opt_cc[12] = { 0, 10, 0, 8, 1, 2, 3, 4, 5, 6, 7, 8 };
+    g_gr.cfg.minimal_any = MINIMAL_ANY_RRSET;
+    put_hdr(&q, 0x4592, 0x0000, 1, 0, 0, 1); put_question(&q, "sig.m.example.", 255, 1); put_opt(&q, 0, 0, 0, opt_cc, sizeof(opt_cc));
+    ask(&q, "sig.m.example.", 255, ip, false, &r);
+    size_t clen = 0;
+    const uint8_t *ck = gr_find_cookie(&r, &clen, NULL);
+    CHECK(&r, (r.msg[2] & 0x02) && r.counts[0] == 0 && ck && clen == 24);
+    uint8_t opt_full[28] = { 0, 10, 0, 24 };
+    memcpy(opt_full + 4, ck, 24);
+    for (int st = MINIMAL_ANY_NO; st <= MINIMAL_ANY_RRSET; st++) {
+        g_gr.cfg.minimal_any = (uint8_t)st;
+        put_hdr(&q, 0x4592, 0x0000, 1, 0, 0, 1); put_question(&q, "sig.m.example.", 255, 1); put_opt(&q, 0, 0, 0, opt_full, sizeof(opt_full));
+        ask(&q, "sig.m.example.", 255, ip, false, &r);
+        CHECK(&r, r.rcode == 0 && !(r.msg[2] & 0x02) && r.counts[0] == (st == MINIMAL_ANY_NO ? 4 : 1) && (gr_count(&r, 1, 13) == 1) == (st == MINIMAL_ANY_HINFO));
+    }
+    g_gr.cfg.minimal_any = MINIMAL_ANY_NO;
+    zone_arena_destroy(&g_gr.arena);
+    printf("  -> minimal-any styles passed.\n");
+}
+
 static void test_sibling_zone_additional_glue_and_limits(void) {
     printf("[TEST] Query Engine: Sibling zone additional search & alternate hash...\n");
     zone_arena_t arena_prim, arena_sib;
@@ -1699,6 +1782,7 @@ int main(void) {
     test_signed_query();
     test_rfc8482_minimal_any_synthesis();
     test_any_udp_tc_and_rrsig_formerr();
+    test_minimal_any_styles();
     test_sibling_zone_additional_glue_and_limits();
     test_eff_ttl_resolution_and_clamp();
     test_response_header_and_error_builder();

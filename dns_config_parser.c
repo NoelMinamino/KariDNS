@@ -1605,6 +1605,44 @@ static int parse_bool_statement(token_ctx_t *ctx, const char *zone, const char *
   return 0;
 }
 
+/* minimal-any yes|no|hinfo|rrset (0.7; BIND takes a boolean): yes = hinfo (MINIMAL_ANY_*).  Any other word is an error with the place
+ * (report_bad_value()), as for a boolean. */
+static int parse_minimal_any(token_ctx_t *ctx, uint8_t *out) {
+  char db[80];
+  conf_token_t tok = get_next_token(ctx);
+  if (tok.type != TOKEN_STRING) {
+    conf_error(ctx, "minimal-any", "expected yes, no, hinfo or rrset but found %s", tok_desc(&tok, db, sizeof(db)));
+    free_token(&tok);
+    return -1;
+  }
+  bool b = false;
+  if (strcasecmp(tok.value, "hinfo") == 0) *out = MINIMAL_ANY_HINFO;
+  else if (strcasecmp(tok.value, "rrset") == 0) *out = MINIMAL_ANY_RRSET;
+  else if (parse_config_bool(tok.value, &b)) *out = b ? MINIMAL_ANY_HINFO : MINIMAL_ANY_NO;
+  else {
+    if (!ctx || ctx->restricted) {
+      report_bad_value(ctx, NULL, "minimal-any", tok.value, "yes, no, hinfo or rrset");   /* (hostile settings text: the value is not echoed) */
+    } else {
+      char loc[300];
+      ctx_location(ctx, loc, sizeof(loc));
+      syslog(LOG_ERR, "[Config] %s: invalid minimal-any value '%s' (expected yes, no, hinfo or rrset)", loc, tok.value);
+      dns_diag_at(DIAG_ERROR, DC_CONF_VALUE_INVALID, loc, "%s: invalid minimal-any value '%s' (expected yes, no, hinfo or rrset)\n", loc, tok.value);
+      ctx->error_occurred = true;
+    }
+    free_token(&tok);
+    return -1;
+  }
+  free_token(&tok);
+  tok = get_next_token(ctx);
+  if (tok.type != TOKEN_SEMICOLON) {
+    conf_error(ctx, "minimal-any", "expected ';' after the value but found %s", tok_desc(&tok, db, sizeof(db)));
+    free_token(&tok);
+    return -1;
+  }
+  free_token(&tok);
+  return 0;
+}
+
 bool match_cidr(const char *client_ip_str, const char *cidr_str) {
   if (!client_ip_str || !cidr_str)
     return false;
@@ -8530,7 +8568,7 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
   config->tcp_idle_timeout = 10000;
   config->tcp_initial_timeout = 10000;
   config->minimal_responses = false;
-  config->minimal_any = true;   /* 0.7: yes, as BIND (named.conf ARM: "The default is yes") */
+  config->minimal_any = MINIMAL_ANY_HINFO;   /* 0.7: yes (hinfo), as BIND's default yes (named.conf ARM: "The default is yes") */
   config->minimal_any_ttl = 86400;
   config->answer_rrsig_queries = false;
   config->wire_cache_max_records = 0;
@@ -8881,7 +8919,7 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
             return -1;
           }
         } else if (strcmp(key, "minimal-any") == 0) {
-          if (parse_bool_statement(ctx, NULL, key, &config->minimal_any) != 0) {
+          if (parse_minimal_any(ctx, &config->minimal_any) != 0) {
             free(key);
             return -1;
           }

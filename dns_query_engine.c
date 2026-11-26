@@ -1205,14 +1205,30 @@ static bool qn_visit(qn_visited_t *v, const char *current, const char *target) {
   return false;
 }
 
-static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16_t *qtypes, int num_qtypes,
+/* RFC 8482 4.2: the synthesized HINFO "RFC8482" "" (CPU "RFC8482", OS empty) at OWNER with the TTL of minimal-any-ttl.  -1: it does not fit. */
+static int write_rfc8482_hinfo(uint8_t *res, size_t max_res_len, uint16_t *offset, compress_ctx_t *comp_ctx, const char *owner, uint32_t ttl) {
+  dns_record_t hinfo_rec;
+  memset(&hinfo_rec, 0, sizeof(hinfo_rec));
+  hinfo_rec.name = (char *)owner;
+  hinfo_rec.type_code = 13; // HINFO
+  char ttl_str[32];
+  snprintf(ttl_str, sizeof(ttl_str), "%u", ttl);
+  hinfo_rec.ttl = ttl_str;
+  char *hinfo_rd[2] = { "RFC8482", "" };
+  hinfo_rec.rdata = hinfo_rd;
+  hinfo_rec.rdata_count = 2;
+  return serialize_dns_record(res, max_res_len, offset, &hinfo_rec, comp_ctx, NULL, 0xFFFFFFFF) < 0 ? -1 : 0;
+}
+
+static void resolve_name_answer(
+const char *qname, uint16_t qclass, const uint16_t *qtypes, int num_qtypes,
                          zone_db_entry_t **db_entry_ptr,
                          zone_version_t **current_zone_ptr, uint8_t *res,
                          size_t max_res_len, uint16_t *offset,
                          compress_ctx_t *comp_ctx, uint16_t *ancount,
                          uint16_t *nscount, uint16_t *arcount,
                          int minimal_mode,
-                         bool minimal_any, uint32_t minimal_any_ttl, bool dnssec_ok,
+                         int minimal_any, uint32_t minimal_any_ttl, bool dnssec_ok,
                          view_snapshot_t *view, uint32_t *qtx_included_out,
                          const char *client_ip, server_config_t *cfg,
                          bool ecs_trusted, const uint8_t *ecs_addr, uint16_t ecs_family,
@@ -1310,20 +1326,11 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
         if (img_rrs[k].type == 5) has_cname = true;   // CNAME
         if (img_rrs[k].type == 46) has_rrsig = true;  // RRSIG
       }
-      skip_synthesis = dnssec_ok && has_rrsig;
+      /* minimal-any rrset (RFC 8482 4.1, as BIND 9.20.31): one RRset of the name whatever DO and signing; hinfo: the HINFO of 4.2, except
+       * with DO=1 at a signed name (one RRset and its RRSIGs) and at a CNAME owner (every RRset) */
+      skip_synthesis = minimal_any == MINIMAL_ANY_RRSET || (dnssec_ok && has_rrsig);
       if (name_exists && !has_cname && !skip_synthesis) {
-        dns_record_t hinfo_rec;
-        memset(&hinfo_rec, 0, sizeof(hinfo_rec));
-        hinfo_rec.name = (char *)current_qname;
-        hinfo_rec.type_code = 13; // HINFO
-        char ttl_str[32];
-        snprintf(ttl_str, sizeof(ttl_str), "%u", minimal_any_ttl);
-        hinfo_rec.ttl = ttl_str;
-        char *hinfo_rd[2] = { "RFC8482", "" };
-        hinfo_rec.rdata = hinfo_rd;
-        hinfo_rec.rdata_count = 2;
-        if (serialize_dns_record(res, max_res_len, offset, &hinfo_rec, comp_ctx,
-                                 NULL, 0xFFFFFFFF) < 0) {
+        if (write_rfc8482_hinfo(res, max_res_len, offset, comp_ctx, current_qname, minimal_any_ttl) < 0) {
           res[2] |= 0x02;
           return;
         }
@@ -1537,6 +1544,36 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
             int wc_written_count = 0;
             uint32_t k = img_names[wc_id].first_rr;
             uint32_t wend = k + (img_names[wc_id].rr_count_flags & ZONE_IMAGE_NAME_COUNT_MASK);
+            /* 0.7: minimal-any for an answer from a wildcard (RFC 4592 3.3.1: the records of the wildcard with the QNAME as owner), the same
+             * rules as at an existing name above: hinfo gives the HINFO at the QNAME, rrset (and hinfo with DO=1 at a signed wildcard) one
+             * RRset; a CNAME at the wildcard keeps every RRset with hinfo.  (Before 0.7 a wildcard ANY was never minimized.) */
+            bool wc_single = false;
+            uint16_t wc_chosen_type = 0;
+            if (has_any && minimal_any) {
+              bool wc_exists = false, wc_cname = false, wc_rrsig = false;
+              for (uint32_t s = k; s < wend; s++) {
+                if (!(qclass == 255 || qclass == img_rrs[s].class_val) || rr_not_served(img, s)) continue;
+                uint32_t s_ttl;
+                note_ecs_variant(img, s, 255, zone_scope, answer_scope);
+                if (!rr_valid(img, s, tinydns_now, client_loc, client_ecs_tag, client_loc_tag, &s_ttl)) continue;
+                wc_exists = true;
+                if (img_rrs[s].type == 5) wc_cname = true;
+                if (img_rrs[s].type == 46) wc_rrsig = true;
+              }
+              wc_single = minimal_any == MINIMAL_ANY_RRSET || (dnssec_ok && wc_rrsig);
+              if (wc_exists && !wc_cname && !wc_single) {
+                if (write_rfc8482_hinfo(res, max_res_len, offset, comp_ctx, current_qname, minimal_any_ttl) < 0) {
+                  res[2] |= 0x02;
+                  return;
+                }
+                (*ancount)++;
+                found = true;
+                wc_found = true;
+                type_matched = true;
+                t_query_rrl_info.wildcard = true; /* D-05 */
+                k = wend;                         /* (the wildcard's own records are not listed) */
+              }
+            }
             for (; k < wend; k++) {
               uint16_t r_class = img_rrs[k].class_val;
               bool class_matches = (qclass == 255 || qclass == r_class);
@@ -1579,6 +1616,11 @@ static void resolve_name_answer(const char *qname, uint16_t qclass, const uint16
                 }
                 break;
               } else {
+                if (has_any && wc_single) {             /* minimal-any: the first RRset only (RRSIGs come with it when DO=1) */
+                  if (rec_type == 46) continue;
+                  if (wc_chosen_type == 0) wc_chosen_type = rec_type;
+                  else if (wc_chosen_type != rec_type) continue;
+                }
                 if (qtypes[0] == 255 || qtypes[0] == rec_type) {
                   // R-04 / O-16: exact-name の場合と同じ (RRSIG は各 RRset の後ろ、RRset ごとに 1 回)
                   if (has_any && dnssec_ok && rec_type == 46) continue;
@@ -2088,7 +2130,7 @@ void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qtypes, in
                          compress_ctx_t *comp_ctx, uint16_t *ancount,
                          uint16_t *nscount, uint16_t *arcount,
                          int minimal_mode,
-                         bool minimal_any, uint32_t minimal_any_ttl, bool dnssec_ok,
+                         int minimal_any, uint32_t minimal_any_ttl, bool dnssec_ok,
                          view_snapshot_t *view, uint32_t *qtx_included_out,
                          const char *client_ip, server_config_t *cfg,
                          bool ecs_trusted, const uint8_t *ecs_addr, uint16_t ecs_family,
@@ -4787,7 +4829,7 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
   resolve_name(current_qname, qclass, qtypes, num_qtypes, &db_entry, &current_zone, res, body_max_len,
                &offset, comp_ctx, &ancount, &nscount, &arcount,
                minimal_mode,
-               cfg_for_ede ? cfg_for_ede->minimal_any : false,
+               cfg_for_ede ? (int)cfg_for_ede->minimal_any : MINIMAL_ANY_NO,
                cfg_for_ede ? cfg_for_ede->minimal_any_ttl : 86400,
                edns.dnssec_ok, view, &qtx_included, client_ip,
                cfg, ecs_trusted, edns.ecs_addr, edns.ecs_family,

@@ -96,6 +96,17 @@ if "$KARICHECK" conf "$TMP_DIR/bad.conf" > "$TMP_DIR/bad.check" 2>&1; then
 else
     pass "karicheck conf refuses answer-rrsig-queries maybe"
 fi
+# minimal-any yes|no|hinfo|rrset (0.7): another word is an error with the file and line
+for v in hinfo rrset yes no; do
+    printf 'options { minimal-any %s; };\n' "$v" > "$TMP_DIR/ma.conf"
+    if "$KARICHECK" conf "$TMP_DIR/ma.conf" > "$TMP_DIR/ma.check" 2>&1; then pass "karicheck conf accepts minimal-any $v"; else fail "karicheck conf minimal-any $v: $(cat "$TMP_DIR/ma.check")"; fi
+done
+printf 'options {\n    minimal-any single;\n};\n' > "$TMP_DIR/ma.conf"
+if ! "$KARICHECK" conf "$TMP_DIR/ma.conf" > "$TMP_DIR/ma.check" 2>&1 && grep -q "ma.conf:2" "$TMP_DIR/ma.check"; then
+    pass "karicheck conf refuses minimal-any single, with the file and line"
+else
+    fail "karicheck conf minimal-any single: $(cat "$TMP_DIR/ma.check")"
+fi
 # nocookie-udp-size: an integer (BIND: uint32; here 0..2147483647), below 128 raised to 128 with a warning, in options and view
 for v in maybe -1 2147483648; do
     printf 'options { nocookie-udp-size %s; };\n' "$v" > "$TMP_DIR/nc.conf"

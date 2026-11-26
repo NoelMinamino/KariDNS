@@ -266,6 +266,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
 
     bool is_tcp = (data[0] & 0x01) != 0;
     g_fuzz_cfg.answer_rrsig_queries = (data[1] & 0x08) != 0;   /* 0.7: an RRSIG question answered, or FORMERR */
+    g_fuzz_cfg.minimal_any = (uint8_t)((data[0] >> 1) % 3);   /* 0.7: minimal-any no / hinfo / rrset */
     struct sockaddr_in local;
     memset(&local, 0, sizeof(local));
     local.sin_family = AF_INET;

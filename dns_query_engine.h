@@ -136,7 +136,7 @@ void resolve_name(const char *qname, uint16_t qclass, const uint16_t *qtypes, in
                   compress_ctx_t *comp_ctx, uint16_t *ancount,
                   uint16_t *nscount, uint16_t *arcount,
                   int minimal_mode,
-                  bool minimal_any, uint32_t minimal_any_ttl, bool dnssec_ok,
+                  int minimal_any, uint32_t minimal_any_ttl, bool dnssec_ok,
                   view_snapshot_t *view, uint32_t *qtx_included_out,
                   const char *client_ip, server_config_t *cfg,
                   bool ecs_trusted, const uint8_t *ecs_addr, uint16_t ecs_family,

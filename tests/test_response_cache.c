@@ -1266,6 +1266,25 @@ static void test_rcache_any_rrsig_not_served(void) {
         assert(len == (int)req_len && (res[3] & 0x0F) == 0 && (res[2] & 0x02) && !(res[2] & 0x04) && res[7] == 0);
         assert(atomic_load(&zone_x_need(&e)->obs.wirecache_hits) == hits0 && atomic_load(&zone_x_need(&e)->obs.wirecache_misses) == miss0);
     }
+    /* minimal-any style (0.7): the ANY answer cached above (every RRset, minimal-any no) is not served once the style changes: a reload
+     * makes a new configuration generation, which is in the key (rcache_tag()).  Each style is cached under its own generation. */
+    static const struct { uint8_t style; uint16_t an; uint16_t first_type; } st[] = {
+        { MINIMAL_ANY_HINFO, 1, 13 }, { MINIMAL_ANY_RRSET, 1, 1 }, { MINIMAL_ANY_NO, 2, 0 },
+    };
+    for (size_t i = 0; i < sizeof(st) / sizeof(st[0]); i++) {
+        cfg.minimal_any = st[i].style;
+        cfg.generation++;
+        for (int round = 0; round < 2; round++) {
+            uint64_t hits0 = atomic_load(&zone_x_need(&e)->obs.wirecache_hits);
+            build_simple_query(req, &req_len, (uint16_t)(0x5341 + round), "www.rs.example.", 255);
+            compress_ctx_init_packet(&cc);
+            int len = process_dns_query_impl(req, req_len, res, 4096, "www.rs.example.", 255, "127.0.0.1", &cc, true, NULL, &snap, &cfg, &matched);
+            assert(len > (int)req_len + 10 && (res[3] & 0x0F) == 0 && res[7] == st[i].an);
+            if (st[i].first_type) assert(res[req_len + 2] == 0 && res[req_len + 3] == st[i].first_type);   /* (the first answer RR's TYPE, after its compressed owner) */
+            assert(atomic_load(&zone_x_need(&e)->obs.wirecache_hits) == hits0 + (uint64_t)round);   /* the first of each generation is built, not served from the cache */
+        }
+    }
+    cfg.minimal_any = MINIMAL_ANY_NO;
     zone_arena_destroy(&arena);
     printf("  [PASS] no cached RRSIG / ANY answer served\n");
 }
