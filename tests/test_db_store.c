@@ -4157,10 +4157,10 @@ static int run_fixes(const char *dir) {
     {
       db_recon_status_t rs0, rs1;
       db_recon_status(&rs0);
+      atomic_store(&g_dbs_jw_nospc, 1);                                 /* (before the pass: set after it, the tick's group commit could make every record of the pass durable first, and the */
+      store_test_jw_fault = dbs_jw_fault;                               /*  batch end, with nothing left to commit, answered 0: CI 2026-11-27, coverage 3/4) */
       p_batch_begin(a[0], &e, 40, KDB_BATCH_AUTO, 0);
       fx_pass(a[0], &e, 40, NF, omit, 350, true);
-      atomic_store(&g_dbs_jw_nospc, 1);
-      store_test_jw_fault = dbs_jw_fault;
       p_batch_end(a[0], &e, 40, NF - 1, 0);
       CHECK(p_result(&mainc, &m, 10000) && m.u.batch_result.batch_id == 40 && m.u.batch_result.store_error == ENOSPC);
       db_recon_status(&rs1);
