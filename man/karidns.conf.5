@@ -1,4 +1,4 @@
-.TH KARIDNS.CONF 5 "2026-11-25" "KariDNS" "KariDNS Manual"
+.TH KARIDNS.CONF 5 "2026-11-26" "KariDNS" "KariDNS Manual"
 .\" Generated from docs/karidns.md by man/md2man.pl (make man): edit the Markdown manual, not this page.
 .SH NAME
 karidns.conf \- the configuration file of karidns(8)
@@ -3940,6 +3940,19 @@ for a very large install, e.g. \fBstore\-max\-zones 100000000;\fR for 100
 million zones on a 16 GB host. Not a limit of the files: a start reserves at
 least twice what the files hold already.
 .TP 8
+\fBstore\-table\-memory <size>;\fR
+\fIDefault:\fR the RAM less \fBmemory\-limit\fR and a quarter of the RAM (at
+least an eighth of the RAM; \fB16M\fR..\fB1T\fR)
+.br
+\fIDescription:\fR 0.7, restart-only: above this many bytes of file pages that
+the store keeps mapped (its tables \fBzt\fR, \fBzc\fR and \fBnx\fR, the index
+\fBix\fR and \fBsx\fR, and the runs of a first fill's index), the server tells
+the kernel, a slice at a time (a full turn in about 30 seconds), that they may
+be freed first (see "Resident tables" below). It reserves nothing and changes
+nothing below the limit: the tables take 128 bytes a zone, so a store of 20,000
+zones maps about 2.5 MB and is never swept. Set it lower on a host that runs
+other services next to KariDNS, higher on a host that runs nothing else.
+.TP 8
 \fBstore\-scrub\-interval <seconds>;\fR \fBstore\-scrub\-interval off;\fR
 \fIDefault:\fR \fB604800\fR (a week; \fB60\fR..\fB31536000\fR)
 .br
@@ -5341,22 +5354,37 @@ opened by the process that starts the server (as root), checked (owner, mode,
 locked), handed to the user the server runs as and inherited by the Backend,
 which limits the rights of the descriptor (look up, create, read, write, mmap,
 fsync, truncate, stat, unlink) and opens the files beneath it, also in the
-sandbox. The loader and the routers never get it. \fBAddress space of the tables
-(0.7).\fR The tables of the store (\fBzt\fR and \fBzc\fR, 64 bytes a zone each,
-and \fBnx\fR, the long names) are mapped files that are never moved while the
-server runs, so the server reserves their address space (\fBPROT_NONE\fR, no
-memory and no swap is charged) when the store is opened. The Backend's virtual
-size (\fBVSZ\fR, \fBulimit \-v\fR) includes it: it is sized from the RAM, so
-that a small server does not show gigabytes. The rule: zones = \fBhw.physmem\fR
-/ 256 bytes, rounded up to a power of two, at least 1,048,576 and at most
-33,554,432 (2^25); \fBzt\fR and \fBzc\fR reserve 64 bytes a zone each and
-\fBnx\fR 32 bytes a zone. A server with 512 MB reserves 2M zones (256 MB for
-\fBzt\fR and \fBzc\fR, 64 MB for \fBnx\fR), one with 16 GB or more 32M (4 GiB
-and 1 GiB), the size before 0.7. \fBstore\-max\-zones\fR sets the number of
-zones itself. At every start the reservation is raised to at least twice what
-the files hold, so a store that has outgrown its reservation opens with room,
-whatever the option or the RAM say. The start logs it (\fBstore: address space
-reserved for the tables: ...\fR), and \fBkarictl store\fR shows
+sandbox. The loader and the routers never get it. \fBResident tables (0.7).\fR
+The tables of the store take 128 bytes a zone (\fBzt\fR and \fBzc\fR, 64 bytes
+each), about 12.8 GB at 100 million zones, and every lookup reads them; they are
+mapped files, and the pages the server has touched stay active. On a host where
+they pass the RAM the kernel would then take the idle memory of other processes
+to swap before it frees a table page. So when what the store maps passes
+\fBstore\-table\-memory\fR, the server deactivates its clean pages a slice at a
+time (\fBmadvise(MADV_DONTNEED)\fR, which discards nothing): a page that is used
+again stays, a cold one is the first the kernel frees and is read again from the
+file (or the ARC) when a lookup needs it. Pages the server has changed and no
+checkpoint has written yet are left alone (they are its memory,
+\fBstore.tables.private_bytes\fR). At the start the read-ahead of the tables
+stops at the same limit. \fBkarictl store\fR shows
+\fBstore.tables.budget_bytes\fR, \fB.mapped_bytes\fR, \fB.cold_bytes\fR and
+\fB.cold_sweeps\fR.
+.PP
+\fBAddress space of the tables (0.7).\fR The tables of the store (\fBzt\fR and
+\fBzc\fR, 64 bytes a zone each, and \fBnx\fR, the long names) are mapped files
+that are never moved while the server runs, so the server reserves their address
+space (\fBPROT_NONE\fR, no memory and no swap is charged) when the store is
+opened. The Backend's virtual size (\fBVSZ\fR, \fBulimit \-v\fR) includes it: it
+is sized from the RAM, so that a small server does not show gigabytes. The rule:
+zones = \fBhw.physmem\fR / 256 bytes, rounded up to a power of two, at least
+1,048,576 and at most 33,554,432 (2^25); \fBzt\fR and \fBzc\fR reserve 64 bytes
+a zone each and \fBnx\fR 32 bytes a zone. A server with 512 MB reserves 2M zones
+(256 MB for \fBzt\fR and \fBzc\fR, 64 MB for \fBnx\fR), one with 16 GB or more
+32M (4 GiB and 1 GiB), the size before 0.7. \fBstore\-max\-zones\fR sets the
+number of zones itself. At every start the reservation is raised to at least
+twice what the files hold, so a store that has outgrown its reservation opens
+with room, whatever the option or the RAM say. The start logs it (\fBstore:
+address space reserved for the tables: ...\fR), and \fBkarictl store\fR shows
 \fBstore.reserve.*\fR. \fBAt the limit\fR (a table that is full: new zones, or
 new zones with names of more than 34 octets) the write is refused, with no harm
 to the zones that are in: the zone is served from the database as it is when the

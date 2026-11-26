@@ -6721,6 +6721,8 @@ static int parse_database_option(token_ctx_t *ctx, database_config_t *db, const 
     db->store_max_zones = (uint32_t)u;
     return 0;
   }
+  if (strcmp(key, "store-table-memory") == 0)         /* 0.7: the budget of the file pages the store keeps mapped (K, M, G; default: by the RAM) */
+    return db_take_uint(ctx, key, true, KARIDNS_DB_STORE_TABLE_MEM_MIN, KARIDNS_DB_STORE_TABLE_MEM_MAX, &db->store_table_memory);
   if (strcmp(key, "store-scrub-interval") == 0) {      /* 0.7 S6: seconds between two scrubs of the store (every record is read and checked, slowly); `off` = never */
     if (db_take_uint_word(ctx, key, false, KARIDNS_DB_STORE_SCRUB_MIN, KARIDNS_DB_STORE_SCRUB_MAX, "off", UINT32_MAX, &u) != 0) return -1;
     db->store_scrub_interval = (uint32_t)u;

@@ -681,6 +681,11 @@ struct store {
   _Atomic uint64_t dx_bytes;                          /* anonymous memory of the delta: memtables, the Bloom filter, fences, the spill's sort buffer (store.index.delta.bytes; counted in memory-limit) */
   _Atomic uint64_t dx_peak, n_dx, n_dx_spills, n_dx_merges, n_dx_spill_err, n_dx_full, n_dx_waits, dx_runs, dx_run_ents, dx_bloom_bytes, n_dx_spill_us, n_dx_scratch_bytes;
   _Atomic uint64_t mem_limit;                         /* the memory-limit of the server (store_opts_t.mem_limit, store_set_mem_limit()): ix_budget() */
+  uint64_t physmem;                                   /* the RAM (store_opts_t.physmem, else hw.physmem; 0 = unknown): tb_budget() */
+  /* 0.7: the file pages the store keeps mapped (see "THE RESIDENT TABLES" at tb_sweep()).  The ticker thread's cursor, and the counters (store.tables.*) */
+  unsigned tb_part;
+  uint64_t tb_off;
+  _Atomic uint64_t tb_budget_now, tb_mapped_now, n_tb_cold, n_tb_sweeps;
   _Atomic uint64_t fb_bytes, fb_peak;                 /* the file builder's anonymous memory (its window and bucket buffers), now and the most */
   _Atomic uint64_t n_fb, n_fb_us, fb_max_us, n_fb_written, n_fb_buckets, n_fb_carry, n_fb_inlock;
   /* holds of the writer mutex */
@@ -7550,7 +7555,97 @@ int store_compact(store_t *s, uint64_t max_bytes, bool finish, store_compact_rep
 }
 
 /* What the tick does besides the commit and the checkpoint: the cleaner, the removal of empty segments, the nx pass, the free space, the scrub.  Never inside a read section. */
+/* ---- THE RESIDENT TABLES (0.7, gate 2 of the ix / sx bulk build: 100M zones on 16 GB of RAM) ----
+ * The store keeps file pages mapped: zt and zc (128 bytes a zone), nx, the generations of ix / sx, and the runs of an index delta.  A page that the process touches is active, and the
+ * kernel's pager takes the anonymous memory of idle processes to swap before it frees an active file page (2026-11-26, 100M zones x 10 on pc31: zt 4.0 GB + zc 4.0 GB + the runs 3.0 GB
+ * resident, the ARC down from 4.3 to 0.7 GB, 90 MB swapped out).  So when what the store maps passes a budget, the ticker deactivates its pages a slice at a time, clock style:
+ * madvise(MADV_DONTNEED), which on FreeBSD moves a clean page to the inactive queue and clears its reference bit and discards nothing; a page that is touched again is referenced and stays,
+ * a cold one is the first the pager frees (it is read again from the file, or from the ARC, by the next touch).  Only clean pages: a private page (dmap_t.priv, a writer's copy that no
+ * checkpoint gave back) is anonymous memory, which a deactivation would send to swap; the runs are read-only mappings of their files.  The budget (store-table-memory, store_opts_t.table_mem,
+ * else the RAM less the memory-limit and a quarter of the RAM for the ARC and the rest of the host) is only where the sweep begins: tables below it are left alone, as before.  A full turn
+ * over what is mapped takes about TB_TURN_S seconds.  Ticker thread only (the cursor); each step holds the writer mutex for at most ST_REL_STEP pages, as ck_release() does. */
+#define TB_TURN_S 30u
+#define TB_MIN_SLICE (64ull << 20)
+static uint64_t tb_budget(const store_t *s) {
+  if (s->o.table_mem) return s->o.table_mem;
+  const uint64_t pm = s->physmem, ml = atomic_load_explicit(&s->mem_limit, memory_order_relaxed);
+  if (!pm) return UINT64_MAX;                         /* (the RAM is not known: no sweep, as before) */
+  const uint64_t keep = ml + pm / 4;
+  return pm > keep + pm / 8 ? pm - keep : pm / 8;     /* (at least an eighth of the RAM) */
+}
+/* part i of what the store maps (writer mutex): 0 zt, 1 zc, 2 nx, 3 ix, 4 sx, 5.. the runs of the delta's view; its address, length and dirty map (NULL: no private pages, a run) */
+#define TB_PARTS (5 + DX_MAXR)
+static bool tb_part(store_t *s, unsigned i, uint8_t **base, uint64_t *len, const dmap_t **d) {
+  *base = NULL; *len = 0; *d = NULL;
+  if (i < 3) {
+    mtab_t *t = i == 0 ? &s->zt : i == 1 ? &s->zc : &s->nx;
+    *base = t->base; *len = atomic_load_explicit(&t->mapped, memory_order_relaxed); *d = &t->d;
+  } else if (i < 5) {
+    ixgen_t *g = atomic_load_explicit(i == 3 ? &s->ix : &s->sx, memory_order_relaxed);
+    if (g && g->slots) { *base = (uint8_t *)g->slots; *len = g->maplen; *d = &g->d; }
+  } else {
+    const dview_t *v = s->dx ? s->dx->v : NULL;
+    if (!v || i - 5 >= v->nr) return false;
+    const drun_t *r = v->r[i - 5];
+    if (r && r->map) { *base = r->map; *len = r->maplen; }
+  }
+  return true;
+}
+static uint64_t tb_mapped_locked(store_t *s) {
+  uint64_t sum = 0;
+  uint8_t *b;
+  uint64_t l;
+  const dmap_t *d;
+  for (unsigned i = 0; i < TB_PARTS && tb_part(s, i, &b, &l, &d); i++) sum += b ? l : 0;
+  return sum;
+}
+/* deactivate the clean pages of [off, off + len) of a part: runs of pages without a private mark, one madvise() each.  Returns the bytes advised */
+static uint64_t tb_advise(const store_t *s, uint8_t *base, uint64_t off, uint64_t len, const dmap_t *d) {
+  const uint64_t ps = s->pagesz;
+  uint64_t done = 0, p = off / ps;
+  const uint64_t e = (off + len) / ps;
+  while (p < e) {
+    while (p < e && d && p < d->npages && (d->priv[p >> 6] & (1ull << (p & 63)))) p++;      /* (a private page: skip) */
+    uint64_t q = p;
+    while (q < e && !(d && q < d->npages && (d->priv[q >> 6] & (1ull << (q & 63))))) q++;
+    if (q > p && madvise(base + p * ps, (size_t)((q - p) * ps), MADV_DONTNEED) == 0) done += (q - p) * ps;
+    p = q;
+  }
+  return done;
+}
+static void tb_sweep(store_t *s) {
+  wr_lock_raw(s);
+  const uint64_t mapped = tb_mapped_locked(s);
+  wr_unlock_raw(s);
+  const uint64_t budget = tb_budget(s);
+  atomic_store_explicit(&s->tb_mapped_now, mapped, memory_order_relaxed);
+  atomic_store_explicit(&s->tb_budget_now, budget, memory_order_relaxed);
+  if (mapped <= budget) return;
+  uint64_t want = mapped / TB_TURN_S;
+  if (want < TB_MIN_SLICE) want = TB_MIN_SLICE;
+  want = (want + s->pagesz - 1) & ~((uint64_t)s->pagesz - 1);
+  if (want > mapped) want = mapped;                   /* (one turn at most a tick) */
+  const uint64_t step = (uint64_t)ST_REL_STEP * s->pagesz;
+  uint64_t seen = 0, cold = 0;
+  for (unsigned guard = 0; seen < want && guard < 2 * TB_PARTS; ) {
+    wr_lock_raw(s);
+    uint8_t *b;
+    uint64_t l;
+    const dmap_t *d;
+    if (!tb_part(s, s->tb_part, &b, &l, &d) || s->tb_part >= TB_PARTS) { s->tb_part = 0; s->tb_off = 0; guard++; wr_unlock_raw(s); continue; }
+    if (!b || s->tb_off >= l) { s->tb_part++; s->tb_off = 0; guard++; wr_unlock_raw(s); continue; }
+    const uint64_t n = l - s->tb_off < step ? l - s->tb_off : step;
+    cold += tb_advise(s, b, s->tb_off, n, d);
+    s->tb_off += n;
+    seen += n;
+    wr_unlock_raw(s);
+  }
+  atomic_fetch_add_explicit(&s->n_tb_cold, cold, memory_order_relaxed);
+  atomic_fetch_add_explicit(&s->n_tb_sweeps, 1, memory_order_relaxed);
+}
+
 static void maintenance(store_t *s) {
+  tb_sweep(s);                                        /* (also in a bulk fill: the first fill of 100M zones is when the tables pass the RAM) */
   dx_build_kick(s);                                   /* (the build that replaces an index delta, when it failed or could not begin) */
   if (st_bulk_busy(s)) {         /* (a bulk fill: the cleaner, the removals, the nx pass and the scrub wait for its end, THE BULK FILL) */
     bad_drain(s);
@@ -8400,6 +8495,10 @@ void store_stats(const store_t *s, store_stats_t *o) {
   o->checkpoint_table_last_bytes = atomic_load_explicit(&s->ck_last_bytes, memory_order_relaxed);
   o->checkpoint_paced_us = atomic_load_explicit(&s->n_ck_paced_us, memory_order_relaxed);
   o->table_private_index_bytes = atomic_load_explicit(&s->priv_ix_bytes, memory_order_relaxed);
+  o->table_budget_bytes = atomic_load_explicit(&s->tb_budget_now, memory_order_relaxed);
+  o->table_mapped_bytes = atomic_load_explicit(&s->tb_mapped_now, memory_order_relaxed);
+  o->table_cold_bytes = atomic_load_explicit(&s->n_tb_cold, memory_order_relaxed);
+  o->table_cold_sweeps = atomic_load_explicit(&s->n_tb_sweeps, memory_order_relaxed);
   o->table_private_max = s->priv_max;
   o->table_released_bytes = atomic_load_explicit(&s->n_rel_bytes, memory_order_relaxed);
   o->table_release_max_us = atomic_load_explicit(&s->n_rel_max_us, memory_order_relaxed);
@@ -9141,8 +9240,10 @@ static void *ra_main(void *arg) {
    * that asks (a worker's lookup, a store thread's attach) */
   const struct { const uint8_t *base; uint64_t mapped; } tab[2] = { { s->zt.base, atomic_load_explicit(&s->zt.mapped, memory_order_acquire) },
                                                                     { s->zc.base, atomic_load_explicit(&s->zc.mapped, memory_order_acquire) } };
+  const uint64_t cap = tb_budget(s) / 2;              /* (0.7: no more than the budget of the resident tables, half each: what passes it is deactivated by the ticker again, tb_sweep()) */
   for (int i = 0; i < 2; i++) {
     uint64_t bytes = want < tab[i].mapped ? want : tab[i].mapped;
+    if (bytes > cap) bytes = cap & ~((uint64_t)s->pagesz - 1);
     if (!bytes || !tab[i].base) continue;
     (void)madvise((void *)(uintptr_t)tab[i].base, (size_t)bytes, MADV_WILLNEED);
     touch_pages(tab[i].base, (size_t)bytes, s->pagesz, &s->ra_stop);
@@ -9465,9 +9566,10 @@ int store_open(int dirfd, const store_opts_t *opts, store_t **out) {
   if (s->o.checkpoint_interval_ms == 0) s->o.checkpoint_interval_ms = 30000;
   if (s->o.journal_max_bytes == 0) s->o.journal_max_bytes = 100ull << 20;
   atomic_store_explicit(&s->mem_limit, s->o.mem_limit, memory_order_relaxed);
+  s->physmem = s->o.physmem ? s->o.physmem : st_physmem();
   s->priv_max = s->o.tables_private_max;              /* (0.7, the bound of the private memory of the tables, priv_due(): a 32nd of the RAM, 64 MiB .. 1 GiB) */
   if (!s->priv_max) {
-    const uint64_t pm = (s->o.physmem ? s->o.physmem : st_physmem()) / 32;
+    const uint64_t pm = s->physmem / 32;
     s->priv_max = pm < (64ull << 20) ? 64ull << 20 : pm > (1ull << 30) ? 1ull << 30 : pm;
   }
   s->seg_size =s->o.seg_size ? s->o.seg_size : (256ull << 20);

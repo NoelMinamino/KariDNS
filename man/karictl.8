@@ -1,4 +1,4 @@
-.TH KARICTL 8 "2026-11-25" "KariDNS" "KariDNS Manual"
+.TH KARICTL 8 "2026-11-26" "KariDNS" "KariDNS Manual"
 .\" Generated from docs/karictl.md by man/md2man.pl (make man): edit the Markdown manual, not this page.
 .SH NAME
 karictl \- Remote Control and Management Utility for KariDNS
@@ -1066,6 +1066,13 @@ pages that changed since the one before and writes the copy, so the writers
 never wait for a page that is being written out (\fB.paced_us\fR: the time a
 checkpoint waited because it had written more than 256 MiB a second, so that the
 writers' journal appends do not queue behind a burst of it)
+.TP 8
+\fBstore.tables.budget_bytes\fR, \fB.mapped_bytes\fR, \fB.cold_bytes\fR, \fB.cold_sweeps\fR
+0.7: the limit of the file pages the store keeps mapped
+(\fBstore\-table\-memory\fR, or by the RAM), what it maps now (tables, index,
+the runs of a first fill), and the bytes it has deactivated and the ticks that
+did it since the start (karidns(8) "Resident tables"); \fB.cold_sweeps\fR stays
+0 while \fB.mapped_bytes\fR is below the limit
 .TP 8
 \fBstore.tables.private_bytes\fR, \fB.private_index_bytes\fR
 0.7: the pages of the tables that the server changed and no checkpoint has given

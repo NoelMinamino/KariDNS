@@ -214,6 +214,9 @@ Fixes from the external reviews and audits of the 0.7 cycle. Each has a test tha
 
 ### Bug fixes
 
+- **Zone store tables and swap**: above `store-table-memory` (new, restart-only; default the RAM less `memory-limit`
+  and a quarter of the RAM) the server deactivates the clean file pages of the store's tables, index and first-fill
+  runs a slice at a time, so the kernel frees them before it swaps other memory (100M zones on 16 GB swapped before).
 - **Stop with a zone store**: the manager gives a backend that is writing the clean checkpoint of its zone store up
   to 120 seconds (it logs at 10 seconds that it waits; a second SIGTERM still kills at once). Before, a kill at 10
   seconds while the fsync() calls waited for the disk made the next start go back to the last bulk checkpoint of a

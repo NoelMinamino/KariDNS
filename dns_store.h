@@ -156,6 +156,9 @@ typedef struct store_opts {
   /* 0.7: the memory-limit the server applies (database { memory-limit }; 0 = none given): the index delta of a first fill and the builder of ix / sx stay within an eighth of it (with none given:
    * within tables_private_max).  store_set_mem_limit() changes it (a reload) */
   uint64_t mem_limit;
+  /* 0.7: the file pages of the tables, the index generations and the delta's runs that the store keeps mapped are deactivated a slice at a time once they pass this (bytes; "THE RESIDENT
+   * TABLES" in dns_store.c; `store-table-memory`); 0 = the RAM less the memory-limit and a quarter of the RAM */
+  uint64_t table_mem;
 } store_opts_t;
 
 /* The zones the tables are reserved room for: `opt` (store-max-zones) when not 0, else the RAM (physmem / 256 bytes, a power of two, 1M .. 2^25; physmem 0 = unknown: 2^25). */
@@ -371,6 +374,10 @@ typedef struct store_stats {
   /* ---- 0.7: the tables in private memory, written by the checkpoint ---- */
   uint64_t table_private_bytes;     /* pages of zt, zc, nx, ix, sx that the writers changed and no checkpoint gave back yet: private memory of the process (counted in memory-limit) */
   uint64_t table_private_index_bytes;   /* ... of them, those of the ix / sx generations (a generation made in this session is private whole until a checkpoint wrote it) */
+  uint64_t table_budget_bytes;      /* 0.7: the budget of the mapped file pages (store_opts_t.table_mem, or by the RAM): above it the ticker deactivates them */
+  uint64_t table_mapped_bytes;      /* ... what the store maps now: zt, zc, nx, ix, sx and the runs of an index delta */
+  uint64_t table_cold_bytes;        /* ... the bytes deactivated (madvise MADV_DONTNEED) since the open */
+  uint64_t table_cold_sweeps;       /* ... the ticks that swept */
   uint64_t table_private_max;       /* the bound in force (store_opts_t.tables_private_max, or the one derived from the RAM) */
   uint64_t table_released_bytes;    /* bytes of written pages that checkpoints mapped from their files again (the kernel may drop them) */
   uint64_t table_release_max_us;    /* the longest hold of the writer mutex by one step of that (at most ST_REL_STEP pages) */

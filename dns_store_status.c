@@ -812,6 +812,10 @@ static void add_store(list_t *l, const store_t *s, const store_attach_stats_t *a
   U("store.checkpoint.paced_us", st->checkpoint_paced_us);
   U("store.tables.private_bytes", st->table_private_bytes);
   U("store.tables.private_index_bytes", st->table_private_index_bytes);
+  U("store.tables.budget_bytes", st->table_budget_bytes);
+  U("store.tables.mapped_bytes", st->table_mapped_bytes);
+  U("store.tables.cold_bytes", st->table_cold_bytes);
+  U("store.tables.cold_sweeps", st->table_cold_sweeps);
   U("store.tables.private_max", st->table_private_max);
   U("store.tables.released_bytes", st->table_released_bytes);
   U("store.tables.release_max_us", st->table_release_max_us);

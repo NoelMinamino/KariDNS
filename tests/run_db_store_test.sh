@@ -692,6 +692,10 @@ conf a "store \"$T/store\"; store-max-zones 100000000;"
 cp "$T/a.conf" "$T/k.conf"; kc; grep -E "ERROR|error" "$T/kc.out" | grep -qi "store" && fail "karicheck refused store-max-zones 100000000: $(grep -i store "$T/kc.out")" || pass "store-max-zones 100000000 is accepted"
 conf a "store-max-zones 100;"
 cp "$T/a.conf" "$T/k.conf"; kc; [ $? != 0 ] && pass "store-max-zones 100 (below 1024) is an error" || fail "karicheck accepted store-max-zones 100"
+conf a "store \"$T/store\"; store-table-memory 8g;"
+cp "$T/a.conf" "$T/k.conf"; kc; grep -E "ERROR|error" "$T/kc.out" | grep -qi "store" && fail "karicheck refused store-table-memory 8g: $(grep -i store "$T/kc.out")" || pass "store-table-memory 8g is accepted"
+conf a "store-table-memory 1m;"
+cp "$T/a.conf" "$T/k.conf"; kc; [ $? != 0 ] && pass "store-table-memory 1m (below 16m) is an error" || fail "karicheck accepted store-table-memory 1m"
 if [ "$(id -u)" = 0 ]; then
     # the owner and mode rules of the start (L8): the same refusals as the server's
     mkdir -p "$T/wdir" && chmod 0777 "$T/wdir"

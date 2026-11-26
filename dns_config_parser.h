@@ -766,6 +766,7 @@ typedef struct {
   bool store_align;            /* `store-align` (default yes, restart-only): in COPY mode on ZFS an image that would lie across a record boundary it need not cross starts at the boundary when that skips at most half a record (0.7 attach-align; dns_store.c seg_align_pos()) */
   uint64_t store_segment_size;     /* `store-segment-size`: the size a segment file of the store grows to before the next one is begun, 1 MiB..4 GiB (0 = the default, 256 MiB); the cleaner works one segment at a time */
   uint32_t store_max_zones;        /* `store-max-zones` (restart-only): the zones the tables of the store are reserved address space for, 1024..2^31 (0 = by the RAM: physmem / 256 bytes, a power of two, 1M..32M zones) */
+  uint64_t store_table_memory;     /* `store-table-memory` (0.7, restart-only): above this many bytes the file pages the store maps (its tables, ix / sx, the runs of a first fill) are deactivated a slice at a time, so that the kernel frees them before it swaps, 16 MiB..1 TiB (0 = the RAM less memory-limit and a quarter of the RAM) */
   uint32_t store_scrub_interval;   /* `store-scrub-interval`: seconds between the starts of two scrubs of the store, 60..31536000 (0 = the default, a week; UINT32_MAX = `off`) */
   char *server_id;             /* postgresql only (B11) */
   char **alias_resolver;       /* stored only (B9a): IP address literals */
@@ -800,6 +801,8 @@ typedef struct {
 #define KARIDNS_DB_STORE_SEGMENT_MAX (4ull << 30)
 #define KARIDNS_DB_STORE_MAX_ZONES_MIN 1024u
 #define KARIDNS_DB_STORE_MAX_ZONES_MAX 0x80000000u
+#define KARIDNS_DB_STORE_TABLE_MEM_MIN (16ull << 20)     /* 0.7 `store-table-memory` (dns_store.c "THE RESIDENT TABLES") */
+#define KARIDNS_DB_STORE_TABLE_MEM_MAX (1ull << 40)
 #define KARIDNS_DB_STORE_SCRUB_MIN 60
 #define KARIDNS_DB_STORE_SCRUB_MAX 31536000u
 #define KARIDNS_DB_STORE_THREADS_MAX 32

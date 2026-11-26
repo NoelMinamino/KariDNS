@@ -9802,6 +9802,102 @@ static void test_dx_faults(void) {
 }
 
 /* A small VPS (UFS, 512 MB to 1 GB, under ~100 domains): a first fill of 100 zones makes no run, no bucket, one window; its delta is one small memtable and no Bloom filter */
+/* 0.7 "THE RESIDENT TABLES": above the budget the ticker deactivates the clean file pages the store maps (zt, zc, nx, ix, sx, the runs of a delta), never a private page; below it nothing */
+static uint64_t get_tb_sweeps(const store_stats_t *st) { return st->table_cold_sweeps; }
+static void test_table_residency(void) {
+  printf("[the resident tables: the budget by the RAM or the option, the sweep above it skips private pages and covers the runs of a delta, the data stays]\n");
+  tdir_t d;
+  tdir_new(&d, "tbres");
+  store_opts_t o;
+  small_opts(&o);
+  o.tables_private_max = UINT64_MAX;
+  o.checkpoint_interval_ms = UINT32_MAX;
+  o.physmem = 16ull << 30;
+  o.mem_limit = 2ull << 30;
+  store_t *s = NULL;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (!s) { tdir_free(&d); return; }
+  CHECK_EQ(store_view_add(s, "default"), 0);
+  for (uint32_t i = 0; i < 3000; i++) CHECK_EQ(put_i(s, 0, i, 1, NULL), 0);
+  CHECK_EQ(store_tick(s), 0);
+  store_stats_t st;
+  store_stats(s, &st);
+  CHECK_EQ(st.table_budget_bytes, (16ull << 30) - (2ull << 30) - (4ull << 30));    /* (the RAM less the memory-limit and a quarter of the RAM) */
+  CHECK(st.table_mapped_bytes >= 3000u * 128u);
+  CHECK_EQ(st.table_cold_sweeps, 0);                                                /* (far below the budget: left alone) */
+  store_set_mem_limit(s, 15ull << 30);                                              /* (a memory-limit near the RAM: an eighth of the RAM at least) */
+  CHECK_EQ(store_tick(s), 0);
+  store_stats(s, &st);
+  CHECK_EQ(st.table_budget_bytes, 2ull << 30);
+  CHECK_EQ(store_close(s), 0);
+  /* a budget below what is mapped (the option): the sweep runs; the private pages (written, no checkpoint yet) are skipped */
+  o.create = false;
+  o.table_mem = 1;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (!s) { tdir_free(&d); return; }
+  for (uint32_t i = 0; i < 3000; i++) CHECK_EQ(put_i(s, 0, i, 2, NULL), 0);
+  store_stats(s, &st);
+  const uint64_t priv = st.table_private_bytes;
+  CHECK(priv > 0);
+  CHECK_EQ(store_tick(s), 0);
+  store_stats(s, &st);
+  CHECK_EQ(st.table_budget_bytes, 1);
+  CHECK_EQ(st.table_cold_sweeps, 1);
+  printf("  mapped %" PRIu64 " bytes, %" PRIu64 " private, %" PRIu64 " deactivated in the first sweep\n", st.table_mapped_bytes, priv, st.table_cold_bytes);
+  CHECK(st.table_cold_bytes + priv <= st.table_mapped_bytes + 4u * 65536u);         /* (no private page; a sweep sees each part once at most here) */
+  CHECK_EQ(store_checkpoint(s), 0);                                                 /* (the pages are given back: clean, so the next sweeps take them) */
+  const uint64_t c0 = st.table_cold_bytes;
+  for (int k = 0; k < 4; k++) CHECK_EQ(store_tick(s), 0);
+  store_stats(s, &st);
+  CHECK(st.table_cold_bytes > c0);
+  for (uint32_t i = 0; i < 3000; i++) CHECK(verify_i(s, 0, i, 2));                  /* (a deactivated page is read again from the file) */
+  check_consistent(s, "tables deactivated");
+  CHECK_EQ(store_close(s), 0);
+  tdir_free(&d);
+  /* a pass with the index delta: its runs are swept too, and every zone is still found */
+  ix_knobs(true);
+  tdir_new(&d, "tbdx");
+  bulk_opts(&o);
+  o.table_mem = 1;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (!s) { ix_knobs(false); tdir_free(&d); return; }
+  CHECK_EQ(store_view_add(s, "default"), 0);
+  CHECK_EQ(store_bulk_begin(s), 0);
+  store_bulk_phase(s, STORE_BULK_PASS);
+  const uint32_t N = 3000;
+  store_known_t kn[32];
+  char names[32][160];
+  store_meta_t metas[32];
+  for (uint32_t i = 0; i < N; ) {
+    unsigned k = 0;
+    for (; k < 32 && i < N; k++, i++) {
+      name_of(i, names[k], sizeof(names[k]));
+      metas[k] = meta_of(i, 1);
+      kn[k].name = names[k];
+      kn[k].len = strlen(names[k]);
+      kn[k].meta = &metas[k];
+    }
+    int res[32];
+    CHECK_EQ(store_set_known_n(s, 0, kn, k, res, NULL), 0);
+    (void)store_index_wait(s);
+  }
+  CHECK(ix_wait(s, get_dx_settled, "the spills"));
+  store_stats(s, &st);
+  CHECK(st.index_delta_runs >= 1);
+  const uint64_t sw0 = st.table_cold_sweeps;
+  for (int k = 0; k < 8; k++) CHECK_EQ(store_tick(s), 0);
+  CHECK(ix_wait(s, get_tb_sweeps, "a sweep"));
+  store_stats(s, &st);
+  printf("  delta pass: %llu runs, mapped %" PRIu64 " bytes, %" PRIu64 " deactivated in %" PRIu64 " sweeps\n", (unsigned long long)st.index_delta_runs, st.table_mapped_bytes, st.table_cold_bytes,
+         st.table_cold_sweeps - sw0);
+  CHECK(st.table_cold_sweeps > sw0);
+  CHECK_EQ(ix_unreached(s, 0, N), 0);
+  check_consistent(s, "tables and runs deactivated");
+  CHECK_EQ(store_close(s), 0);
+  ix_knobs(false);
+  tdir_free(&d);
+}
+
 static void test_dx_small(void) {
   printf("[a first fill of 100 zones with the defaults of a small VPS: one small memtable, no run, no bucket]\n");
   tdir_t d;
@@ -10392,6 +10488,7 @@ int main(void) {
   }
   if (WANT("ixsx") || WANT("conc")) test_dx_conc();
   if (WANT("reserve")) { test_reserve_sizing(); test_reserve_ceiling(false); test_reserve_ceiling(true); }
+  if (WANT("resident")) test_table_residency();
   if (WANT("bulk") || WANT("pairs")) { test_torn_pairs(true); test_torn_pairs(false); }
   if (WANT("clk")) {
     int citers = getenv("KARIDNS_STORE_KILLC_ITERS") ? atoi(getenv("KARIDNS_STORE_KILLC_ITERS")) : (UNDER_TSAN ? 25 : store_long() ? 100 : 50);
