@@ -195,11 +195,18 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: sh tests/ci_cache_prune.sh "freebsd-pkg-${{ inputs.release }}-" "ccache-${{ inputs.release }}-build-"
 
+  # Two VMs at the same time with the same setup (they were one after the other in one job, about 13 minutes): part unit runs the plain unit tests
+  # and the dag smoke test, part asan the unit tests under ASan/UBSan, dnsqps under ASan/UBSan and TSan, and the sanitizer smoke tests.  Each part
+  # ends with the no-rebuild check.
   build-and-test:
-    name: Build and Test on FreeBSD ${{ inputs.release }}
+    name: Build and Test (${{ matrix.part }}) on FreeBSD ${{ inputs.release }}
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [unit, asan]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -260,6 +267,7 @@ jobs:
             touch .unpack_stamp
             echo "::endgroup::"
 
+            if [ "${{ matrix.part }}" = unit ]; then
             echo "::group::🧪 [Unit Tests] All C unit tests (incl. RFC published-vector tests), 4 at a time"
             # Same tests as `make unit-tests` (plus test_acl_match and test_listen_on), run by tests/run_all_suite.sh: 4 at a time,
             # tests that share a resource (the PostgreSQL server) one after the other, each test with its own log, which is printed
@@ -268,6 +276,15 @@ jobs:
             sh tests/run_all_suite.sh -j 4 --test-timeout 1200 --full-log --pg-clusters -c unit -e coverage_sweep < /dev/null
             echo "::endgroup::"
 
+
+            echo "::group::🔍 [Smoke Test] Test dag client against a local mock server"
+            # X-09: no real domains or public resolvers (UDP, TCP, multiple servers, AXFR)
+            sh ./tests/run_ci_dag_smoke.sh
+            echo "::endgroup::"
+
+            fi
+
+            if [ "${{ matrix.part }}" = asan ]; then
             echo "::group::🛡️ [Sanitizers] Unit tests under ASan + UBSan, 4 at a time"
             # The plain test_* binaries use production CFLAGS, so they are NOT sanitizer-checked
             # (test_asan_overflow included). The job build made every unit test with
@@ -279,11 +296,6 @@ jobs:
             sh tests/run_all_suite.sh -j 4 --test-timeout 1200 --full-log --pg-clusters --asan -e coverage_sweep,test_fi_ < /dev/null
             echo "::endgroup::"
 
-            echo "::group::🔍 [Smoke Test] Test dag client against a local mock server"
-            # X-09: no real domains or public resolvers (UDP, TCP, multiple servers, AXFR)
-            sh ./tests/run_ci_dag_smoke.sh
-            echo "::endgroup::"
-
             echo "::group::🛡️ [Sanitizers] dnsqps under ASan/UBSan and TSan: the engine, its threads and the I/O paths (tests/run_dnsqps_test.sh)"
             DNSQPS=./dnsqps-asan sh ./tests/run_dnsqps_test.sh
             DNSQPS=./dnsqps-tsan sh ./tests/run_dnsqps_test.sh
@@ -292,13 +304,14 @@ jobs:
             echo "::group::🛡️ [Sanitizer & Fuzzing] Run Comprehensive Smoke Tests"
             ./tests/run_sanitizer_smoke_test.sh
             echo "::endgroup::"
+            fi
 
             echo "::group::🔨 [Check] no test built anything"
             sh tests/freebsd_no_rebuild_check.sh .unpack_stamp
             echo "::endgroup::"
 
             echo ""
-            echo "🎉 All FreeBSD unit and smoke tests passed!"
+            echo "🎉 All FreeBSD tests of part ${{ matrix.part }} passed!"
 
   # ---------------------------------------------------------------------------
   # ThreadSanitizer (15.1): the RCU and lock-free tests the coverage suite leaves out (Makefile: COV_SUITE_EXCLUDE): tests/run_rcu_tsan_units_test.sh (the
