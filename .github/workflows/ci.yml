@@ -409,7 +409,7 @@ jobs:
             touch .cov_stamp
 
             echo "::group::📦 [Setup] the package and compiler caches (tests/ci_cache_env.sh)"
-            . tests/ci_cache_env.sh ccache
+            CI_CCACHE=1; . tests/ci_cache_env.sh
             echo "::endgroup::"
 
             echo "::group::📦 [Setup] perl5, sqlite3, libpq and libidn2"

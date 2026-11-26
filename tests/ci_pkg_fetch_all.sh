@@ -22,7 +22,7 @@ names=$(for f in $files; do
         cat "$f"
     fi
 done | sed -n 's/^[[:space:]]*pkg install -y //p' | sed 's/#.*//' | tr -d '"' | tr ' ' '\n' | sed "s/\${V}/$V/" | grep -E '^[A-Za-z0-9]'
-    echo ccache4)                                                       # (tests/ci_cache_env.sh ccache)
+    echo ccache4)                                                       # (CI_CCACHE=1 of tests/ci_cache_env.sh)
 names=$(echo "$names" | sort -u)
 echo "packages to cache for $rel: $(echo $names)"
 fail=0

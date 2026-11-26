@@ -1,8 +1,8 @@
 #!/bin/sh
 # ci_cache_env.sh - sourced by the FreeBSD VM steps of .github/workflows/ci.yml and freebsd.yml: the caches of the CI in the workspace.
 #
-# usage: . tests/ci_cache_env.sh             the package cache only
-#        . tests/ci_cache_env.sh ccache      also the compiler cache (the build jobs)
+# usage: . tests/ci_cache_env.sh                          the package cache only
+#        CI_CCACHE=1; . tests/ci_cache_env.sh             also the compiler cache (the build jobs; "." passes no arguments in sh)
 #
 # .ci-cache/pkg   PKG_CACHEDIR: the .pkg files.  The job restores the directory (actions/cache/restore) before the VM starts, and the VM action copies
 #                 the workspace into the VM.  pkg install takes a package from there only when its size and checksum match the repository catalogue,
@@ -18,7 +18,7 @@ mkdir -p "$CI_CACHE/pkg"
 PKG_CACHEDIR="$CI_CACHE/pkg"
 export PKG_CACHEDIR
 echo "package cache: $PKG_CACHEDIR ($(find "$PKG_CACHEDIR" -name '*.pkg' | wc -l | tr -d ' ') files, $(du -sh "$PKG_CACHEDIR" | cut -f1))"
-if [ "${1:-}" = ccache ]; then
+if [ "${CI_CCACHE:-0}" = 1 ]; then
     pkg install -y ccache4
     mkdir -p "$CI_CACHE/bin" "$CI_CACHE/ccache"
     for c in cc c++ clang clang++; do ln -sf "$(command -v ccache)" "$CI_CACHE/bin/$c"; done
