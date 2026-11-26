@@ -14,12 +14,17 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cd "$ROOT" || exit 1
 
 [ "$(id -u)" = "0" ] || { echo "SKIP: run_db_store_stop_wait_test.sh needs root"; exit 0; }
-KARIDNS=${KARIDNS:-./karidns-evict}
+# the server with the test knob: ./karidns when it has it (the instrumented build of `make coverage` does, -DKARIDNS_TEST_EVICT), else ./karidns-evict (make evict).
+# (CI audit 2026-11-26: a test that only looks for ./karidns-evict SKIPs in every CI job, as run_db_store_bulk_test.sh does)
+has_knob() { [ -x "$1" ] && grep -q KARIDNS_TEST_STORE_STOP_DELAY_MS "$1" 2>/dev/null; }
+if [ -z "${KARIDNS:-}" ]; then
+    if has_knob ./karidns; then KARIDNS=./karidns; else KARIDNS=./karidns-evict; fi
+fi
 LOADER=${LOADER:-./karidns-dbloader}
 for b in "$KARIDNS" ./karictl "$LOADER"; do
     [ -x "$b" ] || { echo "SKIP: $b is not built (make evict karictl karidns-dbloader)"; exit 0; }
 done
-grep -q KARIDNS_TEST_STORE_STOP_DELAY_MS "$KARIDNS" 2>/dev/null || { echo "SKIP: $KARIDNS has no test knobs (make evict)"; exit 0; }
+has_knob "$KARIDNS" || { echo "SKIP: $KARIDNS has no test knobs (make evict)"; exit 0; }
 command -v sqlite3 >/dev/null 2>&1 || { echo "SKIP: the sqlite3 command line tool is not installed"; exit 0; }
 "$LOADER" --drivers | grep -qx sqlite3 || { echo "SKIP: $LOADER has no SQLite3 driver"; exit 0; }
 id nobody >/dev/null 2>&1 || { echo "SKIP: no user nobody"; exit 0; }
@@ -77,16 +82,17 @@ start() {
     kari_wait_log "$T/$2" "loader stream connected" 60 || { fail "$2: the server did not come up"; tail -20 "$T/$2"; return 1; }
     return 0
 }
-# gone SECONDS: the server (SRV, the Manager) has ended within SECONDS; ELAPSED is the time it took, in tenths of a second
-gone() { ELAPSED=0; while [ "$ELAPSED" -lt $(($1 * 10)) ] && kill -0 "$SRV" 2>/dev/null; do sleep 0.1; ELAPSED=$((ELAPSED + 1)); done; ! kill -0 "$SRV" 2>/dev/null; }
+# gone SECONDS: the server (SRV, the Manager) has ended within SECONDS; ELAPSED is the time it took, in whole seconds of the wall clock (a count of 0.1 s sleeps runs
+# slow on a busy host: 15 s were counted as 13.1 s on pc101 next to a fuzzer, 2026-11-26)
+gone() { _g0=$(date +%s); ELAPSED=0; while [ "$ELAPSED" -lt "$1" ] && kill -0 "$SRV" 2>/dev/null; do sleep 0.1; ELAPSED=$(($(date +%s) - _g0)); done; ELAPSED=$(($(date +%s) - _g0)); ! kill -0 "$SRV" 2>/dev/null; }
 backend_pid() { sed -n 's/^KariDNS \([0-9]*\) - - \[Backend\] Shutting down.*/\1/p' "$T/$1" | head -1; }
 
 echo "== 1. a stop of the store of 15 s: the Manager waits for it"
 start a a1.log 15000 || exit 1
 waitfor 120 stored_all && pass "the store holds all $NZ zones and the first fill is over" || fail "the store holds $(sf store.zones.stored) of $NZ (bulk.active=$(sf store.bulk.active) end_pending=$(sf store.bulk.end_pending))"
 kill -TERM "$SRV"
-gone 60 && pass "the server ended $((ELAPSED / 10)).$((ELAPSED % 10)) s after SIGTERM" || fail "the server is still there 60 s after SIGTERM"
-[ "$ELAPSED" -ge 140 ] && pass "it ended after the delay of the stop of the store (15 s), not at the 10 s of the kill" || fail "it ended after $((ELAPSED / 10)).$((ELAPSED % 10)) s, before the delay of 15 s: was it killed?"
+gone 60 && pass "the server ended $ELAPSED s after SIGTERM" || fail "the server is still there 60 s after SIGTERM"
+[ "$ELAPSED" -ge 14 ] && pass "it ended after the delay of the stop of the store (15 s), not at the 10 s of the kill" || fail "it ended after $ELAPSED s, before the delay of 15 s: was it killed?"
 grep -q "is still writing the clean checkpoint of the zone store after 10 s: it is given up to 120 s" "$T/a1.log" && pass "the Manager said at 10 s that it waits for the stop of the store" || fail "no line of the Manager that it waits"
 grep -q "did not stop; killing it" "$T/a1.log" && fail "the Manager killed a child: $(grep 'did not stop' "$T/a1.log" | head -2)" || pass "the Manager killed no child"
 SRV=""
@@ -103,7 +109,7 @@ kill -TERM "$SRV"
 kari_wait_log "$T/a3.log" "it is given up to 120 s" 30 && pass "the Manager waits for the stop of the store" || fail "no line of the Manager that it waits"
 BP=$(backend_pid a3.log)
 kill -TERM "$SRV"
-gone 10 && pass "after the second SIGTERM the server ended within $((ELAPSED / 10)).$((ELAPSED % 10)) s" || fail "the server is still there 10 s after the second SIGTERM"
+gone 10 && pass "after the second SIGTERM the server ended within $ELAPSED s" || fail "the server is still there 10 s after the second SIGTERM"
 grep -q "Child process ${BP:-x} did not stop; killing it" "$T/a3.log" && pass "the Manager says that it killed the Backend ($BP)" || fail "no line of the kill of the Backend ${BP:-?}: $(grep 'Manager' "$T/a3.log" | tail -3)"
 SRV=""
 start a a4.log 0 || exit 1
@@ -115,8 +121,8 @@ SRV=""
 echo "== 3. without a database store the Manager does not wait"
 start n n1.log 15000 || exit 1
 kill -TERM "$SRV"
-gone 60 && pass "the server ended $((ELAPSED / 10)).$((ELAPSED % 10)) s after SIGTERM" || fail "the server is still there 60 s after SIGTERM"
-[ "$ELAPSED" -lt 140 ] && ! grep -q "it is given up to" "$T/n1.log" && pass "it was not waited for (no store: the delay of the knob is that of a Backend that ignores SIGTERM)" || fail "the server without a store was waited for ($((ELAPSED / 10)).$((ELAPSED % 10)) s): $(grep 'Manager' "$T/n1.log" | tail -2)"
+gone 60 && pass "the server ended $ELAPSED s after SIGTERM" || fail "the server is still there 60 s after SIGTERM"
+[ "$ELAPSED" -lt 14 ] && ! grep -q "it is given up to" "$T/n1.log" && pass "it was not waited for (no store: the delay of the knob is that of a Backend that ignores SIGTERM)" || fail "the server without a store was waited for ($ELAPSED s): $(grep 'Manager' "$T/n1.log" | tail -2)"
 SRV=""
 
 echo "run_db_store_stop_wait_test: $PASS passed, $FAILS failed"

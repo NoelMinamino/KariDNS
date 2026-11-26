@@ -15,13 +15,18 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cd "$ROOT" || exit 1
 
 [ "$(id -u)" = "0" ] || { echo "SKIP: run_db_store_bulk_test.sh needs root"; exit 0; }
-KARIDNS=${KARIDNS:-./karidns-evict}
+# the server with the test knobs: ./karidns when it has them (the instrumented build of `make coverage` does, -DKARIDNS_TEST_EVICT), else ./karidns-evict (make evict).
+# (CI audit 2026-11-26: with ./karidns-evict only, this test SKIPped in every CI job: the coverage build has no karidns-evict)
+has_knob() { [ -x "$1" ] && grep -q KARIDNS_TEST_STORE_BULK_BYTES "$1" 2>/dev/null; }
+if [ -z "${KARIDNS:-}" ]; then
+    if has_knob ./karidns; then KARIDNS=./karidns; else KARIDNS=./karidns-evict; fi
+fi
 LOADER=${LOADER:-./karidns-dbloader}
 DAG=${DAG:-./dag}
 for b in "$KARIDNS" ./karictl "$LOADER" "$DAG"; do
     [ -x "$b" ] || { echo "SKIP: $b is not built (make evict karictl karidns-dbloader dag)"; exit 0; }
 done
-grep -q KARIDNS_TEST_STORE_BULK_BYTES "$KARIDNS" 2>/dev/null || { echo "SKIP: $KARIDNS has no test knobs (make evict)"; exit 0; }
+has_knob "$KARIDNS" || { echo "SKIP: $KARIDNS has no test knobs (make evict)"; exit 0; }
 command -v sqlite3 >/dev/null 2>&1 || { echo "SKIP: the sqlite3 command line tool is not installed"; exit 0; }
 command -v perl >/dev/null 2>&1 || { echo "SKIP: perl is not installed"; exit 0; }
 command -v cc >/dev/null 2>&1 || { echo "SKIP: no C compiler for the proxy of the loader"; exit 0; }
