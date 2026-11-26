@@ -104,7 +104,7 @@ chmod 644 "$TMP_DIR/$Z.mixed"
 
 write_conf() {
     cat > "$1" <<EOF
-options { port $2; bind-address { 127.0.0.1; }; pid-file "none"; rfc10029-mqtype yes; $4 $USER_OPT };
+options { port $2; bind-address { 127.0.0.1; }; pid-file "none"; rfc10029-mqtype yes; answer-rrsig-queries yes; $4 $USER_OPT };
 zone "$Z" { type master; file "$TMP_DIR/$3"; allow-transfer { 127.0.0.1; }; };
 EOF
 }
@@ -285,7 +285,7 @@ EOF
     nd=0; nq=0
     for f in "$Z" "$WZ"; do
         for o in $(awk '$4 == "NSEC3" { print tolower($1) }' "$TMP_DIR/$f.signed"); do
-            for qt in A TXT NSEC3 RRSIG ANY; do
+            for qt in A TXT NSEC3 ANY; do   # (no RRSIG: named 9.20.31 and later answer it FORMERR, earlier ones the RRSIGs)
                 nq=$((nq + 1))
                 if [ "$(answer $PORT "$o" $qt)" != "$(answer $BPORT "$o" $qt)" ]; then
                     nd=$((nd + 1))

@@ -34,7 +34,7 @@ SRV=""
 cleanup() {
     [ -n "$SRV" ] && kill -TERM "$SRV" 2>/dev/null
     # wait for the manager (it stops its children first; a sanitizer build is slow): a KILL too early orphans them
-    i=0; while [ -n "$SRV" ] && [ $i -lt 100 ] && kill -0 "$SRV" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
+    i=0; while [ -n "$SRV" ] && [ $i -lt "$KARI_STOP_WAIT_TENTHS" ] && kill -0 "$SRV" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
     [ -n "$SRV" ] && kill -KILL "$SRV" 2>/dev/null
     rm -rf "$T"
 }
@@ -136,7 +136,7 @@ run_mode() {
     fi
     file_answers && pass "$mode: the Backend survived and answers the file zone" || fail "$mode: the file zone does not answer"
     kill -TERM "$SRV"
-    i=0; while [ $i -lt 100 ] && kill -0 "$SRV" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
+    i=0; while [ $i -lt "$KARI_STOP_WAIT_TENTHS" ] && kill -0 "$SRV" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
     kill -0 "$SRV" 2>/dev/null && fail "$mode: karidns did not stop"
     SRV=""
     sleep 0.3
@@ -159,7 +159,7 @@ if [ "$(ans www.ok1.test A)" = "192.0.2.10" ]; then pass "slow: www.ok1.test ans
 wait_log "$T/slow.log" "\[DB\] batch 1 complete: 2 zone" 15 && pass "slow: the batch completes" || fail "slow: no batch end"
 wait_ans 192.0.2.25 mail.ok2.test A && pass "slow: ok2.test answers after the batch" || fail "slow: ok2.test does not answer"
 kill -TERM "$SRV"
-i=0; while [ $i -lt 100 ] && kill -0 "$SRV" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
+i=0; while [ $i -lt "$KARI_STOP_WAIT_TENTHS" ] && kill -0 "$SRV" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
 SRV=""
 sleep 0.3
 

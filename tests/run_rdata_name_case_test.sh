@@ -81,7 +81,7 @@ cn|CNAME|Cname.Cn.Example.ORG.
 ptr|PTR|Host.Ptr.Example.COM.
 EOF
 
-printf 'options {\n    %s pid-file "none"; listen-on { 127.0.0.1; }; port %s;\n};\nzone "case.test" { type primary; file "%s/case.test.zone"; allow-transfer { 127.0.0.1; }; };\n' "$USER_LINE" "$PA" "$T" > "$T/a.conf"
+printf 'options {\n    %s pid-file "none"; listen-on { 127.0.0.1; }; port %s; minimal-any no;\n};\nzone "case.test" { type primary; file "%s/case.test.zone"; allow-transfer { 127.0.0.1; }; };\n' "$USER_LINE" "$PA" "$T" > "$T/a.conf"
 "$KARIDNS" -c "$T/a.conf" -f > "$T/a.log" 2>&1 &
 SA=$!
 i=0
@@ -112,7 +112,7 @@ else
         ./tests/db/zone2sql --dialect sqlite3 "$T/case.test.zone" | sqlite3 "$T/db/z.db" > /dev/null 2>&1 || fail "zone2sql / import"
         chown -R nobody "$T/db"; chmod 600 "$T/db/z.db"*
         install -o root -g wheel -m 755 ./karidns-dbloader "$T/karidns-dbloader" 2>/dev/null || { cp ./karidns-dbloader "$T/karidns-dbloader"; chown 0:0 "$T/karidns-dbloader"; chmod 755 "$T/karidns-dbloader"; }
-        printf 'options {\n    user "nobody"; pid-file "none"; listen-on { 127.0.0.1; }; port %s;\n    database { driver sqlite3; database-file "%s/db/z.db"; loader-user "nobody"; loader-path "%s/karidns-dbloader"; };\n};\n' "$PB" "$T" "$T" > "$T/b.conf"
+        printf 'options {\n    user "nobody"; pid-file "none"; listen-on { 127.0.0.1; }; port %s; minimal-any no;\n    database { driver sqlite3; database-file "%s/db/z.db"; loader-user "nobody"; loader-path "%s/karidns-dbloader"; };\n};\n' "$PB" "$T" "$T" > "$T/b.conf"
         "$KARIDNS" -c "$T/b.conf" -f > "$T/b.log" 2>&1 &
         SB=$!
         i=0

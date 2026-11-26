@@ -32,7 +32,7 @@ ADDED=""
 cleanup() {
     for p in "$SA" "$SB" "$SC"; do [ -n "$p" ] && kill -TERM "$p" 2>/dev/null; done
     i=0
-    while [ $i -lt 100 ]; do
+    while [ $i -lt "$KARI_STOP_WAIT_TENTHS" ]; do
         alive=0
         for p in "$SA" "$SB" "$SC"; do [ -n "$p" ] && kill -0 "$p" 2>/dev/null && alive=1; done
         [ $alive -eq 0 ] && break

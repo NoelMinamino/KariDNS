@@ -126,7 +126,7 @@ dag [global-queryopt...] [query...]
 ## TRANSPORT & PROTOCOL OPTIONS
 
 `+[no]tcp`, `+[no]vc`
-: Use TCP transport instead of UDP. `+vc` ("virtual circuit") and `--tcp` are synonyms for `+tcp`. `+novc` / `+notcp` force UDP. `AXFR` and large `IXFR` queries automatically elevate to TCP unless `+udp` is explicitly forced.
+: Use TCP transport instead of UDP. `+vc` ("virtual circuit") and `--tcp` are synonyms for `+tcp`. `+novc` / `+notcp` force UDP. `AXFR`, `IXFR` and `ANY` queries (also as `TYPE252`, `TYPE251`, `TYPE255`) automatically elevate to TCP unless `+udp` is explicitly forced, as `dig` does (RFC 8482 section 4.4: servers may answer ANY over UDP with an empty truncated response).
 
 `+udp`
 : Force UDP transport.
@@ -192,7 +192,7 @@ DoH notes: like `dig`, the DNS message ID is random (RFC 8484 §4.1 recommends 0
 ## DNS HEADER & QUERY FLAGS
 
 `+[no]rec`, `+[no]recurse`, `+[no]rdflag`
-: Set or clear the **RD (Recursion Desired)** header bit. Recursion is enabled by default. Automatically disabled when `+trace` or `+nssearch` is active.
+: Set or clear the **RD (Recursion Desired)** header bit. Recursion is enabled by default, except for `ANY` (also written `TYPE255`): like `dig` from BIND main (commit fce5bf80 of 2026-11-24, which ISC announced for its January 2027 releases; `dig` 9.20.31 and earlier still set RD), an `ANY` query is sent with RD=0 unless `+[no]rec` / `+[no]recurse` / `+[no]rdflag` is given, before or after the type, on the command line or in `~/.digrc`; `dag +recurse example.com ANY` sets RD. Resolvers that follow BIND refuse a recursive ANY (REFUSED with EDE 21). Automatically disabled when `+trace` or `+nssearch` is active.
 
 `+[no]adflag`
 : Set or clear the **AD (Authenticated Data)** bit in the query header.

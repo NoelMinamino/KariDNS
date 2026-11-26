@@ -44,9 +44,31 @@ chmod 755 "$T"
 SRV=""; REF=""
 stop_one() {
     p=$1
+    # the configuration of the instance (its other processes, the Backend, have the same arguments): the next start reuses the control socket and the ports, so the stop waits until
+    # none of them is left (CI 2026-11-25: after a stop the next server's checks read stored=0 and the RSS of an empty store, as from an instance that was still there)
+    pc=""
+    [ -n "$p" ] && pc=$(ps -ww -o command= -p "$p" 2>/dev/null | awk '{ for (i = 1; i < NF; i++) if ($i == "-c") { print $(i + 1); exit } }')
     [ -n "$p" ] && kill -TERM "$p" 2>/dev/null
-    i=0; while [ -n "$p" ] && [ $i -lt 200 ] && kill -0 "$p" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
+    i=0; while [ -n "$p" ] && [ $i -lt "$KARI_STOP_WAIT_TENTHS" ] && kill -0 "$p" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
+    # (a server that does not stop in 130 s is killed (the Manager gives a Backend in the clean checkpoint of its store up to 120 s, SHUTDOWN_STORE_KILL_MS): a stop that cut a first fill off makes the next start go back to its last bulk checkpoint; say so, the checks after it read that state)
+    [ -n "$p" ] && kill -0 "$p" 2>/dev/null && echo "  (the server $p did not stop in 130 s after SIGTERM: killed)"
     [ -n "$p" ] && kill -KILL "$p" 2>/dev/null
+    j=0
+    while [ -n "$pc" ] && [ -n "$(kari_conf_pids "$pc")" ]; do
+        j=$((j + 1))
+        [ $j -lt 100 ] || { echo "  (processes of $pc left 10 s after the stop: $(kari_conf_pids "$pc" | tr '\n' ' ')killed)"; kari_kill_conf "$pc"; break; }
+        sleep 0.1
+    done
+    [ -n "$p" ] && echo "  (stop of $p: $((i / 10)).$((i % 10)) s, the rest of the instance $((j / 10)).$((j % 10)) s)" >> "$T/stops.log"
+    return 0
+}
+# kill9_a: kill -9 of the server under test (a.conf), and the wait until none of its processes is left (a Backend in an fsync() ends only when the fsync() returns: under a
+# disk load the next start met its control socket, "Another KariDNS instance is already running", 2026-11-26)
+kill9_a() {
+    kari_kill_tree "$SRV"; SRV=""
+    j=0; while [ -n "$(kari_conf_pids "$T/a.conf")" ] && [ $j -lt 600 ]; do sleep 0.1; j=$((j + 1)); done
+    [ $j -lt 600 ] || echo "  (processes of a.conf left 60 s after kill -9: $(kari_conf_pids "$T/a.conf" | tr '\n' ' '))"
+    sleep 0.5
 }
 ZFS_DS=""
 cleanup() {
@@ -111,6 +133,7 @@ control-channel { socket "$T/$1.sock"; secret "$SECRET"; };
 EOF
 }
 start_one() {   # start_one a|b : sets SRV / REF
+    [ -f "$T/$1.log" ] && cat "$T/$1.log" >> "$T/$1.all"
     : > "$T/$1.log"
     "$KARIDNS" -c "$T/$1.conf" -f > "$T/$1.log" 2>&1 &
     p=$!
@@ -154,11 +177,14 @@ pass_all() {
     PASS_BAD=$bad
     if [ "$bad" != 0 ]; then echo "  $bad queries not answered right: $(park_drops)"; kari_lost_diag "$KA" "$PA" $BADZ; kari_ipc_diag "$KA" "$T/a.log"; fi
 }
-# the answers of the subset on a port, normalised, into FILE
-subset_answers() {   # subset_answers PORT FILE
-    sp=$1; sout=$2
+# the answers of the subset on a port, normalised, into FILE.  ref: the reference server (every zone in memory, no store): a query of it that got no answer at all (dag: "no servers could
+# be reached", after its own tries) is asked again, up to 5 times, so that one lost datagram of the reference does not show as a difference of the server under test (CI 2026-11-25:
+# z1882.test SOA timed out on the reference only); a reference that keeps not answering is a FAIL of its own.  The server under test is asked once: a query it does not answer is a difference.
+subset_answers() {   # subset_answers PORT FILE [ref]
+    sp=$1; sout=$2; sref=${3:-}
     kari_udp_snap "$T/udp.snap"; sysctl -n net.inet.ip.intr_queue_drops > "$T/iqd.snap" 2>/dev/null || echo 0 > "$T/iqd.snap"
     : > "$sout.tmp"
+    sretried=0
     z=1
     while [ $z -le "$NZ" ]; do
         zn=$(zname $z)
@@ -166,10 +192,19 @@ subset_answers() {   # subset_answers PORT FILE
         for q in "$zn SOA" "$zn NS" "$zn MX" "$zn TXT" "www.$zn A" "alias.$zn CNAME" "x.w.$zn A" "nx.$zn A" "$zn DNSKEY" "ns2.$zn AAAA" "WWW.$zu A"; do
             qn=${q% *}; qt=${q##* }
             echo "## $q" >> "$sout.tmp"
-            ./dag @127.0.0.1 -p "$sp" "$qn" "$qt" +noall +answer +authority +additional +nohexdump 2> /dev/null | tr 'A-Z' 'a-z' | sort >> "$sout.tmp"
+            stry=1
+            while :; do
+                ./dag @127.0.0.1 -p "$sp" "$qn" "$qt" +noall +answer +authority +additional +nohexdump 2> /dev/null | tr 'A-Z' 'a-z' | sort > "$sout.one"
+                if [ -n "$sref" ] && grep -q "no servers could be reached" "$sout.one" && [ $stry -lt 5 ]; then stry=$((stry + 1)); sretried=$((sretried + 1)); continue; fi
+                break
+            done
+            [ -n "$sref" ] && grep -q "no servers could be reached" "$sout.one" && fail "the reference server did not answer $q in 5 tries: $(cat "$sout.one" | tr '\n' ' ')"
+            cat "$sout.one" >> "$sout.tmp"
         done
         z=$((z + STEP))
     done
+    rm -f "$sout.one"
+    [ "$sretried" -gt 0 ] && echo "  the reference was asked again $sretried time(s) after it gave no answer"
     mv "$sout.tmp" "$sout"
 }
 # subset_diff REF FILE: why the answers of the subset differ.  The diff; the queries whose answers differ (a ";; communications error ... timed out" line in one is a try that got no answer: dag tried again)
@@ -233,14 +268,13 @@ ST_ATT=$(sf store.zones.attached)
 [ "$ST_ROWS" -gt "$ST_ATT" ] 2>/dev/null && [ "$ST_ROWS" -le $(( ST_ATT + 128 )) ] 2>/dev/null && pass "karictl stats lists the zones in memory ($ST_ATT) and, after them, the busiest zones that left it ($((ST_ROWS - ST_ATT)) of at most 128)" || fail "karictl stats lists $ST_ROWS zones with $ST_ATT in memory"
 [ "$(sf store.attach.failed)" = 0 ] && pass "no attach failed" || fail "attach failures: $(sf store.attach.failed)"
 echo "  answers on the subset: the server with the store against the reference"
-subset_answers "$PB" "$T/ref.ans"
+subset_answers "$PB" "$T/ref.ans" ref
 subset_answers "$PA" "$T/a1.ans"
 if cmp -s "$T/ref.ans" "$T/a1.ans" && [ -s "$T/ref.ans" ]; then pass "the answers are the reference's ($(grep -c '^##' "$T/ref.ans") queries, $(wc -l < "$T/ref.ans" | tr -d ' ') lines)"; else fail "the answers differ from the reference"; subset_diff "$T/ref.ans" "$T/a1.ans"; fi
 waitfor 30 stored_all >/dev/null
 
 echo "== kill -9, a restart on the same store, the loader stopped: answered from the store alone"
-kari_kill_tree "$SRV"; SRV=""
-sleep 0.5
+kill9_a
 conf a "memory-limit 1m; store \"$T/store\"; store-threads 2; store-mode ${STORE_MODE:-auto};"
 start_one a
 grep -q "\[Store\] the zone store is on" "$T/a.log" && pass "the store was opened again ($(grep '\[Store\] the zone store is on' "$T/a.log" | sed 's/.*zone store is on: //'))" || fail "no 'zone store is on' line after the restart: $(grep Store "$T/a.log" | head -3)"
@@ -345,8 +379,7 @@ nsq "$PB" "$T/ns.ref2"
 nsq "$PA" "$T/ns.a2"
 cmp -s "$T/ns.ref2" "$T/ns.a2" && pass "the answers after the change are the reference's" || { fail "the answers after the change differ"; diff "$T/ns.ref2" "$T/ns.a2" | head -10; }
 # kill -9, a restart on the same store
-kari_kill_tree "$SRV"; SRV=""
-sleep 0.5
+kill9_a
 conf a "store \"$T/store5\"; store-threads 2; store-mode ${STORE_MODE:-auto};"
 start_one a
 waitfor 30 ns_chg && pass "after kill -9 and a restart the zone is served again" || fail "after the restart the long zone is not served"
@@ -373,6 +406,7 @@ backend_rss() {
 }
 # start_cold a|b: a server whose loader never says anything (an idle program in its place): up when the store is open
 start_cold() {
+    [ -f "$T/$1.log" ] && cat "$T/$1.log" >> "$T/$1.all"
     : > "$T/$1.log"
     "$KARIDNS" -c "$T/$1.conf" -f > "$T/$1.log" 2>&1 &
     p=$!
@@ -415,7 +449,15 @@ INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT
     conf a "memory-limit 4m; store \"$T/store2\"; store-threads 2; store-mode ${STORE_MODE:-auto};"
     start_cold a && pass "the server is up on the store with an idle loader"
     "$T/dbquery" -p "$PB" -t 5 "$T/cold.list" "$T/cold.ref" > /dev/null 2>&1
-    "$T/dbquery" -p "$PA" -t 5 "$T/cold.list" "$T/cold.a" > /dev/null 2>&1
+    # (the idle loader answers nothing: with zones missing from the store every query of theirs waits for its 5 s, and the 19 x COLD_N queries take days; suite 2026-11-26: a stop that
+    # was killed sent the store back to empty and the run hung for 8 hours.  So the queries are sent only to a store that has every zone)
+    if [ "$(sf store.zones.stored)" -ge "$COLD_N" ] 2>/dev/null; then
+        "$T/dbquery" -p "$PA" -t 5 "$T/cold.list" "$T/cold.a" > /dev/null 2>&1
+    else
+        fail "the restarted store holds $(sf store.zones.stored) of $COLD_N zones: the cold queries are not sent (was_clean=$(sf store.recovery.was_clean) bulk recoveries=$(sf store.bulk.recoveries))"
+        grep -E 'did not stop|the stop took|cut off|recovered' "$T/a.all" "$T/a.log" 2>/dev/null | tail -6
+        : > "$T/cold.a"
+    fi
     NQC=$(wc -l < "$T/cold.list" | tr -d ' ')
     if [ "$(wc -l < "$T/cold.a" | tr -d ' ')" = "$NQC" ] && cmp -s "$T/cold.ref" "$T/cold.a"; then pass "$NQC queries over $COLD_N zones: every answer is the reference's, byte for byte"; else fail "the cold answers differ from the reference ($(wc -l < "$T/cold.a" | tr -d ' ') of $NQC lines)"; diff "$T/cold.ref" "$T/cold.a" | head -6; fi
     [ "$(fetches)" = 0 ] && pass "no zone was read from the loader" || fail "fetch issued=$(fetches)"
@@ -435,6 +477,8 @@ INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT
     start_one a
     stored3() { [ "$(sf store.zones.stored)" -ge "$HEAP_N" ] 2>/dev/null; }
     waitfor 300 stored3 && pass "the store holds all $HEAP_N zones" || fail "the store holds $(sf store.zones.stored) of $HEAP_N zones"
+    HEAP_STATE=$($KA store -k 2>/dev/null | grep -E '^store\.(bulk\.(active|end_pending|checkpoints)|index\.delta\.(active|full|spills)|zones\.(known|stored)|checkpoint\.count)=' | tr '\n' ' ')
+    echo "  at the stop: $HEAP_STATE"
     stop_one "$SRV"; SRV=""
     # a server with an empty store is the base: the same process with one zone
     mkdir "$T/db4"; sh tests/db/gen_sqlite3_zones.sh "$T/db4/z.db" 1 7 > /dev/null 2>&1; chown -R nobody "$T/db4"; chmod 600 "$T/db4/z.db"*
@@ -450,7 +494,9 @@ INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled) SELECT
     ./dag @127.0.0.1 -p "$PA" www.z77.test A +short +nohexdump +time=5 +tries=1 > /dev/null 2>&1
     R1=$(backend_rss)
     EL=$($KA dbstatus | sed -n 's/^zone directory: .*the heap holds \([0-9]*\) elements.*/\1/p' | head -1)
-    [ "$(sf store.zones.stored)" -ge "$HEAP_N" ] 2>/dev/null && pass "the restarted server has all $HEAP_N zones in its store ($(sf store.zones.stored))" || fail "stored=$(sf store.zones.stored)"
+    # (the stop before this restart was a clean one: a start that takes it for a crash sends an unlogged fill back to its last bulk checkpoint, here the empty store)
+    [ "$(sf store.recovery.was_clean)" = 1 ] && [ "$(sf store.bulk.recoveries)" = 0 ] && pass "the restart after the clean stop found the store clean (no bulk recovery)" || fail "the restart after the clean stop: was_clean=$(sf store.recovery.was_clean) bulk recoveries=$(sf store.bulk.recoveries) (the clean checkpoint of the stop did not end: see the stop times and the log of the stop below)"
+    [ "$(sf store.zones.stored)" -ge "$HEAP_N" ] 2>/dev/null && pass "the restarted server has all $HEAP_N zones in its store ($(sf store.zones.stored))" || { fail "stored=$(sf store.zones.stored)"; $KA store -k 2>/dev/null | grep -E '^store\.(zones\.(known|stored)|recovery\.|bulk\.)' | tr '\n' ' '; echo; tail -5 "$T/stops.log" 2>/dev/null; grep -E 'checkpoint at close|the clean checkpoint|did not stop|the stop took|cut off|recovered|bulk fill|ERROR|WARNING' "$T/a.all" 2>/dev/null | tail -12; grep -v '^\s*$' "$T/a.log" | tail -15; }
     [ "${EL:-99999}" -le 2 ] && pass "the heap holds $EL registry element(s) for $HEAP_N stored zones (only the zone that was asked for)" || fail "registry elements: ${EL:-?}"
     DR=$((R1 - R0))
     echo "  Backend RSS: $R0 KiB with an empty store, $R1 KiB with $HEAP_N stored zones (the store's mapped pages are in it): $DR KiB more"
@@ -488,7 +534,7 @@ UB=$(sf store.segments.used_bytes); LB=$(sf store.segments.live_bytes)
 FILES0=$(ls "$T/storeC" | grep -c '^seg\.')
 echo "  after the rounds: segments used $UB live $LB bytes (dead ${maxdead}% at the most seen), $FILES0 segment files, the cleaner has copied ${MV0:-0} bytes and removed ${FR0:-0} segments by itself"
 sleep 1
-subset_answers "$PB" "$T/cl.ref"
+subset_answers "$PB" "$T/cl.ref" ref
 subset_answers "$PA" "$T/cl.a1"
 cmp -s "$T/cl.ref" "$T/cl.a1" && [ -s "$T/cl.ref" ] && pass "the answers are the reference's (before the cleaner is asked to finish)" || { fail "the answers differ from the reference before compaction"; diff "$T/cl.ref" "$T/cl.a1" | head -6; }
 $KA store compact > "$T/compact.out" 2>&1
@@ -501,7 +547,11 @@ FILES1=$(ls "$T/storeC" | grep -c '^seg\.')
 echo "  after: segments used $UB1 live $LB1 bytes (dead ${DP1}%), $FILES1 segment files; copied $(sf store.compact.moved_bytes) bytes, removed $(sf store.compact.segments_freed) segments, $(sf store.segments.free_numbers) segment numbers free"
 [ "${DP1:-100}" -lt 40 ] && pass "the dead share of the segments is ${DP1}%" || fail "the dead share is still ${DP1}% after the cleaner"
 [ "$(sf store.compact.segments_freed)" -ge 1 ] 2>/dev/null && pass "segments were removed ($(sf store.compact.segments_freed))" || fail "no segment was removed"
-[ "$UB1" -lt "$UB" ] 2>/dev/null || [ "$(sf store.compact.segments_freed)" -gt "${FR0:-0}" ] 2>/dev/null && pass "the segments hold less than before (used $UB -> $UB1, files $FILES0 -> $FILES1)" || fail "used bytes did not fall: $UB -> $UB1"
+# (the cleaner may have done all of its work by itself before the request: then it removed segments before UB was read, the dead share is low already and nothing is left to remove;
+# CI 2026-11-25: 40 segments removed before, 21% dead, used unchanged)
+if [ "$UB1" -lt "$UB" ] 2>/dev/null || [ "$(sf store.compact.segments_freed)" -gt "${FR0:-0}" ] 2>/dev/null; then pass "the segments hold less than before (used $UB -> $UB1, files $FILES0 -> $FILES1)"
+elif [ "${FR0:-0}" -ge 1 ] 2>/dev/null && [ "${DP1:-100}" -lt 40 ] && [ "$UB1" = "$UB" ]; then pass "the cleaner had finished by itself before the request ($FR0 segments removed before it, ${DP1}% dead, used $UB1)"
+else fail "used bytes did not fall: $UB -> $UB1 (segments removed ${FR0:-0} before the request, $(sf store.compact.segments_freed) after, ${DP1}% dead)"; fi
 [ "$FILES1" -le $(( (LB1 + 1048575) / 1048576 + 3 )) ] && pass "the number of segment files ($FILES1) is about what the live bytes need ($LB1)" || fail "$FILES1 segment files for $LB1 live bytes"
 [ "$(sf store.zones.stored)" = "$NZ" ] && [ "$LB1" -ge "$LB" ] 2>/dev/null && pass "every zone is still stored, nothing live was lost ($LB -> $LB1 bytes live)" || fail "stored=$(sf store.zones.stored) live $LB -> $LB1"
 [ "$(sf store.compact.bad_records)" = 0 ] && pass "no record was found damaged by the cleaner" || fail "the cleaner found $(sf store.compact.bad_records) damaged records"
@@ -513,8 +563,7 @@ scrub_done() { [ "$(sf store.scrub.passes)" -ge 1 ] 2>/dev/null; }
 waitfor 120 scrub_done && pass "the scrub pass is over: $(sf store.scrub.zones_checked) zones, $(sf store.scrub.bytes_checked) bytes read, bad images $(sf store.scrub.bad_images), bad cells $(sf store.scrub.bad_cells), bad index $(sf store.scrub.bad_index)" || fail "the scrub did not end: $($KA store | grep -A12 '^scrub:')"
 [ "$(sf store.scrub.bad_images)$(sf store.scrub.bad_cells)$(sf store.scrub.bad_index)" = 000 ] && pass "the scrub found nothing wrong" || fail "the scrub found damage"
 # kill -9 and a restart
-kari_kill_tree "$SRV"; SRV=""
-sleep 0.5
+kill9_a
 start_one a
 subset_answers "$PA" "$T/cl.a3"
 cmp -s "$T/cl.ref" "$T/cl.a3" && pass "after kill -9 and a restart the answers are the reference's" || { fail "after the restart the answers differ"; diff "$T/cl.ref" "$T/cl.a3" | head -6; }
@@ -643,6 +692,10 @@ conf a "store \"$T/store\"; store-max-zones 100000000;"
 cp "$T/a.conf" "$T/k.conf"; kc; grep -E "ERROR|error" "$T/kc.out" | grep -qi "store" && fail "karicheck refused store-max-zones 100000000: $(grep -i store "$T/kc.out")" || pass "store-max-zones 100000000 is accepted"
 conf a "store-max-zones 100;"
 cp "$T/a.conf" "$T/k.conf"; kc; [ $? != 0 ] && pass "store-max-zones 100 (below 1024) is an error" || fail "karicheck accepted store-max-zones 100"
+conf a "store \"$T/store\"; store-table-memory 8g;"
+cp "$T/a.conf" "$T/k.conf"; kc; grep -E "ERROR|error" "$T/kc.out" | grep -qi "store" && fail "karicheck refused store-table-memory 8g: $(grep -i store "$T/kc.out")" || pass "store-table-memory 8g is accepted"
+conf a "store-table-memory 1m;"
+cp "$T/a.conf" "$T/k.conf"; kc; [ $? != 0 ] && pass "store-table-memory 1m (below 16m) is an error" || fail "karicheck accepted store-table-memory 1m"
 if [ "$(id -u)" = 0 ]; then
     # the owner and mode rules of the start (L8): the same refusals as the server's
     mkdir -p "$T/wdir" && chmod 0777 "$T/wdir"

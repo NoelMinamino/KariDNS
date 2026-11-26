@@ -19,6 +19,7 @@
 
 set -u
 cd "$(dirname "$0")/.."
+. tests/fuzz/targets.sh
 
 MODE="${1:-all}"
 case "$MODE" in
@@ -30,6 +31,7 @@ FUZZ_RUNS="${FUZZ_RUNS-1000}"
 FUZZ_SMOKE_SECONDS="${FUZZ_SMOKE_SECONDS:-5}"
 
 FAILED=0
+fuzz_targets_check || FAILED=1          # every tests/fuzz/fuzz_*.c is in tests/fuzz/targets.sh
 SCRATCH=$(mktemp -d "${TMPDIR:-/tmp}/kari_fuzz_smoke.XXXXXX") || exit 1
 trap 'rm -rf "$SCRATCH"' EXIT INT TERM
 log_fail() { echo "  -> FAIL: $1"; FAILED=1; }
@@ -128,19 +130,12 @@ run_fuzz_group() {
 }
 
 if [ "$MODE" = "dag" ] || [ "$MODE" = "all" ]; then
-    run_fuzz_group "DAG Fuzzer Smoke Run" \
-        fuzz_dag_response fuzz_dag_hash fuzz_dag_iter_classify fuzz_dag_chunked_http \
-        fuzz_dag_rdata_yaml fuzz_dag_axfr_stream fuzz_dag_cli_args fuzz_dag_batch_file \
-        fuzz_dag_replay_pcap_reader fuzz_dag_replay_diff fuzz_dag_tcp_reassembly fuzz_tapstat \
-        fuzz_dnsqps_resp fuzz_dnsqps_args fuzz_dnsqps_msg
+    run_fuzz_group "DAG Fuzzer Smoke Run" $FUZZ_DAG_TARGETS
 fi
 
 if [ "$MODE" = "karidns" ] || [ "$MODE" = "all" ]; then
     [ "$MODE" = "all" ] && echo ""
-    run_fuzz_group "KariDNS Server Fuzzer Smoke Run" \
-        fuzz_dns_wire fuzz_dns_server_core fuzz_zone_parser fuzz_zone_image fuzz_zone_image_validate \
-        fuzz_conf_parser fuzz_tsig_sign fuzz_tsig_verify \
-        fuzz_query_engine fuzz_xfr_packet fuzz_dynamic_update fuzz_db_stream fuzz_db_image_frames fuzz_pdns_content fuzz_pdns_metadata fuzz_db_checkline fuzz_json_escape fuzz_zone_text fuzz_zone_changes fuzz_db_logline fuzz_plugin_msg fuzz_nsec3_rebuild fuzz_alias_response fuzz_forward_response fuzz_xfr_state fuzz_ipc_frame
+    run_fuzz_group "KariDNS Server Fuzzer Smoke Run" $FUZZ_KARIDNS_TARGETS
 fi
 
 echo ""

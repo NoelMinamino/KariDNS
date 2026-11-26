@@ -54,6 +54,23 @@ What changes, what it breaks, and what to do. The step-by-step version is [docs/
 - **Socket buffers**: the kernel refuses (does not clip) a `SO_RCVBUF` / `SO_SNDBUF` above about 8/9 of
   `kern.ipc.maxsockbuf`. On a stock system the `4M` default of `udp-recvbuf-size` was refused and the sockets stayed
   at 16 KiB. 0.7 asks for the most the kernel gives and logs a line that names the sysctl to raise (#224): a NOTICE for the default size, a WARNING for a size the configuration wrote (#256).
+- **ANY and RRSIG queries follow BIND's 2026 changes** (#266; docs/karidns.md "ANY and RRSIG queries"). They apply to the
+  answers from this server's own data; forward and program zones relay ANY and RRSIG as before.
+  - ANY over UDP is answered empty with TC=1 (RFC 8482 section 4.4) unless the query carries a valid server cookie
+    (RFC 7873, RFC 9018); over TCP it is answered as before. A client that cannot use TCP and sends no cookies no
+    longer gets ANY answers over UDP. No option turns this off (BIND has none).
+  - **`minimal-any` defaults to `yes`** (it was `no`), as in BIND: an ANY over TCP (or with a valid cookie) gets the
+    RFC 8482 `HINFO "RFC8482" ""` (with DO=1 at a signed name, one RRset and its RRSIGs), not every RRset.
+    `minimal-any no;` keeps the 0.6 answer.
+    `minimal-any` also takes `hinfo` (= `yes`) and `rrset`: one RRset of the name with its RRSIGs when DO=1, as
+    BIND 9.20.31 answers (RFC 8482 section 4.1). A wildcard ANY is minimized too (it never was).
+  - A question for type RRSIG is answered FORMERR with EDE 30 (it was the RRSIG RRset of the name), as BIND 9.20.31.
+    `answer-rrsig-queries yes;` (new, options) keeps the 0.6 answer.
+  - `nocookie-udp-size` (BIND 9.20; options and view) is implemented: it was accepted with a warning and had no
+    effect. A UDP answer to a query without a valid server cookie is no larger than it (default 4096, so with the
+    default `max-udp-size 1232` nothing changes); below 128 is raised to 128.
+  - dag, like dig from BIND main, sends ANY with RD=0 unless `+[no]recurse` / `+[no]rdflag` is given;
+    `TYPE255` / `TYPE252` / `TYPE251` also go over TCP like `ANY` / `AXFR` / `IXFR`.
 - **Stricter configuration** (#248, #234, #211, #220). `karidns` refuses to start, and `karicheck conf` reports an
   error with file and line, for: an invalid `rate-limit` value (negative, above INT_MAX, not a number, `window 0`,
   prefix length out of range; it was a warning and the default stayed, #248); an `alias-max-refresh-time` outside 5 s
@@ -214,6 +231,13 @@ Fixes from the external reviews and audits of the 0.7 cycle. Each has a test tha
 
 ### Bug fixes
 
+- **Zone store tables and swap**: above `store-table-memory` (new, restart-only; default the RAM less `memory-limit`
+  and a quarter of the RAM) the server deactivates the clean file pages of the store's tables, index and first-fill
+  runs a slice at a time, so the kernel frees them before it swaps other memory (100M zones on 16 GB swapped before).
+- **Stop with a zone store**: the manager gives a backend that is writing the clean checkpoint of its zone store up
+  to 120 seconds (it logs at 10 seconds that it waits; a second SIGTERM still kills at once). Before, a kill at 10
+  seconds while the fsync() calls waited for the disk made the next start go back to the last bulk checkpoint of a
+  first fill, at worst to an empty store.
 - **NSEC3 Opt-Out**: below an empty non-terminal that exists only above an insecure delegation the server now uses
   the closest provable encloser (RFC 5155 section 7.2.1); NXDOMAIN and DS answers validate (#180).
 - **Cookies**: the server cookie checks now come before the forward / program dispatch and before every

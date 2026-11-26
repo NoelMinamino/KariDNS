@@ -4,8 +4,8 @@
 # A query that is not answered within RESEND_S seconds is sent again with the same id (RESEND_S 0: never), as a resolver does.
 # Usage: perl ipc_drops_client.pl PORT N WINDOW RESEND_S WAIT_S [BATCH [PAUSE_MS [CONT_PID]]]   (the server is 127.0.0.1)
 #   CONT_PID: a process that gets SIGCONT when the last query is sent (the test stops the Backend, and lets it go once everything is queued)
-# Output (one line): "sent=S received=R answered=A unanswered=U resent=X secs=T"
-#   sent = every datagram sent (the resends included); received = every datagram that came back (a late answer of a resent query too);
+# Output (one line): "sent=S received=R answered=A unanswered=U resent=X sendfail=F secs=T"
+#   sent = every datagram the kernel took (the resends included; sendfail = the ones it refused); received = every datagram that came back (a late answer of a resent query too);
 #   answered = the queries that got at least one answer; unanswered = N - answered.  sent - received is what the server and the kernel lost.
 use strict;
 use warnings;
@@ -34,7 +34,9 @@ sub pkt {
 }
 
 my %pending;                                   # id => time of the last send
-my ($sent, $received, $answered, $resent) = (0, 0, 0, 0);
+my ($sent, $received, $answered, $resent, $sendfail) = (0, 0, 0, 0, 0);
+# xsend: a datagram counts as sent only when the kernel took it (a refused one, ENOBUFS, is counted apart: it was never on the wire)
+sub xsend { my ($p) = @_; if (defined(send($s, $p, 0, $dest))) { $sent++; return 1; } $sendfail++; return 0; }
 my %seen;
 my $buf;
 sub drain {
@@ -61,8 +63,7 @@ while (1) {
     for (my $b = 0; $b < $batch && $next <= $n && keys(%pending) < $window; $b++) {
         my $i = $next++;
         $pending{$i & 0xffff} = time;
-        send($s, pkt($i), 0, $dest);
-        $sent++;
+        xsend(pkt($i));
         $moved++;
     }
     $moved += drain();
@@ -75,8 +76,7 @@ while (1) {
         for my $id (keys %pending) {
             next if time - $pending{$id} < $resend_s;
             $pending{$id} = time;
-            send($s, pkt($id), 0, $dest);
-            $sent++;
+            xsend(pkt($id));
             $resent++;
             $moved++;
         }
@@ -90,5 +90,5 @@ while (1) {
 # the answers that are still on their way (a resent query is answered twice, the second one may be late) are counted too: the test adds up every datagram
 for (my $q0 = time; time - $q0 < 2; ) { $q0 = time if drain(); sleep(0.01); }
 my $secs = time - $t0;
-printf("sent=%d received=%d answered=%d unanswered=%d resent=%d secs=%.2f\n", $sent, $received, $answered, $n - $answered, $resent, $secs);
+printf("sent=%d received=%d answered=%d unanswered=%d resent=%d sendfail=%d secs=%.2f\n", $sent, $received, $answered, $n - $answered, $resent, $sendfail, $secs);
 exit(0);

@@ -49,7 +49,7 @@ PIDA=""; PIDB=""; ADDED=""
 stop_one() {   # stop_one PID: TERM, wait up to 15 s, then the whole tree
     [ -n "$1" ] || return 0
     kill -TERM "$1" 2>/dev/null
-    i=0; while [ $i -lt 150 ] && kill -0 "$1" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
+    i=0; while [ $i -lt "$KARI_STOP_WAIT_TENTHS" ] && kill -0 "$1" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
     kari_kill_tree "$1"
 }
 cleanup() {
@@ -207,7 +207,7 @@ pfz "$T/sql/vschema.sql" > /dev/null 2>&1 && {
 conf() {   # conf FILE PORT "DATABASE-OPTIONS" SERVER-ID [EXTRA TOP-LEVEL]
     cat > "$1" <<EOF
 options {
-    user "nobody"; pid-file "none"; listen-on { 127.0.0.1; }; port $2;
+    user "nobody"; pid-file "none"; listen-on { 127.0.0.1; }; port $2; minimal-any no;
     database { driver postgresql; conninfo-file "$T/ci"; loader-user "$PG_AS"; loader-path "$T/karidns-dbloader"; db-reload-timeout 10; poll-interval 2; coalesce 300; acl-ceiling { 127.0.0.0/24; }; server-id "$4"; $3 };
 };
 ${5:-}

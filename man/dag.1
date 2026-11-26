@@ -194,8 +194,10 @@ malformed DNS messages.
 \fB+[no]tcp\fR, \fB+[no]vc\fR
 Use TCP transport instead of UDP. \fB+vc\fR ("virtual circuit") and
 \fB\-\-tcp\fR are synonyms for \fB+tcp\fR. \fB+novc\fR / \fB+notcp\fR force
-UDP. \fBAXFR\fR and large \fBIXFR\fR queries automatically elevate to TCP unless
-\fB+udp\fR is explicitly forced.
+UDP. \fBAXFR\fR, \fBIXFR\fR and \fBANY\fR queries (also as \fBTYPE252\fR,
+\fBTYPE251\fR, \fBTYPE255\fR) automatically elevate to TCP unless \fB+udp\fR is
+explicitly forced, as \fBdig\fR does (RFC 8482 section 4.4: servers may answer
+ANY over UDP with an empty truncated response).
 .TP 8
 \fB+udp\fR
 Force UDP transport.
@@ -291,8 +293,14 @@ Set the number of transmission retries to \fBN\fR (total attempts will be \fBN +
 .TP 8
 \fB+[no]rec\fR, \fB+[no]recurse\fR, \fB+[no]rdflag\fR
 Set or clear the \fBRD (Recursion Desired)\fR header bit. Recursion is enabled
-by default. Automatically disabled when \fB+trace\fR or \fB+nssearch\fR is
-active.
+by default, except for \fBANY\fR (also written \fBTYPE255\fR): like \fBdig\fR
+from BIND main (commit fce5bf80 of 2026-11-24, which ISC announced for its
+January 2027 releases; \fBdig\fR 9.20.31 and earlier still set RD), an \fBANY\fR
+query is sent with RD=0 unless \fB+[no]rec\fR / \fB+[no]recurse\fR /
+\fB+[no]rdflag\fR is given, before or after the type, on the command line or in
+\fB~/.digrc\fR; \fBdag +recurse example.com ANY\fR sets RD. Resolvers that
+follow BIND refuse a recursive ANY (REFUSED with EDE 21). Automatically disabled
+when \fB+trace\fR or \fB+nssearch\fR is active.
 .TP 8
 \fB+[no]adflag\fR
 Set or clear the \fBAD (Authenticated Data)\fR bit in the query header.

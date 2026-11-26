@@ -1,4 +1,4 @@
-.TH KARIDNS.CONF 5 "2026-11-25" "KariDNS" "KariDNS Manual"
+.TH KARIDNS.CONF 5 "2026-11-26" "KariDNS" "KariDNS Manual"
 .\" Generated from docs/karidns.md by man/md2man.pl (make man): edit the Markdown manual, not this page.
 .SH NAME
 karidns.conf \- the configuration file of karidns(8)
@@ -467,13 +467,17 @@ set, \fBno\fR for the others. Negative answers keep their SOA.
 whose ACLs apply to the requests that come through a view for a zone it shares
 with an earlier view. See Zones shared between views.
 .TP 8
-\fBminimal\-any yes|no;\fR
+`minimal-any yes
+\fIDescription:\fR `minimal-any yes
+.TP 8
+\fBanswer\-rrsig\-queries yes|no;\fR
 \fIDefault:\fR \fBno\fR
 .br
-\fIDescription:\fR RFC 8482: answer \fBQTYPE=ANY\fR with a synthesized \fBHINFO
-"RFC8482" ""\fR record instead of all RRsets. When the query has DO=1 and the
-name has RRSIG records, a single RRset is returned instead (RFC 8482
-\[u00A7]4.2).
+\fIDescription:\fR 0.7, KariDNS only (BIND has no such option). \fBno\fR: a
+question for type RRSIG is answered FORMERR with EDE 30 Invalid Query Type, as
+BIND 9.20.31 and later do (see "ANY and RRSIG queries"). \fByes\fR: the 0.6
+behaviour, the RRSIG RRset of the name (at a CNAME owner the name's own RRSIGs,
+RFC 4035 \[u00A7]2.5).
 .TP 8
 \fBminimal\-any\-ttl <seconds>;\fR
 \fIDefault:\fR \fB86400\fR
@@ -731,6 +735,19 @@ to carry the extended RCODE bits of BADCOOKIE on their own RCODE, RFC 6891
 silently); with \fBudp\-bufsize\fR written too, the two must agree. Can be
 overridden per view. \fBedns\-udp\-size\fR is the size of the queries a resolver
 sends; it is read and has no effect.
+.TP 8
+\fBnocookie\-udp\-size <n>;\fR
+\fIDefault:\fR \fB4096\fR
+.br
+\fIDescription:\fR 0.7, BIND 9.20 (\fBlib/ns/client.c\fR): the largest UDP
+answer to a query without a valid server cookie (RFC 7873 section 5.2); a larger
+answer is truncated (TC=1). The other UDP limits (\fBmax\-udp\-size\fR, the
+client's EDNS size, a \fBserver\fR statement's \fBmax\-udp\-size\fR) still
+apply, and the smallest wins: with the default and \fBmax\-udp\-size 1232\fR
+nothing changes. A value below 128 is raised to 128 with a warning, as BIND does
+(silently there); above 4096 it is the same as 4096; not a number, negative or
+above 2147483647 is a configuration error. Also in \fBview\fR. Not for TCP, and
+not for forward or program zones.
 .TP 8
 \fBudp\-receive\-buffer <n>;\fR \fBudp\-send\-buffer <n>;\fR \fBtcp\-receive\-buffer <n>;\fR \fBtcp\-send\-buffer <n>;\fR
 \fIDefault:\fR see below
@@ -1184,6 +1201,67 @@ alone only exempts \fBaddress\fR and drops nothing (nothing else matches);
 requests received are affected: this server does not apply the list to the
 NOTIFY messages and SOA queries it sends or the transfers it starts. A \fBkey\fR
 element is an error.
+.SS ANY and RRSIG queries (0.7)
+KariDNS follows the changes ISC announced on 2026-11-24 for BIND 9 ("Upcoming
+changes to ANY and RRSIG query processing in BIND 9"; BIND main,
+\fBlib/ns/query.c\fR) for the answers it makes from its own data. Forward and
+program zones are not changed (see the last item).
+.IP \(bu 2
+\fBANY over UDP\fR is answered with an empty response with TC=1 (NOERROR, AA=0,
+AD=0, the question and the OPT record), as RFC 8482 section 4.4 allows, so that
+ANY cannot be used to reflect and amplify traffic towards a spoofed address.
+.RS 2
+.IP \(bu 2
+A client retries over TCP (RFC 7766 section 5); \fBdig\fR and \fBdag\fR already
+send ANY over TCP.
+.IP \(bu 2
+The exception is a query that carries a valid server cookie of this server (RFC
+7873 section 5.2.4, RFC 9018): its source address is known, and it is answered
+over UDP. A client cookie alone is not enough: the TC response gives the client
+its server cookie, and its next query is then answered.
+.IP \(bu 2
+It applies to every zone of this server, the built-in CHAOS zones, names in no
+zone, and database zones that are not in memory (which are neither waited for
+nor read for such a query).
+.IP \(bu 2
+It comes after \fBallow\-query\fR (REFUSED) and the BADCOOKIE answer of RFC 7873
+section 5.2.3, before any answer.
+.IP \(bu 2
+There is no option to turn it off, as in BIND.
+.RE
+.IP \(bu 2
+\fBANY over TCP, and over UDP with a valid server cookie\fR, is answered as
+\fBminimal\-any\fR says. Since 0.7 the default is \fByes\fR (= \fBhinfo\fR), as
+BIND's default \fByes\fR: the synthesized \fBHINFO "RFC8482" ""\fR of RFC 8482
+section 4.2 (with DO=1 at a signed name, one RRset and its
+RRSIGs). \fBminimal\-any rrset;\fR gives one RRset, as BIND answers;
+\fBminimal\-any no;\fR every RRset at the name. Over UDP without a valid cookie
+the TC=1 answer comes first, whatever the style.
+.IP \(bu 2
+\fBA question for type RRSIG\fR is answered FORMERR with EDE 30 Invalid Query
+Type ("RRSIG queries are not supported"; IANA Extended DNS Error registry), with
+the question echoed, as BIND 9.20.31 and later do. Signatures come with the
+RRsets they cover when the query has DO=1 (RFC 4035 section 3.1.1).
+.RS 2
+.IP \(bu 2
+It is checked before the zone data, the ACLs, the cookies and the response
+cache, for every transport, class and DO bit, and for zone files, tinydns zones
+and database zones alike.
+.IP \(bu 2
+An RRSIG listed in an MQTYPE-Query option (RFC 10029) is refused the same way.
+.IP \(bu 2
+\fBanswer\-rrsig\-queries yes;\fR keeps the 0.6 answer: the name's RRSIG RRset,
+and at a CNAME owner its own RRSIGs (RFC 4035 section 2.5).
+.RE
+.IP \(bu 2
+\fB\fBnocookie\-udp\-size\fB\fR (BIND 9.20): a UDP answer to a query without a
+valid server cookie is no larger than this value (RFC 7873 section 5.2); a
+larger one is truncated (TC=1). See the options table.
+.IP \(bu 2
+\fBForward and program zones\fR relay or answer every query as before: ANY over
+UDP is relayed, RRSIG questions are relayed, and \fBnocookie\-udp\-size\fR does
+not limit their answers. BIND's refusal of recursive ANY queries (REFUSED with
+EDE 21) is not followed.
 .SS rate-limit { ... } (in options or zone)
 A \fBrate\-limit\fR block in a zone replaces the server-wide block for that
 zone. \fB0\fR means no limit for that class. Only UDP responses are limited.
@@ -3940,6 +4018,19 @@ for a very large install, e.g. \fBstore\-max\-zones 100000000;\fR for 100
 million zones on a 16 GB host. Not a limit of the files: a start reserves at
 least twice what the files hold already.
 .TP 8
+\fBstore\-table\-memory <size>;\fR
+\fIDefault:\fR the RAM less \fBmemory\-limit\fR and a quarter of the RAM (at
+least an eighth of the RAM; \fB16M\fR..\fB1T\fR)
+.br
+\fIDescription:\fR 0.7, restart-only: above this many bytes of file pages that
+the store keeps mapped (its tables \fBzt\fR, \fBzc\fR and \fBnx\fR, the index
+\fBix\fR and \fBsx\fR, and the runs of a first fill's index), the server tells
+the kernel, a slice at a time (a full turn in about 30 seconds), that they may
+be freed first (see "Resident tables" below). It reserves nothing and changes
+nothing below the limit: the tables take 128 bytes a zone, so a store of 20,000
+zones maps about 2.5 MB and is never swept. Set it lower on a host that runs
+other services next to KariDNS, higher on a host that runs nothing else.
+.TP 8
 \fBstore\-scrub\-interval <seconds>;\fR \fBstore\-scrub\-interval off;\fR
 \fIDefault:\fR \fB604800\fR (a week; \fB60\fR..\fB31536000\fR)
 .br
@@ -4527,15 +4618,16 @@ tables (0.7):\fR the pages of \fBzt\fR, \fBzc\fR, \fBnx\fR, \fBix\fR and
 yet are memory of the process that the kernel cannot drop (see "The tables in
 memory" under the zone store), at most about \fBstore.tables.private_max\fR (a
 32nd of the RAM, 64 MiB to 1 GiB) plus, during the listing pass of a first fill,
-the indexes made for it (not bounded yet: 43 bytes a zone when they are built
-once, measured up to about 165 bytes per name at 100 million zones when the
-growths overlap, so a first fill of 100 million zones does not fit on a 16 GB
-host; a known limit), shown as \fBstore.tables.private_bytes\fR by \fBkarictl
-store\fR; the zones in memory get the limit less those bytes, and at least a
-tenth of the limit. Raise \fBmemory\-limit\fR by that much when you move to the
-store; a WARNING says so (at most once an hour) while the tables hold half of
-the limit or more. A reload of \fBkaridns.conf\fR changes it: within 50 ms when
-a limit is set, within a second when there was none.
+its index delta and, after the pass, the window of the build of the indexes
+(0.7, \fBstore.index.delta.bytes\fR, \fBstore.index.build.bytes\fR: together
+within an eighth of the limit; before, the indexes grew with the names, about
+165 bytes per name at 100 million zones), shown as
+\fBstore.tables.private_bytes\fR by \fBkarictl store\fR; the zones in memory get
+the limit less those bytes, and at least a tenth of the limit. Raise
+\fBmemory\-limit\fR by that much when you move to the store; a WARNING says so
+(at most once an hour) while the tables hold half of the limit or more. A reload
+of \fBkaridns.conf\fR changes it: within 50 ms when a limit is set, within a
+second when there was none.
 .IP \(bu 2
 \fBThe default (0.7.x).\fR A database block whose zones go to the zone store
 (\fBstore\fR, the default of a production server) and that does not write
@@ -5083,12 +5175,15 @@ the most, and registers what it has made) (it attaches the hottest zones and
 never takes one out for the rest of the list; \fBstore.hot.state\fR says
 \fBhigh\-mark\fR). The file is trusted only whole (its checksums and the store's
 uuid must be right; a damaged, torn or foreign file is ignored with a WARNING
-and the zones are attached when they are asked for, as before); after \fBkill
-\-9\fR the list of the last clean stop is still used (its ids are only
-candidates: a zone that is not stored any more is skipped). \fBstore\-hot\-list
-no;\fR turns both the writing and the attaching off. \fBkarictl store\fR shows
-\fBstore.hot.*\fR (\fBstore.hot.threads\fR, and \fBstore.hot.attached_per_s\fR
-from the start of the list to now).
+and the zones are attached when they are asked for, as before); it is written
+after the clean checkpoint of the stop, and with no fsync (a hint: two fsyncs of
+it made a stop take seconds while a fill wrote, before the checkpoint; a power
+cut may lose the file or leave it torn, and then the start attaches the zones
+when they are asked for); after \fBkill \-9\fR the list of the last clean stop
+is still used (its ids are only candidates: a zone that is not stored any more
+is skipped). \fBstore\-hot\-list no;\fR turns both the writing and the attaching
+off. \fBkarictl store\fR shows \fBstore.hot.*\fR (\fBstore.hot.threads\fR, and
+\fBstore.hot.attached_per_s\fR from the start of the list to now).
 .PP
 \fBAttach on the worker (MAP mode, 0.7).\fR A query for a stored zone that is
 not in memory used to wait for a store thread (the worker parks it, asks through
@@ -5337,22 +5432,37 @@ opened by the process that starts the server (as root), checked (owner, mode,
 locked), handed to the user the server runs as and inherited by the Backend,
 which limits the rights of the descriptor (look up, create, read, write, mmap,
 fsync, truncate, stat, unlink) and opens the files beneath it, also in the
-sandbox. The loader and the routers never get it. \fBAddress space of the tables
-(0.7).\fR The tables of the store (\fBzt\fR and \fBzc\fR, 64 bytes a zone each,
-and \fBnx\fR, the long names) are mapped files that are never moved while the
-server runs, so the server reserves their address space (\fBPROT_NONE\fR, no
-memory and no swap is charged) when the store is opened. The Backend's virtual
-size (\fBVSZ\fR, \fBulimit \-v\fR) includes it: it is sized from the RAM, so
-that a small server does not show gigabytes. The rule: zones = \fBhw.physmem\fR
-/ 256 bytes, rounded up to a power of two, at least 1,048,576 and at most
-33,554,432 (2^25); \fBzt\fR and \fBzc\fR reserve 64 bytes a zone each and
-\fBnx\fR 32 bytes a zone. A server with 512 MB reserves 2M zones (256 MB for
-\fBzt\fR and \fBzc\fR, 64 MB for \fBnx\fR), one with 16 GB or more 32M (4 GiB
-and 1 GiB), the size before 0.7. \fBstore\-max\-zones\fR sets the number of
-zones itself. At every start the reservation is raised to at least twice what
-the files hold, so a store that has outgrown its reservation opens with room,
-whatever the option or the RAM say. The start logs it (\fBstore: address space
-reserved for the tables: ...\fR), and \fBkarictl store\fR shows
+sandbox. The loader and the routers never get it. \fBResident tables (0.7).\fR
+The tables of the store take 128 bytes a zone (\fBzt\fR and \fBzc\fR, 64 bytes
+each), about 12.8 GB at 100 million zones, and every lookup reads them; they are
+mapped files, and the pages the server has touched stay active. On a host where
+they pass the RAM the kernel would then take the idle memory of other processes
+to swap before it frees a table page. So when what the store maps passes
+\fBstore\-table\-memory\fR, the server deactivates its clean pages a slice at a
+time (\fBmadvise(MADV_DONTNEED)\fR, which discards nothing): a page that is used
+again stays, a cold one is the first the kernel frees and is read again from the
+file (or the ARC) when a lookup needs it. Pages the server has changed and no
+checkpoint has written yet are left alone (they are its memory,
+\fBstore.tables.private_bytes\fR). At the start the read-ahead of the tables
+stops at the same limit. \fBkarictl store\fR shows
+\fBstore.tables.budget_bytes\fR, \fB.mapped_bytes\fR, \fB.cold_bytes\fR and
+\fB.cold_sweeps\fR.
+.PP
+\fBAddress space of the tables (0.7).\fR The tables of the store (\fBzt\fR and
+\fBzc\fR, 64 bytes a zone each, and \fBnx\fR, the long names) are mapped files
+that are never moved while the server runs, so the server reserves their address
+space (\fBPROT_NONE\fR, no memory and no swap is charged) when the store is
+opened. The Backend's virtual size (\fBVSZ\fR, \fBulimit \-v\fR) includes it: it
+is sized from the RAM, so that a small server does not show gigabytes. The rule:
+zones = \fBhw.physmem\fR / 256 bytes, rounded up to a power of two, at least
+1,048,576 and at most 33,554,432 (2^25); \fBzt\fR and \fBzc\fR reserve 64 bytes
+a zone each and \fBnx\fR 32 bytes a zone. A server with 512 MB reserves 2M zones
+(256 MB for \fBzt\fR and \fBzc\fR, 64 MB for \fBnx\fR), one with 16 GB or more
+32M (4 GiB and 1 GiB), the size before 0.7. \fBstore\-max\-zones\fR sets the
+number of zones itself. At every start the reservation is raised to at least
+twice what the files hold, so a store that has outgrown its reservation opens
+with room, whatever the option or the RAM say. The start logs it (\fBstore:
+address space reserved for the tables: ...\fR), and \fBkarictl store\fR shows
 \fBstore.reserve.*\fR. \fBAt the limit\fR (a table that is full: new zones, or
 new zones with names of more than 34 octets) the write is refused, with no harm
 to the zones that are in: the zone is served from the database as it is when the
@@ -5481,72 +5591,78 @@ least 64 MiB and at most 1 GiB) since the last one gave its pages back
 listing pass. Without the bound every page stayed private for the life of the
 process, about 180 to 225 bytes a zone during a first fill: 2.7 GB at 15 million
 zones, and the first fill of 100 million zones on a 16 GB host was killed by the
-kernel at 57 million. What stays above the bound for a while: an index made for
-a first fill or by a growth (\fBix.N\fR, \fBsx.N\fR, about 21 bytes a zone each
-for a first fill, 43 for both; \fBstore.tables.private_index_bytes\fR) is
-private whole until a checkpoint after the listing pass wrote it, and the bound
-does not hold them: in the listing pass of a first fill they grow with the
-number of names (measured 14.9 GB at 90 million names, three generations alive
-at once), a known limit of 0.7 that a later version removes by building them
-once after the pass; \fBmemory\-limit\fR counts the private pages (see "Memory
-limit"). A restart writes nothing until a zone changes, so after a restart the
-figure starts at 0. Recovery is unchanged: the last checkpoint and the replay of
-the journal; a crash between a growth of an index and the next checkpoint (the
-new \fBix.N\fR / \fBsx.N\fR holds nothing yet) makes the next start rebuild the
-indexes from \fBzt.1\fR, a few seconds at 10 million zones. The files stay in
-the format of earlier versions; go back to an earlier version only after a clean
-stop. \fBThe first fill without a journal (0.7).\fR The first fill of an empty
-store (the first pass finds no zone record in any view and no bytes in the
-segments, and reserves the tables for the zones the loader announces) keeps no
-journal: the database holds every zone, so a fill that a crash cuts off can be
-read again. A configuration with secondary zones whose copies the store keeps
-fills with the journal, as before: their copies must be durable when they are
-acknowledged. Before the first change the store makes a superblock durable that
-says so; from then on the writers (the pass, the bodies) change the tables as
-before but write no journal record, nothing is synced by a commit, and no
-checkpoint is made by the size of the journal or by its interval; the cleaner,
-the removal of empty segments and the scrub wait until the end of the fill is on
-disk (\fBkarictl store compact\fR and \fBstore scrub\fR say it is busy). A
-secondary's copy that is to be stored meanwhile (a secondary added by a
-reconfiguration) asks for the end of the fill and is stored once that end is on
-disk (the zone is served from memory meanwhile, without a new transfer). While
-the bodies are fetched the store makes \fIbulk checkpoints\fR, its durable
-points: the segments are synced, the changed pages of the zone table and the
-long names are written (and of the indexes once the pass is over: the pass
-inserts into every page of them; a recovery rebuilds them in any case), each
-time the segments have doubled since the last one and grew by 4 GiB or more, and
-15 minutes after the last one at the latest; and, also during the pass, whenever
-the private memory of the tables grew by \fBstore.tables.private_max\fR (see
-"The tables in memory": without this the pass of a fill of 100 million zones
-kept 13.5 GB of table pages in memory and the kernel killed the server). The
-fill ends by itself when every view has had its pass end complete (a pass that
-failed or was cut off keeps it for the next pass), no body of the fill is on its
-way and the fill has nothing more to fetch (the zones left without a body are
-the ones it does not fetch: refused, or not kept in the store): from then on
-every change is logged again, and one checkpoint, on the store's checkpoint
-thread, writes every table, the indexes included; until it is on disk
-(\fBstore.bulk.end_pending\fR) it is tried again after a failure, with a
-back-off of 1 s that doubles up to 5 minutes, and it is not tried at all while
-the free space is below what it would write; a crash meanwhile is a crash of the
-fill. What it saves: a logged fill of 10 million zones on ZFS wrote about 25 GB
-to the device for 3.5 GB of images (lz4), most of it the journal, the
-checkpoints of the pass and the fsyncs of the commits, which ZFS writes twice
-(through the ZIL); the unlogged fill writes the images, its bulk checkpoints (2
-or 3 by the segments at 10 million zones, and the ones for the bound of the
-private memory, each writing about \fBstore.tables.private_max\fR of table
-pages) and the last one. The cost: \fBa crash during the first fill goes back to
-the last bulk checkpoint\fR (or to the empty store, before the first one):
-nothing is replayed, the tables are rebuilt from the zone table (seconds at 10
-million zones), a zone whose image is past that checkpoint is kept as a known
-zone and fetched again, the cursors of the views are dropped and the loader
-lists every zone again (also at a later start if the next one has no database
-block: \fBstore.bulk.cut\fR), and a WARNING says to what point the store went
-back; the zones after it are read from the database again, and the server
-answers meanwhile as for any zone that is not in the store. Changes made after
-the end of the fill and before its checkpoint is on disk go back with it. A
-clean stop in the middle of the fill keeps it: the next start needs no rebuild
-and the rest of the fill is unlogged as well. A pass over a store that holds
-zones already is logged as before, with the larger journal of
+kernel at 57 million. The indexes (0.7): a new generation of \fBix.N\fR /
+\fBsx.N\fR (a growth, the rebuild of a start) is made by the file builder as a
+file and mapped from it, so it is page cache and only the pages changed after it
+count (\fBstore.tables.private_index_bytes\fR); a small one (64 MiB or less)
+that fills up before the build outside the writer mutex ends is still grown
+inside the mutex in memory, private whole until a checkpoint wrote it. During
+the listing pass of a first fill no index grows: the new names go into an index
+delta (memtables, sorted runs in scratch files \fBixr.N\fR, a Bloom filter:
+\fBstore.index.delta.*\fR, counted in \fBmemory\-limit\fR) and the indexes are
+built once after the pass (before, they grew with the names: 14.9 GB at 90
+million names, three generations alive at once); \fBmemory\-limit\fR counts the
+private pages (see "Memory limit"). A restart writes nothing until a zone
+changes, so after a restart the figure starts at 0. Recovery is unchanged: the
+last checkpoint and the replay of the journal; a crash between a growth of an
+index and the next checkpoint (the new \fBix.N\fR / \fBsx.N\fR holds nothing
+yet) makes the next start rebuild the indexes from \fBzt.1\fR, a few seconds at
+10 million zones. The files stay in the format of earlier versions; go back to
+an earlier version only after a clean stop. \fBThe first fill without a journal
+(0.7).\fR The first fill of an empty store (the first pass finds no zone record
+in any view and no bytes in the segments, and reserves the tables for the zones
+the loader announces) keeps no journal: the database holds every zone, so a fill
+that a crash cuts off can be read again. A configuration with secondary zones
+whose copies the store keeps fills with the journal, as before: their copies
+must be durable when they are acknowledged. Before the first change the store
+makes a superblock durable that says so; from then on the writers (the pass, the
+bodies) change the tables as before but write no journal record, nothing is
+synced by a commit, and no checkpoint is made by the size of the journal or by
+its interval; the cleaner, the removal of empty segments and the scrub wait
+until the end of the fill is on disk (\fBkarictl store compact\fR and \fBstore
+scrub\fR say it is busy). A secondary's copy that is to be stored meanwhile (a
+secondary added by a reconfiguration) asks for the end of the fill and is stored
+once that end is on disk (the zone is served from memory meanwhile, without a
+new transfer). While the bodies are fetched the store makes \fIbulk
+checkpoints\fR, its durable points: the segments are synced, the changed pages
+of the zone table and the long names are written (not of the indexes while the
+pass's index delta is there, nor of the generations of the build after the pass
+before it ends; a recovery rebuilds them in any case), each time the segments
+have doubled since the last one and grew by 4 GiB or more, and 15 minutes after
+the last one at the latest; and, also during the pass, whenever the private
+memory of the tables grew by \fBstore.tables.private_max\fR (see "The tables in
+memory": without this the pass of a fill of 100 million zones kept 13.5 GB of
+table pages in memory and the kernel killed the server). The fill ends by itself
+when every view has had its pass end complete (a pass that failed or was cut off
+keeps it for the next pass), no body of the fill is on its way and the fill has
+nothing more to fetch (the zones left without a body are the ones it does not
+fetch: refused, or not kept in the store): from then on every change is logged
+again, and one checkpoint, on the store's checkpoint thread, writes every table,
+the indexes included; until it is on disk (\fBstore.bulk.end_pending\fR) it is
+tried again after a failure, with a back-off of 1 s that doubles up to 5
+minutes, and it is not tried at all while the free space is below what it would
+write; a crash meanwhile is a crash of the fill. What it saves: a logged fill of
+10 million zones on ZFS wrote about 25 GB to the device for 3.5 GB of images
+(lz4), most of it the journal, the checkpoints of the pass and the fsyncs of the
+commits, which ZFS writes twice (through the ZIL); the unlogged fill writes the
+images, its bulk checkpoints (2 or 3 by the segments at 10 million zones, and
+the ones for the bound of the private memory, each writing about
+\fBstore.tables.private_max\fR of table pages) and the last one. The cost: \fBa
+crash during the first fill goes back to the last bulk checkpoint\fR (or to the
+empty store, before the first one): nothing is replayed, the tables are rebuilt
+from the zone table (seconds at 10 million zones), a zone whose image is past
+that checkpoint is kept as a known zone and fetched again, the cursors of the
+views are dropped and the loader lists every zone again (also at a later start
+if the next one has no database block: \fBstore.bulk.cut\fR), and a WARNING says
+to what point the store went back; the zones after it are read from the database
+again, and the server answers meanwhile as for any zone that is not in the
+store. Changes made after the end of the fill and before its checkpoint is on
+disk go back with it. A clean stop in the middle of the fill keeps it and the
+rest of the fill is unlogged as well; the next start needs no rebuild, unless
+the stop came during a listing pass or the build after it (the index delta is
+not written: the start rebuilds the indexes from the zone table with the file
+builder, about a minute at 100 million zones, and answers after it). A pass over
+a store that holds zones already is logged as before, with the larger journal of
 \fBstore.journal.boost\fR. \fBkarictl store\fR shows it as \fBstore.bulk.*\fR
 and \fBstore.journal.bytes_written\fR. \fBThe ARC and a restart with many zones
 (COPY mode).\fR A restart is fast when the records of the zones the queries want

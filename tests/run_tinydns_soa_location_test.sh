@@ -192,7 +192,7 @@ EOF
 SECRET=$(openssl rand -base64 32)
 cat > "$TMP_DIR/k.conf" <<EOF
 options {
-    port $PORT; bind-address { 127.0.0.1; }; pid-file "none"; $USER_OPT
+    port $PORT; bind-address { 127.0.0.1; }; pid-file "none"; $USER_OPT minimal-any no;
     location-tags { tag "lt-in" { 127.0.0.1/32; }; tag "lt-ex" { 127.0.0.2/32; }; };
 };
 control-channel { socket "$TMP_DIR/c.sock"; algorithm hmac-sha256; secret "$SECRET"; };

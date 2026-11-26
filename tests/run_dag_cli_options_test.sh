@@ -105,6 +105,21 @@ run_not_check "+noedns sends no OPT record" "$DAG @127.0.0.1 -p ${DEAD_PORT} exa
 run_check "+nocookie keeps EDNS" "$DAG @127.0.0.1 -p ${DEAD_PORT} example.com A +nocookie +qr +timeout=1" "EDNS: version: 0"
 run_not_check "+nocookie sends no cookie" "$DAG @127.0.0.1 -p ${DEAD_PORT} example.com A +nocookie +qr +timeout=1" "; COOKIE:"
 run_check "+bufsize changes the advertised size" "$DAG @127.0.0.1 -p ${DEAD_PORT} example.com A +bufsize=4096 +qr +timeout=1" "udp: 4096"
+# ANY (0.7): RD=0 unless +[no]recurse / +[no]rdflag is given before or after the type, and TCP, as dig from BIND main
+# (fce5bf80, 2026-11-24; dig 9.20.31 and earlier still set RD on ANY, so these RD checks are dag only).  A TCP query to the
+# dead port fails with "connect to ... failed", a UDP one with "communications error".
+if [ "$DAG" != "dig" ]; then
+    Q=";; flags:[^;]*; QUERY: 1"
+    run_not_check "ANY sends RD=0" "$DAG @127.0.0.1 -p ${DEAD_PORT} example.com ANY +qr +timeout=1 +tries=1" ";; flags:[^;]* rd[ ;]" "$Q"
+    run_not_check "TYPE255 sends RD=0" "$DAG @127.0.0.1 -p ${DEAD_PORT} -t TYPE255 example.com +qr +timeout=1 +tries=1" ";; flags:[^;]* rd[ ;]" "$Q"
+    run_check "+recurse before ANY sets RD" "$DAG @127.0.0.1 -p ${DEAD_PORT} +recurse example.com ANY +qr +timeout=1 +tries=1" ";; flags: rd[ ;]"
+    run_check "+rec after ANY sets RD" "$DAG @127.0.0.1 -p ${DEAD_PORT} example.com ANY +rec +qr +timeout=1 +tries=1" ";; flags: rd[ ;]"
+    run_check "+rdflag sets RD on ANY" "$DAG @127.0.0.1 -p ${DEAD_PORT} -t ANY example.com +rdflag +qr +timeout=1 +tries=1" ";; flags: rd[ ;]"
+    run_check "A keeps RD=1" "$DAG @127.0.0.1 -p ${DEAD_PORT} example.com A +qr +timeout=1 +tries=1" ";; flags: rd[ ;]"
+    run_check "TYPE255 goes over TCP" "$DAG @127.0.0.1 -p ${DEAD_PORT} -t TYPE255 example.com +timeout=1 +tries=1" "connect to 127\.0\.0\.1#${DEAD_PORT} failed"
+    run_check "ANY +notcp stays on UDP" "$DAG @127.0.0.1 -p ${DEAD_PORT} example.com ANY +notcp +timeout=1 +tries=1" "communications error to 127\.0\.0\.1#${DEAD_PORT}"
+    run_check "--hex keeps the packet's RD bit" "$DAG @127.0.0.1 -p ${DEAD_PORT} --hex=123401000001000000000000076578616d706c6503636f6d0000010001 +udp +qr +timeout=1 +tries=1" ";; flags: rd[ ;]"
+fi
 # UPDATE and NOTIFY keep no OPT by default (like nsupdate); an explicit EDNS option still adds one
 run_check "UPDATE +qr prints the sent message" "$DAG @127.0.0.1 -p ${DEAD_PORT} example.com --update-add 'www.example.com 300 IN A 192.0.2.1' +qr +timeout=1" "opcode: UPDATE.*|ADDITIONAL: 0"
 run_not_check "UPDATE sends no OPT by default" "$DAG @127.0.0.1 -p ${DEAD_PORT} example.com --update-add 'www.example.com 300 IN A 192.0.2.1' +qr +timeout=1" "OPT PSEUDOSECTION"

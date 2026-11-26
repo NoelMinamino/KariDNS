@@ -66,6 +66,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     dopt.show_additional = true;
 
     print_response(data, size, &axfr_state, &dopt);
+    reset_dag_arena();   // as run_query() does before each response: the names live in g_dag_arena until the next reset
 
     return 0;
 }

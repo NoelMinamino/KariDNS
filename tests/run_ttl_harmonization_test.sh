@@ -52,6 +52,7 @@ cat << EOF > karidns.conf
 options {
     port ${PORT};
     bind-address { 127.0.0.1; };
+    answer-rrsig-queries yes;   # (the RRSIG questions below read the RRSIG TTLs; 0.7 answers them FORMERR by default)
     user "nobody";
     group "nobody";
 };

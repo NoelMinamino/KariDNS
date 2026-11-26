@@ -33,7 +33,7 @@ SRV=""
 stop_srv() {
     [ -n "$SRV" ] || return 0
     kill -TERM "$SRV" 2>/dev/null
-    i=0; while [ $i -lt 150 ] && kill -0 "$SRV" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
+    i=0; while [ $i -lt "$KARI_STOP_WAIT_TENTHS" ] && kill -0 "$SRV" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
     kari_kill_tree "$SRV"
     SRV=""
 }

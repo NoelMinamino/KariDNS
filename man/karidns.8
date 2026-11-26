@@ -1,4 +1,4 @@
-.TH KARIDNS 8 "2026-11-24" "KariDNS" "KariDNS Manual"
+.TH KARIDNS 8 "2026-11-26" "KariDNS" "KariDNS Manual"
 .\" Generated from docs/karidns.md by man/md2man.pl (make man): edit the Markdown manual, not this page.
 .SH NAME
 karidns \- Authoritative DNS Server Daemon for FreeBSD
@@ -1433,8 +1433,12 @@ logged and ignored.
 \fBSIGTERM\fR, \fBSIGINT\fR
 Sent to the manager process, stops all child processes (backend, frontend
 routers, connect broker), removes the PID file and exits. A child that has not
-ended 10 seconds after the SIGTERM it was sent is killed with SIGKILL (logged);
-a second \fBSIGTERM\fR or \fBSIGINT\fR to the manager kills the remaining
+ended 10 seconds after the SIGTERM it was sent is killed with SIGKILL
+(logged). The backend is given up to 120 seconds while it writes the clean
+checkpoint of the zone store of database zones (0.7; a kill there is a crash of
+the store, and a first fill that has not ended goes back to its last bulk
+checkpoint, at worst to the empty store): the manager logs at 10 seconds that it
+waits. A second \fBSIGTERM\fR or \fBSIGINT\fR to the manager kills the remaining
 children at once. The exit status is then non-zero.
 .SH ENVIRONMENT
 .TP 8

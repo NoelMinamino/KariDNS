@@ -33,7 +33,7 @@ SRV=""
 cleanup() {
     [ -n "$SRV" ] && kill -TERM "$SRV" 2>/dev/null
     # wait for the manager (it stops its children first; a sanitizer build is slow): a KILL too early orphans them
-    i=0; while [ -n "$SRV" ] && [ $i -lt 100 ] && kill -0 "$SRV" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
+    i=0; while [ -n "$SRV" ] && [ $i -lt "$KARI_STOP_WAIT_TENTHS" ] && kill -0 "$SRV" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
     [ -n "$SRV" ] && kill -KILL "$SRV" 2>/dev/null
     rm -rf "$T"
 }
@@ -141,7 +141,7 @@ file_answers && pass "the file zone answers after the reload" || fail "the file 
 # ---------------------------------------------------------------- stop
 echo "== SIGTERM"
 kill -TERM "$SRV"
-i=0; while [ $i -lt 100 ] && kill -0 "$SRV" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
+i=0; while [ $i -lt "$KARI_STOP_WAIT_TENTHS" ] && kill -0 "$SRV" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
 if kill -0 "$SRV" 2>/dev/null; then fail "karidns did not stop within 10 s"; else pass "karidns stopped"; fi
 kari_wait_no_proc "karidns.*$T" 15 || true
 LEFT=$(pgrep -f "karidns.*$T" | tr '\n' ' ')
@@ -173,7 +173,7 @@ if [ -x "$T/fake_dbloader" ]; then
             kari_wait_log "$T/f_$mode.log" "Database loader .* started .*restart" 10 && pass "$mode: the supervisor restarted the loader" || fail "$mode: no restart"
         fi
         file_answers && pass "$mode: the Backend survived and answers" || fail "$mode: the file zone does not answer"
-        kill -TERM "$SRV"; i=0; while [ $i -lt 100 ] && kill -0 "$SRV" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
+        kill -TERM "$SRV"; i=0; while [ $i -lt "$KARI_STOP_WAIT_TENTHS" ] && kill -0 "$SRV" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
         kill -0 "$SRV" 2>/dev/null && fail "$mode: karidns did not stop"
         SRV=""
         sleep 0.3

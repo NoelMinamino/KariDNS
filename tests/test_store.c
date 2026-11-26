@@ -2391,8 +2391,9 @@ static int fill_to_build(store_t *s, uint32_t *next, uint32_t limit, bool (*at_h
   }
 }
 
-/* A growth built outside the mutex is put in after a clean checkpoint was made meanwhile (the stop of a server that a straggler follows): its record is a change after the clean flag,
- * so the flag is cleared on disk first, as for any writer (the open after a reboot then rebuilds, as after every unclean stop). */
+/* A clean checkpoint made while a growth is built outside the mutex (the stop of a server) drops that build (0.7: its writes competed with the checkpoint's at the stop, and its record
+ * after the checkpoint cleared the clean flag): the flag stays set.  A straggler that writes after it clears the flag, as any writer, and the growth that is due begins again and is
+ * put in (the open after a reboot then rebuilds, as after every unclean stop). */
 static store_t *g_cg_store;
 static _Atomic int g_cg_done, g_cg_want, g_cg_idle;
 static void cg_hook(int step) {
@@ -2422,13 +2423,21 @@ static void test_clean_then_growth(void) {
     atomic_store(&g_cg_idle, 1);
     for (int w = 0; w < 10000 && atomic_load(&g_cg_done) == 0; w++) usleep(1000);
     if (atomic_load(&g_cg_done) != 1) _exit(4);
+    atomic_store(&store_test_regrow_hook, NULL);
     store_stats_t st;
     store_stats(s, &st);
-    for (int w = 0; w < 5000 && st.growths_background == 0; w++) { usleep(1000); store_stats(s, &st); }
-    if (st.growths_background == 0) _exit(5);
-    if (st.clean_flag) _exit(6);                                         /* (the growth's record cleared the flag on disk) */
-    atomic_store(&store_test_regrow_hook, NULL);
-    _exit(i > 255 ? 0 : 7);                                              /* no close */
+    for (int w = 0; w < 5000 && st.index_build_active; w++) { usleep(1000); store_stats(s, &st); }
+    if (st.index_build_active || st.growths_background != 0) _exit(5);  /* (the build that ran at the clean checkpoint was dropped, not put in) */
+    if (!st.clean_flag) _exit(6);                                        /* (and nothing changed the store after the checkpoint) */
+    const uint64_t g0 = st.growths;
+    for (uint32_t k = 0; k < 20000 && st.growths == g0; k++) {          /* (a straggler: its put clears the flag; the growth that is due begins again and is put in) */
+      if (put_i(s, 0, i++, 1, NULL) != 0) _exit(3);
+      if ((k & 63) == 0) store_stats(s, &st);
+    }
+    for (int w = 0; w < 5000 && st.growths == g0; w++) { usleep(1000); store_stats(s, &st); }
+    if (st.growths == g0) _exit(7);
+    if (st.clean_flag) _exit(8);
+    _exit(i > 255 ? 0 : 9);                                              /* no close */
   }
   int stt = 0;
   waitpid(pid, &stt, 0);
@@ -5416,7 +5425,9 @@ static void test_readahead_close(void) {
   store_test_ra_page = ra_slow_page;                                                  /* (a page that waits for the disk: 0.3 s each, 25 of them) */
   CHECK_EQ(store_open(d.fd, &o, &s), 0);
   if (s) {
-    usleep(100000);
+    /* (the thread is in its pass over the pages when the close comes: wait for its first page, up to 5 s; a fixed 0.1 s was not always enough on a busy
+     * host, pc31 2026-11-27: 2 of 5 runs with test_store running beside another one) */
+    for (int w = 0; w < 500 && atomic_load(&g_ra_calls) == 0; w++) usleep(10000);
     double t0 = mono_s();
     CHECK_EQ(store_close(s), 0);                                                       /* (before: gave up after 5 s with the thread still running over the unmapped table; the stop flag was looked at every 1 MiB) */
     double dt = mono_s() - t0;
@@ -5424,7 +5435,9 @@ static void test_readahead_close(void) {
     usleep(1000000);
     CHECK_EQ(atomic_load(&g_ra_calls), at_close);                                      /* (the thread is gone when the close returns) */
     printf("  close %.2f s, %d pages read\n", dt, at_close);
-    CHECK(dt < 2.0 && at_close >= 1 && at_close < 25);
+    CHECK(at_close >= 1);                                                              /* (the close came while the thread read) */
+    CHECK(dt < 2.0);                                                                   /* (the close waited for one page at most, not for the pass) */
+    CHECK(at_close < 25);
   }
   store_test_ra_page = NULL;
   tdir_free(&d);
@@ -5780,8 +5793,8 @@ static void test_hot_list(void) {
   size_t n = 99;
   CHECK_EQ(store_hot_read(s, &ids, &n), -ENOENT);                       /* (no file: a first start) */
   CHECK(ids == NULL && n == 0);
-  CHECK_EQ(store_hot_write(s, NULL, 0), 0);                             /* (an empty list is a list) */
-  CHECK_EQ(store_hot_read(s, &ids, &n), 0);
+  CHECK_EQ(store_hot_write(s, NULL, 0), 0);                             /* (an empty list: no file, no error) */
+  CHECK_EQ(store_hot_read(s, &ids, &n), -ENOENT);
   CHECK(ids == NULL && n == 0);
   enum { N = 5000 };
   uint32_t *w = malloc(N * sizeof(*w));
@@ -5834,6 +5847,43 @@ static void test_hot_list(void) {
     memset(zero, 0, sizeof(zero));
     CHECK_EQ(write_at(hp, 0, zero, sizeof(zero)), 0);                   /* (the state of a write that did not finish) */
     CHECK_EQ(store_hot_read(s, &ids, &n), -EBADMSG);
+  }
+  /* 0.7: hot.list is written in place with no fsync, so a crash can leave any mix of the old file and the new one on disk: only the old or the new list is taken.
+   * Old list A (N ids), new list B (N other ids): B's header on A's ids, A's header on B's ids, and B's header with A's length (a cut that did not reach the disk) */
+  {
+    uint32_t *b = malloc(N * sizeof(*b));
+    for (uint32_t i = 0; i < N; i++) b[i] = w[i] ^ 0x5a5a5u;
+    static uint8_t fa[48 + N * 4], fb[48 + N * 4];
+    CHECK_EQ(store_hot_write(s, w, N), 0);
+    CHECK_EQ(read_at(hp, 0, fa, sizeof(fa)), 0);
+    CHECK_EQ(store_hot_write(s, b, N), 0);
+    CHECK_EQ(read_at(hp, 0, fb, sizeof(fb)), 0);
+    CHECK_EQ(store_hot_read(s, &ids, &n), 0);                           /* (the new one) */
+    CHECK(n == N && ids && memcmp(ids, b, N * sizeof(*b)) == 0);
+    free(ids);
+    ids = NULL;
+    CHECK_EQ(write_at(hp, 48, fa + 48, N * 4), 0);                      /* (B's header, A's ids) */
+    CHECK_EQ(store_hot_read(s, &ids, &n), -EBADMSG);
+    CHECK(ids == NULL && n == 0);
+    CHECK_EQ(write_at(hp, 0, fa, 48), 0);                               /* (all of A: the old one) */
+    CHECK_EQ(store_hot_read(s, &ids, &n), 0);
+    CHECK(n == N && ids && memcmp(ids, w, N * sizeof(*w)) == 0);
+    free(ids);
+    ids = NULL;
+    CHECK_EQ(write_at(hp, 48, fb + 48, N * 4), 0);                      /* (A's header, B's ids) */
+    CHECK_EQ(store_hot_read(s, &ids, &n), -EBADMSG);
+    CHECK_EQ(store_hot_write(s, b, 3), 0);                              /* (B cut to 3 ids, but the file keeps the length of A) */
+    CHECK_EQ(write_at(hp, 48 + 3 * 4, fa + 48 + 3 * 4, (N - 3) * 4), 0);
+    CHECK_EQ(store_hot_read(s, &ids, &n), -EBADMSG);
+    CHECK_EQ(store_hot_write(s, b, 3), 0);
+    CHECK_EQ(store_hot_read(s, &ids, &n), 0);
+    CHECK(n == 3 && ids && memcmp(ids, b, 3 * sizeof(*b)) == 0);
+    free(ids);
+    ids = NULL;
+    CHECK_EQ(store_hot_write(s, NULL, 0), 0);                           /* (an empty list removes the file, twice is fine) */
+    CHECK_EQ(store_hot_write(s, NULL, 0), 0);
+    CHECK_EQ(store_hot_read(s, &ids, &n), -ENOENT);
+    free(b);
   }
   free(w);
   CHECK_EQ(store_close(s), 0);
@@ -7958,6 +8008,7 @@ static void test_bulk_basic(void) {
   const uint64_t seg1 = store_test_seg_bytes(s);
   CHECK(st.bulk_next_bytes >= 2 * seg1 - 4096 && st.bulk_next_bytes >= seg1 + (256u << 10));
   CHECK(st.journal_bytes_written <= jb0 + 64);                            /* (the header of the journal file the checkpoint switched to) */
+  for (int w = 0; w < 10000 && log_count(6, "bulk checkpoint 1 of the fill") == 0; w++) usleep(1000);     /* (the checkpoint thread counts it, then says it: CI 2026-11-25) */
   CHECK_EQ(log_count(6, "bulk checkpoint 1 of the fill"), 1);
   uint32_t k = 600;
   for (uint64_t seg = store_test_seg_bytes(s); seg < st.bulk_next_bytes && k < 20000; seg = store_test_seg_bytes(s)) CHECK_EQ(put_i(s, 0, k++, 2, NULL), 0);
@@ -7979,7 +8030,11 @@ static void test_bulk_basic(void) {
   CHECK_EQ(store_bulk(s), 0);
   CHECK_EQ(st.bulk_active, 0);
   CHECK(st.bulk_ended_unix > 0);
-  CHECK_EQ(st.checkpoints, ck2 + 1);
+  /* (one checkpoint ends the fill; the store logs again from here, and a checkpoint of the 200 ms interval may follow it at once when the end took longer:
+   * the coverage build, CI 2026-11-27 "6 vs 5".  So the end's own line is counted, not every checkpoint; it comes right after the flag the wait reads) */
+  CHECK(st.checkpoints >= ck2 + 1);
+  for (int w = 0; w < 10000 && log_count(6, "the end of the bulk fill is on disk") == 0; w++) usleep(1000);
+  CHECK_EQ(log_count(6, "the end of the bulk fill is on disk"), 1);
   CHECK_EQ(log_count(6, "the unlogged bulk fill is over"), 1);
   CHECK_EQ(store_bulk_end(s, STORE_BULK_END_WAIT), 0);
   const uint64_t jb1 = st.journal_bytes_written, un = st.bulk_unlogged_records;
@@ -9030,8 +9085,8 @@ static void test_priv_bound(void) {
   }
   tdir_free(&d);
 }
-/* A bulk fill: the manifest pass gets bulk checkpoints for the bound (it had none: 100M KNOWN records were 13.5 GB), which do not take ix / sx (the pass inserts into every page of them); the
- * first checkpoint after the pass takes them whole and gives them back; the end gives back the rest */
+/* A bulk fill: the manifest pass gets bulk checkpoints for the bound (it had none: 100M KNOWN records were 13.5 GB), which do not take ix / sx; the pass puts its entries into the index delta
+ * (0.7), so no generation is private during it; the build after it makes them as files; the end gives back the rest */
 static void test_priv_bulk(void) {
   printf("[a bulk fill: checkpoints for the bound during the pass (not ix / sx), ix / sx given back after it]\n");
   const uint64_t B = 256u << 10;
@@ -9048,7 +9103,7 @@ static void test_priv_bulk(void) {
   CHECK_EQ(store_bulk_begin(s), 0);
   store_bulk_phase(s, STORE_BULK_PASS);
   const uint32_t N = 30000;
-  CHECK_EQ(store_reserve(s, N), 0);                                     /* (as db_recon_begin() does: one generation made for the fill, private whole) */
+  CHECK_EQ(store_reserve(s, N), 0);                                     /* (as db_recon_begin() does: zt / zc; the index delta takes the pass) */
   store_stats_t st;
   uint64_t mtab = 0;
   for (uint32_t i = 0; i < N; i++) {
@@ -9063,7 +9118,8 @@ static void test_priv_bulk(void) {
   CHECK(ck_pass >= 5);
   CHECK_EQ(st.table_private_checkpoints, ck_pass);
   CHECK(mtab <= B + (64u << 10));
-  CHECK(ixb >= (st.ix_slots + st.sx_slots) * 8 - (64u << 10));          /* (not written during the pass) */
+  CHECK_EQ(ixb, 0);                                                     /* (0.7, the index delta: the pass inserts into no generation; before, the reserved one was private whole) */
+  CHECK_EQ(st.index_delta_active, 1);
   /* the body fill: the next call finds the index generations over the bound; that checkpoint writes them and gives them back */
   store_bulk_phase(s, STORE_BULK_BODY);
   uint64_t mall = 0;
@@ -9155,6 +9211,1272 @@ static void test_priv_conc(void) {
   tdir_free(&d);
 }
 
+/* ------------------------------------------------------------------------------------------------------------------ */
+/* 0.7: the index delta of a bulk pass and the file builder (planning ixsx bulk build: B + C + Q2)                     */
+/* ------------------------------------------------------------------------------------------------------------------ */
+
+/* a zone of a pass, made as the pass makes it: the producer gives the spill a short time between its writes when the frozen memtables wait (store_index_wait(), dns_db_recon.c) */
+static int known_w(store_t *s, uint32_t i, uint64_t ver) {
+  const int r = known_i(s, 0, i, ver);
+  (void)store_index_wait(s);
+  return r;
+}
+/* tiny structures so that every path runs at small sizes: memtables of 4 KiB (64 zones a spill), runs merged two at a time, a builder window of 64 slots (buckets, carries, the wrap) */
+static void ix_knobs(bool on) {
+  atomic_store(&store_test_dx_mem_bytes, on ? 4096u : 0u);
+  atomic_store(&store_test_dx_fan, on ? 2u : 0u);
+  atomic_store(&store_test_fb_window, on ? 64u : 0u);
+}
+/* the scratch files of the delta and the builder in a store directory */
+static int ix_scratch(const tdir_t *d) {
+  DIR *dp = opendir(d->path);
+  if (!dp) return -1;
+  int n = 0;
+  struct dirent *de;
+  while ((de = readdir(dp)) != NULL)
+    if (!strncmp(de->d_name, "ixr.", 4) || !strncmp(de->d_name, "ixb.", 4) || !strncmp(de->d_name, "sxb.", 4)) n++;
+  closedir(dp);
+  return n;
+}
+static bool ix_scratch_gone(const tdir_t *d) {
+  for (int w = 0; w < 10000; w++) {                   /* (the spill thread of a retired delta removes its runs: a bounded wait) */
+    if (ix_scratch(d) == 0) return true;
+    usleep(1000);
+  }
+  printf("  scratch files left: %d\n", ix_scratch(d));
+  return false;
+}
+static uint64_t get_dx_done(const store_stats_t *st) { return !st->index_delta_active; }
+static uint64_t get_dx_built(const store_stats_t *st) { return !st->index_delta_active && st->index_builds >= 1; }
+static uint64_t get_dx_settled(const store_stats_t *st) { return st->index_delta_frozen == 0; }
+static bool ix_wait(store_t *s, uint64_t (*get)(const store_stats_t *), const char *what) {
+  if (wait_stat(s, get, 1, 60000)) return true;
+  store_stats_t st;
+  store_stats(s, &st);
+  printf("  wait for %s failed: delta active %u frozen %u runs %llu spills %llu errors %llu, builds %llu\n", what, st.index_delta_active, st.index_delta_frozen,
+         (unsigned long long)st.index_delta_runs, (unsigned long long)st.index_delta_spills, (unsigned long long)st.index_delta_spill_errors, (unsigned long long)st.index_builds);
+  return false;
+}
+/* zone i (KNOWN or STORED) is reachable by its name, its source key and among the candidates of the query path */
+static bool ix_reach(store_t *s, uint32_t i) {
+  char nm[160];
+  name_of(i, nm, sizeof(nm));
+  store_read_lock();
+  const uint32_t z = store_find(s, 0, nm, strlen(nm));
+  const uint32_t zs = store_find_source(s, (uint16_t)(i % 4), (int64_t)i + 1, 0);
+  uint32_t c[16];
+  const unsigned nc = store_find_cand(s, 0, nm, strlen(nm), c, 16);
+  bool in = false;
+  for (unsigned k = 0; k < nc; k++) in |= c[k] == z;
+  store_zone_t zi;                                      /* (a found zone reads back whole: a lookup during a pass, a build or after a rebuild has no error path) */
+  const bool ok = z != STORE_NONE && zs == z && in && store_zid_is(s, z, 0, nm, strlen(nm)) && store_zone_get(s, z, &zi) == 0 && strcmp(zi.name, nm) == 0;
+  store_read_unlock();
+  return ok;
+}
+static uint32_t ix_unreached(store_t *s, uint32_t a, uint32_t b) {
+  uint32_t bad = 0;
+  for (uint32_t i = a; i < b; i++) bad += !ix_reach(s, i);
+  return bad;
+}
+static int known_name(store_t *s, const char *nm, int64_t src) {
+  store_meta_t m = meta_of(0, 1);
+  m.source_id = src;
+  m.source = 0;
+  return store_set_known(s, 0, nm, strlen(nm), &m, NULL);
+}
+
+/* the fence search of a run: every edge (the first and the last fence, equal hashes, 0 and UINT64_MAX), and random arrays against a linear scan */
+static void test_fence_search(void) {
+  printf("[the fence search of a run: edges and random arrays against a linear scan]\n");
+  const uint64_t f[] = { 0, 5, 5, 9, UINT64_MAX };
+  CHECK_EQ(store_test_fence_lb(f, 5, 0), 0);
+  CHECK_EQ(store_test_fence_lb(f, 5, 5), 1);
+  CHECK_EQ(store_test_fence_lb(f, 5, 6), 3);
+  CHECK_EQ(store_test_fence_lb(f, 5, 9), 3);
+  CHECK_EQ(store_test_fence_lb(f, 5, 10), 4);
+  CHECK_EQ(store_test_fence_lb(f, 5, UINT64_MAX), 4);
+  const uint64_t one[] = { 1000 };
+  CHECK_EQ(store_test_fence_lb(one, 1, 0), 0);
+  CHECK_EQ(store_test_fence_lb(one, 1, 1000), 0);
+  CHECK_EQ(store_test_fence_lb(one, 1, 1001), 1);
+  const uint64_t low[] = { 0, 0, 0, 1 };              /* (the interpolated guess is far from the answer: the doubling steps) */
+  CHECK_EQ(store_test_fence_lb(low, 4, UINT64_MAX), 4);
+  CHECK_EQ(store_test_fence_lb(low, 4, 1), 3);
+  const uint64_t high[] = { UINT64_MAX - 3, UINT64_MAX - 2, UINT64_MAX - 1, UINT64_MAX };
+  CHECK_EQ(store_test_fence_lb(high, 4, 1), 0);
+  CHECK_EQ(store_test_fence_lb(high, 4, UINT64_MAX - 1), 2);
+  uint64_t a[300];
+  unsigned bad = 0;
+  for (unsigned it = 0; it < 2000; it++) {
+    const unsigned n = 1 + (unsigned)(mix64(it) % 300);
+    uint64_t x = mix64(it * 7 + 1) >> (mix64(it) % 60);
+    for (unsigned k = 0; k < n; k++) { a[k] = x; x += mix64(it ^ k) % 3 == 0 ? 0 : mix64(k + it) >> (it % 50 + 2); if (x < a[k]) x = a[k]; }
+    for (unsigned q = 0; q < 8; q++) {
+      const uint64_t h = q < 2 ? a[mix64(q + it) % n] : q == 2 ? 0 : q == 3 ? UINT64_MAX : mix64(it * 31 + q);
+      uint64_t want = 0;
+      while (want < n && a[want] < h) want++;
+      bad += store_test_fence_lb(a, n, h) != want;
+    }
+  }
+  CHECK_EQ(bad, 0);
+}
+
+/* A pass with the delta: every zone it lists is found (by name, by source, among the candidates) while it runs, with spills, merges and the Bloom filter; a miss is not; deletes, a reused
+ * zone id and a name that moves to another zone need nothing of the delta.  Then the one build of the file builder (buckets, carries, the wrap): the same answers, the counters of a
+ * rebuild, no scratch file, the generations on disk as in memory; a reopen trusts them. */
+static void test_dx_pass(void) {
+  printf("[a pass with the index delta: lookups during it (memtables, runs, merges, Bloom), deletes and reused ids; then the file builder]\n");
+  ix_knobs(true);
+  tdir_t d;
+  tdir_new(&d, "dxpass");
+  store_opts_t o;
+  bulk_opts(&o);
+  store_t *s = NULL;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (!s) { ix_knobs(false); tdir_free(&d); return; }
+  CHECK_EQ(store_view_add(s, "default"), 0);
+  CHECK_EQ(store_bulk_begin(s), 0);
+  store_bulk_phase(s, STORE_BULK_PASS);
+  store_stats_t st;
+  store_stats(s, &st);
+  CHECK_EQ(st.index_delta_active, 1);
+  CHECK_EQ(st.index_delta_bytes, 0);                  /* (no memtable before the first insert) */
+  const uint64_t slots0 = st.ix_slots;
+  CHECK_EQ(store_reserve(s, 3000), 0);                /* (no index reserve with a delta: zt / zc only) */
+  store_stats(s, &st);
+  CHECK_EQ(st.ix_slots, slots0);
+  const uint32_t N = 3000;
+  store_known_t kn[32];
+  char names[32][160];
+  store_meta_t metas[32];
+  for (uint32_t i = 0; i < N; ) {                     /* (in groups, as the pass does: room for the pending hints of a group) */
+    unsigned k = 0;
+    for (; k < 32 && i < N; k++, i++) {
+      name_of(i, names[k], sizeof(names[k]));
+      metas[k] = meta_of(i, 1);
+      kn[k].name = names[k];
+      kn[k].len = strlen(names[k]);
+      kn[k].meta = &metas[k];
+    }
+    int res[32];
+    CHECK_EQ(store_set_known_n(s, 0, kn, k, res, NULL), 0);
+    (void)store_index_wait(s);
+    for (unsigned q = 0; q < k; q++) CHECK_EQ(res[q], 0);
+  }
+  CHECK(ix_wait(s, get_dx_settled, "the spills"));
+  store_stats(s, &st);
+  printf("  %llu spills, %llu merges, %llu runs with %llu entries, Bloom %llu bytes, delta %llu bytes (peak %llu)\n", (unsigned long long)st.index_delta_spills, (unsigned long long)st.index_delta_merges,
+         (unsigned long long)st.index_delta_runs, (unsigned long long)st.index_delta_run_entries, (unsigned long long)st.index_delta_bloom_bytes, (unsigned long long)st.index_delta_bytes,
+         (unsigned long long)st.index_delta_peak_bytes);
+  CHECK(st.index_delta_spills >= 20);
+  CHECK(st.index_delta_merges >= 5);
+  CHECK(st.index_delta_runs >= 1 && st.index_delta_runs <= 12);
+  CHECK(st.index_delta_bloom_bytes >= 4096);
+  CHECK_EQ(st.ix_slots, slots0);                      /* (no growth during the pass) */
+  CHECK_EQ(st.index_waits, 0);
+  CHECK_EQ(st.index_delta_full, 0);
+  CHECK(ix_scratch(&d) >= 1);
+  CHECK_EQ(ix_unreached(s, 0, N), 0);
+  CHECK_EQ(find_i(s, 0, N + 5), STORE_NONE);          /* (misses: the Bloom filter rules the runs out, or they are verified away) */
+  uint32_t miss = 0;
+  for (uint32_t i = N; i < N + 500; i++) miss += find_i(s, 0, i) != STORE_NONE || store_find_source(s, (uint16_t)(i % 4), (int64_t)i + 1, 0) != STORE_NONE;
+  CHECK_EQ(miss, 0);
+  check_consistent(s, "delta pass");
+  /* deletes, the same name again (a new zone id, or the old one after its grace period), a source id that moves to a new name, a reused id under another name */
+  for (uint32_t i = 0; i < 100; i++) {
+    char nm[160];
+    name_of(i, nm, sizeof(nm));
+    CHECK_EQ(store_delete_name(s, 0, nm, strlen(nm)), 0);
+  }
+  for (uint32_t i = 0; i < 100; i++) CHECK_EQ(find_i(s, 0, i), STORE_NONE);
+  for (uint32_t i = 0; i < 100; i++) CHECK_EQ(store_find_source(s, (uint16_t)(i % 4), (int64_t)i + 1, 0), STORE_NONE);
+  for (uint32_t i = 0; i < 50; i++) CHECK_EQ(known_w(s, i, 2), 0);
+  CHECK_EQ(ix_unreached(s, 0, 50), 0);
+  CHECK_EQ(known_name(s, "moved-160.example.test", 165), -EEXIST);        /* (the source key of zone 164, alive, in the delta: taken) */
+  CHECK_EQ(known_name(s, "fresh-70.example.test", 9000001), 0);
+  store_read_lock();
+  const uint32_t zf = store_find(s, 0, "fresh-70.example.test", 21);
+  store_read_unlock();
+  CHECK(zf != STORE_NONE);
+  CHECK_EQ(store_find_source(s, 0, 9000001, 0), zf);
+  for (uint32_t i = 50; i < 100; i++) CHECK_EQ(find_i(s, 0, i), STORE_NONE);   /* (their hints lead to ids that are free or another zone's now) */
+  check_consistent(s, "delta pass, deletes and reuse");
+  /* the end of the pass: one build replaces the delta */
+  store_bulk_phase(s, STORE_BULK_PASSED);
+  CHECK(ix_wait(s, get_dx_built, "the build"));        /* (the delta goes inside the mutex at the publish; the build is counted after it, once the old generations are dropped: CI 14.4 2026-11-26 read 0 builds between) */
+  store_stats(s, &st);
+  printf("  build: %llu builds, %llu buckets, %llu carries, %llu bytes written, peak %llu bytes, %llu us; ix %llu slots, %llu live\n", (unsigned long long)st.index_builds,
+         (unsigned long long)st.index_build_buckets, (unsigned long long)st.index_build_carries, (unsigned long long)st.index_build_written_bytes, (unsigned long long)st.index_build_peak_bytes,
+         (unsigned long long)st.index_build_max_us, (unsigned long long)st.ix_slots, (unsigned long long)st.ix_live);
+  CHECK(st.index_builds >= 1);
+  CHECK(st.index_build_buckets >= 2);
+  CHECK(st.index_build_carries >= 1);
+  CHECK(st.ix_slots >= 4 * (N - 50));
+  CHECK_EQ(st.ix_live, N - 50 + 1);
+  CHECK_EQ(st.ix_used, st.ix_live);
+  CHECK(st.table_private_index_bytes < st.ix_slots * 8);                  /* (the new generations are the files' pages: never a generation in private memory) */
+  CHECK_EQ(ix_unreached(s, 100, N), 0);
+  CHECK_EQ(ix_unreached(s, 0, 50), 0);
+  for (uint32_t i = 50; i < 100; i++) CHECK_EQ(find_i(s, 0, i), STORE_NONE);
+  CHECK(ix_scratch_gone(&d));
+  check_consistent(s, "after the build");
+  /* the checkpoint writes the pages the catch-up changed and syncs the generation files */
+  CHECK_EQ(store_checkpoint(s), 0);
+  CHECK(store_test_files_match(s));
+  store_bulk_phase(s, STORE_BULK_PASS);               /* (a second pass: a new delta on the new generations, and its build) */
+  store_stats(s, &st);
+  CHECK_EQ(st.index_delta_active, 1);
+  for (uint32_t i = N; i < N + 200; i++) CHECK_EQ(known_w(s, i, 1), 0);
+  CHECK_EQ(ix_unreached(s, N, N + 200), 0);
+  CHECK_EQ(store_bulk_end(s, STORE_BULK_END_WAIT), 0);  /* (with a delta: its build first, then the checkpoint that ends the fill) */
+  store_stats(s, &st);
+  CHECK_EQ(st.index_delta_active, 0);
+  CHECK_EQ(store_bulk(s), 0);
+  CHECK_EQ(st.bulk_end_pending, 0);
+  CHECK_EQ(ix_unreached(s, 100, N + 200), 0);
+  CHECK(ix_scratch_gone(&d));
+  CHECK(store_test_files_match(s));
+  check_consistent(s, "fill over");
+  CHECK_EQ(store_close(s), 0);
+  o.create = false;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (s) {
+    store_stats(s, &st);
+    CHECK(st.recovery.was_clean && !st.recovery.rebuilt);                  /* (the built generations are trusted) */
+    CHECK_EQ(ix_unreached(s, 100, N + 200), 0);
+    check_consistent(s, "reopened");
+    CHECK_EQ(store_close(s), 0);
+  }
+  ix_knobs(false);
+  tdir_free(&d);
+}
+
+/* store_bulk_end() during a pass with a delta: put off to the build (the fill ends with it); an end only if the passes had ended is dropped by a pass that begins meanwhile; a clean stop
+ * during a pass writes no ix / sx (SBF_BULK_CK): the open rebuilds them with the file builder and the fill goes on (Q4) */
+static _Atomic int g_ix_hold;
+static void ix_hold_hook(int step) {
+  if (step != 1) return;
+  while (atomic_load(&g_ix_hold) == 1) usleep(1000);
+}
+/* A delta that a build replaces while its spill thread is in a merge: the merge goes on reading its inputs' mappings, and the delta of the next pass makes runs of its
+ * own meanwhile.  Before the names were reserved for the whole store (store_t.dx_slots), the new delta took ixr.0 again (each delta had its own map of names) and opened
+ * it with O_TRUNC under the old merge: SIGBUS in dent_cmp (CI FreeBSD 14.4 2026-11-26, test_dx_conc).  Now the name of a run that any delta holds is never begun again:
+ * store.index.delta.name_clashes stays 0, and every zone is found after both passes. */
+static _Atomic int g_merge_hold, g_merge_held;
+static void dx_merge_hold_hook(store_t *s, int step) {
+  (void)s;
+  if (step != STORE_DXS_MERGE_BEGUN || !atomic_exchange(&g_merge_hold, 0)) return;   /* (the first merge only) */
+  atomic_store(&g_merge_held, 1);
+  for (int w = 0; w < 60000 && atomic_load(&g_merge_held) == 1; w++) usleep(1000);
+}
+static uint32_t dx_known_range(store_t *s, uint32_t a, uint32_t b) {
+  uint32_t refused = 0;
+  store_known_t kn[32];
+  char names[32][160];
+  store_meta_t metas[32];
+  for (uint32_t i = a; i < b; ) {
+    unsigned k = 0;
+    for (; k < 32 && i < b; k++, i++) {
+      name_of(i, names[k], sizeof(names[k]));
+      metas[k] = meta_of(i, 1);
+      kn[k].name = names[k];
+      kn[k].len = strlen(names[k]);
+      kn[k].meta = &metas[k];
+    }
+    int res[32];
+    CHECK_EQ(store_set_known_n(s, 0, kn, k, res, NULL), 0);
+    (void)store_index_wait(s);
+    for (unsigned q = 0; q < k; q++) refused += res[q] != 0;
+  }
+  return refused;
+}
+static void test_dx_name_reuse(void) {
+  printf("[a delta replaced while its spill thread merges: the next pass's delta never begins a run under a name the old merge still reads]\n");
+  ix_knobs(true);
+  tdir_t d;
+  tdir_new(&d, "dxname");
+  store_opts_t o;
+  bulk_opts(&o);
+  store_t *s = NULL;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (!s) { ix_knobs(false); tdir_free(&d); return; }
+  CHECK_EQ(store_view_add(s, "default"), 0);
+  CHECK_EQ(store_bulk_begin(s), 0);
+  store_bulk_phase(s, STORE_BULK_PASS);
+  atomic_store(&g_merge_held, 0);
+  atomic_store(&g_merge_hold, 1);
+  atomic_store(&store_test_dx_hook, dx_merge_hold_hook);
+  uint32_t n1 = 0, refused = 0;
+  while (n1 < 3000 && atomic_load(&g_merge_held) == 0) { refused += dx_known_range(s, n1, n1 + 100); n1 += 100; }
+  for (int w = 0; w < 10000 && atomic_load(&g_merge_held) == 0; w++) usleep(1000);
+  CHECK_EQ(atomic_load(&g_merge_held), 1);                                         /* (the old delta's merge waits with its inputs taken) */
+  store_bulk_phase(s, STORE_BULK_PASSED);                                           /* (the build replaces the delta: dead, its thread still in the merge) */
+  CHECK(ix_wait(s, get_dx_done, "the build of the first pass"));
+  store_bulk_phase(s, STORE_BULK_PASS);                                             /* (the next pass: a new delta with a spill thread of its own) */
+  store_stats_t st;
+  store_stats(s, &st);
+  const uint64_t sp0 = st.index_delta_spills;
+  uint32_t n2 = n1;
+  for (int round = 0; round < 30; round++) {
+    refused += dx_known_range(s, n2, n2 + 100);
+    n2 += 100;
+    store_stats(s, &st);
+    if (st.index_delta_spills > sp0) break;
+  }
+  CHECK(st.index_delta_spills > sp0);                                               /* (the new delta wrote a run while the old merge still read) */
+  atomic_store(&g_merge_held, 2);                                                   /* (the old merge reads on, then the old delta is cleaned up) */
+  CHECK(ix_wait(s, get_dx_settled, "the spills of the second pass"));
+  atomic_store(&store_test_dx_hook, NULL);
+  store_bulk_phase(s, STORE_BULK_PASSED);
+  CHECK(ix_wait(s, get_dx_built, "the build of the second pass"));
+  store_stats(s, &st);
+  printf("  first pass %u zones, second %u; %llu spills, %llu merges, %llu name clashes\n", n1, n2 - n1, (unsigned long long)st.index_delta_spills,
+         (unsigned long long)st.index_delta_merges, (unsigned long long)st.index_delta_name_clashes);
+  CHECK_EQ(st.index_delta_name_clashes, 0);
+  CHECK_EQ(refused, 0);                                                             /* (each memtable holds about 200 hints: the 100 zones after the hold fit) */
+  CHECK_EQ(ix_unreached(s, 0, n2), 0);
+  check_consistent(s, "a delta replaced during its merge");
+  CHECK_EQ(store_close(s), 0);
+  ix_knobs(false);
+  tdir_free(&d);
+}
+
+static void test_dx_end_and_stop(void) {
+  printf("[the end of a fill and a clean stop during a pass with a delta]\n");
+  ix_knobs(true);
+  tdir_t d;
+  tdir_new(&d, "dxend");
+  store_opts_t o;
+  bulk_opts(&o);
+  store_t *s = NULL;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (!s) { ix_knobs(false); tdir_free(&d); return; }
+  CHECK_EQ(store_view_add(s, "default"), 0);
+  CHECK_EQ(store_bulk_begin(s), 0);
+  store_bulk_phase(s, STORE_BULK_PASS);
+  for (uint32_t i = 0; i < 800; i++) CHECK_EQ(known_w(s, i, 1), 0);
+  /* 1. a clean stop in the pass */
+  CHECK_EQ(store_close(s), 0);
+  CHECK_EQ(ix_scratch(&d), 0);
+  o.create = false;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (!s) { ix_knobs(false); tdir_free(&d); return; }
+  store_stats_t st;
+  store_stats(s, &st);
+  CHECK(st.recovery.was_clean && st.recovery.rebuilt && st.recovery.bulk_resumed && !st.recovery.bulk_recovered);
+  CHECK_EQ(st.recovery.rebuilt_zones, 800);
+  CHECK(st.index_build_written_bytes > 0);            /* (the rebuild of the open: the file builder) */
+  CHECK_EQ(store_bulk(s), 1);
+  CHECK_EQ(ix_unreached(s, 0, 800), 0);
+  check_consistent(s, "clean stop in a pass");
+  /* 2. an end only if the passes had ended, and a pass that begins before the build is done: the fill goes on, with a new delta */
+  store_bulk_phase(s, STORE_BULK_PASS);
+  for (uint32_t i = 800; i < 1000; i++) CHECK_EQ(known_w(s, i, 1), 0);
+  atomic_store(&g_ix_hold, 1);
+  atomic_store(&store_test_regrow_hook, ix_hold_hook);
+  store_bulk_phase(s, STORE_BULK_PASSED);              /* (the build begins and waits after its scan) */
+  CHECK_EQ(store_bulk_end(s, STORE_BULK_END_IF_PASSED), 0);
+  CHECK_EQ(store_bulk(s), 2);                          /* (put off: the build ends it) */
+  for (uint32_t i = 2000; i < 2050; i++) CHECK_EQ(known_w(s, i, 1), 0);   /* (after the build's scan: its catch-up puts them in) */
+  {
+    char nm[160];
+    name_of(5, nm, sizeof(nm));
+    CHECK_EQ(store_delete_name(s, 0, nm, strlen(nm)), 0);
+  }
+  store_bulk_phase(s, STORE_BULK_PASS);
+  atomic_store(&g_ix_hold, 0);
+  for (int w = 0; w < 60000; w++) {                   /* (the build ends; a new delta takes the pass) */
+    store_stats(s, &st);
+    if (st.index_deltas >= 2) break;
+    usleep(1000);
+  }
+  atomic_store(&store_test_regrow_hook, NULL);
+  store_stats(s, &st);
+  CHECK(st.index_deltas >= 2);                         /* (the pass after the clean stop, and the one that began during the build) */
+  CHECK_EQ(st.index_delta_active, 1);
+  CHECK_EQ(store_bulk(s), 1);                          /* (not ended: a pass began) */
+  for (uint32_t i = 1000; i < 1100; i++) CHECK_EQ(known_w(s, i, 1), 0);
+  CHECK_EQ(ix_unreached(s, 0, 5) + ix_unreached(s, 6, 1100) + ix_unreached(s, 2000, 2050), 0);
+  CHECK_EQ(find_i(s, 0, 5), STORE_NONE);
+  /* 3. an end without the wait: the build makes it, then the checkpoint thread */
+  CHECK_EQ(store_bulk_end(s, 0), 0);
+  for (int w = 0; w < 60000 && (store_bulk(s) != 0 || store_bulk_pending(s)); w++) usleep(1000);
+  CHECK_EQ(store_bulk(s), 0);
+  CHECK(!store_bulk_pending(s));
+  store_stats(s, &st);
+  CHECK_EQ(st.index_delta_active, 0);
+  CHECK_EQ(ix_unreached(s, 0, 5) + ix_unreached(s, 6, 1100) + ix_unreached(s, 2000, 2050), 0);
+  CHECK_EQ(find_i(s, 0, 5), STORE_NONE);
+  check_consistent(s, "ended by the build");
+  CHECK_EQ(store_close(s), 0);
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (s) {
+    store_stats(s, &st);
+    CHECK(!st.recovery.rebuilt);
+    CHECK_EQ(ix_unreached(s, 0, 5) + ix_unreached(s, 6, 1100) + ix_unreached(s, 2000, 2050), 0);
+    CHECK_EQ(find_i(s, 0, 5), STORE_NONE);
+    CHECK_EQ(store_close(s), 0);
+  }
+  ix_knobs(false);
+  tdir_free(&d);
+}
+
+/* kill -9 at every step of a spill, a merge and the build, after the build before a checkpoint names the new generations, and in the checkpoint that syncs them: every open works, the store
+ * is consistent, the zones of the last bulk checkpoint are there, no scratch file is left */
+static _Atomic int g_ix_kill_step;
+static void ix_kill_hook(store_t *s, int step) {
+  (void)s;
+  if (step == atomic_load(&g_ix_kill_step)) kill(getpid(), SIGKILL);
+}
+static void ix_kill_ck_hook(int step) {
+  if (step == 3) kill(getpid(), SIGKILL);              /* (the checkpoint wrote and synced its tables, the generation files too, not its superblock) */
+}
+enum { IXK_AFTER_PUBLISH = 100, IXK_IN_CHECKPOINT };
+static void ix_kill_child(const tdir_t *d, const store_opts_t *o, int step) {
+  store_t *s = NULL;
+  if (store_open(d->fd, o, &s) != 0) _exit(10);
+  if (store_view_add(s, "default") != 0 || store_bulk_begin(s) != 0) _exit(11);
+  store_bulk_phase(s, STORE_BULK_PASS);
+  for (uint32_t i = 0; i < 600; i++) if (known_w(s, i, 1) != 0) _exit(12);
+  store_bulk_phase(s, STORE_BULK_BODY);
+  for (int w = 0; w < 60000; w++) {
+    store_stats_t st;
+    store_stats(s, &st);
+    if (!st.index_delta_active) break;
+    usleep(1000);
+  }
+  for (uint32_t i = 0; i < 100; i++) if (put_i(s, 0, i, 2, NULL) != 0) _exit(13);
+  if (store_checkpoint(s) != 0) _exit(14);             /* (a bulk checkpoint: the open goes back to here) */
+  atomic_store(&g_ix_kill_step, step);
+  atomic_store(&store_test_dx_hook, ix_kill_hook);
+  store_bulk_phase(s, STORE_BULK_PASS);
+  for (uint32_t i = 600; i < 1800; i++) if (known_w(s, i, 1) != 0) _exit(15);
+  for (int w = 0; w < 5000; w++) {                     /* (the spills and merges of this pass) */
+    store_stats_t st;
+    store_stats(s, &st);
+    if (st.index_delta_frozen == 0) break;
+    usleep(1000);
+  }
+  store_bulk_phase(s, STORE_BULK_PASSED);
+  for (int w = 0; w < 60000; w++) {
+    store_stats_t st;
+    store_stats(s, &st);
+    if (!st.index_delta_active) break;
+    usleep(1000);
+  }
+  if (step == IXK_AFTER_PUBLISH) kill(getpid(), SIGKILL);
+  if (step == IXK_IN_CHECKPOINT) {
+    atomic_store(&store_test_ckpt_hook, ix_kill_ck_hook);
+    (void)store_checkpoint(s);
+  }
+  _exit(20);                                           /* (the step was not reached) */
+}
+static void test_dx_kill(void) {
+  printf("[kill -9 at every step of a spill, a merge and the build of the delta, and after it]\n");
+  static const int steps[] = { STORE_DXS_SPILL_SORTED, STORE_DXS_SPILL_WRITTEN, STORE_DXS_SPILL_PUBLISHED, STORE_DXS_MERGE_WRITTEN, STORE_DXS_MERGE_PUBLISHED, STORE_FBS_SCANNED,
+                               STORE_FBS_PLACED, STORE_FBS_MAPPED, STORE_FBS_CAUGHT_UP, STORE_FBS_PUBLISHED, IXK_AFTER_PUBLISH, IXK_IN_CHECKPOINT };
+  ix_knobs(true);
+  for (unsigned k = 0; k < sizeof(steps) / sizeof(steps[0]); k++) {
+    tdir_t d;
+    tdir_new(&d, "dxkill");
+    store_opts_t o;
+    bulk_opts(&o);
+    o.no_readahead = true;
+    fflush(stdout);
+    const pid_t pid = fork();
+    if (pid == 0) ix_kill_child(&d, &o, steps[k]);
+    int status = 0;
+    CHECK(waitpid(pid, &status, 0) == pid);
+    const bool killed = WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL;
+    if (!killed) printf("  step %d: the child ended with status %d (exit %d)\n", steps[k], status, WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+    CHECK(killed);
+    store_t *s = NULL;
+    o.create = false;
+    CHECK_EQ(store_open(d.fd, &o, &s), 0);
+    if (!s) { tdir_free(&d); continue; }
+    store_stats_t st;
+    store_stats(s, &st);
+    CHECK(st.recovery.rebuilt && st.recovery.bulk_resumed);
+    CHECK_EQ(ix_scratch(&d), 0);
+    check_consistent(s, "kill in the delta or the build");
+    uint32_t bad = 0, kept = 0;
+    for (uint32_t i = 0; i < 600; i++) bad += !ix_reach(s, i);                  /* (the bulk checkpoint's zones) */
+    for (uint32_t i = 0; i < 100; i++) bad += !verify_i(s, 0, i, 2);
+    for (uint32_t i = 600; i < 1800; i++) if (find_i(s, 0, i) != STORE_NONE) { kept++; bad += !ix_reach(s, i); }
+    CHECK_EQ(bad, 0);
+    printf("  step %d: rebuilt %llu zones, %u of the second pass kept, %llu us\n", steps[k], (unsigned long long)st.recovery.rebuilt_zones, kept, (unsigned long long)st.recovery.open_us);
+    store_bulk_phase(s, STORE_BULK_PASS);                                        /* (the fill goes on) */
+    for (uint32_t i = 600; i < 1800; i++) CHECK_EQ(known_w(s, i, 1), 0);
+    CHECK_EQ(store_bulk_end(s, STORE_BULK_END_WAIT), 0);
+    CHECK_EQ(ix_unreached(s, 0, 1800), 0);
+    check_consistent(s, "the fill ended after the kill");
+    CHECK_EQ(store_close(s), 0);
+    CHECK_EQ(ix_scratch(&d), 0);
+    tdir_free(&d);
+  }
+  atomic_store(&store_test_dx_hook, NULL);
+  atomic_store(&store_test_ckpt_hook, NULL);
+  ix_knobs(false);
+}
+
+/* Growth through the builder (a logged store, Q2): the build outside the mutex makes its generations as files, so the private index memory does not grow by a generation; a big index that
+ * fills to 3/4 before the build ends is grown inside the mutex by the builder too (Q3); the rebuild drops duplicates as it places them */
+static store_t *g_ix_s;
+static _Atomic uint64_t g_ix_priv0, g_ix_priv1;
+static _Atomic int g_ix_seen;
+static void ix_priv_hook(int step) {
+  if (step != 1 || !g_ix_s) return;
+  store_stats_t st;
+  store_stats(g_ix_s, &st);
+  if (!atomic_load(&g_ix_seen)) {                     /* (the new generations are mapped, the catch-up not made: their pages are the page cache's) */
+    atomic_store(&g_ix_priv1, st.table_private_index_bytes);
+    atomic_store(&g_ix_seen, 1);
+  }
+  while (atomic_load(&g_ix_hold) == 1) usleep(1000);
+}
+/* no build of ix / sx runs (a build that the writers began may end after the call that began it: a checkpoint before its end does not hold the generation it puts in) */
+static bool ix_build_idle(store_t *s) {
+  store_stats_t st;
+  for (int w = 0; w < 60000; w++) {
+    store_stats(s, &st);
+    if (!st.index_build_active) return true;
+    usleep(1000);
+  }
+  printf("  a build of the index still runs after 60 s (builds %llu, in the mutex %llu)\n", (unsigned long long)st.index_builds, (unsigned long long)st.index_builds_in_lock);
+  return false;
+}
+static void test_fb_growth(void) {
+  printf("[growth through the file builder: no generation in private memory, the growth inside the mutex at 3/4 for a big index, the duplicates of a rebuild]\n");
+  atomic_store(&store_test_fb_window, 256u);
+  atomic_store(&store_test_rg_small, 4096u);         /* (every index is "big": the growth inside the mutex is the builder's too, at 3/4) */
+  tdir_t d;
+  tdir_new(&d, "fbgrow");
+  store_opts_t o;
+  small_opts(&o);
+  o.checkpoint_interval_ms = UINT32_MAX;
+  store_t *s = NULL;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (!s) { ix_knobs(false); tdir_free(&d); return; }
+  CHECK_EQ(store_view_add(s, "default"), 0);
+  CHECK_EQ(store_checkpoint(s), 0);
+  store_stats_t st;
+  store_stats(s, &st);
+  atomic_store(&g_ix_priv0, st.table_private_index_bytes);
+  g_ix_s = s;
+  atomic_store(&g_ix_seen, 0);
+  atomic_store(&g_ix_hold, 0);
+  atomic_store(&store_test_regrow_hook, ix_priv_hook);
+  uint32_t n = 0;
+  for (; n < 20000 && !atomic_load(&g_ix_seen); n++) CHECK_EQ(known_i(s, 0, n, 1), 0);
+  for (int w = 0; w < 60000; w++) {
+    store_stats(s, &st);
+    if (st.index_builds >= 1) break;
+    usleep(1000);
+  }
+  store_stats(s, &st);
+  CHECK(atomic_load(&g_ix_seen) == 1);
+  CHECK(st.index_builds >= 1);
+  CHECK(atomic_load(&g_ix_priv1) <= atomic_load(&g_ix_priv0) + 2 * 1024 * 8);   /* (C: at most the pages of the old generations that the writers changed; before, the new ones were anonymous whole) */
+  printf("  growth at %u zones: private index bytes %llu before the build, %llu with the new generations mapped\n", n, (unsigned long long)atomic_load(&g_ix_priv0),
+         (unsigned long long)atomic_load(&g_ix_priv1));
+  for (uint32_t i = n; i < n + 2000; i++) CHECK_EQ(known_i(s, 0, i, 1), 0);
+  n += 2000;
+  CHECK_EQ(ix_unreached(s, 0, n), 0);
+  CHECK(ix_build_idle(s));                            /* (CI 2026-11-25: the build of the last growth put its generation in after the checkpoint: the files did not match) */
+  check_consistent(s, "growth by the builder");
+  CHECK_EQ(store_checkpoint(s), 0);
+  CHECK(store_test_files_match(s));
+  /* a big index that fills to 3/4 while the build outside the mutex waits: grown inside it by the builder */
+  atomic_store(&g_ix_seen, 1);
+  atomic_store(&g_ix_hold, 1);
+  const uint64_t inlock0 = st.index_builds_in_lock;
+  for (uint32_t k = 0; k < 200000; k++) {
+    CHECK_EQ(known_i(s, 0, n++, 1), 0);
+    if ((k & 255) == 0) {
+      store_stats(s, &st);
+      if (st.index_builds_in_lock > inlock0) break;
+    }
+  }
+  store_stats(s, &st);
+  CHECK(st.index_builds_in_lock > inlock0);
+  atomic_store(&g_ix_hold, 0);
+  CHECK(ix_build_idle(s));                            /* (the build that waited ends: dropped, its files gone) */
+  atomic_store(&store_test_regrow_hook, NULL);
+  atomic_store(&store_test_rg_small, 0);
+  CHECK_EQ(ix_unreached(s, 0, n), 0);
+  check_consistent(s, "grown inside the mutex");
+  /* the rebuild's duplicates: a second cell with the name of zone 5, and one with the source key of zone 9 */
+  uint32_t z5 = find_i(s, 0, 5), z9 = find_i(s, 0, 9), z20 = find_i(s, 0, 20), z30 = find_i(s, 0, 30);
+  CHECK_EQ(store_test_forge_dup(s, z5, z20, false), 0);
+  CHECK_EQ(store_test_forge_dup(s, z9, z30, true), 0);
+  CHECK_EQ(store_repair(s), 0);
+  store_stats(s, &st);
+  CHECK_EQ(st.recovery.dropped_zones, 2);
+  CHECK_EQ(find_i(s, 0, 5), z5);
+  CHECK_EQ(store_find_source(s, 9 % 4, 10, 0), z9);
+  CHECK_EQ(find_i(s, 0, 20), STORE_NONE);
+  CHECK_EQ(find_i(s, 0, 30), STORE_NONE);
+  check_consistent(s, "rebuild with duplicates");
+  CHECK_EQ(store_close(s), 0);
+  g_ix_s = NULL;
+  CHECK_EQ(ix_scratch(&d), 0);
+  atomic_store(&store_test_fb_window, 0u);
+  tdir_free(&d);
+}
+
+/* errors: a run that cannot be written (the memtable stays and answers; tried again), a bucket or a generation that cannot be written (the build fails; the tick begins it again) */
+static int g_ix_fault_what;
+static int ix_fault(int what) { return what == g_ix_fault_what ? -ENOSPC : 0; }
+static void test_dx_faults(void) {
+  printf("[a failed write of a run, a bucket, a generation: no wrong answer, counted, tried again]\n");
+  ix_knobs(true);
+  tdir_t d;
+  tdir_new(&d, "dxfault");
+  store_opts_t o;
+  bulk_opts(&o);
+  store_t *s = NULL;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (!s) { ix_knobs(false); tdir_free(&d); return; }
+  CHECK_EQ(store_view_add(s, "default"), 0);
+  CHECK_EQ(store_bulk_begin(s), 0);
+  store_bulk_phase(s, STORE_BULK_PASS);
+  g_ix_fault_what = 1;
+  atomic_store(&store_test_ix_fault, ix_fault);
+  uint32_t n = 0, refused = 0;
+  for (; n < 4000; n++) refused += known_i(s, 0, n, 1) == -ENOSPC;          /* (no wait: the spill cannot write, the memtables fill and the writes past them are refused) */
+  store_stats_t st;
+  for (int w = 0; w < 5000; w++) { store_stats(s, &st); if (st.index_delta_spill_errors >= 1) break; usleep(1000); }
+  store_stats(s, &st);
+  printf("  %llu failed spills, %u zones refused (the memtable full with %u frozen)\n", (unsigned long long)st.index_delta_spill_errors, refused, st.index_delta_frozen);
+  CHECK(st.index_delta_spill_errors >= 1);
+  CHECK_EQ(st.index_delta_full, refused);
+  CHECK(refused > 0);
+  for (uint32_t i = 0; i < n; i++) {                 /* (a refused zone is not there; every other one is) */
+    const bool there = find_i(s, 0, i) != STORE_NONE;
+    if (there) CHECK(ix_reach(s, i));
+  }
+  check_consistent(s, "failed spills");
+  atomic_store(&store_test_ix_fault, NULL);
+  CHECK(ix_wait(s, get_dx_settled, "the spills after the fault"));
+  for (uint32_t i = 0; i < n; i++) if (find_i(s, 0, i) == STORE_NONE) CHECK_EQ(known_w(s, i, 1), 0);
+  CHECK_EQ(ix_unreached(s, 0, n), 0);
+  /* the build: a bucket, then a generation that cannot be written */
+  for (int what = 2; what <= 3; what++) {
+    g_ix_fault_what = what;
+    atomic_store(&store_test_ix_fault, ix_fault);
+    const uint64_t e0 = st.write_errors;
+    store_bulk_phase(s, STORE_BULK_BODY);
+    for (int w = 0; w < 5000; w++) { store_stats(s, &st); if (st.write_errors > e0) break; usleep(1000); }
+    store_stats(s, &st);
+    CHECK(st.write_errors > e0);
+    CHECK_EQ(st.index_delta_active, 1);                /* (the delta stays and answers) */
+    CHECK_EQ(ix_unreached(s, 0, n), 0);
+    atomic_store(&store_test_ix_fault, NULL);
+    for (int w = 0; w < 60000; w++) {                 /* (the tick begins it again a second later) */
+      (void)store_tick(s);
+      store_stats(s, &st);
+      if (!st.index_delta_active) break;
+      usleep(1000);
+    }
+    CHECK_EQ(st.index_delta_active, 0);
+    CHECK_EQ(ix_unreached(s, 0, n), 0);
+    check_consistent(s, "the build after a failed write");
+    store_bulk_phase(s, STORE_BULK_PASS);
+    for (uint32_t i = n; i < n + 100; i++) CHECK_EQ(known_w(s, i, 1), 0);
+    n += 100;
+  }
+  CHECK_EQ(store_bulk_end(s, STORE_BULK_END_WAIT), 0);
+  CHECK_EQ(ix_unreached(s, 0, n), 0);
+  CHECK_EQ(store_close(s), 0);
+  CHECK_EQ(ix_scratch(&d), 0);
+  ix_knobs(false);
+  tdir_free(&d);
+}
+
+/* A small VPS (UFS, 512 MB to 1 GB, under ~100 domains): a first fill of 100 zones makes no run, no bucket, one window; its delta is one small memtable and no Bloom filter */
+/* 0.7 "THE RESIDENT TABLES": above the budget the ticker deactivates the clean file pages the store maps (zt, zc, nx, ix, sx, the runs of a delta), never a private page; below it nothing */
+static uint64_t get_tb_sweeps(const store_stats_t *st) { return st->table_cold_sweeps; }
+static void test_table_residency(void) {
+  printf("[the resident tables: the budget by the RAM or the option, the sweep above it skips private pages and covers the runs of a delta, the data stays]\n");
+  tdir_t d;
+  tdir_new(&d, "tbres");
+  store_opts_t o;
+  small_opts(&o);
+  o.tables_private_max = UINT64_MAX;
+  o.checkpoint_interval_ms = UINT32_MAX;
+  o.physmem = 16ull << 30;
+  o.mem_limit = 2ull << 30;
+  store_t *s = NULL;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (!s) { tdir_free(&d); return; }
+  CHECK_EQ(store_view_add(s, "default"), 0);
+  for (uint32_t i = 0; i < 3000; i++) CHECK_EQ(put_i(s, 0, i, 1, NULL), 0);
+  CHECK_EQ(store_tick(s), 0);
+  store_stats_t st;
+  store_stats(s, &st);
+  CHECK_EQ(st.table_budget_bytes, (16ull << 30) - (2ull << 30) - (4ull << 30));    /* (the RAM less the memory-limit and a quarter of the RAM) */
+  CHECK(st.table_mapped_bytes >= 3000u * 128u);
+  CHECK_EQ(st.table_cold_sweeps, 0);                                                /* (far below the budget: left alone) */
+  store_set_mem_limit(s, 15ull << 30);                                              /* (a memory-limit near the RAM: an eighth of the RAM at least) */
+  CHECK_EQ(store_tick(s), 0);
+  store_stats(s, &st);
+  CHECK_EQ(st.table_budget_bytes, 2ull << 30);
+  CHECK_EQ(store_close(s), 0);
+  /* a budget below what is mapped (the option): the sweep runs; the private pages (written, no checkpoint yet) are skipped */
+  o.create = false;
+  o.table_mem = 1;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (!s) { tdir_free(&d); return; }
+  for (uint32_t i = 0; i < 3000; i++) CHECK_EQ(put_i(s, 0, i, 2, NULL), 0);
+  store_stats(s, &st);
+  const uint64_t priv = st.table_private_bytes;
+  CHECK(priv > 0);
+  CHECK_EQ(store_tick(s), 0);
+  store_stats(s, &st);
+  CHECK_EQ(st.table_budget_bytes, 1);
+  CHECK_EQ(st.table_cold_sweeps, 1);
+  printf("  mapped %" PRIu64 " bytes, %" PRIu64 " private, %" PRIu64 " deactivated in the first sweep\n", st.table_mapped_bytes, priv, st.table_cold_bytes);
+  CHECK(st.table_cold_bytes + priv <= st.table_mapped_bytes + 4u * 65536u);         /* (no private page; a sweep sees each part once at most here) */
+  CHECK_EQ(store_checkpoint(s), 0);                                                 /* (the pages are given back: clean, so the next sweeps take them) */
+  const uint64_t c0 = st.table_cold_bytes;
+  for (int k = 0; k < 4; k++) CHECK_EQ(store_tick(s), 0);
+  store_stats(s, &st);
+  CHECK(st.table_cold_bytes > c0);
+  for (uint32_t i = 0; i < 3000; i++) CHECK(verify_i(s, 0, i, 2));                  /* (a deactivated page is read again from the file) */
+  check_consistent(s, "tables deactivated");
+  CHECK_EQ(store_close(s), 0);
+  tdir_free(&d);
+  /* a pass with the index delta: its runs are swept too, and every zone is still found */
+  ix_knobs(true);
+  tdir_new(&d, "tbdx");
+  bulk_opts(&o);
+  o.table_mem = 1;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (!s) { ix_knobs(false); tdir_free(&d); return; }
+  CHECK_EQ(store_view_add(s, "default"), 0);
+  CHECK_EQ(store_bulk_begin(s), 0);
+  store_bulk_phase(s, STORE_BULK_PASS);
+  const uint32_t N = 3000;
+  store_known_t kn[32];
+  char names[32][160];
+  store_meta_t metas[32];
+  for (uint32_t i = 0; i < N; ) {
+    unsigned k = 0;
+    for (; k < 32 && i < N; k++, i++) {
+      name_of(i, names[k], sizeof(names[k]));
+      metas[k] = meta_of(i, 1);
+      kn[k].name = names[k];
+      kn[k].len = strlen(names[k]);
+      kn[k].meta = &metas[k];
+    }
+    int res[32];
+    CHECK_EQ(store_set_known_n(s, 0, kn, k, res, NULL), 0);
+    (void)store_index_wait(s);
+  }
+  CHECK(ix_wait(s, get_dx_settled, "the spills"));
+  store_stats(s, &st);
+  CHECK(st.index_delta_runs >= 1);
+  const uint64_t sw0 = st.table_cold_sweeps;
+  for (int k = 0; k < 8; k++) CHECK_EQ(store_tick(s), 0);
+  CHECK(ix_wait(s, get_tb_sweeps, "a sweep"));
+  store_stats(s, &st);
+  printf("  delta pass: %llu runs, mapped %" PRIu64 " bytes, %" PRIu64 " deactivated in %" PRIu64 " sweeps\n", (unsigned long long)st.index_delta_runs, st.table_mapped_bytes, st.table_cold_bytes,
+         st.table_cold_sweeps - sw0);
+  CHECK(st.table_cold_sweeps > sw0);
+  CHECK_EQ(ix_unreached(s, 0, N), 0);
+  check_consistent(s, "tables and runs deactivated");
+  CHECK_EQ(store_close(s), 0);
+  ix_knobs(false);
+  tdir_free(&d);
+}
+
+static void test_dx_small(void) {
+  printf("[a first fill of 100 zones with the defaults of a small VPS: one small memtable, no run, no bucket]\n");
+  tdir_t d;
+  tdir_new(&d, "dxsmall");
+  store_opts_t o;
+  bulk_opts(&o);
+  o.tables_private_max = 0;
+  o.physmem = 1ull << 30;
+  store_t *s = NULL;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (!s) { tdir_free(&d); return; }
+  CHECK_EQ(store_view_add(s, "default"), 0);
+  CHECK_EQ(store_bulk_begin(s), 0);
+  store_bulk_phase(s, STORE_BULK_PASS);
+  CHECK_EQ(store_reserve(s, 100), 0);
+  for (uint32_t i = 0; i < 100; i++) CHECK_EQ(known_w(s, i, 1), 0);
+  store_stats_t st;
+  store_stats(s, &st);
+  printf("  delta %llu bytes (peak %llu), %llu spills\n", (unsigned long long)st.index_delta_bytes, (unsigned long long)st.index_delta_peak_bytes, (unsigned long long)st.index_delta_spills);
+  CHECK(st.index_delta_peak_bytes <= 8192);           /* (before: the reserve of 1024 slots in ix and in sx, 16 KiB of anonymous index) */
+  CHECK_EQ(st.index_delta_spills, 0);
+  CHECK_EQ(st.index_delta_bloom_bytes, 0);
+  for (uint32_t i = 0; i < 100; i++) CHECK_EQ(put_i(s, 0, i, 2, NULL), 0);
+  store_bulk_phase(s, STORE_BULK_PASSED);
+  CHECK(ix_wait(s, get_dx_done, "the build"));
+  store_stats(s, &st);
+  printf("  build: peak %llu bytes, %llu written, %llu buckets; ix %llu slots\n", (unsigned long long)st.index_build_peak_bytes, (unsigned long long)st.index_build_written_bytes,
+         (unsigned long long)st.index_build_buckets, (unsigned long long)st.ix_slots);
+  CHECK_EQ(st.index_build_buckets, 0);
+  CHECK_EQ(st.index_build_carries, 0);
+  CHECK(st.index_build_peak_bytes <= 2 * 8192);
+  CHECK_EQ(ix_unreached(s, 0, 100), 0);
+  CHECK_EQ(store_bulk_end(s, STORE_BULK_END_WAIT), 0);
+  for (uint32_t i = 0; i < 100; i++) CHECK(verify_i(s, 0, i, 2));
+  CHECK_EQ(store_close(s), 0);
+  CHECK_EQ(ix_scratch(&d), 0);
+  tdir_free(&d);
+}
+
+/* the builder's carry into the next window and the wrap at the end of the table: hashes that crowd the last slots and a window border, against a table made by plain linear probing */
+static uint64_t t_pos(uint64_t h, uint64_t n) { return (uint64_t)(((unsigned __int128)h * n) >> 64); }
+static uint64_t t_val(uint64_t h, uint32_t z) { const uint32_t t = (uint32_t)h ? (uint32_t)h : 1u; return ((uint64_t)t << 32) | z; }
+static void test_fb_wrap(void) {
+  printf("[the file builder: entries carried past a window, the wrap of the last one, a table that is one window]\n");
+  tdir_t d;
+  tdir_new(&d, "fbwrap");
+  store_opts_t o;
+  small_opts(&o);
+  store_t *s = NULL;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (!s) { tdir_free(&d); return; }
+  enum { NS = 1024, NE = 300 };
+  uint64_t h[NE], out[NS], ref[NS];
+  uint32_t z[NE];
+  for (unsigned i = 0; i < NE; i++) {
+    z[i] = i + 1;
+    if (i < 120) h[i] = UINT64_MAX - ((uint64_t)i << 44) - (mix64(i) & 0xfffff);            /* (homes in the last 8 slots: they wrap to slot 0 and on) */
+    else if (i < 220) h[i] = ((uint64_t)63 << 54) + (mix64(i) & 0xffffffffffull);           /* (home 63: the end of the first window of 64 slots) */
+    else h[i] = mix64(i * 977);
+  }
+  memset(ref, 0, sizeof(ref));
+  for (unsigned i = 0; i < NE; i++)
+    for (uint64_t p = t_pos(h[i], NS);; p = (p + 1) % NS)
+      if (!ref[p]) { ref[p] = t_val(h[i], z[i]); break; }
+  for (int pass = 0; pass < 2; pass++) {               /* (windows of 64 slots: buckets, carries, the wrap; then one window: the wrap inside it) */
+    memset(out, 0xee, sizeof(out));
+    CHECK_EQ(store_test_fb_place(s, h, z, NE, NS, pass ? NS : 64, out), 0);
+    unsigned used = 0, found = 0, same = 0;
+    for (unsigned k = 0; k < NS; k++) { used += out[k] != 0; same += (out[k] != 0) == (ref[k] != 0); }
+    for (unsigned i = 0; i < NE; i++)
+      for (uint64_t p = t_pos(h[i], NS), m = 0; m < NS && out[p]; p = (p + 1) % NS, m++)
+        if (out[p] == t_val(h[i], z[i])) { found++; break; }
+    CHECK_EQ(used, NE);
+    CHECK_EQ(found, NE);
+    CHECK_EQ(same, NS);                                /* (the same slots in use as plain linear probing: the clusters are the same) */
+    CHECK(out[0] != 0 && out[NS - 1] != 0);
+  }
+  store_stats_t st;
+  store_stats(s, &st);
+  CHECK(st.index_build_carries >= 100);
+  CHECK(st.index_build_buckets >= 2);
+  CHECK_EQ(ix_scratch(&d), 0);
+  CHECK_EQ(store_close(s), 0);
+  tdir_free(&d);
+}
+
+/* the delta and the builder within the memory-limit the server gives (an eighth of it): memory-limit 8 MiB, a pass of 20000 zones and its build */
+static void test_dx_budget(void) {
+  printf("[the index delta and the builder within an eighth of memory-limit: 8 MiB, 20000 zones]\n");
+  tdir_t d;
+  tdir_new(&d, "dxbudget");
+  store_opts_t o;
+  bulk_opts(&o);
+  o.mem_limit = 64u << 20;
+  store_t *s = NULL;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (!s) { tdir_free(&d); return; }
+  store_set_mem_limit(s, 8u << 20);                    /* (a reload: from now on 1 MiB for the delta and the builder) */
+  const uint64_t B = (8u << 20) / 8;
+  CHECK_EQ(store_view_add(s, "default"), 0);
+  CHECK_EQ(store_bulk_begin(s), 0);
+  store_bulk_phase(s, STORE_BULK_PASS);
+  const uint32_t N = 20000;
+  CHECK_EQ(store_reserve(s, N), 0);
+  for (uint32_t i = 0; i < N; i++) CHECK_EQ(known_w(s, i, 1), 0);
+  CHECK(ix_wait(s, get_dx_settled, "the spills"));
+  store_bulk_phase(s, STORE_BULK_PASSED);
+  CHECK(ix_wait(s, get_dx_done, "the build"));
+  store_stats_t st;
+  store_stats(s, &st);
+  printf("  delta peak %llu bytes (%llu spills, %llu merges, Bloom %llu), build peak %llu bytes (%llu buckets); bound %llu\n", (unsigned long long)st.index_delta_peak_bytes,
+         (unsigned long long)st.index_delta_spills, (unsigned long long)st.index_delta_merges, (unsigned long long)st.index_delta_bloom_bytes, (unsigned long long)st.index_build_peak_bytes,
+         (unsigned long long)st.index_build_buckets, (unsigned long long)B);
+  CHECK(st.index_delta_peak_bytes + st.index_build_peak_bytes <= B);
+  CHECK(st.index_delta_spills >= 10);
+  CHECK(st.index_build_buckets >= 2);
+  CHECK_EQ(st.index_delta_full, 0);
+  CHECK_EQ(ix_unreached(s, 0, N), 0);
+  check_consistent(s, "within the budget");
+  CHECK_EQ(store_bulk_end(s, STORE_BULK_END_WAIT), 0);
+  CHECK_EQ(store_close(s), 0);
+  CHECK_EQ(ix_scratch(&d), 0);
+  tdir_free(&d);
+}
+
+/* The spill held (a disk that stalls) under the budget of memory-limit 4m: the memtables fill and the delta refuses zones (-ENOSPC).  Every zone it took is there, during the pass, after a
+ * clean stop and the open (its rebuild), and the refused ones are not; after a kill -9 the fill goes back to its last bulk checkpoint (the zones of the body phase before it are there) */
+static _Atomic int g_dx_hold;
+static void dx_hold_hook(store_t *s, int step) {
+  (void)s;
+  if (step == STORE_DXS_SPILL_SORTED) while (atomic_load(&g_dx_hold)) usleep(1000);
+}
+static uint32_t ix_hold_fill(store_t *s, uint32_t from, uint32_t n, uint8_t *took) {
+  uint32_t refused = 0;
+  for (uint32_t i = from; i < from + n; i++) {
+    const int r = known_i(s, 0, i, 1);
+    took[i] = r == 0;
+    if (r == -ENOSPC) refused++;
+    else CHECK_EQ(r, 0);
+  }
+  return refused;
+}
+static void test_dx_hold(void) {
+  printf("[the spill held under memory-limit 4m: refused zones, the zones taken survive a clean stop; a kill -9 goes back to the last bulk checkpoint]\n");
+  enum { NH = 12000 };
+  static uint8_t took[2 * NH];
+  for (int variant = 0; variant < 2; variant++) {
+    tdir_t d;
+    tdir_new(&d, "dxhold");
+    store_opts_t o;
+    bulk_opts(&o);
+    o.mem_limit = 4u << 20;
+    o.no_readahead = true;
+    fflush(stdout);
+    const pid_t pid = variant ? fork() : 0;
+    if (pid == 0) {
+      store_t *s = NULL;
+      if (store_open(d.fd, &o, &s) != 0) { if (variant) _exit(10); CHECK(0); tdir_free(&d); continue; }
+      store_view_add(s, "default");
+      store_bulk_begin(s);
+      store_bulk_phase(s, STORE_BULK_PASS);
+      for (uint32_t i = 0; i < 500; i++) (void)known_w(s, i, 1);
+      store_bulk_phase(s, STORE_BULK_BODY);              /* (a build, then images and a bulk checkpoint: the durable point of a crash) */
+      for (int w = 0; w < 60000; w++) { store_stats_t st; store_stats(s, &st); if (!st.index_delta_active) break; usleep(1000); }
+      for (uint32_t i = 0; i < 500; i++) (void)put_i(s, 0, i, 2, NULL);
+      if (store_checkpoint(s) != 0 && variant) _exit(11);
+      atomic_store(&g_dx_hold, 1);
+      atomic_store(&store_test_dx_hook, dx_hold_hook);
+      store_bulk_phase(s, STORE_BULK_PASS);
+      const uint32_t refused = ix_hold_fill(s, NH, NH, took);
+      store_stats_t st;
+      store_stats(s, &st);
+      if (!variant) {
+        printf("  %u of %u zones refused with the spill held (store.index.delta.full %llu, %u memtables frozen)\n", refused, (unsigned)NH, (unsigned long long)st.index_delta_full, st.index_delta_frozen);
+        CHECK(refused > 0);
+        CHECK_EQ(st.index_delta_full, refused);
+        uint32_t bad = 0;
+        for (uint32_t i = NH; i < 2 * NH; i++) bad += (find_i(s, 0, i) != STORE_NONE) != took[i];
+        CHECK_EQ(bad, 0);
+      }
+      atomic_store(&g_dx_hold, 0);
+      if (variant) kill(getpid(), SIGKILL);
+      atomic_store(&store_test_dx_hook, NULL);
+      CHECK(ix_wait(s, get_dx_settled, "the spills"));
+      CHECK_EQ(store_close(s), 0);
+      o.create = false;
+      CHECK_EQ(store_open(d.fd, &o, &s), 0);
+      if (s) {
+        store_stats(s, &st);
+        uint32_t bad = 0, kept = 0;
+        for (uint32_t i = NH; i < 2 * NH; i++) { const bool there = find_i(s, 0, i) != STORE_NONE; kept += there; bad += there != took[i]; }
+        for (uint32_t i = 0; i < 500; i++) bad += !verify_i(s, 0, i, 2);
+        printf("  clean stop: the open rebuilt %d, %u zones of the pass there, %llu known + %llu stored, %u wrong\n", (int)st.recovery.rebuilt, kept, (unsigned long long)st.zones_known,
+               (unsigned long long)st.zones_stored, bad);
+        CHECK_EQ(bad, 0);
+        CHECK_EQ(st.zones_stored, 500);
+        check_consistent(s, "the spill held, a clean stop");
+        CHECK_EQ(store_close(s), 0);
+      }
+      tdir_free(&d);
+      continue;
+    }
+    int status = 0;
+    CHECK(waitpid(pid, &status, 0) == pid);
+    CHECK(WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL);
+    store_t *s = NULL;
+    o.create = false;
+    CHECK_EQ(store_open(d.fd, &o, &s), 0);
+    if (s) {
+      store_stats_t st;
+      store_stats(s, &st);
+      uint32_t bad = 0;
+      for (uint32_t i = 0; i < 500; i++) bad += !verify_i(s, 0, i, 2);           /* (the bulk checkpoint's images) */
+      printf("  kill -9: bulk recovered %d, %llu known + %llu stored, %u of the checkpoint's 500 zones wrong\n", (int)st.recovery.bulk_recovered, (unsigned long long)st.zones_known,
+             (unsigned long long)st.zones_stored, bad);
+      CHECK(st.recovery.bulk_recovered);
+      CHECK_EQ(bad, 0);
+      CHECK_EQ(st.zones_stored, 500);
+      check_consistent(s, "the spill held, kill -9");
+      CHECK_EQ(store_close(s), 0);
+    }
+    tdir_free(&d);
+  }
+  atomic_store(&store_test_dx_hook, NULL);
+  atomic_store(&g_dx_hold, 0);
+}
+
+/* The stop of the server (db_store_stop()): store_checkpoint_clean(), then _exit() with the store open.  The build of a delta that ends after that clean checkpoint must not make the store
+ * unclean on disk: the next start of an unlogged fill would take it for a crash and go back to the last bulk checkpoint (CI and pc31: a restart found a filled store empty) */
+static void test_dx_clean_exit(void) {
+  printf("[a clean checkpoint, then the build of the delta ends, then _exit(): the next open finds the fill as the clean stop left it]\n");
+  tdir_t d;
+  tdir_new(&d, "dxclean");
+  store_opts_t o;
+  bulk_opts(&o);
+  o.no_readahead = true;
+  fflush(stdout);
+  const pid_t pid = fork();
+  if (pid == 0) {
+    store_t *s = NULL;
+    if (store_open(d.fd, &o, &s) != 0) _exit(10);
+    if (store_view_add(s, "default") != 0 || store_bulk_begin(s) != 0) _exit(11);
+    store_bulk_phase(s, STORE_BULK_PASS);
+    for (uint32_t i = 0; i < 3000; i++) if (known_w(s, i, 1) != 0) _exit(12);
+    atomic_store(&g_ix_hold, 1);
+    atomic_store(&store_test_regrow_hook, ix_hold_hook);
+    store_bulk_phase(s, STORE_BULK_PASSED);              /* (the build begins and waits after its scan) */
+    for (uint32_t i = 0; i < 1000; i++) if (put_i(s, 0, i, 2, NULL) != 0) _exit(13);
+    if (store_checkpoint_clean(s) != 0) _exit(14);       /* (the stop: a delta is there, the superblock says SBF_BULK_CK | SBF_CLEAN) */
+    atomic_store(&g_ix_hold, 0);
+    for (int w = 0; w < 60000; w++) {                    /* (the build ends and puts its generations in after the clean checkpoint) */
+      store_stats_t st;
+      store_stats(s, &st);
+      if (!st.index_delta_active) break;
+      usleep(1000);
+    }
+    _exit(0);                                             /* (backend_exit(): the store is not closed) */
+  }
+  int status = 0;
+  CHECK(waitpid(pid, &status, 0) == pid);
+  CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+  atomic_store(&store_test_regrow_hook, NULL);
+  atomic_store(&g_ix_hold, 0);
+  store_t *s = NULL;
+  o.create = false;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (s) {
+    store_stats_t st;
+    store_stats(s, &st);
+    printf("  open: clean %d, bulk recovered %d, rebuilt %d, %llu stored + %llu known\n", (int)st.recovery.was_clean, (int)st.recovery.bulk_recovered, (int)st.recovery.rebuilt,
+           (unsigned long long)st.zones_stored, (unsigned long long)st.zones_known);
+    CHECK(st.recovery.was_clean && !st.recovery.bulk_recovered);
+    CHECK_EQ(st.zones_stored, 1000);
+    CHECK_EQ(st.zones_known, 2000);
+    uint32_t bad = 0;
+    for (uint32_t i = 0; i < 1000; i++) bad += !verify_i(s, 0, i, 2);
+    CHECK_EQ(bad, 0);
+    CHECK_EQ(ix_unreached(s, 1000, 3000), 0);
+    check_consistent(s, "clean checkpoint, then the build");
+    CHECK_EQ(store_close(s), 0);
+  }
+  tdir_free(&d);
+}
+
+/* The growth inside the writer mutex, for sure (no build is begun on a thread of its own): a small index grows at one half in memory, a big one at 3/4 with the file builder (Q3) */
+static void test_regrow_inlock(void) {
+  printf("[the growth inside the writer mutex: a small index at one half (memory), a big one at 3/4 (the file builder)]\n");
+  tdir_t d;
+  tdir_new(&d, "regrow");
+  store_opts_t o;
+  small_opts(&o);
+  o.checkpoint_interval_ms = UINT32_MAX;
+  store_t *s = NULL;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (!s) { tdir_free(&d); return; }
+  CHECK_EQ(store_view_add(s, "default"), 0);
+  atomic_store(&store_test_no_rg_spawn, true);
+  store_stats_t st;
+  uint32_t n = 0;
+  for (; n < 50000; n++) {                             /* (a small index: the growths are made inside the mutex at one half, in memory) */
+    CHECK_EQ(known_i(s, 0, n, 1), 0);
+    if ((n & 127) == 0) { store_stats(s, &st); if (st.growths >= 2) break; }
+  }
+  store_stats(s, &st);
+  CHECK(st.growths >= 2);
+  CHECK_EQ(st.growths_background, 0);
+  CHECK_EQ(st.index_builds_in_lock, 0);
+  CHECK(st.ix_used * 2 <= st.ix_slots);
+  const uint64_t g0 = st.growths;
+  atomic_store(&store_test_rg_small, 4096u);            /* (every index is big now: not before 3/4, and with the builder) */
+  for (uint32_t k = 0; k < 200000; k++, n++) {
+    CHECK_EQ(known_i(s, 0, n, 1), 0);
+    if ((k & 127) == 0) { store_stats(s, &st); if (st.index_builds_in_lock >= 1) break; }
+  }
+  store_stats(s, &st);
+  printf("  %u zones: %llu growths (%llu with the file builder inside the mutex), ix %llu slots, %llu used\n", n, (unsigned long long)st.growths, (unsigned long long)st.index_builds_in_lock,
+         (unsigned long long)st.ix_slots, (unsigned long long)st.ix_used);
+  CHECK(st.index_builds_in_lock >= 1);
+  CHECK(st.growths > g0);
+  CHECK_EQ(st.growths_background, 0);
+  atomic_store(&store_test_no_rg_spawn, false);
+  atomic_store(&store_test_rg_small, 0);
+  CHECK_EQ(ix_unreached(s, 0, n), 0);
+  check_consistent(s, "grown inside the mutex");
+  CHECK_EQ(store_checkpoint(s), 0);
+  CHECK(store_test_files_match(s));
+  CHECK_EQ(store_close(s), 0);
+  o.create = false;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (s) {
+    store_stats(s, &st);
+    CHECK(st.recovery.was_clean && !st.recovery.rebuilt);
+    CHECK_EQ(ix_unreached(s, 0, n), 0);
+    CHECK_EQ(store_close(s), 0);
+  }
+  CHECK_EQ(ix_scratch(&d), 0);
+  tdir_free(&d);
+}
+
+/* store_bulk_end(WAIT) with a delta while the checkpoint thread's end-of-fill checkpoint is slow (its flush held 11 s, longer than the 10 s the call waited before): one checkpoint ends
+ * the fill, the call does not force a second one (CI 2026-11-25: 6 checkpoints, not 5) */
+static _Atomic int g_ck_slow;
+static void ck_slow_hook(int step) {
+  if (step == 2 && atomic_exchange(&g_ck_slow, 0)) usleep(11000000);
+}
+static void test_bulk_end_slow(void) {
+  printf("[the end of a fill with a delta and a slow checkpoint: one checkpoint, not two]\n");
+  tdir_t d;
+  tdir_new(&d, "bkslow");
+  store_opts_t o;
+  bulk_opts(&o);
+  o.log = log_cb;
+  log_clear();
+  store_t *s = NULL;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (!s) { tdir_free(&d); return; }
+  CHECK_EQ(store_view_add(s, "default"), 0);
+  CHECK_EQ(store_bulk_begin(s), 0);
+  store_bulk_phase(s, STORE_BULK_PASS);
+  for (uint32_t i = 0; i < 300; i++) CHECK_EQ(known_w(s, i, 1), 0);
+  store_stats_t st;
+  store_stats(s, &st);
+  const uint64_t ck0 = st.checkpoints;
+  atomic_store(&g_ck_slow, 1);
+  atomic_store(&store_test_ckpt_hook, ck_slow_hook);
+  const uint64_t t0 = now_ms();
+  CHECK_EQ(store_bulk_end(s, STORE_BULK_END_WAIT), 0);  /* (with the delta of the pass: its build, then the checkpoint thread's end of the fill) */
+  const uint64_t ms = now_ms() - t0;
+  atomic_store(&store_test_ckpt_hook, NULL);
+  store_stats(s, &st);
+  printf("  the end took %llu ms, %llu checkpoint(s)\n", (unsigned long long)ms, (unsigned long long)(st.checkpoints - ck0));
+  CHECK(ms >= 11000);                                   /* (the call waited for the slow one) */
+  CHECK_EQ(atomic_load(&g_ck_slow), 0);
+  CHECK_EQ(st.checkpoints, ck0 + 1);
+  CHECK_EQ(store_bulk(s), 0);
+  CHECK_EQ(st.bulk_end_pending, 0);
+  CHECK_EQ(log_count(6, "the unlogged bulk fill is over"), 1);
+  CHECK_EQ(ix_unreached(s, 0, 300), 0);
+  CHECK_EQ(store_close(s), 0);
+  tdir_free(&d);
+}
+
+/* the builder with buckets larger than one read (a bucket is read in pieces of whole entries) and more than one window: 40000 zones in windows of 32768 slots */
+static void test_fb_buckets(void) {
+  printf("[the file builder with buckets of several reads: 40000 zones, windows of 32768 slots]\n");
+  atomic_store(&store_test_fb_window, 32768u);
+  tdir_t d;
+  tdir_new(&d, "fbbkt");
+  store_opts_t o;
+  bulk_opts(&o);
+  store_t *s = NULL;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (!s) { atomic_store(&store_test_fb_window, 0u); tdir_free(&d); return; }
+  CHECK_EQ(store_view_add(s, "default"), 0);
+  CHECK_EQ(store_bulk_begin(s), 0);
+  store_bulk_phase(s, STORE_BULK_PASS);
+  const uint32_t N = 40000;
+  CHECK_EQ(store_reserve(s, N), 0);
+  for (uint32_t i = 0; i < N; i++) CHECK_EQ(known_w(s, i, 1), 0);
+  store_bulk_phase(s, STORE_BULK_PASSED);
+  CHECK(ix_wait(s, get_dx_done, "the build"));
+  store_stats_t st;
+  store_stats(s, &st);
+  printf("  %llu buckets, %llu bytes written, ix %llu slots\n", (unsigned long long)st.index_build_buckets, (unsigned long long)st.index_build_written_bytes, (unsigned long long)st.ix_slots);
+  CHECK(st.index_build_buckets >= 8);
+  CHECK(st.index_build_written_bytes > (st.ix_slots + st.sx_slots) * 8);         /* (the windows and the buckets: 12 B an entry) */
+  CHECK_EQ(ix_unreached(s, 0, N), 0);
+  check_consistent(s, "buckets of several reads");
+  CHECK_EQ(store_bulk_end(s, STORE_BULK_END_WAIT), 0);
+  CHECK_EQ(store_close(s), 0);
+  CHECK_EQ(ix_scratch(&d), 0);
+  atomic_store(&store_test_fb_window, 0u);
+  tdir_free(&d);
+}
+
+/* TSan: readers in tight loops (store_find, store_find_cand, store_find_source) while the pass spills and merges, the build puts its generations in and the delta is retired; two writers */
+typedef struct { store_t *s; _Atomic uint32_t *hi; _Atomic bool *stop; uint64_t bad, looks; } ixr_t;
+static void *ix_reader(void *arg) {
+  ixr_t *r = arg;
+  uint64_t x = (uint64_t)(uintptr_t)arg;
+  while (!atomic_load(r->stop)) {
+    const uint32_t hi = atomic_load(r->hi);
+    if (!hi) continue;
+    x = mix64(x);
+    const uint32_t i = (uint32_t)(x % hi);
+    r->bad += !ix_reach(r->s, i);
+    r->looks++;
+  }
+  return NULL;
+}
+typedef struct { store_t *s; _Atomic bool *stop; int err; } ixw_t;
+static void *ix_churn(void *arg) {                     /* (a second writer: zones 500000.. made and deleted again and again) */
+  ixw_t *w = arg;
+  for (uint32_t k = 0; !atomic_load(w->stop); k++) {
+    const uint32_t i = 500000 + (k % 300);
+    char nm[160];
+    name_of(i, nm, sizeof(nm));
+    int r = (k / 300) % 2 == 0 ? known_w(w->s, i, 1) : store_delete_name(w->s, 0, nm, strlen(nm));
+    if (r != 0 && r != -ENOENT && r != -EEXIST) w->err = r;
+    usleep(20);                                       /* (a writer of the server holds the mutex for a call, then lets the others in) */
+  }
+  return NULL;
+}
+static void test_dx_conc(void) {
+  printf("[readers in tight loops during spills, merges, the build and the retire of the delta; two writers]\n");
+  ix_knobs(true);
+  tdir_t d;
+  tdir_new(&d, "dxconc");
+  store_opts_t o;
+  bulk_opts(&o);
+  store_t *s = NULL;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (!s) { ix_knobs(false); tdir_free(&d); return; }
+  CHECK_EQ(store_view_add(s, "default"), 0);
+  CHECK_EQ(store_bulk_begin(s), 0);
+  store_bulk_phase(s, STORE_BULK_PASS);
+  _Atomic uint32_t hi = 0;
+  _Atomic bool stop = false;
+  ixr_t rd[2] = { { s, &hi, &stop, 0, 0 }, { s, &hi, &stop, 0, 0 } };
+  ixw_t wr = { s, &stop, 0 };
+  pthread_t th[3];
+  for (int k = 0; k < 2; k++) pthread_create(&th[k], NULL, ix_reader, &rd[k]);
+  pthread_create(&th[2], NULL, ix_churn, &wr);
+  const uint32_t N = UNDER_TSAN ? 2000 : 6000;
+  for (uint32_t i = 0; i < N; i++) {
+    CHECK_EQ(known_w(s, i, 1), 0);
+    atomic_store(&hi, i + 1);
+    if (i == N / 2) store_bulk_phase(s, STORE_BULK_BODY);            /* (a build in the middle; the next pass gets a new delta) */
+    if (i == N / 2 + 200) store_bulk_phase(s, STORE_BULK_PASS);
+  }
+  store_bulk_phase(s, STORE_BULK_PASSED);
+  CHECK(ix_wait(s, get_dx_done, "the build"));
+  for (int w = 0; w < 300; w++) usleep(1000);
+  atomic_store(&stop, true);
+  for (int k = 0; k < 3; k++) pthread_join(th[k], NULL);
+  printf("  %llu + %llu lookups\n", (unsigned long long)rd[0].looks, (unsigned long long)rd[1].looks);
+  CHECK_EQ(rd[0].bad + rd[1].bad, 0);
+  CHECK(rd[0].looks > 0 && rd[1].looks > 0);
+  CHECK_EQ(wr.err, 0);
+  CHECK_EQ(ix_unreached(s, 0, N), 0);
+  check_consistent(s, "concurrent delta");
+  CHECK_EQ(store_bulk_end(s, STORE_BULK_END_WAIT), 0);
+  CHECK_EQ(store_close(s), 0);
+  ix_knobs(false);
+  tdir_free(&d);
+}
+
 int main(void) {
   const char *base = getenv("KARIDNS_STORE_TESTDIR");
   snprintf(g_base, sizeof(g_base), "%s/store_test.%d", base && *base ? base : ".", (int)getpid());
@@ -9240,7 +10562,26 @@ int main(void) {
   if (WANT("bulk")) { test_bulk_end_retry(); test_bulk_dead_store(); }
   if (WANT("bulk") || WANT("repair")) { test_rebuild_torn_name(); test_rebuild_names(); }
   if (WANT("repair") || WANT("enomem")) test_open_enomem();
+  if (WANT("ixsx")) {                                    /* (0.7: the index delta of a bulk pass and the file builder) */
+    test_fence_search();
+    test_dx_pass();
+    test_dx_name_reuse();
+    test_dx_end_and_stop();
+    test_dx_small();
+    test_fb_buckets();
+    test_dx_budget();
+    test_dx_hold();
+    test_dx_clean_exit();
+    test_bulk_end_slow();
+    test_fb_wrap();
+    test_fb_growth();
+    test_regrow_inlock();
+    test_dx_faults();
+    test_dx_kill();
+  }
+  if (WANT("ixsx") || WANT("conc")) test_dx_conc();
   if (WANT("reserve")) { test_reserve_sizing(); test_reserve_ceiling(false); test_reserve_ceiling(true); }
+  if (WANT("resident")) test_table_residency();
   if (WANT("bulk") || WANT("pairs")) { test_torn_pairs(true); test_torn_pairs(false); }
   if (WANT("clk")) {
     int citers = getenv("KARIDNS_STORE_KILLC_ITERS") ? atoi(getenv("KARIDNS_STORE_KILLC_ITERS")) : (UNDER_TSAN ? 25 : store_long() ? 100 : 50);

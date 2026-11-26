@@ -60,7 +60,7 @@ zz   IN A   192.0.2.99
 EOF
 
 cat > "$W/k.conf" <<EOF
-options { port $PORT; bind-address { 127.0.0.1; }; pid-file "none"; $USER_OPT };
+options { port $PORT; bind-address { 127.0.0.1; }; pid-file "none"; answer-rrsig-queries yes; $USER_OPT };   # (X-25 reads the RRSIG with an RRSIG question)
 zone "case.test" { type master; file "$W/case.zone"; allow-update { 127.0.0.1; }; allow-transfer { 127.0.0.1; }; };
 EOF
 

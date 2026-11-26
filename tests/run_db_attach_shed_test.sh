@@ -81,7 +81,7 @@ start_srv() {
 }
 stop_srv() {
     kill -TERM "$SRV" 2>/dev/null
-    i=0; while [ $i -lt 300 ] && kill -0 "$SRV" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
+    i=0; while [ $i -lt "$KARI_STOP_WAIT_TENTHS" ] && kill -0 "$SRV" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
     kill -KILL "$SRV" 2>/dev/null
     SRV=""
 }

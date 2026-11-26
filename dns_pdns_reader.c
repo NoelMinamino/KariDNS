@@ -173,6 +173,21 @@ static int count_fields(const char *s, size_t len) {
     return n;
 }
 
+/* An SOA serial or timer: decimal digits only, up to 4294967295 (RFC 1035 3.3.13: unsigned 32-bit), any number of leading
+ * zeros (the zone parser reads them so; review of fuzz_pdns_content 2026-11-26: the reference serial was cut to 40 characters, a
+ * serial with 60 leading zeros read 0 here and 1 in the zone, and the encoding of the zone failed). */
+static bool soa_decimal(const char *d, const char *end, uint32_t *out) {
+    if (d == end) return false;
+    uint64_t v = 0;
+    for (; d < end; d++) {
+        if (*d < '0' || *d > '9') return false;
+        v = v * 10 + (uint64_t)(*d - '0');
+        if (v > 0xFFFFFFFFull) return false;
+    }
+    if (out) *out = (uint32_t)v;
+    return true;
+}
+
 bool pdns_soa_serial(const char *content, uint32_t *serial) {
     if (!content) return false;
     const char *p = content;
@@ -182,14 +197,7 @@ bool pdns_soa_serial(const char *content, uint32_t *serial) {
         while (*p && *p != ' ' && *p != '\t') p++;
         if (p == start) return false;
         if (field < 2) continue;
-        uint64_t v = 0;
-        for (const char *d = start; d < p; d++) {
-            if (*d < '0' || *d > '9') return false;
-            v = v * 10 + (uint64_t)(*d - '0');
-            if (v > 0xFFFFFFFFull) return false;
-        }
-        if (serial) *serial = (uint32_t)v;
-        return true;
+        return soa_decimal(start, p, serial);
     }
     return false;
 }
@@ -205,13 +213,7 @@ bool pdns_soa_timers(const char *content, uint32_t *refresh, uint32_t *retry, ui
         while (*p && *p != ' ' && *p != '\t') p++;
         if (p == start) return false;
         if (field < 3) continue;
-        uint64_t n = 0;
-        for (const char *d = start; d < p; d++) {
-            if (*d < '0' || *d > '9') return false;
-            n = n * 10 + (uint64_t)(*d - '0');
-            if (n > 0xFFFFFFFFull) return false;
-        }
-        v[field - 3] = (uint32_t)n;
+        if (!soa_decimal(start, p, &v[field - 3])) return false;
     }
     if (refresh) *refresh = v[0];
     if (retry) *retry = v[1];
@@ -1803,9 +1805,8 @@ int pdns_zone_finish(pdns_zone_t *z) {
             zfail(z, true, z->soa_row_id, "a presigned zone cannot have several or restricted (location, time stamp, tag) SOA records");
             return -1;
         }
-        char sb[64];
-        snprintf(sb, sizeof(sb), "0 0 %.40s", ref->rdata[2] ? ref->rdata[2] : "");
-        if (!pdns_soa_serial(sb, &z->serial)) {
+        const char *st = ref->rdata_count > 2 && ref->rdata[2] ? ref->rdata[2] : "";
+        if (!soa_decimal(st, st + strlen(st), &z->serial)) {
             zfail(z, true, z->soa_row_id, "SOA serial is not a decimal number up to 4294967295");
             return -1;
         }

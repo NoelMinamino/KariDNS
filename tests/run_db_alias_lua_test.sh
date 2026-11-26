@@ -38,7 +38,7 @@ PIDS=""
 cleanup() {
     for p in $PIDS; do kill -TERM "$p" 2>/dev/null; done
     for p in $PIDS; do
-        i=0; while [ $i -lt 100 ] && kill -0 "$p" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
+        i=0; while [ $i -lt "$KARI_STOP_WAIT_TENTHS" ] && kill -0 "$p" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
         kill -KILL "$p" 2>/dev/null
     done
     for p in $PIDS; do kari_kill_tree "$p"; done
@@ -138,7 +138,7 @@ EOF
 
 conf_file() {   # conf_file FILE PORT [options statements] [zone statements]
     cat > "$1" <<EOF
-options { pid-file "none"; bind-address { 127.0.0.1; }; port $2; $USER_OPT ${3:-} };
+options { pid-file "none"; bind-address { 127.0.0.1; }; port $2; minimal-any no; $USER_OPT ${3:-} };
 zone "alias.test." { type primary; file "$T/alias.test.zone"; allow-transfer { 127.0.0.1; }; ${4:-} };
 zone "tagged.test." { type primary; file "$T/tagged.zone"; allow-transfer { 127.0.0.1; }; };
 EOF
@@ -158,7 +158,7 @@ start_karidns() {   # start_karidns NAME CONF PORT   (sets PID_<NAME> in LAST_PI
 }
 stop_pid() {
     kill -TERM "$1" 2>/dev/null
-    i=0; while [ $i -lt 100 ] && kill -0 "$1" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
+    i=0; while [ $i -lt "$KARI_STOP_WAIT_TENTHS" ] && kill -0 "$1" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
     kill -KILL "$1" 2>/dev/null
 }
 
@@ -415,7 +415,7 @@ if [ -x ./tests/db/zone2sql ]; then
     check "zone2sql writes the ALIAS and LUA RRs as PowerDNS rows (type ALIAS / LUA)" "$(grep -c -E '\|(ALIAS|LUA)\|' "$T/records.txt")" "$n"
 fi
 # the server does not load such a zone
-printf 'options { pid-file "none"; bind-address { 127.0.0.1; }; port %s; %s };\nzone "plain.test." { type primary; file "%s"; };\nzone "bad.test." { type primary; file "%s"; };\n' "$P_SEC2" "$USER_OPT" "$T/plain.zone" "$T/both.zone" > "$T/bad.conf"
+printf 'options { pid-file "none"; bind-address { 127.0.0.1; }; port %s; minimal-any no; %s };\nzone "plain.test." { type primary; file "%s"; };\nzone "bad.test." { type primary; file "%s"; };\n' "$P_SEC2" "$USER_OPT" "$T/plain.zone" "$T/both.zone" > "$T/bad.conf"
 "$KARIDNS" -c "$T/bad.conf" -f > "$T/bad.log" 2>&1 &
 BADPID=$!; PIDS="$PIDS $BADPID"
 i=0; while [ $i -lt 100 ]; do case $(q "$P_SEC2" plain.test SOA) in 'NOERROR|'*) break ;; esac; sleep 0.1; i=$((i + 1)); done
@@ -428,7 +428,7 @@ stop_pid "$BADPID"
 # ================================================================ 4. secondary
 echo "== 4. a secondary gets the zone"
 cat > "$T/sec.conf" <<EOF
-options { pid-file "none"; bind-address { 127.0.0.1; }; port $P_SEC; $USER_OPT };
+options { pid-file "none"; bind-address { 127.0.0.1; }; port $P_SEC; minimal-any no; $USER_OPT };
 zone "alias.test." { type secondary; masters { 127.0.0.1 port $P_DEF; }; allow-transfer { 127.0.0.1; }; };
 zone "tagged.test." { type secondary; masters { 127.0.0.1 port $P_DEF; }; allow-transfer { 127.0.0.1; }; };
 EOF
@@ -452,7 +452,7 @@ fi
 stop_pid "$SECPID"
 if [ $HAVE_PDNS = 1 ]; then
     cat > "$T/sec2.conf" <<EOF
-options { pid-file "none"; bind-address { 127.0.0.1; }; port $P_SEC2; $USER_OPT };
+options { pid-file "none"; bind-address { 127.0.0.1; }; port $P_SEC2; minimal-any no; $USER_OPT };
 zone "alias.test." { type secondary; masters { 127.0.0.1 port $P_PDEF; }; allow-transfer { 127.0.0.1; }; };
 EOF
     "$KARIDNS" -c "$T/sec2.conf" -f > "$T/sec2.log" 2>&1 &
@@ -495,7 +495,7 @@ INSERT INTO domainmetadata (domain_id, kind, content) VALUES (3, 'ENABLE-LUA-REC
     install -o root -g wheel -m 755 ./karidns-dbloader "$T/karidns-dbloader" 2>/dev/null || { cp ./karidns-dbloader "$T/karidns-dbloader"; chown 0:0 "$T/karidns-dbloader"; chmod 755 "$T/karidns-dbloader"; }
     dbconf() {   # dbconf [alias-resolver statement]
         cat > "$T/db.conf" <<EOF
-options { user "nobody"; pid-file "none"; bind-address { 127.0.0.1; }; port $P_DB; ${1:-}
+options { user "nobody"; pid-file "none"; bind-address { 127.0.0.1; }; port $P_DB; minimal-any no; ${1:-}
   database { driver sqlite3; database-file "$T/db/z.db"; loader-user "nobody"; loader-path "$T/karidns-dbloader"; acl-ceiling { 127.0.0.1; }; };
 };
 EOF
