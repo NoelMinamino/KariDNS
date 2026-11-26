@@ -137,6 +137,35 @@ static void test_serialize_exact_fit_base64(void) {
     }
 }
 
+/* RFC 5155 3.1.6: the Hash Length of NSEC3 is 1 to 255 octets.  A Next Hashed Owner Name field that decodes to no
+ * octet ("0": one base32hex digit is 5 bits) was encoded with Hash Length 0, which the wire decoder and the zone image
+ * validation refuse (fuzz_pdns_content, nightly 2026-11-17 .. 11-25).  Two digits (10 bits) are one octet. */
+static void test_serialize_nsec3_hash_length(void) {
+    printf("[TEST] serialize_dns_record: NSEC3 next hashed owner name of no octet is refused (RFC 5155 3.1.6)...\n");
+    static const struct { const char *next; int ok; size_t hlen; } t[] = {
+        { "0", 0, 0 }, { "", 0, 0 }, { "00", 1, 1 }, { "2T7B4G4VSA5SMI47K61MV5BV1A22BOJR", 1, 20 },
+    };
+    for (size_t i = 0; i < sizeof(t) / sizeof(t[0]); i++) {
+        dns_record_t rec;
+        memset(&rec, 0, sizeof(rec));
+        DNS_RECORD_BIND_RDATA(rec);
+        rec.name = "a.example.";
+        rec.type_code = 50;
+        rec.class_val = 1;
+        rec.ttl_value = 60;
+        rec.rdata[0] = "1"; rec.rdata[1] = "0"; rec.rdata[2] = "5"; rec.rdata[3] = "AABB"; rec.rdata[4] = (char *)t[i].next;
+        rec.rdata[5] = "A";
+        rec.rdata_count = 6;
+        uint8_t buf[256];
+        uint16_t off = 0;
+        int rc = serialize_dns_record(buf, sizeof(buf), &off, &rec, NULL, NULL, 0xFFFFFFFFu);
+        CHECK((rc == 0) == (t[i].ok != 0));
+        if (rc == 0 && t[i].ok) CHECK(buf[11 + 10 + 5 + 2] == t[i].hlen);     /* owner 11, fixed 10, alg..salt length 5, salt 2 */
+        uint8_t rd[256];
+        CHECK((dns_record_canonical_rdata(&rec, rd, sizeof(rd)) >= 0) == (t[i].ok != 0));
+    }
+}
+
 static void test_name_label_to_text(void) {
     printf("[TEST] dns_label_to_text: RFC 4343 §2.1 escaping of one label...\n");
     const uint8_t label[] = { 'a', '.', 'b', '\\', ' ', 0x00, 0xFF, '~', '!', '(', 'Z' };
@@ -3711,6 +3740,7 @@ int main(void) {
     test_name_zone_parser_normalizes();
     test_name_tinydns_normalizes();
     test_serialize_exact_fit_base64();
+    test_serialize_nsec3_hash_length();
     test_edns_info_reset();
     test_char_string_nul();
     printf("[*] Final checks: %d checks, %d failed\n", g_checks, g_failed);

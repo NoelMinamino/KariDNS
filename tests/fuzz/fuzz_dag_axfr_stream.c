@@ -30,6 +30,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         size_t this_len = (i == num_msgs - 1) ? remaining : chunk;
         if (this_len < 12) this_len = remaining;
         print_response(p, this_len, &axfr_state, &dopt);
+        reset_dag_arena();   // run_query() resets the arena before each message of a transfer
         p += this_len;
         remaining -= this_len;
     }

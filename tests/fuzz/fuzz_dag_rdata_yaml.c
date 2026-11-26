@@ -27,6 +27,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     // Test both dopt=NULL (hash calculation path) and dopt=&dopt_yaml (+yaml display path)
     format_rdata_for_display(data, size, type, 2, rdlen, rdata_raw, sizeof(rdata_raw), NULL);
     format_rdata_for_display(data, size, type, 2, rdlen, rdata_raw, sizeof(rdata_raw), &dopt_yaml);
+    reset_dag_arena();   // the names of the RDATA live in g_dag_arena until the next reset (run_query() resets per response)
 
     return 0;
 }

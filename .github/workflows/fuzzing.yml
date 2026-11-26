@@ -1,5 +1,12 @@
 name: KariDNS Continuous Fuzzing & Stress Test
 
+# Every harness of tests/fuzz/targets.sh runs every night, in 4 shards (tests/run_fuzz_nightly.sh).  Each shard has
+# about 11 targets, runs 4 at a time for fuzz_seconds each: 3 rounds x 2700 s = 2 h 15 min, plus the VM and the build,
+# well inside the 6 h job limit.  (Until 2026-11 one job ran 41 targets x 1800 s, 2 at a time: 10.5 h, cancelled at
+# 6 h every night, 17 targets never started, and a cancelled job saved neither the corpus nor the crash input.)
+# A failing target fails its shard; its log, its crash / oom input and a rerun of that input with the output open
+# are uploaded as the artifact fuzz-shard-<n>.
+
 on:
   schedule:
     # Run every night at 19:00 UTC (04:00 JST next morning)
@@ -7,9 +14,9 @@ on:
   workflow_dispatch:
     inputs:
       fuzz_seconds:
-        description: 'Duration (in seconds) per fuzz target'
+        description: 'Duration (in seconds) per fuzz target (3 rounds per shard: keep it at most 4800)'
         required: true
-        default: '1800'
+        default: '2700'
       runs_target:
         description: 'Maximum runs per target (leave empty for time-based)'
         required: false
@@ -17,92 +24,58 @@ on:
 
 jobs:
   nightly-fuzz-freebsd:
-    name: Nightly Deep Fuzzing (FreeBSD 15.1)
+    name: Nightly Deep Fuzzing (FreeBSD 15.1, shard ${{ matrix.shard }}/4)
     runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Restore Fuzzer Corpus Cache
         uses: actions/cache/restore@v4
-        id: corpus-cache
         with:
           path: tests/fuzz/corpus_*
-          key: fuzzer-corpus-freebsd-15-${{ github.run_id }}
+          key: fuzzer-corpus-freebsd-15-shard${{ matrix.shard }}-${{ github.run_id }}
+          # the corpora of the one-job runs (before the shards) are the starting point of every shard
           restore-keys: |
+            fuzzer-corpus-freebsd-15-shard${{ matrix.shard }}-
             fuzzer-corpus-freebsd-15-
-            fuzzer-corpus-
 
       - name: Run Continuous Fuzzing in FreeBSD VM
         uses: vmactions/freebsd-vm@v1.4.8
+        # a step that runs over its time fails (the steps below still run); the shard plan ends well before
+        timeout-minutes: 330
         with:
           release: '15.1'
+          mem: '12288'
+          cpu: '4'
           run: |
             set -e
-            FUZZ_TIME="${{ inputs.fuzz_seconds || '1800' }}"
-            FUZZ_RUNS_INPUT="${{ inputs.runs_target || '' }}"
-
-            echo "::group::📦 [Build] Build all libFuzzer targets in parallel"
+            echo "::group::[Build] all libFuzzer targets"
             NCPU=$(sysctl -n hw.ncpu 2>/dev/null || echo 4)
             ./configure
             make -j"$NCPU" fuzz_all
             echo "::endgroup::"
+            FUZZ_SHARD='${{ matrix.shard }}' FUZZ_SHARDS=4 FUZZ_JOBS=4 \
+              FUZZ_SECONDS='${{ inputs.fuzz_seconds || '2700' }}' FUZZ_RUNS='${{ inputs.runs_target || '' }}' \
+              FUZZ_OUT=fuzz_out sh tests/run_fuzz_nightly.sh
 
-            echo "::group::🛡️ [Fuzzing] Continuous Deep Fuzzing (${FUZZ_TIME}s per target, max 2 parallel, rss_limit_mb=2500)"
-            FAILED=0
-            active_pids=""
-            MAX_JOBS=2
-
-            for target in fuzz_dns_wire fuzz_dns_server_core fuzz_zone_parser fuzz_zone_image fuzz_zone_image_validate fuzz_conf_parser fuzz_tsig_sign fuzz_tsig_verify \
-                          fuzz_query_engine fuzz_xfr_packet fuzz_dynamic_update fuzz_db_stream fuzz_db_image_frames fuzz_pdns_content fuzz_pdns_metadata fuzz_db_checkline fuzz_json_escape fuzz_zone_text fuzz_zone_changes fuzz_db_logline fuzz_plugin_msg fuzz_nsec3_rebuild fuzz_alias_response fuzz_forward_response fuzz_xfr_state fuzz_ipc_frame \
-                          fuzz_dag_response fuzz_dag_hash fuzz_dag_iter_classify fuzz_dag_chunked_http fuzz_dag_rdata_yaml fuzz_dag_axfr_stream fuzz_dag_cli_args fuzz_dag_batch_file \
-                          fuzz_dag_replay_pcap_reader fuzz_dag_replay_diff fuzz_dag_tcp_reassembly fuzz_tapstat fuzz_dnsqps_resp fuzz_dnsqps_args fuzz_dnsqps_msg; do
-                bin="tests/fuzz/$target"
-                corpus="tests/fuzz/corpus_$target"
-                mkdir -p "$corpus"
-                echo "[+] Fuzzing target: $target (corpus size: $(ls -1 "$corpus" 2>/dev/null | wc -l) files)"
-                if [ -n "$FUZZ_RUNS_INPUT" ]; then
-                    "$bin" -runs="$FUZZ_RUNS_INPUT" -rss_limit_mb=2500 -close_fd_mask=3 "$corpus" > "fuzz_${target}.log" 2>&1 &
-                else
-                    "$bin" -max_total_time="$FUZZ_TIME" -rss_limit_mb=2500 -close_fd_mask=3 "$corpus" > "fuzz_${target}.log" 2>&1 &
-                fi
-                active_pids="$active_pids $target:$!"
-
-                count=$(echo $active_pids | wc -w)
-                if [ "$count" -ge "$MAX_JOBS" ]; then
-                    for tp in $active_pids; do
-                        t="${tp%%:*}"
-                        p="${tp##*:}"
-                        wait $p || {
-                            echo "❌ Fuzzer target $t crashed or failed! (see fuzz_${t}.log)"
-                            tail -n 60 "fuzz_${t}.log"
-                            FAILED=1
-                        }
-                    done
-                    active_pids=""
-                fi
-            done
-
-            for tp in $active_pids; do
-                t="${tp%%:*}"
-                p="${tp##*:}"
-                wait $p || {
-                    echo "❌ Fuzzer target $t crashed or failed! (see fuzz_${t}.log)"
-                    tail -n 60 "fuzz_${t}.log"
-                    FAILED=1
-                }
-            done
-
-            if [ "$FAILED" -ne 0 ]; then
-                echo "One or more fuzzers detected crashes/memory errors!"
-                exit 1
-            fi
-            echo "🎉 All fuzz targets survived without crashes!"
-            echo "::endgroup::"
+      - name: Upload logs and crash inputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-shard-${{ matrix.shard }}
+          path: fuzz_out/
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Save Updated Fuzzer Corpus Cache
         if: always()
         uses: actions/cache/save@v4
         with:
           path: tests/fuzz/corpus_*
-          key: fuzzer-corpus-freebsd-15-${{ github.run_id }}
+          key: fuzzer-corpus-freebsd-15-shard${{ matrix.shard }}-${{ github.run_id }}

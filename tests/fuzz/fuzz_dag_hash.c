@@ -101,6 +101,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     // always-on path for a plain `dag @server name type` invocation.
     uint32_t wire_hash = 0, record_hash = 0;
     calculate_packet_hashes(data, size, &wire_hash, &record_hash);
+    reset_dag_arena();   // as run_query() does before each response: the names live in g_dag_arena until the next reset
 
     return 0;
 }
