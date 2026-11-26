@@ -1434,6 +1434,9 @@ logged and ignored.
 Sent to the manager process, stops all child processes (backend, frontend
 routers, connect broker), removes the PID file and exits. A child that has not
 ended 10 seconds after the SIGTERM it was sent is killed with SIGKILL (logged);
+the backend is given up to 120 seconds while it writes the clean checkpoint of
+the zone store of database zones (a kill there would lose an unfinished first
+fill: logged at 10 seconds);
 a second \fBSIGTERM\fR or \fBSIGINT\fR to the manager kills the remaining
 children at once. The exit status is then non-zero.
 .SH ENVIRONMENT

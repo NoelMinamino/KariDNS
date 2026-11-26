@@ -217,7 +217,9 @@ store_stmt() { if [ "${DB_DIFF_STORE:-}" = cold ] || [ "${DB_STORE:-}" = on ]; t
 store_cold_restart() {
     [ "${DB_DIFF_STORE:-}" = cold ] || return 0
     kill -TERM "$SB" 2>/dev/null
-    i=0; while [ $i -lt 100 ] && kill -0 "$SB" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
+    # (the Manager gives a Backend in the clean checkpoint of its store up to 120 s, SHUTDOWN_STORE_KILL_MS: a new server started before the old one ended finds the store
+    # "in use by another server"; suite 2026-11-26)
+    i=0; while [ $i -lt 1300 ] && kill -0 "$SB" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
     printf '#!/bin/sh\nexec sleep 100000\n' > "$1/idle-loader"; chown 0:0 "$1/idle-loader"; chmod 755 "$1/idle-loader"
     sed "s|loader-path \"[^\"]*\"|loader-path \"$1/idle-loader\"|" "$1/$2" > "$1/cold-$2"
     "$KARIDNS" -c "$1/cold-$2" -f > "$3.cold" 2>&1 &

@@ -2002,6 +2002,16 @@ typedef struct {
 } sockbuf_sizes_t;
 static sockbuf_sizes_t g_sockbuf_fallback;
 static sockbuf_sizes_t *g_sockbuf_sizes = &g_sockbuf_fallback;
+/* 0.7: the Backend that is in the stop of its zone store (backend_shutdown(): the clean checkpoint and its fsync()s) says its pid here, in the
+ * shared area of ipcd_init(), so that the Manager gives it up to SHUTDOWN_STORE_KILL_MS instead of SHUTDOWN_KILL_MS.  A kill in the middle of it
+ * is a crash of the store: an unlogged first fill goes back to its last bulk checkpoint, with no bulk checkpoint yet the empty store (suite
+ * 2026-11-26 on ZFS: the fsync() of the superblock waited for the pool's transaction group for more than 10 s).  0: none.  A pid that is
+ * not the Backend's of now (a Backend that died in its stop) is not taken for it. */
+typedef struct {
+  _Atomic int store_stop_pid;
+} stopshare_t;
+static stopshare_t g_stopshare_fallback;
+static stopshare_t *g_stopshare = &g_stopshare_fallback;
 
 /* The value of a numeric sysctl for a log line, -1 when it cannot be read. */
 static long long sysctl_num(const char *name) {
@@ -2080,13 +2090,14 @@ static struct { alignas(64) _Atomic uint64_t n; } g_ipcd_wrecv[KARIDNS_WORKER_TH
 
 STATIC_TEST void ipcd_init(void) {
   if (g_ipcd_slots) return;
-  void *p = mmap(NULL, sizeof(ipcd_slot_t) * IPCD_SLOTS + sizeof(sockbuf_sizes_t), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0);
+  void *p = mmap(NULL, sizeof(ipcd_slot_t) * IPCD_SLOTS + sizeof(sockbuf_sizes_t) + sizeof(stopshare_t), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0);
   if (p == MAP_FAILED) {
     syslog(LOG_WARNING, "[IPC] cannot map the shared drop counters (%m): what the routers drop is not counted in karictl ipcstats");
     return;
   }
   g_ipcd_slots = p;                  /* (zero filled) */
   g_sockbuf_sizes = (sockbuf_sizes_t *)(g_ipcd_slots + IPCD_SLOTS);
+  g_stopshare = (stopshare_t *)(g_sockbuf_sizes + 1);
   g_ipcd_self = &g_ipcd_slots[IPCD_BACKEND_SLOT];
 }
 
@@ -7971,6 +7982,7 @@ STATIC_TEST volatile sig_atomic_t g_supervisor_got_sighup = 0;
 STATIC_TEST volatile sig_atomic_t g_supervisor_term_count = 0; /* SIGTERM / SIGINT taken by the handler (not by sigtimedwait) */
 #define SHUTDOWN_KILL_MS 10000   /* the manager SIGKILLs the children that ignore SIGTERM for this long */
 #define SHUTDOWN_GIVEUP_MS 5000  /* ... and stops waiting for those that do not die from SIGKILL either */
+#define SHUTDOWN_STORE_KILL_MS 120000   /* 0.7: a Backend in the stop of its zone store (stopshare_t) is killed only after this long */
 
 /* X-01: ハンドラはどのスレッドでも動くので、volatile sig_atomic_t ではなくロックフリーの
  * atomic にする (C11 7.14.1.1 はハンドラと割り込まれたコードの間しか定めない)。 */
@@ -8008,7 +8020,21 @@ __attribute__((noreturn)) void backend_shutdown(int code) {
   }
   syslog(LOG_NOTICE, "[Backend] Shutting down");
   dnstap_shutdown(DNSTAP_SHUTDOWN_WAIT_MS);
+  if (db_store_enabled()) atomic_store_explicit(&g_stopshare->store_stop_pid, (int)getpid(), memory_order_release);   // 0.7: the Manager waits up to SHUTDOWN_STORE_KILL_MS (stopshare_t)
+#ifdef KARIDNS_TEST_EVICT
+  {
+    /* TEST ONLY (karidns-evict, and the instrumented karidns of `make coverage`; never a production build): a stop of the store that takes this long
+     * (tests/run_db_store_stop_wait_test.sh: the Manager does not kill it at SHUTDOWN_KILL_MS; without a store it is a Backend that is slow to end, which is killed) */
+    const char *d = getenv("KARIDNS_TEST_STORE_STOP_DELAY_MS");
+    const long ms = d ? atol(d) : 0;
+    if (ms > 0) {
+      struct timespec ts = { .tv_sec = ms / 1000, .tv_nsec = (ms % 1000) * 1000000L };
+      while (nanosleep(&ts, &ts) != 0 && errno == EINTR) {}
+    }
+  }
+#endif
   db_store_stop();                       // 0.7 store S2: what is queued is written, the store is checkpointed
+  atomic_store_explicit(&g_stopshare->store_stop_pid, 0, memory_order_release);
   backend_exit(code);
 }
 
@@ -9470,6 +9496,10 @@ int main(int argc, char **argv) {
      * signals are taken by the handler now (the mask was restored above), which counts them. */
     const int shutdown_term_count = g_supervisor_term_count;
     int64_t shutdown_start_ms = 0, kill_sent_ms = 0;
+    /* 0.7: a Backend that is still in the stop of its zone store at SHUTDOWN_KILL_MS (stopshare_t; kids[0] is the Backend) is left out of the kill
+     * then (be_wait) and killed at SHUTDOWN_STORE_KILL_MS, SHUTDOWN_KILL_MS after its store stop ended, or at once on a second SIGTERM / SIGINT */
+    bool be_wait = false;
+    int64_t be_done_ms = 0;
     while (1) {
       int status;
       pid_t w = waitpid(-1, &status, WNOHANG);
@@ -9478,17 +9508,35 @@ int main(int argc, char **argv) {
         clock_gettime(CLOCK_MONOTONIC, &now_ts);
         int64_t now_ms = (int64_t)now_ts.tv_sec * 1000 + now_ts.tv_nsec / 1000000;
         if (shutdown_start_ms == 0) shutdown_start_ms = now_ms;
-        if (kill_sent_ms == 0 &&
-            (now_ms - shutdown_start_ms >= SHUTDOWN_KILL_MS || g_supervisor_term_count != shutdown_term_count)) {
+        const bool again = g_supervisor_term_count != shutdown_term_count;
+        const bool be_store = kids[0] != 0 && atomic_load_explicit(&g_stopshare->store_stop_pid, memory_order_acquire) == (int)kids[0];
+        if (kill_sent_ms == 0 && (now_ms - shutdown_start_ms >= SHUTDOWN_KILL_MS || again)) {
           kill_sent_ms = now_ms;
           for (int k = 0; k < nkids; k++) {
             if (kids[k] == 0) continue;
+            if (k == 0 && be_store && !again) {
+              be_wait = true;
+              syslog(LOG_NOTICE, "[Manager] the Backend (pid %d) is still writing the clean checkpoint of the zone store after %d s: it is given up to %d s "
+                                 "(a kill now would be a crash of the store: a first fill would go back to its last bulk checkpoint); a second SIGTERM kills it at once",
+                     (int)kids[0], SHUTDOWN_KILL_MS / 1000, SHUTDOWN_STORE_KILL_MS / 1000);
+              continue;
+            }
             syslog(LOG_WARNING, "[Manager] Child process %d did not stop; killing it", (int)kids[k]);
             kill(kids[k], SIGKILL);
           }
           if (dbsup.enabled && dbsup.pid > 0) {
             syslog(LOG_WARNING, "[Manager] Database loader (pid %d) did not stop; killing it", (int)dbsup.pid);
             db_sup_signal(&dbsup, SIGKILL);
+          }
+        } else if (be_wait) {
+          if (!be_store && be_done_ms == 0) be_done_ms = now_ms;     /* (its store stop is over: the rest of its exit has the usual time) */
+          if (kids[0] == 0) be_wait = false;
+          else if (again || now_ms - shutdown_start_ms >= SHUTDOWN_STORE_KILL_MS || (be_done_ms != 0 && now_ms - be_done_ms >= SHUTDOWN_KILL_MS)) {
+            syslog(LOG_WARNING, "[Manager] Child process %d did not stop; killing it (%lld s after the SIGTERM%s)", (int)kids[0],
+                   (long long)((now_ms - shutdown_start_ms) / 1000), be_store ? ", still in the clean checkpoint of the zone store" : "");
+            kill(kids[0], SIGKILL);
+            be_wait = false;
+            kill_sent_ms = now_ms;
           }
         } else if (kill_sent_ms != 0 && now_ms - kill_sent_ms >= SHUTDOWN_GIVEUP_MS) {
           /* a process that does not die even from SIGKILL (a hung kernel call): do not hold the pid file forever */
