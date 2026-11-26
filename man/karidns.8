@@ -1,4 +1,4 @@
-.TH KARIDNS 8 "2026-11-26" "KariDNS" "KariDNS Manual"
+.TH KARIDNS 8 "2026-11-27" "KariDNS" "KariDNS Manual"
 .\" Generated from docs/karidns.md by man/md2man.pl (make man): edit the Markdown manual, not this page.
 .SH NAME
 karidns \- Authoritative DNS Server Daemon for FreeBSD
@@ -66,12 +66,20 @@ router and 1 worker, where the machine's 8 CPUs used to give 2 routers and 6
 workers (that was measured at half the throughput on one CPU: about 3 context
 switches per query). On 8 usable CPUs it starts 4 routers and 4 workers (it
 started 2 and 6 before 0.7: the 2 routers were saturated at about 550k queries a
-second while the workers were not). The decision is logged once at start
-(\fB[Startup] 4 routers, 4 workers (8 CPUs usable of 8)\fR, with \fB; set by
-router\-threads and worker\-threads\fR when the options set it); \fBkarictl
-status\fR shows the machine's CPUs (\fBCPUs found\fR) and the workers started
-(\fBworker threads\fR). A CPU set that is changed while the server runs is not
-noticed: restart the server.
+second while the workers were not). More workers help only when many client
+flows (address and port) reach the server: the workers own the UDP sockets
+(\fBudp\-receive backend\fR) and the kernel gives each flow to one of them by a
+hash. On 8 CPUs (minimal responses, 2026-11-26) \fBworker\-threads 8\fR answered
+950k queries a second from 192 flows where 4 + 4 answered 850k, but from 24
+flows both answered 800k and the 99th percentile of the answer time was 2 to 4
+times worse with 8 workers (0.3 to 0.66 ms against 0.16 ms), so the default
+stays 4 + 4; set \fBworker\-threads\fR to twice the routers only on a server
+with many clients that needs the last queries a second. The decision is logged
+once at start (\fB[Startup] 4 routers, 4 workers (8 CPUs usable of 8)\fR, with
+\fB; set by router\-threads and worker\-threads\fR when the options set it);
+\fBkarictl status\fR shows the machine's CPUs (\fBCPUs found\fR) and the workers
+started (\fBworker threads\fR). A CPU set that is changed while the server runs
+is not noticed: restart the server.
 .IP \(bu 2
 \fBCPUs\fR: the routers and the worker threads are not pinned to CPUs (since
 0.6.1), so the scheduler can move a thread that another busy thread displaces;

@@ -1,4 +1,4 @@
-.TH KARIDNS.CONF 5 "2026-11-26" "KariDNS" "KariDNS Manual"
+.TH KARIDNS.CONF 5 "2026-11-27" "KariDNS" "KariDNS Manual"
 .\" Generated from docs/karidns.md by man/md2man.pl (make man): edit the Markdown manual, not this page.
 .SH NAME
 karidns.conf \- the configuration file of karidns(8)
@@ -883,7 +883,9 @@ BLOCKS).
 worker threads (1..128). Not written: 1 router and 1 worker on up to 2 CPUs, 1
 and 2 on 3 CPUs, otherwise half the CPUs as routers (at most 8) and the CPUs
 that are left as workers (4 CPUs: 2 + 2, 8: 4 + 4, 16: 8 + 8), where the CPUs
-are those of the server's CPU set (see the architecture section). A router is a
+are those of the server's CPU set (see the architecture section). More workers
+than that raise the throughput only with many client flows and cost answer time
+with few (see "How many threads" in the architecture section). A router is a
 process with its own UDP sockets (the kernel spreads the clients over them by
 their address and port, so a few clients that send from one port reach one
 router) and its own queues to every worker: more routers than CPUs only add
