@@ -672,6 +672,11 @@ struct store {
   /* ---- 0.7: the index delta of a bulk pass and the file builder (dx_*, fb_*) ---- */
   _Atomic(dview_t *) dv;                              /* the delta's view (NULL: none); a reader loads it before ix / sx (acquire): the build puts the new generations in first, then clears it */
   dx_t *dx;                                           /* (the writer mutex) the delta: from the begin of a pass of an unlogged fill to the build that puts its generations in */
+  /* (the writer mutex) the run file names (ixr.<slot>) in use by any delta: a delta that was replaced by a build still has its spill thread in a merge and its
+   * runs mapped for the readers of its views until its cleanup unlinks them, while the next pass's delta makes runs of its own.  A name is given out only when
+   * no delta holds it, and taken back only after its file is unlinked (CI FreeBSD 14.4 2026-11-26, test_dx_conc: the new delta opened ixr.N with O_TRUNC
+   * while the old one's merge read it: SIGBUS in dent_cmp) */
+  uint64_t dx_slots[DX_RSLOTS / 64];
   bool rg_dx;                                         /* (the writer mutex) the running build replaces the delta (its end retires it) */
   bool dx_end_want;                                   /* (the writer mutex) store_bulk_end() came while a delta was there: the build's end ends the fill */
   bool dx_end_ifp;                                    /* (the writer mutex) ... only if the passes had ended (STORE_BULK_END_IF_PASSED): a pass that begins drops it */
@@ -679,7 +684,7 @@ struct store {
   _Atomic uint32_t dx_nf;                             /* the frozen memtables of the delta's view (store_index_wait() reads it with no read section) */
   _Atomic int dx_live;                                /* spill threads that may still touch the store (store_close() waits for them) */
   _Atomic uint64_t dx_bytes;                          /* anonymous memory of the delta: memtables, the Bloom filter, fences, the spill's sort buffer (store.index.delta.bytes; counted in memory-limit) */
-  _Atomic uint64_t dx_peak, n_dx, n_dx_spills, n_dx_merges, n_dx_spill_err, n_dx_full, n_dx_waits, dx_runs, dx_run_ents, dx_bloom_bytes, n_dx_spill_us, n_dx_scratch_bytes;
+  _Atomic uint64_t dx_peak, n_dx, n_dx_spills, n_dx_merges, n_dx_spill_err, n_dx_clash, n_dx_full, n_dx_waits, dx_runs, dx_run_ents, dx_bloom_bytes, n_dx_spill_us, n_dx_scratch_bytes;
   _Atomic uint64_t mem_limit;                         /* the memory-limit of the server (store_opts_t.mem_limit, store_set_mem_limit()): ix_budget() */
   uint64_t physmem;                                   /* the RAM (store_opts_t.physmem, else hw.physmem; 0 = unknown): tb_budget() */
   /* 0.7: the file pages the store keeps mapped (see "THE RESIDENT TABLES" at tb_sweep()).  The ticker thread's cursor, and the counters (store.tables.*) */
@@ -3824,6 +3829,7 @@ int (*_Atomic store_test_ix_fault)(int what);              /* a write of a run (
 #define DXS_SPILL_PUBLISHED STORE_DXS_SPILL_PUBLISHED
 #define DXS_MERGE_WRITTEN STORE_DXS_MERGE_WRITTEN
 #define DXS_MERGE_PUBLISHED STORE_DXS_MERGE_PUBLISHED
+#define DXS_MERGE_BEGUN STORE_DXS_MERGE_BEGUN
 #define FBS_SCANNED STORE_FBS_SCANNED
 #define FBS_PLACED STORE_FBS_PLACED
 #define FBS_MAPPED STORE_FBS_MAPPED
@@ -3969,10 +3975,20 @@ static void dx_kick(dx_t *x) {
   pthread_cond_signal(&x->cv);
   pthread_mutex_unlock(&x->mu);
 }
-static int dx_slot_get(dx_t *x) {                         /* (writer mutex) */
+/* (writer mutex) a run file name for delta x: one that no delta of the store holds (store_t.dx_slots), marked in both */
+static int dx_slot_get(store_t *s, dx_t *x) {
   for (unsigned i = 0; i < DX_RSLOTS; i++)
-    if (!((x->slots[i >> 6] >> (i & 63)) & 1)) { x->slots[i >> 6] |= 1ull << (i & 63); return (int)i; }
+    if (!((s->dx_slots[i >> 6] >> (i & 63)) & 1)) {
+      s->dx_slots[i >> 6] |= 1ull << (i & 63);
+      x->slots[i >> 6] |= 1ull << (i & 63);
+      return (int)i;
+    }
   return -1;
+}
+/* (writer mutex) the name of slot is free again: its file is unlinked (or was never made) */
+static void dx_slot_put_locked(store_t *s, dx_t *x, unsigned slot) {
+  s->dx_slots[slot >> 6] &= ~(1ull << (slot & 63));
+  x->slots[slot >> 6] &= ~(1ull << (slot & 63));
 }
 static void dx_unlink_slot(store_t *s, unsigned slot) {
   char name[32];
@@ -4041,7 +4057,13 @@ static int rw_begin(store_t *s, rw_t *w, unsigned slot, unsigned tier, uint64_t 
   w->r->tier = tier;
   char name[32];
   drun_name(name, sizeof(name), slot);
-  w->fd = st_openat(s, name, O_RDWR | O_CREAT | O_TRUNC);
+  /* (a new file, never a truncated old one: a name that is still somebody's (dx_slots should make that impossible) keeps its mapped pages when it is
+   * unlinked, where O_TRUNC would cut a mapping that a merge or a reader still reads: SIGBUS) */
+  if (unlinkat(s->dirfd, name, 0) == 0) {
+    atomic_fetch_add_explicit(&s->n_dx_clash, 1, memory_order_relaxed);
+    st_log(s, 4, "store: the run file %s of the index delta was still there when a run was begun: it was unlinked, its mapping is kept (store.index.delta.name_clashes; please report it)", name);
+  }
+  w->fd = st_openat(s, name, O_RDWR | O_CREAT | O_EXCL);
   if (w->fd < 0) return w->err = w->fd;
   s->dir_dirty = true;
   w->off = ST_HDR_PAGE;
@@ -4172,7 +4194,7 @@ static int dx_spill(store_t *s, dx_t *x) {
   const dview_t *v = x->dead ? NULL : x->v;
   if (v) snap = *v;
   dmem_t *f = v && v->nf ? v->f[0] : NULL;
-  const int slot = f ? dx_slot_get(x) : -1;
+  const int slot = f ? dx_slot_get(s, x) : -1;
   wr_unlock_raw(s);
   v = &snap;
   if (!f) return 0;
@@ -4180,7 +4202,7 @@ static int dx_spill(store_t *s, dx_t *x) {
   const uint64_t t0 = st_now_us();
   const size_t bb = (size_t)(f->n ? f->n : 1) * sizeof(dent_t);
   dent_t *buf = malloc(bb);
-  if (!buf) { wr_lock_raw(s); x->slots[slot >> 6] &= ~(1ull << (slot & 63)); wr_unlock_raw(s); return -ENOMEM; }
+  if (!buf) { wr_lock_raw(s); dx_slot_put_locked(s, x, (unsigned)slot); wr_unlock_raw(s); return -ENOMEM; }
   dx_acct(s, bb, true);
   const uint64_t n = dx_extract(f, buf);
   DX_HOOK(s, DXS_SPILL_SORTED);
@@ -4192,7 +4214,7 @@ static int dx_spill(store_t *s, dx_t *x) {
   free(buf);
   if (!run) {
     wr_lock_raw(s);
-    x->slots[slot >> 6] &= ~(1ull << (slot & 63));
+    dx_slot_put_locked(s, x, (unsigned)slot);                          /* (rw_end() unlinked its file) */
     wr_unlock_raw(s);
     dx_note_error(s, x, w.err ? w.err : -EIO, "spill");
     return w.err ? w.err : -EIO;
@@ -4204,9 +4226,11 @@ static int dx_spill(store_t *s, dx_t *x) {
   dview_t *cur = x->dead ? NULL : x->v;
   dview_t *nv = cur && cur->nr < DX_MAXR ? malloc(sizeof(*nv)) : NULL;
   if (!nv) {
-    x->slots[slot >> 6] &= ~(1ull << (slot & 63));
     wr_unlock_raw(s);
-    dx_unlink_slot(s, (unsigned)slot);
+    dx_unlink_slot(s, (unsigned)slot);                                  /* (first the file, then the name is free again: dx_slots) */
+    wr_lock_raw(s);
+    dx_slot_put_locked(s, x, (unsigned)slot);
+    wr_unlock_raw(s);
     drun_free(s, run);
     if (grown) dbloom_free(s, bl);
     return cur ? -ENOMEM : 0;
@@ -4238,10 +4262,11 @@ static int dx_merge(store_t *s, dx_t *x) {
       if (v->r[i]->tier == t) in[k++] = v->r[i];
     tier = t;
   }
-  const int slot = v && k == fan ? dx_slot_get(x) : -1;
+  const int slot = v && k == fan ? dx_slot_get(s, x) : -1;
   wr_unlock_raw(s);
   if (!v || k < fan) return 0;
   if (slot < 0) return -ENOSPC;
+  DX_HOOK(s, DXS_MERGE_BEGUN);                        /* (the inputs are taken; their mappings are read from here on, outside the mutex) */
   uint64_t total = 0, pos[DX_MAXR];
   for (unsigned i = 0; i < k; i++) { total += in[i]->n; pos[i] = 0; }
   rw_t w;
@@ -4256,7 +4281,7 @@ static int dx_merge(store_t *s, dx_t *x) {
   drun_t *out = rw_end(&w);
   if (!out) {
     wr_lock_raw(s);
-    x->slots[slot >> 6] &= ~(1ull << (slot & 63));
+    dx_slot_put_locked(s, x, (unsigned)slot);                          /* (rw_end() unlinked its file) */
     wr_unlock_raw(s);
     dx_note_error(s, x, w.err ? w.err : -EIO, "merge");
     return w.err ? w.err : -EIO;
@@ -4277,16 +4302,15 @@ static int dx_merge(store_t *s, dx_t *x) {
     nv->r[nv->nr++] = out;
     dx_publish_locked(s, x, nv);
     for (unsigned j = 0; j < k; j++) {
-      x->slots[in[j]->slot >> 6] &= ~(1ull << (in[j]->slot & 63));
+      dx_slot_put_locked(s, x, in[j]->slot);                         /* (their files were unlinked above) */
       retire_add_fn(s, drun_free, in[j]);
     }
     atomic_fetch_add_explicit(&s->n_dx_merges, 1, memory_order_relaxed);
-  } else if (cur) {                                   /* (no memory for the view: the inputs stay in it, their files are gone but mapped; the output goes) */
-    x->slots[slot >> 6] &= ~(1ull << (slot & 63));
-  }
+  }                                                   /* (no memory for the view: the inputs stay in it, their files are gone but mapped and their names held; the output goes) */
   wr_unlock_raw(s);
   if (!nv) {
     dx_unlink_slot(s, (unsigned)slot);
+    if (cur) { wr_lock_raw(s); dx_slot_put_locked(s, x, (unsigned)slot); wr_unlock_raw(s); }   /* (the file first, then the name; a dead delta leaves it to its cleanup) */
     drun_free(s, out);
     return cur ? -ENOMEM : 0;
   }
@@ -4310,6 +4334,10 @@ static void dx_cleanup(store_t *s, dx_t *x, bool locked) {
   if (!locked) wr_unlock_raw(s);
   for (unsigned i = 0; i < DX_RSLOTS; i++)
     if ((slots[i >> 6] >> (i & 63)) & 1) dx_unlink_slot(s, i);
+  /* (the names go back only now, with their files unlinked: the delta of the next pass may hold others meanwhile, never these) */
+  if (!locked) wr_lock_raw(s);
+  for (unsigned i = 0; i < DX_RSLOTS / 64; i++) s->dx_slots[i] &= ~slots[i];
+  if (!locked) wr_unlock_raw(s);
   pthread_mutex_destroy(&x->mu);
   pthread_cond_destroy(&x->cv);
   free(x);
@@ -8460,6 +8488,7 @@ void store_stats(const store_t *s, store_stats_t *o) {
   o->index_delta_merges = LD(n_dx_merges);
   o->index_delta_scratch_bytes = LD(n_dx_scratch_bytes);
   o->index_delta_spill_errors = LD(n_dx_spill_err);
+  o->index_delta_name_clashes = LD(n_dx_clash);
   o->index_delta_full = LD(n_dx_full);
   o->index_delta_waits = LD(n_dx_waits);
   o->index_builds = LD(n_fb);

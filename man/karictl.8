@@ -1,4 +1,4 @@
-.TH KARICTL 8 "2026-11-26" "KariDNS" "KariDNS Manual"
+.TH KARICTL 8 "2026-11-27" "KariDNS" "KariDNS Manual"
 .\" Generated from docs/karictl.md by man/md2man.pl (make man): edit the Markdown manual, not this page.
 .SH NAME
 karictl \- Remote Control and Management Utility for KariDNS
@@ -1240,6 +1240,12 @@ sorted by hash, read through the page cache), their entries, the memtables
 written as runs and their total time, the merges of runs, the bytes the spills
 and merges wrote. The runs are scratch: removed with the delta, and by the next
 start after a crash
+.TP 8
+\fBstore.index.delta.name_clashes\fR
+0.7: runs begun under a file name (\fBixr.<n>\fR) that was still there. The
+names are reserved for the whole store until their files are unlinked, so this
+stays 0; a value above 0 is a bug (the old file is unlinked first, so a mapping
+of it is never cut; also logged at WARNING)
 .TP 8
 \fBstore.index.delta.spill_errors\fR, \fB.full\fR, \fB.waits\fR
 0.7: writes of a run that failed (ENOSPC, EIO: the memtable stays in memory and

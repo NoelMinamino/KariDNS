@@ -9454,6 +9454,89 @@ static void ix_hold_hook(int step) {
   if (step != 1) return;
   while (atomic_load(&g_ix_hold) == 1) usleep(1000);
 }
+/* A delta that a build replaces while its spill thread is in a merge: the merge goes on reading its inputs' mappings, and the delta of the next pass makes runs of its
+ * own meanwhile.  Before the names were reserved for the whole store (store_t.dx_slots), the new delta took ixr.0 again (each delta had its own map of names) and opened
+ * it with O_TRUNC under the old merge: SIGBUS in dent_cmp (CI FreeBSD 14.4 2026-11-26, test_dx_conc).  Now the name of a run that any delta holds is never begun again:
+ * store.index.delta.name_clashes stays 0, and every zone is found after both passes. */
+static _Atomic int g_merge_hold, g_merge_held;
+static void dx_merge_hold_hook(store_t *s, int step) {
+  (void)s;
+  if (step != STORE_DXS_MERGE_BEGUN || !atomic_exchange(&g_merge_hold, 0)) return;   /* (the first merge only) */
+  atomic_store(&g_merge_held, 1);
+  for (int w = 0; w < 60000 && atomic_load(&g_merge_held) == 1; w++) usleep(1000);
+}
+static uint32_t dx_known_range(store_t *s, uint32_t a, uint32_t b) {
+  uint32_t refused = 0;
+  store_known_t kn[32];
+  char names[32][160];
+  store_meta_t metas[32];
+  for (uint32_t i = a; i < b; ) {
+    unsigned k = 0;
+    for (; k < 32 && i < b; k++, i++) {
+      name_of(i, names[k], sizeof(names[k]));
+      metas[k] = meta_of(i, 1);
+      kn[k].name = names[k];
+      kn[k].len = strlen(names[k]);
+      kn[k].meta = &metas[k];
+    }
+    int res[32];
+    CHECK_EQ(store_set_known_n(s, 0, kn, k, res, NULL), 0);
+    (void)store_index_wait(s);
+    for (unsigned q = 0; q < k; q++) refused += res[q] != 0;
+  }
+  return refused;
+}
+static void test_dx_name_reuse(void) {
+  printf("[a delta replaced while its spill thread merges: the next pass's delta never begins a run under a name the old merge still reads]\n");
+  ix_knobs(true);
+  tdir_t d;
+  tdir_new(&d, "dxname");
+  store_opts_t o;
+  bulk_opts(&o);
+  store_t *s = NULL;
+  CHECK_EQ(store_open(d.fd, &o, &s), 0);
+  if (!s) { ix_knobs(false); tdir_free(&d); return; }
+  CHECK_EQ(store_view_add(s, "default"), 0);
+  CHECK_EQ(store_bulk_begin(s), 0);
+  store_bulk_phase(s, STORE_BULK_PASS);
+  atomic_store(&g_merge_held, 0);
+  atomic_store(&g_merge_hold, 1);
+  atomic_store(&store_test_dx_hook, dx_merge_hold_hook);
+  uint32_t n1 = 0, refused = 0;
+  while (n1 < 3000 && atomic_load(&g_merge_held) == 0) { refused += dx_known_range(s, n1, n1 + 100); n1 += 100; }
+  for (int w = 0; w < 10000 && atomic_load(&g_merge_held) == 0; w++) usleep(1000);
+  CHECK_EQ(atomic_load(&g_merge_held), 1);                                         /* (the old delta's merge waits with its inputs taken) */
+  store_bulk_phase(s, STORE_BULK_PASSED);                                           /* (the build replaces the delta: dead, its thread still in the merge) */
+  CHECK(ix_wait(s, get_dx_done, "the build of the first pass"));
+  store_bulk_phase(s, STORE_BULK_PASS);                                             /* (the next pass: a new delta with a spill thread of its own) */
+  store_stats_t st;
+  store_stats(s, &st);
+  const uint64_t sp0 = st.index_delta_spills;
+  uint32_t n2 = n1;
+  for (int round = 0; round < 30; round++) {
+    refused += dx_known_range(s, n2, n2 + 100);
+    n2 += 100;
+    store_stats(s, &st);
+    if (st.index_delta_spills > sp0) break;
+  }
+  CHECK(st.index_delta_spills > sp0);                                               /* (the new delta wrote a run while the old merge still read) */
+  atomic_store(&g_merge_held, 2);                                                   /* (the old merge reads on, then the old delta is cleaned up) */
+  CHECK(ix_wait(s, get_dx_settled, "the spills of the second pass"));
+  atomic_store(&store_test_dx_hook, NULL);
+  store_bulk_phase(s, STORE_BULK_PASSED);
+  CHECK(ix_wait(s, get_dx_built, "the build of the second pass"));
+  store_stats(s, &st);
+  printf("  first pass %u zones, second %u; %llu spills, %llu merges, %llu name clashes\n", n1, n2 - n1, (unsigned long long)st.index_delta_spills,
+         (unsigned long long)st.index_delta_merges, (unsigned long long)st.index_delta_name_clashes);
+  CHECK_EQ(st.index_delta_name_clashes, 0);
+  CHECK_EQ(refused, 0);                                                             /* (each memtable holds about 200 hints: the 100 zones after the hold fit) */
+  CHECK_EQ(ix_unreached(s, 0, n2), 0);
+  check_consistent(s, "a delta replaced during its merge");
+  CHECK_EQ(store_close(s), 0);
+  ix_knobs(false);
+  tdir_free(&d);
+}
+
 static void test_dx_end_and_stop(void) {
   printf("[the end of a fill and a clean stop during a pass with a delta]\n");
   ix_knobs(true);
@@ -10478,6 +10561,7 @@ int main(void) {
   if (WANT("ixsx")) {                                    /* (0.7: the index delta of a bulk pass and the file builder) */
     test_fence_search();
     test_dx_pass();
+    test_dx_name_reuse();
     test_dx_end_and_stop();
     test_dx_small();
     test_fb_buckets();

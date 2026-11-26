@@ -756,6 +756,7 @@ static void add_store(list_t *l, const store_t *s, const store_attach_stats_t *a
   U("store.index.delta.merges", st->index_delta_merges);
   U("store.index.delta.scratch_bytes", st->index_delta_scratch_bytes);
   U("store.index.delta.spill_errors", st->index_delta_spill_errors);
+  U("store.index.delta.name_clashes", st->index_delta_name_clashes);
   U("store.index.delta.full", st->index_delta_full);
   U("store.index.delta.waits", st->index_delta_waits);
   U("store.index.build.count", st->index_builds);

@@ -348,6 +348,7 @@ typedef struct store_stats {
   uint64_t index_delta_spills, index_delta_spill_us, index_delta_merges;   /* memtables written as runs (their total time), merges of runs */
   uint64_t index_delta_scratch_bytes;   /* bytes the spills and merges wrote */
   uint64_t index_delta_spill_errors;    /* writes of a run that failed (the memtable stayed in memory; tried again) */
+  uint64_t index_delta_name_clashes;    /* 0.7: a run file name that was still there when a run was begun (unlinked first, so no mapping of it is cut; each one is a bug of the name reservation, store_t.dx_slots) */
   uint64_t index_delta_full;        /* changes refused because the memtable was full and the spill behind (-ENOSPC: the zone is listed again by the next pass) */
   uint64_t index_delta_waits;       /* store_index_wait() calls that gave the spill a short time */
   uint64_t index_builds, index_build_us, index_build_max_us;   /* builds of ix / sx outside the writer mutex by the file builder: number, total and longest time */
@@ -783,7 +784,7 @@ extern _Atomic bool store_test_no_rg_spawn;
 extern void (*_Atomic store_test_dx_hook)(store_t *s, int step);
 extern int (*_Atomic store_test_ix_fault)(int what);
 enum { STORE_DXS_SPILL_SORTED = 1, STORE_DXS_SPILL_WRITTEN, STORE_DXS_SPILL_PUBLISHED, STORE_DXS_MERGE_WRITTEN, STORE_DXS_MERGE_PUBLISHED, STORE_FBS_SCANNED, STORE_FBS_PLACED,
-       STORE_FBS_MAPPED, STORE_FBS_CAUGHT_UP, STORE_FBS_PUBLISHED };
+       STORE_FBS_MAPPED, STORE_FBS_CAUGHT_UP, STORE_FBS_PUBLISHED, STORE_DXS_MERGE_BEGUN };
 uint64_t store_test_fence_lb(const uint64_t *f, uint64_t n, uint64_t h);
 int store_test_forge_dup(store_t *s, uint32_t from, uint32_t to, bool source);
 int store_test_fb_place(store_t *s, const uint64_t *h, const uint32_t *z, size_t n, uint64_t nslots, uint64_t window, uint64_t *out);
