@@ -43,7 +43,7 @@ ADDED=""
 stop_servers() {
     for p in "$SA" "$SB" "$SC" "$SD"; do [ -n "$p" ] && kill -TERM "$p" 2>/dev/null; done
     i=0
-    while [ $i -lt 100 ]; do                       # wait for the managers (they stop their children): no sanitizer build leaves one behind
+    while [ $i -lt "$KARI_STOP_WAIT_TENTHS" ]; do                       # wait for the managers (they stop their children): no sanitizer build leaves one behind
         alive=0
         for p in "$SA" "$SB" "$SC" "$SD"; do [ -n "$p" ] && kill -0 "$p" 2>/dev/null && alive=1; done
         [ $alive -eq 0 ] && break

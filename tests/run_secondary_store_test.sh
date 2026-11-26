@@ -56,7 +56,15 @@ PPID_=""
 SPID=""
 
 cleanup() {
+    _st=$?
     set +e
+    # (a command that failed under set -e ends the script with no [FAIL] line: CI 2026-11-25 and main on pc31, 1 of 11 runs, after "D9 ... the counters".  Say where, and what the servers said)
+    if [ "$_st" != 0 ] && [ -z "${FAILED:-}" ]; then
+        echo "[FAIL] the script stopped with status $_st after the step \"${LASTPASS:-}\" (a command failed under set -e)"
+        [ -f "$W/s.log" ] && tail -20 "$W/s.log" | sed 's/^/    s: /'
+        [ -f "$W/p.log" ] && tail -10 "$W/p.log" | sed 's/^/    p: /'
+        command -v proc_state > /dev/null && proc_state "$W/secondary.conf"
+    fi
     [ -n "$PPID_" ] && kari_kill_tree "$PPID_"
     [ -n "$SPID" ] && kari_kill_tree "$SPID"
     kari_kill_conf "$W/primary.conf" "$W/secondary.conf"
@@ -65,8 +73,10 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 NPASS=0
-pass() { NPASS=$((NPASS + 1)); echo "[OK] $*"; }
+LASTPASS="(none)"; FAILED=""
+pass() { NPASS=$((NPASS + 1)); LASTPASS=$*; echo "[OK] $*"; }
 fail() {
+    FAILED=1
     echo "[FAIL] $*"
     [ -f "$W/q.txt" ] && sed 's/^/    q: /' "$W/q.txt"
     [ -f "$W/s.log" ] && tail -40 "$W/s.log" | sed 's/^/    s: /'

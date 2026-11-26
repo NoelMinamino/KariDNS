@@ -45,7 +45,7 @@ ADDED_ALIASES=""
 cleanup() {
     [ -n "$SRV" ] && kill -TERM "$SRV" 2>/dev/null
     # wait for the manager (it stops its children first; a sanitizer build is slow): a KILL too early orphans them
-    i=0; while [ -n "$SRV" ] && [ $i -lt 100 ] && kill -0 "$SRV" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
+    i=0; while [ -n "$SRV" ] && [ $i -lt "$KARI_STOP_WAIT_TENTHS" ] && kill -0 "$SRV" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
     [ -n "$SRV" ] && kill -KILL "$SRV" 2>/dev/null
     for ip in $ADDED_ALIASES; do ifconfig lo0 inet "$ip" -alias 2>/dev/null || ifconfig lo inet "$ip" -alias 2>/dev/null; done
     rm -rf "$T"
@@ -433,7 +433,7 @@ printf 'zone "a.test" { type primary; file "x"; transfer-acl-match both; };\n' >
 # ================================================================ stop
 echo "== SIGTERM"
 kill -TERM "$SRV"
-i=0; while [ $i -lt 100 ] && kill -0 "$SRV" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
+i=0; while [ $i -lt "$KARI_STOP_WAIT_TENTHS" ] && kill -0 "$SRV" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
 if kill -0 "$SRV" 2>/dev/null; then fail "karidns did not stop within 10 s"; else pass "karidns stopped"; fi
 kari_wait_no_proc "karidns.*$T" 15 || true
 LEFT=$(pgrep -f "karidns.*$T" | tr '\n' ' ')

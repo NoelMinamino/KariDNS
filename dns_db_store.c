@@ -1901,10 +1901,12 @@ static void tables_charge(uint64_t priv, int64_t now_ms, int64_t *warned_ms) {
  * fill does not end before it).  The end itself is the checkpoint thread's (store_bulk_end() does not wait), and only while no pass began meanwhile (STORE_BULK_END_IF_PASSED).  Ticker thread only */
 static void bulk_end_check(store_t *st) {
   static bool armed;
+  static bool asked;                                         /* (0.7: with an index delta the end waits for its build: the call is repeated, the line said once) */
   static uint64_t idle0;
   static unsigned quiet;
   if (store_bulk(st) != 2) {
     armed = false;
+    asked = false;
     return;
   }
   db_recon_status_t r;
@@ -1921,7 +1923,8 @@ static void bulk_end_check(store_t *st) {
     return;
   }
   if (++quiet < 2) return;
-  syslog(LOG_INFO, "[Store] the first fill is over (%llu zone(s) without a body that the fill does not fetch): the store keeps its journal again", (unsigned long long)r.known_now);
+  if (!asked) syslog(LOG_INFO, "[Store] the first fill is over (%llu zone(s) without a body that the fill does not fetch): the store keeps its journal again", (unsigned long long)r.known_now);
+  asked = true;
   (void)store_bulk_end(st, STORE_BULK_END_IF_PASSED);
   armed = false;
 }
@@ -1942,10 +1945,11 @@ static void *ticker_thread(void *arg) {
     if (st) {
       pthread_mutex_unlock(&G.wlock);
       (void)store_tick(st);
+      store_set_mem_limit(st, dbreg_cache_limit());
       bulk_end_check(st);
       store_stats_t ss;
       store_stats(st, &ss);
-      tables_charge(ss.table_private_bytes + ss.ring_bytes, mono_ns() / 1000000, &warned_ms);      /* (0.7: the journal ring is the store's memory too, D4) */
+      tables_charge(ss.table_private_bytes + ss.ring_bytes + ss.index_delta_bytes + ss.index_build_bytes, mono_ns() / 1000000, &warned_ms);      /* (0.7: the journal ring is the store's memory too, D4; and the index delta of a pass and the builder's window) */
       pthread_mutex_lock(&G.wlock);
     }
   }
@@ -3903,6 +3907,7 @@ bool db_recon_begin(const char *view, uint64_t estimate, bool force, char *why, 
    * space of zt / zc: 1 << 25 records) and by what memory-limit can give the two indexes: 8 bytes a slot, 8/3 slots a zone, in ix and in sx = 43 bytes a zone, a quarter of memory-limit
    * at the most (10M zones: 430 MB, 11 percent of 3840M).  Beyond that the tables grow by themselves, with the pass waiting for the build, store_index_wait()) */
   const uint64_t lim = dbreg_cache_limit();
+  store_set_mem_limit(st, lim);                             /* (0.7: the index delta of the pass sizes itself from memory-limit: in force before its first insert) */
   uint64_t cap = (1ull << 25) - 1;
   if (lim && lim / 4 / 43 < cap) cap = lim / 4 / 43;
   const uint64_t want = estimate < cap ? estimate : cap;
@@ -4393,6 +4398,7 @@ static store_t *core_start(const server_config_t *cfg, bool *created_out, bool *
     o.scrub_interval_s = db->store_scrub_interval;           /* 0.7 S6 (WP9): the scrub of the store: its interval, and the structure check it makes of every image it reads */
     o.seg_size = db->store_segment_size;                     /* (0 = 256 MiB) */
     o.max_zones = db->store_max_zones;                       /* (0 = by the RAM) */
+    o.table_mem = db->store_table_memory;                    /* (0 = by the RAM, tb_budget()) */
     o.no_align = !db->store_align;                           /* (0.7 attach-align: `store-align no`) */
   }
   o.validate = zone_image_validate;
@@ -4409,6 +4415,7 @@ static store_t *core_start(const server_config_t *cfg, bool *created_out, bool *
     if (bb && *bb) o.bulk_ckpt_bytes = strtoull(bb, NULL, 10);
     if (bm && *bm) o.bulk_ckpt_interval_ms = (uint32_t)strtoul(bm, NULL, 10);
   }
+  o.mem_limit = dbreg_cache_limit();                        /* (0.7: the index delta of a first fill and the build of ix / sx stay within an eighth of memory-limit; the ticker follows a reload) */
 #endif
   store_t *st = NULL;
   bool quarantined = false;
@@ -4612,6 +4619,9 @@ bool db_store_start(const server_config_t *cfg) {
 void db_store_stop(void) {
   store_t *st = atomic_load_explicit(&G.st, memory_order_acquire);
   if (!st) return;
+  /* (0.7: the time of each part of the stop: the Manager kills a Backend that has not ended in SHUTDOWN_KILL_MS, and a kill before the clean checkpoint is a crash of the store (an unlogged first
+   * fill goes back to its last bulk checkpoint; run_db_store_test 2026-11-25: a stop of 10.1 s and an empty store at the next start).  Said when the stop takes a second or more) */
+  const int64_t t0 = mono_ns();
   xfr_store_stop();                                           /* 0.7 (secondary store 10): the restore thread first */
   atomic_store(&G.hstop, true);                               /* 0.7 fix 8: the background attach of hot.list ends first */
   for (int i = 0; G.hthr_started && i < G.hot_nstarted; i++) pthread_join(G.hthr[i], NULL);
@@ -4632,6 +4642,7 @@ void db_store_stop(void) {
 #endif
   for (int i = 0; i < G.nathr; i++) pthread_join(G.athr[i], NULL);
   G.nathr = 0;
+  const int64_t t1 = mono_ns();
   att_prep_wait();                                            /* (the threads that register zones are gone: the growth that was in progress is done before the store goes) */
   (void)rcu_writer_wait_until_safe(rcu_writer_advance_epoch(), 5000);          /* (the staged elements that were registered are freed when the readers that may have found them have left) */
   stgr_run(false);
@@ -4641,9 +4652,16 @@ void db_store_stop(void) {
   pthread_mutex_unlock(&G.wlock);
   if (G.wthr_started) pthread_join(G.wthr, NULL);
   G.wthr_started = false;
-  if (G.hot_on) hot_write(st);                                /* 0.7 fix 8: what is in memory, the most used first, for the next start (the attach threads are gone: nothing registers a zone meanwhile) */
+  const int64_t t2 = mono_ns();
   /* a clean stop: the flag says so on disk, so the next start does not log an unclean stop and (after a reboot) does not rebuild the tables.  The store stays open, as
-   * workers may still look; a write after this (a straggler) clears the flag again before it changes anything. */
+   * workers may still look; a write after this (a straggler) clears the flag again before it changes anything.  First: the Manager's kill (SHUTDOWN_KILL_MS) must not come
+   * before it. */
   int r = store_checkpoint_clean(st);
   if (r < 0) syslog(LOG_WARNING, "[Store] the clean checkpoint at the stop failed: %s; the next start recovers from the journal", strerror(-r));
+  const int64_t t3 = mono_ns();
+  if (G.hot_on) hot_write(st);                                /* 0.7 fix 8: what is in memory, the most used first, for the next start (the attach threads are gone: nothing registers a zone meanwhile); a hint, written with no fsync (store_hot_write()) */
+  const int64_t t4 = mono_ns();
+  if (t4 - t0 >= 1000000000ll)
+    syslog(LOG_NOTICE, "[Store] the stop took %lld ms: the attach threads %lld ms, the ticker %lld ms, the clean checkpoint %lld ms, hot.list %lld ms", (long long)((t4 - t0) / 1000000),
+           (long long)((t1 - t0) / 1000000), (long long)((t2 - t1) / 1000000), (long long)((t3 - t2) / 1000000), (long long)((t4 - t3) / 1000000));
 }

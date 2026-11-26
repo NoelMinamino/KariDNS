@@ -36,7 +36,7 @@ SRV=""
 cleanup() {
     [ -n "$SRV" ] && kill -TERM "$SRV" 2>/dev/null
     # wait for the manager (it stops its children first; a sanitizer build is slow): a KILL too early orphans them
-    i=0; while [ -n "$SRV" ] && [ $i -lt 100 ] && kill -0 "$SRV" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
+    i=0; while [ -n "$SRV" ] && [ $i -lt "$KARI_STOP_WAIT_TENTHS" ] && kill -0 "$SRV" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
     [ -n "$SRV" ] && kill -KILL "$SRV" 2>/dev/null
     rm -rf "$T"
 }
@@ -234,7 +234,7 @@ sqlite3 "$T/db/z.db" "DELETE FROM records WHERE domain_id = (SELECT id FROM doma
 # ================================================================ stop
 echo "== SIGTERM"
 kill -TERM "$SRV"
-i=0; while [ $i -lt 100 ] && kill -0 "$SRV" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
+i=0; while [ $i -lt "$KARI_STOP_WAIT_TENTHS" ] && kill -0 "$SRV" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
 if kill -0 "$SRV" 2>/dev/null; then fail "karidns did not stop within 10 s"; else pass "karidns stopped"; fi
 kari_wait_no_proc "karidns.*$T" 15 || true
 LEFT=$(pgrep -f "karidns.*$T" | tr '\n' ' ')
@@ -256,7 +256,7 @@ check_ans "www.shadow.test A is the configured zone's" "192.0.2.99" www.shadow.t
 dbst | grep -q "^zones: $NZ in the registry ($((NZ - 1)) served, 1 shadowed by karidns.conf)" && pass "dbstatus (builders): $NZ zones, 1 shadowed" || { fail "dbstatus with builders"; dbst | sed 's/^/         /'; }
 dbst shadow.test | grep -q "serial 30, status shadowed" && pass "dbstatus shadow.test: shadowed at ingest time" || fail "dbstatus shadow.test at ingest time"
 kill -TERM "$SRV"
-i=0; while [ $i -lt 100 ] && kill -0 "$SRV" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
+i=0; while [ $i -lt "$KARI_STOP_WAIT_TENTHS" ] && kill -0 "$SRV" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
 kill -0 "$SRV" 2>/dev/null && fail "karidns (4 builders) did not stop"
 SRV=""
 sleep 0.5

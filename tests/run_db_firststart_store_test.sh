@@ -104,7 +104,7 @@ start_server() { "$KARIDNS" -c "$T/$1.conf" -f > "$T/$2" 2>&1 & SRV=$!; }
 desc() { for c in $(pgrep -P "$1" 2>/dev/null); do echo "$c"; desc "$c"; done; }     # the processes below a process (only the ones of this test are touched)
 stop_server() {
     kill -TERM "$SRV" 2>/dev/null
-    i=0; while [ $i -lt 100 ] && kill -0 "$SRV" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
+    i=0; while [ $i -lt "$KARI_STOP_WAIT_TENTHS" ] && kill -0 "$SRV" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
     kill -KILL "$SRV" 2>/dev/null
     SRV=""
 }

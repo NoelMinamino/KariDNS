@@ -1383,11 +1383,17 @@ static int run_mode(const char *mode) {
         send_zone(a[0], &e, "cold1.test.", 1, 0, 170);
         batch_end(a[0], &e, &mainc, 25, 1, 0);
         for (int w = 0; w < 3000; w++) {                                    /* (the install runs on a builder thread: the limit stays until the zone is in the store; 30 s, an ASan build on a loaded CI VM took more than 5) */
-            if (dbdir()->rec_get("default", "cold1.test.", &rec) && rec.state == STORE_STATE_STORED && dbreg_lookup_entry("default", "cold1.test.") == NULL) break;
+            if (dbdir()->rec_get("default", "cold1.test.", &rec) && rec.state == STORE_STATE_STORED && stored_only("cold1.test.")) break;      /* (the check below itself: the record can be STORED while the entry or its element is still there, flake row 54) */
             usleep(10000);
         }
         dbreg_cache_set_limit(0);
         dbreg_cache_test_pause(false);
+        if (!stored_only("cold1.test.")) {                                   /* (what is left of the zone in memory, so that one failure names it) */
+            zref_t zr1;
+            const bool f1 = zref_of("cold1.test.", &zr1);
+            printf("  cold1.test.: zref %d entry %p el %p zid %u zstate %d, lookup_entry %p, record %d state %d\n", (int)f1, f1 ? (void *)zr1.entry : NULL, f1 ? (void *)zr1.el : NULL,
+                   f1 ? (unsigned)zr1.zid : 0u, f1 ? (int)zr1.zstate : -1, (void *)dbreg_lookup_entry("default", "cold1.test."), (int)dbdir()->rec_get("default", "cold1.test.", &rec), (int)rec.state);
+        }
         CHECK(stored_only("cold1.test."));
         CHECK(dbdir()->rec_get("default", "cold1.test.", &rec) && rec.state == STORE_STATE_STORED && rec.serial == 1);
         CHECK(attach_by_worker("cold1.test.", &k) == 1 && in_memory("cold1.test."));

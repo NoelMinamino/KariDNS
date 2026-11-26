@@ -743,6 +743,31 @@ static void add_store(list_t *l, const store_t *s, const store_attach_stats_t *a
   U("store.index.wait_us", st->index_wait_us);
   U("store.index.wait_max_us", st->index_wait_max_us);
   U("store.index.wait_giveups", st->index_wait_giveups);
+  U("store.index.delta.active", st->index_delta_active);                        /* 0.7: the index delta of a bulk pass and the file builder */
+  U("store.index.delta.frozen", st->index_delta_frozen);
+  U("store.index.delta.count", st->index_deltas);
+  U("store.index.delta.bytes", st->index_delta_bytes);
+  U("store.index.delta.peak_bytes", st->index_delta_peak_bytes);
+  U("store.index.delta.bloom_bytes", st->index_delta_bloom_bytes);
+  U("store.index.delta.runs", st->index_delta_runs);
+  U("store.index.delta.run_entries", st->index_delta_run_entries);
+  U("store.index.delta.spills", st->index_delta_spills);
+  U("store.index.delta.spill_us", st->index_delta_spill_us);
+  U("store.index.delta.merges", st->index_delta_merges);
+  U("store.index.delta.scratch_bytes", st->index_delta_scratch_bytes);
+  U("store.index.delta.spill_errors", st->index_delta_spill_errors);
+  U("store.index.delta.name_clashes", st->index_delta_name_clashes);
+  U("store.index.delta.full", st->index_delta_full);
+  U("store.index.delta.waits", st->index_delta_waits);
+  U("store.index.build.count", st->index_builds);
+  U("store.index.build.us", st->index_build_us);
+  U("store.index.build.max_us", st->index_build_max_us);
+  U("store.index.build.in_lock", st->index_builds_in_lock);
+  U("store.index.build.bytes", st->index_build_bytes);
+  U("store.index.build.peak_bytes", st->index_build_peak_bytes);
+  U("store.index.build.written_bytes", st->index_build_written_bytes);
+  U("store.index.build.buckets", st->index_build_buckets);
+  U("store.index.build.carries", st->index_build_carries);
   U("store.journal.commit_switches", st->journal_commit_switches);
   {                                                                              /* 0.7: the journal ring (the record is written after the writer mutex) */
     static const char *const jst[] = { "ok", "nospace", "failed" };
@@ -788,6 +813,10 @@ static void add_store(list_t *l, const store_t *s, const store_attach_stats_t *a
   U("store.checkpoint.paced_us", st->checkpoint_paced_us);
   U("store.tables.private_bytes", st->table_private_bytes);
   U("store.tables.private_index_bytes", st->table_private_index_bytes);
+  U("store.tables.budget_bytes", st->table_budget_bytes);
+  U("store.tables.mapped_bytes", st->table_mapped_bytes);
+  U("store.tables.cold_bytes", st->table_cold_bytes);
+  U("store.tables.cold_sweeps", st->table_cold_sweeps);
   U("store.tables.private_max", st->table_private_max);
   U("store.tables.released_bytes", st->table_released_bytes);
   U("store.tables.release_max_us", st->table_release_max_us);

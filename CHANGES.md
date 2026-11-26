@@ -214,6 +214,13 @@ Fixes from the external reviews and audits of the 0.7 cycle. Each has a test tha
 
 ### Bug fixes
 
+- **Zone store tables and swap**: above `store-table-memory` (new, restart-only; default the RAM less `memory-limit`
+  and a quarter of the RAM) the server deactivates the clean file pages of the store's tables, index and first-fill
+  runs a slice at a time, so the kernel frees them before it swaps other memory (100M zones on 16 GB swapped before).
+- **Stop with a zone store**: the manager gives a backend that is writing the clean checkpoint of its zone store up
+  to 120 seconds (it logs at 10 seconds that it waits; a second SIGTERM still kills at once). Before, a kill at 10
+  seconds while the fsync() calls waited for the disk made the next start go back to the last bulk checkpoint of a
+  first fill, at worst to an empty store.
 - **NSEC3 Opt-Out**: below an empty non-terminal that exists only above an insecure delegation the server now uses
   the closest provable encloser (RFC 5155 section 7.2.1); NXDOMAIN and DS answers validate (#180).
 - **Cookies**: the server cookie checks now come before the forward / program dispatch and before every

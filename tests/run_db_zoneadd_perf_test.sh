@@ -154,7 +154,7 @@ echo "T-ZONECHANGE: $ONE_N edits, mean $((sum / ONE_N)) ms, worst $worst ms"
 [ $slow -eq 0 ] && pass "every one of $ONE_N one-zone edits was served in less than $ONE_LIMIT_MS ms (worst $worst ms)" || fail "$slow of $ONE_N one-zone edits took $ONE_LIMIT_MS ms or more (worst $worst ms)"
 
 kill -TERM "$SRV"
-i=0; while [ $i -lt 100 ] && kill -0 "$SRV" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
+i=0; while [ $i -lt "$KARI_STOP_WAIT_TENTHS" ] && kill -0 "$SRV" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
 kill -0 "$SRV" 2>/dev/null && fail "karidns did not stop" || pass "karidns stopped"
 SRV=""
 

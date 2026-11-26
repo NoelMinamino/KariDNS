@@ -34,7 +34,7 @@ chmod 755 "$T"
 SRV=""
 stop_srv() {
     [ -n "$SRV" ] && kill -TERM "$SRV" 2>/dev/null
-    i=0; while [ -n "$SRV" ] && kill -0 "$SRV" 2>/dev/null && [ $i -lt 100 ]; do sleep 0.1; i=$((i + 1)); done
+    i=0; while [ -n "$SRV" ] && kill -0 "$SRV" 2>/dev/null && [ $i -lt "$KARI_STOP_WAIT_TENTHS" ]; do sleep 0.1; i=$((i + 1)); done
     [ -n "$SRV" ] && kill -KILL "$SRV" 2>/dev/null
     SRV=""
 }

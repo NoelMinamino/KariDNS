@@ -35,7 +35,7 @@ P1=""; SRV=""
 stop_pid() {   # stop_pid PID CONF: TERM, a bounded wait for the manager (it stops its children first), then whatever is left of CONF is killed
     [ -n "$1" ] || return 0
     kill -TERM "$1" 2>/dev/null
-    i=0; while [ $i -lt 150 ] && kill -0 "$1" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
+    i=0; while [ $i -lt "$KARI_STOP_WAIT_TENTHS" ] && kill -0 "$1" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
     kill -0 "$1" 2>/dev/null && { echo "  (pid $1 did not stop after TERM: killed)"; kari_kill_tree "$1"; }
     wait "$1" 2>/dev/null
     kari_kill_conf "$2"

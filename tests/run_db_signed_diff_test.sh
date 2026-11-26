@@ -43,7 +43,7 @@ stop_servers() {
     [ -n "$SB" ] && kill -TERM "$SB" 2>/dev/null
     [ -n "$SC" ] && kill -TERM "$SC" 2>/dev/null
     i=0
-    while [ $i -lt 50 ]; do
+    while [ $i -lt "$KARI_STOP_WAIT_TENTHS" ]; do
         { [ -z "$SA" ] || ! kill -0 "$SA" 2>/dev/null; } && { [ -z "$SB" ] || ! kill -0 "$SB" 2>/dev/null; } &&
             { [ -z "$SC" ] || ! kill -0 "$SC" 2>/dev/null; } && break
         sleep 0.1; i=$((i + 1))

@@ -197,6 +197,8 @@ static const char *REQUIRED[] = {
   "store.writes.growths_background", "store.flusher", "store.lock.writer_holds", "store.lock.writer_holds_slow", "store.lock.writer_hold_max_us", "store.lock.writer_hold_max_site",     /* (0.7 fix A; the site: 0.7 leftovers) */
   "store.journal.bound_bytes", "store.journal.peak_bytes", "store.journal.limit_waits", "store.journal.limit_wait_us", "store.journal.limit_wait_max_us",
   "store.index.waits", "store.index.wait_us", "store.index.wait_max_us", "store.index.wait_giveups",                         /* (0.7 round 10: the wait for the build of the next index) */
+  "store.index.delta.active", "store.index.delta.bytes", "store.index.delta.peak_bytes", "store.index.delta.runs", "store.index.delta.spills", "store.index.delta.full",     /* (0.7: the index delta and the file builder) */
+  "store.index.build.count", "store.index.build.max_us", "store.index.build.peak_bytes", "store.index.build.written_bytes",
   "store.journal.boost", "store.journal.boosts",                                                                                     /* (0.7 round 12: the larger bound of a bulk fill) */
   "store.journal.bytes_written", "store.bulk.active", "store.bulk.fills", "store.bulk.resumed", "store.bulk.recoveries", "store.bulk.recovered_known",     /* (0.7: the unlogged bulk fill) */
   "store.bulk.checkpoints", "store.bulk.unlogged_records", "store.bulk.since_unix", "store.bulk.ended_unix", "store.bulk.next_checkpoint_bytes", "store.bulk.end_pending", "store.bulk.cut", "store.writes.names_refused",
