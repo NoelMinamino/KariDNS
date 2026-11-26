@@ -50,7 +50,7 @@ cleanup() {
     LP=$(loader_pid 2>/dev/null)
     [ -n "$LP" ] && kill -CONT "$LP" 2>/dev/null
     [ -n "$SRV" ] && kill -TERM "$SRV" 2>/dev/null
-    i=0; while [ -n "$SRV" ] && [ $i -lt 150 ] && kill -0 "$SRV" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
+    i=0; while [ -n "$SRV" ] && [ $i -lt "$KARI_STOP_WAIT_TENTHS" ] && kill -0 "$SRV" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
     [ -n "$SRV" ] && kill -KILL "$SRV" 2>/dev/null
     for ip in $ADDED; do ifconfig lo0 inet "$ip" -alias 2>/dev/null || ifconfig lo inet "$ip" -alias 2>/dev/null || true; done
     rm -rf "$T"

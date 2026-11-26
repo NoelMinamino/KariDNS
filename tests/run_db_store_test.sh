@@ -49,7 +49,7 @@ stop_one() {
     pc=""
     [ -n "$p" ] && pc=$(ps -ww -o command= -p "$p" 2>/dev/null | awk '{ for (i = 1; i < NF; i++) if ($i == "-c") { print $(i + 1); exit } }')
     [ -n "$p" ] && kill -TERM "$p" 2>/dev/null
-    i=0; while [ -n "$p" ] && [ $i -lt 1300 ] && kill -0 "$p" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
+    i=0; while [ -n "$p" ] && [ $i -lt "$KARI_STOP_WAIT_TENTHS" ] && kill -0 "$p" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
     # (a server that does not stop in 130 s is killed (the Manager gives a Backend in the clean checkpoint of its store up to 120 s, SHUTDOWN_STORE_KILL_MS): a stop that cut a first fill off makes the next start go back to its last bulk checkpoint; say so, the checks after it read that state)
     [ -n "$p" ] && kill -0 "$p" 2>/dev/null && echo "  (the server $p did not stop in 130 s after SIGTERM: killed)"
     [ -n "$p" ] && kill -KILL "$p" 2>/dev/null

@@ -39,7 +39,7 @@ SRV=""
 cleanup() {
     rm -f "$T/sampling"
     [ -n "$SRV" ] && kill -TERM "$SRV" 2>/dev/null
-    i=0; while [ -n "$SRV" ] && [ $i -lt 150 ] && kill -0 "$SRV" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
+    i=0; while [ -n "$SRV" ] && [ $i -lt "$KARI_STOP_WAIT_TENTHS" ] && kill -0 "$SRV" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
     [ -n "$SRV" ] && kill -KILL "$SRV" 2>/dev/null
     rm -rf "$T"
 }
@@ -83,7 +83,7 @@ EOF
 : > "$T/samples"
 stop_srv() {
     [ -n "$SRV" ] && kill -TERM "$SRV" 2>/dev/null
-    i=0; while [ -n "$SRV" ] && [ $i -lt 150 ] && kill -0 "$SRV" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
+    i=0; while [ -n "$SRV" ] && [ $i -lt "$KARI_STOP_WAIT_TENTHS" ] && kill -0 "$SRV" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
     [ -n "$SRV" ] && kill -KILL "$SRV" 2>/dev/null
     SRV=""
 }

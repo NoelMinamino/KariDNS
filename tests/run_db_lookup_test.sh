@@ -161,7 +161,7 @@ scenario() {
     OUT=$(dagq "z$LATE.test" A)
     [ "$(echo "$OUT" | status_of)" = NOERROR ] && pass "[$SNAME] z$LATE.test still answers" || fail "[$SNAME] z$LATE.test after the pass: $(echo "$OUT" | status_of)"
     kill -TERM "$SRV" 2>/dev/null
-    i=0; while [ $i -lt 100 ] && kill -0 "$SRV" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
+    i=0; while [ $i -lt "$KARI_STOP_WAIT_TENTHS" ] && kill -0 "$SRV" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
     kill -KILL "$SRV" 2>/dev/null
     SRV=""
 }

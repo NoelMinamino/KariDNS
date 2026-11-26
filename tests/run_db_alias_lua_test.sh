@@ -38,7 +38,7 @@ PIDS=""
 cleanup() {
     for p in $PIDS; do kill -TERM "$p" 2>/dev/null; done
     for p in $PIDS; do
-        i=0; while [ $i -lt 100 ] && kill -0 "$p" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
+        i=0; while [ $i -lt "$KARI_STOP_WAIT_TENTHS" ] && kill -0 "$p" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
         kill -KILL "$p" 2>/dev/null
     done
     for p in $PIDS; do kari_kill_tree "$p"; done
@@ -158,7 +158,7 @@ start_karidns() {   # start_karidns NAME CONF PORT   (sets PID_<NAME> in LAST_PI
 }
 stop_pid() {
     kill -TERM "$1" 2>/dev/null
-    i=0; while [ $i -lt 100 ] && kill -0 "$1" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
+    i=0; while [ $i -lt "$KARI_STOP_WAIT_TENTHS" ] && kill -0 "$1" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
     kill -KILL "$1" 2>/dev/null
 }
 

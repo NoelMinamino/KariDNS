@@ -29,7 +29,7 @@ chmod 755 "$T"
 SRV=""
 cleanup() {
     [ -n "$SRV" ] && kill -TERM "$SRV" 2>/dev/null
-    i=0; while [ -n "$SRV" ] && [ $i -lt 100 ] && kill -0 "$SRV" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
+    i=0; while [ -n "$SRV" ] && [ $i -lt "$KARI_STOP_WAIT_TENTHS" ] && kill -0 "$SRV" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
     [ -n "$SRV" ] && kill -KILL "$SRV" 2>/dev/null
     rm -rf "$T"
 }
@@ -155,7 +155,7 @@ if [ "$STORE" = on ]; then
     # (the first start after the changes above reads the changes the cursor of the store has not seen yet, and brings those zones into memory; the next start has nothing left to read)
     for round in 1 2; do
         kill -TERM "$SRV" 2>/dev/null
-        i=0; while [ $i -lt 100 ] && kill -0 "$SRV" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
+        i=0; while [ $i -lt "$KARI_STOP_WAIT_TENTHS" ] && kill -0 "$SRV" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
         : > "$T/srv.log"
         "$KARIDNS" -c "$T/k.conf" -f > "$T/srv.log" 2>&1 &
         SRV=$!

@@ -31,7 +31,7 @@ chmod 755 "$T"
 SRV=""
 cleanup() {
     [ -n "$SRV" ] && kill -TERM "$SRV" 2>/dev/null
-    i=0; while [ -n "$SRV" ] && [ $i -lt 100 ] && kill -0 "$SRV" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
+    i=0; while [ -n "$SRV" ] && [ $i -lt "$KARI_STOP_WAIT_TENTHS" ] && kill -0 "$SRV" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
     [ -n "$SRV" ] && kill -KILL "$SRV" 2>/dev/null
     rm -rf "$T"
 }
@@ -73,7 +73,7 @@ EOF
 file_answers() { [ "$($DAG file.test SOA +short +nohexdump 2>/dev/null | head -1)" = "ns.file.test. host.file.test. 1 2 3 4 5" ]; }
 stop_srv() {
     kill -TERM "$SRV"
-    i=0; while [ $i -lt 100 ] && kill -0 "$SRV" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
+    i=0; while [ $i -lt "$KARI_STOP_WAIT_TENTHS" ] && kill -0 "$SRV" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
     if kill -0 "$SRV" 2>/dev/null; then fail "karidns did not stop within 10 s"; kill -KILL "$SRV"; fi
     SRV=""
     sleep 0.3

@@ -226,7 +226,7 @@ printf '%s\n' "$OUT" | grep -q "^OK zone c1.test. (view c): unchanged, serial 70
 
 echo "== stop, then a database without karidns_domain_views"
 kill -TERM "$SRV"
-i=0; while [ $i -lt 100 ] && kill -0 "$SRV" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
+i=0; while [ $i -lt "$KARI_STOP_WAIT_TENTHS" ] && kill -0 "$SRV" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
 kill -0 "$SRV" 2>/dev/null && fail "karidns did not stop" || pass "karidns stopped"
 SRV=""
 G2="$T/db/g2.db"
@@ -246,7 +246,7 @@ mkzone "$G2" three.test 3 192.0.2.3
 OUT=$($KCTL reload three.test 2>&1); RC=$?
 printf '%s\n' "$OUT" | grep -q "^OK zone three.test.: view a: applied, serial 3; view b: applied, serial 3; view c: not in the database$" && [ $RC -eq 0 ] && pass "reload <zone>: $OUT" || fail "reload three.test: rc $RC '$OUT'"
 kill -TERM "$SRV"
-i=0; while [ $i -lt 100 ] && kill -0 "$SRV" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
+i=0; while [ $i -lt "$KARI_STOP_WAIT_TENTHS" ] && kill -0 "$SRV" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
 SRV=""
 
 # ================================================================ dump: --map-view and --loader-threads

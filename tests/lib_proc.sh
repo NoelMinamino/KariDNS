@@ -214,12 +214,17 @@ kari_make_dbloader_tsan() {
 # store_stmt DIR: the `store` statement of the database server: a zone store in DIR/store with DB_DIFF_STORE=cold or DB_STORE=on (the store-on variants of the database tests,
 # 0.7 WP7b: tests/run_db_<name>_store_test.sh), else `store none;` (the old behaviour whatever /var/db/karidns says on the host)
 store_stmt() { if [ "${DB_DIFF_STORE:-}" = cold ] || [ "${DB_STORE:-}" = on ]; then printf 'store "%s/store"; store-hot-list no;' "$1"; else printf 'store none;'; fi; return 0; }
+# KARI_STOP_WAIT_TENTHS: how long (tenths of a second) a test waits for a karidns it sent SIGTERM before it kills it.  The Manager gives a Backend in the
+# clean checkpoint of its zone store up to 120 s (SHUTDOWN_STORE_KILL_MS, 0.7); a test that kills the Manager sooner leaves that Backend holding the
+# store, and its next start finds the store "in use by another server" or the old control socket (suite 2026-11-26: run_db_memdefault_test after a
+# 12.4 s stop).  A server that stops at once is not waited for longer.
+KARI_STOP_WAIT_TENTHS=${KARI_STOP_WAIT_TENTHS:-1300}
 store_cold_restart() {
     [ "${DB_DIFF_STORE:-}" = cold ] || return 0
     kill -TERM "$SB" 2>/dev/null
     # (the Manager gives a Backend in the clean checkpoint of its store up to 120 s, SHUTDOWN_STORE_KILL_MS: a new server started before the old one ended finds the store
     # "in use by another server"; suite 2026-11-26)
-    i=0; while [ $i -lt 1300 ] && kill -0 "$SB" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
+    i=0; while [ $i -lt "$KARI_STOP_WAIT_TENTHS" ] && kill -0 "$SB" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
     printf '#!/bin/sh\nexec sleep 100000\n' > "$1/idle-loader"; chown 0:0 "$1/idle-loader"; chmod 755 "$1/idle-loader"
     sed "s|loader-path \"[^\"]*\"|loader-path \"$1/idle-loader\"|" "$1/$2" > "$1/cold-$2"
     "$KARIDNS" -c "$1/cold-$2" -f > "$3.cold" 2>&1 &

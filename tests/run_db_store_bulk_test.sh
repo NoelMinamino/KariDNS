@@ -90,7 +90,7 @@ fv() { echo "$1" | tr ' ' '\n' | sed -n "s/^$2=//p" | head -1; }
 start_server() { env KARIDNS_TEST_STORE_BULK_BYTES="$CKB" "$KARIDNS" -c "$T/$1.conf" -f > "$T/$2" 2>&1 & SRV=$!; }
 stop_server() {
     kill -TERM "$SRV" 2>/dev/null
-    i=0; while [ $i -lt 300 ] && kill -0 "$SRV" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
+    i=0; while [ $i -lt "$KARI_STOP_WAIT_TENTHS" ] && kill -0 "$SRV" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
     kill -KILL "$SRV" 2>/dev/null
     SRV=""
 }

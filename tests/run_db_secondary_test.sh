@@ -41,7 +41,7 @@ cleanup() {
     for p in $SRV $P1 $P2; do kill -TERM "$p" 2>/dev/null; done
     # wait for each manager (it stops its children first; a sanitizer build is slow): a KILL too early orphans them
     for p in $SRV $P1 $P2; do
-        i=0; while [ $i -lt 100 ] && kill -0 "$p" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
+        i=0; while [ $i -lt "$KARI_STOP_WAIT_TENTHS" ] && kill -0 "$p" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
         kill -KILL "$p" 2>/dev/null
     done
     if [ -n "${KARI_KEEP:-}" ]; then echo "kept $T"; else rm -rf "$T"; fi
@@ -336,7 +336,7 @@ else fail "no loader process found"; fi
 # ================================================================ in memory only
 echo "== memory only"
 kill -TERM "$SRV"
-i=0; while [ $i -lt 100 ] && kill -0 "$SRV" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
+i=0; while [ $i -lt "$KARI_STOP_WAIT_TENTHS" ] && kill -0 "$SRV" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
 kill -0 "$SRV" 2>/dev/null && { kill -KILL "$SRV"; fail "karidns did not stop"; }
 SRV=""
 : > "$T/s2.log"
