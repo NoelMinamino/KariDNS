@@ -3167,7 +3167,10 @@ int serialize_dns_record(uint8_t *res, size_t max_res_len, uint16_t *offset_ptr,
                 }
                 uint8_t next_hash[255];
                 size_t next_hash_len = base32hex_decode(rec->rdata[4], next_hash, sizeof(next_hash));
-                if (next_hash_len == (size_t)-1) return -1;
+                /* RFC 5155 3.1.6: the Hash Length is 1 to 255 octets.  A field that decodes to no octet ("0", one digit
+                 * is fewer than 8 bits) was encoded with Hash Length 0, which the wire decoder above and
+                 * zone_image_validate_ex() refuse: a database zone with such a row failed at its encoding (fuzz_pdns_content) */
+                if (next_hash_len == (size_t)-1 || next_hash_len == 0) return -1;
 
                 if ((size_t)offset + 5 + salt_len + 1 + next_hash_len > max_res_len) return -1;
                 res[offset++] = halg;

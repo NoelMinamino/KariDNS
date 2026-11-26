@@ -542,6 +542,32 @@ static void test_text_check(void) {
     }
 }
 
+/* The zone serial is the reference SOA's serial with all its digits.  It was cut to 40 characters: a serial with 60 leading zeros
+ * read 0 here and 1 in the SOA record, and the zone failed when it was encoded (fuzz_pdns_content, 2026-11-26).  The timers follow the
+ * same decimal rule (soa_decimal()). */
+static void test_soa_serial_digits(void) {
+    printf("SOA serial with many leading zeros\n");
+    char content[200];
+    snprintf(content, sizeof(content), "ns1.z.test hostmaster.z.test %0*d 7200 3600 1209600 300", 61, 1);
+    db_record_row_t soa = R(1, "z.test", "SOA", content, 3600, 0);
+    db_record_row_t a = R(2, "x.z.test", "A", "192.0.2.1", 300, 0);
+    pdns_zone_t *z = pdns_zone_new("z.test", NULL);
+    CHECK(z != NULL);
+    pdns_zone_add_record(z, &soa);
+    pdns_zone_add_record(z, &a);
+    CHECK_MSG(pdns_zone_finish(z) == 0, "%s", z->error);
+    CHECK(z->serial == 1);
+    uint32_t s = 0, r1 = 0, r2 = 0, ex = 0;
+    CHECK(pdns_soa_serial(content, &s) && s == 1);
+    CHECK(pdns_soa_timers(content, &r1, &r2, &ex) && r1 == 7200 && r2 == 3600 && ex == 1209600);
+    CHECK(!pdns_soa_serial("a b 4294967296 1 2 3 4", NULL) && !pdns_soa_timers("a b 1 2 3x 4 5", NULL, NULL, NULL));
+    rt_info_t info;
+    char why[300];
+    CHECK_MSG(pdns_roundtrip(z, &info, why, sizeof(why)), "%s", why);
+    CHECK(info.serial == 1);
+    pdns_zone_free(z);
+}
+
 static void test_rejections(void) {
     printf("rejection rules\n");
     /* content */
@@ -560,6 +586,8 @@ static void test_rejections(void) {
     reject("empty content", R(0, "x.z.test", "A", "", 300, 0), "empty content");
     reject("blank content", R(0, "x.z.test", "A", "   ", 300, 0), "empty content");
     reject("NULL content", R(0, "x.z.test", "A", NULL, 300, 0), "empty content");
+    /* RFC 5155 3.1.6: Hash Length 1 to 255; "0" decodes to no octet (fuzz_pdns_content: the zone failed at its encoding, not at the row) */
+    reject("NSEC3 next hash of no octet", R(0, "x.z.test", "NSEC3", "1 0 5 AABB 0 A", 300, 0), "cannot be encoded in wire format");
     {
         char *big = malloc(PDNS_MAX_CONTENT + 10);
         memset(big, 'a', PDNS_MAX_CONTENT + 9);
@@ -2450,6 +2478,7 @@ int main(int argc, char **argv) {
     test_corpus();
     test_owners();
     test_rejections();
+    test_soa_serial_digits();
     test_prio_rules();
     test_ttl_rules();
     test_disabled_and_ent();
