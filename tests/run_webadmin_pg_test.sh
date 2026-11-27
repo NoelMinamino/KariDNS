@@ -193,8 +193,8 @@ same "...and its sessions are gone (the API deleted them when it disabled the us
 
 echo "-- afterwards"
 kill -TERM "$SRV" 2>/dev/null
-i=0; while [ $i -lt 100 ] && kill -0 "$SRV" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
-if kill -0 "$SRV" 2>/dev/null; then bad "the server did not stop after SIGTERM"; kill -KILL "$SRV" 2>/dev/null; else ok "the server stops on SIGTERM"; fi
+i=0; while [ $i -lt 100 ] && kari_alive "$SRV"; do sleep 0.1; i=$((i + 1)); done
+if kari_alive "$SRV"; then bad "the server did not stop after SIGTERM"; kill -KILL "$SRV" 2>/dev/null; else ok "the server stops on SIGTERM"; fi
 SRV=""
 grep -q "stopped" "$T/server.log" && ok "...and says so" || bad "no 'stopped' in the log"
 grep -q "(a bug)" "$T/server.log" && bad "row level security refused what the API had allowed (P3)" "$(grep '(a bug)' "$T/server.log" | head -3)" || ok "P3: row level security never disagreed with the API"

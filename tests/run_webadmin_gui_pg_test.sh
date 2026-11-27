@@ -175,8 +175,9 @@ same "the key request of the page is a row of the table" "$(pq "SELECT count(*) 
 
 echo "-- afterwards"
 kill -TERM "$WEB" 2>/dev/null
-i=0; while [ $i -lt 100 ] && kill -0 "$WEB" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
-if kill -0 "$WEB" 2>/dev/null; then bad "the API did not stop after SIGTERM" "$(kari_log_tail "$T/server.log")"; kill -KILL "$WEB" 2>/dev/null; else ok "the API stops on SIGTERM"; fi
+i=0; while [ $i -lt 100 ] && kari_alive "$WEB"; do sleep 0.1; i=$((i + 1)); done
+if kari_alive "$WEB"; then bad "the API did not stop after SIGTERM" "$(kari_log_tail "$T/server.log")
+$(kari_proc_line "$WEB")"; kill -KILL "$WEB" 2>/dev/null; else ok "the API stops on SIGTERM"; fi
 WEB=""
 grep -q "ERROR\|assertion\|Assertion" "$T/karidns.log" && bad "karidns logged an error" "$(grep 'ERROR\|ssertion' "$T/karidns.log" | head -3)" || ok "karidns logged no error"
 kari_kill_tree "$SRV"; SRV=""
