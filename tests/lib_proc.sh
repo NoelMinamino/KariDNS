@@ -325,7 +325,7 @@ kari_share_sqlite() {
 # kari_now : the time of day (UTC) with milliseconds, for the diagnostics (FreeBSD's date(1) has no %N)
 kari_now() { perl -MTime::HiRes=time -MPOSIX=strftime -e '$t = time; print strftime("%H:%M:%S", gmtime($t)), sprintf(".%03d\n", ($t - int($t)) * 1000)' 2>/dev/null || date -u '+%H:%M:%S'; }
 
-# kari_try_snap DIR [KARICTL] / kari_noanswer_diag DIR KARICTL LOG PORT NAME TYPE : a query to a server of the test that got no answer (CI flakes rows 9, 10, 34 and
+# kari_try_snap DIR [KARICTL] / kari_noanswer_diag DIR KARICTL LOG PORT NAME TYPE [PROC] : a query to a server of the test that got no answer (CI flakes rows 9, 10, 34 and
 # the gap.test case: one try, or all of them, lost to 127.0.0.1 on a quiet runner).  kari_try_snap, before the try: its time, `netstat -s -p udp`,
 # net.inet.ip.intr_queue_drops and (with KARICTL) karictl ipcstats into DIR.  kari_noanswer_diag, when the try got no answer, prints to stdout what tells the
 # places apart: the drops of the loopback netisr IP queue and the UDP counters of the host since the try; the server's ipcstats since the try
@@ -334,17 +334,40 @@ kari_now() { perl -MTime::HiRes=time -MPOSIX=strftime -e '$t = time; print strft
 # the last lines of the server's log; then a query now, and the UDP counters during it: "dropped due to no socket" growing is a reply that came after
 # the client had given up (a late reply, not a lost one).  KARICTL empty: only the host's counters.  At most 3 blocks per DIR, so a loop that waits does
 # not fill the log.  A diagnostic only: the callers' checks and tries are as before.
+# CI flake rows 9, 90 (2026-11-28): on the 14.4 runners the workers read the lost queries (ipcworker.N.queries grew) and the replies left seconds later
+# ("dropped due to no socket" after the query), from two workers at once, with the zones in memory (the tests run without a store): something held the
+# replies after the workers.  So the diag also says, at the moment it runs: the thread states of the server's processes (PROC, a pgrep -f pattern: the
+# configuration file the server was started with) with their wait channels and, as root, their kernel stacks; the page-ins from swap and from files and
+# the free memory since the try; the server's log without the diag's own control lines; and how long the server then stays silent.
+kari_vm_snap() { sysctl -n vm.stats.vm.v_swappgsin vm.stats.vm.v_swappgsout vm.stats.vm.v_vnodepgsin 2>/dev/null | tr '\n' ' '; echo; }
 kari_try_snap() {
     mkdir -p "$1" 2>/dev/null
     kari_now > "$1/t0"
     kari_udp_snap "$1/udp.snap"
     sysctl -n net.inet.ip.intr_queue_drops > "$1/iqd" 2>/dev/null || echo 0 > "$1/iqd"
+    kari_vm_snap > "$1/vm.snap"
     if [ -n "${2:-}" ]; then $2 ipcstats 2>/dev/null | grep '^[a-z][a-z0-9._]*=[0-9][0-9]*$' > "$1/ipc.snap"; else : > "$1/ipc.snap"; fi
 }
+# kari_proc_state PATTERN : the threads of the processes whose command line matches PATTERN (pgrep -f), but those that wait as an idle server's do (a thread of
+# a pool in uwait, a nap in nanslp, the manager in sigwait, a pipe read in sbwait, a kevent() in kqread: those only counted), and as root the kernel stacks of
+# the ones shown
+kari_proc_state() {
+    _kps_p=$(pgrep -f -- "$1" 2>/dev/null | tr '\n' ' ')
+    [ -n "$_kps_p" ] || { echo "      (no process matches $1)"; return 0; }
+    ps -H -o pid,lwp,stat,wchan,time,nvcsw,nivcsw,comm -p "$(echo $_kps_p | tr ' ' ',')" > "${TMPDIR:-/tmp}/kari_ps.$$" 2>&1
+    awk 'NR == 1 { print; next } $3 !~ /[TDL]/ && $4 ~ /^(uwait|nanslp|sigwait|sbwait|kqread)$/ { idle[$4]++; next } { print; busy[$2] = 1 }
+         END { s = ""; for (w in idle) s = s " " idle[w] " " w; print "(and" s ")" }' "${TMPDIR:-/tmp}/kari_ps.$$" | head -24 | sed 's/^/      /'
+    if [ "$(id -u)" = 0 ]; then
+        _kps_l=$(awk 'NR > 1 && !($3 !~ /[TDL]/ && $4 ~ /^(uwait|nanslp|sigwait|sbwait|kqread)$/) { print $2 }' "${TMPDIR:-/tmp}/kari_ps.$$" | head -12)
+        for _kps_t in $_kps_l; do procstat -kk $_kps_p 2>/dev/null | awk -v t="$_kps_t" '$2 == t' | cut -c1-300 | sed 's/^/      /'; done
+    fi
+    rm -f "${TMPDIR:-/tmp}/kari_ps.$$"
+}
 kari_noanswer_diag() {
-    _kn_d=$1; _kn_ctl=$2; _kn_log=$3; _kn_port=$4; _kn_name=$5; _kn_type=$6
+    _kn_d=$1; _kn_ctl=$2; _kn_log=$3; _kn_port=$4; _kn_name=$5; _kn_type=$6; _kn_proc=${7:-}
     _kn_end=$(kari_now)
     kari_udp_snap "$_kn_d/udp.late"
+    _kn_vm1=$(kari_vm_snap)
     _kn_q1=$(sysctl -n net.inet.ip.intr_queue_drops 2>/dev/null || echo 0)
     _kn_n=$(cat "$_kn_d/count" 2>/dev/null || echo 0)
     _kn_n=$((_kn_n + 1)); echo "$_kn_n" > "$_kn_d/count"
@@ -356,6 +379,16 @@ kari_noanswer_diag() {
     echo "    net.inet.ip.intr_queue_drops: $(cat "$_kn_d/iqd" 2>/dev/null) -> $_kn_q1 (intr_queue_maxlen=$(sysctl -n net.inet.ip.intr_queue_maxlen 2>/dev/null) net.isr.dispatch=$(sysctl -n net.isr.dispatch 2>/dev/null) hw.ncpu=$(sysctl -n hw.ncpu 2>/dev/null) load: $(sysctl -n vm.loadavg 2>/dev/null))"
     echo "    netstat -s -p udp since the query (the whole host: other tests count too):"
     kari_udp_delta "$_kn_d/udp.snap" | head -12
+    echo "$(cat "$_kn_d/vm.snap" 2>/dev/null) $_kn_vm1" | awk '{ printf "    pages since the query: %+d in from swap, %+d out to swap, %+d in from files", $4 - $1, $5 - $2, $6 - $3 }'
+    printf '; free memory %s MB; swap: %s\n' "$(( $(sysctl -n vm.stats.vm.v_free_count 2>/dev/null || echo 0) * $(sysctl -n hw.pagesize 2>/dev/null || echo 4096) / 1048576 ))" "$(swapinfo -m 2>/dev/null | tail -n 1 | awk '{ print $3 " MB used of " $2 }')"
+    if [ -n "$_kn_proc" ]; then
+        echo "    the server's threads at $(kari_now) (a router waits in kqread, a worker in kqread or for its queries; anything else holds the replies):"
+        kari_proc_state "$_kn_proc"
+    fi
+    if [ -n "$_kn_log" ] && [ -f "$_kn_log" ]; then
+        echo "    the last lines of $_kn_log (without the [Control] lines of this diag):"
+        grep -v '\[Control\] key "(main)": \(ipcstats\|store -k\|dbstatus\)$' "$_kn_log" | tail -n 10 | cut -c1-300 | sed 's/^/      /'
+    fi
     if [ -n "$_kn_ctl" ]; then
         echo "    karictl ipcstats since the query (ipcworker.N.queries: read and run by worker N; ipc.*dropped*: lost between a worker and a router):"
         $_kn_ctl ipcstats 2>&1 | awk -F= 'NR == FNR { a[$1] = $2; next } NF == 2 && $2 ~ /^[0-9]+$/ { d = $2 - a[$1]; if (d != 0) printf "      %+d %s (now %s)\n", d, $1, $2; next } { print "      " $0 }' "$_kn_d/ipc.snap" - | head -20
@@ -363,16 +396,24 @@ kari_noanswer_diag() {
         $_kn_ctl store -k 2>&1 | grep -E '^store\.(park\.drop\.|lookup\.(drop\.|shed=|expired=|reask_suppressed=|servfail=))|ERROR' | grep -v '=0$' | head -12 | sed 's/^/      /'
         printf '    dbstatus: %s\n' "$($_kn_ctl dbstatus 2>&1 | grep -E 'fetchq:|ERROR' | head -1 | sed 's/^ *//')"
     fi
-    if [ -n "$_kn_log" ] && [ -f "$_kn_log" ]; then
-        echo "    the last lines of $_kn_log:"
-        tail -n 6 "$_kn_log" | cut -c1-300 | sed 's/^/      /'
-    fi
-    printf '    a query now (%s UTC): %s\n' "$(kari_now)" "$("${ROOT:-.}/dag" @127.0.0.1 -p "$_kn_port" "$_kn_name" "$_kn_type" +nohexdump +time=3 +tries=1 2>&1 | grep -E 'status:|timed out|no servers' | head -2 | tr '\n' ' ')"
+    _kn_now=$("${ROOT:-.}/dag" @127.0.0.1 -p "$_kn_port" "$_kn_name" "$_kn_type" +nohexdump +time=3 +tries=1 2>&1 | grep -E 'status:|timed out|no servers' | head -2 | tr '\n' ' ')
+    printf '    a query now (%s UTC): %s\n' "$(kari_now)" "$_kn_now"
     echo "    netstat -s -p udp from the end of the query to now ('dropped due to no socket': a reply that came late):"
     kari_udp_delta "$_kn_d/udp.late" | head -8
+    case $_kn_now in
+        *status:*) ;;
+        *)  # still silent: how long it stays so (one try of 1 s at a time, at most 20), and the threads once more when it is over or the time is up
+            _kn_i=0
+            while [ "$_kn_i" -lt 20 ] && ! "${ROOT:-.}/dag" @127.0.0.1 -p "$_kn_port" "$_kn_name" "$_kn_type" +nohexdump +time=1 +tries=1 2>&1 | grep -q 'status:'; do _kn_i=$((_kn_i + 1)); done
+            [ "$_kn_i" -lt 20 ] && echo "    answered again at $(kari_now) UTC, after $_kn_i more tries of 1 s" || echo "    still no answer at $(kari_now) UTC (20 more tries of 1 s)"
+            if [ -n "$_kn_proc" ]; then
+                echo "    the server's threads at $(kari_now):"
+                kari_proc_state "$_kn_proc"
+            fi ;;
+    esac
 }
 
-# kari_noanswer_script FILE DIR KARICTL LOG PORT : writes a sh script FILE for a test program that is not sh (webadmin/test/it_versions.mjs, IT_LOST_DIAG):
+# kari_noanswer_script FILE DIR KARICTL LOG PORT [PROC] : writes a sh script FILE for a test program that is not sh (webadmin/test/it_versions.mjs, IT_LOST_DIAG):
 # `sh FILE snap` before a query, `sh FILE diag NAME TYPE` when it got no answer (kari_try_snap, kari_noanswer_diag above, with these arguments)
 kari_noanswer_script() {
     cat > "$1" <<EOF
@@ -381,7 +422,7 @@ cd "${ROOT:-.}" || exit 0
 . "${ROOT:-.}/tests/lib_proc.sh"
 case "\$1" in
     snap) kari_try_snap "$2" "$3" ;;
-    diag) kari_noanswer_diag "$2" "$3" "$4" "$5" "\$2" "\$3" ;;
+    diag) kari_noanswer_diag "$2" "$3" "$4" "$5" "\$2" "\$3" "${6:-}" ;;
 esac
 exit 0
 EOF
