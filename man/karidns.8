@@ -564,7 +564,7 @@ zone "anomaly.test." {
     type program;
     program "/usr/local/bin/mock_server.pl";
     program\-args { "\-\-verbose"; };
-    program\-timeout 2000; # timeout in milliseconds (default: 2000)
+    program\-timeout 2000; # timeout in milliseconds (default: 2000, 1 to 30000)
     program\-max\-failures 5; # consecutive failures before the circuit breaker opens (default: 5)
     program\-user "nobody"; # optional privilege drop for plugin process (default: options { user })
     disable\-auto\-tc\-flag no; # yes: send oversized UDP replies as\-is (default: no)
@@ -661,7 +661,7 @@ zone "corp.example.com." {
     type forward;
     forwarders { 192.0.2.53; 198.51.100.53 port 5353; };
     # forwarders port 5353 { 192.0.2.53; };   the port of the list is the default of its addresses (without any: options { port }, else 53)
-    forward\-timeout 2000; # total time budget in milliseconds for all forwarders (default: 2000)
+    forward\-timeout 2000; # total time budget in milliseconds for all forwarders (default: 2000, 1 to 30000)
 };
 .fi
 .RE

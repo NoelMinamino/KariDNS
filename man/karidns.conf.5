@@ -7176,14 +7176,16 @@ address with its own port keeps it.
 \fBforward\-timeout <ms>;\fR
 \fIApplies to:\fR forward
 .br
-\fIDescription:\fR Total time budget in milliseconds (default 2000), shared by
-the forwarders: each one gets the remaining time divided by the number of
-forwarders not tried yet.
+\fIDescription:\fR Total time budget in milliseconds (default 2000), 1 to 30000
+(0.7; 0 and larger values are configuration errors), shared by the forwarders:
+each one gets the remaining time divided by the number of forwarders not tried
+yet.
 .TP 8
 \fBprogram "<path>";\fR, \fBprogram\-args { "<arg>"; ... };\fR, \fBprogram\-user "<user>";\fR, \fBprogram\-timeout <ms>;\fR, \fBprogram\-max\-failures <n>;\fR, \fBprogram\-reload\-line yes|no;\fR
 \fIApplies to:\fR program
 .br
-\fIDescription:\fR See PROGRAM ZONE PLUGINS.
+\fIDescription:\fR See PROGRAM ZONE PLUGINS. \fBprogram\-timeout\fR is 1 to
+30000 ms (0.7; 0 and larger values are configuration errors).
 .SH TRANSPORT TUNING (TCP MSS / WINDOW, UDP PAYLOAD SIZE)
 These directives correspond to \fBdag\fR's \fB+tcp\-mss\fR, \fB+tcp\-window\fR
 and \fB+bufsize\fR. Each has a server-wide form in \fBoptions {}\fR and a
