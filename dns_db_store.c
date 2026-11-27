@@ -2532,9 +2532,8 @@ static void stgr_run(bool force) {
 static void stgr_push(zdir_elem_t *s) {
   stg_ret_t *r = malloc(sizeof(*r));
   const uint64_t ep = rcu_writer_advance_epoch();
-  if (!r) {                                                   /* (no memory for the node: the grace period is waited for here) */
-    (void)rcu_writer_wait_until_safe(ep, 60000);
-    dbreg_staged_free(s);
+  if (!r) {                                                   /* (no memory for the node: the grace period is waited for here; a reader that stays: leaked) */
+    if (rcu_writer_wait_or_leak(ep, 60000, "a staged zone element")) dbreg_staged_free(s);
     return;
   }
   r->s = s;

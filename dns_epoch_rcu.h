@@ -68,6 +68,9 @@ bool rcu_writer_is_safe(uint64_t retire_epoch);
 // A short, quiet try (0.7): wait at most budget_ms (1 ms steps) for the grace period of retire_epoch; true when it is over.  For waits that only
 // bound memory (the retire stack, a reload's postponement): a reader that stays in its section costs memory, never the time of the caller.  No log line.
 bool rcu_writer_try_wait(uint64_t retire_epoch, int budget_ms);
+// The fallback of a retire that has no memory for its queue node: true when the grace period of retire_epoch ended within timeout_ms (free
+// the object now); false: a reader still holds it, the caller must keep (leak) it.  One LOG_ERR line per false.
+bool rcu_writer_wait_or_leak(uint64_t retire_epoch, int timeout_ms, const char *what);
 // R1 (0.7): the reader slots that hold back retire_epoch, by kind, as text for a warning; returns their number (0 = none)
 #include <stddef.h>
 int rcu_describe_blockers(uint64_t retire_epoch, char *buf, size_t len);
