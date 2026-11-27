@@ -1259,14 +1259,21 @@ An RRSIG listed in an MQTYPE-Query option (RFC 10029) is refused the same way.
 and at a CNAME owner its own RRSIGs (RFC 4035 section 2.5).
 .RE
 .IP \(bu 2
+\fBA question for type NXNAME\fR (128, the meta-type of RFC 9824) is answered
+FORMERR with EDE 30 Invalid Query Type ("NXNAME queries are not allowed"), with
+the question echoed (RFC 9824 section 3.5, a MUST). It is checked at the same
+point as the RRSIG question. An MQTYPE-Query option that lists NXNAME is FORMERR
+(RFC 10029 section 3.3). Forward and program zones relay an NXNAME question as
+they relay every other one, and return the answer they get.
+.IP \(bu 2
 \fB\fBnocookie\-udp\-size\fB\fR (BIND 9.20): a UDP answer to a query without a
 valid server cookie is no larger than this value (RFC 7873 section 5.2); a
 larger one is truncated (TC=1). See the options table.
 .IP \(bu 2
 \fBForward and program zones\fR relay or answer every query as before: ANY over
-UDP is relayed, RRSIG questions are relayed, and \fBnocookie\-udp\-size\fR does
-not limit their answers. BIND's refusal of recursive ANY queries (REFUSED with
-EDE 21) is not followed.
+UDP is relayed, RRSIG and NXNAME questions are relayed, and
+\fBnocookie\-udp\-size\fR does not limit their answers. BIND's refusal of
+recursive ANY queries (REFUSED with EDE 21) is not followed.
 .SS rate-limit { ... } (in options or zone)
 A \fBrate\-limit\fR block in a zone replaces the server-wide block for that
 zone. \fB0\fR means no limit for that class. Only UDP responses are limited.
