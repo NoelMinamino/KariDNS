@@ -3875,12 +3875,14 @@ loader reads that many requests in parallel on \fBloader\-threads\fR workers
 (each with its own database connection); the warm-up and the walk for apexes use
 at most half of it (and at most 8) so that the queries keep the rest. The bodies
 of a fill (the first fill, the reconcile) take no place of it (0.7 first-fill
-latency): they have their own limit of 256 in flight (the old share, a quarter
-of this value and at most 32, while a request of a query waits), and the load
-they put on the database is bounded by \fBloader\-threads\fR, as the workers of
-the loader read; see "The first fill and the queries". \fBdbstatus\fR shows the
-value as \fBconcurrency=\fR in the \fBfetch:\fR line, and the requests that wait
-as \fBqueued=\fR in the \fBfetchq:\fR line.
+latency): they have their own limit in flight, 128 for each worker of the loader
+that reads the fill (\fBloader\-threads\fR - 1), at least 256 and at most 1024
+(the old share, a quarter of this value and at most 32, while a request of a
+query waits), and the load they put on the database is bounded by
+\fBloader\-threads\fR, as the workers of the loader read; see "The first fill
+and the queries". \fBdbstatus\fR shows the value as \fBconcurrency=\fR in the
+\fBfetch:\fR line, and the requests that wait as \fBqueued=\fR in the
+\fBfetchq:\fR line.
 .TP 8
 \fBfetch\-rate unlimited|<n>;\fR
 \fIDefault:\fR \fBunlimited\fR
@@ -5259,41 +5261,45 @@ hands the requests of the workers to the loader between slices of about a
 millisecond of what the loader sends (a manifest pass, the bodies), so a request
 never waits for a whole pass; every place of \fBfetch\-concurrency\fR is the
 queries' (their fetches and the lookups of names; a place goes to the oldest
-query that waits), and the fill takes none: it has a limit of its own, \fB256
-bodies in flight\fR while no request of a query waits, so that the loader reads
-whole statements of 128 zones (one \fBIN\fR list per table; with 32 bodies
-spread over the loader's workers it read about 2 zones a statement, and
-PostgreSQL, whose cost is its statements, took five times as long as SQLite3 for
-the same 10M zones), and its old share, a quarter of \fBfetch\-concurrency\fR
-(at least one, at most 32), while a request of a query waits for a place: the
-fill makes no new request then, so a flood of queries does not stop the fill
-(the zones the queries ask for then come out of the fill's sequential reads,
-which are much cheaper than reading a zone by name) and the fill does not stop
-the queries. \fBWhat bounds the load of the database during a fill is
-\fBloader\-threads\fB\fR: the loader's workers read (each one statement at a
-time); the requests in flight only wait in the loader's queue (512 requests;
-more are answered "busy"). The loader takes a request of a query (or of the
-warm-up) before one of the fill, the oldest first (a request that has waited 200
-ms goes first whatever its class, so that a query that joined a body of the fill
-on its way is not left behind), reads up to 16 requests of queries together and
-up to 128 of the fill, and leaves one worker to the queries: at most
-\fBloader\-threads\fR - 1 workers read a batch of the fill larger than 16 at a
-time, and with \fBloader\-threads 1\fR (a small server) a batch of the fill is
-128 zones only while no query came in the last second. A zone that a query waits
-for is not read again by the fill (the query's read brings it). The loader says
-how it read in one line a minute while it reads, and once when it stops
-(\fBfetch reads in 60 s: queries 120 reads 130 zones, fill 400 reads 51200 zones
-(128.0 zones a read)\fR, LOG_INFO). The ingest thread waits for the store's
-journal at 4 times its limit (the disk is behind the fill's writes) in slices of
-5 ms and makes the requests of queries between them, so a lookup or a fetch of a
-query never waits for a checkpoint (\fBstore.ingest.journal_wait_slices\fR
-counts the slices). \fBkarictl dbstatus\fR shows the share of the ingest thread
-the bodies of the fill took (\fBfill_busy=P%\fR in the \fBfetchq:\fR line, next
-to \fBingest_busy\fR). A name that no stored zone covers is the one thing the
-store cannot answer by itself: until the first pass has listed a zone (about a
-second at 100,000 zones, about a minute at ten million) the store does not know
-it.  So that such a query is not refused for a zone that is in the database, it
-is \fIlooked up\fR: the worker parks the query and asks the loader, on the fetch
+query that waits), and the fill takes none: it has a limit of its own, \fB128
+bodies in flight for each worker of the loader that reads the fill\fR
+(\fBloader\-threads\fR - 1; at least 256, at most 1024) while no request of a
+query waits, so that the loader reads whole statements of up to 128 zones in
+parallel (one \fBIN\fR list per table; with 32 bodies spread over the loader's
+workers it read about 2 zones a statement, and PostgreSQL took five times as
+long as SQLite3 for the same 10M zones; measured on a 4-core host with
+\fBloader\-threads 8\fR, 10M zones: PostgreSQL 2556 s before, see the pull
+request for the figures now), and its old share, a quarter of
+\fBfetch\-concurrency\fR (at least one, at most 32), while a request of a query
+waits for a place: the fill makes no new request then, so a flood of queries
+does not stop the fill (the zones the queries ask for then come out of the
+fill's sequential reads, which are much cheaper than reading a zone by name) and
+the fill does not stop the queries. \fBWhat bounds the load of the database
+during a fill is \fBloader\-threads\fB\fR: the loader's workers read (each one
+statement at a time); the requests in flight only wait in the loader's queue
+(1280 requests; more are answered "busy"). The loader takes a request of a query
+(or of the warm-up) before one of the fill, the oldest first (a request that has
+waited 200 ms goes first whatever its class, so that a query that joined a body
+of the fill on its way is not left behind), reads up to 16 requests of queries
+together and up to 128 of the fill, and leaves one worker to the queries:
+\fBloader\-threads\fR - 1 workers read the fill and the last one only the
+queries, the warm-up and the lookups; with \fBloader\-threads 1\fR (a small
+server) the one worker does both, and a batch of the fill is 128 zones only
+while no query came in the last second. A zone that a query waits for is not
+read again by the fill (the query's read brings it). The loader says how it read
+in one line a minute while it reads, and once when it stops (\fBfetch reads in
+60 s: queries 120 reads 130 zones, fill 400 reads 51200 zones (128.0 zones a
+read)\fR, LOG_INFO). The ingest thread waits for the store's journal at 4 times
+its limit (the disk is behind the fill's writes) in slices of 5 ms and makes the
+requests of queries between them, so a lookup or a fetch of a query never waits
+for a checkpoint (\fBstore.ingest.journal_wait_slices\fR counts the
+slices). \fBkarictl dbstatus\fR shows the share of the ingest thread the bodies
+of the fill took (\fBfill_busy=P%\fR in the \fBfetchq:\fR line, next to
+\fBingest_busy\fR). A name that no stored zone covers is the one thing the store
+cannot answer by itself: until the first pass has listed a zone (about a second
+at 100,000 zones, about a minute at ten million) the store does not know it.  So
+that such a query is not refused for a zone that is in the database, it is
+\fIlooked up\fR: the worker parks the query and asks the loader, on the fetch
 stream (which a pass on the first stream does not hold up), which zone of the
 view encloses the name (the name and its parent names, never the root; the
 longest one that the view serves and that is a primary zone); the loader finds
