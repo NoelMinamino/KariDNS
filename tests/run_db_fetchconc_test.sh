@@ -117,7 +117,7 @@ echo "== the default: loader-threads x 16"
 conf "loader-threads 3;"
 start_srv
 if [ "$STORE" = on ]; then
-    # the first start filled the store: the background fetch of the bodies has its own limit, 256 in flight (0.7 first-fill latency: ING_FILL_NFREQ, outside fetch-concurrency, whose places are the queries'): the most fetches it had in flight
+    # the first start filled the store: the background fetch of the bodies has its own limit (0.7 first-fill latency: 128 for each worker of the fill, loader-threads - 1, at least 256: here 256; outside fetch-concurrency, whose places are the queries'): the most fetches it had in flight
     FP=$(cat "$T/fill.peak" 2>/dev/null)
     [ -n "$FP" ] && [ "$FP" -ge 1 ] && [ "$FP" -le 256 ] && pass "the fill of the store (the background fetch of the bodies) had at most $FP fetches in flight (its own limit is 256)" || fail "the fill had '$FP' fetches in flight (want 1..256)"
 fi

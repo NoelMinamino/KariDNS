@@ -618,9 +618,11 @@ typedef struct { uint64_t id; uint16_t view; bool force; char zone[DNS_NAME_TEXT
 
 /* D1a: a FETCH_REQ waiting for the fetch thread (priority 0 = a parked query waits, 1 = warm-up, 2 = background) */
 typedef struct { uint64_t id; uint16_t view; uint8_t prio, mode; bool range; int64_t source_id; int64_t at; char zone[DNS_NAME_TEXT_SIZE]; } freq_t;   /* at: CLOCK_MONOTONIC ms of the enqueue */
-/* more than this is answered "busy" (design 6.1).  0.7 first-fill latency: the Backend keeps up to 256 bodies of the fill in flight (ING_FILL_NFREQ, dns_db_ingest.c) beside the requests
- * of queries (fetch-concurrency, at most 256): 512, so that neither is turned away */
-#define FQ_MAX 512
+/* more than this is answered "busy" (design 6.1).  0.7 first-fill latency: the Backend keeps up to 1024 bodies of the fill in flight (fill_max_for(), dns_db_ingest.c) beside the
+ * requests of queries (fetch-concurrency, at most 256): 1280, so that neither is turned away */
+#ifndef FQ_MAX
+#define FQ_MAX 1280
+#endif
 /* 0.7: a fetch worker that finds several requests of the same kind queued reads them together (fetch_batch()): one snapshot, one statement per table for
  * the zones instead of about a dozen statements for every one.  The most requests of one batch: FETCH_BATCH_MAX for the requests of queries, the warm-up and the
  * lookups (a query waits for its batch: small batches keep its time short), FETCH_BG_BATCH_MAX (DB_IN_MAX, one IN statement) for the bodies of the fill (the background class):
@@ -733,7 +735,7 @@ struct lio {
     pthread_mutex_t fq_lock, wlock;
     pthread_cond_t fq_cond;
     size_t fq_idle, fq_allowed;
-    size_t fq_bg_big;                        /* 0.7: workers reading a batch of the fill larger than FETCH_BATCH_MAX now (fq_bg_cap(): one worker is left to the queries) */
+    size_t fq_bg_active;                     /* 0.7: workers reading requests of the fill now (at most fq_bg_limit(): the others are the queries') */
     int64_t fq_fg_at;                        /* ... when the last request of a query or of the warm-up was queued (CLOCK_MONOTONIC ms, 0 = never) */
     _Atomic bool wstop;
     uint64_t fq_busy;                        /* requests turned away because fq was full (the thread answers them) */
@@ -5972,13 +5974,38 @@ static size_t fq_pick(const freq_t *fq, size_t n, int64_t now, int64_t aging) {
             if (fq[i].prio < fq[best].prio) best = i;
     return best;
 }
+/* the same among the requests that are not of the fill (priority < KDB_FETCH_PRIO_BACKGROUND): for a worker that may not read the fill now (fq_bg_limit()); n when there is none */
+static size_t fq_pick_fg(const freq_t *fq, size_t n, int64_t now, int64_t aging) {
+    size_t best = n;
+    for (size_t i = 0; i < n; i++) {
+        if (fq[i].prio >= KDB_FETCH_PRIO_BACKGROUND) continue;
+        if (best == n) {
+            best = i;
+            if (now - fq[i].at >= aging) break;              /* (the oldest of them has waited long enough: it goes first) */
+        } else if (fq[i].prio < fq[best].prio) {
+            best = i;
+        }
+    }
+    return best;
+}
 
-/* 0.7 first-fill latency: the most requests of the fill (the background class) that one batch takes.  A batch of DB_IN_MAX zones is one statement per table (the cost of a read of PostgreSQL
- * is mostly its statements), but a query that comes while every worker reads one waits for it: so at most loader-threads - 1 workers read such a batch at once (bg_big of them do now), and one is
- * left for the queries; with a single worker (loader-threads 1, a small server) the batch is that large only while no query or warm-up request came for FQ_FG_RECENT_MS (fg_recent). */
-static size_t fq_bg_cap(size_t workers, size_t bg_big, bool fg_recent) {
-    if (workers <= 1) return fg_recent ? FETCH_BATCH_MAX : FETCH_BG_BATCH_MAX;
-    return bg_big < workers - 1 ? FETCH_BG_BATCH_MAX : FETCH_BATCH_MAX;
+/* 0.7 first-fill latency: how many workers may read requests of the fill (the background class) at once, and the most requests one such batch takes.  The cost of a read of PostgreSQL is
+ * mostly its statements (a batch of DB_IN_MAX zones is one statement per table) but PostgreSQL is CPU-bound and the reads in parallel count too: pc31, 10M zones, loader-threads 8, the Backend's
+ * fill in flight 256: 7 workers on the fill 12.1k zones/s at 20 zones a read, 4 workers 11.2k at 41, 2 workers 8.9k at 127; 7 workers with 896 in flight 13.8k at 112.  So loader-threads - 1
+ * workers read the fill (the Backend keeps DB_IN_MAX bodies in flight for each, fill_max_for()), and one only the queries, the warm-up and the lookups: a query never waits behind the fill while
+ * loader-threads is 2 or more.  With a single worker (loader-threads 1, a small server) the batch of the
+ * fill is DB_IN_MAX only while no query or warm-up request came for FQ_FG_RECENT_MS (fg_recent), FETCH_BATCH_MAX otherwise. */
+static size_t fq_bg_limit(size_t workers) { return workers <= 1 ? 1 : workers - 1; }
+static size_t fq_bg_cap(size_t workers, bool fg_recent) {
+    return workers <= 1 && fg_recent ? FETCH_BATCH_MAX : FETCH_BG_BATCH_MAX;
+}
+/* may a worker take a request now: one of a query (or the warm-up, a lookup), or one of the fill while fewer than fq_bg_limit() workers read the fill (fq_lock held) */
+static bool fq_takeable(const struct lio *io) {
+    if (io->nfq == 0) return false;
+    if (io->fq_bg_active < fq_bg_limit(io->fq_allowed)) return true;
+    for (size_t i = 0; i < io->nfq; i++)
+        if (io->fq[i].prio < KDB_FETCH_PRIO_BACKGROUND) return true;
+    return false;
 }
 
 /* 0.7: the worker has taken request *r as the most urgent; more requests of the same kind join it (fq_lock held; `queued` = what was queued before r was taken).  Same view, same priority (a query that
@@ -6038,7 +6065,7 @@ static void *fetch_worker(void *arg) {
     struct fbatch *fb = calloc(1, sizeof(*fb));            /* (NULL: no batches, every request is read alone) */
     for (;;) {
         pthread_mutex_lock(&io->fq_lock);
-        while (!atomic_load(&io->wstop) && !(io->nfq > 0 && a->idx < io->fq_allowed)) {
+        while (!atomic_load(&io->wstop) && !(a->idx < io->fq_allowed && fq_takeable(io))) {
             io->fq_idle++;
             pthread_cond_wait(&io->fq_cond, &io->fq_lock);
             io->fq_idle--;
@@ -6048,20 +6075,15 @@ static void *fetch_worker(void *arg) {
             break;
         }
         const int64_t tnow = now_ms();
-        const size_t best = fq_pick(io->fq, io->nfq, tnow, g_fq_aging_ms);
-        freq_t r = io->fq[best];
+        const bool fill_ok = io->fq_bg_active < fq_bg_limit(io->fq_allowed);
+        const size_t best = fill_ok ? fq_pick(io->fq, io->nfq, tnow, g_fq_aging_ms) : fq_pick_fg(io->fq, io->nfq, tnow, g_fq_aging_ms);
+        freq_t r = io->fq[best];                                  /* (fq_takeable(): there is one) */
         const size_t queued = io->nfq;
         memmove(&io->fq[best], &io->fq[best + 1], (io->nfq - best - 1) * sizeof(io->fq[0]));
         io->nfq--;
-        bool big = false;                                         /* (this worker reads a batch of the fill larger than FETCH_BATCH_MAX: one place of fq_bg_big) */
-        if (fb) {
-            const bool bg = r.prio >= KDB_FETCH_PRIO_BACKGROUND;
-            fetch_take(io, fb, &r, queued, bg ? fq_bg_cap(io->fq_allowed, io->fq_bg_big, io->fq_fg_at && tnow - io->fq_fg_at < FQ_FG_RECENT_MS) : FETCH_BATCH_MAX);
-            if (bg && fb->n > FETCH_BATCH_MAX) {
-                big = true;
-                io->fq_bg_big++;
-            }
-        }
+        const bool bg = r.prio >= KDB_FETCH_PRIO_BACKGROUND;      /* (this worker reads the fill: one place of fq_bg_active until the read is over) */
+        if (bg) io->fq_bg_active++;
+        if (fb) fetch_take(io, fb, &r, queued, bg ? fq_bg_cap(io->fq_allowed, io->fq_fg_at && tnow - io->fq_fg_at < FQ_FG_RECENT_MS) : FETCH_BATCH_MAX);
         pthread_mutex_unlock(&io->fq_lock);
 #ifdef KARIDNS_TEST_EVICT
         if (g_test_fetch_delay_ms > 0) {                          /* (a test build: a slow database, a read costs this much whatever its size, as a statement of PostgreSQL does) */
@@ -6077,9 +6099,10 @@ static void *fetch_worker(void *arg) {
         }
         pthread_mutex_unlock(&g_fcfg_lock);
         const int frc = fb && fb->n >= 2 ? fetch_batch(&x, &lc, fb) : fetch_one(&x, &lc, &r);
-        if (big) {
+        if (bg) {
             pthread_mutex_lock(&io->fq_lock);
-            io->fq_bg_big--;
+            io->fq_bg_active--;
+            pthread_cond_broadcast(&io->fq_cond);                 /* (a worker that waited because the fill had its workers may take it now) */
             pthread_mutex_unlock(&io->fq_lock);
         }
         if (frc != 0) {

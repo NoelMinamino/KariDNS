@@ -73,7 +73,9 @@ _Static_assert(ZDIR_APEX_GLUE_PER_NS == KDB_NOTIFY_ADDR_PER_NS && ZDIR_APEX_NADD
 #define ING_MAX_BUILDERS 16
 #define ING_RBUF 65536
 #define ING_FLUSH_AT 16384        /* queued bytes that are written at once; the rest goes out after the event round */
-#define ING_FETCH_MAX 512         /* fetches in flight (D1a): more is refused, the queries then wait for their own deadline.  0.7 first-fill latency: the fill's ING_FILL_NFREQ (256) and fetch-concurrency (at most 256) both fit */
+#ifndef ING_FETCH_MAX
+#define ING_FETCH_MAX 1280         /* fetches in flight (D1a): more is refused, the queries then wait for their own deadline.  0.7 first-fill latency: the fill's ING_FILL_NFREQ_MAX (1024) and fetch-concurrency (at most 256) both fit */
+#endif
 #define ING_WQ_MAX 8192           /* 0.7 P-B: requests of queries that wait for a place, a token or room ("the wait queue"); the park tables bound the queries behind them, and a request is made once per zone */
 #define ING_LQ_MAX 16384          /* 0.7: lookups that wait for a place ("the lookup queue"); a request that finds it full is dropped and counted (true overload: the queries behind it time out) */
 #define ING_WQ_TICK_MS 10         /* ... and how often the thread looks again while some wait: the bucket, a new attempt to make room, their deadlines */
@@ -1599,7 +1601,9 @@ static uint32_t fetch_conc_eff(uint32_t conc, uint32_t loader_threads) {
   if (conc > ING_FETCH_MAX) conc = ING_FETCH_MAX;
   return conc;
 }
+static void fill_max_set(uint32_t loader_threads);
 static void set_fetch_limits(const ing_cfg_t *c) {
+  fill_max_set(c->loader_threads);           /* (0.7 first-fill latency: the fill's bodies in flight follow loader-threads) */
   uint32_t eff = fetch_conc_eff(c->fetch_concurrency, c->loader_threads);
   atomic_store_explicit(&g_fetch_conc, eff, memory_order_relaxed);
   park_places_set_limit(eff);                /* the pool of places the workers and this thread draw from: a lower limit takes effect as the places in use are given back, none is lost */
@@ -1627,16 +1631,29 @@ static uint32_t bulk_reserve_for(uint32_t conc) {
 }
 static uint32_t bulk_reserve(void) { return bulk_reserve_for(atomic_load_explicit(&g_fetch_conc, memory_order_relaxed)); }
 /* 0.7 first-fill latency (W1, W5): the bodies of the fill take no place of fetch-concurrency: every place is the queries' (their fetches and lookups), and the fill has a limit of its own, its
- * bodies in flight: ING_FILL_NFREQ while no request of a query waits (the wait queue and the lookup queue are empty), so that the loader reads whole IN statements (DB_IN_MAX zones; with
+ * bodies in flight: fill_max_for(loader-threads) (256..1024) while no request of a query waits (the wait queue and the lookup queue are empty), so that the loader reads whole IN statements (DB_IN_MAX zones; with
  * 32 in flight spread over the workers it read about 2 zones a statement, PostgreSQL 10M zones 2556 s against SQLite3's 490 s), and back to the old share (bulk_reserve(), at most 32) while
  * one waits: the fill makes no new request then, and the queries come first.  What bounds the load of the database is loader-threads (the loader's workers read; the requests in flight only
  * wait in its queue), and the loader leaves one worker to the queries (fq_bg_cap(), karidns_dbloader.c). */
-#define ING_FILL_NFREQ 256
-static uint32_t fill_limit_calc(uint32_t nwq, uint32_t nlq, uint32_t conc) { return nwq == 0 && nlq == 0 ? ING_FILL_NFREQ : bulk_reserve_for(conc); }
-static uint32_t fill_limit(const ing_t *g) { return fill_limit_calc(g->nwq, g->nlq, atomic_load_explicit(&g_fetch_conc, memory_order_relaxed)); }
+
+#define ING_FILL_NFREQ_MIN 256
+#define ING_FILL_NFREQ_MAX 1024
+#define ING_FILL_BATCH 128          /* the loader's batch of the fill (DB_IN_MAX of dns_db_driver.h, FETCH_BG_BATCH_MAX of karidns_dbloader.c) */
+/* the fill's bodies in flight while no query waits: DB_IN_MAX for each worker of the loader that reads the fill (loader-threads - 1, at least one: fq_bg_limit() of the loader), between
+ * ING_FILL_NFREQ_MIN and ING_FILL_NFREQ_MAX.  pc31, PostgreSQL 10M zones, loader-threads 8: 256 in flight gave 14 zones a read and 10.8k zones/s, 896 gave 112 zones a read and 13.8k zones/s
+ * (PostgreSQL is CPU-bound: the statements and the parallel reads both count) */
+static uint32_t fill_max_for(uint32_t loader_threads) {
+  const uint32_t w = loader_threads > 1 ? loader_threads - 1 : 1;
+  const uint32_t n = w * ING_FILL_BATCH;
+  return n < ING_FILL_NFREQ_MIN ? ING_FILL_NFREQ_MIN : (n > ING_FILL_NFREQ_MAX ? ING_FILL_NFREQ_MAX : n);
+}
+static _Atomic uint32_t g_fill_max = ING_FILL_NFREQ_MIN;   /* fill_max_for(loader-threads), set_fetch_limits() */
+static void fill_max_set(uint32_t loader_threads) { atomic_store_explicit(&g_fill_max, fill_max_for(loader_threads), memory_order_relaxed); }
+static uint32_t fill_limit_calc(uint32_t nwq, uint32_t nlq, uint32_t conc, uint32_t fmax) { return nwq == 0 && nlq == 0 ? fmax : bulk_reserve_for(conc); }
+static uint32_t fill_limit(const ing_t *g) { return fill_limit_calc(g->nwq, g->nlq, atomic_load_explicit(&g_fetch_conc, memory_order_relaxed), atomic_load_explicit(&g_fill_max, memory_order_relaxed)); }
 #ifdef KARIDNS_UNIT_TEST
-/* tests: the fill's limit of bodies in flight with nwq requests of queries and nlq lookups waiting, at fetch-concurrency conc */
-uint32_t db_ingest_test_fill_limit(uint32_t nwq, uint32_t nlq, uint32_t conc) { return fill_limit_calc(nwq, nlq, conc); }
+/* tests: the fill's limit of bodies in flight with nwq requests of queries and nlq lookups waiting, at fetch-concurrency conc and loader-threads lt */
+uint32_t db_ingest_test_fill_limit(uint32_t nwq, uint32_t nlq, uint32_t conc, uint32_t lt) { return fill_limit_calc(nwq, nlq, conc, fill_max_for(lt)); }
 #endif
 static _Atomic uint32_t g_ing_fill_pct;                    /* the share of the last window (~10 s) the ingest thread spent on the bodies of the fill (what a first fill takes of it) */
 static _Atomic uint64_t g_fetch_issued;   /* fetches of a whole zone sent to the loader (queries, transfers, the warm-up) */

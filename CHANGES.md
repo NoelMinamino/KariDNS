@@ -44,9 +44,9 @@ What changes, what it breaks, and what to do. The step-by-step version is [docs/
   EDE 14 "Zone not ready (empty)") SERVFAIL + EDE 14, as BIND; `drop` counts them in
   `karidns_not_ready_dropped_total` (karictl stats). A zone whose file failed to load stays SERVFAIL.
 - **The fill of a store has its own limit, outside `fetch-concurrency`** (first-fill latency PR). Its bodies take no
-  place of `fetch-concurrency` (every place is the queries'): up to 256 are in flight while no query waits (32 at most
+  place of `fetch-concurrency` (every place is the queries'): 128 for each worker of the fill (`loader-threads` - 1, 256..1024) are in flight while no query waits (32 at most
   while one does), and the loader reads up to 128 zones of the fill a statement (16 for queries) with one worker left
-  to the queries. The load on the database is bounded by `loader-threads`. The loader's queue holds 512 requests (was
+  to the queries. The load on the database is bounded by `loader-threads`. The loader's queue holds 1280 requests (was
   256). The loader logs its reads once a minute (`fetch reads in 60 s: ... zones a read`).
 - **More threads by default, and different ones** (#220, #226, #227).
   - Router and worker counts follow the CPUs the process may run on (`cpuset`, jails); from 4 CPUs half of them are

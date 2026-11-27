@@ -939,13 +939,14 @@ static int run_mode(const char *mode) {
         CHECK(park_att_take(sv, bogus) == PARK_ATT_ALL);                       /* (the claim was taken with it) */
     }
 
-    /* 0.7 first-fill latency: the fill takes no place of fetch-concurrency; its own limit of bodies in flight is ING_FILL_NFREQ (256) while no request of a query waits, and the old share
+    /* 0.7 first-fill latency: the fill takes no place of fetch-concurrency; its own limit of bodies in flight, 128 for each worker of the fill (loader-threads - 1), 256..1024, while no request of a query waits, and the old share
      * (a quarter of fetch-concurrency, at least one, at most 32) while one waits in the wait queue or the lookup queue */
     {
-        extern uint32_t db_ingest_test_fill_limit(uint32_t nwq, uint32_t nlq, uint32_t conc);
-        CHECK(db_ingest_test_fill_limit(0, 0, 8) == 256 && db_ingest_test_fill_limit(0, 0, 256) == 256);
-        CHECK(db_ingest_test_fill_limit(1, 0, 8) == 2 && db_ingest_test_fill_limit(0, 1, 8) == 2);
-        CHECK(db_ingest_test_fill_limit(5, 5, 256) == 32 && db_ingest_test_fill_limit(1, 0, 2) == 1 && db_ingest_test_fill_limit(1, 0, 64) == 16);
+        extern uint32_t db_ingest_test_fill_limit(uint32_t nwq, uint32_t nlq, uint32_t conc, uint32_t lt);
+        CHECK(db_ingest_test_fill_limit(0, 0, 8, 1) == 256 && db_ingest_test_fill_limit(0, 0, 256, 3) == 256);      /* (at least 256) */
+        CHECK(db_ingest_test_fill_limit(0, 0, 16, 4) == 384 && db_ingest_test_fill_limit(0, 0, 16, 8) == 896 && db_ingest_test_fill_limit(0, 0, 16, 16) == 1024);   /* (128 for each worker of the fill, at most 1024) */
+        CHECK(db_ingest_test_fill_limit(1, 0, 8, 8) == 2 && db_ingest_test_fill_limit(0, 1, 8, 8) == 2);
+        CHECK(db_ingest_test_fill_limit(5, 5, 256, 8) == 32 && db_ingest_test_fill_limit(1, 0, 2, 1) == 1 && db_ingest_test_fill_limit(1, 0, 64, 1) == 16);
         {   /* the places the lookups may take (lk_share()): three quarters, but one place is always left to the fetches of zones (the share was all of the places at 1 to 3) */
             extern uint32_t db_ingest_test_lk_share(uint32_t conc);
             CHECK(db_ingest_test_lk_share(1) == 1 && db_ingest_test_lk_share(2) == 1 && db_ingest_test_lk_share(3) == 2 && db_ingest_test_lk_share(4) == 3 && db_ingest_test_lk_share(5) == 4);

@@ -5190,9 +5190,9 @@ static void test_fetch_take(void) {
         fq_put(io, 1000 + (uint64_t)i, KDB_FETCH_FULL, KDB_FETCH_PRIO_BACKGROUND, 1, nm);
     }
     io->fq_allowed = 1;
-    fetch_take(io, fb, &r, 301, fq_bg_cap(1, 0, false));
+    fetch_take(io, fb, &r, 301, fq_bg_cap(1, false));
     CHECK_MSG(fb->n == FETCH_BG_BATCH_MAX && io->nfq == 301 - FETCH_BG_BATCH_MAX, "the fill, one worker, no query: %zu taken", fb->n);
-    fetch_take(io, fb, &r, io->nfq + 1, fq_bg_cap(1, 0, true));
+    fetch_take(io, fb, &r, io->nfq + 1, fq_bg_cap(1, true));
     CHECK_MSG(fb->n == FETCH_BATCH_MAX, "the fill, one worker, a query came: %zu taken", fb->n);
     free(io);
     free(fb);
@@ -5212,13 +5212,29 @@ static void test_fetch_pick(void) {
     CHECK(fq_pick(q, 2, 1100, 200) == 1);
     CHECK(fq_pick(q, 1, 1100, 200) == 0);
     /* one worker: DB_IN_MAX unless a query came recently; more workers: the last one never reads a large batch of the fill */
-    CHECK(fq_bg_cap(1, 0, false) == FETCH_BG_BATCH_MAX);
-    CHECK(fq_bg_cap(1, 0, true) == FETCH_BATCH_MAX);
-    CHECK(fq_bg_cap(0, 0, false) == FETCH_BG_BATCH_MAX);
-    CHECK(fq_bg_cap(2, 0, true) == FETCH_BG_BATCH_MAX);
-    CHECK(fq_bg_cap(2, 1, false) == FETCH_BATCH_MAX);
-    CHECK(fq_bg_cap(8, 6, false) == FETCH_BG_BATCH_MAX);
-    CHECK(fq_bg_cap(8, 7, false) == FETCH_BATCH_MAX);
+    CHECK(fq_bg_cap(1, false) == FETCH_BG_BATCH_MAX && fq_bg_cap(1, true) == FETCH_BATCH_MAX && fq_bg_cap(0, false) == FETCH_BG_BATCH_MAX);
+    CHECK(fq_bg_cap(2, true) == FETCH_BG_BATCH_MAX && fq_bg_cap(8, true) == FETCH_BG_BATCH_MAX);
+    CHECK(fq_bg_limit(0) == 1 && fq_bg_limit(1) == 1 && fq_bg_limit(2) == 1 && fq_bg_limit(8) == 7);
+    /* the worker that may not read the fill takes the most urgent of the others (the oldest when it is aged), and none when only the fill is queued */
+    CHECK(fq_pick_fg(q, 4, 1100, 200) == 2 && fq_pick_fg(q, 1, 1100, 200) == 1 && fq_pick_fg(q, 2, 1300, 200) == 1);
+    {
+        struct lio *io2 = calloc(1, sizeof(*io2));
+        CHECK(io2 != NULL);
+        if (io2) {
+            io2->fq_allowed = 2;
+            io2->nfq = 1;
+            io2->fq[0] = q[0];                                     /* (the fill only) */
+            CHECK(fq_takeable(io2));
+            io2->fq_bg_active = 1;
+            CHECK(!fq_takeable(io2));                              /* (the one worker of the fill is busy: the other waits for a query) */
+            io2->fq[1] = q[2];
+            io2->nfq = 2;
+            CHECK(fq_takeable(io2));
+            io2->nfq = 0;
+            CHECK(!fq_takeable(io2));
+            free(io2);
+        }
+    }
     /* the line of the reads: nothing until reads stopped for FR_IDLE_MS (or FR_REPORT_MS went by), then once */
     fr_state_t s;
     memset(&s, 0, sizeof(s));
