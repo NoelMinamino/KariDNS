@@ -157,11 +157,8 @@ export function createApp(env) {
   const returnRoute = () => (route === null || route.name === 'home' || route.name === 'notfound' ? '/' : String(win.location.hash ?? '').replace(/^#/, '') || '/');
 
   function loginScreen() {
-    const form = loginForm(ctx, { route: returnRoute(), onDone: async (r) => {
-      notice = null;
-      if (!r.enrollmentRequired) await session.loadVersion().catch(noop);
-      render();
-    } });
+    // (the screen after the sign-in is drawn by the change of the session, with the version: drawWithVersion)
+    const form = loginForm(ctx, { route: returnRoute(), onDone: () => { notice = null; } });
     // the page the service sends the browser to when a sign-in with an identity provider did not work (/#/?oidc=failed): one text for each of three words
     const why = route?.query?.oidc;
     const oidcFailure = why === 'failed' || why === 'unavailable' || why === 'busy' ? h('p', { class: 'msg error', role: 'alert' }, t(`login.oidc-${why}`)) : null;
@@ -263,13 +260,22 @@ export function createApp(env) {
   }
 
   // ---------------------------------------------------------------- start
+  // The screens of a person who is in read GET /version (the types, require_totp, the limits, the ldns link).  It is asked once per session, when the second step is
+  // done (before it the service answers 403): after a sign-in, after the TOTP confirmation, after a sign-in in another tab.  The screen of the new session is drawn
+  // when it has come (or failed), once: never first without it and then again under the person, and never left drawn without it.
+  let versionWait = null;
+  function drawWithVersion() {
+    versionWait ??= session.loadVersion().catch(noop).finally(() => {
+      versionWait = null;
+      if (keyOf() !== drawnKey) render();
+    });
+  }
   session.on('change', () => {
     if (route === null) return;
     if (keyOf() !== drawnKey) {
       closeWarning();
-      render();
-      // the version is asked once per session, when the second step is done (before it the service answers 403)
-      if (status() === 'in' && !forced() && !session.state.version) session.loadVersion().catch(noop);
+      if (status() === 'in' && !forced() && !session.state.version) drawWithVersion();
+      else render();               // (the change that GET /version itself makes is drawn here; the finally of drawWithVersion then finds it drawn)
     }
   });
   session.on('warn', warn);
@@ -279,7 +285,8 @@ export function createApp(env) {
   session.on('reauthenticated', (outcome) => { if (outcome === 'other') { drafts.clear(); router.go('home'); } });
   session.on('logout', () => drafts.clear());
   session.on('other-tab-logout', () => { drafts.clear(); notice = t('login.other-tab'); closeWarning(); render(); });
-  session.on('other-tab-login', () => render());
+  // (a sign-in in another tab: when this tab now waits for the version, drawWithVersion draws it; drawn now it would stay without the version)
+  session.on('other-tab-login', () => { if (versionWait === null) render(); });
   // (the screen is drawn again in the new language.  A control the person was using keeps the focus: the language is chosen with the arrow keys of a select, and a focus
   // that jumps to the top of the page after the first key is a keyboard trap in effect, WCAG 2.4.3 / 3.2.2)
   i18n.onChange((lang) => {
