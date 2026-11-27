@@ -49,7 +49,8 @@
 #
 # Environment: KARI_SUITE_STATUS=<file>  write "total=N passed=N failed=N skipped=N" and a line "failed_tests=<the failed tests>" there when every test has run
 # (make coverage-run fails when the file is missing, i.e. the suite stopped early; make coverage-suite-check fails unless failed=0).
-# It also has "shard=I/N" (1/1 without --shard) and "selected=N", the number of tests selected before the split into shards (make coverage-suite-check-shards).
+# It also has "shard=I/N" (1/1 without --shard) and "selected=N", the number of tests selected before the split into shards (make coverage-suite-check-shards),
+# and "checks=N", the sum of the "N checks, M failed" lines of the logs of this run (also printed in the summary: a dropped test or part shows there).
 # ==============================================================================
 
 set -u
@@ -1022,6 +1023,7 @@ fi
 # Scratch area of this run: the plan, the results, KARI_TMP of every slot
 SUITE_TMP=$(mktemp -d "${TMPDIR:-/tmp}/karisuite.XXXXXX") || exit 1
 chmod 755 "${SUITE_TMP}"
+: > "${SUITE_TMP}/start_stamp"    # the logs newer than this one are the ones of this run (CHECK_TOTAL)
 RES_DIR="${SUITE_TMP}/res"
 PLAN_FILE="${SUITE_TMP}/plan.tsv"
 mkdir -p "${RES_DIR}"
@@ -1794,10 +1796,19 @@ while IFS='|' read -r _s _c _cat _t _code _d _skip_r; do
     esac
 done < "${SUMMARY_FILE}"
 
+# The checks the tests of this run counted: the sum of their "N checks, M failed" lines (the unit tests and some scripts print them; a test with
+# several parts prints one per part), from the logs this run wrote.  The same tests give the same sum, so a CI change that drops a test or a part of
+# one shows here even when every test passes (the logs of a passing test are not printed).
+CHECK_SUM=$(find "${LOG_DIR}" -name 'test_*.log' -newer "${SUITE_TMP}/start_stamp" -exec cat {} + 2>/dev/null |
+    grep -a -o -E '(^|[^0-9])[0-9]+ checks, [0-9]+ failed' | tr -cs '0-9\n' ' ' |
+    awk '{ s += $1; n++ } END { printf "%d %d", s, n }')
+CHECK_TOTAL=${CHECK_SUM% *}
+CHECK_LINES=${CHECK_SUM#* }
+
 # KARI_SUITE_STATUS=<file>: the counts are written there once every test has run, so a caller that ignores the exit status (make
 # coverage-run) can tell a suite that finished, with or without failing tests, from one that stopped before running them (the file is missing).
 if [ -n "${KARI_SUITE_STATUS:-}" ]; then
-    printf 'total=%d passed=%d failed=%d skipped=%d\nfailed_tests=%s\ngui_not_run=%d\nshard=%d/%d\nselected=%d\npartly_skipped=%d\n' "${TOTAL_COUNT}" "${PASSED_COUNT}" "${FAILED_COUNT}" "${SKIPPED_COUNT}" "${FAILED_TESTS}" "${GUI_LEFT_OUT_COUNT}" "${SHARD_I}" "${SHARD_N}" "${SELECTED_TOTAL}" "${PARTLY_SKIPPED_COUNT}" >"${KARI_SUITE_STATUS}" ||
+    printf 'total=%d passed=%d failed=%d skipped=%d\nfailed_tests=%s\ngui_not_run=%d\nshard=%d/%d\nselected=%d\npartly_skipped=%d\nchecks=%d\n' "${TOTAL_COUNT}" "${PASSED_COUNT}" "${FAILED_COUNT}" "${SKIPPED_COUNT}" "${FAILED_TESTS}" "${GUI_LEFT_OUT_COUNT}" "${SHARD_I}" "${SHARD_N}" "${SELECTED_TOTAL}" "${PARTLY_SKIPPED_COUNT}" "${CHECK_TOTAL}" >"${KARI_SUITE_STATUS}" ||
         echo "WARN: could not write ${KARI_SUITE_STATUS}" >&2
 fi
 
@@ -1828,6 +1839,7 @@ fi
 if [ "${GUI_LEFT_OUT_COUNT}" -gt 0 ]; then
     printf "  Not run (browser)    : ${C_YELLOW}%d${C_RESET} (category gui; --with-gui)\n" "${GUI_LEFT_OUT_COUNT}"
 fi
+printf "  Checks counted       : %d (%d \"N checks\" lines in the logs of this run)\n" "${CHECK_TOTAL}" "${CHECK_LINES}"
 printf "  Total Execution Time : %ds (jobs: %d)\n" "${TOTAL_DURATION}" "${JOBS}"
 echo "${C_BOLD}======================================================================${C_RESET}"
 if [ -s "${ROOT_FILES_LIST}" ]; then
