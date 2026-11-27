@@ -1,4 +1,4 @@
-.TH KARIDNS.CONF 5 "2026-11-27" "KariDNS" "KariDNS Manual"
+.TH KARIDNS.CONF 5 "2026-11-28" "KariDNS" "KariDNS Manual"
 .\" Generated from docs/karidns.md by man/md2man.pl (make man): edit the Markdown manual, not this page.
 .SH NAME
 karidns.conf \- the configuration file of karidns(8)
@@ -6995,14 +6995,16 @@ nobody). \fBWithout an \fBallow\-transfer\fB at any level and without
 (first match decides; a \fBkey\fR element matches a request signed with that
 key; the zone's \fBtsig\-key\fR still has to sign the request when the list has
 addresses); with \fBtransfer\-acl\-match\fR written it is the older "address and
-key" / "address or key" combination: see Address match lists. At most 4
-transfers per zone run at the same time. The first message of an answer carries
-an OPT when the request had one (RFC 5936 \[u00A7]2.2.5). An IXFR request needs
-the client's SOA in the Authority section (RFC 1995 \[u00A7]3), otherwise it
-gets FORMERR; a client whose serial is the same as or newer than the zone's (RFC
-1982 comparison) gets the current SOA only (RFC 1995 \[u00A7]2), also over
-UDP. A transfer request for a zone that has no data yet (a secondary before its
-first transfer) gets SERVFAIL with EDE 14 (Not Ready).
+key" / "address or key" combination: see Address match lists. The outbound
+transfers that run at the same time are bounded by \fBtransfers\-out\fR
+(server-wide, default 10; see Transfer and NOTIFY options); there is no per-zone
+limit. The first message of an answer carries an OPT when the request had one
+(RFC 5936 \[u00A7]2.2.5). An IXFR request needs the client's SOA in the
+Authority section (RFC 1995 \[u00A7]3), otherwise it gets FORMERR; a client
+whose serial is the same as or newer than the zone's (RFC 1982 comparison) gets
+the current SOA only (RFC 1995 \[u00A7]2), also over UDP. A transfer request for
+a zone that has no data yet (a secondary before its first transfer) gets
+SERVFAIL with EDE 14 (Not Ready).
 .TP 8
 \fBalso\-notify [ port <n> ] { <addr> [port <n>] [key <name>]; <list>; ... };\fR
 \fIApplies to:\fR master
