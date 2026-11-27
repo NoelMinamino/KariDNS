@@ -1,4 +1,4 @@
-.TH KARIDNS\-TAPSTAT 1 "2026-11-24" "KariDNS" "KariDNS Manual"
+.TH KARIDNS\-TAPSTAT 1 "2026-11-27" "KariDNS" "KariDNS Manual"
 .\" Generated from docs/karidns-tapstat.md by man/md2man.pl (make man): edit the Markdown manual, not this page.
 .SH NAME
 karidns\-tapstat \- Aggregates the dnstap stream of \fBkaridns\fR into periodic
@@ -167,6 +167,32 @@ file's group; any other is refused with a message on standard error. A mode with
 \fBo+w\fR (such as \fB666\fR) lets every local user send made-up dnstap and fill
 the 16 places, so it is accepted with a warning only.
 .TP 8
+\fB\-u user\fR
+The only sender allowed (0.7, tools review T4-L5): a user name or a numeric uid,
+repeatable up to 16 times. \fBkaridns\fR connects as the user it runs as
+(\fBoptions { user }\fR), at its start after the privilege drop and through its
+connect broker when it reconnects, so \fB\-u\fR with that user admits
+\fBkaridns\fR and refuses every other local user that the socket mode lets in,
+root and the members of the socket's group included. A refused sender is
+reported on standard error and counted (\fBsenders refused\fR in the
+summary). \fB\-u\fR needs the peer's credentials (\fBLOCAL_PEERCRED\fR on
+FreeBSD, \fBSO_PEERCRED\fR on Linux); on a system without them \fB\-u\fR is a
+usage error and the socket mode alone decides, as without \fB\-u\fR.
+.TP 8
+\fB\-l rate\fR
+The bytes per second one sender may send, with \fBK\fR, \fBM\fR or \fBG\fR
+(powers of 1024; default \fB64M\fR, \fB0\fR = no limit, otherwise 4K to 1024G: a
+slower sender could not finish its handshake within its 5 seconds). A sender is
+a uid (the peer's credentials): all its connections share one bucket of one
+second's worth, kept when they close, so neither more connections nor a
+reconnect give it more than the rate (on a system without peer credentials the
+bucket is per connection). A sender over it is not read until the bucket
+refills, so it waits on its socket (nothing it sent is lost or cut;
+\fBkaridns\fR counts what its ring could not hold as dnstap drops). Each pause
+is counted (\fBthrottled\fR in the summary). A dnstap message of \fBkaridns\fR
+takes a few hundred bytes, so \fB64M\fR is some 200,000 messages a second; raise
+\fB\-l\fR for a busier server.
+.TP 8
 \fB\-w seconds\fR
 Close a sender that has sent nothing for this long after the handshake, 1 to
 86400 (default \fB600\fR): a sender that holds a place without sending gives it
@@ -192,6 +218,7 @@ file, a failing output) and 2 for a usage error.
 .nf
 karidns\-tapstat 2026\-11\-11T12:00:00Z \- 2026\-11\-11T12:01:00Z (60.0 s)
 frames 1204  bad 0  queries 0  responses 1204  other\-messages 0  no\-question 0  malformed 0
+senders refused 0  throttled 0
 zone: events 1204  keys 2  evictions 0
          900  example.test.
          304  other
@@ -210,16 +237,18 @@ client: events 1204  keys 5  evictions 0
 .PP
 A key that may be over-counted is followed by \fB(may be over\-counted by up to
 E)\fR; see "Bounded memory". \fBframes\fR is the number of dnstap frames,
-\fBbad\fR those that could not be decoded, \fBother\-messages\fR those of a
-message type that is neither query nor response, \fBno\-question\fR messages
-with an empty question section, \fBmalformed\fR those whose question could not
-be read.
+\fBbad\fR those that could not be decoded, \fBsenders refused\fR the senders of
+the interval that were refused (not a \fB\-u\fR user, not allowed by the socket
+mode, or no place left) and \fBthrottled\fR the pauses of a sender over
+\fB\-l\fR, \fBother\-messages\fR those of a message type that is neither query
+nor response, \fBno\-question\fR messages with an empty question section,
+\fBmalformed\fR those whose question could not be read.
 .SS json
 One JSON object per summary on one line: \fBstart\fR, \fBend\fR, \fBseconds\fR,
 the counters above (\fBframes\fR, \fBbad_frames\fR, \fBqueries\fR,
-\fBresponses\fR, \fBother_messages\fR, \fBno_question\fR, \fBmalformed\fR) and
-\fBdimensions\fR, an object with \fBzone\fR, \fBqname\fR, \fBqtype\fR,
-\fBrcode\fR and \fBclient\fR, each
+\fBresponses\fR, \fBother_messages\fR, \fBno_question\fR, \fBmalformed\fR),
+\fBsenders_refused\fR, \fBsenders_throttled\fR and \fBdimensions\fR, an object
+with \fBzone\fR, \fBqname\fR, \fBqtype\fR, \fBrcode\fR and \fBclient\fR, each
 \fB{"events":N,"keys":N,"evictions":N,"top":[{"key":"...","count":N,"error":N},...]}\fR;
 \fBcount\fR may be too high by up to \fBerror\fR (Space-Saving).
 .SS prom
@@ -227,6 +256,7 @@ Gauges for the interval just ended (the counters restart after every summary, so
 they are not Prometheus counters): \fBkaridns_tapstat_interval_seconds\fR,
 \fBkaridns_tapstat_last_summary_timestamp_seconds\fR,
 \fBkaridns_tapstat_messages{kind=...}\fR,
+\fBkaridns_tapstat_senders{kind="refused"|"throttled"}\fR,
 \fBkaridns_tapstat_events{dimension=...,kind="total"|"evictions"}\fR,
 \fBkaridns_tapstat_count{dimension=...,key=...}\fR for the most frequent keys
 and \fBkaridns_tapstat_count_error{dimension=...,key=...}\fR for the over-count

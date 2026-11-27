@@ -2050,6 +2050,27 @@ this authoritative server has nothing to write to them: \fBdispatch\fR,
 \fBspill\fR, \fBserve\-stale\fR, \fBedns\-disabled\fR, \fBresolver\fR,
 \fBtrust\-anchor\-telemetry\fR, \fBsslkeylog\fR, \fBunmatched\fR.
 .PP
+\fBThe other lines on the query path: a rate limit per call site (0.7, review
+M-3).\fR A log line written by a thread on the query path (a worker, or a thread
+of the async pool of the program and forward zones: a client can make those
+lines happen at will) passes a rate limit of its call site (the place in the
+source that writes it): 20 lines a second, 1000 while the debug level in force
+is above 0. When the second is over one line reports the rest, in the category
+of the site and at the level of the last line dropped: \fB[Logging] <N> line(s)
+like "<the start of the first line>" suppressed by the rate limit of <L> per
+second\fR. Such a thread never writes a line itself: it puts the line into its
+event ring and the query logger thread writes it (the same line, with the time
+of the call, cut at 255 bytes as event lines are; when the ring is full the line
+is dropped and counted in the \fB[QueryLog] Dropped N event log messages\fR
+warning), so a slow or blocked log destination (a full stderr pipe, a stalled
+file system, syslog) cannot stop the answers. When no logger thread drains the
+rings (before it starts, after it ends) the thread writes the line itself, as
+before 0.7, and without a logging runtime the logger thread sends the lines to
+syslog, so a line is not left in a ring. The lines of the other threads
+(start-up, loads and reloads, transfers, the database ingest: one line per zone,
+which the operator needs, set by the configuration and the database rather than
+by clients) are not limited.
+.PP
 \fBEvent messages (\fBupdate\-security\fB, \fBupdate\fB, \fBxfer\-out\fB,
 \fBquery\-errors\fB).\fR These categories carry messages about what clients ask
 of the server, in the form BIND writes them (\fBlib/ns/update.c\fR,
