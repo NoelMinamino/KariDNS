@@ -2470,11 +2470,19 @@ static bool at_fill_to_prep(const dbdir_ops_t *ops, uint32_t base, zdir_elem_t *
     }
     return ops->counters(9) != 0;
 }
+/* the grace period after elements were taken out of the table: true when every reader that may have found them has left, and only then may they be freed.  The thread that makes a bigger table
+ * (att_prep_thread()) reads the elements in its read section, and on a loaded host (ASan, the suite in parallel) that section can outlast a short wait: an element freed after a wait that ran out
+ * was read after its free (heap-use-after-free in att_zid() under ASan).  A wait that runs out is a failure, and the elements are then left unfreed (a leak in a test, not a use after free) */
+static bool at_grace(void) {
+    const bool ok = rcu_writer_wait_until_safe(rcu_writer_advance_epoch(), 60000);
+    CHECK_MSG(ok, "a reader stayed in its read section for 60 s: the elements taken out are not freed");
+    return ok;
+}
 static void at_drop_all(const dbdir_ops_t *ops, zdir_elem_t **arr, uint32_t n) {
     CHECK(at_wait_prep(ops, false, 20000));                                       /* (a thread that makes a table reads the elements: they are not freed meanwhile) */
     for (uint32_t i = 0; i < n; i++) ops->attach_remove(arr[i]);
-    (void)rcu_writer_wait_until_safe(rcu_writer_advance_epoch(), 5000);
-    for (uint32_t i = 0; i < n; i++) free(arr[i]);
+    if (at_grace())
+        for (uint32_t i = 0; i < n; i++) free(arr[i]);
     free(arr);
 }
 
@@ -2586,14 +2594,14 @@ static void at_scenarios(const dbdir_ops_t *ops) {
         ring[slot] = at_new(next++);
         CHECK(at_put(ops, ring[slot]));
         if (ngone == 4096) {
-            (void)rcu_writer_wait_until_safe(rcu_writer_advance_epoch(), 5000);
-            for (int g = 0; g < ngone; g++) free(gone[g]);
+            if (at_grace())
+                for (int g = 0; g < ngone; g++) free(gone[g]);
             ngone = 0;
         }
         if ((k & 1023) == 0) usleep(100);
     }
-    (void)rcu_writer_wait_until_safe(rcu_writer_advance_epoch(), 5000);
-    for (int g = 0; g < ngone; g++) free(gone[g]);
+    if (at_grace())
+        for (int g = 0; g < ngone; g++) free(gone[g]);
     CHECK(at_wait_prep(ops, false, 20000));
     const uint64_t gr3 = ops->counters(6) - gr2, bg3 = ops->counters(8) - bg2;
     printf("  tombstones: %llu table(s) made at %llu slots, %llu of them outside the lock; prepared growths started: %d\n", (unsigned long long)gr3, (unsigned long long)slots2, (unsigned long long)bg3, atomic_load(&g_pp_calls));
@@ -2701,8 +2709,8 @@ static int run_attab(const char *dir) {
     for (uint32_t i = 1; i <= AT_N && g_at_el; i++) {                            /* (the table is emptied: nothing is freed that a reader could have) */
         if (!(i % 7 == 0 && i + 50 <= AT_N)) ops->attach_remove(g_at_el[i]);
     }
-    (void)rcu_writer_wait_until_safe(rcu_writer_advance_epoch(), 5000);
-    for (uint32_t i = 1; i <= AT_N && g_at_el; i++) free(g_at_el[i]);
+    if (at_grace())
+        for (uint32_t i = 1; i <= AT_N && g_at_el; i++) free(g_at_el[i]);
     free(g_at_el);
     at_scenarios(ops);
     at_stop_scenario(ops);                                                       /* (this stops the store) */
