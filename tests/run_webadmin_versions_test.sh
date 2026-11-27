@@ -115,7 +115,7 @@ chmod 644 "$T/karidns.conf"
 # CI flake rows 9, 34: when a query of it_versions.mjs gets no answer, IT_LOST_DIAG prints the counters that say where it was lost (tests/lib_proc.sh)
 printf 'socket "%s";\nkey "karictl" { algorithm hmac-sha256; secret "%s"; };\n' "$T/ctl.sock" "$MAIN_SECRET" > "$T/main-karictl.conf"
 chmod 600 "$T/main-karictl.conf"
-kari_noanswer_script "$T/noanswer.sh" "$T/noanswer" "$ROOT/karictl -c $T/main-karictl.conf" "$T/karidns.log" "$PORT"
+kari_noanswer_script "$T/noanswer.sh" "$T/noanswer" "$ROOT/karictl -c $T/main-karictl.conf" "$T/karidns.log" "$PORT" "$T/karidns.conf"
 printf 'socket "%s";\nkey "karictl" { algorithm hmac-sha256; secret "%s"; };\n' "$T/ctl.sock" "$WEB_SECRET" > "$T/web-karictl.conf"
 chmod 600 "$T/web-karictl.conf"
 "$KARIDNS" -c "$T/karidns.conf" -f > "$T/karidns.log" 2>&1 &

@@ -133,7 +133,7 @@ ask() {
     kari_try_snap "$W/noanswer"
     _ask=$("$DAG" "$1" "$2" @127.0.0.1 -p $PORT +dnssec +norec +nohexdump +tries=1 +time=2 2>/dev/null | sed -n 's/.*status: \([A-Z]*\),.*/\1/p')
     # (no status: no answer in 2 s; CI 2026-11-22 #249, gap.test beside run_db_cold_burst_test: the host's counters say where it was lost; the check is the caller's)
-    [ -n "$_ask" ] || kari_noanswer_diag "$W/noanswer" "" "$W/server.log" "$PORT" "$1" "$2" >&2
+    [ -n "$_ask" ] || kari_noanswer_diag "$W/noanswer" "" "$W/server.log" "$PORT" "$1" "$2" "$W/k.conf" >&2
     printf '%s\n' "$_ask"
 }
 
