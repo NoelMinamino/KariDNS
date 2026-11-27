@@ -2616,7 +2616,7 @@ static void test_no_wait_in_lock(int mode) {
   CHECK(got[1] > 0 && got[5] > 0);
   CHECK(got[2] == 1);                                                    /* (the calls ended while the flush still slept) */
   /* (a call that waited for the held flush or build would take most of its 400 ms; got[2] and got[3] say the calls ended while it slept.  The bound is 300 ms, not 100:
-   *  in MAP mode a call that first touches a table page reads it in, and a coverage build on a CI VM took 149 ms for one: CI flakes row 82) */
+   *  in MAP mode a call that first touches a table page reads it in, and a coverage build on a CI VM took 149 ms for one: CI flakes row 83) */
   CHECK(got[0] < 300000);
   CHECK(got[4] < 300000);
   CHECK(got[3] == 1);
