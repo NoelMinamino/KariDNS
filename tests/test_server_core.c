@@ -5972,6 +5972,18 @@ static void test_klog_destinations_and_batches(void) {
     assert(lx && lx[strlen(want)] == 'x' && s[strlen(s) - 1] == '\n' && strlen(lx) <= KLOG_MSG_MAX + 256);
     free(s);
     assert(klog_lines(errfile) == 3);
+    /* 0.7 review M-3: the query logger thread's way for an event record when there is no logging runtime (a line of a worker is not dropped) */
+    saved = dup(2);
+    fd = open(errfile, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    assert(saved >= 0 && fd >= 0);
+    dup2(fd, 2);
+    close(fd);
+    klog_syslog_level(LOG_LVL_WARNING, "worker line without a runtime");
+    dup2(saved, 2);
+    close(saved);
+    s = klog_slurp(errfile);
+    assert(strstr(s, want) == s && strstr(s, " - - worker line without a runtime\n") != NULL);
+    free(s);
     setenv("KARIDNS_NOSYSLOG", "0", 1);
     assert(!klog_nosyslog_from_env("KariDNS"));
     unsetenv("KARIDNS_NOSYSLOG");
