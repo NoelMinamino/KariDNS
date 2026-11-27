@@ -113,6 +113,22 @@ export class Browser {
     }
   }
 
+  // Every drawing of a screen puts a new <main> into #app (app.js shell()).  countDraws() starts counting them; waitDraws(n) waits until n were drawn since.  The GUI
+  // draws twice after a sign-in: when the session changes, and again when GET /version has come (app.js loginScreen, onDone).  A test that goes on after the first
+  // can hold an element that the second replaces ("stale element reference", flake row 86), or have the page it opened drawn again under it.
+  countDraws() {
+    return this.exec(() => {
+      window.__draws?.o.disconnect();
+      const d = { n: 0, o: null };
+      d.o = new MutationObserver((ms) => { for (const m of ms) for (const x of m.addedNodes) if (x.nodeName === 'MAIN') d.n++; });
+      d.o.observe(document.getElementById('app'), { childList: true });
+      window.__draws = d;
+    });
+  }
+  waitDraws(n, o = {}) {
+    return this.waitFor(() => this.exec((k) => (window.__draws ? window.__draws.n : 0) >= k, n), { message: `${n} drawings of the screen`, ...o });
+  }
+
   waitCss(css, o = {}) { return this.waitFor(async () => { const e = await this.$(css); return (await e.displayed()) ? e : null; }, { message: `${css} to be shown`, ...o }); }
   waitGone(css, o = {}) { return this.waitFor(async () => !(await this.exists(css)), { message: `${css} to go`, ...o }); }
   waitText(css, re, o = {}) {

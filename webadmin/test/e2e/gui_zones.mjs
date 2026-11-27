@@ -83,7 +83,7 @@ fs.mkdirSync(path.join(DIR, 'shots'), { recursive: true });
 const files = path.join(DIR, 'files');
 fs.mkdirSync(files, { recursive: true });
 
-const h1 = async () => (await (await b.$('h1')).text()).trim();
+const h1 = () => retryStale(async () => (await (await b.$('h1')).text()).trim());
 const waitH1 = (re, o) => b.waitText('h1', re, o);
 const bodyText = () => b.exec(() => document.body.innerText);
 const fill = async (name, value, scope = '') => retryStale(async () => { const e = await b.$(`${scope} [name=${name}]`); await e.clear(); await e.type(value); });
@@ -119,11 +119,14 @@ const rowIs = async (name, type, want, what) => {
     .catch((e) => { throw new Failed(`${e.message} (it holds ${JSON.stringify(got)})`); });
 };
 const setSelect = (name, value, scope = '') => b.exec((n, v, s) => { const el = document.querySelector(`${s} select[name=${n}]`); el.value = v; el.dispatchEvent(new Event('change', { bubbles: true })); }, name, value, scope);
+// (done when the second drawing after the sign-in is there: the one after GET /version, wd.mjs countDraws)
 const signIn = async (user, password) => {
   await fill('user', user);
   await fill('password', password);
+  await b.countDraws();
   await click('Sign in', 'form');
   await waitH1(/^Welcome, /);
+  await b.waitDraws(2, { message: 'the second drawing after the sign-in (GET /version)' });
 };
 const logout = async () => {
   await click('Log out', 'header');
@@ -152,13 +155,36 @@ const noTrouble = async () => {
   eq(await b.exec(() => [window.__xss, window.__xss2, window.__xss3]), [null, null, null], 'a canary was set');
 };
 
-async function scenario(name, fn) {
+// `who` is the person signed in when the scenario starts, as the scenario before it leaves the page: 'admin', 'dom', or null (nobody).
+async function scenario(name, fn, who = 'admin') {
+  if (resetFor) await resetTo(who);
   try {
     await fn();
     ok(name);
   } catch (e) {
     bad(name, e.message);
     try { await b.screenshot(path.join(DIR, 'shots', `${name.replace(/[^A-Za-z0-9]+/g, '_').slice(0, 60)}.png`)); } catch { /* no picture */ }
+    resetFor = name;
+  }
+}
+
+// A scenario that failed half-way leaves the page as it was at the failure: another person signed in (the hostile data scenario signs in as evil), Japanese, a dialog, a
+// draft.  Every scenario after it would fail for that alone (flake row 86: one failure, then seven).  So the next one starts on the page loaded again, in English, with
+// the person it expects signed in anew (the log-out takes the drafts, F-13).
+let resetFor = null;
+const PASSWORDS = { admin: E.GUI_ADMIN_PASSWORD, dom: 'dora quartz lantern 12' };
+async function resetTo(who) {
+  const after = resetFor;
+  resetFor = null;
+  try {
+    await b.exec(() => { try { window.localStorage.setItem('karidns-lang', 'en'); } catch { /* refused */ } });
+    await b.get(`${BASE}/`);
+    await waitH1(/^(Sign in|Welcome, .*)$/);
+    if ((await h1()) !== 'Sign in') await logout();
+    if (who) await signIn(who, PASSWORDS[who]);
+    console.log(`  [INFO] after "${after}" failed: the page was loaded again, ${who ?? 'nobody'} signed in`);
+  } catch (e) {
+    console.log(`  [INFO] after "${after}" failed: the page could not be set back (${e.message})`);
   }
 }
 
@@ -201,7 +227,7 @@ try {
     await setSelect('kind', 'SLAVE');
     await click('Find zones', 'form');
     await b.waitText('main', /No zone matches\./);
-  });
+  }, null);
 
   // ------------------------------------------------------------------------------------------------------------------------------------------ editing
   console.log('-- a zone, a change with a preview, the update button (S4, S5)');
@@ -306,7 +332,7 @@ try {
     await b.waitText('section[aria-labelledby=last-title]', /The change was saved\./);
     await rowIs('www', 'A', '192.0.2.78', 'mine won');
     must(!(await rowText('www', 'A'))[3].includes('192.0.2.56'), 'theirs is gone');
-  });
+  }, 'dom');
 
   await scenario('the same conflict in Japanese: the refusal and the choices', async () => {
     await open('#/account', /^Your account$/);
@@ -334,7 +360,7 @@ try {
     await b.exec(() => document.querySelector('select').focus());
     await b.keys(NAMED_KEYS.ArrowUp);
     await waitH1(/^Your account$/);
-  });
+  }, 'dom');
 
   console.log('-- refusals of the service on the right place (422, 403)');
   const addSet = async (name, type, ttl, records) => {
@@ -372,7 +398,7 @@ try {
     await b.waitText('section.draft', /This is not allowed:/);
     must(await b.exists('section.draft ul.entry-errors'), 'the refusal is not at the record set');
     await click('Discard all changes', 'section.draft');
-  });
+  }, 'dom');
 
   console.log('-- a draft survives the end of the session (F-13)');
   await scenario('the session is ended behind the page: the sign-in opens over it, the draft stays and goes on', async () => {
@@ -399,7 +425,7 @@ try {
     await waitDraft(/This is what the change would do/);
     await click('Discard all changes', 'section.draft');
     await logout();
-  });
+  }, 'dom');
 
   // ------------------------------------------------------------------------------------------------------------------------------------------ the subdomain master
   console.log('-- a subdomain master (S4)');
@@ -426,7 +452,7 @@ try {
     await open('#/zones/main/example.test./dnssec', /./);
     await b.waitText('main', /DNSSEC is for the masters of the whole zone\./);
     await logout();
-  });
+  }, null);
 
   // ------------------------------------------------------------------------------------------------------------------------------------------ new zones
   console.log('-- new zones (S6)');
@@ -478,7 +504,7 @@ try {
     await waitH1(/^text\.test\./);
     await b.waitCss('table.rrsets');
     await rowIs('web', 'A', '192.0.2.2', 'the record of the file');
-  });
+  }, null);
 
   await scenario('a refusal is told at the field: a zone that exists, a name server that is not a host name', async () => {
     await openCreate();
@@ -1001,7 +1027,7 @@ try {
     await b.waitText('main', /managed by the masters of the whole zone/);
     await logout();
     await signIn('admin', E.GUI_ADMIN_PASSWORD);
-  });
+  }, 'dom');
 
   console.log('-- the audit log (S12)');
   await scenario('filters, a change set to its version, the rows of hostile data are text', async () => {
