@@ -677,6 +677,7 @@ register_test "core" "sh" "tests/run_daemonize_relative_paths_test.sh" "Daemoniz
 register_test "core" "sh" "tests/run_notify_source_test.sh" "RFC 1996 notify-source address binding" "serial"   # fixed ports 10053/10054 and the loopback alias 127.0.0.2 (the control socket is the test's own)
 register_test "core" "sh" "tests/run_privilege_drop_root_test.sh" "FreeBSD setuid/setgid privilege drop"
 register_test "core" "sh" "tests/run_nonroot_startup_test.sh" "Non-root startup & fail-closed port/log/pid/control checks"
+register_test "core" "sh" "tests/run_aux_wake_test.sh" "The UDP routers and the connect broker of an idle server wake at least once a second (0.7: FreeBSD 14 swaps out a process asleep longer than vm.swap_idle_threshold1, and a swapped-out router held the replies for seconds)"
 register_test "core" "sh" "tests/run_response_cache_test.sh" "Response cache hit/miss functional verification"
 register_test "core" "sh" "tests/run_ttl_harmonization_test.sh" "RRset TTL harmonization on zone load"
 register_test "core" "sh" "tests/run_ttl_rfc2181_clamp_test.sh" "TTL range of zone files (BIND 9.20 ARM 3.5.5.4: above 2147483647 is rejected) and the clamp to 2147483647 on the wire (RFC 8767 §4, O-14)"
