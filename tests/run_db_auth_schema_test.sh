@@ -10,7 +10,7 @@
 #     two chains), a user has no members, a membership cannot be updated, the kind of a principal in a membership (or with credentials) cannot change;
 #   - credentials are for users only and a password hash must be a $argon2id$ or $scrypt$ string; an rr_policy takes no DNSSEC-managed type (each of the
 #     seven), no lower case type, a TTL range that makes sense; grants: the scope of each role, canonical zone and suffix names (lower case, no trailing dot,
-#     no empty label, 253 octets), a suffix that is the zone or ends in '.<zone>' (evilexample.com is not under example.com), the foreign keys.
+#     no empty label, 253 octets), a suffix that is the zone or ends in '.<zone>' (xexample.test is not under example.test), the foreign keys.
 # PostgreSQL only: the trigger on domains (DELETE removes the grants of the zone, a rename renames them, another schema's zone of the same name is not
 #   touched), karidns_auth.enable_audit() / disable_audit() (idempotent, the PowerDNS tables have no audit trigger before it), the audit rows of INSERT /
 #   UPDATE / DELETE (before / after, zone, row id, database role, principal and change set from the session, the cascade of a zone delete), cryptokeys.content
@@ -197,7 +197,7 @@ shared_cases() {
     X_ERR "a domain master with a suffix is refused" "grants_scope" "$(gins "'domain_master', $DS, 'example.com', 'sub.example.com', $PW")"
     X_ERR "a subdomain master without a suffix is refused" "grants_scope" "$(gins "'subdomain_master', $DS, 'example.com', NULL, $PW")"
     X_ERR "a subdomain master without a zone is refused" "grants_scope" "$(gins "'subdomain_master', $DS, NULL, 'sub.example.com', $PW")"
-    X_ERR "the suffix evilexample.com is not under example.com (label boundary)" "grants_suffix_under_zone" "$(gins "'subdomain_master', $DS, 'example.com', 'evilexample.com', $PW")"
+    X_ERR "the suffix xexample.test is not under example.test (label boundary)" "grants_suffix_under_zone" "$(gins "'subdomain_master', $DS, 'example.test', 'xexample.test', $PW")"
     X_ERR "the suffix com is not under example.com" "grants_suffix_under_zone" "$(gins "'subdomain_master', $DS, 'example.com', 'com', $PW")"
     X_ERR "the suffix example.org is not under example.com" "grants_suffix_under_zone" "$(gins "'subdomain_master', $DS, 'example.com', 'x.example.org', $PW")"
     X_ERR "an upper case zone is refused" "grants_zone_canonical" "$(gins "'domain_master', $DS, 'Example.com', NULL, $PW")"
