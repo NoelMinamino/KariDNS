@@ -600,6 +600,9 @@ static void add_lookup(list_t *l) {
   U("store.lookup.rtt.p50_us", store_status_hist_pct(k->hist, 50, k->max_ns));
   U("store.lookup.rtt.p99_us", store_status_hist_pct(k->hist, 99, k->max_ns));
   U("store.lookup.rtt.max_us", (k->max_ns + 999) / 1000);
+  U("store.fetch.query.rtt.p50_us", store_status_hist_pct(k->qf_hist, 50, k->qf_max_ns));
+  U("store.fetch.query.rtt.p99_us", store_status_hist_pct(k->qf_hist, 99, k->qf_max_ns));
+  U("store.fetch.query.rtt.max_us", (k->qf_max_ns + 999) / 1000);
   add_hist(l, "store.lookup.rtt", k->hist);
   free(k);
 }
@@ -731,6 +734,8 @@ static void add_store(list_t *l, const store_t *s, const store_attach_stats_t *a
   U("store.bulk.recoveries", st->bulk_recoveries);
   U("store.bulk.recovered_known", st->recovery.bulk_known);
   U("store.bulk.checkpoints", st->bulk_checkpoints);
+  U("store.bulk.presyncs", st->bulk_presyncs);
+  U("store.bulk.presync_max_us", st->bulk_presync_max_us);
   U("store.bulk.unlogged_records", st->bulk_unlogged_records);
   U("store.bulk.since_unix", st->bulk_since_unix);
   U("store.bulk.ended_unix", st->bulk_ended_unix);

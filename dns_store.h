@@ -411,6 +411,7 @@ typedef struct store_stats {
   uint64_t bulk_resumed;            /* opens that found one going on (a clean stop or a crash in the middle of it): 0 or 1 */
   uint64_t bulk_recoveries;         /* ... of them the ones after a crash: 0 or 1 */
   uint64_t bulk_checkpoints;        /* bulk checkpoints made (the durable points of the body fill) */
+  uint64_t bulk_presyncs, bulk_presync_max_us;   /* 0.7 first-fill latency: early syncs of the segments of an unlogged fill (every 128 MiB written), and the longest (bulk_presync()) */
   uint64_t bulk_unlogged_records;   /* writer records applied without a journal record */
   uint64_t bulk_since_unix;         /* when the fill began or was resumed (0: none) */
   uint64_t bulk_ended_unix;         /* when the last one ended (store_bulk_end(); 0: none in this session) */

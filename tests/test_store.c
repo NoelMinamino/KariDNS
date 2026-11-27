@@ -7996,6 +7996,12 @@ static void test_bulk_basic(void) {
   CHECK_EQ(store_scrub_run(s, NULL), -EBUSY);
   CHECK_EQ(store_journal_wait(s, 1), 0);
   for (uint32_t i = 0; i < 600; i++) CHECK(verify_i(s, 0, i, 2));
+  for (int w = 0; w < 300; w++) {                                         /* (0.7 first-fill latency: the segments past half the bulk checkpoint bytes are synced early, at a turn of the checkpoint thread) */
+    store_stats(s, &st);
+    if (st.bulk_presyncs > 0) break;
+    usleep(10000);
+  }
+  CHECK(st.bulk_presyncs >= 1 && st.checkpoints == ck0);                  /* (a presync is no checkpoint) */
   /* 2. the body fill: a bulk checkpoint at once (the segments are past 256 KiB), the next one at twice the bytes of that one */
   store_set_ck_slow_fn(s, reads_wait_yes);                                /* (0.7 first-fill latency: reads wait: the bulk checkpoint writes its tables at the slow rate) */
   store_bulk_phase(s, STORE_BULK_PASSED);

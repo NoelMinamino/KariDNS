@@ -5215,6 +5215,7 @@ static void test_fetch_pick(void) {
     CHECK(fq_bg_cap(1, false) == FETCH_BG_BATCH_MAX && fq_bg_cap(1, true) == FETCH_BATCH_MAX && fq_bg_cap(0, false) == FETCH_BG_BATCH_MAX);
     CHECK(fq_bg_cap(2, true) == FETCH_BG_BATCH_MAX && fq_bg_cap(8, true) == FETCH_BG_BATCH_MAX);
     CHECK(fq_bg_limit(0) == 1 && fq_bg_limit(1) == 1 && fq_bg_limit(2) == 1 && fq_bg_limit(8) == 7);
+    CHECK(fq_fg_cap_n(0) == FETCH_BATCH_MAX && fq_fg_cap_n(FETCH_BATCH_MAX) == FETCH_BATCH_MAX && fq_fg_cap_n(FETCH_BATCH_MAX + 1) == FETCH_QUEUED_BATCH_MAX);   /* (queries queue: larger batches) */
     /* the worker that may not read the fill takes the most urgent of the others (the oldest when it is aged), and none when only the fill is queued */
     CHECK(fq_pick_fg(q, 4, 1100, 200) == 2 && fq_pick_fg(q, 1, 1100, 200) == 1 && fq_pick_fg(q, 2, 1300, 200) == 1);
     {

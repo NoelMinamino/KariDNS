@@ -597,6 +597,7 @@ struct store {
   pthread_cond_t bg_cv;
   bool io_busy, ck_busy, ck_handoff, bg_stop, bg_kick, fl_on;
   _Atomic bool ck_running;                            /* 0.7 first-fill latency: ck_busy for readers without bg_mu (store_ck_running(): the Backend holds its fill back meanwhile) */
+  _Atomic uint64_t presync_seg, n_presyncs, presync_max_us;   /* 0.7 first-fill latency: the segment bytes at the last presync of an unlogged fill (bulk_presync()), the presyncs, the longest */
   pthread_t fl_thr, fl_thr2;
   /* 0.7 round 15: what the commit thread and the writers must not wait for.  ah_tab: the blocks of the next growth of zt, zc and nx (tables_ahead(): a posix_fallocate() waited 0.5 to 11 s on UFS, and the commit
    * thread, which is also the background leader of the journal ring, stood in it).  ah_seg: the next segment file made ahead of its use (seg_pre_make(): seg_create() inside the writer mutex held it for
@@ -8512,6 +8513,8 @@ void store_stats(const store_t *s, store_stats_t *o) {
   o->bulk_resumed = s->rec.bulk_resumed ? 1 : 0;
   o->bulk_recoveries = s->rec.bulk_recovered ? 1 : 0;
   o->bulk_checkpoints = atomic_load_explicit(&s->n_bulk_ckpts, memory_order_relaxed);
+  o->bulk_presyncs = atomic_load_explicit(&s->n_presyncs, memory_order_relaxed);
+  o->bulk_presync_max_us = atomic_load_explicit(&s->presync_max_us, memory_order_relaxed);
   o->bulk_unlogged_records = atomic_load_explicit(&s->n_bulk_unlogged, memory_order_relaxed);
   o->bulk_since_unix = o->bulk_active ? atomic_load_explicit(&s->bulk_since, memory_order_relaxed) : 0;
   o->bulk_ended_unix = atomic_load_explicit(&s->bulk_ended, memory_order_relaxed);
@@ -9575,6 +9578,32 @@ static void seg_pre_drop(store_t *s) {
   atomic_store_explicit(&s->pre_state, PRE_NONE, memory_order_relaxed);
   pthread_mutex_unlock(&s->pre_mu);
 }
+/* 0.7 first-fill latency (W2): no commit syncs anything in an unlogged fill, so each bulk checkpoint synced every segment byte written since the one before (about a gigabyte at 10M zones), and on
+ * ZFS that sync (24 to 40 s on pc31) held the reads of the attaches of queries behind it.  The checkpoint thread now syncs the segments that are marked dirty each time ST_BULK_PRESYNC more segment
+ * bytes were written in the fill, outside any checkpoint: the bytes reach the disk in smaller groups and the checkpoint's own sync finds little to do.  The marks stay (the checkpoint's commit takes
+ * them as before: a presync is an early fsync, it changes nothing a crash goes back to); io_hold keeps the descriptors.  Counted: store.bulk.presyncs, .presync_max_us. */
+#define ST_BULK_PRESYNC (128ull << 20)
+static void bulk_presync(store_t *s) {
+  if (!atomic_load_explicit(&s->bulk, memory_order_relaxed) || atomic_load_explicit(&s->ck_running, memory_order_relaxed)) return;
+  const uint64_t seg = st_seg_bytes(s), last = atomic_load_explicit(&s->presync_seg, memory_order_relaxed);
+  const uint64_t minb = s->o.bulk_ckpt_bytes ? s->o.bulk_ckpt_bytes : ST_BULK_BYTES, step = minb / 2 < ST_BULK_PRESYNC ? minb / 2 : ST_BULK_PRESYNC;   /* (a store whose bulk checkpoints come sooner presyncs sooner) */
+  if (seg < last + step && seg >= last) return;
+  atomic_store_explicit(&s->presync_seg, seg, memory_order_relaxed);
+  const uint64_t t0 = st_now_us();
+  atomic_fetch_add_explicit(&s->io_hold, 1, memory_order_acq_rel);
+  uint32_t nsegs = (uint32_t)VG(s, V_NSEGS);
+  if (nsegs > ST_MAXSEG) nsegs = ST_MAXSEG;
+  for (uint32_t n = 1; n <= nsegs; n++) {
+    if (!atomic_load_explicit(&s->seg_dirty[n], memory_order_relaxed)) continue;
+    seg_t *g = atomic_load_explicit(&s->segs[n], memory_order_acquire);
+    if (g) (void)fsync(g->fd);                        /* (a failure is the checkpoint's to see: its own sync of the segment comes after) */
+  }
+  atomic_fetch_sub_explicit(&s->io_hold, 1, memory_order_acq_rel);
+  const uint64_t us = st_now_us() - t0;
+  atomic_fetch_add_explicit(&s->n_presyncs, 1, memory_order_relaxed);
+  uint64_t m = atomic_load_explicit(&s->presync_max_us, memory_order_relaxed);
+  while (us > m && !atomic_compare_exchange_weak_explicit(&s->presync_max_us, &m, us, memory_order_relaxed, memory_order_relaxed)) {}
+}
 static void *fl_ckpt_main(void *arg) {
   store_t *s = arg;
   pthread_mutex_lock(&s->bg_mu);
@@ -9600,6 +9629,8 @@ static void *fl_ckpt_main(void *arg) {
 #ifdef KARIDNS_UNIT_TEST
       st_hook(&store_test_fl_ckpt_hook, 2);
 #endif
+    } else {
+      bulk_presync(s);                                 /* (0.7 first-fill latency: the fill's segment bytes go to the disk in groups of ST_BULK_PRESYNC) */
     }
     pthread_mutex_lock(&s->bg_mu);
     if (r < 0) bg_backoff(s, 1000);

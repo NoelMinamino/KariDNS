@@ -1692,6 +1692,14 @@ static _Atomic uint32_t g_fp_max_n;                        /* the most requests 
 static _Atomic uint64_t g_fp_max_ns;                       /* the longest one pass of fetch_issue() ran (and handled something), since the start */
 static _Atomic uint64_t g_fp_passes, g_fp_cut;             /* the passes that handled something, and those that ended at their bound (the time slice) with work left */
 static _Atomic uint64_t g_ing_jw_slices;                   /* 0.7 first-fill latency: slices of the journal wait in which the requests of queries were served (ing_journal_wait(), store.ingest.journal_wait_slices) */
+static _Atomic uint64_t g_qf_hist[STORE_STATUS_HIST_BUCKETS], g_qf_max_ns;   /* 0.7 first-fill latency: the fetches of queries, from the request to the install (store.fetch.query.rtt.*) */
+static void qf_hist_add(int64_t ns) {
+  const uint64_t us = ns <= 0 ? 0 : ((uint64_t)ns + 999) / 1000;
+  int b = 0;
+  while (b < STORE_STATUS_HIST_BUCKETS - 1 && ((uint64_t)1 << b) < us) b++;
+  atomic_fetch_add_explicit(&g_qf_hist[b], 1, memory_order_relaxed);
+  if (ns > 0 && (uint64_t)ns > atomic_load_explicit(&g_qf_max_ns, memory_order_relaxed)) atomic_store_explicit(&g_qf_max_ns, (uint64_t)ns, memory_order_relaxed);
+}
 static _Atomic uint64_t g_fill_stalls;                     /* 0.7 first-fill latency: windows of dd_tick() in which the fill had work and no body of it came (store.ingest.fill_stalled_windows) */
 
 /* ---- 0.7 first-fill latency (W3): a database that cannot be read ----
@@ -1831,6 +1839,8 @@ bool db_ingest_lookup_stats(store_lookup_t *out) {
   out->drain_pass_max_ns = atomic_load_explicit(&g_fp_max_ns, memory_order_relaxed);
   out->max_ns = atomic_load_explicit(&g_lk_max_ns, memory_order_relaxed);
   for (int i = 0; i < STORE_STATUS_HIST_BUCKETS; i++) out->hist[i] = atomic_load_explicit(&g_lk_hist[i], memory_order_relaxed);
+  out->qf_max_ns = atomic_load_explicit(&g_qf_max_ns, memory_order_relaxed);
+  for (int i = 0; i < STORE_STATUS_HIST_BUCKETS; i++) out->qf_hist[i] = atomic_load_explicit(&g_qf_hist[i], memory_order_relaxed);
   return true;
 }
 #define ING_BUSY_WINDOW_NS 10000000000LL
@@ -4063,6 +4073,7 @@ static void fetch_complete(ing_t *g, ing_freq_t *r, bool ok, const char *why) {
     return;
   }
   if (ok) fq_hist_add(now_ms() - done.sent_ms);
+  if (ok && !done.bulk && done.prio == KDB_FETCH_PRIO_QUERY) qf_hist_add((now_ms() - done.sent_ms) * 1000000LL);      /* (0.7 first-fill latency: the time of a query's fetch, store.fetch.query.rtt.*) */
   if (done.mode != KDB_FETCH_SUMMARY) {
     dbreg_fetch_end(done.view_name, done.zone);
   } else {                                               /* (a summary is not a fetch of the data: it took no LOADING state) */

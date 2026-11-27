@@ -632,6 +632,9 @@ typedef struct { uint64_t id; uint16_t view; uint8_t prio, mode; bool range; int
 #define FETCH_BATCH_MAX 16
 #endif
 #define FETCH_BG_BATCH_MAX DB_IN_MAX
+/* 0.7 first-fill latency: while more than FETCH_BATCH_MAX requests of queries queue, their batches take up to FETCH_QUEUED_BATCH_MAX (a batch costs about one read whatever its size: pc31, PostgreSQL
+ * 10M zones under 2500 cold queries a second, the queries read about 7 zones a read and queued past park-timeout); with few queued they stay small (a query waits for its batch) */
+#define FETCH_QUEUED_BATCH_MAX 64
 /* a request of a query (or of the warm-up) came this recently: with a single worker (loader-threads 1) a batch of the fill stays at FETCH_BATCH_MAX, so that the
  * next query does not wait behind a read of DB_IN_MAX zones (fq_bg_cap()) */
 #define FQ_FG_RECENT_MS 1000
@@ -5999,6 +6002,14 @@ static size_t fq_pick_fg(const freq_t *fq, size_t n, int64_t now, int64_t aging)
  * loader-threads is 2 or more.  With a single worker (loader-threads 1, a small server) the batch of the
  * fill is DB_IN_MAX only while no query or warm-up request came for FQ_FG_RECENT_MS (fg_recent), FETCH_BATCH_MAX otherwise. */
 static size_t fq_bg_limit(size_t workers) { return workers <= 1 ? 1 : workers - 1; }
+/* the most requests of queries (or the warm-up, lookups) that one batch takes, with nfg of them queued: FETCH_BATCH_MAX, or FETCH_QUEUED_BATCH_MAX while more than that queue */
+static size_t fq_fg_cap_n(size_t nfg) { return nfg > FETCH_BATCH_MAX ? FETCH_QUEUED_BATCH_MAX : FETCH_BATCH_MAX; }
+static size_t fq_fg_cap(const struct lio *io) {          /* (fq_lock held) */
+    size_t nfg = 0;
+    for (size_t i = 0; i < io->nfq; i++)
+        if (io->fq[i].prio < KDB_FETCH_PRIO_BACKGROUND) nfg++;
+    return fq_fg_cap_n(nfg);
+}
 static size_t fq_bg_cap(size_t workers, bool fg_recent) {
     return workers <= 1 && fg_recent ? FETCH_BATCH_MAX : FETCH_BG_BATCH_MAX;
 }
@@ -6086,7 +6097,7 @@ static void *fetch_worker(void *arg) {
         io->nfq--;
         const bool bg = r.prio >= KDB_FETCH_PRIO_BACKGROUND;      /* (this worker reads the fill: one place of fq_bg_active until the read is over) */
         if (bg) io->fq_bg_active++;
-        if (fb) fetch_take(io, fb, &r, queued, bg ? fq_bg_cap(io->fq_allowed, io->fq_fg_at && tnow - io->fq_fg_at < FQ_FG_RECENT_MS) : FETCH_BATCH_MAX);
+        if (fb) fetch_take(io, fb, &r, queued, bg ? fq_bg_cap(io->fq_allowed, io->fq_fg_at && tnow - io->fq_fg_at < FQ_FG_RECENT_MS) : fq_fg_cap(io));
         pthread_mutex_unlock(&io->fq_lock);
 #ifdef KARIDNS_TEST_EVICT
         if (g_test_fetch_delay_ms > 0) {                          /* (a test build: a slow database, a read costs this much whatever its size, as a statement of PostgreSQL does) */

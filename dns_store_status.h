@@ -160,6 +160,7 @@ typedef struct store_lookup {
    * (fetch_issue()) that handled a request: how many, how many ended at the time slice with work left, the most requests one handled, the longest one ran (ns); since the start */
   uint64_t remembered, reask_suppressed, remember_releases, drain_passes, drain_cut, drain_pass_max, drain_pass_max_ns;
   uint64_t hist[STORE_STATUS_HIST_BUCKETS];
+  uint64_t qf_hist[STORE_STATUS_HIST_BUCKETS], qf_max_ns;   /* 0.7 first-fill latency: the fetches of queries, from the request to the install (store.fetch.query.rtt.*) */
   uint64_t max_ns;
 } store_lookup_t;
 void store_status_set_lookup_fn(bool (*fn)(store_lookup_t *out));
