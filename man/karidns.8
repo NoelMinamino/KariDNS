@@ -63,13 +63,8 @@ server may run on, at most 8 (4 CPUs: 2 routers, 8: 4, 16 and more: 8;
 \fBrouter\-threads\fR sets the number). A router costs about as much CPU per
 query as a worker: with 2 routers and 6 workers on 8 CPUs the routers were the
 limit (about 90 % of a CPU each at 550,000 queries a second) while the machine
-was 38 % idle. An idle router and the connect broker wake once a second with
-nothing to do (0.7): FreeBSD 14 swaps out a whole process all of whose threads
-have slept longer than \fBvm.swap_idle_threshold1\fR (2 s) when memory is short,
-and the replies of a swapped-out router waited until it was read back from swap,
-seconds on a busy disk (seen on loaded 14.4 hosts; FreeBSD 15 does not swap
-processes out). The cost is one empty \fBkevent(2)\fR or \fBpoll(2)\fR a second
-each.
+was 38 % idle. An idle router wakes once a second (see "PERFORMANCE AND
+OPERATIONS", FreeBSD 14 and swap).
 .IP \(bu 2
 \fBBackend Process\fR: Operates in FreeBSD Capsicum capability mode
 (\fBcap_enter(2)\fR). DNS packet parsing and response generation are performed
@@ -428,6 +423,30 @@ control\-channel {
 .RE
 .SH CONFIGURATION
 The configuration file is described in karidns.conf(5).
+.SH PERFORMANCE AND OPERATIONS
+.SS FreeBSD 14: idle processes and swap (0.7)
+When memory is short, FreeBSD 14 swaps out a whole process all of whose threads
+have slept longer than \fBvm.swap_idle_threshold1\fR (2 s by default). Before
+0.7 an idle UDP router slept until the next reply came, so on a host under
+memory pressure it was swapped out. The replies of its workers then waited until
+the router was read back from swap: 3 to 12 s on a busy disk, seen on loaded
+FreeBSD 14.4 hosts. FreeBSD 15 no longer swaps out processes.
+.PP
+Since 0.7 the processes on the path of an answer never sleep that long:
+.IP \(bu 2
+The routers and the connect broker (transfers, NOTIFY over TCP, forward zones,
+dnstap) wake once a second with nothing to do, at a cost of one empty
+\fBkevent(2)\fR or \fBpoll(2)\fR a second each.
+.IP \(bu 2
+\fBkaridns\-dbloader\fR waits at most a second.
+.IP \(bu 2
+The plugin supervisor waits at most 100 ms.
+.IP \(bu 2
+The Backend always has threads that nap for milliseconds.
+.PP
+Only the manager may still be swapped out on an idle host. It supervises the
+other processes and takes no part in an answer. \fBtests/run_aux_wake_test.sh\fR
+checks the wake-ups.
 .SH ROLLBACK (karictl rollback)
 A reload with a mistake in the zone file, or a bad change in the database, is
 served at once. \fBkarictl rollback <zone> [view] [local]\fR puts the zone back

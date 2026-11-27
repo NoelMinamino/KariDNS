@@ -6,7 +6,8 @@
 # swap-in.  The routers' kevent() and the broker's poll() now end at least every KARIDNS_AUX_WAKE_MS (1 s) with nothing to do, so they are never
 # asleep that long.  This test starts a server with a zone file, leaves it idle and checks that each router and the broker made voluntary context
 # switches (ps nvcsw) during a quiet window of 4 s: a process that sleeps until an event makes none.  It then checks that the server still answers.
-# Root or not (the server runs as the caller, or as nobody when root).  About 8 seconds.
+# Root or not (the server runs as the caller, or as nobody when root).  About 8 seconds.  KARI_SWAP_HOG_MB=<MB> adds the swap-out itself under a memory hog
+# (FreeBSD 14 and root only; SKIP otherwise), see below.
 set -u
 DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$DIR/.."
@@ -67,6 +68,28 @@ for p in $ROUTERS $BROKER; do
     else bad "the $what $p did not wake by itself in 4 s idle (voluntary context switches $c0 -> $c1): FreeBSD 14 would swap it out" "$(ps -H -o pid,lwp,stat,wchan,nvcsw -p "$p")"; fi
 done
 [ "$("$ROOT/dag" @127.0.0.1 -p "$PORT" www.example.test A +short +time=2 +tries=3 2>/dev/null)" = 192.0.2.10 ] && ok "the server answers after the idle time" || bad "no answer after the idle time"
+
+# The swap-out itself (opt-in: KARI_SWAP_HOG_MB=<MB>, FreeBSD 14, root; about the RAM of the host minus 200 MB, e.g. 5900 on a 6 GB VM).  A memory hog
+# holds that much for 30 s; after 20 s of it the routers and the broker must not be swapped out (ps STAT W; the manager may be) and a query must be
+# answered within 1 s.  Not in the suite's default run: it takes the host's memory from every other test.  On main's build the routers went to IW.
+# (Where swap is fast, a swapped-out router is read back in under a millisecond: then only the W check fails without the fix, not the 1 s answer.)
+if [ -n "${KARI_SWAP_HOG_MB:-}" ]; then
+    if [ "$(id -u)" != 0 ] || [ "$(uname -r | cut -d. -f1)" != 14 ]; then
+        echo "  SKIP: the swap-out part needs root and FreeBSD 14 (FreeBSD 15 does not swap processes out); this is $(uname -r)"
+    else
+        perl -e 'my @a; for (1 .. $ARGV[0]) { my $s = "\0" x (1 << 20); push @a, $s } for my $t (1 .. 30) { sleep 1; substr($_, ($t * 4096) % (1 << 20), 1) = "x" for @a }' "$KARI_SWAP_HOG_MB" &
+        HOG=$!
+        sleep 20
+        st=$(ps -o pid=,stat= -p "$(echo $ROUTERS $BROKER | tr ' ' ',')" 2>/dev/null)
+        echo "    under the hog: $(echo "$st" | tr '\n' ' ') swap used $(swapinfo -m | tail -n 1 | awk '{ print $3 }') MB"
+        case "$st" in *W*) bad "a router or the broker was swapped out under memory pressure" "$st" ;; *) ok "no router and no broker swapped out under memory pressure" ;; esac
+        t0=$(perl -MTime::HiRes=time -e 'printf "%d\n", time * 1000')
+        a=$("$ROOT/dag" @127.0.0.1 -p "$PORT" www.example.test A +short +time=5 +tries=1 2>/dev/null)
+        t1=$(perl -MTime::HiRes=time -e 'printf "%d\n", time * 1000')
+        [ "$a" = 192.0.2.10 ] && [ $((t1 - t0)) -lt 1000 ] && ok "answered within 1 s under memory pressure ($((t1 - t0)) ms)" || bad "under memory pressure: answer \"$a\" after $((t1 - t0)) ms"
+        kill "$HOG" 2>/dev/null; wait "$HOG" 2>/dev/null
+    fi
+fi
 grep -q "ERROR\|ssertion" "$T/srv.log" && bad "the server logged an error" "$(grep 'ERROR\|ssertion' "$T/srv.log" | head -3)" || ok "the server logged no error"
 
 echo
