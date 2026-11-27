@@ -114,6 +114,16 @@ bool rcu_writer_is_safe(uint64_t retire_epoch) {
   return readers_safe(retire_epoch, NULL);
 }
 
+/* The fallback of a retire that could not queue its object (no memory for the node): wait here for the grace period.  true: free it now.
+ * false: a reader is still in a section that began before retire_epoch after timeout_ms; the object must not be freed under it, so the
+ * caller keeps it (leaked, said once here with what = the kind of object).  Freeing whatever the wait returned was a use-after-free. */
+bool rcu_writer_wait_or_leak(uint64_t retire_epoch, int timeout_ms, const char *what) {
+  if (rcu_writer_wait_until_safe(retire_epoch, timeout_ms)) return true;
+  syslog(LOG_ERR, "[EpochRCU] out of memory retiring %s, and a reader still holds it after %d ms; it is leaked (retire_epoch=%" PRIu64 ")",
+         what, timeout_ms, retire_epoch);
+  return false;
+}
+
 bool rcu_writer_try_wait(uint64_t retire_epoch, int budget_ms) {
   struct timespec start, now;
   clock_gettime(CLOCK_MONOTONIC, &start);

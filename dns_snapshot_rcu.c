@@ -3733,8 +3733,9 @@ static void store_retire_locked(zone_db_entry_t *e, void *obj, void (*fn)(void *
         zone_entry_unref(e);
         return;
     }
-    /* no memory for the retire node: wait for the grace period here (rare) */
-    (void)rcu_writer_wait_until_safe(ep, 60000);
+    /* no memory for the retire node: wait for the grace period here (rare).  A reader that stays keeps the object and the entry (leaked):
+     * the entry's last reference must not go while a reader can still reach it through the object. */
+    if (!rcu_writer_wait_or_leak(ep, 60000, "a zone element")) return;
     fn(obj);
     zone_entry_unref(e);
 }
@@ -3793,7 +3794,7 @@ void dbreg_staged_retire(zdir_elem_t *z, bool entry_dead) {
     zone_db_entry_t *e = zdir_entry(z);
     uint64_t ep = rcu_writer_advance_epoch();
     if (!zone_retire_object(e, z, staged_free_cb, ep)) {
-        (void)rcu_writer_wait_until_safe(ep, 60000);
+        if (!rcu_writer_wait_or_leak(ep, 60000, "a staged zone element")) return;   /* (a reader still has z, and through it e: both are kept) */
         staged_free_cb(z);
     }
     if (entry_dead) zone_entry_unref(e);

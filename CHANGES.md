@@ -275,6 +275,10 @@ Fixes from the external reviews and audits of the 0.7 cycle. Each has a test tha
   that read data last. A handshake is read while the sender is paused, exactly the rest of its current control frame
   and never a data frame behind START. A data frame header before START is refused at the header, before anything is
   allocated for it.
+- **Out of memory while a zone element is retired**: when the retire queue could not take an element (database
+  zones: a zone taken out of memory, a staged attach), the element was freed after a wait of 60 seconds whether or
+  not the readers had left. It is now freed only when they have; a reader that stays past the wait leaves it in
+  memory (leaked), with one `[EpochRCU] out of memory retiring ...` error line.
 - **Replies seconds late on FreeBSD 14 under memory pressure**: FreeBSD 14 swaps out a whole process that has
   slept longer than `vm.swap_idle_threshold1` (2 s) when memory is short, and an idle UDP router was swapped out:
   the replies of its workers waited until it was read back from swap (3 to 12 s on the loaded 14.4 CI runners, the
