@@ -9,7 +9,7 @@
 ```sh
 ./configure [--prefix=DIR] [--sysconfdir=DIR] [--libexecdir=DIR] [--with-db-drivers=auto|none|sqlite3|postgresql|"sqlite3 postgresql"]
             [--with-idn2=auto|yes|no] [--with-openssl=DIR] [--march=native|none|V] [CC=cc] [CFLAGS=...] [LDFLAGS=...]
-make                  # karidns, dag, karictl, karicheck, karidns-tapstat
+make                  # karidns, dag, karictl, karicheck, karidns-tapstat, dnsqps
 make karidns-dbloader karidns-zone
 make distclean        # make clean, and remove config.mk and config.log
 ```
@@ -31,7 +31,7 @@ It finds the compiler (`CC`, else `cc`, `gcc` or `clang`), proves with a small t
 | `--sysconfdir=DIR` | The directory the tools look in for their configuration when they are not told where: `DIR/karidns/karidns.conf` (`karicheck`, `karidns-zone`), `DIR/karidns/karictl.conf` (`karictl`), the example in the help of `karidns-dbloader`. It is compiled in as `-DKARIDNS_SYSCONFDIR="DIR"` (`dns_utils.h`). `dag` looks for its CA bundle (`+tls-ca` without a file) at `DIR/ssl/cert.pem`, as one of its fixed places (below). Default `PREFIX/etc`; the sources default to `/usr/local/etc`, and only another directory adds a flag, so the default build is the build without `configure`. The rc scripts, the packages and the manuals keep the FreeBSD layout (`/usr/local/etc`). Only letters, digits and `_ . / + @ -` are allowed. |
 | `--libexecdir=DIR` | Where `karidns` finds the database loader when `loader-path` is not set: `DIR/karidns-dbloader` (`KARIDNS_DB_DEFAULT_LOADER_PATH` in `dns_config_parser.h`; `karicheck conf` and the server both use it). Compiled in as `-DKARIDNS_LIBEXECDIR="DIR"`. Default `PREFIX/libexec`. The FreeBSD packages install the loader in `/usr/local/libexec` and the manuals say so; a package for another layout passes `--libexecdir`. |
 | `--with-db-drivers=LIST` | The drivers of `karidns-dbloader` and `karidns-zone`: `auto` (the default: the drivers whose library is found), `none`, `sqlite3`, `postgresql`, or both (`"sqlite3 postgresql"` or `sqlite3,postgresql`). A driver that is named and not found is an error. `make DB_DRIVERS=...` on the command line still wins over `config.mk`. |
-| `--with-idn2=auto\|yes\|no` | libidn2 for `dag` (internationalized names). `yes` is an error when it is not found; `auto` (the default) says so in the summary. `--with-idn2` is `yes`, `--without-idn2` is `no`. |
+| `--with-idn2=auto\|yes\|no` | libidn2 for `dag` and `karidns-zone idn` (internationalized names). `yes` is an error when it is not found; `auto` (the default) says so in the summary. `--with-idn2` is `yes`, `--without-idn2` is `no`. |
 | `--with-openssl=DIR` | OpenSSL is in `DIR/include` and `DIR/lib`. The default is the system's, or the Homebrew one on macOS. The `Makefile` always searches `/usr/local` and the Homebrew directories first (`BREW_CFLAGS`, `BREW_LDFLAGS`): with a second copy of OpenSSL there, put your directory first in `CFLAGS` and `LDFLAGS`. |
 | `--march=native\|none\|V` | `native` (the default): `-march=native`, the CPU of the build host. `none`: the baseline of the architecture, for a package that runs on other machines. `V`: `-march=V`. A default `native` that the compiler refuses becomes `none` with a line in the summary; a value that was asked for and is refused is an error. |
 | `CC`, `CFLAGS`, `LDFLAGS` | From the environment or as arguments. They are saved in `config.mk`; the flags of the `Makefile` are added to them. |
@@ -45,7 +45,7 @@ It finds the compiler (`CC`, else `cc`, `gcc` or `clang`), proves with a small t
 | Library | Used by | Missing |
 |---|---|---|
 | OpenSSL (`libssl`, `libcrypto`), zlib | everything | error |
-| libidn2 | `dag` | with `auto` the summary says so; `yes` is an error |
+| libidn2 | `dag`, `karidns-zone idn` | with `auto` the summary says so; `yes` is an error |
 | SQLite3 (`sqlite3.h`, `libsqlite3`) | the `sqlite3` driver | with `auto` no such driver; named: error |
 | libpq (`pkg-config libpq`, else `pg_config`) | the `postgresql` driver | with `auto` no such driver; named: error |
 
@@ -67,7 +67,7 @@ A few things are not in `config.mk` on purpose:
 
 ```sh
 ./configure                         # its summary shows the DB drivers it found ("DB drivers    sqlite3")
-make                                # karidns, dag, karictl, karicheck, karidns-tapstat
+make                                # karidns, dag, karictl, karicheck, karidns-tapstat, dnsqps
 make karidns-dbloader karidns-zone  # only when ./configure found DB drivers: make install installs these too then
 make install                        # as root
 make install DESTDIR=/tmp/stage     # staged: the files land under /tmp/stage/usr/local/...
@@ -78,7 +78,7 @@ make uninstall                      # removes what make install put there
 
 | Target | Installs | Where (defaults) |
 |---|---|---|
-| `install-server` | `karidns`; `karictl`, `karicheck`, `karidns-tapstat`; the rc script; `karidns.conf.sample`, `karictl.conf.sample`, `zones/example.test.zone.sample` | `SBINDIR` (`PREFIX/sbin`); `BINDIR` (`PREFIX/bin`); `RCDIR` (`PREFIX/etc/rc.d`); `SYSCONFDIR/karidns` |
+| `install-server` | `karidns`; `karictl`, `karicheck`, `karidns-tapstat`; the rc script; `karidns.conf.sample`, `karictl.conf.sample`, `zones/example.test.zone.sample`; the directory the default zone store is made in (`INST_VARDB`: made with mode 0755 when it is missing, an existing one is left as it is, uninstall never removes it) | `SBINDIR` (`PREFIX/sbin`); `BINDIR` (`PREFIX/bin`); `RCDIR` (`PREFIX/etc/rc.d`); `SYSCONFDIR/karidns`; `VARDB` (`/var/db/karidns`) |
 | `install-dag` | `dag` (what the dag packages of Linux, macOS and Homebrew ship) | `BINDIR` |
 | `install-db` | `karidns-dbloader`; `karidns-zone`; the SQL files of the drivers in `DB_DRIVERS` | `LIBEXECDIR`; `BINDIR`; `DATADIR/db` (`PREFIX/share/karidns/db`) |
 | `install-signer`, `install-webadmin` | the Node.js programs with `node_modules` (run `npm ci --omit=dev --ignore-scripts` in `signer/` or `webadmin/` first), the wrapper, the rc script, the sample configuration | `LIBEXECDIR/karidns-signer/`, `LIBEXECDIR/karidns-webadmin/`; `SBINDIR`; `RCDIR`; `SYSCONFDIR/karidns` |
