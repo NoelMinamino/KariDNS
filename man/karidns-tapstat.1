@@ -186,12 +186,14 @@ slower sender could not finish its handshake within its 5 seconds). A sender is
 a uid (the peer's credentials): all its connections share one bucket of one
 second's worth, kept when they close, so neither more connections nor a
 reconnect give it more than the rate (on a system without peer credentials the
-bucket is per connection). A sender over it is not read until the bucket
-refills, so it waits on its socket (nothing it sent is lost or cut;
-\fBkaridns\fR counts what its ring could not hold as dnstap drops). Each pause
-is counted (\fBthrottled\fR in the summary). A dnstap message of \fBkaridns\fR
-takes a few hundred bytes, so \fB64M\fR is some 200,000 messages a second; raise
-\fB\-l\fR for a busier server.
+bucket is per connection). The 64 buckets outnumber the 16 places; a bucket a
+sender no longer uses goes to another sender only once it is full again, and a
+new sender that finds none is refused (counted with \fBsenders refused\fR). A
+sender over it is not read until the bucket refills, so it waits on its socket
+(nothing it sent is lost or cut; \fBkaridns\fR counts what its ring could not
+hold as dnstap drops). Each pause is counted (\fBthrottled\fR in the summary). A
+dnstap message of \fBkaridns\fR takes a few hundred bytes, so \fB64M\fR is some
+200,000 messages a second; raise \fB\-l\fR for a busier server.
 .TP 8
 \fB\-w seconds\fR
 Close a sender that has sent nothing for this long after the handshake, 1 to

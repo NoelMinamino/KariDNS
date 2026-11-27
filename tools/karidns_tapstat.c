@@ -50,19 +50,8 @@ typedef struct {
     int bk;                 /* T4-L5: its sender's bucket (g_bkt), -1 = none */
 } conn_t;
 
-/* T4-L5 (-l): the byte bucket of a sender: one per uid (the peer's credentials), shared by all its connections, and kept when they close, so that
- * neither more connections nor a reconnect give a uid more than the rate (the bucket refills with the time, one second's worth at most).  On a
- * system without peer credentials each connection has a bucket of its own (docs: the rate is per connection there).  At most MAX_CONN buckets
- * are in use at once (a connection holds one), so a free or idle one is always there. */
-typedef struct {
-    bool used, keyed;       /* keyed: uid names the sender */
-    uid_t uid;
-    int nconn;              /* connections that use it now */
-    int64_t tokens;         /* the bytes the sender may still send now */
-    int64_t t_fill_ms;      /* when it was last refilled */
-    bool paused;            /* over the rate: its connections are not read until it refills (the kernel's socket buffers hold the rest, then the sender waits) */
-} bkt_t;
-static bkt_t g_bkt[MAX_CONN];
+/* T4-L5 (-l): the byte buckets of the senders, one per uid (tapstat_core.h tapstat_bkt_take() says how they are shared and given out) */
+static tapstat_bkt_t g_bkt[TAPSTAT_BUCKETS];
 
 #define MAX_SENDER_UIDS 16
 /* T4-L5: the senders -u names (uids); none = what the socket mode allows (peer_allowed()) */
@@ -266,25 +255,6 @@ static void conn_close(conn_t *c) {
     fstrm_reader_free(&c->rd);
 }
 
-/* the bucket of a new connection: its uid's (kept from before), else an unused one, else the idle one refilled longest ago (filled up: a second
- * has passed or the sender is new) */
-static int bkt_take(bool keyed, uid_t uid, uint64_t rate, int64_t now) {
-    int pick = -1;
-    if (keyed)
-        for (int i = 0; i < MAX_CONN && pick < 0; i++)
-            if (g_bkt[i].used && g_bkt[i].keyed && g_bkt[i].uid == uid) pick = i;
-    if (pick < 0) {
-        for (int i = 0; i < MAX_CONN; i++) {
-            if (g_bkt[i].nconn > 0) continue;
-            if (!g_bkt[i].used) { pick = i; break; }
-            if (pick < 0 || g_bkt[i].t_fill_ms < g_bkt[pick].t_fill_ms) pick = i;
-        }
-        if (pick < 0) return -1;                          /* (cannot happen: a connection holds a bucket, and there are as many as places) */
-        g_bkt[pick] = (bkt_t){ .used = true, .keyed = keyed, .uid = uid, .tokens = (int64_t)rate, .t_fill_ms = now };
-    }
-    g_bkt[pick].nconn++;
-    return pick;
-}
 
 /* the ACCEPT / FINISH of the reader: a few dozen bytes into an empty socket buffer; a peer that cannot take them is dropped */
 static bool conn_flush_reply(conn_t *c) {
@@ -345,18 +315,6 @@ static bool peer_allowed(int fd, mode_t mode, gid_t sock_gid, bool *have_uid, ui
 #endif
 }
 
-/* -l: a bucket refilled at `rate` bytes per second up to one second's worth.  0 = no limit. */
-static void bkt_refill(bkt_t *b, uint64_t rate, int64_t now) {
-    if (!rate || !b->used) return;
-    const int64_t dt = now - b->t_fill_ms;
-    if (dt <= 0) return;
-    const int64_t cap = (int64_t)rate;
-    const int64_t add = (int64_t)((rate * (uint64_t)dt) / 1000);
-    if (add == 0) return;                                 /* (less than a byte yet: the time stays counted) */
-    b->tokens = b->tokens + add > cap ? cap : b->tokens + add;
-    b->t_fill_ms = now;
-    if (b->paused && b->tokens > 0) b->paused = false;
-}
 
 static int run_socket(tapstat_t *st, const char *sockpath, mode_t mode, unsigned interval, unsigned idle_s, uint64_t rate, tapstat_format_t fmt, const char *outpath) {
     if (mode & S_IWOTH)
@@ -383,7 +341,7 @@ static int run_socket(tapstat_t *st, const char *sockpath, mode_t mode, unsigned
         pfds[np].fd = lfd; pfds[np].events = POLLIN; map[np] = -1; np++;
         int64_t now = now_ms();
         bool any_paused = false;
-        for (int i = 0; i < MAX_CONN; i++) bkt_refill(&g_bkt[i], rate, now);
+        for (int i = 0; i < TAPSTAT_BUCKETS; i++) tapstat_bkt_refill(&g_bkt[i], rate, now);
         for (int i = 0; i < MAX_CONN; i++) {
             if (conns[i].fd < 0) continue;
             if (conns[i].bk >= 0 && g_bkt[conns[i].bk].paused) { any_paused = true; continue; }    /* T4-L5: its sender is over its rate, not read until the bucket refills */
@@ -415,17 +373,24 @@ static int run_socket(tapstat_t *st, const char *sockpath, mode_t mode, unsigned
                         else fprintf(stderr, "karidns-tapstat: a sender that the socket mode %03o does not allow, connection refused\n", (unsigned)mode);
                         continue;
                     }
+                    const int bk = tapstat_bkt_take(g_bkt, TAPSTAT_BUCKETS, have_uid, (uint32_t)puid, rate, now_ms());
+                    if (bk < 0) {                       /* (every bucket belongs to a sender that is connected or not full again: no fresh one for a newcomer) */
+                        close(nfd);
+                        tapstat_note_senders(st, 1, 0);
+                        fprintf(stderr, "karidns-tapstat: too many senders over their rate (no free byte bucket), connection refused\n");
+                        continue;
+                    }
                     int fl = fcntl(nfd, F_GETFL, 0);
                     if (fl >= 0) fcntl(nfd, F_SETFL, fl | O_NONBLOCK);
                     fcntl(nfd, F_SETFD, FD_CLOEXEC);
                     conns[slot].fd = nfd;
                     fstrm_reader_init(&conns[slot].rd, true);
                     conns[slot].t_connect_ms = conns[slot].t_last_ms = now_ms();
-                    conns[slot].bk = bkt_take(have_uid, puid, rate, conns[slot].t_connect_ms);
+                    conns[slot].bk = bk;
                     continue;
                 }
                 conn_t *c = &conns[map[k]];
-                bkt_t *b = c->bk >= 0 ? &g_bkt[c->bk] : NULL;
+                tapstat_bkt_t *b = c->bk >= 0 ? &g_bkt[c->bk] : NULL;
                 if (rate && b && b->paused) continue;           /* (another connection of the sender used the bucket up in this round) */
                 size_t want = sizeof(buf);
                 if (rate && b && (uint64_t)b->tokens < want) want = (size_t)b->tokens;    /* (tokens > 0: a paused sender is not read) */

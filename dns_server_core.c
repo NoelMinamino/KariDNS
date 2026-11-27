@@ -1586,10 +1586,8 @@ void *query_logger_thread_func(void *arg) {
         log_runtime_t *rt = log_runtime_acquire();
         int nch = 0;
         log_channel_t *const *route = rt && enabled ? log_runtime_route(rt, LOGC_QUERIES, &nch) : NULL;
-        if (rt) {
-            logev_flush_suppressed((int64_t)time(NULL));
-            klog_sites_flush((int64_t)time(NULL));     /* 0.7 review M-3: the reports of the general path's rate limit */
-        }
+        if (rt) logev_flush_suppressed((int64_t)time(NULL));
+        klog_sites_flush((int64_t)time(NULL));         /* 0.7 review M-3: the reports of the query path's rate limit, with or without a runtime (then to syslog) */
         /* each channel is held to its own limit (the rings admit what the most generous channel allows: get_effective_query_log_max_qps()) */
         uint32_t chan_limit[LOG_ROUTE_MAX];
         for (int i = 0; i < nch; i++) chan_limit[i] = qlog_channel_limit(opt_qps, route[i]->max_qps_specified, route[i]->max_qps);
@@ -1598,7 +1596,7 @@ void *query_logger_thread_func(void *arg) {
         int num_workers = atomic_load_explicit(&g_worker_count, memory_order_acquire);
         worker_ctx_t *workers = atomic_load_explicit(&g_worker_ctxs, memory_order_acquire);
         bool any_work = false;
-        for (int i = 0; i < ASYNC_IO_POOL_SIZE; i++) any_work |= qlog_drain_event_ring(rt, &g_async_ev_rings[i]);   /* (no runtime: the records are dropped) */
+        for (int i = 0; i < ASYNC_IO_POOL_SIZE; i++) any_work |= qlog_drain_event_ring(rt, &g_async_ev_rings[i]);   /* (no runtime: the records go to syslog) */
 
         if (rt && num_workers > 0 && workers) {
             /* 0.7 (K-11): two rings per worker, each with one producer (the worker) and this one consumer.  Each pass takes, worker by worker, the

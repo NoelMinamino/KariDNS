@@ -759,3 +759,33 @@ void tapstat_render(const tapstat_t *s, tapstat_format_t fmt, FILE *fp, time_t s
     }
     for (int d = 0; d < TAPSTAT_DIMS; d++) free(sorted[d]);
 }
+
+/* ---- T4-L5: the byte buckets of the senders (tapstat_core.h) ---- */
+int tapstat_bkt_take(tapstat_bkt_t *b, int n, bool keyed, uint32_t uid, uint64_t rate, int64_t now_ms) {
+    int pick = -1;
+    if (keyed)
+        for (int i = 0; i < n; i++)
+            if (b[i].used && b[i].keyed && b[i].uid == uid) {
+                b[i].nconn++;
+                return i;
+            }
+    for (int i = 0; i < n && pick < 0; i++)
+        if (!b[i].used) pick = i;
+    for (int i = 0; i < n && pick < 0; i++)
+        if (b[i].nconn == 0 && (rate == 0 || (uint64_t)b[i].tokens >= rate) && b[i].tokens >= 0) pick = i;   /* (idle and full: its sender has nothing to gain) */
+    if (pick < 0) return -1;
+    b[pick] = (tapstat_bkt_t){ .used = true, .keyed = keyed, .uid = uid, .nconn = 1, .tokens = (int64_t)rate, .t_fill_ms = now_ms };
+    return pick;
+}
+
+void tapstat_bkt_refill(tapstat_bkt_t *b, uint64_t rate, int64_t now_ms) {
+    if (!rate || !b->used) return;
+    const int64_t dt = now_ms - b->t_fill_ms;
+    if (dt <= 0) return;
+    const int64_t cap = (int64_t)rate;
+    const int64_t add = (int64_t)((rate * (uint64_t)dt) / 1000);
+    if (add == 0) return;                                 /* (less than a byte yet: the time stays counted) */
+    b->tokens = b->tokens + add > cap ? cap : b->tokens + add;
+    b->t_fill_ms = now_ms;
+    if (b->paused && b->tokens > 0) b->paused = false;
+}

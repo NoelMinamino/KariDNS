@@ -961,6 +961,13 @@ static void klog_site_report(klog_site_t *s, uint32_t n, int level, bool query_p
            (unsigned)atomic_load_explicit(&s->limit, memory_order_relaxed));
   klog_sanitize(text);
   if (query_path && klog_sink_post(cat, level, text)) return;
+  /* without a logging runtime (klog_emit_level() would drop it) the report goes to syslog, as klog_route() writes a line then */
+  log_runtime_t *rt = t_inside ? NULL : log_runtime_acquire();
+  if (!rt) {
+    klog_syslog_level(level, text);
+    return;
+  }
+  log_runtime_release(rt);
   klog_emit_level(cat, level, text);
 }
 
