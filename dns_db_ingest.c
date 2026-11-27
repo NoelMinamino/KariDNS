@@ -3721,12 +3721,6 @@ static bool bulk_take(ing_t *g, park_fetch_req_t *q, uint32_t *zid, uint32_t *ba
         break;
       }
     if (vi < 0 || fetch_find_zone(g, (uint16_t)vi, it.zone, KDB_FETCH_FULL)) continue;      /* a view that left the configuration, or the body is on its way already */
-    /* 0.7 first-fill latency: a request of a query holds the claim mark of the zone (it waits for a place, or is being made): its fetch brings the body, the fill does not read it a
-     * second time (with 256 bodies in flight the fill overtakes the queries that wait); a zone whose request is dropped is wanted still and comes in a later round of the scan */
-    if (park_claim_held(park_claim_key(it.view, it.zone))) {
-      g->bg_again = true;                                /* (the scan goes through the store once more: the zone is looked at again then) */
-      continue;
-    }
     memset(q, 0, sizeof(*q));
     q->worker = -1;
     snprintf(q->view, sizeof(q->view), "%s", it.view);
@@ -4656,6 +4650,16 @@ static void fetch_issue(ing_t *g) {
       atomic_fetch_add_explicit(&g_fq_table_full, 1, memory_order_relaxed);
       fetch_refuse(&q);
       continue;
+    }
+    /* 0.7 first-fill latency: a request of a query that waited (a place, the wait queue) while the fill, 256 bodies in flight, brought its zone into the store: the zone is attached
+     * from there, not read from the database a second time; the queries are woken and look again (as for a zone that came into memory meanwhile, below).  Only a worker's request: a
+     * transfer (worker -1) waits for the zone in memory, which a wake-up does not bring */
+    if (!bulk && !warm && q.worker >= 0 && q.mode == KDB_FETCH_FULL && dbdir()) {
+      dbdir_rec_t rec;
+      if (dbdir()->rec_get(q.view, q.zone, &rec) && rec.state == STORE_STATE_STORED && !(rec.flags & STORE_F_STALE)) {
+        park_wake_queue_all(q.view, q.zone, false);
+        continue;
+      }
     }
     int st = (q.mode == KDB_FETCH_SUMMARY || bulk) ? DBREG_FETCH_STARTED : dbreg_fetch_begin(g->view_names[vi], q.zone);       /* (a summary leaves the zone's state alone: queries are not held for it) */
     if (st == DBREG_FETCH_BUSY) continue;

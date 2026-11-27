@@ -3532,6 +3532,8 @@ static int run_proto(int phase, const char *dir) {
             enum { NQ1 = 40 };
             typedef struct { char name[24]; uint64_t id; int64_t sid; uint8_t prio; } req1_t;
             static req1_t rq1[64];
+            static req1_t held[600];
+            int nheld = 0;
             int nrq1 = 0, nq = 0, nb = 0, fill_asked = 0;
             for (int i = 0; i < NQ1; i++) {
                 char zn[24];
@@ -3555,7 +3557,14 @@ static int run_proto(int phase, const char *dir) {
                         nq++;
                     } else {
                         nb++;
-                        if (zi >= 0 && zi < PN) {
+                        if (zi >= 0 && zi < PN && nb > 300 && nheld < (int)(sizeof(held) / sizeof(held[0]))) {      /* (0.7 first-fill latency: the fill keeps 256 in flight; past 300 its bodies are held back, so that
+                                                                                                                            most zones stay known without a body for the cases below; answered after the loop) */
+                            req1_t *h = &held[nheld++];
+                            snprintf(h->name, sizeof(h->name), "%s", m.u.fetch_req.name);
+                            h->id = m.u.fetch_req.request_id;
+                            h->sid = m.u.fetch_req.source_id;
+                            h->prio = m.u.fetch_req.priority;
+                        } else if (zi >= 0 && zi < PN) {
                             g_pasked[zi]++;
                             g_pprio[zi] = m.u.fetch_req.priority;
                             g_psid[zi] = m.u.fetch_req.source_id;
@@ -3576,6 +3585,13 @@ static int run_proto(int phase, const char *dir) {
                 g_pprio[zi] = rq1[i].prio;
                 g_psid[zi] = rq1[i].sid;
                 send_zone(f[0], &e, rq1[i].name, g_pserial[zi] ? g_pserial[zi] : 1, rq1[i].id, rq1[i].sid);
+            }
+            for (int i = 0; i < nheld; i++) {                                                 /* (and the bodies of the fill that were held back) */
+                const int zi = pn_index(held[i].name);
+                g_pasked[zi]++;
+                g_pprio[zi] = held[i].prio;
+                g_psid[zi] = held[i].sid;
+                send_zone(f[0], &e, held[i].name, g_pserial[zi] ? g_pserial[zi] : 1, held[i].id, held[i].sid);
             }
         }
         /* a query for a zone that is known and has no body goes to the fetch queue (priority 0, with the domain id) and is answered */
