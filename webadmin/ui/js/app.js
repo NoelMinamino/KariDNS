@@ -68,6 +68,8 @@ const IN_ZONES = new Set(['zones', 'zone', 'zone-import', 'zone-settings', 'zone
 const sectionOf = (r) => (IN_ZONES.has(r) ? 'zones' : r === 'totp' ? 'account' : r.startsWith('admin-') ? 'admin-users' : r.startsWith('template') ? 'templates' : r);
 const mayShow = (who, caps) => who === undefined || (who === 'global' ? caps?.global === true : caps?.global === true || (caps?.grant_on ?? []).length > 0);
 const noop = () => {};
+// how long the screen of a new session waits for GET /version before it is drawn without it (drawWithVersion)
+export const VERSION_WAIT_MS = 5000;
 
 export function createApp(env) {
   const { window: win, document: doc, timers, now } = env;
@@ -262,12 +264,21 @@ export function createApp(env) {
   // ---------------------------------------------------------------- start
   // The screens of a person who is in read GET /version (the types, require_totp, the limits, the ldns link).  It is asked once per session, when the second step is
   // done (before it the service answers 403): after a sign-in, after the TOTP confirmation, after a sign-in in another tab.  The screen of the new session is drawn
-  // when it has come (or failed), once: never first without it and then again under the person, and never left drawn without it.
+  // when it has come (or failed), once: never first without it and then again under the person, and never left drawn without it.  A service or a proxy that does not
+  // answer must not keep the old screen until the request's own timeout (api.js, 60 s): after VERSION_WAIT_MS the screen is drawn without the version, as when it
+  // failed, and drawn again with it when it comes.
   let versionWait = null;
   function drawWithVersion() {
-    versionWait ??= session.loadVersion().catch(noop).finally(() => {
-      versionWait = null;
+    if (versionWait) return;
+    let early = false;
+    const deadline = timers.setTimeout(() => {
+      early = true;
       if (keyOf() !== drawnKey) render();
+    }, VERSION_WAIT_MS);
+    versionWait = session.loadVersion().then(() => true, () => false).then((got) => {
+      timers.clearTimeout(deadline);
+      versionWait = null;
+      if (keyOf() !== drawnKey || (early && got && status() === 'in')) render();
     });
   }
   session.on('change', () => {

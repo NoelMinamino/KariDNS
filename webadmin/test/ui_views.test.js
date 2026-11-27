@@ -3,7 +3,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createApp } from '../ui/js/app.js';
+import { createApp, VERSION_WAIT_MS } from '../ui/js/app.js';
 import { GUI_VERSION } from '../ui/js/version.js';
 import { makeEnv, makeClock, makeBroadcast, FakeStorage, FakeEvent, reply, problem, flush, findAll, byText } from './fakedom.js';
 import en from '../ui/i18n/en.js';
@@ -910,6 +910,40 @@ test('a sign-in whose GET /version fails draws the next screen without it; a sig
   await v.release();
   assert.equal(other.q('h1').textContent, 'Your account');
   assert.match(other.text(), MANDATORY, 'the page of the other tab\'s sign-in has the version');
+});
+
+test('GET /version that does not answer: the screen is drawn without it at the deadline, and again with it when it comes', async () => {
+  const v = heldVersion();
+  const ui = await boot({ st: { in: false, totpOn: true }, hash: '#/account', routes: { 'GET /version': v.route } });
+  ui.type(ui.input('user'), 'alice');
+  ui.type(ui.input('password'), 'pw');
+  await ui.submit(ui.q('form'));
+  await ui.clock.advance(VERSION_WAIT_MS - 1);
+  await flush();
+  assert.equal(ui.q('h1').textContent, 'Sign in', 'not before the deadline');
+  await ui.clock.advance(1);
+  await flush();
+  assert.equal(ui.q('h1').textContent, 'Your account', 'drawn at the deadline');
+  assert.doesNotMatch(ui.text(), MANDATORY, 'without the version');
+  const first = ui.main();
+  await v.release();
+  assert.equal(ui.q('h1').textContent, 'Your account');
+  assert.match(ui.text(), MANDATORY, 'drawn again with the version when it comes');
+  assert.notEqual(ui.main(), first);
+  assert.equal(ui.count('GET', '/version'), 1);
+
+  // the version that comes in time: the deadline is cleared, no second drawing
+  const w = heldVersion();
+  const fast = await boot({ st: { in: false, totpOn: true }, hash: '#/account', routes: { 'GET /version': w.route } });
+  fast.type(fast.input('user'), 'alice');
+  fast.type(fast.input('password'), 'pw');
+  await fast.submit(fast.q('form'));
+  await w.release();
+  const drawn = fast.main();
+  await fast.clock.advance(VERSION_WAIT_MS * 2);
+  await flush();
+  assert.equal(fast.main(), drawn, 'the deadline does not draw it again');
+  assert.match(fast.text(), MANDATORY);
 });
 
 test('the session of a visitor that must enrol is not extended by the page, and a language change redraws the sign-in screen', async () => {
