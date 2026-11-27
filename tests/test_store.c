@@ -8017,6 +8017,7 @@ static void test_bulk_basic(void) {
   store_stats(s, &st);
   CHECK_EQ(st.bulk_checkpoints, 1);
   CHECK(st.checkpoint_slow_bytes > 0);                                    /* (its table bytes were written at the slow rate) */
+  for (int w = 0; w < 500 && store_ck_running(s); w++) usleep(10000);   /* (the count goes up inside the checkpoint, before its end clears the mark: a bounded wait) */
   CHECK(!store_ck_running(s) && !store_ck_running(NULL));
   store_set_ck_slow_fn(s, NULL);
   store_set_ck_slow_fn(NULL, NULL);
