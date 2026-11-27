@@ -9651,7 +9651,7 @@ static void ix_kill_child(const tdir_t *d, const store_opts_t *o, int step) {
   for (int w = 0; w < 60000; w++) {
     store_stats_t st;
     store_stats(s, &st);
-    if (!st.index_delta_active) break;
+    if (!st.index_delta_active && !st.index_build_active) break;   /* (the first build has ended: its FBS_PUBLISHED comes after dv is cleared, and must not reach the hook set below) */
     usleep(1000);
   }
   for (uint32_t i = 0; i < 100; i++) if (put_i(s, 0, i, 2, NULL) != 0) _exit(13);
@@ -9670,7 +9670,7 @@ static void ix_kill_child(const tdir_t *d, const store_opts_t *o, int step) {
   for (int w = 0; w < 60000; w++) {
     store_stats_t st;
     store_stats(s, &st);
-    if (!st.index_delta_active) break;
+    if (!st.index_delta_active && !st.index_build_active) break;   /* (as ix_build_idle(): the delta is cleared inside the publish, before FBS_PUBLISHED; rg_live drops after it.  Waiting for dv alone let the child reach _exit(20) first on a slow VM, CI flakes row 89) */
     usleep(1000);
   }
   if (step == IXK_AFTER_PUBLISH) kill(getpid(), SIGKILL);
