@@ -14,6 +14,8 @@
 # Phase 2, a database that cannot be read (W3): five zones, `store none`, a zone taken out of memory (karictl evict) and the database file moved away: an ordinary query for it is not
 # answered (dag: no answer), counted (store.park.drop.failed); an AXFR of a zone that is out of memory gets SERVFAIL + EDE 14 (transfers are not ordinary queries); one WARNING line
 # in a window says how many queries were not answered (KARIDNS_TEST_DBDOWN_LOG_S=2), not one line a query.
+# Phase 3, a flood of queries stalls the fill (loader-threads 1) while bodies of the fill expire (KARIDNS_TEST_FETCH_TIMEOUT_MS=1500): a stall of the queries'
+# (store.ingest.fill_stalled_windows), not a failure.  Phase 4, the fill's reads fail (the test loader's KARIDNS_TEST_FILL_FAIL=1): store.ingest.fill_failed_windows, not a stall.
 # Needs root (the loader runs as nobody), sqlite3, perl, ./dag, ./dnsqps, ./karictl, the server and the loader with the test switches (./karidns and ./karidns-dbloader of `make coverage`,
 # else ./karidns-evict and ./karidns-dbloader-evict: make evict karidns-dbloader-evict).  SKIP without them.
 . "$(dirname "$0")/lib_proc.sh"
@@ -66,9 +68,9 @@ PA=$(kari_port 0 $((23000 + $$ % 15000)))
 SECRET="dGVzdC1zZWNyZXQtMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3"
 export ASAN_OPTIONS="detect_leaks=0:abort_on_error=0"      # (the evict command leaks what it takes out of memory on purpose)
 
-PHASES=${FFL_PHASES:-1 3 2}                  # (1: the fills, 3: a flood that stalls the fill, 2: the database that cannot be read)
+PHASES=${FFL_PHASES:-1 3 4 2}                # (1: the fills, 3: a flood that stalls the fill, 4: the fill's reads fail, 2: the database that cannot be read)
 mkdir "$T/db"
-case " $PHASES " in *" 1 "*|*" 3 "*)
+case " $PHASES " in *" 1 "*|*" 3 "*|*" 4 "*)
     echo "== the database: $NZ zones, the loader waits $DELAY ms before every read of its fetch pool"
     sh tests/db/gen_sqlite3_zones.sh "$T/db/z.db" "$NZ" 11 > "$T/gen.log" 2>&1 || { echo "gen failed"; cat "$T/gen.log"; exit 1; }
     chown -R nobody "$T/db"; chmod 600 "$T/db/z.db"*
@@ -95,7 +97,7 @@ EOF
 }
 start_srv() {
     : > "$T/a.log"
-    KARIDNS_TEST_DBDOWN_LOG_S=2 "$KARIDNS" -c "$T/a.conf" -f > "$T/a.log" 2>&1 &
+    env KARIDNS_TEST_DBDOWN_LOG_S=2 ${SRV_ENV:-} "$KARIDNS" -c "$T/a.conf" -f > "$T/a.log" 2>&1 &      # (SRV_ENV: more test switches of a phase)
     SRV=$!
 }
 stop_srv() {
@@ -202,19 +204,41 @@ echo "== a flood of queries stalls the fill (loader-threads 1, 20 ms a read), wh
 printf '#!/bin/sh\nKARIDNS_TEST_FETCH_DELAY_MS=20; export KARIDNS_TEST_FETCH_DELAY_MS\nexec %s "$@"\n' "$T/karidns-dbloader.real" > "$T/karidns-dbloader"
 rm -rf "$T/store"
 conf "$T/db/z.db" "loader-threads 1; store \"$T/store\"; memory-limit 4g;"
+SRV_ENV="KARIDNS_TEST_FETCH_TIMEOUT_MS=1500"          # (review #279, A: the bodies of the fill that wait behind the flood expire, as they do in 30 s in production; the stall stays the queries')
 start_srv
+SRV_ENV=""
 waitfor 60 ctl_up || fail "the control channel did not answer"
 awk -v n=40000 -v hi="$NZ" 'BEGIN { srand(77); for (i = 0; i < n; i++) printf "z%d.test SOA\n", 1 + int(rand() * hi) }' > "$T/qf_flood"
 ./dnsqps -s 127.0.0.1 -p "$PA" -d "$T/qf_flood" -Q 4000 -l 10 -t 1 -T 1 --json > "$T/flood.json" 2>/dev/null
 FS=$(sf store.ingest.fill_stalled_windows)
 [ "${FS:-0}" -ge 1 ] && grep -q 'the fill of the store made no progress' "$T/a.log" && pass "the flood stalled the fill: counted (store.ingest.fill_stalled_windows $FS) and said ($(grep -c 'made no progress' "$T/a.log") lines)" \
     || fail "no stall seen: store.ingest.fill_stalled_windows ${FS:-?}, stored $(sf store.zones.stored); $(grep 'fetch reads in' "$T/a.log" | tail -1)"
-FF=$(sf store.ingest.fill_failed_windows)
-[ "${FF:-x}" = 0 ] && grep -q 'made no progress.*the queries take the loader first' "$T/a.log" && ! grep -q 'made no progress.*its reads failed' "$T/a.log" \
-    && pass "the stall is said to be the queries' (store.ingest.fill_failed_windows 0: no read of the fill failed)" \
-    || fail "the stall is not told apart: store.ingest.fill_failed_windows ${FF:-?}; $(grep 'made no progress' "$T/a.log" | tail -1)"
+FF=$(sf store.ingest.fill_failed_windows); FT=$(sf store.ingest.fetch_timeouts)
+[ "${FT:-0}" -ge 1 ] && pass "bodies waited behind the flood until they expired (store.ingest.fetch_timeouts $FT)" || fail "no fetch expired (store.ingest.fetch_timeouts ${FT:-?}): the case below is not tested"
+[ "${FF:-x}" = 0 ] && grep -q 'made no progress.*the queries take the loader first' "$T/a.log" && ! grep -q 'made no progress.*reads of the database failed' "$T/a.log" \
+    && pass "the stall is said to be the queries' although bodies expired (store.ingest.fill_failed_windows 0: no read of the database failed)" \
+    || fail "the stall is not told apart: store.ingest.fill_failed_windows ${FF:-?}, fetch_timeouts ${FT:-?}; $(grep 'made no progress' "$T/a.log" | tail -1)"
 waitfor 30 grep -q 'the fill of the store goes on' "$T/a.log" && pass "the NOTICE that the fill goes on" || fail "no NOTICE that the fill goes on"
 waitfor "$MAXS" stored_all && pass "the fill went on to the end: the store holds all $NZ zones" || fail "the fill did not end: $(sf store.zones.stored) of $NZ zones"
+stop_srv
+printf '#!/bin/sh\nKARIDNS_TEST_FETCH_DELAY_MS=%s; export KARIDNS_TEST_FETCH_DELAY_MS\nexec %s "$@"\n' "$DELAY" "$T/karidns-dbloader.real" > "$T/karidns-dbloader"
+;; esac
+
+case " $PHASES " in *" 4 "*)
+# (review #279, A, B) the fill's own reads fail (the test loader answers every request of the fill with a read error, KARIDNS_TEST_FILL_FAIL=1): a window without progress is counted as
+# failed and said so, not blamed on queries (there are none)
+echo "== the fill's reads of the database fail"
+printf '#!/bin/sh\nKARIDNS_TEST_FILL_FAIL=1; KARIDNS_TEST_FETCH_DELAY_MS=200; export KARIDNS_TEST_FILL_FAIL KARIDNS_TEST_FETCH_DELAY_MS\nexec %s "$@"\n' "$T/karidns-dbloader.real" > "$T/karidns-dbloader"   # (200 ms a read: the failing reads go on over several windows, not all in the first)
+rm -rf "$T/store"
+conf "$T/db/z.db" "loader-threads 2; store \"$T/store\"; memory-limit 4g;"
+start_srv
+waitfor 60 ctl_up || fail "the control channel did not answer"
+waitfor 30 sh -c "[ \"\$($KA store -k 2>/dev/null | sed -n 's/^store.ingest.fill_failed_windows=//p')\" -ge 1 ] 2>/dev/null" \
+    && grep -q 'made no progress.*reads of the database failed' "$T/a.log" \
+    && pass "a fill whose reads fail is counted as failed and said so (store.ingest.fill_failed_windows $(sf store.ingest.fill_failed_windows))" \
+    || fail "the failed fill is not told: fill_failed_windows $(sf store.ingest.fill_failed_windows), fill_stalled_windows $(sf store.ingest.fill_stalled_windows); $(grep 'made no progress' "$T/a.log" | tail -1)"
+[ "$(sf store.ingest.fill_stalled_windows)" = 0 ] && ! grep -q 'made no progress.*the queries take the loader first' "$T/a.log" \
+    && pass "and not as a stall of the queries (store.ingest.fill_stalled_windows 0)" || fail "the failed fill was blamed on queries: fill_stalled_windows $(sf store.ingest.fill_stalled_windows)"
 stop_srv
 printf '#!/bin/sh\nKARIDNS_TEST_FETCH_DELAY_MS=%s; export KARIDNS_TEST_FETCH_DELAY_MS\nexec %s "$@"\n' "$DELAY" "$T/karidns-dbloader.real" > "$T/karidns-dbloader"
 ;; esac

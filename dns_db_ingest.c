@@ -1705,6 +1705,7 @@ static void qf_hist_add(int64_t ns) {
 }
 static _Atomic uint64_t g_fill_stalls;                     /* 0.7 first-fill latency: windows of dd_tick() in which the fill had work and no body of it came (store.ingest.fill_stalled_windows) */
 static _Atomic uint64_t g_fill_failed_windows;             /* (review #279, 4) windows in which the fill made no progress because its reads failed or a failed round waited (store.ingest.fill_failed_windows) */
+static _Atomic uint64_t g_fetch_timeouts;                  /* (review #279, 2) fetches the loader did not answer in time (fetch_expire(); store.ingest.fetch_timeouts) */
 
 /* ---- 0.7 first-fill latency (W3): a database that cannot be read ----
  * The queries whose data cannot be read are not answered (never SERVFAIL while the data is being loaded, DNS_NR_DROP) and are counted (store.park.drop.failed, store.lookup.drop.failed; a
@@ -1759,12 +1760,13 @@ static void dd_tick(ing_t *g, int64_t now) {
   /* 0.7 first-fill latency: the fill waits while queries take the loader (queries first, fq_pick()); a window in which the fill has work and no body of it came is a stall: counted, and said
    * once a window; the fill goes on by itself when the queries leave the loader a worker, which a NOTICE says */
   if (g->bg_on && g->fetch_fd >= 0 && g->fs_done == 0) {
-    /* (review #279, 4) not the queries' doing when the fill's own reads failed in the window, or a failed round waits before it is made again (bg_retry_ms), or reads of the database
-     * failed: counted and said apart */
-    const bool failing = g->fs_fail > 0 || g->dd_fail > 0 || (g->bg_retry_ms && now < g->bg_retry_ms);
+    /* (review #279, 4, A) not the queries' doing when reads of the database failed in the window (the fill's own, or any): counted and said apart.  Only real read errors count: bodies
+     * that expired (the loader did not answer in time) or were answered busy are the loader being behind, which is what a flood of queries does (with the 30 s time-out of a fetch a window
+     * without progress nearly always has some), so they leave the window a stall of the queries */
+    const bool failing = g->fs_fail > 0 || g->dd_fail > 0;
     if (failing) {
       atomic_fetch_add_explicit(&g_fill_failed_windows, 1, memory_order_relaxed);
-      syslog(LOG_WARNING, "[DB] the fill of the store made no progress in the last %lld s: its reads failed or are paused (%u bodies of the fill failed, %u reads of the database failed, %u requests not answered in time); a failed round is made again (store.ingest.fill_failed_windows)",
+      syslog(LOG_WARNING, "[DB] the fill of the store made no progress in the last %lld s: reads of the database failed (%u bodies of the fill, %u reads in all; %u requests were not answered in time); a failed round is made again (store.ingest.fill_failed_windows)",
              secs, g->fs_fail, g->dd_fail, g->dd_tmo);
     } else {
       atomic_fetch_add_explicit(&g_fill_stalls, 1, memory_order_relaxed);
@@ -1847,6 +1849,7 @@ bool db_ingest_lookup_stats(store_lookup_t *out) {
   out->fill_throttled = atomic_load_explicit(&g_fill_throttled, memory_order_relaxed);
   out->fill_stalls = atomic_load_explicit(&g_fill_stalls, memory_order_relaxed);
   out->fill_failed_windows = atomic_load_explicit(&g_fill_failed_windows, memory_order_relaxed);
+  out->fetch_timeouts = atomic_load_explicit(&g_fetch_timeouts, memory_order_relaxed);
   out->remembered = park_shed_remembered();
   out->reask_suppressed = park_cnt_get(PARK_CNT_LK_REMEMBERED);
   out->remember_releases = park_shed_releases();
@@ -4099,10 +4102,12 @@ static void fetch_complete(ing_t *g, ing_freq_t *r, bool ok, const char *why) {
   }
   if (ok) fq_hist_add(now_ms() - done.sent_ms);
   if (ok && !done.bulk && done.prio == KDB_FETCH_PRIO_QUERY) qf_hist_add((now_ms() - done.sent_ms) * 1000000LL);      /* (0.7 first-fill latency: the time of a query's fetch, store.fetch.query.rtt.*) */
-  /* (review #279, 1) a body of the fill whose zone a query asks for itself (its own request, the fill's body does not stand in for it): the zone's state (LOADING, or the element of a zone of
-   * the store) is the query's request's, and so are the queries that wait; the end of that request ends it and wakes them, whatever became of the fill's body (a body that failed must not
-   * drop queries that their own read answers) */
-  const bool shadowed = done.bulk && done.mode == KDB_FETCH_FULL && fetch_other_full(g, r);
+  /* (review #279, 1, C, D) a body of the fill that failed while a query asks for the zone itself (its own request on its way, or waiting in the wait queue with the zone's claim held): the zone's
+   * state (LOADING, or the element of a zone of the store) is the query's request's, and so are the queries that wait; the end of that request ends it and wakes them (a body of the fill that
+   * failed must not drop queries that their own read answers).  A body that came is installed: it ends the state and wakes them as it always did (they are answered from it, not after their
+   * own read; the second body is dropped as unchanged) */
+  const bool shadowed = !ok && done.bulk && done.mode == KDB_FETCH_FULL &&
+                        (fetch_other_full(g, r) || park_claim_held(park_claim_key(done.view_name, done.zone)));
   if (done.mode != KDB_FETCH_SUMMARY) {
     if (!shadowed) dbreg_fetch_end(done.view_name, done.zone);
   } else {                                               /* (a summary is not a fetch of the data: it took no LOADING state) */
@@ -4130,7 +4135,7 @@ static void fetch_complete(ing_t *g, ing_freq_t *r, bool ok, const char *why) {
       g->fs_done++;                                      /* (0.7 first-fill latency: the fill moved in this window, dd_tick()) */
     } else {
       db_recon_note_fetch(DBR_FETCH_FAILED, 1);
-      g->fs_fail++;                                      /* (review #279, 4: a window without progress because the fill's reads fail is said as such, dd_tick()) */
+      if (done.loader_failed) g->fs_fail++;              /* (review #279, 4, A: a read of the database that failed; a body the loader did not answer in time or answered busy is not one, it is the loader being behind) */
       if (!done.loader_failed) g->bg_fail++;             /* (a busy or lost loader: the round is made again; a zone the loader cannot read is marked refused below) */
       if (done.nonstore && !done.loader_failed) db_recon_scan_retry(done.bzid);
     }
@@ -4280,6 +4285,7 @@ static void fetch_expire(ing_t *g) {
   for (uint32_t i = 0; i < ING_FETCH_MAX; i++)
     if (g->freq[i].active && now - g->freq[i].sent_ms >= g_ing_fetch_timeout_ms) {
       g->freq[i].timedout = true;
+      atomic_fetch_add_explicit(&g_fetch_timeouts, 1, memory_order_relaxed);
       fetch_complete(g, &g->freq[i], false, "the loader did not answer in time");
     }
 }
@@ -5628,6 +5634,9 @@ bool db_ingest_start(int stream_fd, int ctrl_fd, int fetch_fd) {
     const char *dd = getenv("KARIDNS_TEST_DBDOWN_LOG_S");  /* (the test builds only: the window of dd_tick() in seconds, tests/run_db_firstfill_latency_test.sh) */
     const unsigned long v = dd && *dd ? strtoul(dd, NULL, 10) : 0;
     if (v >= 1 && v <= 3600) g_dd_window_ms = (int64_t)v * 1000;
+    const char *ft = getenv("KARIDNS_TEST_FETCH_TIMEOUT_MS"); /* (review #279, B: the time the ingest thread waits for a fetch, so that a test sees bodies of the fill expire) */
+    const unsigned long fv = ft && *ft ? strtoul(ft, NULL, 10) : 0;
+    if (fv >= 100 && fv <= 600000) g_ing_fetch_timeout_ms = (int64_t)fv;
   }
 #endif
   static struct ing_wq *s_wq;

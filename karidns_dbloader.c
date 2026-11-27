@@ -656,6 +656,8 @@ static int64_t g_fq_aging_ms = FQ_AGING_MS;
 /* the test builds only (KARIDNS_TEST_EVICT: `make coverage`, karidns-dbloader-evict): KARIDNS_TEST_FETCH_DELAY_MS, a slow database; every read of the fetch pool (one request or a
  * batch) waits this long first (tests/run_db_firstfill_latency_test.sh; the supervisor clears the environment, so the test starts the loader through a script that sets it) */
 static int64_t g_test_fetch_delay_ms;
+/* (review #279, B) KARIDNS_TEST_FILL_FAIL=1: every request of the fill (the background class) is answered ZONE_FAILED, a read error of the database, so that a test can see a fill whose reads fail */
+static bool g_test_fill_fail;
 #endif
 /* 0.7: the reads of the fetch pool, for the line of fr_report(): statements of zones (scan_records_in() or the one-zone reads), and the zones they read; [0] the requests of queries,
  * the warm-up and the lookups, [1] the background class (the fill).  The workers add, the fetch thread reports. */
@@ -6134,6 +6136,23 @@ static void *fetch_worker(void *arg) {
             seen = g_fcfg_seq;
         }
         pthread_mutex_unlock(&g_fcfg_lock);
+#ifdef KARIDNS_TEST_EVICT
+        if (bg && g_test_fill_fail) {                         /* (a test build: the fill's reads fail, see g_test_fill_fail) */
+            int frc = 0;
+            if (fb && fb->n >= 2) for (size_t i = 0; i < fb->n && frc == 0; i++) frc = fetch_fail(&x, &fb->rq[i], "test: an injected read error of the database");
+            else frc = fetch_fail(&x, &r, "test: an injected read error of the database");
+            pthread_mutex_lock(&io->fq_lock);
+            io->fq_bg_active--;
+            pthread_cond_broadcast(&io->fq_cond);
+            pthread_mutex_unlock(&io->fq_lock);
+            if (frc != 0) {
+                atomic_store(&g_fetch_died, true);
+                fetch_workers_stop(io);
+                break;
+            }
+            continue;
+        }
+#endif
         const int frc = fb && fb->n >= 2 ? fetch_batch(&x, &lc, fb) : fetch_one(&x, &lc, &r);
         if (bg) {
             pthread_mutex_lock(&io->fq_lock);
@@ -7527,6 +7546,8 @@ int main(int argc, char **argv) {
         unsigned long dv;
         if (parse_uint(delay_env, 0, 10000, &dv)) g_test_fetch_delay_ms = (int64_t)dv;
     }
+    const char *ff_env = getenv("KARIDNS_TEST_FILL_FAIL");                    /* (the test builds only, see g_test_fill_fail) */
+    g_test_fill_fail = ff_env && strcmp(ff_env, "1") == 0;
 #endif
     const char *stuck_env = getenv("KARIDNS_SIGNER_STUCK_MS");                /* (a test switch, see SIGW_STUCK_MS) */
     if (stuck_env) {
