@@ -42,7 +42,8 @@ What changes, what it breaks, and what to do. The step-by-step version is [docs/
   New `not-ready-answer drop|servfail;` (options, reloadable, default `drop`) chooses: `servfail` answers these
   queries, the ones whose `park-timeout` ran out, and a secondary before its first transfer (was SERVFAIL +
   EDE 14 "Zone not ready (empty)") SERVFAIL + EDE 14, as BIND; `drop` counts them in
-  `karidns_not_ready_dropped_total` (karictl stats). A zone whose file failed to load stays SERVFAIL.
+  `karidns_not_ready_dropped_total` (karictl stats). The responses log says `[DROP:NOT-READY]`, and a TCP
+  connection stays open after such a message. A zone whose file failed to load stays SERVFAIL.
 - **The fill of a store has its own limit, outside `fetch-concurrency`** (first-fill latency PR). Its bodies take no
   place of `fetch-concurrency` (every place is the queries'): 128 for each worker of the fill (`loader-threads` - 1, 256..1024) are in flight while no query waits (32 at most
   while one does), and the loader reads up to 128 zones of the fill a statement (16 for queries) with one worker left
@@ -50,7 +51,9 @@ What changes, what it breaks, and what to do. The step-by-step version is [docs/
   256). The loader logs its reads once a minute (`fetch reads in 60 s: ... zones a read`).
   A request of the fill never goes before a query in the loader, and a query does not wait for a body of the fill on
   its way; a fill that queries stall is counted (`store.ingest.fill_stalled_windows`, one WARNING a minute) and goes on
-  by itself. While attaches of queries queue up the fill is held to 32 in flight (`store.ingest.fill_throttled`).
+  by itself; one whose own reads fail is counted apart (`store.ingest.fill_failed_windows`). The loader drops a request
+  of the fill that waited 30 s (the Backend gave it up), and a request it did not answer in time is not counted as a
+  failed read of the database. While attaches of queries queue up the fill is held to 32 in flight (`store.ingest.fill_throttled`).
 - **The unlogged first fill begins when the store opens empty** (first-fill latency PR), not at the first pass: under
   queries from the start the lookups used to make the store non-empty and the whole fill ran with its journal. With
   no pass in 10 minutes it is given up (logged fill). Secondary copies are never written in it (put off to its end).

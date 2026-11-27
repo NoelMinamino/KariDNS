@@ -1,4 +1,4 @@
-.TH KARIDNS\-DBLOADER 8 "2026-11-27" "KariDNS" "KariDNS Manual"
+.TH KARIDNS\-DBLOADER 8 "2026-11-28" "KariDNS" "KariDNS Manual"
 .\" Generated from docs/karidns-dbloader.md by man/md2man.pl (make man): edit the Markdown manual, not this page.
 .SH NAME
 karidns\-dbloader \- reads the PowerDNS 5.1 tables of a SQLite3 or PostgreSQL
@@ -332,7 +332,12 @@ itself. Every priority and mode is covered: the age counts, not the class) and
 reads the zone through the same code as a one-zone reload: its own connection
 and snapshot, no batch, no inventory, no results. A request beyond the queue is
 answered \fBZONE_FAILED\fR "busy" (the first eight; more are dropped and the
-Backend's own time-out ends them).
+Backend's own time-out ends them). A request of the fill that waited 30 s in the
+queue (the time the Backend waits for an answer: it has given the request up and
+asks for the zone again) is dropped unread, so that a long flood of queries does
+not leave the queue full of them and the requests of queries answered busy; a
+line at LOG_INFO counts them (\fBdropped N requests of the fill that waited 30 s
+in the queue ...\fR, 0.7).
 .IP \(bu 2
 \fBBatches (0.7).\fR A worker that finds more requests of the same kind queued
 reads them together: the same view, the same priority (a query that waits is

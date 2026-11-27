@@ -1,4 +1,4 @@
-.TH KARIDNS.CONF 5 "2026-11-27" "KariDNS" "KariDNS Manual"
+.TH KARIDNS.CONF 5 "2026-11-28" "KariDNS" "KariDNS Manual"
 .\" Generated from docs/karidns.md by man/md2man.pl (make man): edit the Markdown manual, not this page.
 .SH NAME
 karidns.conf \- the configuration file of karidns(8)
@@ -940,14 +940,17 @@ was being looked up (see "The first fill and the queries"), and a secondary zone
 before its first transfer (or before the restore of its stored copy). \fBdrop\fR
 sends nothing and counts it (\fBkarictl stats\fR:
 \fBkaridns_not_ready_dropped_total\fR; for database zones also
-\fBstore.park.drop.*\fR / \fBstore.lookup.drop.*\fR): a resolver retries or asks
-another server and caches no error. \fBservfail\fR answers SERVFAIL with
-Extended DNS Error 14, Not Ready (RFC 8914 4.15), AA=0, as BIND does (a resolver
-may cache it for up to 5 minutes, RFC 2308 7.1). Not changed by it: zone
-transfers (AXFR, IXFR) and UPDATE always get SERVFAIL + EDE 14; a zone whose
-file failed to load is SERVFAIL; a query dropped for overload (the park table or
-the wait queue full, \fBrate\-limit\fR) is dropped. The value is read only when
-a query cannot be answered: answered queries do not look at it.
+\fBstore.park.drop.*\fR / \fBstore.lookup.drop.*\fR), the responses log
+(\fBcategory responses\fR) says \fB[DROP:NOT\-READY]\fR with the name and type,
+and over TCP the connection stays open for the next message (whatever
+\fBtcp\-connection\-reuse\fR says): a resolver retries or asks another server
+and caches no error. \fBservfail\fR answers SERVFAIL with Extended DNS Error 14,
+Not Ready (RFC 8914 4.15), AA=0, as BIND does (a resolver may cache it for up to
+5 minutes, RFC 2308 7.1). Not changed by it: zone transfers (AXFR, IXFR) and
+UPDATE always get SERVFAIL + EDE 14; a zone whose file failed to load is
+SERVFAIL; a query dropped for overload (the park table or the wait queue full,
+\fBrate\-limit\fR) is dropped. The value is read only when a query cannot be
+answered: answered queries do not look at it.
 .TP 8
 \fBresponse\-cache\-size <size>;\fR
 \fIDefault:\fR \fB32M\fR
@@ -2246,24 +2249,26 @@ record is too large.
 failed (<RCODE>) for <name>/<class>/<type>: <reason>\fR. The reason is the text
 of the Extended DNS Error the answer carries (\fBQuery refused due to access
 control\fR, \fBThis server is not authoritative for the queried zone\fR, \fBZone
-expired (SOA EXPIRE exceeded)\fR, \fBZone not ready (empty)\fR, \fBInvalid
-TSIG\fR, \fBThis opcode is not supported by this server\fR ...; the text is used
-also when \fBsend\-extended\-errors\fR is off and the client does not see it),
-or what the server found wrong with a malformed query (\fBthe question count is
-not valid for this opcode (RFC 9619)\fR, \fBa query without a question and
-without a COOKIE option (RFC 9619, RFC 7873 5.4)\fR, \fBthe question name is
-compressed (RFC 1035 4.1.4)\fR, \fBthe question is cut short (no QTYPE and
-QCLASS)\fR, \fBmalformed COOKIE option (RFC 7873 5.2.2)\fR, \fBmalformed EDNS
-Client Subnet option (RFC 7871 6)\fR, \fBinvalid MQTYPE\-Query option ...\fR,
-\fBthe OPT record cannot be used ...\fR, \fBthe TSIG record cannot be
-parsed\fR). A query whose question cannot be read is \fB\-/\-/\-\fR. SERVFAIL is
-logged at \fBdebug 1\fR, the other results at \fBdebug 3\fR (BIND's levels), and
-everything at \fBinfo\fR while the query log is on (BIND:
-\fBNS_SERVER_LOGQUERIES\fR), so an operator who wants them writes a channel with
-\fBseverity debug 3;\fR (or turns \fBquerylog yes\fR on). UPDATE, NOTIFY and the
-transfers are not query errors (their own categories); an answer that was
-dropped (RRL, a message too short to have a header) has no line. UDP, TCP, TLS
-and DoH go through the same code.
+expired (SOA EXPIRE exceeded)\fR, \fBZone not ready (empty)\fR (a secondary
+before its first transfer: a zone transfer of it, or any query with
+\fBnot\-ready\-answer servfail\fR; an ordinary query is not answered by default
+and has no line), \fBInvalid TSIG\fR, \fBThis opcode is not supported by this
+server\fR ...; the text is used also when \fBsend\-extended\-errors\fR is off
+and the client does not see it), or what the server found wrong with a malformed
+query (\fBthe question count is not valid for this opcode (RFC 9619)\fR, \fBa
+query without a question and without a COOKIE option (RFC 9619, RFC 7873
+5.4)\fR, \fBthe question name is compressed (RFC 1035 4.1.4)\fR, \fBthe question
+is cut short (no QTYPE and QCLASS)\fR, \fBmalformed COOKIE option (RFC 7873
+5.2.2)\fR, \fBmalformed EDNS Client Subnet option (RFC 7871 6)\fR, \fBinvalid
+MQTYPE\-Query option ...\fR, \fBthe OPT record cannot be used ...\fR, \fBthe
+TSIG record cannot be parsed\fR). A query whose question cannot be read is
+\fB\-/\-/\-\fR. SERVFAIL is logged at \fBdebug 1\fR, the other results at
+\fBdebug 3\fR (BIND's levels), and everything at \fBinfo\fR while the query log
+is on (BIND: \fBNS_SERVER_LOGQUERIES\fR), so an operator who wants them writes a
+channel with \fBseverity debug 3;\fR (or turns \fBquerylog yes\fR on). UPDATE,
+NOTIFY and the transfers are not query errors (their own categories); an answer
+that was dropped (RRL, a message too short to have a header) has no line. UDP,
+TCP, TLS and DoH go through the same code.
 .IP \(bu 2
 \fBupdate\fR (besides the \fB[Update]\fR lines): \fBupdate failed: <zone>: not
 authoritative for update zone (NOTAUTH)\fR, \fBupdate failed: zone section is
@@ -5308,11 +5313,14 @@ unchanged); a flood of queries can stall the fill, which is counted
 (\fBstore.ingest.fill_stalled_windows\fR) and said once a minute (\fB[DB] the
 fill of the store made no progress in the last 60 s ...\fR, WARNING), and the
 fill goes on by itself when the queries leave the loader room (a NOTICE says
-so). While the workers' attach rings hold 32 requests or more (the store threads
-are behind with the attaches of queries) the fill is held to its old share as
-while queries wait (\fBstore.ingest.fill_throttled\fR). The loader reads up to
-16 requests of queries together (up to 64 while more than 16 of them queue) and
-up to 128 of the fill, and leaves one worker to the queries:
+so); a window without progress because the fill's own reads failed or a failed
+round waits to be made again is counted and said apart
+(\fBstore.ingest.fill_failed_windows\fR, "its reads failed or are
+paused"). While the workers' attach rings hold 32 requests or more (the store
+threads are behind with the attaches of queries) the fill is held to its old
+share as while queries wait (\fBstore.ingest.fill_throttled\fR). The loader
+reads up to 16 requests of queries together (up to 64 while more than 16 of them
+queue) and up to 128 of the fill, and leaves one worker to the queries:
 \fBloader\-threads\fR - 1 workers read the fill and the last one only the
 queries, the warm-up and the lookups; with \fBloader\-threads 1\fR (a small
 server) the one worker does both, and a batch of the fill is 128 zones only
@@ -5537,13 +5545,13 @@ room, and the stored zone is not read from the loader for a query (\fBfetch
 issued\fR stays 0 for it, whatever the load; a burst of first queries for zones
 that are all stored is answered from the store). The attach is given 200 ms; a
 query whose attach is still queued then goes on waiting for the rest of its
-\fBpark\-timeout\fR and is not answered "not ready" earlier. The query path
-never sleeps for the store: a worker that finds a table cell of the store being
-written spins a few hundred times and then parks the query for a store thread,
-which looks again. The answer is the one the zone read from the database gives,
-byte for byte. A record that is missing or damaged (checksum, structure) falls
-back to the read from the database (a zone the store knows without an image,
-"known", is read from the database): the queries that wait for it are given the
+\fBpark\-timeout\fR and is not dropped earlier. The query path never sleeps for
+the store: a worker that finds a table cell of the store being written spins a
+few hundred times and then parks the query for a store thread, which looks
+again. The answer is the one the zone read from the database gives, byte for
+byte. A record that is missing or damaged (checksum, structure) falls back to
+the read from the database (a zone the store knows without an image, "known", is
+read from the database): the queries that wait for it are given the
 \fBpark\-timeout\fR again, a damaged record is logged (\fB[Store] the record of
 zone ... cannot be used\fR) and set back to "known", and the next install writes
 it again. Taking a zone out of memory (\fBmemory\-limit\fR) is what it always
@@ -6153,29 +6161,29 @@ way.
 \fBOver the hard line: room on demand (0.7).\fR The 110% line that keeps the
 overshoot bounded (above) never turns a query away. A query for a zone that is
 out of memory while the zones in memory are above the line is parked like any
-other (UDP and TCP; DoT and DoH do not park and get SERVFAIL + EDE 14 for such a
-zone) and its zone is asked for; the ingest thread, seeing the zones in memory
-above the hard line, takes zones out of memory \fBnow\fR (no waiting for the
-next round of the manager) and makes the request when the zones in memory are
-back under the line; the query is answered from the zone, on its first try (this
-is for servers on which queries for zones that do not fit \fBmemory\-limit\fR
-are normal: a million zones and a small limit). The request waits in the same
-queue as the requests that wait for a place of \fBfetch\-concurrency\fR or a
-token of \fBfetch\-rate\fR: the oldest first, one entry per zone (a second query
-for the same zone asks for nothing), holding the mark of its zone and nothing
-else (no place and no token are taken until the request is made, so the requests
-that wait cannot use up the pool). If there is no room before
-\fBpark\-timeout\fR (nothing can be taken out: everything that is left is
-pinned, changed by an UPDATE, or too young), the request is dropped and the
-queries are dropped when their own time is up, like any parked query (counted in
-\fBpark_timeout\fR of the \fBfetchq:\fR line, in \fBstore.park.drop.timeout\fR
-and in \fBroom_timeouts\fR; the retry of the client then finds the zones that
-the manager has taken out meanwhile). A reload (\fBkarictl reconfig\fR, SIGHUP)
-while requests wait loses none of them and leaves nothing behind: they go on
-waiting for what the new settings ask (a reload that takes \fBmemory\-limit\fR
-away makes them go at once). Zone transfers wait in the same queue; the
-background fetches (a CNAME or the glue of a name server) and the warm-up are
-not queries and do not wait: they are dropped above the line as before.
+other (UDP and TCP, the transports the server listens on) and its zone is asked
+for; the ingest thread, seeing the zones in memory above the hard line, takes
+zones out of memory \fBnow\fR (no waiting for the next round of the manager) and
+makes the request when the zones in memory are back under the line; the query is
+answered from the zone, on its first try (this is for servers on which queries
+for zones that do not fit \fBmemory\-limit\fR are normal: a million zones and a
+small limit). The request waits in the same queue as the requests that wait for
+a place of \fBfetch\-concurrency\fR or a token of \fBfetch\-rate\fR: the oldest
+first, one entry per zone (a second query for the same zone asks for nothing),
+holding the mark of its zone and nothing else (no place and no token are taken
+until the request is made, so the requests that wait cannot use up the pool). If
+there is no room before \fBpark\-timeout\fR (nothing can be taken out:
+everything that is left is pinned, changed by an UPDATE, or too young), the
+request is dropped and the queries are dropped when their own time is up, like
+any parked query (counted in \fBpark_timeout\fR of the \fBfetchq:\fR line, in
+\fBstore.park.drop.timeout\fR and in \fBroom_timeouts\fR; the retry of the
+client then finds the zones that the manager has taken out meanwhile). A reload
+(\fBkarictl reconfig\fR, SIGHUP) while requests wait loses none of them and
+leaves nothing behind: they go on waiting for what the new settings ask (a
+reload that takes \fBmemory\-limit\fR away makes them go at once). Zone
+transfers wait in the same queue; the background fetches (a CNAME or the glue of
+a name server) and the warm-up are not queries and do not wait: they are dropped
+above the line as before.
 .RS 2
 .IP \(bu 2
 \fBWhat is taken out, and how thrashing is avoided.\fR The same order as the
@@ -6383,19 +6391,20 @@ accepts none) is REFUSED , an UPDATE for it is checked (SOA question, apex,
 \fBallow\-update\fR from the settings kept in the element); one that may be made
 waits for the zone like a query (UDP and TCP; the zone is read, the UPDATE is
 applied to it when it is there, and it does not count for the zone's frequency),
-and gets SERVFAIL + EDE 14 only where nothing can wait (TLS, DoH) or the fetch
-failed; with a full park table, a full wait queue or when the time is up it is
-dropped and counted like a query. A zone changed by a dynamic UPDATE is
-\fBpinned\fR: it is never taken out of memory until the next load from the
-database replaces it (the change would be lost, since UPDATEs are kept in memory
-only); \fBkarictl dbstatus\fR shows how many zones are pinned that way
-(\fBupdated: N zone(s)\fR) and \fBkarictl dbstatus <zone>\fR marks the
-zone. These come with the next steps of D1 (design 7). The settings of a zone
-out of memory are the ones it had when it was taken out (an edit of its metadata
-reaches it when the zone is read or sent again), and \fBallow\-query\fR is
-checked from them. A zone of the database that another view shares by
-\fBin\-view\fR is looked up in the directory of its own view (see "Zones shared
-between views"), so the cache manager may take it out of memory like any other.
+and gets SERVFAIL + EDE 14 when the fetch failed (an UPDATE is not an ordinary
+query: \fBnot\-ready\-answer\fR does not change it); with a full park table, a
+full wait queue or when the time is up it is dropped and counted like a query. A
+zone changed by a dynamic UPDATE is \fBpinned\fR: it is never taken out of
+memory until the next load from the database replaces it (the change would be
+lost, since UPDATEs are kept in memory only); \fBkarictl dbstatus\fR shows how
+many zones are pinned that way (\fBupdated: N zone(s)\fR) and \fBkarictl
+dbstatus <zone>\fR marks the zone. These come with the next steps of D1 (design
+7). The settings of a zone out of memory are the ones it had when it was taken
+out (an edit of its metadata reaches it when the zone is read or sent again),
+and \fBallow\-query\fR is checked from them. A zone of the database that another
+view shares by \fBin\-view\fR is looked up in the directory of its own view (see
+"Zones shared between views"), so the cache manager may take it out of memory
+like any other.
 .SS Settings of database zones (milestone B7a)
 A zone in \fBkaridns.conf\fR takes its per-zone options from its \fBzone { }\fR
 statement; a database zone takes them from its PowerDNS \fBdomainmetadata\fR
