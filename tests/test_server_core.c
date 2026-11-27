@@ -4995,9 +4995,10 @@ static void test_klog_format(void) {
     printf("  -> klog_vformat passed.\n");
 }
 
-/* 0.7 review M-3: the general path has a rate limit per call site (KLOG_SITE_RATE lines a second, KLOG_SITE_RATE_QUERY on the query path) with one
- * "N line(s) suppressed" report when the second is over, and a thread with an event sink (a worker, an async I/O thread) hands its lines to the
- * sink instead of writing them */
+/* 0.7 review M-3: a thread on the query path (one with an event sink: a worker, an async I/O thread) hands its lines to the sink while a drainer runs,
+ * held to KLOG_SITE_RATE_QUERY lines a second per call site with one "N line(s) suppressed" report when the second is over; the report says the limit
+ * the lines were counted against, whichever thread writes it.  Other threads are not limited (a line per zone of a load), and a line of the query path
+ * with no drainer running is written at once (never left in a ring) */
 static char g_site_sink[64][300];
 static int g_site_sink_n;
 static void site_test_sink(void *ctx, int cat, int level, const char *ip, int port, const char *msg) {
@@ -5007,41 +5008,22 @@ static void site_test_sink(void *ctx, int cat, int level, const char *ip, int po
 }
 
 static void test_klog_site_rate(void) {
-    printf("[TEST] Logging: the rate limit of a call site of the general path, the report, the query path's sink (review M-3)...\n");
+    printf("[TEST] Logging: the rate limit of a call site of the query path, the report, the sink, the threads that are not limited (review M-3)...\n");
     char dir[] = "/tmp/karidns_klog_site_XXXXXX";
     assert(mkdtemp(dir));
     char conf[1024], p[300];
     snprintf(p, sizeof(p), "%s/site.log", dir);
     snprintf(conf, sizeof(conf), "logging { channel s { file \"%s\"; print-severity yes; }; category default { s; }; };", p);
     klog_install_conf(conf);
-    /* one site logs 250 lines in one second: KLOG_SITE_RATE pass (a second that turns over during the loop is run again) */
-    time_t t0 = 0;
-    for (int attempt = 0; attempt < 5; attempt++) {
-        klog_sites_reset();
-        unlink(p);
-        klog_install_conf(conf);
-        t0 = time(NULL);
-        for (int i = 0; i < 250; i++) kdns_syslog(LOG_WARNING, "[Config] flood line %d", i);
-        if (time(NULL) == t0) break;
-        t0 = 0;
-    }
-    assert(t0 != 0);
-    assert(klog_lines(p) == (int)KLOG_SITE_RATE);
-    kdns_syslog(LOG_WARNING, "[Config] another site");                 /* another site has its own budget */
-    assert(klog_lines(p) == (int)KLOG_SITE_RATE + 1);
-    klog_sites_flush((int64_t)t0 + 1);                                  /* the second is over: one report, in the site's category, at its level */
-    char *s = klog_slurp(p);
-    assert(strstr(s, "warning: [Logging] 50 line(s) like \"[Config] flood line 0\" suppressed by the rate limit of 200 per second\n"));
-    assert(strstr(s, "warning: [Config] flood line 199\n") && !strstr(s, "flood line 200\n"));
-    free(s);
-    klog_sites_flush((int64_t)t0 + 2);                                  /* said once */
-    assert(klog_lines(p) == (int)KLOG_SITE_RATE + 2);
-
-    /* the query path: the lines go to the thread's sink, not to the file, with the lower limit */
     klog_sites_reset();
-    g_site_sink_n = 0;
+    /* a thread that is not on the query path: 2500 lines of one site in a moment, all written (a load of many zones, one line each) */
+    for (int i = 0; i < 2500; i++) kdns_syslog(LOG_WARNING, "[Zone] zone 'z%d.test.': flood line", i);
+    assert(klog_lines(p) == 2500);
+
+    /* the query path with the drainer running: the lines go to the thread's sink, not to the file, KLOG_SITE_RATE_QUERY of them */
+    klog_set_sink_drainer(true);
     logev_set_thread_sink(site_test_sink, NULL);
-    t0 = 0;
+    time_t t0 = 0;
     for (int attempt = 0; attempt < 5; attempt++) {
         klog_sites_reset();
         g_site_sink_n = 0;
@@ -5052,11 +5034,33 @@ static void test_klog_site_rate(void) {
     }
     assert(t0 != 0);
     assert(g_site_sink_n == (int)KLOG_SITE_RATE_QUERY && strcmp(g_site_sink[0], "[Worker] query path line 0") == 0);
-    klog_sites_flush((int64_t)t0 + 1);
+    klog_sites_flush((int64_t)t0 + 1);                                  /* the report goes to the sink as well */
     assert(g_site_sink_n == (int)KLOG_SITE_RATE_QUERY + 1);
     assert(strcmp(g_site_sink[KLOG_SITE_RATE_QUERY], "[Logging] 10 line(s) like \"[Worker] query path line 0\" suppressed by the rate limit of 20 per second") == 0);
+    assert(klog_lines(p) == 2500);                                     /* nothing of the query path reached the file */
+    /* the report written by a thread that is not on the query path (the query logger thread's flush) says the limit the lines were counted against */
+    for (int attempt = 0; attempt < 5; attempt++) {
+        klog_sites_reset();
+        t0 = time(NULL);
+        for (int i = 0; i < 25; i++) kdns_syslog(LOG_ERR, "[Worker] counted on the query path %d", i);
+        if (time(NULL) == t0) break;
+        t0 = 0;
+    }
+    assert(t0 != 0);
     logev_set_thread_sink(NULL, NULL);
-    assert(klog_lines(p) == (int)KLOG_SITE_RATE + 2);                   /* nothing of the query path reached the file */
+    klog_sites_flush((int64_t)t0 + 1);
+    char *s = klog_slurp(p);
+    assert(strstr(s, "error: [Logging] 5 line(s) like \"[Worker] counted on the query path 0\" suppressed by the rate limit of 20 per second\n"));
+    free(s);
+    assert(klog_lines(p) == 2501);
+    /* no drainer: a line of the query path is written at once (before the logger thread runs, after it ended) */
+    klog_set_sink_drainer(false);
+    logev_set_thread_sink(site_test_sink, NULL);
+    g_site_sink_n = 0;
+    klog_sites_reset();
+    kdns_syslog(LOG_ERR, "[Worker] no drainer");
+    logev_set_thread_sink(NULL, NULL);
+    assert(g_site_sink_n == 0 && klog_lines(p) == 2502);
     klog_sites_reset();
     unlink(p);
     rmdir(dir);
@@ -6115,7 +6119,6 @@ static void test_klog_replacement_under_load(void) {
     char path[300], conf[1024];
     snprintf(path, sizeof(path), "%s/load.log", dir);
     snprintf(conf, sizeof(conf), "logging { channel l { file \"%s\"; }; category default { l; }; };", path);
-    klog_sites_test_limit(UINT32_MAX);                     /* (6000 lines of one call site: the replacement is tested, not the rate limit of review M-3) */
     klog_install_conf(conf);
     for (long i = 0; i < 4; i++) assert(pthread_create(&g_klog_threads[i], NULL, klog_thread_main, (void *)(intptr_t)i) == 0);
     for (int i = 0; i < 30; i++) {
@@ -6124,7 +6127,6 @@ static void test_klog_replacement_under_load(void) {
     }
     for (int i = 0; i < 4; i++) pthread_join(g_klog_threads[i], NULL);
     assert(klog_lines(path) == 4 * 1500);
-    klog_sites_test_limit(0);
     test_retire_runtime(NULL);
     unlink(path);
     rmdir(dir);

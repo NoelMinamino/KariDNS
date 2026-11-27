@@ -1182,8 +1182,11 @@ static void lint_nsec(const char *domain, const zone_arena_t *arena, kc_tally_t 
 /* ---- 0.7 review: the SOA timers (RFC 1035 3.3.13, RFC 1912 2.2, RFC 2308 5) ----
  * Warnings: the values work, but not as a secondary needs them.  RFC 1912 2.2: the retry interval is "some fraction of the refresh interval",
  * and the expire time "must be greater than the minimum and retry intervals"; a zone whose expire is shorter than refresh + retry expires on a
- * secondary that misses one refresh and its retry.  RFC 2308 5: negative answers live min(SOA MINIMUM, SOA TTL), and values over a day "have been
- * found to be problematic". */
+ * secondary that misses one refresh and its retry.  The minimum: RFC 1912 2.2 (written before RFC 2308) calls 1-5 days typical, RFC 2308 4 made it
+ * the TTL of negative answers, which live min(SOA MINIMUM, SOA TTL) (RFC 2308 5); resolvers cap that (BIND 9.20 max-ncache-ttl: 3 hours by default,
+ * "cannot exceed 7 days and is silently truncated").  So the warning is for a negative TTL above 7 days: none of the sources calls it sane, and no
+ * resolver keeps it.  (A day, RFC 2308 5's "problematic" for a resolver default, would warn on zones RFC 1912 calls typical.) */
+#define LINT_SOA_NEG_TTL_MAX 604800u
 static void lint_soa_timers(const char *domain, const zone_arena_t *arena, kc_tally_t *t) {
     for (long j = lint_first_at(arena, domain, SIZE_MAX, NULL, NULL); j >= 0; j = lint_at_from(arena, domain, (size_t)j + 1, SIZE_MAX, NULL, NULL)) {
         const dns_record_t *r = &arena->records[j];
@@ -1200,9 +1203,10 @@ static void lint_soa_timers(const char *domain, const zone_arena_t *arena, kc_ta
                        "before it retries (RFC 1912 section 2.2)\n", domain, expire, refresh, retry);
         else if (expire <= minimum)
             kc_warning(t, DC_ZONE_SOA_EXPIRE, "SOA of zone '%s': the expire time %u is not greater than the minimum %u (RFC 1912 section 2.2)\n", domain, expire, minimum);
-        if (minimum > 86400)
-            kc_warning(t, DC_ZONE_SOA_MINIMUM, "SOA of zone '%s': the minimum %u (the TTL of negative answers, RFC 2308 section 4) is over a day; RFC 2308 section 5 finds such values "
-                       "problematic\n", domain, minimum);
+        const uint32_t neg = r->ttl_value < minimum ? r->ttl_value : minimum;       /* (RFC 2308 section 5: min(SOA TTL, MINIMUM)) */
+        if (neg > LINT_SOA_NEG_TTL_MAX)
+            kc_warning(t, DC_ZONE_SOA_MINIMUM, "SOA of zone '%s': the TTL of negative answers is %u (min(SOA TTL %u, minimum %u), RFC 2308 section 5), over 7 days; resolvers "
+                       "keep it 7 days at most (BIND max-ncache-ttl) and RFC 1912 section 2.2 calls 1-5 days typical\n", domain, neg, r->ttl_value, minimum);
     }
 }
 

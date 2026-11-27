@@ -3057,9 +3057,9 @@ typedef struct un_zone {
 } un_zone_t;
 
 /* The state of the reconcile.  Three threads use it: the reconcile thread (dns_db_recon.c rt_main(): db_recon_begin(), _entry_n(), _end(), _abort(), the one writer of the pass), the ingest thread
- * (db_recon_lookup(): lk_mark(), the records the store cannot name) and the control thread (db_recon_status(): karictl store, dbstatus).  0.7 review: every field is read and written under RC.mu, by
- * every thread, the writer included (the pass's fields are copied under it where a long step follows: the sweep, the apply of a page); lk_any alone is atomic, the hint that lets lk_has() skip the
- * lock.  tests/test_db_store.c recon_status_during_pass() reads the state from another thread during passes, under ThreadSanitizer (test_db_store-tsan). */
+ * (db_recon_lookup(): lk_mark(), the records the store cannot name) and the control thread (db_recon_status(): karictl store, dbstatus).  0.7 review: every field is written under RC.mu and read
+ * under it by every thread (the pass's fields are copied under it where a long step follows: the sweep, the apply of a page), with two exceptions: lk_any is atomic, the hint that lets lk_has()
+ * skip the lock, and the bits of RC.seen, which only the reconcile thread writes or reads, are read by it without the lock in the sweep (rc_listed(): once per zone of the view).  tests/test_db_store.c recon_status_during_pass() reads the state from another thread during passes, under ThreadSanitizer (test_db_store-tsan). */
 static struct {
   pthread_mutex_t mu;
   /* the pass */
@@ -3550,13 +3550,11 @@ static bool lk_has(uint32_t zid) {
   rc_unlock();
   return b;
 }
-/* the sweep: did the pass list the record, or did a lookup's answer make it (under RC.mu, as the bits are written: 0.7 review) */
-static bool rc_listed(uint32_t zid) {
-  rc_lock();
-  const bool b = bits_get(&RC.seen, zid) || (zid != STORE_NONE && atomic_load_explicit(&RC.lk_any, memory_order_relaxed) && bits_get(&RC.lk, zid));
-  rc_unlock();
-  return b;
-}
+/* the sweep: did the pass list the record, or did a lookup's answer make it.  It runs for every zone of the view under store_read_lock() (10^9
+ * at the largest), so it takes RC.mu only where another thread writes: RC.seen is the reconcile thread's alone (db_recon_begin() / _entry_n() /
+ * _end() / _abort() write it, under RC.mu, and nothing else reads it), and the sweep runs on that thread, so it reads its own bits without the
+ * lock; RC.lk is written by the ingest thread (lk_mark()), so lk_has() looks at it under RC.mu, and only when lk_any says a lookup marked one. */
+static bool rc_listed(uint32_t zid) { return bits_get(&RC.seen, zid) || lk_has(zid); }
 static void lk_mark(const char *view, uint32_t zid) {
   rc_lock();
   if (RC.active && zid != STORE_NONE && strcmp(view, RC.view) == 0 && bits_set(&RC.lk, zid)) atomic_store_explicit(&RC.lk_any, true, memory_order_release);

@@ -235,9 +235,25 @@ if [ -n "$FLB" ] && [ -n "$FLS" ]; then
     MIN=$(( (FLB - 65536) / 65536 - 1 ))
     [ "$FLS" -ge "$MIN" ] && pass "the rate holds: $FLB bytes took $FLS s (at least $MIN)" || fail "the rate does not hold: $FLB bytes in $FLS s (want >= $MIN)"
 fi
+# the rate is the sender's (its uid), not the connection's: two connections at once share one bucket, which the first flood left empty-ish and a
+# reconnect does not fill: 2 x 500 copies take at least what the rate allows for both together
+T0=$(date +%s)
+perl "$MOCK" send "$SOCK6" flood 500 > "$TMP_DIR/fa.out" 2>&1 &
+FA=$!
+perl "$MOCK" send "$SOCK6" flood 500 > "$TMP_DIR/fb.out" 2>&1
+RB=$?
+wait "$FA"; RA=$?
+T1=$(date +%s)
+[ "$RA" -eq 0 ] && [ "$RB" -eq 0 ] && pass "two connections of one sender are both served ($(cat "$TMP_DIR/fa.out"); $(cat "$TMP_DIR/fb.out"))" || fail "two floods: $(cat "$TMP_DIR/fa.out" "$TMP_DIR/fb.out")"
+FAB=$(sed -n 's/^OK flood \([0-9]*\) bytes.*/\1/p' "$TMP_DIR/fa.out")
+if [ -n "$FAB" ]; then
+    MIN2=$(( (2 * FAB - 65536) / 65536 - 1 ))
+    [ $((T1 - T0)) -ge "$MIN2" ] && pass "one bucket for the uid: 2 x $FAB bytes took $((T1 - T0)) s (at least $MIN2; per connection it would be half)" ||
+        fail "the two connections got more than the sender's rate: 2 x $FAB bytes in $((T1 - T0)) s (want >= $MIN2)"
+fi
 kill -TERM "$TAP_PID"; wait "$TAP_PID"; TAP_PID=""
 perl "$MOCK" sum "$TMP_DIR/s6.json" > "$TMP_DIR/s6.sum"
-grep -q "^frames=7007$" "$TMP_DIR/s6.sum" && pass "every frame of the slowed sender is counted (7 + 7000)" || fail "frames of -l: $(grep '^frames=' "$TMP_DIR/s6.sum")"
+grep -q "^frames=14007$" "$TMP_DIR/s6.sum" && pass "every frame of the slowed sender is counted (7 + 7000 + 2 x 3500)" || fail "frames of -l: $(grep '^frames=' "$TMP_DIR/s6.sum")"
 TH=$(sed -n 's/^senders_throttled=//p' "$TMP_DIR/s6.sum")
 [ "${TH:-0}" -gt 0 ] && pass "the pauses are counted (senders_throttled=$TH)" || fail "senders_throttled: $(cat "$TMP_DIR/s6.sum")"
 "$TAPSTAT" -s "$TMP_DIR/t7.sock" -u no-such-user-tapstat >/dev/null 2>&1; [ $? -eq 2 ] && pass "-u unknown user: exit 2" || fail "-u unknown user"

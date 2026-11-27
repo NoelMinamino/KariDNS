@@ -30,7 +30,7 @@ EOF
 cat > "$W/bad.zone" <<'EOF'
 $ORIGIN bad.test.
 $TTL 3600
-@ IN SOA ns1 hostmaster ( 1 600 900 1000 172800 )
+@ 1209600 IN SOA ns1 hostmaster ( 1 600 900 1000 1209600 )
 @ IN NS ns1
 @ IN NSEC host.bad.test. SOA NSEC
 host IN A 192.0.2.10
@@ -67,7 +67,7 @@ grep -q "Name 'mail.bad.test.' .*no NSEC record" "$W/bad.out" || fail "the gap a
 grep -q "names 'other.bad.test.', not the apex" "$W/bad.out" || fail "the open chain is not named: $(grep -i "closed" "$W/bad.out")"
 grep -q "retry interval 900 is longer than the refresh interval 600" "$W/bad.out" || fail "retry > refresh: $(grep -i retry "$W/bad.out")"
 grep -q "expire time 1000 is shorter than refresh + retry (600 + 900)" "$W/bad.out" || fail "expire < refresh + retry: $(grep -i expire "$W/bad.out")"
-grep -q "minimum 172800" "$W/bad.out" || fail "minimum over a day: $(grep -i minimum "$W/bad.out")"
+grep -q "the TTL of negative answers is 1209600 (min(SOA TTL 1209600, minimum 1209600)" "$W/bad.out" || fail "negative TTL over 7 days: $(grep -i minimum "$W/bad.out")"
 
 # 4. expire not greater than the minimum (expire >= refresh + retry)
 sed -e 's/( 1 7200 1800 1209600 3600 )/( 1 7200 1800 9000 9000 )/' "$W/good.zone" > "$W/exp.zone"

@@ -286,7 +286,7 @@ X (ZONE_SOA_LOCATION_UNDEFINED, "zone.soa.location-undefined", 'W', "the SOA rec
 X (ZONE_SOA_EXPIRED, "zone.soa.expired", 'W', "the SOA record has expired")
 X (ZONE_SOA_RETRY, "zone.soa.retry", 'W', "the SOA retry interval is longer than the refresh interval")
 X (ZONE_SOA_EXPIRE, "zone.soa.expire", 'W', "the SOA expire time is shorter than refresh + retry, or not greater than the minimum")
-X (ZONE_SOA_MINIMUM, "zone.soa.minimum", 'W', "the SOA minimum (negative TTL) is over a day")
+X (ZONE_SOA_MINIMUM, "zone.soa.minimum", 'W', "the TTL of negative answers, min(SOA TTL, minimum), is over 7 days")
 X (ZONE_NS_MISSING, "zone.ns.missing", 'E', "the zone has no NS record at the apex")
 X (ZONE_CATALOG_VERSION, "zone.catalog.version", 'E', "a catalog zone lacks its version TXT record")
 X (ZONE_CATALOG_NAME_TOO_LONG, "zone.catalog.name-too-long", 'E', "a name in a catalog zone is too long to check")

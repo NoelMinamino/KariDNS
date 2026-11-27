@@ -92,11 +92,11 @@ is the order of work. The manuals have the detail: [karidns(8)](karidns.md), [ka
    - `karicheck zone <domain> <file>` run by root parses the file as `nobody` (`-u user` to choose, `-u root` to keep
      root): an `$INCLUDE` that only root may read is an error there now.
    - `karicheck zone` and `karidns-dbloader --check` warn about NSEC chains (order, closure, gaps, type bitmaps) and
-     SOA timers (retry > refresh, expire < refresh + retry or <= minimum, minimum over a day): a check that counted
+     SOA timers (retry > refresh, expire < refresh + retry or <= minimum, a negative TTL over 7 days): a check that counted
      warnings may see more.
-   - Every log line of the server passes a rate limit of its call site (200 a second, 20 on the query path; a
-     `[Logging] N line(s) like "..." suppressed` line reports the rest), and the workers hand their lines to the
-     query logger thread (docs/karidns.md, logging).
+   - The log lines of the query path (workers, the async pool) pass a rate limit of their call site (20 a second; a
+     `[Logging] N line(s) like "..." suppressed` line reports the rest) and go through the query logger thread
+     (docs/karidns.md, logging); the other threads are not limited.
 7. **Plan the disk**: with a database or secondary zones the store is on by default (section 3). About 1.2-1.6 KB of
    disk per small database zone (#185), and free space for the first fill and the cleaner.
 8. Read "CHANGES.md / Upgrade notes" once for the items that are specific to your setup (DNS Cookies, `signer-wait`).

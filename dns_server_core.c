@@ -1536,24 +1536,27 @@ void write_query_log(worker_ctx_t *ctx,
     atomic_store_explicit(&ring->head, h + 1, memory_order_release);
 }
 
-/* 0.7 review M-3: the records of a ring that carries event lines only (an async I/O pool thread's) to the channels; rt NULL = no runtime, dropped.
- * true when there were records. */
+/* 0.7 review M-3: one event record of a ring to the channels, or to syslog(3) when there is no logging runtime (rt NULL: what klog_route() does
+ * with a line then; a record is never dropped here) */
+static void qlog_event_out(log_runtime_t *rt, qlog_event_t *ev) {
+    if (ev->kind != QLOG_KIND_EVENT || ev->cat >= LOGC_COUNT) return;
+    char line[KLOG_MSG_MAX];
+    ev->client_text[sizeof(ev->client_text) - 1] = '\0';
+    ev->qname[sizeof(ev->qname) - 1] = '\0';
+    logev_format_line(line, sizeof(line), ev->client_text, ev->client_port, ev->qname);
+    for (char *p = line; *p; p++)
+        if (((unsigned char)*p < 0x20 && *p != '\t') || *p == 0x7f) *p = '?';
+    if (rt) klog_record(rt, ev->cat, ev->level, &ev->ts, line);
+    else klog_syslog_level(ev->level, line);
+}
+
+/* the records of a ring that carries event lines only (an async I/O pool thread's); true when there were records */
 static bool qlog_drain_event_ring(log_runtime_t *rt, qlog_ring_t *ring) {
     if (!ring->events) return false;
     uint32_t t = atomic_load_explicit(&ring->tail, memory_order_relaxed);
     const uint32_t h = atomic_load_explicit(&ring->head, memory_order_acquire);
     if (t == h) return false;
-    for (; t != h; t++) {
-        qlog_event_t *ev = &ring->events[t & ring->mask];
-        if (!rt || ev->kind != QLOG_KIND_EVENT || ev->cat >= LOGC_COUNT) continue;
-        char line[KLOG_MSG_MAX];
-        ev->client_text[sizeof(ev->client_text) - 1] = '\0';
-        ev->qname[sizeof(ev->qname) - 1] = '\0';
-        logev_format_line(line, sizeof(line), ev->client_text, ev->client_port, ev->qname);
-        for (char *p = line; *p; p++)
-            if (((unsigned char)*p < 0x20 && *p != '\t') || *p == 0x7f) *p = '?';
-        klog_record(rt, ev->cat, ev->level, &ev->ts, line);
-    }
+    for (; t != h; t++) qlog_event_out(rt, &ring->events[t & ring->mask]);
     atomic_store_explicit(&ring->tail, t, memory_order_release);
     return true;
 }
@@ -1567,6 +1570,7 @@ void *query_logger_thread_func(void *arg) {
     uint64_t last_reported_dropped = 0;
     uint64_t last_reported_ev_dropped = 0;
 
+    klog_set_sink_drainer(true);      /* 0.7 review M-3: the lines of the query path go to the rings while this thread empties them */
     while (!TEST_THREADS_STOPPING()) {
         rcu_slot_reader_enter(&g_query_logger_rcu_ctx);
         server_config_t *cfg = acquire_config_snapshot();
@@ -1710,12 +1714,15 @@ void *query_logger_thread_func(void *arg) {
                 }
             }
         } else if (num_workers > 0 && workers) {
-            // クエリロギング未設定時はエントリを破棄してCPU消費を防ぐ (no logging runtime: both rings, the query log's and the events')
-            for (int w = 0; w < num_workers * 2; w++) {
-                qlog_ring_t *ring = (w & 1) ? &workers[w / 2].qlog_ring : &workers[w / 2].ev_ring;
-                if (!ring->events) continue;
-                uint32_t h = atomic_load_explicit(&ring->head, memory_order_relaxed);
-                atomic_store_explicit(&ring->tail, h, memory_order_relaxed);
+            // クエリロギング未設定時はエントリを破棄してCPU消費を防ぐ (no logging runtime: the query log ring is emptied; the event lines go to syslog, as
+            // klog_route() writes a line when there is no runtime: 0.7 review M-3, a worker's line is never lost for want of a runtime)
+            for (int w = 0; w < num_workers; w++) {
+                qlog_ring_t *ring = &workers[w].qlog_ring;
+                if (ring->events) {
+                    uint32_t h = atomic_load_explicit(&ring->head, memory_order_relaxed);
+                    atomic_store_explicit(&ring->tail, h, memory_order_relaxed);
+                }
+                any_work |= qlog_drain_event_ring(rt, &workers[w].ev_ring);
             }
         }
 
@@ -1724,6 +1731,16 @@ void *query_logger_thread_func(void *arg) {
 
         // 常に数ミリ秒休止してワーカースレッドにCPUを完全に明け渡す
         usleep(any_work ? 1000 : 10000);
+    }
+    /* the lines of the query path are written by their threads again; what is in the event rings now is written once more, so nothing is left there */
+    klog_set_sink_drainer(false);
+    {
+        log_runtime_t *rt = log_runtime_acquire();
+        const int num_workers = atomic_load_explicit(&g_worker_count, memory_order_acquire);
+        worker_ctx_t *workers = atomic_load_explicit(&g_worker_ctxs, memory_order_acquire);
+        for (int w = 0; workers && w < num_workers; w++) (void)qlog_drain_event_ring(rt, &workers[w].ev_ring);
+        for (int i = 0; i < ASYNC_IO_POOL_SIZE; i++) (void)qlog_drain_event_ring(rt, &g_async_ev_rings[i]);
+        if (rt) log_runtime_release(rt);
     }
     return NULL;
 }
