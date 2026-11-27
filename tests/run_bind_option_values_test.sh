@@ -227,7 +227,7 @@ serial=$(d $P1 ex.test SOA +short | awk '{ print $3 }')
 d $P1 ex.test A --update-add 'n2.ex.test 300 A 192.0.2.102' -y "$YKEY" | grep -q "status: NOERROR" && pass "update accepted (8 records, max-records 8)" || fail "update 2"
 d $P1 ex.test A --update-add 'n3.ex.test 300 A 192.0.2.103' -y "$YKEY" | grep -q "status: SERVFAIL" && pass "max-records 8: the update that makes 9 is SERVFAIL" || fail "update 3"
 [ -z "$(d $P1 n3.ex.test A +short)" ] && pass "the refused update changed nothing" || fail "n3 exists"
-grep -q "exceeds max-records\|more than max-records" "$W/s1.log" && pass "the refusal is logged" || fail "no log line about max-records"
+kari_wait_log "$W/s1.log" "exceeds max-records\|more than max-records" 10 && pass "the refusal is logged" || { fail "no log line about max-records"; tail -5 "$W/s1.log"; }   # (the Backend's log line reaches the file after the answer: a bounded wait)
 
 # server 2: minimal-responses no-auth, then a server with no-auth-recursive and one with none
 cat > "$W/s2.conf" <<EOF
@@ -264,7 +264,7 @@ for n in version.bind hostname.bind id.server; do
     echo "$out" | grep -q "ANSWER: 0, AUTHORITY: 1" && echo "$out" | grep -q "status: NOERROR" && pass "$n with none / not written: NODATA with the SOA" || fail "$n none: $out"
 done
 d $P4 big.test SOA | grep -q "status: SERVFAIL\|status: REFUSED" && pass "a zone with more than max-records records is not served" || fail "big.test is served: $(d $P4 big.test SOA)"
-grep -q "more than max-records 5" "$W/s4.log" && pass "the load failure is logged" || fail "no log line for big.test"
+kari_wait_log "$W/s4.log" "more than max-records 5" 10 && pass "the load failure is logged" || { fail "no log line for big.test"; tail -5 "$W/s4.log"; }
 d $P4 ex.test SOA +short | grep -q "^[^;]" && pass "the other zone is served" || fail "ex.test not served"
 
 kari_kill_tree $PIDS; PIDS=""
