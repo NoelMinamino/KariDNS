@@ -244,15 +244,10 @@ Fixes from the external reviews and audits of the 0.7 cycle. Each has a test tha
 
 ### Bug fixes
 
-<<<<<<< HEAD
 - **NXNAME questions** (RFC 9824 §3.5): a query for type NXNAME is answered FORMERR with EDE 30, also in forward and
   program zones, which no longer pass it on; an MQTYPE-Query option that lists NXNAME is FORMERR (RFC 10029 §3.3).
   Before, it was answered like any other type (NODATA) or relayed. `KariDNS_RFC_GUIDELINE.md` was checked against the
   RFC texts: titles, section numbers and moved source files corrected.
-- **Zone store tables and swap**: above `store-table-memory` (new, restart-only; default the RAM less `memory-limit`
-  and a quarter of the RAM) the server deactivates the clean file pages of the store's tables, index and first-fill
-  runs a slice at a time, so the kernel frees them before it swaps other memory (100M zones on 16 GB swapped before).
-=======
 - **Zone store tables in private memory** (#262): a first fill of 100M zones was killed after 8.6 min (13.5 GB of private
   table pages, swap full). A fuzzy checkpoint now gives the written private pages back to their file, and a checkpoint is due
   when the private pages grew by `tables_private_max` (default RAM/32, 64 MiB .. 1 GiB); new `store.tables.private_*` stats.
@@ -265,7 +260,6 @@ Fixes from the external reviews and audits of the 0.7 cycle. Each has a test tha
   `memory-limit` and a quarter of the RAM) the server deactivates the clean file pages of the store's tables, index
   and first-fill runs a slice at a time, so the kernel frees them before it swaps other memory (100M zones on 16 GB
   swapped before).
->>>>>>> origin/main
 - **Stop with a zone store**: the manager gives a backend that is writing the clean checkpoint of its zone store up
   to 120 seconds (it logs at 10 seconds that it waits; a second SIGTERM still kills at once). Before, a kill at 10
   seconds while the fsync() calls waited for the disk made the next start go back to the last bulk checkpoint of a
