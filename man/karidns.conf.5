@@ -5277,18 +5277,25 @@ fill's sequential reads, which are much cheaper than reading a zone by name) and
 the fill does not stop the queries. \fBWhat bounds the load of the database
 during a fill is \fBloader\-threads\fB\fR: the loader's workers read (each one
 statement at a time); the requests in flight only wait in the loader's queue
-(1280 requests; more are answered "busy"). The loader takes a request of a query
-(or of the warm-up) before one of the fill, the oldest first (a request that has
-waited 200 ms goes first whatever its class, so that a query that joined a body
-of the fill on its way is not left behind), reads up to 16 requests of queries
-together and up to 128 of the fill, and leaves one worker to the queries:
-\fBloader\-threads\fR - 1 workers read the fill and the last one only the
-queries, the warm-up and the lookups; with \fBloader\-threads 1\fR (a small
-server) the one worker does both, and a batch of the fill is 128 zones only
-while no query came in the last second. A zone that a query waits for is not
-read again by the fill (the query's read brings it). The loader says how it read
-in one line a minute while it reads, and once when it stops (\fBfetch reads in
-60 s: queries 120 reads 130 zones, fill 400 reads 51200 zones (128.0 zones a
+(1280 requests; more are answered "busy"). The loader takes every request of a
+query (or of the warm-up) before one of the fill, however long that one waited
+(a query whose zone is on its way as a body of the fill does not wait for it:
+the Backend asks for the zone itself, and the second body is dropped as
+unchanged); a flood of queries can stall the fill, which is counted
+(\fBstore.ingest.fill_stalled_windows\fR) and said once a minute (\fB[DB] the
+fill of the store made no progress in the last 60 s ...\fR, WARNING), and the
+fill goes on by itself when the queries leave the loader room (a NOTICE says
+so). While the workers' attach rings hold 32 requests or more (the store threads
+are behind with the attaches of queries) the fill is held to its old share as
+while queries wait (\fBstore.ingest.fill_throttled\fR). The loader reads up to
+16 requests of queries together and up to 128 of the fill, and leaves one worker
+to the queries: \fBloader\-threads\fR - 1 workers read the fill and the last one
+only the queries, the warm-up and the lookups; with \fBloader\-threads 1\fR (a
+small server) the one worker does both, and a batch of the fill is 128 zones
+only while no query came in the last second. A zone that a query waits for is
+not read again by the fill (the query's read brings it). The loader says how it
+read in one line a minute while it reads, and once when it stops (\fBfetch reads
+in 60 s: queries 120 reads 130 zones, fill 400 reads 51200 zones (128.0 zones a
 read)\fR, LOG_INFO). The ingest thread waits for the store's journal at 4 times
 its limit (the disk is behind the fill's writes) in slices of 5 ms and makes the
 requests of queries between them, so a lookup or a fetch of a query never waits
@@ -5395,7 +5402,26 @@ why), \fBremembered\fR, \fBreask_suppressed\fR, \fBremember_releases\fR,
 until the first pass has ended, as well as until the hot list of the loader is
 read, for at most that many seconds. Without a store (\fBstore none;\fR, or a
 directory that cannot be used) every database zone is a zone of the heap
-directory, as before 0.7, and the hot list works as described under "Warm-up".
+directory, as before 0.7, and the hot list works as described under
+"Warm-up". The unlogged first fill of an empty store (the store keeps no journal
+until the fill is over, "THE BULK FILL") is begun when the store opens empty for
+a database, before any query is served (0.7 first-fill latency; it used to begin
+with the first pass, and the zones that the lookups of the first seconds
+recorded made the store not empty, so that under queries from the start the
+whole fill ran with its journal and about 45 checkpoints of up to 33 s on 10M
+zones, in which the attaches of queries stalled). A crash in it goes back to the
+checkpoint that began it, as for any unlogged fill: what came after, the zones
+the lookups recorded included, is read or looked up again. It ends as before, at
+the end of the first fill; a clean stop keeps it for the next start; when no
+pass of the database begins within 10 minutes of the start (no loader comes, the
+database cannot be read) it is given up and the store keeps its journal (a
+NOTICE says so). It is not begun when secondary zones of the configuration keep
+their copies in the store, and the copy of a secondary (of the configuration or
+of the database) is never written in an unlogged fill: a transfer that comes
+during it ends the fill first and its copy is stored once that end is on disk
+(the zone is served from memory meanwhile), so a crash never leaves a copy
+written in part; a copy that was not stored yet is transferred again after the
+restart.
 .PP
 \fBA database that cannot be read (0.7).\fR An ordinary query (opcode QUERY) is
 never answered SERVFAIL or another error while the data of its answer is being
