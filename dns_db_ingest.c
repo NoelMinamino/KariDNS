@@ -1654,7 +1654,7 @@ static void fill_max_set(uint32_t loader_threads) { atomic_store_explicit(&g_fil
 static uint32_t fill_limit_calc(uint32_t nwq, uint32_t nlq, uint32_t conc, uint32_t fmax) { return nwq == 0 && nlq == 0 ? fmax : bulk_reserve_for(conc); }
 /* 0.7 first-fill latency (W2): the attaches of stored zones for queries wait behind the fill's writes (the store threads read the segments while the fill writes them and its checkpoints sync
  * them: pc31, PostgreSQL 10M zones under load, store.cold.p99 1.4 s).  While the workers' attach rings hold ING_FILL_ATT_BACKLOG requests or more (the store threads are behind) the fill is
- * held to its old share as while queries wait (store.ingest.fill_throttled counts the times it began) */
+ * held to its old share as while queries wait, and so it is while a checkpoint of the store runs (store.ingest.fill_throttled counts the times it began) */
 #define ING_FILL_ATT_BACKLOG 32
 static _Atomic uint64_t g_fill_throttled;
 static uint32_t fill_limit(const ing_t *g) {
@@ -1663,7 +1663,7 @@ static uint32_t fill_limit(const ing_t *g) {
     uint64_t shed, newest, queued;
     park_attach_counts(&shed, &newest, &queued);
     static bool s_held;                                      /* (this thread only: the last call held the fill back; a hold is counted once, when it begins) */
-    const bool hold = queued >= ING_FILL_ATT_BACKLOG;
+    const bool hold = queued >= ING_FILL_ATT_BACKLOG || db_store_ck_running();      /* (or a checkpoint of the store runs: the fill adds no dirty data to its sync, which the reads of the attaches wait behind) */
     if (hold && !s_held) atomic_fetch_add_explicit(&g_fill_throttled, 1, memory_order_relaxed);
     s_held = hold;
     if (hold) nwq = 1;                                       /* (the same limit as for a query that waits) */

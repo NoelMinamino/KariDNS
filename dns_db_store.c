@@ -4468,6 +4468,7 @@ static store_t *core_start(const server_config_t *cfg, bool *created_out, bool *
   }
 #endif
   store_open_segments(st);                                   /* (0.7 fix 7: the worker's attach looks at pages of segments that are open) */
+  store_set_ck_slow_fn(st, park_attach_pending);             /* (0.7 first-fill latency, W2: a bulk checkpoint writes slowly while attaches of queries wait) */
   set_load(g_dir.dirfd);                                     /* the settings texts: a zone that is not in memory is answered and attached with them */
   store_stats_t ss;
   store_stats(st, &ss);
@@ -4502,6 +4503,8 @@ static void bulk_begin_early(store_t *st) {
   /* (a fill that a stop left before its passes ended goes on, and is given up the same way when no pass comes) */
   if (store_bulk(st) == 1 || (!store_bulk(st) && store_bulk_begin(st) == 0)) atomic_store_explicit(&G.bulk_early_ms, mono_ns() / 1000000, memory_order_relaxed);
 }
+
+bool db_store_ck_running(void) { return store_ck_running(atomic_load_explicit(&G.st, memory_order_acquire)); }
 
 /* a loader without the store protocol makes no pass (its startup batch installs the zones as before 0.7): the fill begun at the start is ended, and the end is on disk before the batch writes */
 void db_store_bulk_early_cancel(void) {

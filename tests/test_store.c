@@ -7946,6 +7946,7 @@ static bool wait_ckpt(store_t *s, uint64_t (*get)(const store_stats_t *), uint64
   return false;
 }
 #define CK_WAIT(s, get, want) CHECK(wait_ckpt((s), (get), (want)))
+static bool reads_wait_yes(void) { return true; }
 static void test_bulk_basic(void) {
   printf("[a bulk fill: no journal record, no commit, no checkpoint by size or interval; bulk checkpoints in the body fill only, by the segment bytes; its end logs again]\n");
   tdir_t d;
@@ -7996,11 +7997,16 @@ static void test_bulk_basic(void) {
   CHECK_EQ(store_journal_wait(s, 1), 0);
   for (uint32_t i = 0; i < 600; i++) CHECK(verify_i(s, 0, i, 2));
   /* 2. the body fill: a bulk checkpoint at once (the segments are past 256 KiB), the next one at twice the bytes of that one */
+  store_set_ck_slow_fn(s, reads_wait_yes);                                /* (0.7 first-fill latency: reads wait: the bulk checkpoint writes its tables at the slow rate) */
   store_bulk_phase(s, STORE_BULK_PASSED);
   CHECK_EQ(store_bulk(s), 2);
   CK_WAIT(s, get_bulk_ck, 1);
   store_stats(s, &st);
   CHECK_EQ(st.bulk_checkpoints, 1);
+  CHECK(st.checkpoint_slow_bytes > 0);                                    /* (its table bytes were written at the slow rate) */
+  CHECK(!store_ck_running(s) && !store_ck_running(NULL));
+  store_set_ck_slow_fn(s, NULL);
+  store_set_ck_slow_fn(NULL, NULL);
   CHECK_EQ(st.checkpoints, ck0 + 1);
   {                                                                       /* the state a failed wait prints: whole in its buffer (the last field is there) */
     char dbuf[1024];

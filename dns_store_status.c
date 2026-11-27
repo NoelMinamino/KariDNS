@@ -815,6 +815,8 @@ static void add_store(list_t *l, const store_t *s, const store_attach_stats_t *a
   U("store.checkpoint.table_bytes", st->checkpoint_table_bytes);
   U("store.checkpoint.table_last_bytes", st->checkpoint_table_last_bytes);
   U("store.checkpoint.paced_us", st->checkpoint_paced_us);
+  U("store.checkpoint.slow_bytes", st->checkpoint_slow_bytes);
+  U("store.checkpoint.slow_paced_us", st->checkpoint_slow_paced_us);
   U("store.tables.private_bytes", st->table_private_bytes);
   U("store.tables.private_index_bytes", st->table_private_index_bytes);
   U("store.tables.budget_bytes", st->table_budget_bytes);

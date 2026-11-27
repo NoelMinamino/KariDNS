@@ -596,6 +596,7 @@ struct store {
   pthread_mutex_t bg_mu;
   pthread_cond_t bg_cv;
   bool io_busy, ck_busy, ck_handoff, bg_stop, bg_kick, fl_on;
+  _Atomic bool ck_running;                            /* 0.7 first-fill latency: ck_busy for readers without bg_mu (store_ck_running(): the Backend holds its fill back meanwhile) */
   pthread_t fl_thr, fl_thr2;
   /* 0.7 round 15: what the commit thread and the writers must not wait for.  ah_tab: the blocks of the next growth of zt, zc and nx (tables_ahead(): a posix_fallocate() waited 0.5 to 11 s on UFS, and the commit
    * thread, which is also the background leader of the journal ring, stood in it).  ah_seg: the next segment file made ahead of its use (seg_pre_make(): seg_create() inside the writer mutex held it for
@@ -631,6 +632,7 @@ struct store {
   uint32_t jnext_gen;
   struct {                                            /* (ck_busy) the checkpoint being made */
     uint64_t lsn, t0, tw0;                            /* tw0: when the write of the tables began (ck_pace()) */
+    uint64_t pace_done, pace_due_us;                  /* 0.7 first-fill latency (ck_pace()): the bytes paced so far, and the microseconds after tw0 they are due at (each run at the rate of its moment) */
     uint64_t epos;                                    /* the ring position after its switch: the old file's records and the new file's header are below it (rule F) */
     bool clean, dir;
     bool bulk;                                        /* a bulk checkpoint: the superblock says SBF_BULK_CK (ix / sx are not taken while a pass runs) */
@@ -653,6 +655,8 @@ struct store {
   _Atomic uint64_t n_rel_bytes, n_rel_max_us, n_rel_errors, n_priv_ckpts;   /* store.tables.released_bytes, .release_max_us, .release_errors, .private_checkpoints */
   _Atomic uint64_t n_ck_bytes, ck_last_bytes;         /* bytes of the tables written by checkpoints: all, the last one */
   _Atomic uint64_t n_ck_paced_us;                     /* the time fuzzy checkpoints gave way to the writers (ck_pace()) */
+  _Atomic uint64_t n_ck_slow_bytes, n_ck_slow_us;     /* 0.7 first-fill latency: table bytes a bulk checkpoint wrote at ST_CK_RATE_SLOW because reads waited (store.checkpoint.slow_bytes), and the time it gave way at that rate (.slow_paced_us) */
+  bool (*_Atomic ck_slow_fn)(void);                       /* the owner says reads wait (the attaches of queries: dns_db_store.c); NULL: never */
   struct { uint32_t nseg; seg_t *seg[ST_MAXSEG]; } cm;   /* (baton) the segments of the commit being made */
   /* growth of ix / sx outside the mutex (rg_*; wlock, except the flags the build thread reads) */
   bool rg_active, rg_bad;
@@ -2833,19 +2837,21 @@ static void ck_acquire(store_t *s) {
   pthread_mutex_lock(&s->bg_mu);
   while (s->io_busy || s->ck_busy) pthread_cond_wait(&s->bg_cv, &s->bg_mu);
   s->io_busy = s->ck_busy = true;
+  atomic_store_explicit(&s->ck_running, true, memory_order_relaxed);
   pthread_mutex_unlock(&s->bg_mu);
 }
 static bool ck_try_locked(store_t *s) {
   pthread_mutex_lock(&s->bg_mu);
   const bool ok = !s->io_busy && !s->ck_busy;
   if (ok) s->io_busy = s->ck_busy = true;
+  if (ok) atomic_store_explicit(&s->ck_running, true, memory_order_relaxed);
   pthread_mutex_unlock(&s->bg_mu);
   return ok;
 }
 static void bg_release(store_t *s, bool io, bool ck) {
   pthread_mutex_lock(&s->bg_mu);
   if (io) s->io_busy = false;
-  if (ck) { s->ck_busy = false; s->ck_ends++; }
+  if (ck) { s->ck_busy = false; s->ck_ends++; atomic_store_explicit(&s->ck_running, false, memory_order_relaxed); }
   pthread_cond_broadcast(&s->bg_cv);
   pthread_mutex_unlock(&s->bg_mu);
 }
@@ -3247,11 +3253,29 @@ static void ck_drop_taken(store_t *s) {
  * checkpoints of a 10M first start on UFS 60 to 98 s long and left the longest hold where it was; a sync every 64 MiB, which made the 10M first fill on ZFS slower, 371 to 411 s against
  * 316 to 336 s, with no shorter hold.) */
 #define ST_CK_RATE (256ull << 20)
+/* 0.7 first-fill latency (W2): the table writes of a bulk checkpoint come in the transaction group that also flushes the fill's segment data, and on ZFS the reads of the attaches of queries
+ * queued behind its sync (pc31, PostgreSQL 10M zones under load: bulk checkpoints of 24 and 31 s, 5 threads a sample in zfs_read -> zio_wait, 40-96 % of the queries lost in those windows).  While the
+ * owner says reads wait (ck_slow_fn: the workers' attach rings hold requests) a bulk checkpoint writes at ST_CK_RATE_SLOW, so that its pages come in smaller groups with the disk free between them;
+ * the rate is the one of each run's moment.  The longer checkpoint is counted (store.checkpoint.slow_bytes, .slow_paced_us, and .last_us / .max_us as always): it is the range a crash makes the
+ * fill read again. */
+#define ST_CK_RATE_SLOW (32ull << 20)
+void store_set_ck_slow_fn(store_t *s, bool (*fn)(void)) { if (s) atomic_store_explicit(&s->ck_slow_fn, fn, memory_order_release); }
+bool store_ck_running(const store_t *s) { return s && atomic_load_explicit(&s->ck_running, memory_order_relaxed); }
 static void ck_pace(store_t *s, uint64_t done, const _Atomic bool *cancel) {
-  const uint64_t el = st_now_us() - s->ck.tw0, due = done / (ST_CK_RATE / 1000000);
+  bool (*const sfn)(void) = atomic_load_explicit(&s->ck_slow_fn, memory_order_acquire);
+  const bool slow = s->ck.bulk && sfn && sfn();
+  const uint64_t rate = slow ? ST_CK_RATE_SLOW : ST_CK_RATE;
+  if (done > s->ck.pace_done) {
+    const uint64_t n = done - s->ck.pace_done;
+    s->ck.pace_due_us += n / (rate / 1000000);
+    s->ck.pace_done = done;
+    if (slow) atomic_fetch_add_explicit(&s->n_ck_slow_bytes, n, memory_order_relaxed);
+  }
+  const uint64_t el = st_now_us() - s->ck.tw0, due = s->ck.pace_due_us;
   if (due <= el) return;
   uint64_t nap = due - el > 200000 ? 200000 : due - el;
   atomic_fetch_add_explicit(&s->n_ck_paced_us, nap, memory_order_relaxed);
+  if (slow) atomic_fetch_add_explicit(&s->n_ck_slow_us, nap, memory_order_relaxed);
   while (nap && !atomic_load_explicit(cancel, memory_order_relaxed)) {
     const uint64_t p = nap > 20000 ? 20000 : nap;
     usleep((useconds_t)p);
@@ -3419,6 +3443,7 @@ static int ck_io_tables(store_t *s, const _Atomic bool *cancel) {
   mtab_t *tabs[3] = { &s->zt, &s->zc, &s->nx };
   uint64_t done = 0;
   s->ck.tw0 = st_now_us();
+  s->ck.pace_done = s->ck.pace_due_us = 0;
   int r = 0;
   for (int i = 0; i < 5 && r == 0; i++) {
     if (i == 2 && cancel) r = ck_nx_widen(s);       /* (fuzzy: the nx rule, above; with the writers kept out nothing was marked since P) */
@@ -3708,6 +3733,7 @@ static bool ck_acquire_fl(store_t *s) {
   while ((s->io_busy || s->ck_busy) && !s->ck_handoff) pthread_cond_wait(&s->bg_cv, &s->bg_mu);
   const bool ok = !s->ck_handoff;
   if (ok) s->io_busy = s->ck_busy = true;
+  if (ok) atomic_store_explicit(&s->ck_running, true, memory_order_relaxed);
   pthread_mutex_unlock(&s->bg_mu);
   return ok;
 }
@@ -8559,6 +8585,8 @@ void store_stats(const store_t *s, store_stats_t *o) {
   o->checkpoint_table_bytes = atomic_load_explicit(&s->n_ck_bytes, memory_order_relaxed);
   o->checkpoint_table_last_bytes = atomic_load_explicit(&s->ck_last_bytes, memory_order_relaxed);
   o->checkpoint_paced_us = atomic_load_explicit(&s->n_ck_paced_us, memory_order_relaxed);
+  o->checkpoint_slow_bytes = atomic_load_explicit(&s->n_ck_slow_bytes, memory_order_relaxed);
+  o->checkpoint_slow_paced_us = atomic_load_explicit(&s->n_ck_slow_us, memory_order_relaxed);
   o->table_private_index_bytes = atomic_load_explicit(&s->priv_ix_bytes, memory_order_relaxed);
   o->table_budget_bytes = atomic_load_explicit(&s->tb_budget_now, memory_order_relaxed);
   o->table_mapped_bytes = atomic_load_explicit(&s->tb_mapped_now, memory_order_relaxed);

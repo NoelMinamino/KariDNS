@@ -91,6 +91,8 @@ uint64_t db_store_journal_wait(unsigned factor);
 bool db_store_journal_wait_slice(unsigned factor, store_jwait_t *w, unsigned slice_ms);
 /* 0.7 first-fill latency: a loader without the store protocol: the unlogged first fill begun when the store opened (bulk_begin_early()) is ended, on disk */
 void db_store_bulk_early_cancel(void);
+/* 0.7 first-fill latency (W2): a checkpoint of the store runs now (no lock; the ingest thread holds the fill to its old share meanwhile) */
+bool db_store_ck_running(void);
 /* 0.7: the wait for the build of the next index (store_index_wait()), for the reconcile thread between the groups of a pass (no lock held): a first fill adds zones faster than the build puts them in, and the growth inside the writer mutex that followed held it for seconds.  The microseconds waited (0: none, no store). */
 uint64_t db_store_index_wait(void);
 
