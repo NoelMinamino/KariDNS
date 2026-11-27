@@ -244,6 +244,10 @@ Fixes from the external reviews and audits of the 0.7 cycle. Each has a test tha
 
 ### Bug fixes
 
+- **Out of memory while a zone element is retired**: when the retire queue could not take an element (database
+  zones: a zone taken out of memory, a staged attach), the element was freed after a wait of 60 seconds whether or
+  not the readers had left. It is now freed only when they have; a reader that stays past the wait leaves it in
+  memory (leaked), with one `[EpochRCU] out of memory retiring ...` error line.
 - **Zone store tables in private memory** (#262): a first fill of 100M zones was killed after 8.6 min (13.5 GB of private
   table pages, swap full). A fuzzy checkpoint now gives the written private pages back to their file, and a checkpoint is due
   when the private pages grew by `tables_private_max` (default RAM/32, 64 MiB .. 1 GiB); new `store.tables.private_*` stats.

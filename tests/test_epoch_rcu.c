@@ -432,10 +432,24 @@ static void test_try_wait(void) {
   printf("  [PASS] no reader: true at once; a reader: false after the budget, no log line\n");
 }
 
+/* rcu_writer_wait_or_leak(): the out-of-memory fallback of a retire frees only after a grace period that really ended */
+static void test_wait_or_leak(void) {
+  printf("[TEST] rcu_writer_wait_or_leak: free only when the readers left...\n");
+  uint64_t e = rcu_writer_advance_epoch();
+  assert(rcu_writer_wait_or_leak(e, 50, "a test object"));      // no reader: free
+  rcu_aux_read_lock();
+  e = rcu_writer_advance_epoch();
+  assert(!rcu_writer_wait_or_leak(e, 30, "a test object"));     // a reader older than e stays past the bound: keep (leak)
+  rcu_aux_read_unlock();
+  assert(rcu_writer_wait_or_leak(e, 50, "a test object"));      // it left: free
+  printf("  [PASS] true without a reader and after it left, false while it holds the epoch\n");
+}
+
 int main(void) {
   printf("=== Epoch RCU tests (R-25) ===\n");
   test_describe_blockers();
   test_try_wait();
+  test_wait_or_leak();
   test_publish_order();
   test_aux_slots();
   test_aux_slot_released_at_thread_exit();
