@@ -775,4 +775,50 @@ make coverage-report COV_FROM_SHARDS=1              # ... the report from that f
 make coverage-suite-check-shards                    # ... every part there, together every selected test once, failed=0 everywhere
 ```
 
-HTML coverage reports with line and branch-level precision will be written to `coverage_html/index.html`. `coverage-run` needs root for the integration tests that use loopback aliases. The CI job "Coverage gate" checks the per-tier thresholds with `perl tests/coverage_gate.pl --phase=2 --strict` and fails when a test of the suite failed (`make coverage-suite-check`: only `failed=0` passes); the latest measured values are in [`docs/COVERAGE_STATUS.md`](../docs/COVERAGE_STATUS.md).
+HTML coverage reports with line and branch-level precision will be written to `coverage_html/index.html`. `coverage-run` needs root for the integration tests that use loopback aliases. The CI job "Coverage gate" checks the per-tier thresholds with `perl tests/coverage_gate.pl --phase=2 --strict` and fails when a test of the suite failed (`make coverage-suite-check`: only `failed=0` passes); the tiers, the thresholds and where the latest figures are: [4.3](#43-coverage-gate-tiers-and-thresholds).
+
+### 4.3 Coverage gate: tiers and thresholds
+
+`tests/coverage_gate.pl` reads the coverage summary of the binaries of `COV_BIN_OBJS` (the list `make coverage-report` gives `llvm-cov`) and checks lines, regions, branches and functions per tier. The CI job "Coverage gate" runs it with `--phase=2 --strict` (a tier under its threshold fails the job) and fails as well when a test of the suite failed.
+
+**The latest figures** are not copied into this document:
+- the report of the last push to `main`, with the per-tier table (`gate.html`, linked from the top of the report): <https://noelminamino.github.io/KariDNS/coverage/>;
+- the table of any CI run: the run on the Actions page → job "Coverage gate (FreeBSD 15.1)" → Summary.
+
+**Tiers.** The file lists are in `tests/coverage_gate.pl`; a file in no list counts only in the total.
+
+| Tier | What | Files |
+|---|---|---|
+| A | protocol and parsers | `dns_wire.c`, `dns_zone_parser.c`, `dns_config_parser.c`, `dns_tinydns_parser.c`, `dns_utils.c`, `dns_cidr.c`, `dns_tsig_acl.c`, `dns_query_engine.c`, `dns_axfr_ixfr.c`, `dns_dynamic_update.c`, `dns_catalog_zone.c`, `dns_rrl.c`, `dns_edns_ecs.c` |
+| B | server runtime | `dns_server_core.c`, `dns_snapshot_rcu.c`, `dns_dnstap.c`, `dns_priv_sandbox.c`, `dns_epoch_rcu.c`, `dns_log.c` |
+| C | tools | `tools/dag*.c` (the modules of dag), `tools/dnstap_decode.c`, `tools/tapstat_core.c`, `tools/karicheck.c` with `dns_zone_lint.c` and `dns_diag.c`, `tools/karictl.c`, `tools/karidns_zone.c` with `dns_zone_rows.c`, `dns_zone_text.c`, `dns_zone_import.c`, `dns_zone_export.c`, `dns_zone_msg.c` |
+| D | database layer | `karidns_dbloader.c` (also built into `test_db_sqlite3`), `dns_db_sqlite3.c`, `dns_db_pgsql.c`, `dns_db_checkproto.c` |
+
+**Thresholds** (measured value >= threshold; the tiers have one set for both phases, the total one per phase):
+
+| | Lines | Regions | Branches | Functions |
+|---|---|---|---|---|
+| Tier A | 93.0% | 89.0% | 80.0% | 100% |
+| Tier B | 87.0% | 80.0% | 68.0% | 100% |
+| Tier C | 90.0% | 84.0% | 72.0% | 100% |
+| Tier D | 85.0% | 78.0% | 60.0% | 100% |
+| Total, phase 1 (the default) | 90.0% | 84.0% | 72.0% | 100% |
+| Total, phase 2 (CI) | 92.0% | 85.0% | 75.0% | 100% |
+
+**Functions: 100% is a MUST** in every measured file, not only per tier: one function that never ran fails the gate, and the gate names it with its file and line (from an lcov export of the same binaries). A function no test reaches either lacks a test or is dead code, and dead code is deleted. The counts are compared, not the percentages (99.999% would print as 100.00%).
+
+**Tier D, what the gate cannot know.** `make coverage-build` always builds `karidns-dbloader` with the SQLite3 driver, and adds the PostgreSQL driver when libpq is installed (`COV_DB_DRIVERS`), so the loader, the SQLite3 driver and the check protocol are always gated.
+- **No PostgreSQL server (or no libpq):** the PostgreSQL tests (`test_db_pgsql`, `run_db_pg_*_test.sh`) SKIP. A `dns_db_pgsql.c` with fewer than 10% of its lines executed (a run with a server reaches about 85%) is left out of Tier D and of the total; the gate says so (`[i] dns_db_pgsql.c was left out ...`, a note under the table of `--markdown` / `--html`). To gate the driver, run the suite with a server the test user can reach (`tests/db/pg_lib.sh`: the default socket of the user, or `KARIDNS_TEST_PG_USER` for root shells; CI: `--pg-clusters`).
+- **No data for any Tier D file** (the loader not built, e.g. `DB_DRIVERS=` empty): the row reads `SKIPPED (no database test data)` and does not fail the gate.
+- **Root-only tests:** `run_db_zoneadd_perf_test.sh` and the loader-user tests need root and SKIP otherwise; the unit tests and the non-root integration tests cover the loader and both drivers without root. Watch for code that only root-only integration tests reach.
+
+**Running it locally** (after `make coverage-run`, or the stages of 4.2):
+
+```bash
+make coverage-report      # coverage_html/ and the gate in phase 1, not strict (reports, never fails)
+perl tests/coverage_gate.pl --llvm-cov=llvm-cov19 --profdata=coverage.profdata --phase=2 --strict   # as CI: exit 1 when a tier fails
+#   --markdown=gate.md --html=coverage_html/gate.html   also write the table (CI: the Job Summary and gate.html)
+#   --json=FILE   a summary from `llvm-cov export -format=text -summary-only` instead of running llvm-cov
+```
+
+Use `llvm-cov19` / `llvm-profdata19` from the `llvm19-lite` package (the version of the base clang): the base `llvm-cov show` aborts on FreeBSD 15.

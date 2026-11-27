@@ -11,6 +11,9 @@
 #   llvm-cov export ... -format=text -summary-only | perl tests/coverage_gate.pl [options]
 #   perl tests/coverage_gate.pl --profdata=coverage.profdata [options]
 #
+# The text report goes to stdout.  --markdown=FILE and --html=FILE write the same table as well (measured value, threshold of the phase,
+# counts, pass/fail per tier), for the Job Summary of the CI job "Coverage gate" and for coverage_html/gate.html.
+#
 # The binaries the summary is made from are COV_BIN_OBJS of the Makefile, the list make coverage-report gives llvm-cov: --objects="$(COV_BIN_OBJS)",
 # or, without --objects, what `make -s print-cov-bin-objs` prints.  The gate kept a list of its own before, which lost six unit tests and
 # karidns-tapstat: one list, so that the gate and the report count the same binaries.
@@ -29,8 +32,14 @@ my $strict = 0;
 my $help = 0;
 my $json_file = "";
 my $objects = "";
+my $markdown_file = "";    # --markdown=FILE: the table as Markdown (the CI job writes it to the Job Summary)
+my $html_file = "";        # --html=FILE: the table as a page (CI: coverage_html/gate.html, published with the report on GitHub Pages)
+my $gen_note = "";         # --note=TEXT: a line under the table of --html (CI: the commit and the run)
 
 GetOptions(
+    "markdown=s" => \$markdown_file,
+    "html=s"     => \$html_file,
+    "note=s"     => \$gen_note,
     "profdata=s" => \$profdata,
     "target=s"   => \$target,
     "objects=s"  => \$objects,
@@ -42,7 +51,7 @@ GetOptions(
 ) or die "Error in command line arguments\n";
 
 if ($help) {
-    print "Usage: $0 [--profdata=FILE] [--json=FILE] [--objects=\"\$(COV_BIN_OBJS)\"] [--phase=1|2] [--strict]\n";
+    print "Usage: $0 [--profdata=FILE] [--json=FILE] [--objects=\"\$(COV_BIN_OBJS)\"] [--phase=1|2] [--strict] [--markdown=FILE] [--html=FILE] [--note=TEXT]\n";
     exit 0;
 }
 
@@ -256,25 +265,18 @@ sub basename {
     return $p;
 }
 
-# Print report
-print "\n";
-print "=" x 109 . "\n";
-printf "                KariDNS Multi-Tier Coverage Quality Gate (Phase %d)\n", $phase;
-print "=" x 109 . "\n";
-printf "%-10s | %-16s | %-16s | %-16s | %-16s | %-8s\n",
-    "Tier", "Line Cov (%)", "Region Cov (%)", "Branch Cov (%)", "Func Cov (%)", "Status";
-print "-" x 109 . "\n";
-
+# The rows of the report, once: the text below, --markdown and --html print the same rows
 my $all_passed = 1;
-
+my @rows;
 for my $t (qw(A B C D Overall)) {
     my $st = $tier_stats{$t};
     my $th = $thresholds{$t};
+    my $label = ($t eq 'Overall' ? "TOTAL" : "Tier $t");
     if ($t eq 'D' && !$st->{lines_cnt}) {      # no data for any file of the tier (no loader built): not gated
-        printf "%-10s | %-16s | %-16s | %-16s | %-16s | %-8s\n", "Tier D", "-", "-", "-", "-", "SKIPPED (no database test data)";
+        push @rows, { label => $label, skipped => 1, th => $th };
         next;
     }
-    
+
     my $l_pct = $st->{lines_cnt} ? (100.0 * $st->{lines_cov} / $st->{lines_cnt}) : 100.0;
     my $r_pct = $st->{regions_cnt} ? (100.0 * $st->{regions_cov} / $st->{regions_cnt}) : 100.0;
     my $b_pct = $st->{branches_cnt} ? (100.0 * $st->{branches_cov} / $st->{branches_cnt}) : 100.0;
@@ -289,40 +291,146 @@ for my $t (qw(A B C D Overall)) {
     my $tier_pass = ($l_pass && $r_pass && $b_pass && $f_pass);
     $all_passed = 0 unless $tier_pass;
 
-    my $status_str = $tier_pass ? "PASS" : "FAIL";
     # a missed function never shows as 100.00% (rounding), so the column and the status agree
-    my $f_str = $f_pass ? sprintf("%6.2f%%", $f_pct) : sprintf("%6.2f%%", $f_pct > 99.99 ? 99.99 : $f_pct);
+    push @rows, { label => $label, th => $th, st => $st, pass => $tier_pass,
+                  l_pct => $l_pct, r_pct => $r_pct, b_pct => $b_pct, l_pass => $l_pass, r_pass => $r_pass, b_pass => $b_pass,
+                  f_pass => $f_pass, f_pct => ($f_pass ? $f_pct : ($f_pct > 99.99 ? 99.99 : $f_pct)) };
+}
+my @never_executed = @missed_functions ? never_executed_functions() : ();
+$all_passed = 0 if @missed_functions;
+my $pg_note = "dns_db_pgsql.c was left out of Tier D and the totals: the PostgreSQL tests did not run (under 10% of its lines executed)";
 
-    printf "%-10s | %6.2f%% (%4.1f%%) | %6.2f%% (%4.1f%%) | %6.2f%% (%4.1f%%) | %s (100%%) | %-8s\n",
-        ($t eq 'Overall' ? "TOTAL" : "Tier $t"),
-        $l_pct, $th->{line},
-        $r_pct, $th->{region},
-        $b_pct, $th->{branch},
-        $f_str,
-        $status_str;
+# Print report
+print "\n";
+print "=" x 109 . "\n";
+printf "                KariDNS Multi-Tier Coverage Quality Gate (Phase %d)\n", $phase;
+print "=" x 109 . "\n";
+printf "%-10s | %-16s | %-16s | %-16s | %-16s | %-8s\n",
+    "Tier", "Line Cov (%)", "Region Cov (%)", "Branch Cov (%)", "Func Cov (%)", "Status";
+print "-" x 109 . "\n";
+
+for my $r (@rows) {
+    if ($r->{skipped}) {
+        printf "%-10s | %-16s | %-16s | %-16s | %-16s | %-8s\n", $r->{label}, "-", "-", "-", "-", "SKIPPED (no database test data)";
+        next;
+    }
+    printf "%-10s | %6.2f%% (%4.1f%%) | %6.2f%% (%4.1f%%) | %6.2f%% (%4.1f%%) | %6.2f%% (100%%) | %-8s\n",
+        $r->{label},
+        $r->{l_pct}, $r->{th}{line},
+        $r->{r_pct}, $r->{th}{region},
+        $r->{b_pct}, $r->{th}{branch},
+        $r->{f_pct},
+        $r->{pass} ? "PASS" : "FAIL";
 }
 
 print "=" x 109 . "\n\n";
 if ($pg_driver_skipped) {
-    print "[i] dns_db_pgsql.c was left out of Tier D and the totals: the PostgreSQL tests did not run (under 10% of its lines executed)\n\n";
+    print "[i] $pg_note\n\n";
 }
 
 if (@missed_functions) {
     print "[-] Function coverage below 100%:\n";
     print "    $_\n" for @missed_functions;
     print "\n";
-    print "    $_\n" for never_executed_functions();
+    print "    $_\n" for @never_executed;
     print "\n";
-    $all_passed = 0;
 }
 
+my $verdict = $all_passed
+    ? "PASSED (All tiers met target thresholds, every function executed)"
+    : "FAILED (One or more tiers below target, or a function never executed)";
 if (!$all_passed) {
-    print "[-] Coverage Gate Status: FAILED (One or more tiers below target, or a function never executed)\n";
-    if ($strict) {
-        exit 1;
-    }
+    print "[-] Coverage Gate Status: $verdict\n";
 } else {
-    print "[+] Coverage Gate Status: PASSED (All tiers met target thresholds, every function executed)\n";
+    print "[+] Coverage Gate Status: $verdict\n";
+}
+
+# --markdown=FILE (the Job Summary of the CI job "Coverage gate") and --html=FILE (gate.html beside the llvm-cov report): the same table, with
+# the measured value and its threshold in each cell, the counts behind it, and the cells under their threshold marked
+sub cell_counts {
+    my ($r, $k) = @_;
+    my %n = (l => 'lines', r => 'regions', b => 'branches', f => 'functions');
+    return sprintf("%d / %d", $r->{st}{"$n{$k}_cov"}, $r->{st}{"$n{$k}_cnt"});
+}
+sub esc_html { my $s = shift; $s =~ s/&/&amp;/g; $s =~ s/</&lt;/g; $s =~ s/>/&gt;/g; $s =~ s/"/&quot;/g; return $s; }
+sub write_file {
+    my ($file, $text) = @_;
+    open my $fh, '>', $file or die "Cannot write $file: $!\n";
+    print $fh $text;
+    close $fh or die "Cannot write $file: $!\n";
+}
+my $title = sprintf("KariDNS coverage gate (phase %d%s)", $phase, $strict ? ", strict" : "");
+
+if ($markdown_file ne "") {
+    my $md = "## $title: " . ($all_passed ? "PASSED" : "FAILED") . "\n\n";
+    $md .= "Each cell: measured (threshold). Functions must be 100% in every file (a MUST).\n\n";
+    $md .= "| Tier | Lines | Regions | Branches | Functions | Status |\n|---|---|---|---|---|---|\n";
+    for my $r (@rows) {
+        if ($r->{skipped}) { $md .= "| $r->{label} | - | - | - | - | SKIPPED (no database test data) |\n"; next; }
+        my $c = sub {
+            my ($k, $pct, $th, $ok) = @_;
+            my $s = sprintf("%.2f%% (%s) <sub>%s</sub>", $pct, $th, cell_counts($r, $k));
+            return $ok ? $s : "**$s** :x:";
+        };
+        $md .= sprintf("| %s | %s | %s | %s | %s | %s |\n", $r->{label},
+            $c->('l', $r->{l_pct}, sprintf("%.1f%%", $r->{th}{line}), $r->{l_pass}),
+            $c->('r', $r->{r_pct}, sprintf("%.1f%%", $r->{th}{region}), $r->{r_pass}),
+            $c->('b', $r->{b_pct}, sprintf("%.1f%%", $r->{th}{branch}), $r->{b_pass}),
+            $c->('f', $r->{f_pct}, "100%", $r->{f_pass}),
+            $r->{pass} ? "PASS" : "**FAIL**");
+    }
+    $md .= "\n";
+    $md .= "> [!NOTE]\n> $pg_note\n\n" if $pg_driver_skipped;
+    if (@missed_functions) {
+        $md .= "### Function coverage below 100%\n\n";
+        $md .= "- `$_`\n" for @missed_functions;
+        $md .= "\nNever executed:\n\n";
+        $md .= "- `$_`\n" for @never_executed;
+        $md .= "\n";
+    }
+    $md .= "**Coverage gate: $verdict**\n";
+    write_file($markdown_file, $md);
+}
+
+if ($html_file ne "") {
+    my $h = "<!DOCTYPE html>\n<html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
+          . "<title>" . esc_html($title) . "</title>\n<style>\n"
+          . "body{font-family:sans-serif;margin:1em;color:#222;background:#fff}table{border-collapse:collapse}"
+          . "th,td{border:1px solid #bbb;padding:.3em .6em;text-align:right}th:first-child,td:first-child{text-align:left}"
+          . "small{color:#666}.fail{background:#fdd;font-weight:bold}.pass{background:#dfd}.skip{color:#666}\n</style></head><body>\n"
+          . "<h1>" . esc_html($title) . ": " . ($all_passed ? "PASSED" : "FAILED") . "</h1>\n"
+          . "<p>Each cell: measured (threshold). Functions must be 100% in every file (a MUST). "
+          . "<a href=\"index.html\">The line-by-line report</a>.</p>\n"
+          . "<table>\n<tr><th>Tier</th><th>Lines</th><th>Regions</th><th>Branches</th><th>Functions</th><th>Status</th></tr>\n";
+    for my $r (@rows) {
+        if ($r->{skipped}) {
+            $h .= "<tr class=\"skip\"><td>$r->{label}</td><td>-</td><td>-</td><td>-</td><td>-</td><td>SKIPPED (no database test data)</td></tr>\n";
+            next;
+        }
+        my $c = sub {
+            my ($k, $pct, $th, $ok) = @_;
+            return sprintf("<td%s>%.2f%% (%s)<br><small>%s</small></td>", $ok ? "" : " class=\"fail\"", $pct, $th, cell_counts($r, $k));
+        };
+        $h .= "<tr><td>$r->{label}</td>"
+            . $c->('l', $r->{l_pct}, sprintf("%.1f%%", $r->{th}{line}), $r->{l_pass})
+            . $c->('r', $r->{r_pct}, sprintf("%.1f%%", $r->{th}{region}), $r->{r_pass})
+            . $c->('b', $r->{b_pct}, sprintf("%.1f%%", $r->{th}{branch}), $r->{b_pass})
+            . $c->('f', $r->{f_pct}, "100%", $r->{f_pass})
+            . sprintf("<td class=\"%s\">%s</td></tr>\n", $r->{pass} ? "pass" : "fail", $r->{pass} ? "PASS" : "FAIL");
+    }
+    $h .= "</table>\n";
+    $h .= "<p>" . esc_html($pg_note) . "</p>\n" if $pg_driver_skipped;
+    if (@missed_functions) {
+        $h .= "<h2>Function coverage below 100%</h2>\n<ul>\n";
+        $h .= "<li><code>" . esc_html($_) . "</code></li>\n" for @missed_functions;
+        $h .= "</ul>\n<p>Never executed:</p>\n<ul>\n";
+        $h .= "<li><code>" . esc_html($_) . "</code></li>\n" for @never_executed;
+        $h .= "</ul>\n";
+    }
+    $h .= "<p><strong>Coverage gate: " . esc_html($verdict) . "</strong></p>\n";
+    $h .= "<p><small>" . esc_html($gen_note) . "</small></p>\n" if $gen_note ne "";
+    $h .= "</body></html>\n";
+    write_file($html_file, $h);
 }
 
 exit($all_passed ? 0 : ($strict ? 1 : 0));

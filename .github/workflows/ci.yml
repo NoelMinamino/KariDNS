@@ -588,6 +588,8 @@ jobs:
     if: always() && needs.coverage-build.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    outputs:
+      pages: ${{ steps.pages.outputs.ready }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -627,11 +629,16 @@ jobs:
           key: freebsd-pkg-15.1-${{ github.run_id }}
           restore-keys: freebsd-pkg-15.1-
 
+      # This step ends in success when it got to the end, so that the copyback (vmactions skips it when the run fails) brings back the report and
+      # the gate table also when the gate or the suite failed; the results are in coverage_status.txt and the step "Verdict" fails the job on them.
       - name: Merge, report and gate inside FreeBSD VM
         uses: vmactions/freebsd-vm@v1.4.8
+        env:
+          GATE_NOTE: "commit ${{ github.sha }} (${{ github.ref_name }}), run ${{ github.run_id }} attempt ${{ github.run_attempt }}"
         with:
           release: '15.1'
           copyback: true
+          envs: 'GATE_NOTE'
           run: |
             set -e
 
@@ -659,8 +666,14 @@ jobs:
             GATE=0
             # stdin is the rest of this script (the VM action pipes it to sh): coverage_gate.pl reads a JSON summary from a piped stdin, which ate
             # the lines below ("Failed to parse JSON coverage summary", then "sh: Syntax error: Unterminated quoted string")
-            [ "$REPORT" -ne 0 ] || perl tests/coverage_gate.pl --llvm-cov="llvm-cov${V}" --profdata=coverage.profdata --phase=2 --strict < /dev/null || GATE=$?
+            # gate.md: the Job Summary (step "Coverage gate summary"); coverage_html/gate.html: the same table beside the report (GitHub Pages)
+            [ "$REPORT" -ne 0 ] || perl tests/coverage_gate.pl --llvm-cov="llvm-cov${V}" --profdata=coverage.profdata --phase=2 --strict \
+              --markdown=gate.md --html=coverage_html/gate.html --note="${GATE_NOTE:-}" < /dev/null || GATE=$?
             [ "$REPORT" -eq 0 ] || GATE=$REPORT
+            # a link to the table at the top of the llvm-cov report
+            if [ -f coverage_html/gate.html ] && [ -f coverage_html/index.html ]; then
+              perl -pi -e 's{(<body[^>]*>)}{$1<p><a href="gate.html">Coverage gate: the per-tier table (thresholds, pass/fail)</a></p>}' coverage_html/index.html
+            fi
             echo "::endgroup::"
 
             echo "::group::🧪 [Suite] the status of the parts (success only when all of them ran, every selected test once, with failed=0)"
@@ -674,7 +687,17 @@ jobs:
             sh tests/coverage_pack.sh clean cov-bins.tar.zst
             rm -f cov-bins.tar.zst
             rm -rf .ci-cache
-            [ "$GATE" -eq 0 ] && [ "$SUITE" -eq 0 ]
+            echo "report=$REPORT gate=$GATE suite=$SUITE" > coverage_status.txt
+
+      - name: Coverage gate summary
+        if: always()
+        run: |
+          if [ -s gate.md ]; then cat gate.md >> "$GITHUB_STEP_SUMMARY"
+          else echo "## KariDNS coverage gate: no table (the report was not made, or the VM step stopped before the gate; see its log)" >> "$GITHUB_STEP_SUMMARY"; fi
+          if [ -s coverage_status.txt ]; then
+            if grep -q 'suite=0' coverage_status.txt; then s=passed; else s="**failed** (see the annotation \"Test suite\")"; fi
+            printf '\nTest suite of the parts: %s\n' "$s" >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Upload HTML coverage report
         if: always()
@@ -683,6 +706,32 @@ jobs:
           name: coverage-html
           path: coverage_html
           if-no-files-found: warn
+
+      # GitHub Pages (job coverage-pages): pushes to main of this repository only, never pull requests, forks, schedules or dispatches.  The site
+      # is the report under coverage/ (https://noelminamino.github.io/KariDNS/coverage/), the root a redirect to it.
+      - name: Prepare the GitHub Pages site
+        id: pages
+        if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main' && github.repository == 'NoelMinamino/KariDNS' && hashFiles('coverage_html/index.html') != ''
+        run: |
+          set -eu
+          mkdir -p _site
+          cp -R coverage_html _site/coverage
+          printf '%s\n' '<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><title>KariDNS coverage</title>' \
+            '<meta http-equiv="refresh" content="0; url=coverage/"></head><body><a href="coverage/">KariDNS coverage report</a></body></html>' > _site/index.html
+          echo "ready=true" >> "$GITHUB_OUTPUT"
+
+      - name: Upload the GitHub Pages site
+        if: always() && steps.pages.outputs.ready == 'true'
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: _site
+
+      - name: Verdict
+        if: always()
+        run: |
+          [ -s coverage_status.txt ] || { echo "::error title=Coverage gate::the VM step did not finish (no coverage_status.txt)"; exit 1; }
+          cat coverage_status.txt
+          grep -q '^report=0 gate=0 suite=0$' coverage_status.txt
 
       # the times of this run's tests: tests/suite_durations.sh turns them into tests/suite_durations.tsv (tests/TEST_MATRIX.md, "Shards")
       - name: The times of the tests of this run
@@ -699,3 +748,23 @@ jobs:
           path: durations
           retention-days: 30
           if-no-files-found: ignore
+
+  # The report of the last push to main on GitHub Pages: https://noelminamino.github.io/KariDNS/coverage/ (gate.html there is the per-tier table).
+  # The site is made and uploaded by coverage-gate (steps "Prepare the GitHub Pages site" and "Upload the GitHub Pages site", main pushes only); this job
+  # only deploys it, with the two permissions deploy-pages needs, in the environment github-pages.
+  coverage-pages:
+    name: Coverage report on GitHub Pages
+    needs: coverage-gate
+    if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main' && github.repository == 'NoelMinamino/KariDNS' && needs.coverage-gate.outputs.pages == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}coverage/
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deploy
+        uses: actions/deploy-pages@v4
