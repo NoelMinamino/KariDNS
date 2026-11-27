@@ -313,7 +313,7 @@ conf_case ctl_unknown_key conf 1 "control-channel: unknown option 'port' (suppor
 conf_case ctl_misspelt  conf 1 "control-channel: unknown option 'secrt'" 'control-channel { socket "/tmp/x.sock"; secrt "dGVzdC1zZWNyZXQ="; };'
 conf_case ctl_top_level conf 0 "is valid" 'options { port 5300; };
 control-channel { algorithm "hmac-sha256"; secret "dGVzdC1zZWNyZXQ="; };'
-printf '$ORIGIN m.example.\n$TTL 60\n@ SOA ns h 1 2 3 4 5\n@ NS ns\nns A 192.0.2.1\n' > "$TMP/m.zone"
+printf '$ORIGIN m.example.\n$TTL 60\n@ SOA ns h 1 7200 1800 1209600 300\n@ NS ns\nns A 192.0.2.1\n' > "$TMP/m.zone"
 printf 'zone "m.example" { type master; file "%s/m.zone"; };\nzone "p.example" { type program; program "/bin/true"; };\noptions { allow-program-zones yes; };\n' "$TMP" > "$TMP/zm.conf"
 out=$("$KC" zone m.example. "$TMP/zm.conf" 2>&1); rc=$?
 check "zone-from-conf" 0 "0 error(s), 0 warning(s)" "$out" "$rc"

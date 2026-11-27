@@ -2033,14 +2033,21 @@ int zone_image_check_policy(const void *buf, size_t len, const zone_image_policy
     return 0;
 }
 
-int zone_image_asm_add(uint8_t **buf, size_t *len, size_t *cap, uint64_t announced, const uint8_t *body, size_t n) {
-    if (announced == 0 || (uint64_t)*len > announced || (uint64_t)n > announced - *len) return -1;
-    if (!*buf) {
-        *buf = malloc((size_t)announced);
-        if (!*buf) return -2;
-        *cap = (size_t)announced;
+int zone_image_asm_add(uint8_t **buf, size_t *len, size_t *cap, uint64_t announced, uint64_t limit, const uint8_t *body, size_t n) {
+    /* The loader is untrusted (CLAUDE.md 4): its announced size is a promise, not a reason to reserve memory.  The size is checked again here against what an image can be at all (zone_image_validate() works in
+     * 32 bits: the bound of the state machine, dns_db_stream.c) and against max-zone-bytes (`limit`; no tighter bound follows from max-zone-records, since one record may hold 64 KiB of RDATA, RFC 1035 3.2.1).
+     * The buffer holds what has come, grown by doubling from at most ZONE_IMAGE_ASM_FIRST up to the announced size and never past it, so a huge announcement with a tiny body costs the body. */
+    if (announced == 0 || announced > ZONE_IMAGE_ASM_MAX || (limit && announced > limit) || (uint64_t)*len > announced || (uint64_t)n > announced - *len) return -1;
+    const size_t need = *len + n;
+    if (need > *cap) {
+        size_t nc = *cap ? *cap : (announced < ZONE_IMAGE_ASM_FIRST ? (size_t)announced : ZONE_IMAGE_ASM_FIRST);
+        while (nc < need) nc = (uint64_t)nc > announced / 2 ? (size_t)announced : nc * 2;
+        uint8_t *p = realloc(*buf, nc);
+        if (!p) return -2;
+        *buf = p;
+        *cap = nc;
     }
-    memcpy(*buf + *len, body, n);
+    if (n) memcpy(*buf + *len, body, n);
     *len += n;
     return 0;
 }

@@ -403,8 +403,11 @@ int zone_image_check_policy(const void *buf, size_t len, const zone_image_policy
 int zone_image_check_limits(const zone_image_t *img, const zone_limits_t *lim, char *err, size_t errlen);
 
 /* The reassembly of an image from ZONE_IMAGE messages (dns_db_ingest.c job_image(); tests/fuzz/fuzz_db_image_frames.c runs this very function).  *buf / *len / *cap are the buffer, the octets in it and its size
- * (all 0 at the start); `announced` is ZONE_BEGIN's image_size, which the state machine has checked against max-zone-bytes: the buffer is allocated once, with that size, when the first piece comes (an
- * allocation that nothing has written to is not memory, and the image is exactly that long or it is refused by zone_image_validate_ex()).  0 = added; -1 = not announced, or more than announced; -2 = out of memory. */
-int zone_image_asm_add(uint8_t **buf, size_t *len, size_t *cap, uint64_t announced, const uint8_t *body, size_t n);
+ * (all 0 at the start); `announced` is ZONE_BEGIN's image_size and `limit` max-zone-bytes (0 = only ZONE_IMAGE_ASM_MAX).  The size is checked again here (the state machine checked it too), and the buffer
+ * grows with the octets that came, by doubling from at most ZONE_IMAGE_ASM_FIRST up to the announced size (0.7 review D-L1: an untrusted loader that announces the most and sends a kilobyte holds a megabyte,
+ * not max-zone-bytes); the caller trims the slack when the image is complete.  0 = added; -1 = not announced, above a limit, or more than announced; -2 = out of memory. */
+#define ZONE_IMAGE_ASM_FIRST ((size_t)1 << 20)
+#define ZONE_IMAGE_ASM_MAX 0xFFFFF000ull         /* what dns_db_stream.c accepts for image_size: zone_image_validate() works in 32 bits */
+int zone_image_asm_add(uint8_t **buf, size_t *len, size_t *cap, uint64_t announced, uint64_t limit, const uint8_t *body, size_t n);
 
 #endif

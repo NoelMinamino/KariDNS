@@ -1025,6 +1025,14 @@ void logev_set_thread_sink(logev_sink_t fn, void *ctx) {
   t_logev_sink.ctx = ctx;
 }
 
+bool logev_thread_has_sink(void) { return t_logev_sink.fn != NULL; }
+
+bool logev_thread_sink_post(int cat, int level, const char *msg) {
+  if (!t_logev_sink.fn) return false;
+  t_logev_sink.fn(t_logev_sink.ctx, cat, level, NULL, 0, msg);
+  return true;
+}
+
 void logev_name_text(const char *name, char *out, size_t n) {
   if (!out || n == 0) return;
   size_t o = 0;

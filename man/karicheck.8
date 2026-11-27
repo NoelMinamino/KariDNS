@@ -1,4 +1,4 @@
-.TH KARICHECK 8 "2026-11-24" "KariDNS" "KariDNS Manual"
+.TH KARICHECK 8 "2026-11-27" "KariDNS" "KariDNS Manual"
 .\" Generated from docs/karicheck.md by man/md2man.pl (make man): edit the Markdown manual, not this page.
 .SH NAME
 karicheck \- Configuration and Zone File Validation Utility for KariDNS
@@ -18,6 +18,8 @@ karicheck zone <domain> \-
 karicheck db [view] [config_path]
 \&
 karicheck \-\-json conf|zones|zone|db ...
+\&
+karicheck [\-\-json] \-u user conf|zones|zone|db ...
 \&
 karicheck \-v | \-\-version
 \&
@@ -61,12 +63,19 @@ for \fB<domain>\fR without a configuration file. The third argument is treated
 as a configuration file if it contains \fB.conf\fR, and as a zone file
 otherwise. A relative path is resolved against the current directory; the server
 resolves relative zone paths (also with \fB../\fR) against the directory it was
-started from. Run as root with standard error on a terminal, \fBkaricheck\fR
-prints a note there that it parses the file with root's rights: a zone file from
-elsewhere is better checked as an unprivileged user. (\fBkaricheck\fR does not
-drop privileges itself: \fBconf\fR, \fBzones\fR and \fBzone <domain> [config]\fR
-read the server's own files, which the server also reads as root when it starts,
-and a lower user could not read the ones only root may.)
+started from. Run as root (0.7, tools review T4-L4), \fBkaricheck\fR reads the
+file (or standard input) as root and then drops to the user \fBnobody\fR, or to
+the user \fB\-u\fR names, before it parses it: an \fB$INCLUDE\fR is opened with
+that user's rights (one only root may read is an error) and a fault in a parser
+has no root to give away. \fB\-u root\fR keeps root. If the user does not exist
+the run stops (\fBio.privilege\-drop\fR, or a usage error for
+\fB\-u\fR). \fBconf\fR, \fBzones\fR, \fBzone <domain> [config]\fR and \fBdb\fR
+keep root unless \fB\-u\fR names a user: they read what \fBkaridns\fR itself
+reads as root when it starts, before its own drop (the configuration, its
+includes, the TSIG key files and the zone files, often mode 0600 and root's),
+and the parsers open those files while they parse, so there is no set of files
+to open first; with \fB\-u\fR they run as that user from the start (\fBdb\fR
+then checks with that user's rights instead of dropping to \fBloader\-user\fR).
 .TP 8
 \fBzone <domain> \-\fR
 The zone text is read from standard input (BIND format, at most 64 MiB; a bigger
@@ -482,6 +491,15 @@ client that sees both gets an RRset with differing TTLs; the TTLs are kept)
 .IP \(bu 2
 SOA MNAME pointing to a CNAME (warning)
 .IP \(bu 2
+SOA timers (0.7, warnings): a retry interval longer than the refresh interval
+(RFC 1912 \[u00A7]2.2: retry is a fraction of refresh), an expire time shorter
+than refresh + retry (a secondary that misses one refresh would expire the zone
+before it retries) or not greater than the minimum (RFC 1912 \[u00A7]2.2: expire
+"must be greater than the minimum and retry intervals"), and a TTL of negative
+answers, min(SOA TTL, minimum) (RFC 2308 \[u00A7]5), above 7 days (BIND
+truncates max-ncache-ttl to 7 days; RFC 1912 \[u00A7]2.2 calls a minimum of 1-5
+days typical)
+.IP \(bu 2
 Meta-types (e.g. \fBOPT\fR, \fBTSIG\fR, \fBAXFR\fR) must not appear in zone data
 .IP \(bu 2
 PowerDNS ALIAS and LUA records (TYPE65401 / TYPE65402 of CLASS IN, see
@@ -552,6 +570,17 @@ NSEC3 records are checked once per chain (RRs with the same hash algorithm,
 iterations and salt), not once per RR: hash algorithm, reserved flag bits,
 opt-out (RFC 9276 \[u00A7]3.1), iterations and salt as above, and a warning for
 a chain that matches no NSEC3PARAM with Flags 0 (the server does not use it)
+.IP \(bu 2
+The NSEC chain of a zone that has NSEC records (0.7, warnings): one NSEC per
+name with authoritative data and per delegation point, none below a delegation
+or a DNAME or outside the zone, and one per name (RFC 4035 \[u00A7]2.3); in
+canonical order (RFC 4034 \[u00A7]6.1) each NSEC names the next owner and the
+last names the apex (RFC 4034 \[u00A7]4.1.1); the type bitmap lists exactly the
+types at its owner, NSEC and RRSIG included, and at a delegation point only NS,
+DS, NSEC and RRSIG (RFC 4034 \[u00A7]4.1.2). The RFCs say MUST; these are
+warnings because the server serves such a zone as it is (its denials are wrong
+for the names concerned) and \fBnamed\-checkzone\fR does not verify the chain
+(\fBdnssec\-verify\fR does)
 .RE
 .IP 4. 4
 \fBDNSSEC Algorithm & Digest Verification (RFC 8624 / RFC 8078)\fR:
@@ -1021,6 +1050,12 @@ MiB)
 \fISeverity:\fR error
 .br
 \fIMeaning:\fR the database loader could not be started
+.TP 8
+\fBio.privilege\-drop\fR
+\fISeverity:\fR error
+.br
+\fIMeaning:\fR karicheck, run by root, could not drop to the user it parses as
+(nobody, or \-u user)
 .TP 8
 \fBinternal.oom\fR
 \fISeverity:\fR error
@@ -1946,6 +1981,39 @@ delegation point
 .br
 \fIMeaning:\fR an NSEC3 chain that matches no usable NSEC3PARAM
 .TP 8
+\fBzone.nsec.duplicate\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR a name has more than one NSEC record
+.TP 8
+\fBzone.nsec.not\-authoritative\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR an NSEC record below a delegation or a DNAME, or outside the zone
+.TP 8
+\fBzone.nsec.next\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR an NSEC record does not name the next owner of the chain in
+canonical order
+.TP 8
+\fBzone.nsec.not\-closed\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR the last NSEC record of the chain does not name the apex
+.TP 8
+\fBzone.nsec.missing\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR a name with authoritative data or a delegation has no NSEC record
+in a zone with an NSEC chain
+.TP 8
+\fBzone.nsec.bitmap\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR the type bitmap of an NSEC record does not match the types at its
+owner
+.TP 8
 \fBzone.ttl.inconsistent\fR
 \fISeverity:\fR warning
 .br
@@ -2229,6 +2297,23 @@ define
 \fISeverity:\fR warning
 .br
 \fIMeaning:\fR the SOA record has expired
+.TP 8
+\fBzone.soa.retry\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR the SOA retry interval is longer than the refresh interval
+.TP 8
+\fBzone.soa.expire\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR the SOA expire time is shorter than refresh + retry, or not
+greater than the minimum
+.TP 8
+\fBzone.soa.minimum\fR
+\fISeverity:\fR warning
+.br
+\fIMeaning:\fR the TTL of negative answers, min(SOA TTL, minimum), is over 7
+days
 .TP 8
 \fBzone.ns.missing\fR
 \fISeverity:\fR error

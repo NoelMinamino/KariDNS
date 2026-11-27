@@ -414,7 +414,11 @@ void enter_capsicum_sandbox(void) {
   (void)catopen("libc", NL_CAT_LOCALE);
   if (!g_bypass_cap_enter) {
     int trapmode = PROC_TRAPCAP_CTL_ENABLE;
-    procctl(P_PID, 0, PROC_TRAPCAP_CTL, &trapmode);
+    /* the confinement does not depend on it (cap_enter() below is what confines): a failure only means that a Capsicum violation is an error return (ECAPMODE) instead of a SIGTRAP, so it is logged and the
+     * start goes on (procctl(2) PROC_TRAPCAP_CTL; logged before cap_enter(), while strerror() can still be looked up) */
+    if (procctl(P_PID, 0, PROC_TRAPCAP_CTL, &trapmode) != 0) {
+      syslog(LOG_WARNING, "[Backend] procctl(PROC_TRAPCAP_CTL) failed: %s; a Capsicum violation will be an ECAPMODE error, not a SIGTRAP", strerror(errno));
+    }
     if (cap_enter() != 0) {
       if (errno == ENOSYS) {
         /* O-02: カーネルに CAPABILITY_MODE が無い。サンドボックスなしで動き続けることを

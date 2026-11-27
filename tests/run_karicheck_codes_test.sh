@@ -283,6 +283,7 @@ db.settings.combined
 zone.catalog.name-too-long
 zone.zonemd.canonical
 io.fork
+io.privilege-drop
 io.pipe
 io.stat
 io.stdin.read

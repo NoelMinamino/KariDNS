@@ -33,6 +33,7 @@ fi
 
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/karicheck_low_l4.XXXXXX")"
 trap 'rm -rf "$TMP"' EXIT INT TERM
+chmod 755 "$TMP"      # (run by root, karicheck parses a zone file as nobody (T4-L4): its $INCLUDE files must be reachable by nobody)
 PASS=0
 FAIL=0
 

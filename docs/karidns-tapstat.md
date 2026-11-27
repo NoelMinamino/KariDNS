@@ -99,6 +99,12 @@ Each of the five tables holds at most `-k` keys (default 10000; qname keys take 
 `-m mode`
 : Octal permission of the socket file (default `660`). The sender (`karidns`) must be able to connect to the socket: the Backend of `karidns` connects through its unprivileged broker, so give the socket a group or mode that the user of `karidns` can write to. Every sender is checked against this mode when it connects, from its credentials (`LOCAL_PEERCRED` on FreeBSD): root, the user `karidns-tapstat` runs as, or, when the mode gives the group write access, a member of the socket file's group; any other is refused with a message on standard error. A mode with `o+w` (such as `666`) lets every local user send made-up dnstap and fill the 16 places, so it is accepted with a warning only.
 
+`-u user`
+: The only sender allowed (0.7, tools review T4-L5): a user name or a numeric uid, repeatable up to 16 times. `karidns` connects as the user it runs as (`options { user }`), at its start after the privilege drop and through its connect broker when it reconnects, so `-u` with that user admits `karidns` and refuses every other local user that the socket mode lets in, root and the members of the socket's group included. A refused sender is reported on standard error and counted (`senders refused` in the summary). `-u` needs the peer's credentials (`LOCAL_PEERCRED` on FreeBSD, `SO_PEERCRED` on Linux); on a system without them `-u` is a usage error and the socket mode alone decides, as without `-u`.
+
+`-l rate`
+: The bytes per second one sender may send, with `K`, `M` or `G` (powers of 1024; default `64M`, `0` = no limit, otherwise 4K to 1024G: a slower sender could not finish its handshake within its 5 seconds). A sender is a uid (the peer's credentials): all its connections share one bucket of one second's worth, kept when they close, so neither more connections nor a reconnect give it more than the rate (on a system without peer credentials the bucket is per connection). The 64 buckets outnumber the 16 places; a bucket a sender no longer uses goes to another sender only once it is full again, and a new sender that finds none is refused (counted with `senders refused`). A sender over it is not read until the bucket refills, so it waits on its socket (nothing it sent is lost or cut; `karidns` counts what its ring could not hold as dnstap drops). Each pause is counted (`throttled` in the summary). A dnstap message of `karidns` takes a few hundred bytes, so `64M` is some 200,000 messages a second; raise `-l` for a busier server.
+
 `-w seconds`
 : Close a sender that has sent nothing for this long after the handshake, 1 to 86400 (default `600`): a sender that holds a place without sending gives it up. `karidns` notices it with its next message and connects again about a second later (the messages of that second are counted as lost in `karictl status`, "dnstap dropped (not connected)"); keep `-w` well above the quietest stretch of the server.
 
@@ -121,6 +127,7 @@ The exit status is 0, 1 for a runtime error (a bad file, a protocol error in a f
 ```text
 karidns-tapstat 2026-11-11T12:00:00Z - 2026-11-11T12:01:00Z (60.0 s)
 frames 1204  bad 0  queries 0  responses 1204  other-messages 0  no-question 0  malformed 0
+senders refused 0  throttled 0
 zone: events 1204  keys 2  evictions 0
          900  example.test.
          304  other
@@ -136,15 +143,15 @@ client: events 1204  keys 5  evictions 0
          ...
 ```
 
-A key that may be over-counted is followed by `(may be over-counted by up to E)`; see "Bounded memory". `frames` is the number of dnstap frames, `bad` those that could not be decoded, `other-messages` those of a message type that is neither query nor response, `no-question` messages with an empty question section, `malformed` those whose question could not be read.
+A key that may be over-counted is followed by `(may be over-counted by up to E)`; see "Bounded memory". `frames` is the number of dnstap frames, `bad` those that could not be decoded, `senders refused` the senders of the interval that were refused (not a `-u` user, not allowed by the socket mode, or no place left) and `throttled` the pauses of a sender over `-l`, `other-messages` those of a message type that is neither query nor response, `no-question` messages with an empty question section, `malformed` those whose question could not be read.
 
 ### json
 
-One JSON object per summary on one line: `start`, `end`, `seconds`, the counters above (`frames`, `bad_frames`, `queries`, `responses`, `other_messages`, `no_question`, `malformed`) and `dimensions`, an object with `zone`, `qname`, `qtype`, `rcode` and `client`, each `{"events":N,"keys":N,"evictions":N,"top":[{"key":"...","count":N,"error":N},...]}`; `count` may be too high by up to `error` (Space-Saving).
+One JSON object per summary on one line: `start`, `end`, `seconds`, the counters above (`frames`, `bad_frames`, `queries`, `responses`, `other_messages`, `no_question`, `malformed`), `senders_refused`, `senders_throttled` and `dimensions`, an object with `zone`, `qname`, `qtype`, `rcode` and `client`, each `{"events":N,"keys":N,"evictions":N,"top":[{"key":"...","count":N,"error":N},...]}`; `count` may be too high by up to `error` (Space-Saving).
 
 ### prom
 
-Gauges for the interval just ended (the counters restart after every summary, so they are not Prometheus counters): `karidns_tapstat_interval_seconds`, `karidns_tapstat_last_summary_timestamp_seconds`, `karidns_tapstat_messages{kind=...}`, `karidns_tapstat_events{dimension=...,kind="total"|"evictions"}`, `karidns_tapstat_count{dimension=...,key=...}` for the most frequent keys and `karidns_tapstat_count_error{dimension=...,key=...}` for the over-count bound of each key where it is not 0. Label values are escaped as the format requires (`\\`, `\"`, `\n`). With `-o` into the textfile directory of node_exporter this gives query statistics without opening another port.
+Gauges for the interval just ended (the counters restart after every summary, so they are not Prometheus counters): `karidns_tapstat_interval_seconds`, `karidns_tapstat_last_summary_timestamp_seconds`, `karidns_tapstat_messages{kind=...}`, `karidns_tapstat_senders{kind="refused"|"throttled"}`, `karidns_tapstat_events{dimension=...,kind="total"|"evictions"}`, `karidns_tapstat_count{dimension=...,key=...}` for the most frequent keys and `karidns_tapstat_count_error{dimension=...,key=...}` for the over-count bound of each key where it is not 0. Label values are escaped as the format requires (`\\`, `\"`, `\n`). With `-o` into the textfile directory of node_exporter this gives query statistics without opening another port.
 
 ---
 

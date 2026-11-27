@@ -88,7 +88,13 @@ OUT=$("$KARICHECK" zone example. tests/zones/zonemd_a3.zone 2>&1)
 [ "$(echo "$OUT" | grep -c "^\[INFO\] ZONEMD (Scheme [0-9]*, Hash [0-9]*) for 'example.' is not verified")" -eq 2 ] ||
     fail "A.3: the two private-range ZONEMD RRs are not reported as not verified"
 check_vector A.4 uri.arpa. tests/zones/zonemd_a4.zone 1 "0 error(s), 0 warning(s)"
-check_vector A.5 root-servers.net. tests/zones/zonemd_a5.zone 1 "0 error(s), 0 warning(s)"
+# (A.5 is the root-servers.net zone of 2018: SOA TTL and minimum 3600000 (41 days) and expire 1209600 (14 days).  The SOA timer checks of 0.7 give
+#  two warnings, both right by their sources: the expire is not greater than the minimum (RFC 1912 2.2) and negative answers would live 41 days
+#  (RFC 2308 5, BIND max-ncache-ttl caps 7 days).  The ZONEMD checks of the vector are unchanged.)
+check_vector A.5 root-servers.net. tests/zones/zonemd_a5.zone 1 "0 error(s), 2 warning(s)"
+A5W=$("$KARICHECK" zone root-servers.net. tests/zones/zonemd_a5.zone 2>&1 | grep "^\[WARNING\]")
+echo "$A5W" | grep -q "the expire time 1209600 is not greater than the minimum 3600000" || fail "A.5: no warning for expire <= minimum: $A5W"
+echo "$A5W" | grep -q "the TTL of negative answers is 3600000 (min(SOA TTL 3600000, minimum 3600000)" || fail "A.5: no warning for the negative TTL: $A5W"
 
 # check_fail <label> <file> <message> <expected [RESULT] counts>
 check_fail() {

@@ -2655,13 +2655,43 @@ static void m3_review_rules(void) {
         size_t len = 0, cap = 0;
         uint8_t piece[100];
         memset(piece, 0xAB, sizeof(piece));
-        CHECK(zone_image_asm_add(&buf, &len, &cap, 0, piece, 8) == -1 && buf == NULL);                  /* (no size announced) */
-        CHECK(zone_image_asm_add(&buf, &len, &cap, 250, piece, 100) == 0 && cap == 250 && len == 100);  /* (the first piece allocates the whole) */
+        CHECK(zone_image_asm_add(&buf, &len, &cap, 0, 0, piece, 8) == -1 && buf == NULL);                  /* (no size announced) */
+        CHECK(zone_image_asm_add(&buf, &len, &cap, 250, 0, piece, 100) == 0 && cap == 250 && len == 100);  /* (a small image: the first piece allocates the whole) */
         uint8_t *first = buf;
-        CHECK(zone_image_asm_add(&buf, &len, &cap, 250, piece, 100) == 0 && buf == first && len == 200);   /* (no realloc: the buffer does not move) */
-        CHECK(zone_image_asm_add(&buf, &len, &cap, 250, piece, 51) == -1 && len == 200);                /* (one octet more than announced) */
-        CHECK(zone_image_asm_add(&buf, &len, &cap, 250, piece, 50) == 0 && len == 250 && cap == 250);
-        CHECK(zone_image_asm_add(&buf, &len, &cap, 250, piece, 1) == -1);                               /* (the image is complete) */
+        CHECK(zone_image_asm_add(&buf, &len, &cap, 250, 0, piece, 100) == 0 && buf == first && len == 200);   /* (no realloc: the buffer does not move) */
+        CHECK(zone_image_asm_add(&buf, &len, &cap, 250, 0, piece, 51) == -1 && len == 200);                /* (one octet more than announced) */
+        CHECK(zone_image_asm_add(&buf, &len, &cap, 250, 0, piece, 50) == 0 && len == 250 && cap == 250);
+        CHECK(zone_image_asm_add(&buf, &len, &cap, 250, 0, piece, 1) == -1);                               /* (the image is complete) */
+        free(buf);
+        /* review D-L1: the loader is untrusted.  A huge announcement with a tiny body holds what came (at most ZONE_IMAGE_ASM_FIRST), not the announced size; the buffer doubles with the octets
+         * and stops at the announced size; an announcement above max-zone-bytes or above what an image can be is refused before anything is allocated */
+        buf = NULL;
+        len = cap = 0;
+        const uint64_t huge = 1ull << 30;                                                                   /* (KDB_DEFAULT_MAX_ZONE_BYTES) */
+        CHECK(zone_image_asm_add(&buf, &len, &cap, huge + 8, huge, piece, 100) == -1 && buf == NULL && cap == 0);   /* (above max-zone-bytes) */
+        CHECK(zone_image_asm_add(&buf, &len, &cap, ZONE_IMAGE_ASM_MAX + 8, 0, piece, 100) == -1 && buf == NULL);  /* (above what an image can be) */
+        CHECK(zone_image_asm_add(&buf, &len, &cap, huge, huge, piece, 100) == 0 && len == 100 && cap == ZONE_IMAGE_ASM_FIRST);
+        const size_t big = ZONE_IMAGE_ASM_FIRST + 4096;
+        uint8_t *body = calloc(1, big);
+        CHECK(body != NULL);
+        if (body) {
+            CHECK(zone_image_asm_add(&buf, &len, &cap, huge, huge, body, big) == 0 && len == 100 + big && cap == 2 * ZONE_IMAGE_ASM_FIRST);   /* (doubled once) */
+            CHECK(buf[0] == 0xAB && buf[99] == 0xAB && buf[100] == 0);                                     /* (the first piece moved with the buffer) */
+            free(body);
+        }
+        free(buf);
+        /* the last doubling stops at the announced size */
+        buf = NULL;
+        len = cap = 0;
+        const uint64_t odd = 3 * (uint64_t)ZONE_IMAGE_ASM_FIRST + 8;
+        uint8_t *all = calloc(1, (size_t)odd);
+        CHECK(all != NULL);
+        if (all) {
+            CHECK(zone_image_asm_add(&buf, &len, &cap, odd, 0, all, ZONE_IMAGE_ASM_FIRST) == 0 && cap == ZONE_IMAGE_ASM_FIRST);
+            CHECK(zone_image_asm_add(&buf, &len, &cap, odd, 0, all, ZONE_IMAGE_ASM_FIRST + 1) == 0 && cap == (size_t)odd);
+            CHECK(zone_image_asm_add(&buf, &len, &cap, odd, 0, all, (size_t)odd - len) == 0 && len == (size_t)odd && cap == (size_t)odd);
+            free(all);
+        }
         free(buf);
     }
 }

@@ -229,6 +229,8 @@ echo "=== 6. program-max-failures: the plugin is killed and started again ==="
 hang_pid=$(pid 192.0.2.21)
 answer a.hang.example. >/dev/null
 answer b.hang.example. >/dev/null
+# (the line comes from a thread of the async pool, which hands it to the query logger thread (0.7 review M-3): it is written a moment after the answer)
+for _w in $(seq 1 50); do grep -q "zone 'hang.example.' exceeded max failures" "$TMP_DIR/karidns.log" && break; sleep 0.1; done
 if grep -q "zone 'hang.example.' exceeded max failures" "$TMP_DIR/karidns.log" && gone "$hang_pid" 5; then
     pass "hang.example's plugin was killed at program-max-failures"
 else

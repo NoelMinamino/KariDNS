@@ -92,10 +92,32 @@ void tapstat_render(const tapstat_t *s, tapstat_format_t fmt, FILE *fp, time_t s
 /* counters of the current interval */
 uint64_t tapstat_frames(const tapstat_t *s);
 uint64_t tapstat_bad_frames(const tapstat_t *s);
+/* T4-L5: the program counts the senders it refused and the times it paused a sender over its rate (-l); they are part of the interval */
+void tapstat_note_senders(tapstat_t *s, uint64_t refused, uint64_t throttled);
 
 /* helpers shared with the program and the tests */
 bool tapstat_name_to_wire(const char *name, uint8_t *out, size_t *out_len);
 const char *tapstat_qtype_name(uint16_t t, char *buf, size_t cap);
 const char *tapstat_rcode_name(unsigned rc, char *buf, size_t cap);
+
+/* ---- T4-L5 (-l): the byte buckets of the senders (tools/karidns_tapstat.c) ----
+ * One bucket per sender: a uid (the peer's credentials), shared by all its connections and kept when they close, so that neither more connections
+ * nor a reconnect give a uid more than the rate; refilled at the rate up to one second's worth.  Without peer credentials (keyed false) a connection
+ * has a bucket of its own.  The table has TAPSTAT_BUCKETS entries, more than the connections (16): an idle bucket is given to another sender only
+ * when it is full again (a sender that was throttled cannot get a fresh bucket by letting a new uid push its empty one out and reconnecting);
+ * tapstat_bkt_take() returns -1 when no bucket can be taken, and the connection is refused. */
+#define TAPSTAT_BUCKETS 64
+typedef struct {
+    bool used, keyed;       /* keyed: uid names the sender */
+    uint32_t uid;
+    int nconn;              /* connections that use it now */
+    int64_t tokens;         /* the bytes the sender may still send now */
+    int64_t t_fill_ms;      /* when it was last refilled */
+    bool paused;            /* over the rate: its connections are not read until it refills */
+} tapstat_bkt_t;
+/* the bucket of a new connection: its uid's, else an unused one, else an idle one that is full (any idle one when rate is 0); -1 = none (refuse) */
+int tapstat_bkt_take(tapstat_bkt_t *b, int n, bool keyed, uint32_t uid, uint64_t rate, int64_t now_ms);
+/* refills b at rate bytes a second up to rate (0 = no limit: nothing to do); a paused bucket that has tokens again is no longer paused */
+void tapstat_bkt_refill(tapstat_bkt_t *b, uint64_t rate, int64_t now_ms);
 
 #endif /* TAPSTAT_CORE_H */

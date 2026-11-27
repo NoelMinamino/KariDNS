@@ -661,6 +661,57 @@ static void test_names(void) {
     assert(!tapstat_name_to_wire(long_name, w, &l)); /* over 255 bytes */
 }
 
+/* T4-L5 (-l): the byte buckets of the senders.  A uid has one bucket for all its connections and keeps it when they close (a reconnect does not
+ * fill it); an idle bucket goes to another sender only when it is full again, so a throttled uid cannot get a fresh one by having it pushed out;
+ * with every bucket busy or not full the new connection is refused (-1); without peer credentials each connection has its own */
+static void test_buckets(void) {
+    tapstat_bkt_t b[TAPSTAT_BUCKETS];
+    memset(b, 0, sizeof(b));
+    const uint64_t rate = 65536;
+    int64_t t = 1000;
+    int a1 = tapstat_bkt_take(b, TAPSTAT_BUCKETS, true, 1001, rate, t);
+    int a2 = tapstat_bkt_take(b, TAPSTAT_BUCKETS, true, 1001, rate, t);
+    assert(a1 >= 0 && a2 == a1 && b[a1].nconn == 2 && b[a1].tokens == (int64_t)rate);     /* one uid, one bucket */
+    b[a1].tokens = -10;                                                                    /* the sender used it up */
+    b[a1].paused = true;
+    b[a1].nconn = 0;                                                                       /* ... and its connections closed */
+    /* every other bucket is taken by other uids that are connected */
+    for (uint32_t u = 0; u < TAPSTAT_BUCKETS - 1; u++) assert(tapstat_bkt_take(b, TAPSTAT_BUCKETS, true, 2000 + u, rate, t) >= 0);
+    /* a newcomer: the only idle bucket is the empty one of uid 1001, which it must not take */
+    assert(tapstat_bkt_take(b, TAPSTAT_BUCKETS, true, 3000, rate, t) == -1);
+    /* uid 1001 reconnects: its own bucket, still empty (no refill from the reconnect) */
+    int a3 = tapstat_bkt_take(b, TAPSTAT_BUCKETS, true, 1001, rate, t);
+    assert(a3 == a1 && b[a1].tokens == -10 && b[a1].paused);
+    b[a1].nconn = 0;
+    /* a second later the bucket is full again (refilled up to one second's worth, no more): now another sender may have it */
+    t += 500;
+    tapstat_bkt_refill(&b[a1], rate, t);
+    assert(b[a1].tokens == (int64_t)rate / 2 - 10 && !b[a1].paused);
+    assert(tapstat_bkt_take(b, TAPSTAT_BUCKETS, true, 3000, rate, t) == -1);              /* (half full: not yet) */
+    t += 2000;
+    tapstat_bkt_refill(&b[a1], rate, t);
+    assert(b[a1].tokens == (int64_t)rate);
+    int a4 = tapstat_bkt_take(b, TAPSTAT_BUCKETS, true, 3000, rate, t);
+    assert(a4 == a1 && b[a4].uid == 3000 && b[a4].nconn == 1 && b[a4].tokens == (int64_t)rate);
+    /* less than a byte of time is kept for later; rate 0 refills nothing */
+    tapstat_bkt_t one = { .used = true, .tokens = 0, .t_fill_ms = 0 };
+    tapstat_bkt_refill(&one, 100, 5);
+    assert(one.tokens == 0 && one.t_fill_ms == 0);
+    tapstat_bkt_refill(&one, 100, 10);
+    assert(one.tokens == 1 && one.t_fill_ms == 10);
+    tapstat_bkt_refill(&one, 0, 1000000);
+    assert(one.tokens == 1);
+    /* without credentials every connection has a bucket of its own; with rate 0 any idle bucket can be given out */
+    memset(b, 0, sizeof(b));
+    int n1 = tapstat_bkt_take(b, TAPSTAT_BUCKETS, false, 0, rate, t), n2 = tapstat_bkt_take(b, TAPSTAT_BUCKETS, false, 0, rate, t);
+    assert(n1 >= 0 && n2 >= 0 && n1 != n2);
+    memset(b, 0, sizeof(b));
+    for (int i = 0; i < TAPSTAT_BUCKETS; i++) assert(tapstat_bkt_take(b, TAPSTAT_BUCKETS, true, (uint32_t)i, 0, t) == i);
+    b[5].nconn = 0;
+    assert(tapstat_bkt_take(b, TAPSTAT_BUCKETS, true, 999, 0, t) == 5);
+    printf("  buckets: passed\n");
+}
+
 int main(void) {
     test_fstrm();
     test_decoder();
@@ -668,6 +719,7 @@ int main(void) {
     test_tables();
     test_space_saving();
     test_names();
+    test_buckets();
     printf("test_tapstat: all passed\n");
     return 0;
 }

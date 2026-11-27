@@ -1245,7 +1245,7 @@ static void job_execute(ing_job_t *j) {
     job_reject(j, "the zone image is incomplete");
     goto rejected;
   }
-  if (j->img_cap > j->img_len) {                         /* (the buffer grew by doubling: the image lives as long as the entry does, without the slack) */
+  if (j->img_cap > j->img_len) {                         /* (zone_image_asm_add() stops at the announced size, so this is a guard: the image lives as long as the entry does, without slack) */
     uint8_t *tr = realloc(j->img, j->img_len);
     if (tr) {
       j->img = tr;
@@ -2434,12 +2434,11 @@ static void on_zone_begin(ing_t *g, const kdb_msg_t *m) {
 }
 
 /* ZONE_IMAGE of the zone j (either stream): the octets are appended to the image.  The announced size (ZONE_BEGIN image_size) is what the image must be (zone_image_validate_ex() refuses any other length) and is at most
- * max-zone-bytes (the state machine: dns_db_stream.c), so the buffer is allocated once with that size, with the first piece: no doubling that copies the image again and holds up to three times its size meanwhile.  A
- * loader that announces the most and sends a kilobyte holds the address space of one zone for as long as the stream's zone lasts (an allocation that nothing has touched is not memory), and a job is a zone of
- * one stream at a time. */
+ * max-zone-bytes (the state machine: dns_db_stream.c, and zone_image_asm_add() again).  The loader is untrusted, so the buffer holds what came, grown by doubling up to the announced size (0.7 review D-L1): a
+ * loader that announces the most and sends a kilobyte holds a megabyte, not the address space of a whole zone. */
 static void job_image(ing_job_t *j, const kdb_msg_t *m) {
   if (!j || j->skip || j->failed || j->cold) return;
-  const int rc = zone_image_asm_add(&j->img, &j->img_len, &j->img_cap, j->img_size, m->u.zone_image.body, m->u.zone_image.len);      /* (the harness of tests/fuzz/fuzz_db_image_frames.c runs the same function) */
+  const int rc = zone_image_asm_add(&j->img, &j->img_len, &j->img_cap, j->img_size, j->lim_bytes, m->u.zone_image.body, m->u.zone_image.len);      /* (the harness of tests/fuzz/fuzz_db_image_frames.c runs the same function) */
   if (rc == -1) {                                        /* (the state machine refuses it: a job that is not an image zone, or more octets than announced) */
     j->failed = true;
     snprintf(j->reason, sizeof(j->reason), "zone image data that was not announced");

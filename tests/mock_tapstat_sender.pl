@@ -4,7 +4,7 @@
 #
 #   gen-file OUT              write a Frame Streams file (START, dnstap frames, STOP) with known traffic
 #   send SOCK MODE            act as a dnstap sender on tapstat's socket and check the answers
-#                             MODE: good badct garbage oversize idle earlydata nofields dataidle refused
+#                             MODE: good badct garbage oversize idle earlydata nofields dataidle refused flood [COUNT]
 #   sum FILE                  add up the JSON lines of karidns-tapstat; prints name=value lines
 #
 # The known traffic of gen-file (what the test expects, with -z example.test,sub.example.test):
@@ -137,6 +137,25 @@ if ($cmd eq 'send') {
         print $s ctl(4, 1);
         my $acc = read_exact($s, 42, 3);
         die "got an ACCEPT\n" if defined $acc;
+    } elsif ($mode eq 'flood') {
+        # T4-L5: the handshake, then COUNT copies of the known traffic as fast as the socket takes them, STOP; the receiver's -l rate makes it
+        # wait, nothing is lost (the sum counts every frame) and FINISH still comes.  Prints the seconds it took after OK.
+        my $count = $ARGV[2] // 400;
+        print $s ctl(4, 1);
+        my $acc = read_exact($s, 42, 3);
+        die "no ACCEPT\n" unless defined $acc && $acc eq ctl(1, 1);
+        my $t0 = time;
+        my $all = ctl(2, 1) . join('', map { data($_) } (traffic()) x $count) . ctl(3, 0);
+        my $off = 0;
+        while ($off < length $all) {
+            my $w = syswrite($s, $all, length($all) - $off, $off);
+            die "write: $!\n" unless defined $w;
+            $off += $w;
+        }
+        my $fin = read_exact($s, 12, 60);
+        die "no FINISH\n" unless defined $fin && $fin eq ctl(5, 0);
+        print "OK flood ", length($all), " bytes in ", time - $t0, " s\n";
+        exit 0;
     } elsif ($mode eq 'nofields') {
         # READY without a content type is accepted (ACCEPT without one), then a session
         print $s ctl(4, 0);
@@ -159,7 +178,7 @@ if ($cmd eq 'sum') {
     while (my $l = <$fh>) {
         my $d = decode_json($l);
         $lines++;
-        $t{$_} += $d->{$_} for qw(frames bad_frames queries responses other_messages no_question malformed);
+        $t{$_} += $d->{$_} for qw(frames bad_frames queries responses other_messages no_question malformed senders_refused senders_throttled);
         for my $dim (keys %{ $d->{dimensions} }) {
             my $x = $d->{dimensions}{$dim};
             $t{"$dim.events"} += $x->{events};
