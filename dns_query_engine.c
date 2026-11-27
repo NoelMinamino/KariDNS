@@ -281,7 +281,7 @@ static bool zone_nsec3(const zone_image_t *img, const char *apex_name, zone_n3_t
 
 static bool is_non_data_rrtype(uint16_t t) {
     switch (t) {
-        case 41: case 249: case 250: case 251: case 252: case 253: case 254: case 255:
+        case 41: case 128 /* NXNAME, a meta-type (RFC 9824 3.5) */: case 249: case 250: case 251: case 252: case 253: case 254: case 255:
             return true;
         default:
             return false;
@@ -3992,6 +3992,15 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
       add_ede(&edns, send_ede, 0, NULL);
       return dns_build_error_response(req, req_len, res, max_res_len, 1, 0, 1, &edns, is_tcp, cfg); // FORMERR
     }
+  }
+
+  /* RFC 9824 3.5: an explicit query for the NXNAME meta-type MUST get FORMERR, and a resolver MUST NOT forward it upstream, so a forward
+   * or program zone does not relay it either.  EDE 30 Invalid Query Type is the MAY of the same section.  Before the zone, as the RRSIG
+   * question below. */
+  if (opcode == 0 && qdcount == 1 && qtype == 128) {
+    qe_why("a question for the meta-type NXNAME (RFC 9824 3.5)");
+    add_ede(&edns, send_ede, 30, "NXNAME queries are not allowed");
+    return dns_build_error_response(req, req_len, res, max_res_len, 1, 0, dns_error_qd_echo(req, req_len), &edns, is_tcp, cfg); // FORMERR
   }
 
   /* 0.7: a question for type RRSIG alone is a FORMERR with EDE 30 Invalid Query Type (IANA EDE registry), whatever the name, the class, the

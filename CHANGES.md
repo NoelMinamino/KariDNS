@@ -235,6 +235,10 @@ Fixes from the external reviews and audits of the 0.7 cycle. Each has a test tha
 
 ### Bug fixes
 
+- **NXNAME questions** (RFC 9824 §3.5): a query for type NXNAME is answered FORMERR with EDE 30, also in forward and
+  program zones, which no longer pass it on; an MQTYPE-Query option that lists NXNAME is FORMERR (RFC 10029 §3.3).
+  Before, it was answered like any other type (NODATA) or relayed. `KariDNS_RFC_GUIDELINE.md` was checked against the
+  RFC texts: titles, section numbers and moved source files corrected.
 - **Zone store tables and swap**: above `store-table-memory` (new, restart-only; default the RAM less `memory-limit`
   and a quarter of the RAM) the server deactivates the clean file pages of the store's tables, index and first-fill
   runs a slice at a time, so the kernel frees them before it swaps other memory (100M zones on 16 GB swapped before).

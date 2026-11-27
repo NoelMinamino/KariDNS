@@ -5,6 +5,7 @@
 # 3. NOTIFY (Opcode=4) with MQTYPE-Query option
 # 4. UPDATE (Opcode=5) with MQTYPE-Query option
 # 5-7. QDCOUNT=0 QUERY without OPT, with OPT, with a COOKIE option only (RFC 9619, RFC 7873 5.4)
+# 8. MQTYPE-Query listing the meta-type NXNAME (RFC 10029 3.3, RFC 9824 3.5)
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -118,6 +119,16 @@ for T in "+udp" "+tcp"; do   # --hex is sent as an ANY query: dag goes to TCP un
         || { echo "FAIL: Test 7 ($T) cookie-only query is not NOERROR with a server cookie"; exit 1; }
 done
 echo "[+] Tests 5-7 passed: QDCOUNT=0 FORMERR without COOKIE, NOERROR for a cookie-only query."
+
+echo "========================================================"
+echo "Test 8: MQTYPE-Query option that lists the meta-type NXNAME (RFC 10029 3.3, RFC 9824 3.5)"
+echo "========================================================"
+"$BIN_DIR/dag" @127.0.0.1 -p ${PORT} +nohexdump example.com A +mqtype=AAAA > dag_out8a.txt 2>&1 || true
+grep -q "status: NOERROR" dag_out8a.txt || { cat dag_out8a.txt; echo "FAIL: Test 8 control (+mqtype=AAAA) is not NOERROR"; exit 1; }
+"$BIN_DIR/dag" @127.0.0.1 -p ${PORT} +nohexdump example.com A +mqtype=NXNAME > dag_out8.txt 2>&1 || true
+cat dag_out8.txt
+grep -q "status: FORMERR" dag_out8.txt || { echo "FAIL: Test 8 an MQTYPE-Query option with NXNAME is not FORMERR"; exit 1; }
+echo "[+] Test 8 passed: NXNAME in MQTYPE-Query is FORMERR."
 
 echo "[+] All RFC 10029 FORMERR & ID preservation tests passed successfully!"
 exit 0
