@@ -53,7 +53,7 @@ else
 fi
 a=${archive#./}
 s=${stamp#./}
-grep -v -E '^\.git/|(^|/)node_modules/|^coverage_raw/|^tests/\.test_logs/' "$list.all" | grep -v -F -e "$a" -e "${s:-/nonexistent}" |
+grep -v -E '^\.git/|(^|/)node_modules/|^coverage_raw/|^tests/\.test_logs/|^\.ci-cache/' "$list.all" | grep -v -F -e "$a" -e "${s:-/nonexistent}" |
     sort -u > "$list.sorted"
 # objects first, then the rest (extraction order = the order of the times)
 { grep -E '\.(o|a)$' "$list.sorted"; grep -v -E '\.(o|a)$' "$list.sorted"; } > "$list"

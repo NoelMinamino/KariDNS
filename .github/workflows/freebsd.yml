@@ -41,19 +41,46 @@ jobs:
     name: Build on FreeBSD ${{ inputs.release }}
     runs-on: ubuntu-latest
     timeout-minutes: 35
+    # actions: write: the caches below are saved, and the older ones of this ref deleted (main / schedule / dispatch runs only)
+    permissions:
+      contents: read
+      actions: write
+    env:
+      # 1: this run saves the package and compiler caches (tests/ci_cache_env.sh); a pull request only reads them, so it can never put anything in them
+      CI_SAVE_CACHE: ${{ github.event_name != 'pull_request' && '1' || '0' }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
+      # the caches (tests/ci_cache_env.sh) before the VM step: the VM action copies the workspace into the VM when its step starts
+      - name: Restore the package cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .ci-cache/pkg
+          key: freebsd-pkg-${{ inputs.release }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: freebsd-pkg-${{ inputs.release }}-
+
+      - name: Restore the compiler cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .ci-cache/ccache
+          key: ccache-${{ inputs.release }}-build-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: ccache-${{ inputs.release }}-build-
 
       - name: Build and checks inside FreeBSD VM
         uses: vmactions/freebsd-vm@v1.4.8
         with:
           release: ${{ inputs.release }}
           copyback: true
+          envs: 'CI_SAVE_CACHE'
           run: |
             set -e
             # everything the build makes is newer than this file (tests/coverage_pack.sh pack: no git in the VM needed)
             touch .build_stamp
+
+            echo "::group::📦 [Setup] the package and compiler caches (tests/ci_cache_env.sh)"
+            CI_CCACHE=1; . tests/ci_cache_env.sh
+            echo "::endgroup::"
 
             echo "::group::📦 [Setup] Install dependencies (perl5, sqlite3 for karidns-dbloader and its tests)"
             # no "|| true": the manual-page gate below needs perl (a failed install must fail here, as the coverage job does)
@@ -74,6 +101,13 @@ jobs:
             pkg install -y postgresql17-client
             echo "::endgroup::"
 
+            # a run that saves the caches fetches every package of the release's jobs while the build compiles (tests/ci_pkg_fetch_all.sh)
+            FETCH_PID=""
+            if [ "$CI_SAVE_CACHE" = 1 ]; then
+              sh tests/ci_pkg_fetch_all.sh ${{ inputs.release }} > .ci-cache/pkg-fetch.log 2>&1 &
+              FETCH_PID=$!
+            fi
+
             echo "::group::📦 [Build] Parallel Build KariDNS, Sanitizers, Tests & Fuzzers"
             NCPU=$(sysctl -n hw.ncpu 2>/dev/null || echo 4)
             # configure finds the compiler and the libraries and writes config.mk, which every make below reads (docs/building.md); both database drivers are built.
@@ -84,6 +118,10 @@ jobs:
             make -j"$NCPU" all karicheck-codelog test_coverage_sweep_tools-codelog karidns-dbloader karidns-zone karidns-zone-asan zone2sql zone2kdb asan tsan tools-asan dnsqps-tsan fuzz_all fuzz_dag_all asan_test tinydns_test hash_test include_test response_cache_test test_response_cache vulnerability_test bench_serialize fetch_backend fake_dbloader karidns-evict test_store_status tsan-test-bins karidns-dbloader-tsan
             # stdin from /dev/null: no test may block reading the VM session's stdin
             make -j"$NCPU" unit-test-bins unit-test-bins-asan < /dev/null
+            echo "::endgroup::"
+
+            echo "::group::📊 [Cache] ccache statistics of the build"
+            ccache -s
             echo "::endgroup::"
 
             echo "::group::📦 [Pack] the build, for the test jobs"
@@ -115,6 +153,18 @@ jobs:
             rm -rf signer/node_modules webadmin/node_modules
             echo "::endgroup::"
 
+            echo "::group::📦 [Cache] what goes back to the runner to be saved"
+            if [ -n "$FETCH_PID" ]; then
+              wait "$FETCH_PID" || true
+              cat .ci-cache/pkg-fetch.log
+              rm -f .ci-cache/pkg-fetch.log
+              du -sh .ci-cache/pkg .ci-cache/ccache
+            else
+              # a pull request saves nothing: the copyback carries only the archive
+              rm -rf .ci-cache
+            fi
+            echo "::endgroup::"
+
       - name: Upload the build
         uses: actions/upload-artifact@v4
         with:
@@ -124,11 +174,39 @@ jobs:
           compression-level: 0
           if-no-files-found: error
 
+      - name: Save the package cache
+        if: env.CI_SAVE_CACHE == '1'
+        uses: actions/cache/save@v4
+        with:
+          path: .ci-cache/pkg
+          key: freebsd-pkg-${{ inputs.release }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Save the compiler cache
+        if: env.CI_SAVE_CACHE == '1'
+        uses: actions/cache/save@v4
+        with:
+          path: .ci-cache/ccache
+          key: ccache-${{ inputs.release }}-build-${{ github.run_id }}-${{ github.run_attempt }}
+
+      # one cache of each kind per ref: the older ones of this ref go (the repository has 10 GB of caches; the VM images live there too)
+      - name: Delete the older caches of this ref
+        if: env.CI_SAVE_CACHE == '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: sh tests/ci_cache_prune.sh "freebsd-pkg-${{ inputs.release }}-" "ccache-${{ inputs.release }}-build-"
+
+  # Two VMs at the same time with the same setup (they were one after the other in one job, about 13 minutes): part unit runs the plain unit tests
+  # and the dag smoke test, part asan the unit tests under ASan/UBSan, dnsqps under ASan/UBSan and TSan, and the sanitizer smoke tests.  Each part
+  # ends with the no-rebuild check.
   build-and-test:
-    name: Build and Test on FreeBSD ${{ inputs.release }}
+    name: Build and Test (${{ matrix.part }}) on FreeBSD ${{ inputs.release }}
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [unit, asan]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -139,6 +217,13 @@ jobs:
         with:
           name: freebsd-bins-${{ inputs.release }}
 
+      - name: Restore the package cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .ci-cache/pkg
+          key: freebsd-pkg-${{ inputs.release }}-${{ github.run_id }}
+          restore-keys: freebsd-pkg-${{ inputs.release }}-
+
       - name: Unit tests and smoke tests inside FreeBSD VM
         uses: vmactions/freebsd-vm@v1.4.8
         with:
@@ -146,6 +231,9 @@ jobs:
           copyback: false
           run: |
             set -e
+
+            # the package cache (tests/ci_cache_env.sh): restored before this step, saved by the build job of main
+            . tests/ci_cache_env.sh
 
             echo "::group::📦 [Setup] Install test dependencies (perl5, sqlite3 for karidns-dbloader and its tests)"
             pkg install -y perl5
@@ -179,6 +267,7 @@ jobs:
             touch .unpack_stamp
             echo "::endgroup::"
 
+            if [ "${{ matrix.part }}" = unit ]; then
             echo "::group::🧪 [Unit Tests] All C unit tests (incl. RFC published-vector tests), 4 at a time"
             # Same tests as `make unit-tests` (plus test_acl_match and test_listen_on), run by tests/run_all_suite.sh: 4 at a time,
             # tests that share a resource (the PostgreSQL server) one after the other, each test with its own log, which is printed
@@ -187,6 +276,15 @@ jobs:
             sh tests/run_all_suite.sh -j 4 --test-timeout 1200 --full-log --pg-clusters -c unit -e coverage_sweep < /dev/null
             echo "::endgroup::"
 
+
+            echo "::group::🔍 [Smoke Test] Test dag client against a local mock server"
+            # X-09: no real domains or public resolvers (UDP, TCP, multiple servers, AXFR)
+            sh ./tests/run_ci_dag_smoke.sh
+            echo "::endgroup::"
+
+            fi
+
+            if [ "${{ matrix.part }}" = asan ]; then
             echo "::group::🛡️ [Sanitizers] Unit tests under ASan + UBSan, 4 at a time"
             # The plain test_* binaries use production CFLAGS, so they are NOT sanitizer-checked
             # (test_asan_overflow included). The job build made every unit test with
@@ -198,11 +296,6 @@ jobs:
             sh tests/run_all_suite.sh -j 4 --test-timeout 1200 --full-log --pg-clusters --asan -e coverage_sweep,test_fi_ < /dev/null
             echo "::endgroup::"
 
-            echo "::group::🔍 [Smoke Test] Test dag client against a local mock server"
-            # X-09: no real domains or public resolvers (UDP, TCP, multiple servers, AXFR)
-            sh ./tests/run_ci_dag_smoke.sh
-            echo "::endgroup::"
-
             echo "::group::🛡️ [Sanitizers] dnsqps under ASan/UBSan and TSan: the engine, its threads and the I/O paths (tests/run_dnsqps_test.sh)"
             DNSQPS=./dnsqps-asan sh ./tests/run_dnsqps_test.sh
             DNSQPS=./dnsqps-tsan sh ./tests/run_dnsqps_test.sh
@@ -211,13 +304,14 @@ jobs:
             echo "::group::🛡️ [Sanitizer & Fuzzing] Run Comprehensive Smoke Tests"
             ./tests/run_sanitizer_smoke_test.sh
             echo "::endgroup::"
+            fi
 
             echo "::group::🔨 [Check] no test built anything"
             sh tests/freebsd_no_rebuild_check.sh .unpack_stamp
             echo "::endgroup::"
 
             echo ""
-            echo "🎉 All FreeBSD unit and smoke tests passed!"
+            echo "🎉 All FreeBSD tests of part ${{ matrix.part }} passed!"
 
   # ---------------------------------------------------------------------------
   # ThreadSanitizer (15.1): the RCU and lock-free tests the coverage suite leaves out (Makefile: COV_SUITE_EXCLUDE): tests/run_rcu_tsan_units_test.sh (the
@@ -226,7 +320,8 @@ jobs:
   # SQLite3 for parts 4 to 7).  Any ThreadSanitizer report fails the test.  A job of its own: about 10 minutes next to the other test jobs.
   # ---------------------------------------------------------------------------
   tsan:
-    name: ThreadSanitizer RCU tests on FreeBSD ${{ inputs.release }}
+    # a fixed name, as the browser job has: a job skipped by its "if" shows its name unevaluated ("${{ inputs.release }}") in the 14.4 list
+    name: ThreadSanitizer RCU tests (FreeBSD 15.1)
     if: inputs.release == '15.1'
     needs: build
     runs-on: ubuntu-latest
@@ -240,6 +335,13 @@ jobs:
         with:
           name: freebsd-bins-${{ inputs.release }}
 
+      - name: Restore the package cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .ci-cache/pkg
+          key: freebsd-pkg-${{ inputs.release }}-${{ github.run_id }}
+          restore-keys: freebsd-pkg-${{ inputs.release }}-
+
       - name: TSan tests inside FreeBSD VM
         uses: vmactions/freebsd-vm@v1.4.8
         with:
@@ -247,6 +349,9 @@ jobs:
           copyback: false
           run: |
             set -e
+
+            # the package cache (tests/ci_cache_env.sh): restored before this step, saved by the build job of main
+            . tests/ci_cache_env.sh
 
             echo "::group::📦 [Setup] perl5, sqlite3 (parts 4 to 7 of run_rcu_tsan_test.sh: database zones on SQLite3), the libraries the build linked"
             # libidn2 (dag, --with-idn2=yes) and libpq (karidns-dbloader and karidns-dbloader-tsan have the PostgreSQL driver): the build job has them
@@ -290,6 +395,13 @@ jobs:
         with:
           name: freebsd-bins-${{ inputs.release }}
 
+      - name: Restore the package cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .ci-cache/pkg
+          key: freebsd-pkg-${{ inputs.release }}-${{ github.run_id }}
+          restore-keys: freebsd-pkg-${{ inputs.release }}-
+
       - name: Functional tests inside FreeBSD VM
         uses: vmactions/freebsd-vm@v1.4.8
         with:
@@ -297,6 +409,9 @@ jobs:
           copyback: false
           run: |
             set -e
+
+            # the package cache (tests/ci_cache_env.sh): restored before this step, saved by the build job of main
+            . tests/ci_cache_env.sh
 
             echo "::group::📦 [Setup] Install test dependencies (perl5, sqlite3 for karidns-dbloader and its tests)"
             pkg install -y perl5
@@ -408,6 +523,14 @@ jobs:
         with:
           name: freebsd-bins-${{ inputs.release }}
 
+      - name: Restore the package cache
+        if: steps.paths.outputs.run == 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: .ci-cache/pkg
+          key: freebsd-pkg-${{ inputs.release }}-${{ github.run_id }}
+          restore-keys: freebsd-pkg-${{ inputs.release }}-
+
       - name: Browser tests inside FreeBSD VM
         if: steps.paths.outputs.run == 'true'
         uses: vmactions/freebsd-vm@v1.4.8
@@ -416,6 +539,9 @@ jobs:
           copyback: false
           run: |
             set -e
+
+            # the package cache (tests/ci_cache_env.sh): restored before this step, saved by the build job of main
+            . tests/ci_cache_env.sh
 
             echo "::group::📦 [Setup] perl5, sqlite3, Node.js, PostgreSQL, Firefox and geckodriver"
             # Firefox crashes at the start without a font.  The tests use no network (a profile that talks to nothing, everything on 127.0.0.1): the network is for this step only.

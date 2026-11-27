@@ -34,6 +34,10 @@ jobs:
       fail-fast: false
       matrix:
         release: ['14.4', '15.1']
+    # actions: write: the build job of freebsd.yml saves the package and compiler caches and deletes the older ones (main / schedule / dispatch runs)
+    permissions:
+      contents: read
+      actions: write
     uses: ./.github/workflows/freebsd.yml
     with:
       release: ${{ matrix.release }}
@@ -366,19 +370,47 @@ jobs:
     name: Coverage build (FreeBSD 15.1)
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    # actions: write: the compiler cache is saved and the older one of this ref deleted (main / schedule / dispatch runs only)
+    permissions:
+      contents: read
+      actions: write
+    env:
+      # 1: this run saves the compiler cache (tests/ci_cache_env.sh); a pull request only reads it
+      CI_SAVE_CACHE: ${{ github.event_name != 'pull_request' && '1' || '0' }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
+      # the caches (tests/ci_cache_env.sh) before the VM step: the VM action copies the workspace into the VM when its step starts.  The packages
+      # are the ones the build job of FreeBSD 15.1 saves (freebsd.yml); the compiler cache is this job's own (other flags, other objects)
+      - name: Restore the package cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .ci-cache/pkg
+          key: freebsd-pkg-15.1-${{ github.run_id }}
+          restore-keys: freebsd-pkg-15.1-
+
+      - name: Restore the compiler cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .ci-cache/ccache
+          key: ccache-15.1-cov-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: ccache-15.1-cov-
 
       - name: Instrumented build inside FreeBSD VM
         uses: vmactions/freebsd-vm@v1.4.8
         with:
           release: '15.1'
           copyback: true
+          envs: 'CI_SAVE_CACHE'
           run: |
             set -e
             # everything the build makes is newer than this file (tests/coverage_pack.sh pack: no git in the VM needed)
             touch .cov_stamp
+
+            echo "::group::📦 [Setup] the package and compiler caches (tests/ci_cache_env.sh)"
+            CI_CCACHE=1; . tests/ci_cache_env.sh
+            echo "::endgroup::"
 
             echo "::group::📦 [Setup] perl5, sqlite3, libpq and libidn2"
             # libpq (postgresql17-client) decides the database drivers of the instrumented loader (COV_DB_DRIVERS: sqlite3 and postgresql, config.mk: DBPG_HAVE)
@@ -398,6 +430,7 @@ jobs:
             # (-DKARIDNS_TEST_EVICT).  The loader and karidns-zone have the drivers the suite wants (the same libpq check), so it builds neither
             make zone2sql zone2kdb fetch_backend fake_dbloader < /dev/null
             echo "make coverage-build took $(( $(date +%s) - START ))s"
+            ccache -s
             echo "::endgroup::"
 
             echo "::group::📦 [Pack] the build, for the VMs of coverage-shard and coverage-gate"
@@ -405,6 +438,9 @@ jobs:
             ls -l cov-bins.tar.zst
             sh tests/coverage_pack.sh clean cov-bins.tar.zst
             rm -f .cov_stamp
+            # the copyback carries the compiler cache when this run saves it, never the packages (the build job of 15.1 saves those)
+            rm -rf .ci-cache/pkg .ci-cache/bin
+            [ "$CI_SAVE_CACHE" = 1 ] && du -sh .ci-cache/ccache || rm -rf .ci-cache
             echo "::endgroup::"
 
       - name: Upload the instrumented build
@@ -415,6 +451,19 @@ jobs:
           retention-days: 1
           compression-level: 0
           if-no-files-found: error
+
+      - name: Save the compiler cache
+        if: env.CI_SAVE_CACHE == '1'
+        uses: actions/cache/save@v4
+        with:
+          path: .ci-cache/ccache
+          key: ccache-15.1-cov-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Delete the older compiler caches of this ref
+        if: env.CI_SAVE_CACHE == '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: sh tests/ci_cache_prune.sh "ccache-15.1-cov-"
 
   coverage-shard:
     name: Coverage suite ${{ matrix.shard }}/4 (FreeBSD 15.1)
@@ -435,6 +484,13 @@ jobs:
         with:
           name: cov-bins
 
+      - name: Restore the package cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .ci-cache/pkg
+          key: freebsd-pkg-15.1-${{ github.run_id }}
+          restore-keys: freebsd-pkg-15.1-
+
       - name: Part ${{ matrix.shard }}/4 of the suite inside FreeBSD VM
         uses: vmactions/freebsd-vm@v1.4.8
         with:
@@ -442,6 +498,9 @@ jobs:
           copyback: true
           run: |
             set -e
+
+            # the package cache (tests/ci_cache_env.sh): restored before this step, saved by the build job of main
+            . tests/ci_cache_env.sh
             SHARD=${{ matrix.shard }}
 
             echo "::group::📦 [Setup] perl5 + LLVM tools matching the base clang"
@@ -497,7 +556,7 @@ jobs:
             fi
             ls -l shard-out
             # the build, the raw profiles and the logs stay in the VM (the copyback takes the whole workspace)
-            rm -rf coverage_raw tests/.test_logs signer/node_modules webadmin/node_modules
+            rm -rf coverage_raw tests/.test_logs signer/node_modules webadmin/node_modules .ci-cache
             sh tests/coverage_pack.sh clean cov-bins.tar.zst
             rm -f cov-bins.tar.zst
             echo "::endgroup::"
@@ -542,6 +601,13 @@ jobs:
           path: coverage_shards
           merge-multiple: true
 
+      - name: Restore the package cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .ci-cache/pkg
+          key: freebsd-pkg-15.1-${{ github.run_id }}
+          restore-keys: freebsd-pkg-15.1-
+
       - name: Merge, report and gate inside FreeBSD VM
         uses: vmactions/freebsd-vm@v1.4.8
         with:
@@ -549,6 +615,9 @@ jobs:
           copyback: true
           run: |
             set -e
+
+            # the package cache (tests/ci_cache_env.sh): restored before this step, saved by the build job of main
+            . tests/ci_cache_env.sh
 
             echo "::group::📦 [Setup] perl5 + LLVM tools matching the base clang"
             # Base llvm-cov on FreeBSD 15 aborts in "show"; the llvmNN-lite package
@@ -585,6 +654,7 @@ jobs:
             # the build and the profiles stay in the VM (the copyback takes the whole workspace)
             sh tests/coverage_pack.sh clean cov-bins.tar.zst
             rm -f cov-bins.tar.zst
+            rm -rf .ci-cache
             [ "$GATE" -eq 0 ] && [ "$SUITE" -eq 0 ]
 
       - name: Upload HTML coverage report
