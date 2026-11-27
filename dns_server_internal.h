@@ -1539,7 +1539,8 @@ typedef struct {
   uint64_t evict_yields;                     /* 0.7 attach-align: times a round of sampled detaches let the registry lock go for the attaches that waited for it */
   uint64_t fixed;                            /* 0.7: the zone store's private table bytes, which memory-limit counts before the zones (dbreg_cache_set_fixed()) */
 } dbreg_cache_stats_t;
-void dbreg_cache_set_limit(uint64_t limit);
+void dbreg_cache_set_limit(uint64_t limit);                    /* the unit tests: a limit the manager's write-back leaves until it is set to 0 */
+void dbreg_cache_apply_limit(uint64_t limit);                     /* the manager: memory-limit of the configuration (dns_db_ingest.c) */
 void dbreg_cache_set_fixed(uint64_t bytes);                       /* 0.7: memory that memory-limit counts besides the zones: the zone store's private tables (the store glue, once a second) */
 uint64_t dbreg_cache_limit(void);
 uint32_t dbreg_cache_round(void);

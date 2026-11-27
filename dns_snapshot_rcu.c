@@ -5354,7 +5354,20 @@ STATIC_TEST uint64_t cache_lim_eff(uint64_t lim) {
     const uint64_t fixed = atomic_load_explicit(&g_cache_fixed, memory_order_relaxed), floor = lim / 10;
     return lim - floor > fixed ? lim - fixed : floor;
 }
-void dbreg_cache_set_limit(uint64_t limit) { atomic_store_explicit(&g_cache_limit, limit, memory_order_relaxed); }
+/* The limit in force.  dbreg_cache_apply_limit() is the manager's: memory-limit of the configuration, every 50 ms (dns_db_ingest.c cache_thread) and at the start.  dbreg_cache_set_limit()
+ * (the unit tests) sets one that the manager leaves until it is set to 0: before, the next write-back undid a test's limit at any moment (CI flakes rows 54, 65).  The hold is stored before
+ * the limit and the write-back is a compare-exchange from the value it read before it looked at the hold, so a write-back that began before the hold cannot land after it. */
+static _Atomic bool g_cache_limit_held;
+void dbreg_cache_set_limit(uint64_t limit) {
+  if (limit) atomic_store(&g_cache_limit_held, true);
+  atomic_store(&g_cache_limit, limit);
+  if (!limit) atomic_store(&g_cache_limit_held, false);
+}
+void dbreg_cache_apply_limit(uint64_t limit) {
+  uint64_t cur = atomic_load(&g_cache_limit);
+  if (atomic_load(&g_cache_limit_held) || cur == limit) return;
+  (void)atomic_compare_exchange_strong(&g_cache_limit, &cur, limit);
+}
 uint64_t dbreg_cache_limit(void) { return atomic_load_explicit(&g_cache_limit, memory_order_relaxed); }
 void dbreg_cache_note_miss(void) { atomic_fetch_add_explicit(&g_cache_misses, 1, memory_order_relaxed); }
 

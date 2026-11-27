@@ -5141,7 +5141,7 @@ static void *cache_thread(void *arg) {
     ing_cfg_t c;
     snapshot_cfg(&c);
     uint64_t lim = c.enabled ? c.memory_limit : 0;
-    dbreg_cache_set_limit(lim);
+    dbreg_cache_apply_limit(lim);
     atomic_store_explicit(&g_limit_default, c.enabled && c.limit_default, memory_order_relaxed);
     set_fetch_limits(&c);
     atomic_store_explicit(&g_xfr_timeout_ms, c.xfr_timeout_ms ? c.xfr_timeout_ms : KARIDNS_DB_XFR_FETCH_TIMEOUT_DEFAULT, memory_order_relaxed);
@@ -5512,7 +5512,7 @@ bool db_ingest_start(int stream_fd, int ctrl_fd, int fetch_fd) {
   if (stream_fd >= 0) adopt_stream(g, stream_fd);
   if (fetch_fd >= 0) fetch_adopt(g, fetch_fd);
   park_fetch_set_notify(g->kq);
-  dbreg_cache_set_limit(snap.memory_limit);              /* before the first batch: the startup load already keeps within it */
+  dbreg_cache_apply_limit(snap.memory_limit);              /* before the first batch: the startup load already keeps within it */
   atomic_store_explicit(&g_limit_default, snap.limit_default, memory_order_relaxed);
   if (snap.limit_default) {                          /* 0.7.x: a database block without memory-limit gets one from the RAM (docs/karidns.md, "Memory limit") */
     char t[400];
