@@ -9590,7 +9590,9 @@ static void bulk_presync(store_t *s) {
   if (seg < last + step && seg >= last) return;
   atomic_store_explicit(&s->presync_seg, seg, memory_order_relaxed);
   const uint64_t t0 = st_now_us();
+  wr_lock_raw(s);                                     /* (review #279, 5) io_hold is taken under the writer mutex, as by every other holder: retire_run() frees a segment only when it saw 0 under it */
   atomic_fetch_add_explicit(&s->io_hold, 1, memory_order_acq_rel);
+  wr_unlock_raw(s);
   uint32_t nsegs = (uint32_t)VG(s, V_NSEGS);
   if (nsegs > ST_MAXSEG) nsegs = ST_MAXSEG;
   for (uint32_t n = 1; n <= nsegs; n++) {

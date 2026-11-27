@@ -176,6 +176,7 @@ typedef struct {
   bool nonstore;                         /* ... a secondary or catalog zone (it has a record that only remembers it) */
   bool loader_failed;                    /* the loader answered ZONE_FAILED (not "busy"): the zone is marked refused until its stamp changes */
   bool busy;                             /* the loader answered "busy" (KDB_FETCH_BUSY_REASON): overload, not a failure of the zone: the queries that wait are dropped, not answered SERVFAIL (0.7) */
+  bool timedout;                         /* (review #279, 2) the loader did not answer in time (fetch_expire()): not a read that failed, counted apart (dd_tmo) */
   bool reqfetch;                         /* the fetch of the zone a `karictl reload <zone>` asks for: the answer of the request waits for it */
   /* 0.7, a lookup of a name (FETCH_REQ mode KDB_FETCH_LOOKUP, or LOOKUP_FULL: the body of the zone that is found follows the answer, with the same request id).  `zone` is the name asked for until the answer; a request whose answer has a zone
    * that comes with its body (lkst LKS_BODY) is a fetch of that zone from then on (mode FULL, `zone` the zone), and lk_q is the name the queries wait for (they are woken by it too) */
@@ -305,11 +306,13 @@ typedef struct {
   int64_t dd_start;              /* when the window began (CLOCK_MONOTONIC ms; 0: not begun) */
   uint64_t dd_c0[3];             /* store.park.drop.failed, store.lookup.drop.failed, store.park.drop.timeout at its beginning */
   uint32_t dd_fail, dd_ok;       /* reads that failed / ended well in the window */
+  uint32_t dd_tmo;               /* (review #279, 2) requests the loader did not answer in time in the window (fetch_expire()): the loader is behind, the database may be fine */
   bool dd_nolink;                /* the loader was not connected at some time in the window */
   bool dd_warned;                /* the WARNING of one failed fetch was written in the window */
   bool dd_reported;              /* the last line said the queries were dropped (the NOTICE of a window whose last read ended well says that is over) */
   bool dd_last_ok;               /* the last read (since the start) ended well */
   uint32_t fs_done;              /* 0.7 first-fill latency: bodies of the fill that came in the window of dd_tick() (a window without one while the fill has work: a stall) */
+  uint32_t fs_fail;              /* (review #279, 4) bodies of the fill that failed in the window (busy, lost, unread): a window without progress is then not the queries' doing */
   bool fs_reported;              /* the last window said the fill stalled (the next one with progress says it goes on) */
   char dd_why[KDB_REASON_LEN];   /* the reason of the last failed read */
   bool rf_has;                   /* what the job of the request fetch became (fetch_job_finish() to fetch_complete()) */
@@ -1701,6 +1704,7 @@ static void qf_hist_add(int64_t ns) {
   if (ns > 0 && (uint64_t)ns > atomic_load_explicit(&g_qf_max_ns, memory_order_relaxed)) atomic_store_explicit(&g_qf_max_ns, (uint64_t)ns, memory_order_relaxed);
 }
 static _Atomic uint64_t g_fill_stalls;                     /* 0.7 first-fill latency: windows of dd_tick() in which the fill had work and no body of it came (store.ingest.fill_stalled_windows) */
+static _Atomic uint64_t g_fill_failed_windows;             /* (review #279, 4) windows in which the fill made no progress because its reads failed or a failed round waited (store.ingest.fill_failed_windows) */
 
 /* ---- 0.7 first-fill latency (W3): a database that cannot be read ----
  * The queries whose data cannot be read are not answered (never SERVFAIL while the data is being loaded, DNS_NR_DROP) and are counted (store.park.drop.failed, store.lookup.drop.failed; a
@@ -1737,8 +1741,11 @@ static void dd_tick(ing_t *g, int64_t now) {
   const long long secs = (long long)((now - g->dd_start + 500) / 1000);
   if (failed + lkfailed > 0 || (g->dd_nolink && timeout > 0)) {
     if (g->dd_fail > 0)
-      syslog(LOG_WARNING, "[DB] %llu queries were not answered in the last %lld s: %u reads of the database failed (the last: %s); store.park.drop.failed %llu, store.lookup.drop.failed %llu, store.park.drop.timeout %llu",
-             (unsigned long long)(failed + lkfailed + timeout), secs, g->dd_fail, g->dd_why, (unsigned long long)failed, (unsigned long long)lkfailed, (unsigned long long)timeout);
+      syslog(LOG_WARNING, "[DB] %llu queries were not answered in the last %lld s: %u reads of the database failed (the last: %s), %u requests were not answered by the loader in time; store.park.drop.failed %llu, store.lookup.drop.failed %llu, store.park.drop.timeout %llu",
+             (unsigned long long)(failed + lkfailed + timeout), secs, g->dd_fail, g->dd_why, g->dd_tmo, (unsigned long long)failed, (unsigned long long)lkfailed, (unsigned long long)timeout);
+    else if (g->dd_tmo > 0 && !g->dd_nolink)                 /* (review #279, 2: requests that timed out are not reads that failed: the loader is behind) */
+      syslog(LOG_WARNING, "[DB] %llu queries were not answered in the last %lld s: the loader did not answer %u requests in time (it is behind; no read of the database failed); store.park.drop.failed %llu, store.lookup.drop.failed %llu, store.park.drop.timeout %llu",
+             (unsigned long long)(failed + lkfailed + timeout), secs, g->dd_tmo, (unsigned long long)failed, (unsigned long long)lkfailed, (unsigned long long)timeout);
     else
       syslog(LOG_WARNING, "[DB] %llu queries were not answered in the last %lld s: %s; store.park.drop.failed %llu, store.lookup.drop.failed %llu, store.park.drop.timeout %llu",
              (unsigned long long)(failed + lkfailed + timeout), secs, g->dd_nolink ? "the loader was not connected" : "the data of their zones could not be read",
@@ -1752,18 +1759,27 @@ static void dd_tick(ing_t *g, int64_t now) {
   /* 0.7 first-fill latency: the fill waits while queries take the loader (queries first, fq_pick()); a window in which the fill has work and no body of it came is a stall: counted, and said
    * once a window; the fill goes on by itself when the queries leave the loader a worker, which a NOTICE says */
   if (g->bg_on && g->fetch_fd >= 0 && g->fs_done == 0) {
-    atomic_fetch_add_explicit(&g_fill_stalls, 1, memory_order_relaxed);
-    syslog(LOG_WARNING, "[DB] the fill of the store made no progress in the last %lld s: the queries take the loader first (%u fetches of queries and %u lookups waiting, %u in flight); it goes on when they leave it room (store.ingest.fill_stalled_windows)",
-           secs, g->nwq, g->nlq, g->nfreq);
+    /* (review #279, 4) not the queries' doing when the fill's own reads failed in the window, or a failed round waits before it is made again (bg_retry_ms), or reads of the database
+     * failed: counted and said apart */
+    const bool failing = g->fs_fail > 0 || g->dd_fail > 0 || (g->bg_retry_ms && now < g->bg_retry_ms);
+    if (failing) {
+      atomic_fetch_add_explicit(&g_fill_failed_windows, 1, memory_order_relaxed);
+      syslog(LOG_WARNING, "[DB] the fill of the store made no progress in the last %lld s: its reads failed or are paused (%u bodies of the fill failed, %u reads of the database failed, %u requests not answered in time); a failed round is made again (store.ingest.fill_failed_windows)",
+             secs, g->fs_fail, g->dd_fail, g->dd_tmo);
+    } else {
+      atomic_fetch_add_explicit(&g_fill_stalls, 1, memory_order_relaxed);
+      syslog(LOG_WARNING, "[DB] the fill of the store made no progress in the last %lld s: the queries take the loader first (%u fetches of queries and %u lookups waiting, %u in flight); it goes on when they leave it room (store.ingest.fill_stalled_windows)",
+             secs, g->nwq, g->nlq, g->nfreq);
+    }
     g->fs_reported = true;
   } else if (g->fs_reported && g->fs_done > 0) {
     syslog(LOG_NOTICE, "[DB] the fill of the store goes on (%u bodies in the last %lld s)", g->fs_done, secs);
     g->fs_reported = false;
   }
-  g->fs_done = 0;
+  g->fs_done = g->fs_fail = 0;
   g->dd_start = now;
   memcpy(g->dd_c0, c, sizeof(c));
-  g->dd_fail = g->dd_ok = 0;
+  g->dd_fail = g->dd_ok = g->dd_tmo = 0;
   g->dd_nolink = g->fetch_fd < 0;
   g->dd_warned = false;
 }
@@ -1830,6 +1846,7 @@ bool db_ingest_lookup_stats(store_lookup_t *out) {
   out->jw_slices = atomic_load_explicit(&g_ing_jw_slices, memory_order_relaxed);
   out->fill_throttled = atomic_load_explicit(&g_fill_throttled, memory_order_relaxed);
   out->fill_stalls = atomic_load_explicit(&g_fill_stalls, memory_order_relaxed);
+  out->fill_failed_windows = atomic_load_explicit(&g_fill_failed_windows, memory_order_relaxed);
   out->remembered = park_shed_remembered();
   out->reask_suppressed = park_cnt_get(PARK_CNT_LK_REMEMBERED);
   out->remember_releases = park_shed_releases();
@@ -3730,6 +3747,14 @@ static ing_freq_t *fetch_find_zone(ing_t *g, uint16_t view, const char *zone, ui
     if (g->freq[i].active && g->freq[i].zh == zh && g->freq[i].view == view && g->freq[i].mode == mode && domain_names_match_ci(g->freq[i].zone, zone)) return &g->freq[i];
   return NULL;
 }
+/* 0.7 first-fill latency (review #279, 1): a request of the whole zone that is not a body of the fill, on its way for the zone of r (a query's own request, which does not join the fill's body) */
+static bool fetch_other_full(ing_t *g, const ing_freq_t *r) {
+  for (uint32_t i = 0; i < ING_FETCH_MAX; i++) {
+    const ing_freq_t *e = &g->freq[i];
+    if (e != r && e->active && !e->bulk && e->zh == r->zh && e->view == r->view && e->mode == KDB_FETCH_FULL && domain_names_match_ci(e->zone, r->zone)) return true;
+  }
+  return false;
+}
 
 /* 0.7 WP7b: the stamp of the store's record of the zone (and its domain id, when the request has none) at the time of the request: the body that comes is installed only while the record has it */
 static void freq_stamp(ing_freq_t *r, const char *view, const char *zone) {
@@ -4058,7 +4083,8 @@ static void lookup_offer(ing_t *g, const park_fetch_req_t *q, int vi) {
 static void fetch_complete(ing_t *g, ing_freq_t *r, bool ok, const char *why) {
   ing_freq_t done = *r;
   r->active = false;
-  if (!done.busy && !done.quiet) dd_note(g, ok, why);    /* (0.7 first-fill latency: the reads that failed, for the line of dd_tick(); "busy" is overload, not a database that cannot be read) */
+  if (done.timedout) g->dd_tmo++;                         /* (review #279, 2: the loader is behind; the request may still be in its queue, which drops it at its age, fq_drop_stale()) */
+  else if (!done.busy && !done.quiet) dd_note(g, ok, why);    /* (0.7 first-fill latency: the reads that failed, for the line of dd_tick(); "busy" is overload, not a database that cannot be read) */
   if (done.placed) park_place_give();                    /* (B2 W5: the one place of the fetch goes back, whichever way it ended: installed, failed, dropped, the loader gone) */
   g->nfreq--;
   atomic_store_explicit(&g_fq_inflight, g->nfreq, memory_order_relaxed);
@@ -4073,8 +4099,12 @@ static void fetch_complete(ing_t *g, ing_freq_t *r, bool ok, const char *why) {
   }
   if (ok) fq_hist_add(now_ms() - done.sent_ms);
   if (ok && !done.bulk && done.prio == KDB_FETCH_PRIO_QUERY) qf_hist_add((now_ms() - done.sent_ms) * 1000000LL);      /* (0.7 first-fill latency: the time of a query's fetch, store.fetch.query.rtt.*) */
+  /* (review #279, 1) a body of the fill whose zone a query asks for itself (its own request, the fill's body does not stand in for it): the zone's state (LOADING, or the element of a zone of
+   * the store) is the query's request's, and so are the queries that wait; the end of that request ends it and wakes them, whatever became of the fill's body (a body that failed must not
+   * drop queries that their own read answers) */
+  const bool shadowed = done.bulk && done.mode == KDB_FETCH_FULL && fetch_other_full(g, r);
   if (done.mode != KDB_FETCH_SUMMARY) {
-    dbreg_fetch_end(done.view_name, done.zone);
+    if (!shadowed) dbreg_fetch_end(done.view_name, done.zone);
   } else {                                               /* (a summary is not a fetch of the data: it took no LOADING state) */
     g->nsum--;
     atomic_fetch_add_explicit(&g_apex_answered, 1, memory_order_relaxed);
@@ -4100,6 +4130,7 @@ static void fetch_complete(ing_t *g, ing_freq_t *r, bool ok, const char *why) {
       g->fs_done++;                                      /* (0.7 first-fill latency: the fill moved in this window, dd_tick()) */
     } else {
       db_recon_note_fetch(DBR_FETCH_FAILED, 1);
+      g->fs_fail++;                                      /* (review #279, 4: a window without progress because the fill's reads fail is said as such, dd_tick()) */
       if (!done.loader_failed) g->bg_fail++;             /* (a busy or lost loader: the round is made again; a zone the loader cannot read is marked refused below) */
       if (done.nonstore && !done.loader_failed) db_recon_scan_retry(done.bzid);
     }
@@ -4137,7 +4168,7 @@ static void fetch_complete(ing_t *g, ing_freq_t *r, bool ok, const char *why) {
     else park_wake_queue_all(done.view_name, done.zone, !ok);
     if (!same) park_wake_queue_claim(done.view_name, done.lk_q, done.ckey, !ok && !shed, shed ? PARK_ASK_DROP : 0);
     if (done.ckey) park_claim_clear(done.ckey);
-  } else if (!done.quiet) {
+  } else if (!done.quiet && !shadowed) {
     if (shed) park_wake_queue_drop_all(done.view_name, done.zone);
     else park_wake_queue_all(done.view_name, done.zone, !ok);      /* (the triggers go out together, park_wake_flush())  */
   }
@@ -4247,8 +4278,10 @@ static void fetch_expire(ing_t *g) {
   if (g->nfreq == 0) return;
   int64_t now = now_ms();
   for (uint32_t i = 0; i < ING_FETCH_MAX; i++)
-    if (g->freq[i].active && now - g->freq[i].sent_ms >= g_ing_fetch_timeout_ms)
+    if (g->freq[i].active && now - g->freq[i].sent_ms >= g_ing_fetch_timeout_ms) {
+      g->freq[i].timedout = true;
       fetch_complete(g, &g->freq[i], false, "the loader did not answer in time");
+    }
 }
 
 /* the requests the workers have pushed since the last time */

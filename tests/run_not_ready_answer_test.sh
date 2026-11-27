@@ -45,6 +45,7 @@ options {
     $1
 };
 control-channel { socket "$T/ctl.sock"; secret "$SECRET"; };
+logging { channel r { file "$T/r.log"; }; category responses { r; }; };
 zone "pri.test" { type master; file "pri.test.zone"; };
 zone "sec.test" { type slave; masters { 127.0.0.1 port $DEAD; }; primary-settings no; file "sec.test.zone"; };
 EOF
@@ -69,6 +70,23 @@ D0=$(dropped); D0=${D0:-0}
 D1=$(dropped)
 [ "${D1:-0}" -gt "$D0" ] 2>/dev/null && pass "counted: karidns_not_ready_dropped_total $D0 -> $D1" || fail "karidns_not_ready_dropped_total stays ${D1:-?}"
 ./dag @127.0.0.1 -p "$P" www.pri.test A +short +nohexdump +time=2 +tries=1 | grep -q 192.0.2.80 && pass "the primary zone is answered meanwhile" || fail "the primary zone is not answered"
+# (review #279, 3) the responses log says why it was not answered (not "<malformed>"), and over TCP the connection stays open after the dropped message (tcp-connection-reuse no, the default)
+kari_wait_log "$T/r.log" "www.sec.test.*DROP:NOT-READY" 5 && ! grep -q "<malformed>" "$T/r.log" \
+    && pass "the responses log names the query and says it was not answered as not ready ($(grep -m1 'DROP:NOT-READY' "$T/r.log" | sed 's/.*response: //'))" \
+    || { fail "responses log:"; sed 's/^/    /' "$T/r.log" | tail -5; }
+perl -MIO::Socket::INET -e '
+    my $s = IO::Socket::INET->new(PeerAddr => "127.0.0.1", PeerPort => $ARGV[0], Proto => "tcp", Timeout => 3) or exit 2;
+    sub msg { my ($id, $name) = @_; my $m = pack("nnnnnn", $id, 0x0100, 1, 0, 0, 0); $m .= pack("C", length $_) . $_ for split /\./, $name; $m .= "\0" . pack("nn", 1, 1); return pack("n", length $m) . $m; }
+    sub rd { my ($t) = @_; my $rin = ""; vec($rin, fileno($s), 1) = 1; return select(my $r = $rin, undef, undef, $t); }
+    syswrite($s, msg(1, "www.sec.test"));
+    if (rd(1.5) > 0) { my $n = sysread($s, my $b, 2); exit($n ? 3 : 4); }   # (3: answered; 4: the server closed the connection)
+    syswrite($s, msg(2, "www.pri.test"));
+    rd(3) > 0 or exit 5;
+    my $h = ""; while (length $h < 2) { my $n = sysread($s, $h, 2 - length $h, length $h); exit 6 unless $n; }
+    my $len = unpack("n", $h); my $m = ""; while (length $m < $len) { my $n = sysread($s, $m, $len - length $m, length $m); exit 6 unless $n; }
+    my ($id, $fl) = unpack("nn", $m); exit(($id == 2 && ($fl & 0x0F) == 0) ? 0 : 7);
+' "$P"; rc=$?
+[ "$rc" = 0 ] && pass "TCP: the query for the secondary is dropped and the connection stays open: the next query on it is answered" || fail "TCP: exit $rc (3: answered, 4: closed, 5-7: no answer to the next query)"
 ./dag @127.0.0.1 -p "$P" sec.test AXFR +nohexdump +time=5 +tries=1 > "$T/x.out" 2>&1
 grep -q 'Transfer failed' "$T/x.out" && kari_wait_log "$T/srv.log" "the zone has no data yet (SERVFAIL, Not Ready)" 5 \
     && pass "an AXFR of the secondary gets SERVFAIL + EDE 14 (a transfer is not an ordinary query)" || { fail "AXFR:"; sed 's/^/    /' "$T/x.out" | head -8; }

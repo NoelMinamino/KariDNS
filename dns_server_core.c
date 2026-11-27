@@ -1087,6 +1087,13 @@ void submit_response_log(log_action_t action, const char *client_ip, int client_
     // データ書き込み完了をConsumerに通知
     atomic_store_explicit(&entry->ready, true, memory_order_release);
 }
+
+/* (review #279, 3) the log of a query that got no answer: one that is not answered while the data of its zone is being loaded (DNS_NR_DROP: a database zone, a secondary before its
+ * first transfer) is said as such, with its name and type; anything else is a message that could not be answered (malformed) */
+static void submit_unanswered_log(int res_len, const char *client_ip, int client_port, const char *qname, uint16_t qclass, uint16_t qtype, bool has_edns, bool dnssec_ok) {
+  if (res_len == DNS_NR_DROP) submit_response_log(LOG_ACT_DROP_NOT_READY, client_ip, client_port, qname, qclass, qtype, 2, has_edns, dnssec_ok);
+  else submit_response_log(LOG_ACT_DROP_MALFORMED, client_ip, client_port, "<malformed>", 0, 0, 0, false, false);
+}
 void escape_qname_for_log(const char *src, char *dst, size_t dst_size) {
   if (!dst || dst_size == 0) return;
   if (!src) {
@@ -1384,6 +1391,7 @@ void *response_logger_thread_func(void *arg) {
                 const char *action_str = "";
                 if (entry->action == LOG_ACT_DROP_RRL) action_str = " [DROP:RRL]";
                 else if (entry->action == LOG_ACT_DROP_MALFORMED) action_str = " [DROP:MALFORMED]";
+                else if (entry->action == LOG_ACT_DROP_NOT_READY) action_str = " [DROP:NOT-READY]";
 
                 char safe_qname[512];
                 escape_qname_for_log(entry->qname, safe_qname, sizeof(safe_qname));
@@ -2606,8 +2614,7 @@ STATIC_TEST void *async_io_worker_func(void *arg) {
                               task.qclass, task.qtype, res_buf[3] & 0x0F, task.has_edns, task.dnssec_ok);
         }
       } else {
-        submit_response_log(LOG_ACT_DROP_MALFORMED, task.client_ip, task.client_port, "<malformed>",
-                            0, 0, 0, false, false);
+        submit_unanswered_log(res_len, task.client_ip, task.client_port, task.qname, task.qclass, task.qtype, task.has_edns, task.dnssec_ok);
       }
       rcu_slot_reader_exit(&g_async_io_rcu_ctxs[thread_idx]);
       release_zone_snapshot(task.snap);
@@ -2627,8 +2634,7 @@ STATIC_TEST void *async_io_worker_func(void *arg) {
           submit_response_log(LOG_ACT_SENT, task.client_ip, task.client_port, task.qname, task.qclass, task.qtype,
                               tcp_res[3] & 0x0F, task.has_edns, task.dnssec_ok);
         } else {
-          submit_response_log(LOG_ACT_DROP_MALFORMED, task.client_ip, task.client_port, "<malformed>",
-                              0, 0, 0, false, false);
+          submit_unanswered_log(res_len, task.client_ip, task.client_port, task.qname, task.qclass, task.qtype, task.has_edns, task.dnssec_ok);
         }
         rcu_slot_reader_exit(&g_async_io_rcu_ctxs[thread_idx]);
         release_zone_snapshot(task.snap);
@@ -3371,15 +3377,17 @@ STATIC_TEST void udp_one(udp_pass_t *w, udp_ipc_t *ipc_msg, uint8_t *req_buf, ss
               res_len = process_dns_not_ready_routed(req_buf, payload_received, res_buf, UDP_DEFAULT_MAX_RES_LEN,
                                                      UDP_IPC_BUFFER_SIZE - sizeof(udp_ipc_t), qname,
                                                      qtype, client_ip, &(*w->cc), false, &rrl_cfg, snap, &route, &pel, false);
-              if (res_len == DNS_NR_DROP) {               /* 0.7 first-fill latency: an ordinary query is not answered SERVFAIL while its data is being loaded: dropped, counted (a failed lookup was counted at its wake-up) */
-                if (!w->lookup_failed) park_cnt_note(PARK_CNT_ZONE_FAILED);
-                rcu_reader_exit(ctx);
-                return;
-              }
             } else {
               res_len = process_dns_query_cap_routed(req_buf, payload_received, res_buf, UDP_DEFAULT_MAX_RES_LEN,
                                                      UDP_IPC_BUFFER_SIZE - sizeof(udp_ipc_t), qname,
                                                      qtype, client_ip, &(*w->cc), false, &rrl_cfg, snap, &route);
+            }
+            if (res_len == DNS_NR_DROP) {                 /* 0.7 first-fill latency: an ordinary query is not answered SERVFAIL while its data is being loaded (a database zone, counted: a failed lookup was counted at
+                                                           * its wake-up; a secondary before its first transfer, review #279, 3): dropped and logged as such */
+              if (not_ready && !w->lookup_failed) park_cnt_note(PARK_CNT_ZONE_FAILED);
+              if (rlog_enabled) submit_unanswered_log(res_len, client_ip, client_port, qname, qclass, qtype, has_edns, dnssec_ok);
+              rcu_reader_exit(ctx);
+              return;
             }
             if (res_len > 0) {
               bool drop_packet = false;
@@ -4786,16 +4794,18 @@ process_tcp_client: ;
               res_len = process_dns_not_ready_routed(msg, msg_len, tcp_res_buf, 65535, 0,
                                                      qname, qtype, ctx_tcp->client_ip,
                                                      &thread_compress_ctx, true, NULL, snap, &route, &pel, false);
-              if (res_len == DNS_NR_DROP) {               /* 0.7 first-fill latency: not answered SERVFAIL while its data is being loaded: the message is dropped and counted, the connection stays open (as tcp_drop_message() says) */
-                if (!lk_failed_tcp) park_cnt_note(PARK_CNT_ZONE_FAILED);
-                tcp_drop_message(ctx_tcp);
-                rcu_reader_exit(ctx);
-                continue;
-              }
             } else {
               res_len = process_dns_query_cap_routed(msg, msg_len, tcp_res_buf, 65535, 0,
                                                      qname, qtype, ctx_tcp->client_ip,
                                                      &thread_compress_ctx, true, NULL, snap, &route);
+            }
+            if (res_len == DNS_NR_DROP) {                 /* 0.7 first-fill latency: not answered SERVFAIL while its data is being loaded (a database zone, counted; a secondary before its first transfer, review #279, 3):
+                                                           * the message is dropped and logged as such, and the connection stays open (as tcp_drop_message() says), whatever tcp-connection-reuse says */
+              if (not_ready && !lk_failed_tcp) park_cnt_note(PARK_CNT_ZONE_FAILED);
+              submit_unanswered_log(res_len, ctx_tcp->client_ip, client_port, qname, qclass, qtype, has_edns, dnssec_ok);
+              tcp_drop_message(ctx_tcp);
+              rcu_reader_exit(ctx);
+              continue;
             }
             if (res_len > 0) {
               submit_response_log(LOG_ACT_SENT, ctx_tcp->client_ip, client_port, qname, qclass, qtype,
@@ -4803,8 +4813,7 @@ process_tcp_client: ;
               write_dnstap_event(ctx, 2 /*AUTH_RESPONSE*/, tcp_res_buf, res_len, &ctx_tcp->client_addr, ctx_tcp->client_len,
                                  ctx_tcp->has_server_addr ? &ctx_tcp->server_addr : NULL, ctx_tcp->has_server_addr, IPPROTO_TCP);
             } else {
-              submit_response_log(LOG_ACT_DROP_MALFORMED, ctx_tcp->client_ip, client_port, "<malformed>",
-                                  0, 0, 0, false, false);
+              submit_unanswered_log(res_len, ctx_tcp->client_ip, client_port, qname, qclass, qtype, has_edns, dnssec_ok);
             }
             /* the configuration is read in the read section only (config_standby_reap()) */
             server_config_t *cfg = acquire_config_snapshot();

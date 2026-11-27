@@ -3047,6 +3047,8 @@ static int g_pasked[PN + 16];                                           /* FETCH
 static int g_pprio[PN + 16];
 static int64_t g_psid[PN + 16];
 static int g_pother;                                                    /* requests for names that are not mNNNN */
+static int g_ffl_shadow = -1;                                           /* (review #279, 1) the zone of A1 whose body of the fill failed while the query's own request was on its way */
+bool dbreg_test_loading(const char *view, const char *zone);   /* (dns_snapshot_rcu.c, KARIDNS_UNIT_TEST) */
 static char g_pothername[16][64];
 
 /* answer the FETCH_REQs that arrive within `ms` of silence (the loader of the store protocol: the body of every zone asked for); returns how many were answered.  skip: leave the answer out of
@@ -3589,6 +3591,59 @@ static int run_proto(int phase, const char *dir) {
                 g_psid[zi] = rq1[i].sid;
                 send_zone(f[0], &e, rq1[i].name, g_pserial[zi] ? g_pserial[zi] : 1, rq1[i].id, rq1[i].sid);
             }
+            /* (review #279, 1) a query for a zone whose body of the fill is on its way makes its own request; the fill's body fails (the loader is busy): the queries of the zone are not dropped
+             * for it, the zone stays the query's (LOADING), and the query's own body answers them */
+            int hzi = nheld - 1;                                                             /* (a held body of a zone no query of A1 asks for: 2000..2039 are the queries') */
+            while (hzi >= 0 && pn_index(held[hzi].name) >= 2000 && pn_index(held[hzi].name) < 2000 + NQ1) hzi--;
+            CHECK(hzi >= 0);
+            if (hzi >= 0) {
+                req1_t hzc = held[hzi];
+                held[hzi] = held[--nheld];
+                req1_t *hz = &hzc;
+                const int zz = pn_index(hz->name);
+                drain_wakes();
+                CHECK(park_fetch_request(0, "default", hz->name, KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL));
+                uint64_t qid = 0;
+                int64_t qsid = 0;
+                struct timespec u0, u1;
+                clock_gettime(CLOCK_MONOTONIC, &u0);
+                do {                                                                             /* (the query's own request comes; the fill's others are answered meanwhile) */
+                    if (ch_next(&fetchc, &m, 20) && m.type == KDB_T_FETCH_REQ) {
+                        const int zi = pn_index(m.u.fetch_req.name);
+                        if (zi == zz && m.u.fetch_req.priority == KDB_FETCH_PRIO_QUERY) {
+                            qid = m.u.fetch_req.request_id;
+                            qsid = m.u.fetch_req.source_id;
+                        } else if (zi >= 0 && zi < PN && m.u.fetch_req.priority == KDB_FETCH_PRIO_QUERY) {        /* (the other queries of A1 that waited for a place: answered, so the places go round) */
+                            g_pasked[zi]++;
+                            g_pprio[zi] = m.u.fetch_req.priority;
+                            g_psid[zi] = m.u.fetch_req.source_id;
+                            send_zone(f[0], &e, m.u.fetch_req.name, g_pserial[zi] ? g_pserial[zi] : 1, m.u.fetch_req.request_id, m.u.fetch_req.source_id);
+                        } else if (zi >= 0 && zi < PN && nheld < (int)(sizeof(held) / sizeof(held[0]))) {    /* (held back with the others: answered after the loop) */
+                            req1_t *h = &held[nheld++];
+                            snprintf(h->name, sizeof(h->name), "%s", m.u.fetch_req.name);
+                            h->id = m.u.fetch_req.request_id;
+                            h->sid = m.u.fetch_req.source_id;
+                            h->prio = m.u.fetch_req.priority;
+                        }
+                    }
+                    clock_gettime(CLOCK_MONOTONIC, &u1);
+                } while (qid == 0 && (u1.tv_sec - u0.tv_sec) * 1000 + (u1.tv_nsec - u0.tv_nsec) / 1000000 < 3000);
+                CHECK_MSG(qid != 0, "no request of the query for %s, whose body of the fill is on its way", hz->name);
+                kdb_enc_begin(&e, KDB_T_ZONE_FAILED);                                            /* (the fill's body: the loader was busy) */
+                kdb_enc_u16(&e, 1, 0); kdb_enc_name(&e, 2, hz->name); kdb_enc_i64(&e, 3, hz->sid); kdb_enc_str(&e, 4, KDB_FETCH_BUSY_REASON); kdb_enc_u64(&e, 5, hz->id);
+                kdb_enc_end(&e);
+                ch_send(f[0], &e);
+                CHECK_MSG(!wake_for(hz->name, &k, 400), "the failed body of the fill woke the queries of %s (failed=%d retry=%d)", hz->name, (int)k.failed, (int)k.retry);
+                CHECK(dbreg_test_loading("default", hz->name));                                    /* (the zone is still the query's: LOADING, its element of the fetch is kept) */
+                if (qid) {
+                    g_pasked[zz]++;
+                    g_pprio[zz] = KDB_FETCH_PRIO_QUERY;
+                    g_psid[zz] = qsid;
+                    send_zone(f[0], &e, hz->name, g_pserial[zz] ? g_pserial[zz] : 1, qid, qsid);
+                    CHECK(wake_for(hz->name, &k, 5000) && !k.failed && !k.retry);              /* (the query's own body answers it) */
+                }
+                g_ffl_shadow = zz;
+            }
             for (int i = 0; i < nheld; i++) {                                                 /* (and the bodies of the fill that were held back) */
                 const int zi = pn_index(held[i].name);
                 g_pasked[zi]++;
@@ -3600,7 +3655,7 @@ static int run_proto(int phase, const char *dir) {
         /* a query for a zone that is known and has no body goes to the fetch queue (priority 0, with the domain id) and is answered */
         drain_wakes();
         CHECK(park_fetch_request(0, "default", "m4000.test.", KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL));
-        int n = serve_fetches(&fetchc, f[0], &e, 1500, -1, -1);
+        int n = serve_fetches(&fetchc, f[0], &e, g_ffl_shadow >= 0 ? 7000 : 1500, -1, -1);      /* (review #279, 1: the fill's round with a body that failed is made again after 5 s) */
         CHECK(n > 0);                                                  /* (the rest of the fill: what A1 answered is not in the count; wait_stored() and `bad` below check that every zone came, once) */
         CHECK(wake_for("m4000.test.", &k, 5000) && !k.failed && !k.retry);
         CHECK(g_pprio[4000] == 0 && g_psid[4000] == p_sid(4000));       /* (asked for by the query, and with the id the record holds) */
@@ -3614,7 +3669,7 @@ static int run_proto(int phase, const char *dir) {
             CHECK(zrec(st, "m0010.test", &z) && z.state == STORE_STATE_STORED && z.serial == 1 && z.stamp_gen == 1 && z.stamp_time == 10 && !(z.flags & STORE_F_STALE));
         }
         int bad = 0;
-        for (int i = 0; i < PN; i++) bad += g_pasked[i] != 1;
+        for (int i = 0; i < PN; i++) bad += g_pasked[i] != 1 && !(i == g_ffl_shadow && g_pasked[i] == 2);   /* (review #279, 1: the zone whose fill body failed may be asked again by the fill's next round) */
         CHECK(bad == 0);                                                 /* (every zone was asked for once) */
 
         /* -- B. changes: a new stamp, the same stamp, an unstamped zone, a forced one, deletes by id and by name, a rename */

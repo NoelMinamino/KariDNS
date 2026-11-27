@@ -209,6 +209,10 @@ awk -v n=40000 -v hi="$NZ" 'BEGIN { srand(77); for (i = 0; i < n; i++) printf "z
 FS=$(sf store.ingest.fill_stalled_windows)
 [ "${FS:-0}" -ge 1 ] && grep -q 'the fill of the store made no progress' "$T/a.log" && pass "the flood stalled the fill: counted (store.ingest.fill_stalled_windows $FS) and said ($(grep -c 'made no progress' "$T/a.log") lines)" \
     || fail "no stall seen: store.ingest.fill_stalled_windows ${FS:-?}, stored $(sf store.zones.stored); $(grep 'fetch reads in' "$T/a.log" | tail -1)"
+FF=$(sf store.ingest.fill_failed_windows)
+[ "${FF:-x}" = 0 ] && grep -q 'made no progress.*the queries take the loader first' "$T/a.log" && ! grep -q 'made no progress.*its reads failed' "$T/a.log" \
+    && pass "the stall is said to be the queries' (store.ingest.fill_failed_windows 0: no read of the fill failed)" \
+    || fail "the stall is not told apart: store.ingest.fill_failed_windows ${FF:-?}; $(grep 'made no progress' "$T/a.log" | tail -1)"
 waitfor 30 grep -q 'the fill of the store goes on' "$T/a.log" && pass "the NOTICE that the fill goes on" || fail "no NOTICE that the fill goes on"
 waitfor "$MAXS" stored_all && pass "the fill went on to the end: the store holds all $NZ zones" || fail "the fill did not end: $(sf store.zones.stored) of $NZ zones"
 stop_srv

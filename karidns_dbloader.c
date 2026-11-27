@@ -5262,6 +5262,7 @@ static int hot_run(ctx_t *x, struct lio *io) {
     return send_enc(x);
 }
 
+static size_t fq_drop_stale(struct lio *io, int64_t now);
 static void io_dispatch(struct lio *io, const kdb_frame_t *fr) {
     kdb_msg_t m;
     char why[KDB_REASON_LEN];
@@ -5281,6 +5282,7 @@ static void io_dispatch(struct lio *io, const kdb_frame_t *fr) {
         const kdb_fetch_req_t *q = &m.u.fetch_req;
         freq_t *f = NULL;
         pthread_mutex_lock(&io->fq_lock);                      /* (only the fetch stream gets a FETCH_REQ, and its lock is initialised) */
+        if (io->nfq == FQ_MAX) (void)fq_drop_stale(io, now_ms());      /* (review #279, 2: the requests of the fill the Backend gave up make room first) */
         if (io->nfq < FQ_MAX) f = &io->fq[io->nfq++];
         else if (io->nfbusy < sizeof(io->fbusy) / sizeof(io->fbusy[0])) f = &io->fbusy[io->nfbusy++];
         else io->fq_busy++;                                    /* beyond even that: the Backend's request times out */
@@ -6013,6 +6015,26 @@ static size_t fq_fg_cap(const struct lio *io) {          /* (fq_lock held) */
 static size_t fq_bg_cap(size_t workers, bool fg_recent) {
     return workers <= 1 && fg_recent ? FETCH_BATCH_MAX : FETCH_BG_BATCH_MAX;
 }
+/* (review #279, 2) a request of the fill that waited in the queue as long as the Backend waits for an answer (its g_ing_fetch_timeout_ms, 30 s) is not read: the Backend has given it up
+ * and asks again for the zone, so it would only take a read of the database and a place of the queue (a long flood of queries kept up to FQ_MAX of them, and the requests of queries were
+ * then answered busy).  The requests are in arrival order: the first request of the fill is its oldest.  Drops them (fq_lock held) and returns how many. */
+#define FQ_BG_STALE_MS 30000
+static _Atomic uint64_t g_fq_stale;                        /* requests of the fill dropped for their age, since the start */
+static size_t fq_drop_stale(struct lio *io, int64_t now) {
+    size_t i = 0;
+    while (i < io->nfq && io->fq[i].prio < KDB_FETCH_PRIO_BACKGROUND) i++;
+    if (i == io->nfq || now - io->fq[i].at < FQ_BG_STALE_MS) return 0;
+    const size_t n0 = io->nfq;
+    size_t j = i;
+    for (; i < n0; i++) {
+        if (io->fq[i].prio >= KDB_FETCH_PRIO_BACKGROUND && now - io->fq[i].at >= FQ_BG_STALE_MS) continue;
+        if (j != i) io->fq[j] = io->fq[i];
+        j++;
+    }
+    io->nfq = j;
+    atomic_fetch_add_explicit(&g_fq_stale, n0 - j, memory_order_relaxed);
+    return n0 - j;
+}
 /* may a worker take a request now: one of a query (or the warm-up, a lookup), or one of the fill while fewer than fq_bg_limit() workers read the fill (fq_lock held) */
 static bool fq_takeable(const struct lio *io) {
     if (io->nfq == 0) return false;
@@ -6079,7 +6101,7 @@ static void *fetch_worker(void *arg) {
     struct fbatch *fb = calloc(1, sizeof(*fb));            /* (NULL: no batches, every request is read alone) */
     for (;;) {
         pthread_mutex_lock(&io->fq_lock);
-        while (!atomic_load(&io->wstop) && !(a->idx < io->fq_allowed && fq_takeable(io))) {
+        while (!atomic_load(&io->wstop) && !(a->idx < io->fq_allowed && (fq_drop_stale(io, now_ms()), fq_takeable(io)))) {      /* (review #279, 2: a request of the fill the Backend gave up is not read) */
             io->fq_idle++;
             pthread_cond_wait(&io->fq_cond, &io->fq_lock);
             io->fq_idle--;
@@ -6141,8 +6163,14 @@ typedef struct {
     uint64_t calls[2], zones[2];     /* the counters at the last line */
     uint64_t seen;                   /* the sum of the calls at the last look (a change means reads went on) */
     int64_t since, last_change;      /* when the last line was written; when the last change was seen */
+    uint64_t stale;                  /* (review #279, 2) g_fq_stale at the last line of it */
 } fr_state_t;
 static void fr_report(fr_state_t *s, int64_t now) {
+    const uint64_t st = atomic_load_explicit(&g_fq_stale, memory_order_relaxed);
+    if (st != s->stale) {
+        lg(LOG_INFO, "dropped %llu requests of the fill that waited %d s in the queue (the Backend gave them up and asks for the zones again)", (unsigned long long)(st - s->stale), FQ_BG_STALE_MS / 1000);
+        s->stale = st;
+    }
     uint64_t c[2], z[2];
     for (int i = 0; i < 2; i++) {
         c[i] = atomic_load_explicit(&g_fr_calls[i], memory_order_relaxed);

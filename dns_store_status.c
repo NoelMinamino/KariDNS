@@ -597,6 +597,7 @@ static void add_lookup(list_t *l) {
   U("store.ingest.journal_wait_slices", k->jw_slices);
   U("store.ingest.fill_throttled", k->fill_throttled);
   U("store.ingest.fill_stalled_windows", k->fill_stalls);
+  U("store.ingest.fill_failed_windows", k->fill_failed_windows);
   U("store.lookup.rtt.p50_us", store_status_hist_pct(k->hist, 50, k->max_ns));
   U("store.lookup.rtt.p99_us", store_status_hist_pct(k->hist, 99, k->max_ns));
   U("store.lookup.rtt.max_us", (k->max_ns + 999) / 1000);

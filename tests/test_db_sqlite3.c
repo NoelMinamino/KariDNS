@@ -5233,6 +5233,23 @@ static void test_fetch_pick(void) {
             CHECK(fq_takeable(io2));
             io2->nfq = 0;
             CHECK(!fq_takeable(io2));
+            /* (review #279, 2) the requests of the fill that waited FQ_BG_STALE_MS are dropped (the Backend gave them up); the queries' and the younger ones of the fill stay, in order */
+            for (int i = 0; i < 6; i++) {
+                io2->fq[i] = q[0];
+                io2->fq[i].id = 100 + (uint64_t)i;
+                io2->fq[i].prio = (i == 1 || i == 4) ? KDB_FETCH_PRIO_QUERY : KDB_FETCH_PRIO_BACKGROUND;
+                io2->fq[i].at = i < 3 ? 1000 : 20000;                /* (0, 2 of the fill: old; 3, 5 of the fill: young) */
+            }
+            io2->nfq = 6;
+            const uint64_t st0 = atomic_load(&g_fq_stale);
+            CHECK(fq_drop_stale(io2, 1000 + FQ_BG_STALE_MS - 1) == 0 && io2->nfq == 6);      /* (not yet) */
+            CHECK(fq_drop_stale(io2, 1000 + FQ_BG_STALE_MS) == 2 && io2->nfq == 4);
+            CHECK(io2->fq[0].id == 101 && io2->fq[1].id == 103 && io2->fq[2].id == 104 && io2->fq[3].id == 105 && atomic_load(&g_fq_stale) == st0 + 2);
+            CHECK(fq_drop_stale(io2, 1000 + FQ_BG_STALE_MS) == 0);                           /* (the oldest of the fill is young now: nothing to look at) */
+            io2->nfq = 1;
+            io2->fq[0].prio = KDB_FETCH_PRIO_QUERY;
+            io2->fq[0].at = 0;
+            CHECK(fq_drop_stale(io2, 999999) == 0 && io2->nfq == 1);                         /* (a query is never dropped for its age) */
             free(io2);
         }
     }
@@ -5245,6 +5262,7 @@ static void test_fetch_pick(void) {
         atomic_store(&g_fr_zones[i], 0);
     }
     fr_report(&s, 10);
+    CHECK(s.stale == atomic_load(&g_fq_stale) && s.stale >= 2);  /* (the requests of the fill dropped above for their age: said once) */
     fr_note(true, 128);
     fr_note(false, 1);
     fr_report(&s, 100);
