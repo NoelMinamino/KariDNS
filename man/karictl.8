@@ -1469,6 +1469,16 @@ data is being loaded; zone transfers and UPDATE still get SERVFAIL + EDE 14)
 (at 4 times its limit: the disk is behind the writes) and made the requests of
 queries meanwhile
 .TP 8
+\fBstore.ingest.fill_throttled\fR, \fBstore.ingest.fill_stalled_windows\fR
+0.7: times the fill was held to its old share (32 bodies in flight) because
+attaches of queries waited or a checkpoint of the store ran; windows of a minute
+in which the fill had work and no body of it came (queries took the loader
+first: a WARNING says so, a NOTICE when it goes on)
+.TP 8
+\fBstore.checkpoint.slow_bytes\fR, \fBstore.checkpoint.slow_paced_us\fR
+0.7: table bytes bulk checkpoints wrote at 32 MiB/s because attaches of queries
+waited, and the time they gave way at that rate
+.TP 8
 \fBstore.lookup.rtt.p50_us\fR, \fB.p99_us\fR, \fB.max_us\fR, \fB.rtt.hist.*\fR
 The time from the request to the answer (without the body), as the attach times:
 the upper bound of the bucket that holds the percentile, the longest, the

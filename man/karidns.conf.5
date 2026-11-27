@@ -5874,40 +5874,55 @@ that is not aligned yet, \fBvfs.zfs.vdev.sync_read_max_active=32\fR (in
 longer the limit). A host whose zones fit in memory-limit does not need it. The
 setting was measured as a test and put back (\fBsysctl
 vfs.zfs.vdev.sync_read_max_active=10\fR restores the default at once; remove the
-line from \fB/etc/sysctl.conf\fR to keep it). \fBScrub.\fR Every
-\fBstore\-scrub\-interval\fR the store reads every record, at 16 MiB a second at
-the most: the table record (its CRC), the way the name and source indexes lead
-to the zone, and for a stored zone the whole image: its checksum and the
-structure check that is made at every attach. A zone whose image is bad becomes
-known without an image and is read from the database again (the log says which
-zone; \fBstore.scrub.bad_images\fR); the cleaner does the same for a record that
-fails its checksum when it is to be copied. A zone that is in memory with that
-image (the store is in MAP mode: the zone serves the mapped pages) is taken out
-of memory too, even when it is pinned, so that it is read again and does not go
-on serving damaged pages (when a reader or a transfer holds it, the store tries
-again at the next tick). A table record that is damaged or an index entry that
-does not lead to its zone is repaired at the end of the pass: the indexes are
-built again from the zone table, and a record that cannot be read is dropped and
-comes again with the next pass of the loader. \fBkarictl store scrub start\fR
-starts a pass now, \fBstore scrub stop\fR ends it. \fBError ring.\fR
-\fBerr.ring\fR (14 MB, sparse until used) keeps the last 65,536 texts of zones
-that were refused or failed (which zone id, which version, when, why), written
-in place and wrapped; it is not journaled and holds no heap
-(\fBstore.errors.total\fR). The server keeps the last 512 texts in memory as
-well (\fBzonestatus\fR asks the memory first, then the file): a rejected zone of
-the store has no registry element, so after a text is pushed out of memory, or
-after a restart, the file still has it, by zone id. A text is forgotten when a
-version of the zone is registered. A zone id is reused after a delete, so a text
-is only shown for a zone whose record is still the one it was made for. The
-NOTIFY that is due for a zone is a flag of its record (\fBNOTIFY_DUE\fR,
-journaled, so a NOTIFY that was due at a crash is due after the
-restart). \fBWhat a zone in memory costs.\fR A zone that is attached takes one
-slot of 256 octets of the pool of zone entries (a light entry: name, serial and
-timers, the zone's version, the settings, counters; what a zone seldom needs,
-such as transfer state, an IXFR ring or the full per-zone statistics, is made
-when it is first needed) plus its image: measured, about 739 octets of heap for
-a small attached zone in \fBmap\fR mode (the image is a pointer into the mapped
-segment, and counted by \fBmemory\-limit\fR) and about 1,251 octets in
+line from \fB/etc/sysctl.conf\fR to keep it). \fBA first fill under queries
+(ZFS, 0.7).\fR The bulk checkpoints of a first fill write the tables (about
+500-670 MB at 10M zones) and sync them, and that sync waits for the transaction
+group that also writes the fill's segments: the reads of the attaches of queries
+queue behind it (measured on pc31, 10M zones under 2,500 cold queries a second:
+about five store threads at a time in \fBzfs_read\fR waiting for the disk during
+checkpoints of 24-31 s, and 40-96 % of the queries of those seconds
+lost). KariDNS does two things about it: while a checkpoint runs the fill is
+held to its old share of 32 bodies in flight
+(\fBstore.ingest.fill_throttled\fR), and while the attach rings hold requests a
+bulk checkpoint writes its tables at 32 MiB/s instead of 256
+(\fBstore.checkpoint.slow_bytes\fR, \fB.slow_paced_us\fR; the checkpoint takes
+longer, and the range a crash makes the fill read again grows with it). The read
+queue of the pool above (\fBvfs.zfs.vdev.sync_read_max_active\fR, and
+\fBvfs.zfs.vdev.sync_read_min_active\fR for the reads the pool serves first)
+stays an operator's choice: KariDNS does not change it, and the defaults are
+kept. \fBScrub.\fR Every \fBstore\-scrub\-interval\fR the store reads every
+record, at 16 MiB a second at the most: the table record (its CRC), the way the
+name and source indexes lead to the zone, and for a stored zone the whole image:
+its checksum and the structure check that is made at every attach. A zone whose
+image is bad becomes known without an image and is read from the database again
+(the log says which zone; \fBstore.scrub.bad_images\fR); the cleaner does the
+same for a record that fails its checksum when it is to be copied. A zone that
+is in memory with that image (the store is in MAP mode: the zone serves the
+mapped pages) is taken out of memory too, even when it is pinned, so that it is
+read again and does not go on serving damaged pages (when a reader or a transfer
+holds it, the store tries again at the next tick). A table record that is
+damaged or an index entry that does not lead to its zone is repaired at the end
+of the pass: the indexes are built again from the zone table, and a record that
+cannot be read is dropped and comes again with the next pass of the
+loader. \fBkarictl store scrub start\fR starts a pass now, \fBstore scrub
+stop\fR ends it. \fBError ring.\fR \fBerr.ring\fR (14 MB, sparse until used)
+keeps the last 65,536 texts of zones that were refused or failed (which zone id,
+which version, when, why), written in place and wrapped; it is not journaled and
+holds no heap (\fBstore.errors.total\fR). The server keeps the last 512 texts in
+memory as well (\fBzonestatus\fR asks the memory first, then the file): a
+rejected zone of the store has no registry element, so after a text is pushed
+out of memory, or after a restart, the file still has it, by zone id. A text is
+forgotten when a version of the zone is registered. A zone id is reused after a
+delete, so a text is only shown for a zone whose record is still the one it was
+made for. The NOTIFY that is due for a zone is a flag of its record
+(\fBNOTIFY_DUE\fR, journaled, so a NOTIFY that was due at a crash is due after
+the restart). \fBWhat a zone in memory costs.\fR A zone that is attached takes
+one slot of 256 octets of the pool of zone entries (a light entry: name, serial
+and timers, the zone's version, the settings, counters; what a zone seldom
+needs, such as transfer state, an IXFR ring or the full per-zone statistics, is
+made when it is first needed) plus its image: measured, about 739 octets of heap
+for a small attached zone in \fBmap\fR mode (the image is a pointer into the
+mapped segment, and counted by \fBmemory\-limit\fR) and about 1,251 octets in
 \fBcopy\fR mode (the image is a copy). \fBkarictl dbstatus\fR has the line
 \fBzone entries:\fR (slots in use, slabs and their size, the octets of a slot,
 the zones that left memory and kept their counters, the rejection texts in
