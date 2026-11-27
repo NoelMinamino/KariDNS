@@ -764,7 +764,7 @@ The CI job "Coverage gate" is three stages, so that the suite (20 minutes on one
 
 ```bash
 make coverage-clean coverage-build                  # stage 1, once: the instrumented build (+ make zone2sql zone2kdb fetch_backend)
-sh tests/coverage_pack.sh pack cov-bins.tar.zst STAMP   # ... packed (every file the build made: tests/coverage_pack.sh), uploaded as cov-bins
+sh tests/coverage_pack.sh pack cov-bins.tar.zst STAMP   # ... packed (every file the build made: tests/coverage_pack.sh), uploaded as cov-bins-attempt-N (N = the attempt of the run)
 sh tests/coverage_pack.sh unpack cov-bins.tar.zst   # stage 2 (4 VMs) and 3: tar -m, same path as the build (the loader has coverage_raw compiled in)
 make coverage-run COV_SHARD=2/4                     # stage 2: part 2 of 4 (run_all_suite.sh --shard 2/4 --pg-clusters; the fuzz replay only in part 1)
 make coverage-shard-merge COV_SHARD_PROFDATA=shard-2.profdata   # ... its raw profiles in one file, uploaded with coverage_suite.status
