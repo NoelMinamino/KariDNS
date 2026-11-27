@@ -39,6 +39,12 @@
 #include <stdatomic.h>
 #include <sys/event.h>
 #include <sys/ioctl.h>
+#include <sys/sysctl.h>
+#include <netinet/in.h>
+#include <netinet/ip.h>
+#include <netinet/ip_var.h>
+#include <netinet/udp.h>
+#include <netinet/udp_var.h>
 
 #include "../dns_config_parser.h"
 #include "../dns_db_stream.h"
@@ -83,6 +89,44 @@ static size_t build_query(uint8_t *b, uint16_t id, bool edns, size_t padding) {
         }
     }
     return o;
+}
+
+/* The datagrams the kernel dropped before a socket could queue them, host-wide since boot: the IP input queue of netisr (net.inet.ip.intr_queue_drops,
+ * the "QDrops" of ip in netstat -Q; loopback queues every datagram there, and the queue, net.route.netisr_maxqlen = 256, is the host's: other tests
+ * running beside this one fill it too) and full UDP socket buffers (udps_fullsock).  Other processes' drops count too: an upper bound for a test's. */
+static uint64_t kernel_udp_drops(void) {
+    uint64_t total = 0;
+    unsigned int q = 0;
+    size_t ql = sizeof(q);
+    if (sysctlbyname("net.inet.ip.intr_queue_drops", &q, &ql, NULL, 0) == 0) total += q;
+    struct udpstat us;
+    size_t ul = sizeof(us);
+    if (sysctlbyname("net.inet.udp.stats", &us, &ul, NULL, 0) == 0) total += us.udps_fullsock;
+    return total;
+}
+
+/* One datagram from uc to `to`, queued on the socket rs that nobody reads meanwhile: true once rs holds len more bytes (FIONREAD).  A datagram the
+ * kernel dropped on the way (kernel_udp_drops() grew) is sent again, up to 5 times; each wait is bounded (2 s).  A loss the kernel did not count fails */
+static bool udp_send_queued(int uc, const struct sockaddr_in *to, int rs, const void *pkt, size_t len) {
+    int nr0 = 0;
+    if (ioctl(rs, FIONREAD, &nr0) != 0) return false;
+    for (int round = 0; round < 5; round++) {
+        const uint64_t d0 = kernel_udp_drops();
+        ssize_t s;
+        for (int t = 0; (s = sendto(uc, pkt, len, 0, (const struct sockaddr *)to, sizeof(*to))) < 0 && errno == ENOBUFS && t < 10000; t++) usleep(100);
+        if (s != (ssize_t)len) return false;
+        int nr = 0;
+        for (int t = 0; t < 2000; t++) {
+            if (ioctl(rs, FIONREAD, &nr) == 0 && nr >= nr0 + (int)len) return true;
+            usleep(1000);
+        }
+        if (kernel_udp_drops() == d0) {
+            printf("    a datagram of %zu bytes was not queued (%d bytes held, %d before) and the kernel counted no drop\n", len, nr, nr0);
+            return false;
+        }
+        printf("    a datagram of %zu bytes dropped by the kernel: sent again\n", len);
+    }
+    return false;
 }
 
 /* a query for www.late.test. A (no zone of the test has it): the lookup path */
@@ -296,8 +340,8 @@ static zdir_elem_t *the_elem(void) {
 
 /* 0.7 work stealing, concurrently (run under ThreadSanitizer by test_park_worker-tsan): an owner and two thieves read one loopback UDP socket with the
  * steal protocol of dns_server_core.c (steal_owner_note(), steal_pick(), steal_may_sleep(), steal_thief_step(), the EVFILT_USER wake-up) while a sender
- * sends ST_N numbered datagrams.  Checked: every number is read exactly once (no loss, no duplicate), the thieves read some of them (the owner is
- * slow on purpose and starts only when ST_HEAD are queued, so it is behind: a thief that does nothing fails), nobody stays asleep while the owner is
+ * sends ST_N numbered datagrams.  Checked: every number is read exactly once (no duplicate; none lost but by the kernel, and those are sent again),
+ * the thieves read some of them (the owner is slow on purpose and starts only when ST_HEAD are queued, so it is behind: a thief that does nothing fails), nobody stays asleep while the owner is
  * behind (the run ends within its bound), and the shared state is race-free (TSan).  The datagrams are not DNS queries: the protocol is what is
  * tested here; worker_udp_steal() itself is tested above on real queries. */
 #define ST_N 20000
@@ -376,6 +420,43 @@ static void *st_thief(void *arg) {
     return NULL;
 }
 
+#define ST_ROUNDS 5
+/* At most ST_LEAD ahead of the readers.  A datagram the kernel dropped is never read, so the kernel's drops since st_drops_start count as read here: without
+ * that, 200 drops would make every later send wait out its bound (3 s). */
+static uint64_t st_drops_start;
+static void st_send(int sc, const struct sockaddr_in *to, uint32_t v) {
+    for (int t = 0; t < 30000 && (int)atomic_load(&st_sent) - atomic_load(&st_read_total) >= ST_LEAD; t++) {
+        if ((int64_t)atomic_load(&st_sent) - atomic_load(&st_read_total) - (int64_t)(kernel_udp_drops() - st_drops_start) < ST_LEAD) break;
+        usleep(100);
+    }
+    ssize_t s;
+    while ((s = sendto(sc, &v, sizeof(v), 0, (const struct sockaddr *)to, sizeof(*to))) < 0 && errno == ENOBUFS) usleep(100);
+    CHECK(s == (ssize_t)sizeof(v));
+    atomic_fetch_add(&st_sent, 1);
+}
+
+static int st_missing(void) {
+    int missing = 0;
+    for (int v = 0; v < ST_N; v++) missing += !atomic_load(&st_seen[v]);
+    return missing;
+}
+
+/* Waits until all ST_N numbers were read (st_read_total counts the reads: with no duplicate, the numbers), or until none more is coming: nothing
+ * read for 5 s while the socket is empty (FIONREAD 0; a datagram in it is the owner's within 10 ms).  Bounded: 60 s (TSan is slow).
+ * Returns the numbers not read. */
+static int st_wait_read(void) {
+    int last = atomic_load(&st_read_total), still_ms = 0;
+    for (int t = 0; t < 60000 && atomic_load(&st_read_total) < ST_N && still_ms < 5000; t++) {
+        usleep(1000);
+        int queued = 0;
+        const int now = atomic_load(&st_read_total);
+        if (now != last || ioctl(st_fd, FIONREAD, &queued) != 0 || queued > 0) still_ms = 0;
+        else still_ms++;
+        last = now;
+    }
+    return st_missing();
+}
+
 static void test_steal_concurrent(void) {
     printf("[work stealing: an owner and %d thieves on one socket]\n", ST_THIEVES);
     const int saved_count = g_be_udp_count;
@@ -406,16 +487,28 @@ static void test_steal_concurrent(void) {
     CHECK(pthread_create(&th[0], NULL, st_owner, NULL) == 0);
     for (int i = 1; i <= ST_THIEVES; i++) CHECK(pthread_create(&th[i], NULL, st_thief, (void *)(intptr_t)i) == 0);
     /* the sender: at most ST_LEAD ahead of the readers.  Loopback hands every datagram to the IP input queue of netisr first (net.route.netisr_maxqlen, 256
-     * by default), which drops what does not fit: 4000 ahead lost about 400 of 20000 in 2 of 6 runs (pc101, 2026-11-27).  Below that queue nothing is
-     * lost, so a missing datagram is the protocol's */
-    for (uint32_t v = 0; v < ST_N; v++) {
-        for (int t = 0; t < 30000 && (int)v - atomic_load(&st_read_total) >= ST_LEAD; t++) usleep(100);
-        ssize_t s;
-        while ((s = sendto(sc, &v, sizeof(v), 0, (struct sockaddr *)&a, sizeof(a))) < 0 && errno == ENOBUFS) usleep(100);
-        CHECK(s == (ssize_t)sizeof(v));
-        atomic_fetch_add(&st_sent, 1);
+     * by default), which drops what does not fit: 4000 ahead lost about 400 of 20000 in 2 of 6 runs (pc101, 2026-11-27).  That queue is the host's, so
+     * other loopback traffic fills it too: 200 ahead still lost 21 in CI, where other tests run beside this one (PR #295, 2026-11-28).
+     * A datagram that reached the socket cannot be lost by the protocol here: the owner polls it every 10 ms until the end (level-triggered) and reads
+     * until a short batch.  So a missing number is checked against the kernel's drop counters (kernel_udp_drops()) and sent again, up to ST_ROUNDS
+     * times: the run fails if more are missing than the kernel dropped, or if a number sent again is never read. */
+    uint64_t drops0 = kernel_udp_drops();
+    st_drops_start = drops0;
+    for (uint32_t v = 0; v < ST_N; v++) st_send(sc, &a, v);
+    int sent = ST_N, missing = st_wait_read(), resent = 0;
+    uint64_t dropped = 0;
+    for (int round = 0; missing > 0 && round < ST_ROUNDS; round++) {
+        const uint64_t d = kernel_udp_drops() - drops0;
+        printf("  round %d: %d missing, the kernel dropped %llu meanwhile (host-wide: the IP input queue + full UDP socket buffers)\n", round, missing,
+               (unsigned long long)d);
+        CHECK((uint64_t)missing <= d);                     /* (more missing than the kernel dropped: the protocol lost some) */
+        if ((uint64_t)missing > d) break;
+        dropped += (uint64_t)missing;
+        drops0 = kernel_udp_drops();
+        for (uint32_t v = 0; v < ST_N; v++)
+            if (!atomic_load(&st_seen[v])) { st_send(sc, &a, v); sent++; resent++; }
+        missing = st_wait_read();
     }
-    for (int t = 0; t < 60000 && atomic_load(&st_read_total) < ST_N; t++) usleep(1000);   /* (bounded: 60 s; TSan is slow) */
     atomic_store(&st_stop, true);
     for (int i = 1; i <= ST_THIEVES; i++) {
         struct kevent ev;
@@ -423,13 +516,13 @@ static void test_steal_concurrent(void) {
         (void)kevent(st_kq[i], &ev, 1, NULL, 0, NULL);
     }
     for (int i = 0; i <= ST_THIEVES; i++) pthread_join(th[i], NULL);
-    int missing = 0;
-    for (int v = 0; v < ST_N; v++) missing += !atomic_load(&st_seen[v]);
+    missing = st_missing();
     const int stolen = atomic_load(&st_read_by[1]) + atomic_load(&st_read_by[2]);
     CHECK(atomic_load(&st_read_total) == ST_N && missing == 0 && atomic_load(&st_dups) == 0 && atomic_load(&st_bad) == 0);
     CHECK(stolen > 0);
-    printf("  read %d of %d (owner %d, thieves %d + %d), missing %d, duplicates %d, bad %d\n", atomic_load(&st_read_total), ST_N,
-           atomic_load(&st_read_by[0]), atomic_load(&st_read_by[1]), atomic_load(&st_read_by[2]), missing, atomic_load(&st_dups), atomic_load(&st_bad));
+    printf("  read %d of %d (sent %d; owner %d, thieves %d + %d), missing %d, duplicates %d, bad %d; sent again %d (dropped by the kernel %llu)\n",
+           atomic_load(&st_read_total), ST_N, sent, atomic_load(&st_read_by[0]), atomic_load(&st_read_by[1]), atomic_load(&st_read_by[2]), missing,
+           atomic_load(&st_dups), atomic_load(&st_bad), resent, (unsigned long long)dropped);
     int sa;
     CHECK(steal_pick(1, &sa) == -1);                       /* (the owner cleared its mark) */
     for (int i = 0; i <= ST_THIEVES; i++) close(st_kq[i]);
@@ -548,8 +641,7 @@ int main(void) {
         const uint64_t q0 = atomic_load(&wctx.query_count), r0 = ipcd_wrecv(0);
         const uint64_t short0 = ipcd_total(IPCD_WURX_SHORT), trunc0 = ipcd_total(IPCD_WURX_TRUNC);
         uint8_t qb[600];
-        #define UDP_IN(id) do { size_t ql_ = build_query(qb, (id), true, 0); CHECK(sendto(uc, qb, ql_, 0, (struct sockaddr *)&ua, sizeof(ua)) == (ssize_t)ql_); \
-            struct pollfd up_ = { us, POLLIN, 0 }; CHECK(poll(&up_, 1, 2000) == 1); } while (0)
+        #define UDP_IN(id) do { size_t ql_ = build_query(qb, (id), true, 0); CHECK(udp_send_queued(uc, &ua, us, qb, ql_)); } while (0)
         /* the raw answer on the router's pair: the header the router reads */
         #define RAW_ANSWER(hdr, id_out) do { uint8_t rb_[sizeof(udp_ipc_t) + 4096]; struct pollfd rp_ = { sk[1], POLLIN, 0 }; ssize_t rn_ = poll(&rp_, 1, 1000) == 1 ? \
             recv(sk[1], rb_, sizeof(rb_), 0) : -1; CHECK(rn_ > (ssize_t)sizeof(udp_ipc_t) + 12); memset(&(hdr), 0, sizeof(hdr)); (id_out) = 0; \
@@ -581,10 +673,10 @@ int main(void) {
         CHECK(!read_answer(sk[1]).got);                              /* once */
 
         /* a datagram shorter than a DNS header and one larger than the buffer (cut: MSG_TRUNC) are dropped and counted, never run */
-        CHECK(sendto(uc, "short", 5, 0, (struct sockaddr *)&ua, sizeof(ua)) == 5);
+        CHECK(udp_send_queued(uc, &ua, us, "short", 5));
         static uint8_t big[5000];
         memset(big, 0, sizeof(big));
-        CHECK(sendto(uc, big, sizeof(big), 0, (struct sockaddr *)&ua, sizeof(ua)) == (ssize_t)sizeof(big));
+        CHECK(udp_send_queued(uc, &ua, us, big, sizeof(big)));
         int runs = 0;
         for (int i = 0; i < 200 && (ipcd_total(IPCD_WURX_SHORT) < short0 + 1 || ipcd_total(IPCD_WURX_TRUNC) < trunc0 + 1); i++) {   /* (bounded: 2 s) */
             runs += worker_udp_rx(&w, us, 2, sk[0]);
@@ -620,10 +712,7 @@ int main(void) {
             steal_register(-1, stk);
             steal_register(2, stk);                                  /* (no such worker: nothing) */
             #define QUEUE(n, id0) do { for (int i_ = 0; i_ < (n); i_++) { size_t ql_ = build_query(qb, (uint16_t)((id0) + i_), true, 0); \
-                CHECK(sendto(uc, qb, ql_, 0, (struct sockaddr *)&ua, sizeof(ua)) == (ssize_t)ql_); } \
-                int nr_ = 0; for (int t_ = 0; t_ < 400; t_++) { if (ioctl(us, FIONREAD, &nr_) == 0 && nr_ >= (n) * (int)ql_one) break; usleep(5000); } \
-                CHECK(nr_ >= (n) * (int)ql_one); } while (0)
-            const size_t ql_one = build_query(qb, 0, true, 0);
+                CHECK(udp_send_queued(uc, &ua, us, qb, ql_)); } } while (0)
             /* the frames on the pair: how many, all with index 2 and this client; returns the number read */
             #define FRAMES(want) do { int nf_ = 0, bad_ = 0; uint8_t fb_[65536]; for (int t_ = 0; t_ < 100 && nf_ < (want); t_++) { \
                 struct pollfd fp_ = { sk[1], POLLIN, 0 }; if (poll(&fp_, 1, 20) != 1) continue; ssize_t fn_ = recv(sk[1], fb_, sizeof(fb_), 0); \
