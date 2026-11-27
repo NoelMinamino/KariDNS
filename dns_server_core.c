@@ -361,6 +361,10 @@ STATIC_TEST _Atomic int g_worker_start_failures = 0;
 
 STATIC_TEST void auxlog_changed(void);   /* 0.7 M2 (below, with the control commands) */
 
+/* 0.7: the longest the routers and the connect broker sleep with nothing to do (their loops): below vm.swap_idle_threshold1 of FreeBSD 14 (2 s), so that they are never
+ * swapped out (CI flake rows 9 and 90, the routers' loop) */
+#define KARIDNS_AUX_WAKE_MS 1000
+
 // Broker
 STATIC_TEST int g_broker_sock = -1;
 STATIC_TEST pid_t g_broker_pid = -1;
@@ -428,7 +432,13 @@ __attribute__((unused)) STATIC_TEST bool start_connect_broker(void) {
     if (g_config_db.config_a.dnstap.enabled && g_config_db.config_a.dnstap.socket_path)
       strlcpy(allowed_unix_path, g_config_db.config_a.dnstap.socket_path, sizeof(allowed_unix_path));
     broker_req_t req;
-    while (recv(sv[1], &req, sizeof(req), MSG_WAITALL) == sizeof(req)) {
+    for (;;) {
+      /* a wake-up at least once a second, so that FreeBSD 14 never swaps the idle broker out (the routers' loop says why): the connect of a transfer or a NOTIFY over TCP
+       * would wait for the swap-in.  The request is read only when it has come (poll), so a wake-up never cuts one */
+      struct pollfd bp = { .fd = sv[1], .events = POLLIN, .revents = 0 };
+      const int pr = poll(&bp, 1, KARIDNS_AUX_WAKE_MS);
+      if (pr == 0 || (pr < 0 && errno == EINTR)) continue;
+      if (pr < 0 || recv(sv[1], &req, sizeof(req), MSG_WAITALL) != sizeof(req)) break;
       if (req.family == BROKER_REQ_LOGSTATE) {
         /* 0.7 M2: the debug level and the logging runtime of the Backend (dns_log_state.h; checked there as hostile input).  A length that
          * is not one of a record leaves the stream without a known boundary: the broker ends, as when a request is cut */
@@ -7906,7 +7916,12 @@ STATIC_TEST void run_frontend_router(pid_t backend_pid, int router_id) {
              g_num_workers, router_id == 0 ? ", the NOTIFY sender" : "", klog_debug_level());
 
   while (1) {
-    int n = kevent(kq, NULL, 0, ev_list, 128, NULL);
+    /* The wait ends at least once a second (KARIDNS_AUX_WAKE_MS), with nothing to do (0.7, CI flake rows 9 and 90): FreeBSD 14 swaps out a whole process all of whose threads
+     * have slept longer than vm.swap_idle_threshold1 (2 s by default) when memory is short, and a router that sleeps until the next reply was swapped out on a loaded host
+     * (seen on the 14.4 CI runners: STAT W, free memory 300 MB); the replies of its workers then waited in the IPC until the swapper read it back from the disk, seconds on a
+     * busy disk.  A router that wakes every second is never asleep that long.  (FreeBSD 15 no longer swaps out processes.)  The cost: one empty kevent() a second. */
+    const struct timespec aux_wake = { KARIDNS_AUX_WAKE_MS / 1000, (KARIDNS_AUX_WAKE_MS % 1000) * 1000000L };
+    int n = kevent(kq, NULL, 0, ev_list, 128, &aux_wake);
     if (n < 0) {
       if (errno == EINTR)
         continue;

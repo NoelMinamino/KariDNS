@@ -63,7 +63,13 @@ server may run on, at most 8 (4 CPUs: 2 routers, 8: 4, 16 and more: 8;
 \fBrouter\-threads\fR sets the number). A router costs about as much CPU per
 query as a worker: with 2 routers and 6 workers on 8 CPUs the routers were the
 limit (about 90 % of a CPU each at 550,000 queries a second) while the machine
-was 38 % idle.
+was 38 % idle. An idle router and the connect broker wake once a second with
+nothing to do (0.7): FreeBSD 14 swaps out a whole process all of whose threads
+have slept longer than \fBvm.swap_idle_threshold1\fR (2 s) when memory is short,
+and the replies of a swapped-out router waited until it was read back from swap,
+seconds on a busy disk (seen on loaded 14.4 hosts; FreeBSD 15 does not swap
+processes out). The cost is one empty \fBkevent(2)\fR or \fBpoll(2)\fR a second
+each.
 .IP \(bu 2
 \fBBackend Process\fR: Operates in FreeBSD Capsicum capability mode
 (\fBcap_enter(2)\fR). DNS packet parsing and response generation are performed

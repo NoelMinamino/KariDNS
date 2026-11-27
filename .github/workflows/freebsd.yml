@@ -461,7 +461,7 @@ jobs:
               run_karictl_observatory_test,run_axfr_multikey_tsig_test,run_config_duplicate_rejection_test,run_cve_coo_test,\
               run_dag_batch_advanced_opts_test,run_dag_fuzzer_test,run_dnssec_negative_soa_rrsig_test,run_domain_length_rfc1035_test,\
               run_ds_delegation_test,run_karictl_reload_reconfig_test,run_logging_channel_validation_test,run_mx_srv_glue_test,\
-              run_notify_source_test,run_privilege_drop_root_test,run_nonroot_startup_test,run_query_log_rate_limit_test,\
+              run_notify_source_test,run_privilege_drop_root_test,run_nonroot_startup_test,run_aux_wake_test,run_query_log_rate_limit_test,\
               run_response_cache_test,run_rrl_window_test,run_tinydns_timestamp_test,run_ttl_harmonization_test,\
               run_ttl_harmonization_update_test,run_ttl_rfc2181_clamp_test,run_update_secondary_refused_test,\
               run_zone_oom_partial_load_test,run_zone_type_secondary_test,\
