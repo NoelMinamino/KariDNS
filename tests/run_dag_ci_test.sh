@@ -398,8 +398,9 @@ fi
 echo "========================================================"
 echo "13. Live DoT / DoH Checks (against public resolvers)"
 echo "========================================================"
-# Check if outbound internet is accessible
-if "$DAG" @1.1.1.1 example.com A +timeout=2 +tries=1 >/dev/null 2>&1; then
+# Check if outbound internet is accessible: either public resolver, three tries each (one lost UDP datagram made a CI runner that had the network skip
+# the live part: CI flakes row 81)
+if "$DAG" @1.1.1.1 example.com A +timeout=2 +tries=3 >/dev/null 2>&1 || "$DAG" @8.8.8.8 example.com A +timeout=2 +tries=3 >/dev/null 2>&1; then
     echo "Internet connectivity detected. Running Live DoT & DoH tests..."
     run_check "Live DoT (RFC 7858) @8.8.8.8" "$DAG @8.8.8.8 www.google.com A +tls +timeout=4" "142\.25[0-9]\.[0-9]+"
     run_check "Live DoT with default CA & SNI verification" "$DAG @8.8.8.8 www.google.com A +tls +tls-ca +tls-hostname=dns.google +timeout=4" "142\.25[0-9]\.[0-9]+"
