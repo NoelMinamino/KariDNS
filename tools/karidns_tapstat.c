@@ -334,6 +334,7 @@ static int run_socket(tapstat_t *st, const char *sockpath, mode_t mode, unsigned
     int64_t m0 = now_ms();
     int64_t deadline = m0 + (int64_t)interval * 1000;
 
+    int rr = 0;   /* the connection read first in this round (it turns each round) */
     while (!g_stop) {
         struct pollfd pfds[MAX_CONN + 1];
         int map[MAX_CONN + 1];
@@ -342,11 +343,19 @@ static int run_socket(tapstat_t *st, const char *sockpath, mode_t mode, unsigned
         int64_t now = now_ms();
         bool any_paused = false;
         for (int i = 0; i < TAPSTAT_BUCKETS; i++) tapstat_bkt_refill(&g_bkt[i], rate, now);
-        for (int i = 0; i < MAX_CONN; i++) {
-            if (conns[i].fd < 0) continue;
-            if (conns[i].bk >= 0 && g_bkt[conns[i].bk].paused) { any_paused = true; continue; }    /* T4-L5: its sender is over its rate, not read until the bucket refills */
+        /* The connections of one sender share its bucket, and the first one read in a round takes what the refill gave (CI flake row 96): read in slot
+         * order, a sender's first connection took every refill and its second one was not read until the first had finished, its READY unanswered for
+         * seconds (the sender gave up waiting for ACCEPT).  So the order turns by one connection each round, and a connection whose handshake is not
+         * done is read even while its sender is paused: a few control frames, counted against the bucket all the same (FSTRM_MAX_CONTROL bounds a read
+         * then, and HANDSHAKE_TIMEOUT_MS the time it may take). */
+        int act[MAX_CONN], na = 0;
+        for (int i = 0; i < MAX_CONN; i++) if (conns[i].fd >= 0) act[na++] = i;
+        for (int s = 0; s < na; s++) {
+            const int i = act[(rr + s) % na];
+            if (conns[i].bk >= 0 && g_bkt[conns[i].bk].paused && conns[i].rd.state == FSTRM_ST_DATA) { any_paused = true; continue; }    /* T4-L5: its sender is over its rate, not read until the bucket refills */
             pfds[np].fd = conns[i].fd; pfds[np].events = POLLIN; map[np] = i; np++;
         }
+        rr = na ? (rr + 1) % na : 0;
 
         int64_t wait = deadline - now;
         if (wait > 1000) wait = 1000; /* also the granularity of the handshake timeout */
@@ -391,9 +400,11 @@ static int run_socket(tapstat_t *st, const char *sockpath, mode_t mode, unsigned
                 }
                 conn_t *c = &conns[map[k]];
                 tapstat_bkt_t *b = c->bk >= 0 ? &g_bkt[c->bk] : NULL;
-                if (rate && b && b->paused) continue;           /* (another connection of the sender used the bucket up in this round) */
+                const bool hs = c->rd.state != FSTRM_ST_DATA;   /* (the handshake: read whatever the bucket says, a control frame at a time) */
+                if (rate && b && b->paused && !hs) continue;    /* (another connection of the sender used the bucket up in this round) */
                 size_t want = sizeof(buf);
-                if (rate && b && (uint64_t)b->tokens < want) want = (size_t)b->tokens;    /* (tokens > 0: a paused sender is not read) */
+                if (hs && rate && b) want = FSTRM_MAX_CONTROL + 8;
+                else if (rate && b && (uint64_t)b->tokens < want) want = (size_t)b->tokens;    /* (tokens > 0: a paused sender is not read) */
                 ssize_t n = read(c->fd, buf, want);
                 if (n < 0 && (errno == EAGAIN || errno == EINTR)) continue;
                 if (n <= 0) { conn_close(c); continue; } /* the sender went away; it reconnects */

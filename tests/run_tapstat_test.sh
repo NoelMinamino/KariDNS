@@ -251,9 +251,24 @@ if [ -n "$FAB" ]; then
     [ $((T1 - T0)) -ge "$MIN2" ] && pass "one bucket for the uid: 2 x $FAB bytes took $((T1 - T0)) s (at least $MIN2; per connection it would be half)" ||
         fail "the two connections got more than the sender's rate: 2 x $FAB bytes in $((T1 - T0)) s (want >= $MIN2)"
 fi
+# a connection of the same sender that comes while the other one is throttled in the middle of its flood (CI flake row 96: under the -j 4 suite the second
+# perl sender started late, and the first connection, read first in every round, took every refill of the shared bucket, so the newcomer's READY was not
+# read for seconds and it gave up "no ACCEPT"): its handshake is answered at once and it gets its share.  A flood of 1000 copies takes more than 7 s at
+# 64K; the second sender starts 1 s into it, when the bucket is surely empty and paused (the window is the flood's own length, not a wait for an event).
+# Without the fix the newcomer is not read until the other has finished: its ACCEPT does not come within the mock's 3 s.  With it the newcomer's 100
+# copies (a tenth of the bytes, half the rate) are done while the other is still sending.
+perl "$MOCK" send "$SOCK6" flood 1000 > "$TMP_DIR/fc.out" 2>&1 &
+FC=$!
+sleep 1
+perl "$MOCK" send "$SOCK6" flood 100 > "$TMP_DIR/fd.out" 2>&1; RD=$?
+kill -0 "$FC" 2>/dev/null; FC_RUNNING=$?
+wait "$FC"; RC=$?
+[ "$RD" -eq 0 ] && pass "a connection that comes while its sender is throttled is answered and served ($(cat "$TMP_DIR/fd.out"))" || fail "late connection of a throttled sender: $(cat "$TMP_DIR/fd.out")"
+[ "$RC" -eq 0 ] && pass "...and the throttled one finishes too ($(cat "$TMP_DIR/fc.out"))" || fail "the throttled connection: $(cat "$TMP_DIR/fc.out")"
+[ "$RD" -eq 0 ] && [ "$FC_RUNNING" -eq 0 ] && pass "the late connection got its share: it was done while the other was still sending" || fail "the late connection was served only after the other had finished ($(cat "$TMP_DIR/fd.out"); the other: $(cat "$TMP_DIR/fc.out"))"
 kill -TERM "$TAP_PID"; wait "$TAP_PID"; TAP_PID=""
 perl "$MOCK" sum "$TMP_DIR/s6.json" > "$TMP_DIR/s6.sum"
-grep -q "^frames=14007$" "$TMP_DIR/s6.sum" && pass "every frame of the slowed sender is counted (7 + 7000 + 2 x 3500)" || fail "frames of -l: $(grep '^frames=' "$TMP_DIR/s6.sum")"
+grep -q "^frames=21707$" "$TMP_DIR/s6.sum" && pass "every frame of the slowed sender is counted (7 + 7000 + 2 x 3500 + 7000 + 700)" || fail "frames of -l: $(grep '^frames=' "$TMP_DIR/s6.sum")"
 TH=$(sed -n 's/^senders_throttled=//p' "$TMP_DIR/s6.sum")
 [ "${TH:-0}" -gt 0 ] && pass "the pauses are counted (senders_throttled=$TH)" || fail "senders_throttled: $(cat "$TMP_DIR/s6.sum")"
 "$TAPSTAT" -s "$TMP_DIR/t7.sock" -u no-such-user-tapstat >/dev/null 2>&1; [ $? -eq 2 ] && pass "-u unknown user: exit 2" || fail "-u unknown user"

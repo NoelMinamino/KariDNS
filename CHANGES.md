@@ -268,6 +268,11 @@ Fixes from the external reviews and audits of the 0.7 cycle. Each has a test tha
 
 ### Bug fixes
 
+- **karidns-tapstat: a second connection of a throttled sender was starved** (`-l`): the connections of one sender
+  share its byte bucket, and the one read first in every round took every refill, so a second connection was not
+  read until the first had finished and its handshake went unanswered for seconds (the sender gave up waiting for
+  `ACCEPT`; the flake of run_tapstat_test under the -j 4 suite). The connections now take turns, and a handshake is
+  read while the sender is paused.
 - **NXNAME questions** (RFC 9824 §3.5): a query for type NXNAME is answered FORMERR with EDE 30 from this server's own
   data, and an MQTYPE-Query option that lists NXNAME is FORMERR (RFC 10029 §3.3); before, it was answered NODATA.
   Forward and program zones relay it as before. `KariDNS_RFC_GUIDELINE.md` was checked against the
