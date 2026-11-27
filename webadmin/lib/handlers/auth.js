@@ -58,7 +58,11 @@ export async function login(ctx) {
   });
   const origin = ctx.req.headers.origin;
   if (origin !== undefined && origin !== s['public-origin']) throw new ApiError(403, 'csrf', 'the Origin header does not name this site');
-  const wait = app.buckets.loginIp.take(ctx.ip) || app.buckets.loginUser.take(body.user.toLowerCase());
+  // the pace of attempts: per address, and per user name from that address (web review W2-L1, 0.7).  A bucket of the name alone, shared by every
+  // address, let anyone who knows a user name keep it empty and its owner out (a lockout DoS, which the per-network locks of 0.6.2 had removed);
+  // now an address empties only its own buckets, and the owner signs in from another one.  Guesses from many addresses are held back by the
+  // per-network locks of loginFailed().  (The name holds no control character: shape() refuses them, so "\n" cannot be part of it.)
+  const wait = app.buckets.loginIp.take(ctx.ip) || app.buckets.loginUser.take(`${body.user.toLowerCase()}\n${ctx.ip}`);
   if (wait) throw new ApiError(429, 'rate-limited', 'too many login attempts', { headers: { 'Retry-After': String(wait) } });
 
   const found = await app.backend.tx({}, async (tx) => {
