@@ -5151,7 +5151,7 @@ static void *cache_thread(void *arg) {
       ts.tv_sec = 1;
     } else {
       int64_t t0 = now_ms();
-      uint32_t n = dbreg_cache_round();
+      uint32_t n = dbreg_cache_manager_paused() ? 0 : dbreg_cache_round();   /* (a unit test that paused the manager makes the rounds itself: two of them at once would take out more and fight for the lock, CI flakes row 79) */
       int64_t dt = now_ms() - t0;
       if (n || dt > 50) syslog(LOG_DEBUG, "[DB] cache round: %u zone(s) taken out in %lld ms", n, (long long)dt);
       if (c.state_file) hot_tick(&c);

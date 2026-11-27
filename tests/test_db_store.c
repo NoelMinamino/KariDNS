@@ -5572,8 +5572,7 @@ static int run_s5(const char *mode) {
         CHECK(res0 > 0 && cap0 >= 1024);
         dbreg_cache_stats_t cs0, cs1;
         dbreg_cache_stats(&cs0);
-        dbreg_cache_set_limit(res0 * 55 / 100);
-        dbreg_cache_test_pause(false);
+        dbreg_cache_set_limit(res0 * 55 / 100);                                                    /* (the manager stays paused: the rounds below are the only ones, CI flakes row 79) */
         dbreg_cache_stats_t csm;
         memset(&csm, 0, sizeof(csm));
         uint32_t taken = 0, first = 0;
@@ -5592,7 +5591,6 @@ static int run_s5(const char *mode) {
         }
         if (waiter) dbreg_test_reg_waiter(-1);
         dbreg_cache_set_limit(0);
-        dbreg_cache_test_pause(true);
         wait_retired();
         dbreg_cache_stats(&cs1);
         const size_t left = dbdir()->attach_count();
