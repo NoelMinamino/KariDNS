@@ -1340,8 +1340,8 @@ An element is an IPv4/IPv6 address, a prefix, `any`, `none`, `localhost`, `local
 | `alias-resolver { <addr> [port <n>]; ... };` | master, slave | The resolvers that expand the ALIAS records of this zone; replaces the `options` value. See POWERDNS ALIAS AND LUA RECORDS. |
 | `alias-max-refresh-time <duration>;` | master, slave | The longest time between two lookups of the ALIAS targets of this zone (0.7, 5 s to 1 day); replaces the `options` value. A target that several zones share is looked up at the smallest of their values. See POWERDNS ALIAS AND LUA RECORDS. |
 | `forwarders [ port <n> ] { <addr> [port <n>]; ... };` | forward | Upstream servers; see FORWARD ZONES. An address without a port takes the `port` written before the `{`, else `options { port }`, else 53 (BIND 9.20 `bin/named/server.c` `configure_forward()`); an address with its own port keeps it. |
-| `forward-timeout <ms>;` | forward | Total time budget in milliseconds (default 2000), shared by the forwarders: each one gets the remaining time divided by the number of forwarders not tried yet. |
-| `program "<path>";`, `program-args { "<arg>"; ... };`, `program-user "<user>";`, `program-timeout <ms>;`, `program-max-failures <n>;`, `program-reload-line yes\|no;` | program | See PROGRAM ZONE PLUGINS. |
+| `forward-timeout <ms>;` | forward | Total time budget in milliseconds (default 2000), 1 to 30000 (0.7; 0 and larger values are configuration errors), shared by the forwarders: each one gets the remaining time divided by the number of forwarders not tried yet. |
+| `program "<path>";`, `program-args { "<arg>"; ... };`, `program-user "<user>";`, `program-timeout <ms>;`, `program-max-failures <n>;`, `program-reload-line yes\|no;` | program | See PROGRAM ZONE PLUGINS. `program-timeout` is 1 to 30000 ms (0.7; 0 and larger values are configuration errors). |
 
 ---
 
@@ -1646,7 +1646,7 @@ zone "anomaly.test." {
     type program;
     program "/usr/local/bin/mock_server.pl";
     program-args { "--verbose"; };
-    program-timeout 2000; # timeout in milliseconds (default: 2000)
+    program-timeout 2000; # timeout in milliseconds (default: 2000, 1 to 30000)
     program-max-failures 5; # consecutive failures before the circuit breaker opens (default: 5)
     program-user "nobody"; # optional privilege drop for plugin process (default: options { user })
     disable-auto-tc-flag no; # yes: send oversized UDP replies as-is (default: no)
@@ -1677,7 +1677,7 @@ zone "corp.example.com." {
     type forward;
     forwarders { 192.0.2.53; 198.51.100.53 port 5353; };
     # forwarders port 5353 { 192.0.2.53; };   the port of the list is the default of its addresses (without any: options { port }, else 53)
-    forward-timeout 2000; # total time budget in milliseconds for all forwarders (default: 2000)
+    forward-timeout 2000; # total time budget in milliseconds for all forwarders (default: 2000, 1 to 30000)
 };
 ```
 

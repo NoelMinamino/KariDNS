@@ -157,6 +157,10 @@ What changes, what it breaks, and what to do. The step-by-step version is [docs/
 
 Fixes from the external reviews and audits of the 0.7 cycle. Each has a test that fails before the fix.
 
+- **Program and forward zones, review D-L8**: `program-timeout` and `forward-timeout` are 1 to 30000 ms. They took 0 to
+  2^31-1 (24 days), so a hung plugin or forwarder could hold an async thread and a reload's reader that long; 0 (which
+  meant the default, 2000) and larger values are configuration errors now.
+
 - **Server core review, group 1** (#248): a TCP client that reads a few bytes now and then no longer holds a worker in
   a send for ever (`tcp-idle-timeout` bounds the send of one answer, RFC 7766 section 6.2.3); a rollback check at
   serial 0 (a secondary at serial 0 accepted an older first SOA); the dnstap socket rights are cut where it is
