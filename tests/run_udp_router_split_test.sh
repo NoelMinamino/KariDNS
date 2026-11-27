@@ -20,6 +20,10 @@
 #   (4 worker(s) x M listen address(es))", ipcworker.<w>.queries above 0 for all four workers and their sum exactly the queries sent, and the routers
 #   read none of them (ipcrouter.<r>.queries do not move); the answers still come from the address and port the query went to (the router sends on
 #   its descriptor of the worker's socket).  With udp-receive frontend there are no ipcworker lines.
+#   Both modes: every router sent replies of the 20000 (ipcrouter.<r>.replies, 0.7), and one flow (2000 queries from one source port) is answered
+#   whole and right with no reply refused as a bad socket; with udp-receive backend that one flow goes to one worker, whose batches of replies go to
+#   the routers in turn (be_udp_reply_next()): every router sent some of them (before 0.7: only router worker mod 4).
+#   C  udp-receive backend with 2 routers + 1 worker (more routers than workers): the one flow's replies leave through both routers.
 #
 # SKIP (exit 0, with the reason) without karidns, karictl, dag, perl.  The alias checks are skipped without root (ifconfig lo0 alias).  About 80 s (both modes).
 # See docs/karidns.md (thread layout, router-threads), docs/karictl.md (ipcstats).
@@ -96,8 +100,8 @@ write_conf() {
 options {
     port $PORT;
     $1
-    router-threads 4;
-    worker-threads 4;
+    router-threads ${RT:-4};
+    worker-threads ${WT:-4};
     udp-receive $MODE;
     pid-file "none";
     $USER_OPT
@@ -129,6 +133,29 @@ ipcv() { ctl ipcstats 2>/dev/null | sed -n "s/^$1=//p" | head -1; }   # ipcv ipc
 routed_sum() { s=0; for r in 0 1 2 3; do s=$((s + $(ipcv ipcrouter.$r.queries))); done; echo "$s"; }
 wrecv_sum() { s=0; for w in 0 1 2 3; do v=$(ipcv ipcworker.$w.queries); s=$((s + ${v:-0})); done; echo "$s"; }   # (udp-receive backend: the workers' own sockets)
 kv() { echo "$1" | tr ' ' '\012' | sed -n "s/^$2=//p" | head -1; }   # kv "sent=3 received=2" received
+# rep_snap: the replies each router sent so far (ipcrouter.<r>.replies, 0.7), one number a router
+rep_snap() { r=0; out=""; while [ $r -lt "${RT:-4}" ]; do v=$(ipcv ipcrouter.$r.replies); out="$out ${v:-0}"; r=$((r + 1)); done; echo $out; }
+# reply_spread LABEL BEFORE N: since the rep_snap BEFORE every router sent some of the replies, and all of them together N (at least N - LOST_Q: the
+# kernel's loopback queue, see load()).  udp-receive backend: a worker hands its batches of replies to the routers in turn (be_udp_reply_next()), so
+# even one client flow, which the kernel gives to one worker, reaches every router.  The counters are read until they add up or 10 s are up.
+reply_spread() {
+    rs_l=$1; before=$2; want=$3; i=0
+    while :; do
+        now=$(rep_snap); tot=0; idle=""; deltas=""; r=0
+        for b in $before; do
+            v=$(echo "$now" | cut -d' ' -f$((r + 1))); d=$((v - b)); tot=$((tot + d)); deltas="$deltas $d"
+            [ "$d" -gt 0 ] || idle="$idle $r"
+            r=$((r + 1))
+        done
+        if [ "$tot" -ge $((want - LOST_Q)) ] || [ $i -ge 50 ]; then break; fi
+        sleep 0.2; i=$((i + 1))
+    done
+    if [ -z "$idle" ] && [ "$tot" -le "$want" ] && [ "$tot" -ge $((want - LOST_Q)) ]; then
+        ok "$rs_l: every router sent replies (per router:$deltas; $tot of $want)"
+    else
+        bad "$rs_l: the replies per router:$deltas (sum $tot, want $want, every router above 0; idle:${idle:- none})" "$(ctl ipcstats | grep -E 'ipcworker|ipcrouter|bad_socket|reply')"
+    fi
+}
 
 # load LABEL N NSOCK WINDOW BATCH PAUSE_MS: the client against the server; every query answered, every answer right
 load() {
@@ -174,8 +201,9 @@ one_server() {
     elif grep -q 'udp-receive backend' "$LOG"; then
         bad "$lbl: udp-receive frontend, but the log speaks of backend receive sockets" "$(grep 'udp-receive' "$LOG")"
     fi
-    sum0=$(routed_sum); wsum0=$(wrecv_sum); drop0=$(ipcv ipc.dropped.total)
+    sum0=$(routed_sum); wsum0=$(wrecv_sum); drop0=$(ipcv ipc.dropped.total); rep0=$(rep_snap)
     load "$lbl: 64 source ports" 20000 64 256 16 0
+    reply_spread "$lbl: 64 source ports" "$rep0" 20000
     # (the counters are read until they reach the 20000 or 10 s are up: a router or a worker that is late on a loaded host is waited for)
     if [ "$MODE" = "backend" ]; then
         i=0; while [ $i -lt 50 ] && [ "$(($(wrecv_sum) - wsum0))" -lt $((20000 - LOST_Q)) ]; do sleep 0.2; i=$((i + 1)); done
@@ -204,6 +232,27 @@ one_server() {
     fi
     load "$lbl: paced single queries (a short batch each)" 300 8 1 1 3
     load "$lbl: bursts of 33" 3300 33 33 33 0
+    one_flow "$lbl"
+}
+
+# one_flow LABEL: 2000 queries from one source port (one flow: the kernel gives it to one worker with udp-receive backend).  Every answer is checked
+# by the client as in load() (the source address and port the query went to, also through the alias), and with udp-receive backend the replies of
+# that one worker leave through every router (0.7, be_udp_reply_next(): before, all went through router worker mod routers); nothing is dropped or
+# refused as a bad socket (a router sends on another router's worker's socket only for the worker whose pair the reply came on)
+one_flow() {
+    rep0=$(rep_snap); bs0=$(ipcv ipc.router.reply.bad_socket); drop0=$(ipcv ipc.dropped.total); wsum0=$(wrecv_sum)
+    load "$1: one flow" 2000 1 16 16 0
+    if [ "$MODE" = "backend" ]; then
+        reply_spread "$1: one flow" "$rep0" 2000
+        busy=0
+        for w in $(seq 0 $((${WT:-4} - 1))); do v=$(ipcv ipcworker.$w.queries); [ "${v:-0}" -gt 0 ] && busy=$((busy + 1)); done
+        echo "    (workers that read queries so far: $busy of ${WT:-4}; queries read in this load: $(($(wrecv_sum) - wsum0)))"
+    fi
+    if [ "$(ipcv ipc.router.reply.bad_socket)" = "$bs0" ] && [ "$(ipcv ipc.dropped.total)" = "$drop0" ]; then
+        ok "$1: one flow: no reply refused as a bad socket, no drop counted"
+    else
+        bad "$1: one flow: bad_socket $bs0 -> $(ipcv ipc.router.reply.bad_socket), dropped $drop0 -> $(ipcv ipc.dropped.total)" "$(ctl ipcstats | grep -v '=0$')"
+    fi
 }
 
 q() { _ip=$1; _n=$2; "$DAG" "@$_ip" -p "$PORT" "$_n" A +nohexdump +time=2 +tries=1 2>&1; }
@@ -237,6 +286,14 @@ if [ "$ALIAS_ADDED" = "1" ]; then
 fi
 stop_server
 done
+
+echo "== C (backend). 2 routers + 1 worker: more routers than workers, the one worker's replies leave through both"
+MODE=backend; RT=2; WT=1
+write_conf ""
+if ! start_server; then bad "C: the server did not start" "$(tail -20 "$LOG")"; exit 1; fi
+if grep -q '\[Startup\] 2 routers, 1 workers' "$LOG"; then ok "C: 2 routers, 1 worker"; else bad "C: start-up line" "$(grep Startup "$LOG")"; fi
+one_flow "C backend"
+stop_server
 
 echo "== passed $PASS, failed $FAILS"
 [ "$FAILS" -eq 0 ]

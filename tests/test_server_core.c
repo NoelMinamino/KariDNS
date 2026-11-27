@@ -3159,6 +3159,20 @@ static void test_ipcd_counters(void) {
     assert(waitpid(pid, &st, 0) == pid && WIFEXITED(st) && WEXITSTATUS(st) == 0);
     assert(ipcd_routed(2) == r2 + 12 && ipcd_routed(1) == r0);
     assert(ipcd_routed(-1) == 0 && ipcd_routed(IPCD_BACKEND_SLOT + 5) == 0);
+    // 0.7: the replies each router sent, in its own slot (one writer), shown per router (ipcrouter.<r>.replies) and not as a drop
+    const uint64_t p1 = ipcd_replies(1), p2 = ipcd_replies(2);
+    pid = fork();
+    assert(pid >= 0);
+    if (pid == 0) {                                // a router: slot 1
+        ipcd_set_self(1);
+        ipcd_replies_add(9);
+        ipcd_replies_add(0);                       // (nothing)
+        ipcd_replies_add(4);
+        _exit(0);
+    }
+    assert(waitpid(pid, &st, 0) == pid && WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    assert(ipcd_replies(1) == p1 + 13 && ipcd_replies(2) == p2);
+    assert(ipcd_replies(-1) == 0 && ipcd_replies(IPCD_BACKEND_SLOT + 5) == 0);
     const int saved_routers = g_num_frontend_routers;
     g_num_frontend_routers = 3;
     len = ipcd_format(buf, sizeof(buf));
@@ -3166,6 +3180,8 @@ static void test_ipcd_counters(void) {
     char want[64];
     snprintf(want, sizeof(want), "ipcrouter.2.queries=%llu\n", (unsigned long long)(r2 + 12));
     assert(strstr(buf, want) != NULL && strstr(buf, "ipcrouter.3.queries=") == NULL);
+    snprintf(want, sizeof(want), "ipcrouter.1.replies=%llu\n", (unsigned long long)(p1 + 13));
+    assert(strstr(buf, want) != NULL && strstr(buf, "ipcrouter.0.replies=") != NULL && strstr(buf, "ipcrouter.3.replies=") == NULL);
     dt = strstr(buf, "ipc.dropped.total=");
     sum = 0;
     for (int i = 0; i < IPCD_COUNT; i++)
@@ -3519,9 +3535,9 @@ static void test_udp_ipc_from_recv(void) {
     printf("  -> udp_ipc_from_recv passed.\n");
 }
 
-/* router_reply_fd(): the socket index of a reply comes from the Backend and is checked by the router; be_udp_reply_router(); be_udp_budget() */
+/* router_reply_fd(): the socket index of a reply comes from the Backend and is checked by the router; be_udp_reply_next(); be_udp_budget() */
 static void test_router_reply_fd_and_budget(void) {
-    printf("[TEST] Server Core: router_reply_fd (the reply's socket index is hostile input), be_udp_reply_router, be_udp_budget...\n");
+    printf("[TEST] Server Core: router_reply_fd (the reply's socket index is hostile input), be_udp_reply_next, be_udp_budget...\n");
     const int saved_workers = g_num_workers, saved_count = g_be_udp_count;
     int saved_fds[3][2];
     for (int w = 0; w < 3; w++)
@@ -3530,7 +3546,7 @@ static void test_router_reply_fd_and_budget(void) {
     g_num_workers = 3;
     g_be_udp_count = 2;
     g_be_udp_fds[0][0] = 10; g_be_udp_fds[0][1] = 11;
-    g_be_udp_fds[1][0] = -1; g_be_udp_fds[1][1] = -1;     /* (a worker whose replies go to another router: the router closed them) */
+    g_be_udp_fds[1][0] = -1; g_be_udp_fds[1][1] = -1;     /* (descriptors the router does not hold: refused) */
     g_be_udp_fds[2][0] = 20; g_be_udp_fds[2][1] = 21;
     assert(router_reply_fd(0, 0, local, 3) == 10 && router_reply_fd(0, 1, local, 3) == 11 && router_reply_fd(2, 1, local, 3) == 21);
     assert(router_reply_fd(1, 0, local, 3) == -1 && router_reply_fd(1, 1, local, 3) == -1);
@@ -3547,9 +3563,29 @@ static void test_router_reply_fd_and_budget(void) {
     g_num_workers = saved_workers;
     g_be_udp_count = saved_count;
 
-    /* the workers' replies are shared out over the routers */
-    assert(be_udp_reply_router(0, 4) == 0 && be_udp_reply_router(3, 4) == 3 && be_udp_reply_router(5, 4) == 1 && be_udp_reply_router(7, 1) == 0);
-    assert(be_udp_reply_router(2, 8) == 2 && be_udp_reply_router(0, 0) == 0 && be_udp_reply_router(-1, 4) == 0);
+    /* the routers in turn (0.7): R calls of a worker visit every router once, from worker mod routers; one router (or none) is always router 0 */
+    for (int routers = 1; routers <= KARIDNS_ROUTER_THREADS_MAX; routers++)
+        for (unsigned w = 0; w < 10; w++) {
+            unsigned rr = w;
+            int seen[KARIDNS_ROUTER_THREADS_MAX] = { 0 };
+            assert(be_udp_reply_next(&rr, routers) == (int)(w % (unsigned)routers));
+            for (int k = 1; k < routers; k++) (void)be_udp_reply_next(&rr, routers);
+            rr = w;
+            for (int k = 0; k < 3 * routers; k++) {
+                const int r = be_udp_reply_next(&rr, routers);
+                assert(r >= 0 && r < routers && (routers == 1 || rr <= (unsigned)routers));   /* (one router: the counter is not used) */
+                seen[r]++;
+            }
+            for (int r = 0; r < routers; r++) assert(seen[r] == 3);
+        }
+    {
+        unsigned rr = UINT_MAX;                                                  /* (a counter at its end: no overflow, it stays below the routers) */
+        assert(be_udp_reply_next(&rr, 4) == 3 && rr == 4 && be_udp_reply_next(&rr, 4) == 0 && rr == 1);
+        rr = 7;
+        assert(be_udp_reply_next(&rr, 1) == 0 && be_udp_reply_next(&rr, 0) == 0 && be_udp_reply_next(&rr, -1) == 0 && rr == 7);
+        rr = 0;
+        assert(be_udp_reply_next(&rr, 2) == 0 && be_udp_reply_next(&rr, 2) == 1 && be_udp_reply_next(&rr, 2) == 0);   /* (2 routers, 1 worker: both) */
+    }
 
     /* the start-up budget: sockets and descriptors */
     char err[512];
@@ -3589,12 +3625,15 @@ static void test_router_reply_fd_and_budget(void) {
     for (int i = 0; i < IPCD_COUNT; i++)
         if (i != IPCD_RTW_SPILLED && i != IPCD_RREP_CUT && i != IPCD_RCLI_RETRIED && i != IPCD_WREP_RETRIED) sum += ipcd_total((ipcd_t)i);
     assert(dt && strtoull(dt + strlen("ipc.dropped.total="), NULL, 10) == sum);   /* (the worker queries are not drops; the new drops are) */
-    g_num_workers = KARIDNS_WORKER_THREADS_MAX;                                 /* (the reply of 128 workers fits the control thread's buffer) */
+    const int saved_routers = g_num_frontend_routers;
+    g_num_frontend_routers = KARIDNS_ROUTER_THREADS_MAX;
+    g_num_workers = KARIDNS_WORKER_THREADS_MAX;                                 /* (the reply of 8 routers and 128 workers fits the control thread's buffer) */
     fl = ipcd_format(fb, sizeof(fb));
-    assert(strstr(fb, "ipcworker.127.queries=") && strstr(fb, "ipcbuf.udp.snd.got=") && fl < sizeof(fb));
+    assert(strstr(fb, "ipcrouter.7.replies=") && strstr(fb, "ipcworker.127.queries=") && strstr(fb, "ipcbuf.udp.snd.got=") && fl < sizeof(fb));
+    g_num_frontend_routers = saved_routers;
     g_num_workers = saved_workers;
     g_be_udp_count = saved_count;
-    printf("  -> router_reply_fd / be_udp_reply_router / be_udp_budget passed.\n");
+    printf("  -> router_reply_fd / be_udp_reply_next / be_udp_budget passed.\n");
 }
 
 /* Capsicum: a worker's descriptor of a UDP socket may only receive, a router's descriptor of the same socket may only send (dns_priv_sandbox.c) */

@@ -408,7 +408,7 @@ int main(void) {
         udp_ipc_t rh;
         uint16_t rid;
         UDP_IN(0x6101);                                              /* in memory: answered at once */
-        CHECK(worker_udp_rx(&w, us, 2, sk[0]) == 1 && w.n_tx == 0 && table.nwait == 0);
+        CHECK(worker_udp_rx(&w, us, 2, &sk[0], 1) == 1 && w.n_tx == 0 && table.nwait == 0);
         RAW_ANSWER(rh, rid);
         CHECK(rid == 0x6101 && rh.sock_fd_idx == 2 && rh.addr_len == sizeof(struct sockaddr_in) && rh.client_addr.sin.sin_port == ucl.sin_port &&
               rh.client_addr.sin.sin_addr.s_addr == htonl(INADDR_LOOPBACK));
@@ -416,7 +416,7 @@ int main(void) {
 
         atomic_store(&el->entry, NULL);                              /* not in memory: parked, nothing sent, the zone asked for */
         UDP_IN(0x6102);
-        CHECK(worker_udp_rx(&w, us, 2, sk[0]) == 1 && table.nwait == 1);
+        CHECK(worker_udp_rx(&w, us, 2, &sk[0], 1) == 1 && table.nwait == 1);
         CHECK(park_fetch_pop(park_fetch_ring(0), &q) && strcmp(q.zone, "park.test.") == 0);
         CHECK(!read_answer(sk[1]).got);
         atomic_store(&el->entry, entry);
@@ -437,7 +437,7 @@ int main(void) {
         CHECK(sendto(uc, big, sizeof(big), 0, (struct sockaddr *)&ua, sizeof(ua)) == (ssize_t)sizeof(big));
         int runs = 0;
         for (int i = 0; i < 200 && (ipcd_total(IPCD_WURX_SHORT) < short0 + 1 || ipcd_total(IPCD_WURX_TRUNC) < trunc0 + 1); i++) {   /* (bounded: 2 s) */
-            runs += worker_udp_rx(&w, us, 2, sk[0]);
+            runs += worker_udp_rx(&w, us, 2, &sk[0], 1);
             usleep(10000);
         }
         CHECK(runs == 0 && ipcd_total(IPCD_WURX_SHORT) == short0 + 1 && ipcd_total(IPCD_WURX_TRUNC) == trunc0 + 1);
@@ -445,10 +445,41 @@ int main(void) {
         CHECK(atomic_load(&wctx.query_count) == q0 + 2 && ipcd_wrecv(0) == r0 + 2);
         /* a socket index the Backend does not have reads nothing */
         UDP_IN(0x6103);
-        CHECK(worker_udp_rx(&w, us, 3, sk[0]) == 0 && worker_udp_rx(&w, us, -1, sk[0]) == 0);
-        CHECK(worker_udp_rx(&w, us, 2, sk[0]) == 1);
+        CHECK(worker_udp_rx(&w, us, 3, &sk[0], 1) == 0 && worker_udp_rx(&w, us, -1, &sk[0], 1) == 0);
+        CHECK(worker_udp_rx(&w, us, 2, &sk[0], 1) == 1);
         RAW_ANSWER(rh, rid);
         CHECK(rid == 0x6103 && rh.sock_fd_idx == 2);
+        /* 0.7: the batches go to the routers in turn (be_udp_reply_next()): with two pairs the answer of one batch is on the second pair, of the next
+         * on the first; a query parked in a batch keeps that batch's pair, and its answer leaves there after the wake-up */
+        {
+            int sk2[2];
+            CHECK(socketpair(AF_UNIX, SOCK_DGRAM, 0, sk2) == 0);
+            const int pairs[2] = { sk[0], sk2[0] };
+            w.reply_rr = 1;
+            UDP_IN(0x6104);
+            CHECK(worker_udp_rx(&w, us, 2, pairs, 2) == 1);
+            ans_t a = read_answer(sk2[1]);
+            CHECK(a.got && a.id == 0x6104 && a.sock_idx == 2 && w.reply_rr == 2);
+            CHECK(!read_answer(sk[1]).got);
+            UDP_IN(0x6105);
+            CHECK(worker_udp_rx(&w, us, 2, pairs, 2) == 1);
+            a = read_answer(sk[1]);
+            CHECK(a.got && a.id == 0x6105 && !read_answer(sk2[1]).got);
+            atomic_store(&el->entry, NULL);                          /* parked in a batch for the second pair */
+            UDP_IN(0x6106);
+            CHECK(worker_udp_rx(&w, us, 2, pairs, 2) == 1 && table.nwait == 1);
+            CHECK(park_fetch_pop(park_fetch_ring(0), &q) && strcmp(q.zone, "park.test.") == 0);
+            atomic_store(&el->entry, entry);
+            CHECK(park_wake_push(park_wake_ring(0), "default", "park.test.", false));
+            w.active_fd = -1;
+            park_service(&w, -1);
+            w.active_fd = sk[0];
+            CHECK(table.nwait == 0 && table.nready == 0);
+            a = read_answer(sk2[1]);
+            CHECK(a.got && a.id == 0x6106 && a.sock_idx == 2 && !read_answer(sk[1]).got);
+            close(sk2[0]);
+            close(sk2[1]);
+        }
         #undef UDP_IN
         #undef RAW_ANSWER
         g_be_udp_count = 0;

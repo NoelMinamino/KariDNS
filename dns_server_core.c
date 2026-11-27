@@ -2119,6 +2119,17 @@ uint64_t ipcd_routed(int slot) {
   return (slot >= 0 && slot < IPCD_SLOTS) ? atomic_load_explicit(&g_ipcd_slots[slot].routed, memory_order_relaxed) : 0;
 }
 
+/* The replies a router sent to the clients, in its own slot (one writer, as ipcd_routed_add()): ipcrouter.<r>.replies shows how the replies are
+ * shared out over the routers (udp-receive backend: be_udp_reply_next()) */
+void ipcd_replies_add(uint64_t n) {
+  if (n) atomic_store_explicit(&g_ipcd_self->replies, atomic_load_explicit(&g_ipcd_self->replies, memory_order_relaxed) + n, memory_order_relaxed);
+}
+
+uint64_t ipcd_replies(int slot) {
+  if (!g_ipcd_slots) return slot == 0 ? atomic_load_explicit(&g_ipcd_fallback.replies, memory_order_relaxed) : 0;
+  return (slot >= 0 && slot < IPCD_SLOTS) ? atomic_load_explicit(&g_ipcd_slots[slot].replies, memory_order_relaxed) : 0;
+}
+
 void ipcd_wrecv_add(int worker, uint64_t n) {
   if (n && worker >= 0 && worker < KARIDNS_WORKER_THREADS_MAX)
     atomic_store_explicit(&g_ipcd_wrecv[worker].n, atomic_load_explicit(&g_ipcd_wrecv[worker].n, memory_order_relaxed) + n, memory_order_relaxed);
@@ -2151,7 +2162,8 @@ size_t ipcd_format(char *buf, size_t cap) {
   if (w > 0 && (size_t)w < cap - len) len += (size_t)w;
   /* the queries each router read and handed to the workers (B3: with several routers, SO_REUSEPORT_LB shares the clients' ports out; a router at 0 is idle) */
   for (int r = 0; r < g_num_frontend_routers && r < KARIDNS_ROUTER_THREADS_MAX; r++) {
-    w = snprintf(buf + len, cap - len, "ipcrouter.%d.queries=%llu\n", r, (unsigned long long)ipcd_routed(r));
+    w = snprintf(buf + len, cap - len, "ipcrouter.%d.queries=%llu\nipcrouter.%d.replies=%llu\n", r, (unsigned long long)ipcd_routed(r), r,
+                 (unsigned long long)ipcd_replies(r));
     if (w < 0 || (size_t)w >= cap - len) return len;
     len += (size_t)w;
   }
@@ -2262,6 +2274,7 @@ STATIC_TEST int router_send_clients(int fd, struct mmsghdr *msgs, int n, bool *s
   }
   const int full = n - off;
   if (full == 0) *stuck = false;
+  ipcd_replies_add((uint64_t)(n - full - hard));
   ipcd_add(IPCD_RCLI_FULL, (uint64_t)full);
   ipcd_add(IPCD_RCLI_ERR, (uint64_t)hard);
   ipcd_add(IPCD_RCLI_RETRIED, (uint64_t)retried);
@@ -3477,10 +3490,11 @@ STATIC_TEST void park_service(udp_pass_t *w, int kq) {
 
 /* udp-receive backend (B3 phase 2): the queries that came in on this worker's own UDP socket sock_idx (descriptor fd, receive only) are read in batches,
  * given the udp_ipc_t header the router used to build (udp_ipc_from_recv(): the client, the destination, sock_idx), and run through udp_one() exactly
- * as a message of a router; the replies go on reply_fd, the IPC pair to the router that sends this worker's replies (be_udp_reply_router()), which
- * sends them on its descriptor of the same socket.  A query that parks keeps the header (and so sock_idx) and reply_fd in its entry (park_udp()).
- * No allocation: the batch buffers of the worker.  Returns the number of queries run (the tests). */
-int worker_udp_rx(udp_pass_t *pass, int fd, int sock_idx, int reply_fd) {
+ * as a message of a router; the replies of each batch go on one of reply_fds[0 .. n_reply), this worker's IPC pairs to the routers, the next in turn
+ * (be_udp_reply_next(), pass->reply_rr), and that router sends them on its descriptor of the same socket.  A query that parks keeps the header (and so
+ * sock_idx) and the pair of its batch in its entry (park_udp()).  No allocation: the batch buffers of the worker.  Returns the number of queries run
+ * (the tests). */
+int worker_udp_rx(udp_pass_t *pass, int fd, int sock_idx, const int *reply_fds, int n_reply) {
   udp_batch_ctx_t *batch = pass->batch;
   if (sock_idx < 0 || sock_idx >= g_be_udp_count || sock_idx >= MAX_BIND_ADDRS) return 0;
   const bool want_dst = g_be_udp_wild[sock_idx];       /* (only a wildcard socket was asked for the destination: udp_listen_socket()) */
@@ -3502,6 +3516,7 @@ int worker_udp_rx(udp_pass_t *pass, int fd, int sock_idx, int reply_fd) {
     }
     const int n_recv = recvmmsg(fd, batch->urx_msgs, UDP_BATCH_SIZE, MSG_DONTWAIT, NULL);
     if (n_recv <= 0) break;                               /* EAGAIN (EV_CLEAR: the next datagram raises the event again) */
+    const int reply_fd = n_reply > 0 ? reply_fds[be_udp_reply_next(&pass->reply_rr, n_reply)] : -1;   /* (this batch's router: the next in turn) */
     pass->active_fd = reply_fd;
     pass->n_tx = 0;
     pass->woken = false;
@@ -3632,7 +3647,10 @@ void *worker_thread_func(void *arg) {
   }
   /* udp-receive backend (B3 phase 2): this worker's own UDP sockets, one per listen address (receive only: the Backend limited them before the threads
    * started).  A socket that is not watched would keep its share of the clients unanswered: the start fails instead (X-33) */
-  const int be_reply_fd = g_be_udp_count > 0 && g_num_frontend_routers > 0 ? g_ipc_fds[be_udp_reply_router(w, g_num_frontend_routers)][w][1] : -1;
+  /* (the replies of the batches read there go to the routers in turn, on this worker's pairs: the ends limited above, no other descriptor) */
+  int be_reply_fds[KARIDNS_ROUTER_THREADS_MAX];
+  const int be_n_reply = g_be_udp_count > 0 ? (g_num_frontend_routers < KARIDNS_ROUTER_THREADS_MAX ? g_num_frontend_routers : KARIDNS_ROUTER_THREADS_MAX) : 0;
+  for (int f = 0; f < be_n_reply; f++) be_reply_fds[f] = g_ipc_fds[f][w][1];
   for (int a = 0; a < g_be_udp_count; a++) {
     struct kevent ev_udp;
     EV_SET(&ev_udp, g_be_udp_fds[w][a], EVFILT_READ, EV_ADD | EV_CLEAR, 0, 0, (void *)(uintptr_t)(WORKER_UDP_UDATA + a));
@@ -3687,6 +3705,7 @@ worker_startup_success:;
   pass.cc = &thread_compress_ctx;
   pass.park = park_on ? &park : NULL;
   pass.worker_idx = ctx->thread_id;
+  pass.reply_rr = (unsigned)ctx->thread_id;           /* (the first batch goes to router worker mod routers: the workers are not in step) */
   pass.park_timeout_ms = park_timeout_ms;
 
   while (1) {
@@ -3801,7 +3820,7 @@ worker_startup_success:;
       } else if (ev_list[i].filter == EVFILT_READ && (uintptr_t)ev_list[i].udata >= WORKER_UDP_UDATA &&
                  (uintptr_t)ev_list[i].udata < WORKER_UDP_UDATA + MAX_BIND_ADDRS) {
         // UDP (udp-receive backend: this worker's own socket of one listen address; the replies go to a router over the IPC)
-        (void)worker_udp_rx(&pass, (int)ev_list[i].ident, (int)((uintptr_t)ev_list[i].udata - WORKER_UDP_UDATA), be_reply_fd);
+        (void)worker_udp_rx(&pass, (int)ev_list[i].ident, (int)((uintptr_t)ev_list[i].udata - WORKER_UDP_UDATA), be_reply_fds, be_n_reply);
       } else if (ev_list[i].udata == (void *)2) {
         // TCP
         int active_tcp_fd = ev_list[i].ident;
@@ -7309,17 +7328,26 @@ int udp_ipc_from_recv(udp_ipc_t *msg, const struct msghdr *mh, size_t len, int32
   return UDP_RX_OK;
 }
 
-/* udp-receive backend: the router that the replies of worker `worker` go to (each worker sends all of them on its pair to one router, so the routers
- * share the workers out: 4 + 4 is one worker per router) */
-int be_udp_reply_router(int worker, int routers) {
-  return routers > 0 && worker >= 0 ? worker % routers : 0;
+/* udp-receive backend (0.7): the router of a worker's next batch of replies.  *rr is the worker's own counter (one thread; it starts at the worker's
+ * index, so the workers are not in step); each call returns the next router in turn.  Why: the kernel gives each client flow to one worker's socket
+ * by a hash (SO_REUSEPORT_LB), and with a fixed router per worker (worker mod routers, before) the flows of two busy workers piled up on one router
+ * (pc31, 4 routers + 8 workers, 24 flows: one router at 22-23 s of sys time in 30 s, the knee stuck at 800k).  In turn, each router sends 1/routers
+ * of every worker's replies, whatever the flows.  The cost is none: every worker already holds its pair to every router, and a batch is still one
+ * IPC send.  Replies of one flow in two batches may leave through two routers, so out of order (UDP DNS has no order: RFC 1035 4.2.1, matched by
+ * ID).  *rr stays below routers (no overflow); routers <= 1 gives router 0 always (one router: as before). */
+int be_udp_reply_next(unsigned *rr, int routers) {
+  if (routers <= 1) return 0;
+  const int r = (int)(*rr % (unsigned)routers);
+  *rr = (unsigned)r + 1;
+  return r;
 }
 
 /* The descriptor a router sends a worker's reply on.  sock_fd_idx comes from the Backend, which the router does not trust: an index outside the router's
- * table, a worker that does not exist, or the socket of a worker whose replies go to another router (the router closed that descriptor) gives -1, and
- * the caller drops the reply and counts it (IPCD_RREP_BADSOCK).  With udp-receive backend the first g_be_udp_count indices are the listen addresses
- * (the socket of the replying worker for that address: the reply leaves from the socket the query came in on), the ones above them the router's own
- * NOTIFY sockets; with udp-receive frontend every index is one of the router's sockets. */
+ * table, a worker that does not exist, or a descriptor the router does not hold (-1) gives -1, and the caller drops the reply and counts it
+ * (IPCD_RREP_BADSOCK).  With udp-receive backend the first g_be_udp_count indices are the listen addresses (the socket of the replying worker for that
+ * address, worker_idx being the worker whose pair the reply came on: a worker can only make a router send on its own sockets, and the reply leaves from
+ * the socket the query came in on), the ones above them the router's own NOTIFY sockets; with udp-receive frontend every index is one of the router's
+ * sockets. */
 int router_reply_fd(int worker_idx, int32_t sock_idx, const int *local_fds, int num_local) {
   if (sock_idx < 0 || sock_idx >= num_local || sock_idx >= MAX_BIND_ADDRS) return -1;
   if (sock_idx < g_be_udp_count) {
@@ -7436,20 +7464,17 @@ STATIC_TEST void run_frontend_router(pid_t backend_pid, int router_id) {
   memset(tx_stuck, 0, sizeof(tx_stuck));
   router_src_t local_udp_src[MAX_BIND_ADDRS];
   int local_num_udp_fds;
-  /* udp-receive backend (B3 phase 2): the listen addresses are the workers' sockets, which the manager made; this router keeps the descriptors of the
-   * workers whose replies come to it, plus those of one worker (router_id % workers) that stand for the listen addresses in local_udp_fds[0 .. count)
-   * (the NOTIFY sockets, the pre-bind check), each limited to sending.  It never reads them and has no socket of its own in a listen address's
-   * SO_REUSEPORT_LB group (it would take a share of the queries) */
+  /* udp-receive backend (B3 phase 2): the listen addresses are the workers' sockets, which the manager made; this router keeps the descriptors of
+   * every worker (0.7: every worker hands its batches of replies to the routers in turn, be_udp_reply_next()), those of one worker (router_id %
+   * workers) standing for the listen addresses in local_udp_fds[0 .. count) (the NOTIFY sockets, the pre-bind check), each limited to sending.  It
+   * never reads them and has no socket of its own in a listen address's SO_REUSEPORT_LB group (it would take a share of the queries).  The
+   * descriptors (workers x addresses + the pairs) stay below the Backend's, which be_udp_budget() checks against the same limit. */
   const int be_count = g_be_udp_count;
   if (be_count > 0) {
     const int hold = g_num_workers > 0 ? router_id % g_num_workers : -1;
     for (int w = 0; w < g_num_workers; w++) {
-      const bool keep = w == hold || be_udp_reply_router(w, g_num_frontend_routers) == router_id;
       for (int a = 0; a < be_count; a++) {
-        if (!keep) {
-          close(g_be_udp_fds[w][a]);
-          g_be_udp_fds[w][a] = -1;
-        } else if (!limit_udp_send_rights(g_be_udp_fds[w][a])) {
+        if (!limit_udp_send_rights(g_be_udp_fds[w][a])) {
           fprintf(stderr, "[ERROR] [Frontend %d] cannot limit a worker UDP socket to sending; aborting startup\n", router_id);
           exit(EXIT_FAILURE);
         }

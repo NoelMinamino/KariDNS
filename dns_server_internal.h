@@ -340,6 +340,7 @@ typedef struct {
   compress_ctx_t *cc;
   int active_fd;
   int n_tx;                          /* answers in the batch of datagrams to send */
+  unsigned reply_rr;                 /* udp-receive backend: the router of this worker's next batch of replies (be_udp_reply_next(); this thread's own) */
   bool qlog_enabled, rlog_enabled, blackhole_on;
   uint32_t eff_max_qps;
   /* parking (park == NULL: this worker never parks) */
@@ -1856,10 +1857,11 @@ bool router_src_from_sockaddr(const struct sockaddr_storage *ss, router_src_t *o
 /* ---- 0.7 B3 phase 2: udp-receive backend (decision Q2) ----
  * The manager makes, before the Backend and the routers are forked, one SO_REUSEPORT_LB UDP socket per (worker, listen address): g_be_udp_fds[w][a],
  * a < g_be_udp_count (0: udp-receive frontend, the routers read the queries as before).  The Backend limits its descriptors to CAP_RECV + CAP_EVENT
- * (worker w reads only its own row, receive only: it never sends UDP, Rule 2); a router keeps the rows of the workers whose replies come to it
- * (be_udp_reply_router()), limited to CAP_SEND + CAP_CONNECT (sendmsg with a destination) + CAP_GETSOCKNAME, and never reads them.  The replies take
- * the Backend->Frontend IPC as before: sock_fd_idx a < g_be_udp_count names the address, and the router sends on its descriptor of that worker's
- * socket (router_reply_fd()), so the reply leaves from the socket and the address the query came to. */
+ * (worker w reads only its own row, receive only: it never sends UDP, Rule 2); every router keeps every row (0.7: a worker hands each batch of
+ * replies to the next router in turn, be_udp_reply_next()), limited to CAP_SEND + CAP_CONNECT (sendmsg with a destination) + CAP_GETSOCKNAME, and
+ * never reads them.  The replies take the Backend->Frontend IPC as before: sock_fd_idx a < g_be_udp_count names the address, and the router sends on
+ * its descriptor of that socket of the worker whose pair the reply came on (router_reply_fd()), so the reply leaves from the socket and the address
+ * the query came to. */
 #define BE_UDP_SOCKETS_MAX 4096              /* worker-threads x listen addresses: more is refused at start-up (be_udp_budget()) */
 #define WORKER_UDP_UDATA 4096                /* kevent udata of the worker's UDP socket a: WORKER_UDP_UDATA + a (never a TCP context pointer) */
 extern int g_be_udp_count;
@@ -1869,11 +1871,11 @@ extern router_src_t g_be_udp_src[MAX_BIND_ADDRS];
 enum { UDP_RX_OK = 0, UDP_RX_TRUNC = 1, UDP_RX_SHORT = 2 };
 int udp_ipc_from_recv(udp_ipc_t *msg, const struct msghdr *mh, size_t len, int32_t sock_idx, bool want_dst, const router_src_t *bound_src);
 int router_reply_fd(int worker_idx, int32_t sock_idx, const int *local_fds, int num_local);
-int be_udp_reply_router(int worker, int routers);
+int be_udp_reply_next(unsigned *rr, int routers);
 bool be_udp_budget(int workers, int addrs, int routers, long long nofile, char *err, size_t errlen);
 bool open_backend_udp_sockets(server_config_t *cfg, int num_workers, char *err, size_t errlen);
 void be_udp_close_all(void);
-int worker_udp_rx(udp_pass_t *pass, int fd, int sock_idx, int reply_fd);
+int worker_udp_rx(udp_pass_t *pass, int fd, int sock_idx, const int *reply_fds, int n_reply);
 void setup_udp_socket_buffers(int fd, int desired_rcv, int desired_snd);
 void apply_tcp_listen_opts(int fd, const server_config_t *cfg, bool verbose);
 void apply_tcp_mss(int fd, tcp_stream_ctx_t *c, int mss);
@@ -1969,11 +1971,14 @@ typedef enum {
 typedef struct {
   alignas(64) _Atomic uint64_t c[IPCD_COUNT];
   _Atomic uint64_t routed;   /* router slots: the queries the router read from its UDP sockets and handed to the workers (not a loss: shown as ipcrouter.<r>.queries) */
+  _Atomic uint64_t replies;  /* router slots: the replies the router sent to the clients (router_send_clients(): sent, not dropped; shown as ipcrouter.<r>.replies) */
 } ipcd_slot_t;
 #define IPCD_BACKEND_SLOT KARIDNS_ROUTER_THREADS_MAX   /* the slots below it are the routers' */
 void ipcd_add(ipcd_t c, uint64_t n);
 void ipcd_routed_add(uint64_t n);
 uint64_t ipcd_routed(int slot);
+void ipcd_replies_add(uint64_t n);
+uint64_t ipcd_replies(int slot);
 void ipcd_wrecv_add(int worker, uint64_t n);   /* udp-receive backend: the queries worker `worker` read from its own UDP sockets (one writer per slot) */
 uint64_t ipcd_wrecv(int worker);
 uint64_t ipcd_total(ipcd_t c);
