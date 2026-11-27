@@ -6346,6 +6346,67 @@ static bool lkv_record(store_t *st, int64_t sid, store_zone_t *z) {
     store_read_unlock();
     return ok;
 }
+/* 0.7 review: the state of the reconcile (RC in dns_db_store.c) is read by the control thread (db_recon_status(): karictl store, dbstatus) and by the ingest thread (a lookup's answer: lk_mark())
+ * while the reconcile thread runs a pass.  This thread does both, all the time, while the test runs passes; under ThreadSanitizer (test_db_store-tsan) a field read or written outside RC.mu is a
+ * report.  What the status says must hold together: a pass that is active names its view. */
+static _Atomic bool g_rcs_stop;
+static _Atomic uint64_t g_rcs_reads, g_rcs_active_seen, g_rcs_bad;
+static void *recon_status_reader(void *arg) {
+    (void)arg;
+    db_recon_entry_t a;
+    memset(&a, 0, sizeof(a));
+    a.source_id = 6501; a.name = "lk0.rcs.test."; a.kind = KDB_ZK_PRIMARY; a.stamped = true; a.time = 10;
+    uint64_t k = 0;
+    while (!atomic_load(&g_rcs_stop)) {
+        db_recon_status_t rs;
+        db_recon_status(&rs);
+        if (rs.active) {
+            atomic_fetch_add(&g_rcs_active_seen, 1);
+            if (strcmp(rs.view, "rcs") != 0) atomic_fetch_add(&g_rcs_bad, 1);
+        }
+        if (++k % 16 == 0) {                                                   /* (the ingest thread's side: an answer of a lookup during the pass) */
+            a.gen = k;
+            uint32_t lz = STORE_NONE;
+            (void)db_recon_lookup("rcs", &a, &lz);
+        }
+        atomic_fetch_add(&g_rcs_reads, 1);
+    }
+    return NULL;
+}
+static void recon_status_during_pass(void) {
+    printf("  [the state of the reconcile read from other threads during passes (review: RC.mu)]\n");
+    char why[200];
+    db_recon_end_t o;
+    db_recon_entry_t e[8];
+    char names[8][64];
+    int res[8];
+    uint32_t zid[8];
+    memset(e, 0, sizeof(e));
+    for (int i = 0; i < 8; i++) {
+        snprintf(names[i], sizeof(names[i]), "z%d.rcs.test.", i);
+        e[i].source_id = 6400 + i; e[i].name = names[i]; e[i].kind = KDB_ZK_PRIMARY; e[i].stamped = true; e[i].gen = 1; e[i].time = 10;
+    }
+    atomic_store(&g_rcs_stop, false);
+    atomic_store(&g_rcs_active_seen, 0);
+    atomic_store(&g_rcs_bad, 0);
+    pthread_t th;
+    CHECK(pthread_create(&th, NULL, recon_status_reader, NULL) == 0);
+    for (int pass = 0; pass < 20; pass++) {
+        CHECK(db_recon_begin("rcs", 8, true, why, sizeof(why)));
+        for (int i = 0; i < 8; i++) e[i].gen = (uint64_t)pass + 1;
+        db_recon_entry_n(e, 4, res, zid);
+        /* (the reader has read the state at least once while this pass is open: a bounded wait, 5 s) */
+        const uint64_t r0 = atomic_load(&g_rcs_reads);
+        for (int w = 0; w < 5000 && atomic_load(&g_rcs_reads) < r0 + 2; w++) usleep(1000);
+        db_recon_entry_n(e + 4, 4, res, zid);
+        db_recon_end(true, 0, false, 0, NULL, 0, &o);
+        CHECK_MSG(!o.failed, "pass %d failed", pass);
+    }
+    atomic_store(&g_rcs_stop, true);
+    pthread_join(th, NULL);
+    CHECK_MSG(atomic_load(&g_rcs_bad) == 0 && atomic_load(&g_rcs_active_seen) > 0, "status during the passes: %llu reads saw a pass, %llu named another view",
+              (unsigned long long)atomic_load(&g_rcs_active_seen), (unsigned long long)atomic_load(&g_rcs_bad));
+}
 static void recon_lookup_in_pass(store_t *st) {
     printf("  [A2: the answer of a lookup during a pass]\n");
     char why[200];
@@ -6686,6 +6747,7 @@ static int run_recon_thread(const char *dir) {
     CHECK(st != NULL);
     recon_equivalence(st);
     recon_lookup_in_pass(st);
+    recon_status_during_pass();
     recon_un_sweep_fail();
     recon_rename_delete_fail(st);
     recon_heap_delete_fail();

@@ -5872,9 +5872,12 @@ static int parse_zone_body(token_ctx_t *ctx, zone_config_t *zone, zone_config_t 
       if (tok.type != TOKEN_SEMICOLON) { free(key); free_zone_config(zone); free_token(&tok); return -1; }
       free_token(&tok);
     } else if (strcmp(key, "program-timeout") == 0 || strcmp(key, "program-max-failures") == 0) {
-      /* 0.6.2 (audit): digits only and within range.  A bad value was ignored silently and a large one cut to 32 bits. */
+      /* 0.6.2 (audit): digits only and within range.  A bad value was ignored silently and a large one cut to 32 bits.  0.7 (review D-L8): program-timeout is
+       * 1..KARIDNS_ZONE_WAIT_MAX_MS: a query that waits for a plugin holds an async thread and a reload's reader for that long, and 0..2^31-1 let a hung plugin hold
+       * them for 24 days (0 used to mean the default; it is refused now) */
+      const bool is_timeout = strcmp(key, "program-timeout") == 0;
       int v = 0;
-      if (parse_transport_param(ctx, zone->domain, key, false, 0, INT32_MAX, &v) != 0) { free(key); free_zone_config(zone); return -1; }
+      if (parse_transport_param(ctx, zone->domain, key, false, is_timeout ? 1 : 0, is_timeout ? KARIDNS_ZONE_WAIT_MAX_MS : INT32_MAX, &v) != 0) { free(key); free_zone_config(zone); return -1; }
       if (strcmp(key, "program-timeout") == 0) x->program_timeout_ms = (uint32_t)v;
       else x->program_max_failures = (uint32_t)v;
     } else if (strcmp(key, "program-reload-line") == 0) {
@@ -5891,8 +5894,8 @@ static int parse_zone_body(token_ctx_t *ctx, zone_config_t *zone, zone_config_t 
         free(key); free_zone_config(zone); return -1;
       }
     } else if (strcmp(key, "forward-timeout") == 0) {
-      int v = 0;   /* 0.6.2 (audit): as program-timeout above */
-      if (parse_transport_param(ctx, zone->domain, "forward-timeout", false, 0, INT32_MAX, &v) != 0) { free(key); free_zone_config(zone); return -1; }
+      int v = 0;   /* 0.6.2 (audit): as program-timeout above, and 0.7 (review D-L8) the same range: the budget of a query that waits for the forwarders */
+      if (parse_transport_param(ctx, zone->domain, "forward-timeout", false, 1, KARIDNS_ZONE_WAIT_MAX_MS, &v) != 0) { free(key); free_zone_config(zone); return -1; }
       x->forward_timeout_ms = (uint32_t)v;
     } else if (strcmp(key, "rate-limit") == 0) {
       if (parse_rate_limit_config(ctx, &x->rrl) != 0) {

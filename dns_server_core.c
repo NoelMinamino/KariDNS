@@ -1413,10 +1413,25 @@ void *response_logger_thread_func(void *arg) {
  * room from the query log or bring it to the 80% at which it stops itself.  The query logger thread formats it and routes it to the channels.  Fixed
  * size, nothing allocated; the texts are cut.  Inside the event ring a debug record may fill it only to half, so that a debug flood always leaves the
  * other half to info and above; what does not fit is counted in ev_dropped.  Called only when a channel passes the message (logev_wanted()) and the
- * rate limit has admitted it. */
+ * rate limit has admitted it.  0.7 review M-3: the general log lines of the thread (kdns_syslog(), dns_log.c klog_route()) come here too, after the
+ * rate limit of their call site, so a worker never writes a log line itself. */
+static void qlog_ring_post_event(qlog_ring_t *ring, int cat, int level, const char *client_ip, int client_port, const char *msg);
+
 STATIC_TEST void qlog_event_sink(void *vctx, int cat, int level, const char *client_ip, int client_port, const char *msg) {
     worker_ctx_t *ctx = vctx;
-    qlog_ring_t *ring = &ctx->ev_ring;
+    qlog_ring_post_event(&ctx->ev_ring, cat, level, client_ip, client_port, msg);
+}
+
+/* 0.7 review M-3: the threads of the async I/O pool (program and forward zones, dns_query_engine.c) are on the query path as well: each has an
+ * event ring of its own (one producer, the query logger thread the consumer, as a worker's), made by init_async_io_pool() before the threads */
+#define ASYNC_EV_RING_SIZE 64
+static qlog_ring_t g_async_ev_rings[ASYNC_IO_POOL_SIZE];
+
+static void async_event_sink(void *vctx, int cat, int level, const char *client_ip, int client_port, const char *msg) {
+    qlog_ring_post_event((qlog_ring_t *)vctx, cat, level, client_ip, client_port, msg);
+}
+
+static void qlog_ring_post_event(qlog_ring_t *ring, int cat, int level, const char *client_ip, int client_port, const char *msg) {
     if (!ring->events) return;
     uint32_t h = atomic_load_explicit(&ring->head, memory_order_relaxed);
     uint32_t t = atomic_load_explicit(&ring->tail, memory_order_acquire);
@@ -1521,6 +1536,31 @@ void write_query_log(worker_ctx_t *ctx,
     atomic_store_explicit(&ring->head, h + 1, memory_order_release);
 }
 
+/* 0.7 review M-3: one event record of a ring to the channels, or to syslog(3) when there is no logging runtime (rt NULL: what klog_route() does
+ * with a line then; a record is never dropped here) */
+static void qlog_event_out(log_runtime_t *rt, qlog_event_t *ev) {
+    if (ev->kind != QLOG_KIND_EVENT || ev->cat >= LOGC_COUNT) return;
+    char line[KLOG_MSG_MAX];
+    ev->client_text[sizeof(ev->client_text) - 1] = '\0';
+    ev->qname[sizeof(ev->qname) - 1] = '\0';
+    logev_format_line(line, sizeof(line), ev->client_text, ev->client_port, ev->qname);
+    for (char *p = line; *p; p++)
+        if (((unsigned char)*p < 0x20 && *p != '\t') || *p == 0x7f) *p = '?';
+    if (rt) klog_record(rt, ev->cat, ev->level, &ev->ts, line);
+    else klog_syslog_level(ev->level, line);
+}
+
+/* the records of a ring that carries event lines only (an async I/O pool thread's); true when there were records */
+static bool qlog_drain_event_ring(log_runtime_t *rt, qlog_ring_t *ring) {
+    if (!ring->events) return false;
+    uint32_t t = atomic_load_explicit(&ring->tail, memory_order_relaxed);
+    const uint32_t h = atomic_load_explicit(&ring->head, memory_order_acquire);
+    if (t == h) return false;
+    for (; t != h; t++) qlog_event_out(rt, &ring->events[t & ring->mask]);
+    atomic_store_explicit(&ring->tail, t, memory_order_release);
+    return true;
+}
+
 void *query_logger_thread_func(void *arg) {
     (void)arg;
     static klog_batch_t batches[LOG_ROUTE_MAX];   /* one per channel of the category: the lines of a drain of the rings, written at once */
@@ -1530,6 +1570,7 @@ void *query_logger_thread_func(void *arg) {
     uint64_t last_reported_dropped = 0;
     uint64_t last_reported_ev_dropped = 0;
 
+    klog_set_sink_drainer(true);      /* 0.7 review M-3: the lines of the query path go to the rings while this thread empties them */
     while (!TEST_THREADS_STOPPING()) {
         rcu_slot_reader_enter(&g_query_logger_rcu_ctx);
         server_config_t *cfg = acquire_config_snapshot();
@@ -1546,6 +1587,7 @@ void *query_logger_thread_func(void *arg) {
         int nch = 0;
         log_channel_t *const *route = rt && enabled ? log_runtime_route(rt, LOGC_QUERIES, &nch) : NULL;
         if (rt) logev_flush_suppressed((int64_t)time(NULL));
+        klog_sites_flush((int64_t)time(NULL));         /* 0.7 review M-3: the reports of the query path's rate limit, with or without a runtime (then to syslog) */
         /* each channel is held to its own limit (the rings admit what the most generous channel allows: get_effective_query_log_max_qps()) */
         uint32_t chan_limit[LOG_ROUTE_MAX];
         for (int i = 0; i < nch; i++) chan_limit[i] = qlog_channel_limit(opt_qps, route[i]->max_qps_specified, route[i]->max_qps);
@@ -1554,6 +1596,7 @@ void *query_logger_thread_func(void *arg) {
         int num_workers = atomic_load_explicit(&g_worker_count, memory_order_acquire);
         worker_ctx_t *workers = atomic_load_explicit(&g_worker_ctxs, memory_order_acquire);
         bool any_work = false;
+        for (int i = 0; i < ASYNC_IO_POOL_SIZE; i++) any_work |= qlog_drain_event_ring(rt, &g_async_ev_rings[i]);   /* (no runtime: the records go to syslog) */
 
         if (rt && num_workers > 0 && workers) {
             /* 0.7 (K-11): two rings per worker, each with one producer (the worker) and this one consumer.  Each pass takes, worker by worker, the
@@ -1661,6 +1704,7 @@ void *query_logger_thread_func(void *arg) {
                 }
                 uint64_t ev_total = 0;
                 for (int w = 0; w < num_workers; w++) ev_total += atomic_load_explicit(&workers[w].ev_ring.ev_dropped, memory_order_relaxed);
+                for (int i = 0; i < ASYNC_IO_POOL_SIZE; i++) ev_total += atomic_load_explicit(&g_async_ev_rings[i].ev_dropped, memory_order_relaxed);
                 if (ev_total > last_reported_ev_dropped) {
                     uint64_t diff = ev_total - last_reported_ev_dropped;
                     last_reported_ev_dropped = ev_total;
@@ -1668,12 +1712,15 @@ void *query_logger_thread_func(void *arg) {
                 }
             }
         } else if (num_workers > 0 && workers) {
-            // クエリロギング未設定時はエントリを破棄してCPU消費を防ぐ (no logging runtime: both rings, the query log's and the events')
-            for (int w = 0; w < num_workers * 2; w++) {
-                qlog_ring_t *ring = (w & 1) ? &workers[w / 2].qlog_ring : &workers[w / 2].ev_ring;
-                if (!ring->events) continue;
-                uint32_t h = atomic_load_explicit(&ring->head, memory_order_relaxed);
-                atomic_store_explicit(&ring->tail, h, memory_order_relaxed);
+            // クエリロギング未設定時はエントリを破棄してCPU消費を防ぐ (no logging runtime: the query log ring is emptied; the event lines go to syslog, as
+            // klog_route() writes a line when there is no runtime: 0.7 review M-3, a worker's line is never lost for want of a runtime)
+            for (int w = 0; w < num_workers; w++) {
+                qlog_ring_t *ring = &workers[w].qlog_ring;
+                if (ring->events) {
+                    uint32_t h = atomic_load_explicit(&ring->head, memory_order_relaxed);
+                    atomic_store_explicit(&ring->tail, h, memory_order_relaxed);
+                }
+                any_work |= qlog_drain_event_ring(rt, &workers[w].ev_ring);
             }
         }
 
@@ -1682,6 +1729,16 @@ void *query_logger_thread_func(void *arg) {
 
         // 常に数ミリ秒休止してワーカースレッドにCPUを完全に明け渡す
         usleep(any_work ? 1000 : 10000);
+    }
+    /* the lines of the query path are written by their threads again; what is in the event rings now is written once more, so nothing is left there */
+    klog_set_sink_drainer(false);
+    {
+        log_runtime_t *rt = log_runtime_acquire();
+        const int num_workers = atomic_load_explicit(&g_worker_count, memory_order_acquire);
+        worker_ctx_t *workers = atomic_load_explicit(&g_worker_ctxs, memory_order_acquire);
+        for (int w = 0; workers && w < num_workers; w++) (void)qlog_drain_event_ring(rt, &workers[w].ev_ring);
+        for (int i = 0; i < ASYNC_IO_POOL_SIZE; i++) (void)qlog_drain_event_ring(rt, &g_async_ev_rings[i]);
+        if (rt) log_runtime_release(rt);
     }
     return NULL;
 }
@@ -2166,7 +2223,10 @@ size_t ipcd_format(char *buf, size_t cap) {
   /* udp-receive backend (B3 phase 2): the queries each worker read from its own UDP sockets (SO_REUSEPORT_LB shares the clients out over the workers;
    * the routers' lines then count only what came in on their NOTIFY sockets) */
   for (int wk = 0; g_be_udp_count > 0 && wk < g_num_workers && wk < KARIDNS_WORKER_THREADS_MAX; wk++) {
-    w = snprintf(buf + len, cap - len, "ipcworker.%d.queries=%llu\n", wk, (unsigned long long)ipcd_wrecv(wk));
+    /* (0.7 work stealing: stolen = the queries this worker ran from other workers' sockets, lent = the ones others ran from its sockets; the kernel's
+     * share of its sockets is queries - stolen + lent) */
+    w = snprintf(buf + len, cap - len, "ipcworker.%d.queries=%llu\nipcworker.%d.stolen=%llu\nipcworker.%d.lent=%llu\n", wk, (unsigned long long)ipcd_wrecv(wk),
+                 wk, (unsigned long long)steal_stolen(wk), wk, (unsigned long long)steal_lent(wk));
     if (w < 0 || (size_t)w >= cap - len) return len;
     len += (size_t)w;
   }
@@ -2475,6 +2535,9 @@ STATIC_TEST void *async_io_worker_func(void *arg) {
   if (thread_idx < 0 || thread_idx >= MAX_ASYNC_IO_RCU_WORKERS) {
     thread_idx = 0;
   }
+  /* 0.7 review M-3: the log lines of this thread (events and kdns_syslog()) go to its ring, never to a write() here (an index past the rings, which
+   * init_async_io_pool() does not make, keeps the thread without a sink) */
+  if (thread_idx < ASYNC_IO_POOL_SIZE && g_async_ev_rings[thread_idx].events) logev_set_thread_sink(async_event_sink, &g_async_ev_rings[thread_idx]);
   compress_ctx_t thread_compress_ctx = {0};
   while (1) {
     pthread_mutex_lock(&g_async_io_pool.lock);
@@ -2595,6 +2658,18 @@ bool init_async_io_pool(void) {
   pthread_mutex_init(&g_async_io_pool.lock, NULL);
   pthread_cond_init(&g_async_io_pool.cond_not_empty, NULL);
   g_async_io_pool.running = true;
+  for (int i = 0; i < ASYNC_IO_POOL_SIZE; i++) {   /* 0.7 review M-3: the event rings of the threads, before the threads (never freed: they live as long as the process) */
+    qlog_ring_t *r = &g_async_ev_rings[i];
+    if (!r->events) {
+      r->events = calloc(ASYNC_EV_RING_SIZE, sizeof(qlog_event_t));
+      if (!r->events) {
+        syslog(LOG_ERR, "[Backend] Failed to allocate the event ring of async I/O thread %d", i);
+        return false;
+      }
+      r->size = ASYNC_EV_RING_SIZE;
+      r->mask = ASYNC_EV_RING_SIZE - 1;
+    }
+  }
   for (int i = 0; i < ASYNC_IO_POOL_SIZE; i++) {
     if (pthread_create(&g_async_io_pool.threads[i], NULL, async_io_worker_func, (void *)(uintptr_t)i) != 0) {
       syslog(LOG_ERR, "[Backend] Failed to start async I/O thread %d: %m", i);
@@ -3493,57 +3568,214 @@ STATIC_TEST void park_service(udp_pass_t *w, int kq) {
   }
 }
 
-/* udp-receive backend (B3 phase 2): the queries that came in on this worker's own UDP socket sock_idx (descriptor fd, receive only) are read in batches,
- * given the udp_ipc_t header the router used to build (udp_ipc_from_recv(): the client, the destination, sock_idx), and run through udp_one() exactly
- * as a message of a router; the replies go on reply_fd, the IPC pair to the router that sends this worker's replies (be_udp_reply_router()), which
- * sends them on its descriptor of the same socket.  A query that parks keeps the header (and so sock_idx) and reply_fd in its entry (park_udp()).
- * No allocation: the batch buffers of the worker.  Returns the number of queries run (the tests). */
-int worker_udp_rx(udp_pass_t *pass, int fd, int sock_idx, int reply_fd) {
+/* udp-receive backend (B3 phase 2): one batch of the queries on UDP socket sock_idx (descriptor fd, receive only), given the udp_ipc_t header the router
+ * used to build (udp_ipc_from_recv(): the client, the destination, sock_idx), and run through udp_one() exactly as a message of a router; the replies
+ * go on reply_fd, the IPC pair to the router that sends this worker's replies (be_udp_reply_router()), which sends them on its descriptor of this
+ * worker's socket of the same listen address.  A query that parks keeps the header (and so sock_idx) and reply_fd in its entry (park_udp()).
+ * No allocation: the batch buffers of the worker.  Returns what recvmmsg() returned (<= 0: nothing read); *served: the queries run. */
+static int udp_rx_batch(udp_pass_t *pass, int fd, int sock_idx, int reply_fd, int *served) {
   udp_batch_ctx_t *batch = pass->batch;
-  if (sock_idx < 0 || sock_idx >= g_be_udp_count || sock_idx >= MAX_BIND_ADDRS) return 0;
   const bool want_dst = g_be_udp_wild[sock_idx];       /* (only a wildcard socket was asked for the destination: udp_listen_socket()) */
   const router_src_t *const bound_src = &g_be_udp_src[sock_idx];
-  int total = 0;
-  while (1) {
-    for (int k = 0; k < UDP_BATCH_SIZE; k++) {
-      udp_ipc_t *h = (udp_ipc_t *)batch->rx_buffers[k];
-      struct msghdr *mh = &batch->urx_msgs[k].msg_hdr;
-      batch->urx_iov[k].iov_base = batch->rx_buffers[k] + sizeof(udp_ipc_t);
-      batch->urx_iov[k].iov_len = BUFFER_SIZE;            /* (as the router: a larger datagram comes cut, MSG_TRUNC, and is dropped) */
-      mh->msg_iov = &batch->urx_iov[k];
-      mh->msg_iovlen = 1;
-      mh->msg_name = &h->client_addr;
-      mh->msg_namelen = sizeof(h->client_addr);
-      mh->msg_control = want_dst ? batch->urx_cbuf[k].buf : NULL;
-      mh->msg_controllen = want_dst ? sizeof(batch->urx_cbuf[k].buf) : 0;
-      mh->msg_flags = 0;
-    }
-    const int n_recv = recvmmsg(fd, batch->urx_msgs, UDP_BATCH_SIZE, MSG_DONTWAIT, NULL);
-    if (n_recv <= 0) break;                               /* EAGAIN (EV_CLEAR: the next datagram raises the event again) */
-    pass->active_fd = reply_fd;
-    pass->n_tx = 0;
-    pass->woken = false;
-    int n_served = 0;
-    for (int p = 0; p < n_recv; p++) {
-      udp_ipc_t *h = (udp_ipc_t *)batch->rx_buffers[p];
-      const int rx = udp_ipc_from_recv(h, &batch->urx_msgs[p].msg_hdr, batch->urx_msgs[p].msg_len, sock_idx, want_dst, bound_src);
-      if (rx != UDP_RX_OK) {
-        ipcd_add(rx == UDP_RX_TRUNC ? IPCD_WURX_TRUNC : IPCD_WURX_SHORT, 1);
-        continue;
-      }
-      udp_one(pass, h, batch->rx_buffers[p] + sizeof(udp_ipc_t), h->payload_len);
-      n_served++;
-    }
-    atomic_fetch_add_explicit(&pass->ctx->query_count, (uint64_t)n_served, memory_order_relaxed);
-    ipcd_wrecv_add(pass->worker_idx, (uint64_t)n_served);
-    if (pass->n_tx > 0) {
-      ipc_reply_flush(reply_fd, batch->tx_iov, pass->n_tx);
-      pass->n_tx = 0;
-    }
-    total += n_served;
-    if (udp_batch_drained(n_recv)) break;                /* (as the router and the IPC read loop) */
+  *served = 0;
+  for (int k = 0; k < UDP_BATCH_SIZE; k++) {
+    udp_ipc_t *h = (udp_ipc_t *)batch->rx_buffers[k];
+    struct msghdr *mh = &batch->urx_msgs[k].msg_hdr;
+    batch->urx_iov[k].iov_base = batch->rx_buffers[k] + sizeof(udp_ipc_t);
+    batch->urx_iov[k].iov_len = BUFFER_SIZE;            /* (as the router: a larger datagram comes cut, MSG_TRUNC, and is dropped) */
+    mh->msg_iov = &batch->urx_iov[k];
+    mh->msg_iovlen = 1;
+    mh->msg_name = &h->client_addr;
+    mh->msg_namelen = sizeof(h->client_addr);
+    mh->msg_control = want_dst ? batch->urx_cbuf[k].buf : NULL;
+    mh->msg_controllen = want_dst ? sizeof(batch->urx_cbuf[k].buf) : 0;
+    mh->msg_flags = 0;
   }
+  const int n_recv = recvmmsg(fd, batch->urx_msgs, UDP_BATCH_SIZE, MSG_DONTWAIT, NULL);
+  if (n_recv <= 0) return n_recv;                       /* EAGAIN (EV_CLEAR: the next datagram raises the event again) */
+  pass->active_fd = reply_fd;
+  pass->n_tx = 0;
+  pass->woken = false;
+  int n_served = 0;
+  for (int p = 0; p < n_recv; p++) {
+    udp_ipc_t *h = (udp_ipc_t *)batch->rx_buffers[p];
+    const int rx = udp_ipc_from_recv(h, &batch->urx_msgs[p].msg_hdr, batch->urx_msgs[p].msg_len, sock_idx, want_dst, bound_src);
+    if (rx != UDP_RX_OK) {
+      ipcd_add(rx == UDP_RX_TRUNC ? IPCD_WURX_TRUNC : IPCD_WURX_SHORT, 1);
+      continue;
+    }
+    udp_one(pass, h, batch->rx_buffers[p] + sizeof(udp_ipc_t), h->payload_len);
+    n_served++;
+  }
+  atomic_fetch_add_explicit(&pass->ctx->query_count, (uint64_t)n_served, memory_order_relaxed);
+  ipcd_wrecv_add(pass->worker_idx, (uint64_t)n_served);
+  if (pass->n_tx > 0) {
+    ipc_reply_flush(reply_fd, batch->tx_iov, pass->n_tx);
+    pass->n_tx = 0;
+  }
+  *served = n_served;
+  return n_recv;
+}
+
+/* udp-receive backend: the queries of this worker's own socket sock_idx, batch after batch until one comes back short.  A second full batch in one
+ * wake says the socket is behind (32 or more were queued): the worker is marked busy on that address and the other workers may read it too
+ * (steal_owner_note()); a short batch clears the mark.  Returns the number of queries run (the tests). */
+int worker_udp_rx(udp_pass_t *pass, int fd, int sock_idx, int reply_fd) {
+  if (sock_idx < 0 || sock_idx >= g_be_udp_count || sock_idx >= MAX_BIND_ADDRS) return 0;
+  int total = 0, full = 0;
+  while (1) {
+    int served;
+    const int n_recv = udp_rx_batch(pass, fd, sock_idx, reply_fd, &served);
+    if (n_recv <= 0) break;
+    total += served;
+    if (udp_batch_drained(n_recv)) break;                /* (as the router and the IPC read loop) */
+    (void)steal_owner_note(pass->worker_idx, sock_idx, ++full, false);
+  }
+  (void)steal_owner_note(pass->worker_idx, sock_idx, 0, true);
   return total;
+}
+
+/* ---- 0.7 work stealing (dns_server_internal.h; planning: planing_0.7.x_worker_steal.md) ----
+ * One slot per worker.  busy: the owner's addresses that are behind (one writer, the owner; MAX_BIND_ADDRS = 64 bits).  stolen: written by the worker
+ * itself.  cold: the worker sleeps in kevent() without a timeout; a waker takes it with an exchange, so one worker is woken once.  kq1: the worker's
+ * kqueue + 1 (0: none), for the EVFILT_USER wake-up.  These are the worker's own (and on the line the thieves read for busy); lent, added to by the
+ * thieves once per stolen batch, has a line of its own.
+ * g_steal_nbusy counts the busy workers (changed only when a worker's busy goes 0 <-> non-0): the load an idle worker pays.  g_steal_ncold counts the
+ * cold flags that are set (changed with each flag, by the exchange that changed it), so a waker reads the slots only when someone sleeps.
+ * Lost wake-up: the thief sets cold, adds itself to g_steal_ncold and then loads g_steal_nbusy; the owner changes g_steal_nbusy and then loads
+ * g_steal_ncold and the flags (all seq_cst): one of the two sees the other.  An EVFILT_USER trigger stays pending until the kevent() that reads it. */
+_Static_assert(MAX_BIND_ADDRS <= 64, "one busy bit per listen address");
+typedef struct {
+  alignas(64) _Atomic uint64_t busy;
+  _Atomic uint64_t stolen;
+  _Atomic int kq1;
+  _Atomic bool cold;
+  alignas(64) _Atomic uint64_t lent;
+} steal_slot_t;
+static steal_slot_t g_steal[KARIDNS_WORKER_THREADS_MAX];
+static _Atomic int g_steal_nbusy;
+static _Atomic int g_steal_ncold;
+STATIC_TEST int g_steal_workers;          /* the workers that may steal (0: off); set before they start */
+
+void steal_setup(int workers) {
+  g_steal_workers = g_be_udp_count > 0 && workers >= 2 ? (workers < KARIDNS_WORKER_THREADS_MAX ? workers : KARIDNS_WORKER_THREADS_MAX) : 0;
+}
+
+bool steal_on(void) { return g_steal_workers >= 2; }
+
+void steal_register(int w, int kq) {
+  if (w >= 0 && w < g_steal_workers) atomic_store_explicit(&g_steal[w].kq1, kq >= 0 ? kq + 1 : 0, memory_order_release);
+}
+
+/* The cold flag of slot s is cleared if it was set (and the count follows): true when this call cleared it */
+static bool steal_uncold(steal_slot_t *s) {
+  if (!atomic_load_explicit(&s->cold, memory_order_seq_cst) || !atomic_exchange_explicit(&s->cold, false, memory_order_seq_cst)) return false;
+  atomic_fetch_sub_explicit(&g_steal_ncold, 1, memory_order_seq_cst);
+  return true;
+}
+
+/* One sleeping worker other than `from` is woken (the first after it, round the workers): 1, or 0 when none sleeps (one load when nobody does) */
+static int steal_wake_one(int from) {
+  if (atomic_load_explicit(&g_steal_ncold, memory_order_seq_cst) <= 0) return 0;
+  for (int k = 1; k < g_steal_workers; k++) {
+    steal_slot_t *s = &g_steal[(from + k) % g_steal_workers];
+    if (!steal_uncold(s)) continue;
+    const int kq = atomic_load_explicit(&s->kq1, memory_order_acquire) - 1;
+#ifdef __FreeBSD__
+    if (kq >= 0) {
+      struct kevent t;
+      EV_SET(&t, STEAL_WAKE_IDENT, EVFILT_USER, 0, NOTE_TRIGGER, 0, NULL);
+      (void)kevent(kq, &t, 1, NULL, 0, NULL);
+    }
+#else
+    (void)kq;
+#endif
+    return 1;
+  }
+  return 0;
+}
+
+int steal_owner_note(int w, int a, int full_batches, bool drained) {
+  if (w < 0 || w >= g_steal_workers || a < 0 || a >= MAX_BIND_ADDRS) return 0;
+  steal_slot_t *s = &g_steal[w];
+  const uint64_t bit = 1ull << a, cur = atomic_load_explicit(&s->busy, memory_order_relaxed);
+  if (drained) {
+    if (!(cur & bit)) return 0;
+    atomic_store_explicit(&s->busy, cur & ~bit, memory_order_relaxed);
+    if ((cur & ~bit) == 0) atomic_fetch_sub_explicit(&g_steal_nbusy, 1, memory_order_seq_cst);
+    return 0;
+  }
+  if (full_batches < 2 || (cur & bit)) return 0;
+  atomic_store_explicit(&s->busy, cur | bit, memory_order_relaxed);
+  if (cur != 0) return 0;
+  atomic_fetch_add_explicit(&g_steal_nbusy, 1, memory_order_seq_cst);   /* (a release: a thief that sees the count sees the bit) */
+  return steal_wake_one(w);
+}
+
+int steal_pick(int self, int *addr) {
+  if (self < 0 || self >= g_steal_workers || atomic_load_explicit(&g_steal_nbusy, memory_order_acquire) <= 0) return -1;
+  for (int k = 1; k < g_steal_workers; k++) {
+    const int v = (self + k) % g_steal_workers;          /* (from the next one: thieves start on different victims) */
+    const uint64_t b = atomic_load_explicit(&g_steal[v].busy, memory_order_relaxed);
+    if (b) {
+      *addr = __builtin_ctzll(b);
+      return v;
+    }
+  }
+  return -1;
+}
+
+bool steal_may_sleep(int self) {
+  if (self < 0 || self >= g_steal_workers) return true;
+  steal_slot_t *s = &g_steal[self];
+  if (!atomic_exchange_explicit(&s->cold, true, memory_order_seq_cst)) atomic_fetch_add_explicit(&g_steal_ncold, 1, memory_order_seq_cst);
+  if (atomic_load_explicit(&g_steal_nbusy, memory_order_seq_cst) <= 0) return true;
+  /* a worker became busy meanwhile: stay awake, unless a waker took the mark already (its trigger is pending: the kevent() returns at once) */
+  return !steal_uncold(s);
+}
+
+void steal_awake(int self) {
+  if (self >= 0 && self < g_steal_workers) (void)steal_uncold(&g_steal[self]);
+}
+
+int steal_thief_step(steal_thief_t *t, int self, int got) {
+  if (got >= UDP_BATCH_SIZE) {                           /* (a full batch: more is probably there, and one more sleeping worker may help) */
+    t->linger = STEAL_LINGER_POLLS;
+    (void)steal_wake_one(self);
+    return STEAL_NOW;
+  }
+  if (atomic_load_explicit(&g_steal_nbusy, memory_order_relaxed) > 0) {
+    t->linger = STEAL_LINGER_POLLS;
+    return STEAL_WARM;
+  }
+  if (t->linger > 0) {
+    t->linger--;
+    return STEAL_WARM;
+  }
+  return STEAL_BLOCK;
+}
+
+int worker_udp_steal(udp_pass_t *pass, int victim, int a, int reply_fd) {
+  const int self = pass->worker_idx;
+  if (victim < 0 || victim >= g_steal_workers || victim == self || self < 0 || self >= g_steal_workers || a < 0 || a >= g_be_udp_count ||
+      a >= MAX_BIND_ADDRS || g_be_udp_fds[victim][a] < 0)
+    return 0;
+  int served;
+  const int n_recv = udp_rx_batch(pass, g_be_udp_fds[victim][a], a, reply_fd, &served);
+  if (served > 0) {
+    steal_slot_t *me = &g_steal[self];
+    atomic_store_explicit(&me->stolen, atomic_load_explicit(&me->stolen, memory_order_relaxed) + (uint64_t)served, memory_order_relaxed);
+    atomic_fetch_add_explicit(&g_steal[victim].lent, (uint64_t)served, memory_order_relaxed);
+  }
+  return n_recv > 0 ? n_recv : 0;
+}
+
+uint64_t steal_stolen(int w) {
+  return w >= 0 && w < KARIDNS_WORKER_THREADS_MAX ? atomic_load_explicit(&g_steal[w].stolen, memory_order_relaxed) : 0;
+}
+
+uint64_t steal_lent(int w) {
+  return w >= 0 && w < KARIDNS_WORKER_THREADS_MAX ? atomic_load_explicit(&g_steal[w].lent, memory_order_relaxed) : 0;
 }
 
 void *worker_thread_func(void *arg) {
@@ -3659,6 +3891,17 @@ void *worker_thread_func(void *arg) {
       goto worker_startup_failed;
     }
   }
+  /* 0.7 work stealing: a worker that sleeps is woken by EVFILT_USER STEAL_WAKE_IDENT when another one's socket falls behind (steal_owner_note()) */
+  const bool steal_active = steal_on() && be_reply_fd >= 0;
+  if (steal_active) {
+    struct kevent ev_steal;
+    EV_SET(&ev_steal, STEAL_WAKE_IDENT, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0, NULL);
+    if (kevent(kq, &ev_steal, 1, NULL, 0, NULL) != 0) {
+      syslog(LOG_CRIT, "[Backend] worker %d: cannot watch its wake-up event (%m)", w);
+      goto worker_startup_failed;
+    }
+    steal_register(w, kq);
+  }
 
   pid_t parent_pid = getppid();
   struct kevent ev_parent;
@@ -3706,6 +3949,8 @@ worker_startup_success:;
   pass.park = park_on ? &park : NULL;
   pass.worker_idx = ctx->thread_id;
   pass.park_timeout_ms = park_timeout_ms;
+  steal_thief_t steal_thief = { 0 };
+  int steal_mode = STEAL_BLOCK;
 
   while (1) {
     /* with queries parked the wait ends at the first deadline (and at a wake-up: EVFILT_USER, PARK_WAKE_IDENT) */
@@ -3717,7 +3962,19 @@ worker_startup_success:;
       park_ts.tv_nsec = (left % 1000) * 1000000;
       park_tp = &park_ts;
     }
+    /* 0.7 work stealing: right away after a full stolen batch, STEAL_POLL_US while a worker is busy (and a little after), else asleep, marked cold
+     * so that a worker that falls behind can wake it (steal_may_sleep() false: one became busy meanwhile) */
+    struct timespec steal_ts;
+    if (steal_active && (steal_mode != STEAL_BLOCK || !steal_may_sleep(w))) {
+      const long steal_ns = steal_mode == STEAL_WARM ? (long)STEAL_POLL_US * 1000L : 0L;
+      if (!park_tp || park_tp->tv_sec > 0 || park_tp->tv_nsec > steal_ns) {
+        steal_ts.tv_sec = 0;
+        steal_ts.tv_nsec = steal_ns;
+        park_tp = &steal_ts;
+      }
+    }
     int n_events = kevent(kq, NULL, 0, ev_list, MAX_EVENTS, park_tp);
+    if (steal_active) steal_awake(w);
     if (n_events < 0) {
       if (errno == EINTR)
         continue;
@@ -3741,6 +3998,7 @@ worker_startup_success:;
     release_config_snapshot(active);
     rcu_reader_exit(ctx);
 
+    int own_udp = 0;                     /* (0.7 work stealing: the queries this turn read from this worker's own UDP sockets) */
     for (int i = 0; i < n_events; i++) {
       if (ev_list[i].udata == (void *)(uintptr_t)1001) {
         backend_shutdown(0); /* Supervisor が終了した (O-15: exit() は使わない) */
@@ -3819,7 +4077,9 @@ worker_startup_success:;
       } else if (ev_list[i].filter == EVFILT_READ && (uintptr_t)ev_list[i].udata >= WORKER_UDP_UDATA &&
                  (uintptr_t)ev_list[i].udata < WORKER_UDP_UDATA + MAX_BIND_ADDRS) {
         // UDP (udp-receive backend: this worker's own socket of one listen address; the replies go to a router over the IPC)
-        (void)worker_udp_rx(&pass, (int)ev_list[i].ident, (int)((uintptr_t)ev_list[i].udata - WORKER_UDP_UDATA), be_reply_fd);
+        own_udp += worker_udp_rx(&pass, (int)ev_list[i].ident, (int)((uintptr_t)ev_list[i].udata - WORKER_UDP_UDATA), be_reply_fd);
+      } else if (ev_list[i].filter == EVFILT_USER && ev_list[i].ident == STEAL_WAKE_IDENT) {
+        /* 0.7 work stealing: woken because another worker fell behind; the steal round after this loop reads its socket */
       } else if (ev_list[i].udata == (void *)2) {
         // TCP
         int active_tcp_fd = ev_list[i].ident;
@@ -4592,12 +4852,26 @@ process_tcp_client: ;
         }
       }
     }
+    if (steal_active && own_udp >= UDP_BATCH_SIZE) {
+      /* 0.7 work stealing: this turn read a full batch or more of its own: it has its own work and does not look at the others (with many flows
+       * every worker is here near saturation, and pays nothing for the others' marks).  Not "no own query at all": a worker with a few flows of its
+       * own reads one or two queries nearly every turn and would never help.  It sleeps as usual; a worker that falls behind can wake it */
+      steal_mode = STEAL_BLOCK;
+    } else if (steal_active) {
+      /* 0.7 work stealing: less than a batch of its own this turn (served above); now one batch of a busy worker's socket, answered on this worker's
+       * pair and socket of the same address (worker_udp_steal()), and the next kevent() looks at its own sockets again before any further batch */
+      int steal_addr = -1, got = 0;
+      const int victim = steal_pick(w, &steal_addr);
+      if (victim >= 0) got = worker_udp_steal(&pass, victim, steal_addr, be_reply_fd);   /* (the pass's flags: this turn's snapshot, above) */
+      steal_mode = steal_thief_step(&steal_thief, w, got);
+    }
     if (park_on) park_service(&pass, kq);        /* D1a: wake-ups, deadlines, the parked requests that are done */
   }
   if (park_on) {
     park_unregister_worker(ctx->thread_id);
     park_free(&park);
   }
+  if (steal_active) steal_register(w, -1);       /* (no wake-up goes to the kqueue once it is closed) */
   close(kq);
   free(tcp_res_buf);
   pthread_exit(NULL);
@@ -6856,7 +7130,7 @@ void *control_thread_func(void *arg) {
               (void)ctl_send_all(cfd, stbuf, stlen);
             } else if (strcmp(cmd, "ipcstats") == 0) {
               /* 0.7: the queries and replies lost between the routers and the workers (ipcd_t), as "ipc.<name>=<n>" lines (a read command) */
-              char ipbuf[8192];         /* (udp-receive backend: one ipcworker line per worker, up to 128) */
+              char ipbuf[24576];        /* (udp-receive backend: three ipcworker lines per worker, up to 128) */
               size_t iplen = ipcd_format(ipbuf, sizeof(ipbuf));
               (void)ctl_send_all(cfd, ipbuf, iplen);
             } else if (strcmp(cmd, "storeop") == 0) {
@@ -9651,6 +9925,8 @@ int main(int argc, char **argv) {
         fprintf(stderr, "[ERROR] [Backend] cannot limit a worker UDP socket to receiving; aborting startup\n");
         backend_exit(EXIT_FAILURE);
       }
+  /* 0.7 work stealing: with 2 or more workers an idle one also reads a busy one's socket (the same receive-only descriptors: nothing new) */
+  steal_setup(num_workers);
   server_config_t *cfg = &g_config_db.config_a;
   /* The ring of the threads that are not workers (AXFR, async I/O) has slots of 64 KB: about 270 MB of address space at the default queue size.
    * dnstap is switched on at start-up only, so it is allocated only then; without it write_dnstap_event() finds no ring and returns.

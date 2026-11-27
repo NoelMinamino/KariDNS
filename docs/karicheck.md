@@ -29,6 +29,8 @@ karicheck db [view] [config_path]
 
 karicheck --json conf|zones|zone|db ...
 
+karicheck [--json] -u user conf|zones|zone|db ...
+
 karicheck -v | --version
 
 karicheck -h | --help
@@ -58,7 +60,7 @@ When `config_path` is omitted, `/usr/local/etc/karidns/karidns.conf` is used (or
 : Look up `<domain>` in the configuration file and validate its zone file with the zone's settings (`file-format`, `catalog-zone`, tags). If several views define the zone, each view's definition is checked; the exit status is 1 if any of them fails.
 
 `zone <domain> <zone_file_path>`
-: Standalone mode: parse and validate `<zone_file_path>` as a BIND-format zone for `<domain>` without a configuration file. The third argument is treated as a configuration file if it contains `.conf`, and as a zone file otherwise. A relative path is resolved against the current directory; the server resolves relative zone paths (also with `../`) against the directory it was started from. Run as root with standard error on a terminal, `karicheck` prints a note there that it parses the file with root's rights: a zone file from elsewhere is better checked as an unprivileged user. (`karicheck` does not drop privileges itself: `conf`, `zones` and `zone <domain> [config]` read the server's own files, which the server also reads as root when it starts, and a lower user could not read the ones only root may.)
+: Standalone mode: parse and validate `<zone_file_path>` as a BIND-format zone for `<domain>` without a configuration file. The third argument is treated as a configuration file if it contains `.conf`, and as a zone file otherwise. A relative path is resolved against the current directory; the server resolves relative zone paths (also with `../`) against the directory it was started from. Run as root (0.7, tools review T4-L4), `karicheck` reads the file (or standard input) as root and then drops to the user `nobody`, or to the user `-u` names, before it parses it: an `$INCLUDE` is opened with that user's rights (one only root may read is an error) and a fault in a parser has no root to give away. `-u root` keeps root. If the user does not exist the run stops (`io.privilege-drop`, or a usage error for `-u`). `conf`, `zones`, `zone <domain> [config]` and `db` keep root unless `-u` names a user: they read what `karidns` itself reads as root when it starts, before its own drop (the configuration, its includes, the TSIG key files and the zone files, often mode 0600 and root's), and the parsers open those files while they parse, so there is no set of files to open first; with `-u` they run as that user from the start (`db` then checks with that user's rights instead of dropping to `loader-user`).
 
 `zone <domain> -`
 : The zone text is read from standard input (BIND format, at most 64 MiB; a bigger input is refused with `io.stdin.too-large`, it is not cut). The messages and the JSON document call the file `<stdin>`. `$INCLUDE` is refused (`zone.include-stdin`): there is no directory to include from. This is for a caller that holds the zone in memory (a web interface that validates an edited zone before it writes it to the database) and wants no temporary file.
@@ -119,6 +121,7 @@ When `config_path` is omitted, `/usr/local/etc/karidns/karidns.conf` is used (or
    - In-bailiwick NS targets (apex and delegations) must have an A/AAAA record in the zone (error); in-bailiwick MX and SRV targets without A/AAAA give a warning only, because no RFC requires an address for them. Records occluded by a delegation give warnings
    - Inconsistent TTLs within one RRset (warning); RRs with a location, time stamp or tag are not harmonized with RRs that every client sees, and an unrestricted and a restricted RR of one name and type with different TTLs are reported as such (a client that sees both gets an RRset with differing TTLs; the TTLs are kept)
    - SOA MNAME pointing to a CNAME (warning)
+   - SOA timers (0.7, warnings): a retry interval longer than the refresh interval (RFC 1912 §2.2: retry is a fraction of refresh), an expire time shorter than refresh + retry (a secondary that misses one refresh would expire the zone before it retries) or not greater than the minimum (RFC 1912 §2.2: expire "must be greater than the minimum and retry intervals"), and a TTL of negative answers, min(SOA TTL, minimum) (RFC 2308 §5), above 7 days (BIND truncates max-ncache-ttl to 7 days; RFC 1912 §2.2 calls a minimum of 1-5 days typical)
    - Meta-types (e.g. `OPT`, `TSIG`, `AXFR`) must not appear in zone data
    - PowerDNS ALIAS and LUA records (TYPE65401 / TYPE65402 of CLASS IN, see karidns(8) "POWERDNS ALIAS AND LUA RECORDS"): an ALIAS name that also owns an A or AAAA RRset, an ALIAS in a zone with DNSKEY, RRSIG, NSEC, NSEC3 or NSEC3PARAM records, and malformed ALIAS / LUA RDATA are errors (the server does not load such a zone); an `[INFO]` line counts the ALIAS records (A and AAAA at those names are NODATA unless an `alias-resolver` is configured), and a warning says that LUA records are kept for transfers and never answered
    - The `check-*` options of the zone's configuration set the severity of some of the findings above and add checks that report nothing without them (karidns(8) "BIND option values"): `check-integrity` (the NS glue and the MX / SRV addresses; `no` skips them), `check-mx-cname` (an MX target that is a CNAME: error without the option), `check-srv-cname` (warning without the option), `check-wildcard` (a `*` label that is not the first), `check-dup-records` (the same RR twice), `check-mx` (an MX target that is an IP address) and `check-names` (host names of A, AAAA and MX owners and of NS, MX, SRV and SOA MNAME targets). The size limits `max-records`, `max-records-per-type`, `max-types-per-name` and `max-zone-ttl` (primary zones) are errors here because the server does not load such a zone. `karicheck db` passes the options-level severities to `karidns-dbloader --check --zone-checks`.
@@ -131,6 +134,7 @@ When `config_path` is omitted, `/usr/local/etc/karidns/karidns.conf` is used (or
    - WKS: the protocol is a number (0-255) or `TCP` / `UDP` (any case), as the server reads it; a port is a number (0-65535) or a service name from the server's built-in table (RFC 1035 §3.4.2; the IANA names of the common ports, e.g. `smtp`, `http`, `domain`); any other port gives a warning, and the record is reported as an error because the server cannot load it
    - NSEC3PARAM at the apex: Flags other than 0 are an error (RFC 5155 §4.1.2: such an NSEC3PARAM MUST be ignored, and the server ignores it); a hash algorithm other than 1 (SHA-1), an iteration count other than 0 (RFC 9276 §3.1: MUST be 0) and a non-empty salt (RFC 9276 §3.1: SHOULD NOT) give warnings; more than 100 iterations are an error, and more than 150 (RFC 9276 §3.2) are refused with `zone.pdns-types` because the server does not load such a zone (a zone file, a transfer and a database or presigned zone are all held to this limit; BIND 9.20 only warns above 50 and loads the zone). A warning is also given when no NSEC3PARAM is usable, or when the one the server uses has no NSEC3 RRs
    - NSEC3 records are checked once per chain (RRs with the same hash algorithm, iterations and salt), not once per RR: hash algorithm, reserved flag bits, opt-out (RFC 9276 §3.1), iterations and salt as above, and a warning for a chain that matches no NSEC3PARAM with Flags 0 (the server does not use it)
+   - The NSEC chain of a zone that has NSEC records (0.7, warnings): one NSEC per name with authoritative data and per delegation point, none below a delegation or a DNAME or outside the zone, and one per name (RFC 4035 §2.3); in canonical order (RFC 4034 §6.1) each NSEC names the next owner and the last names the apex (RFC 4034 §4.1.1); the type bitmap lists exactly the types at its owner, NSEC and RRSIG included, and at a delegation point only NS, DS, NSEC and RRSIG (RFC 4034 §4.1.2). The RFCs say MUST; these are warnings because the server serves such a zone as it is (its denials are wrong for the names concerned) and `named-checkzone` does not verify the chain (`dnssec-verify` does)
 4. **DNSSEC Algorithm & Digest Verification (RFC 8624 / RFC 8078)**:
    - Evaluates DNSSEC algorithms in DNSKEY and RRSIG records against RFC 8624 status recommendations (e.g., flagging deprecated SHA-1 or MD5 algorithms)
    - Validates DS digest types (warning on deprecated digests) and, for the known types, the length of the DS / CDS digest (SHA-1 20, SHA-256 32, GOST 32, SHA-384 48 octets: RFC 4034 §5.1.4, RFC 4509 §2, RFC 6605 §5; an error, as BIND refuses it); SSHFP fingerprints are checked the same way (SHA-1 20, SHA-256 32 octets: RFC 4255 §3.1.2, RFC 6594 §5), in a zone file and in a tinydns `_` line
@@ -309,6 +313,7 @@ Severity is the usual one of the code; a check whose severity the configuration 
 | `io.file.too-large` | error | a configuration or zone file is larger than the server reads (256 MiB) |
 | `io.pipe` | error | a pipe for the database loader could not be created |
 | `io.fork` | error | the database loader could not be started |
+| `io.privilege-drop` | error | karicheck, run by root, could not drop to the user it parses as (nobody, or -u user) |
 | `internal.oom` | error | out of memory |
 | `conf.syntax` | error | a syntax error in a configuration statement |
 | `conf.value.invalid` | error | the value of an option is not one the option accepts |
@@ -488,6 +493,12 @@ Severity is the usual one of the code; a check whose severity the configuration 
 | `zone.nsec3.iterations` | warning | NSEC3 iterations other than 0 (RFC 9276) |
 | `zone.nsec3.salt` | warning | an NSEC3 chain that uses a salt (RFC 9276) |
 | `zone.nsec3.chain-orphan` | warning | an NSEC3 chain that matches no usable NSEC3PARAM |
+| `zone.nsec.duplicate` | warning | a name has more than one NSEC record |
+| `zone.nsec.not-authoritative` | warning | an NSEC record below a delegation or a DNAME, or outside the zone |
+| `zone.nsec.next` | warning | an NSEC record does not name the next owner of the chain in canonical order |
+| `zone.nsec.not-closed` | warning | the last NSEC record of the chain does not name the apex |
+| `zone.nsec.missing` | warning | a name with authoritative data or a delegation has no NSEC record in a zone with an NSEC chain |
+| `zone.nsec.bitmap` | warning | the type bitmap of an NSEC record does not match the types at its owner |
 | `zone.ttl.inconsistent` | warning | the records of an RRset have different TTLs (RFC 2181 section 5.2) |
 | `zone.ttl.inconsistent-visibility` | warning | restricted and unrestricted records of an RRset have different TTLs |
 | `zone.alias.present` | info | the zone has ALIAS records |
@@ -544,6 +555,9 @@ Severity is the usual one of the code; a check whose severity the configuration 
 | `zone.soa.invalid` | error | the SOA records of the zone are not valid |
 | `zone.soa.location-undefined` | warning | the SOA record is restricted to a location the zone does not define |
 | `zone.soa.expired` | warning | the SOA record has expired |
+| `zone.soa.retry` | warning | the SOA retry interval is longer than the refresh interval |
+| `zone.soa.expire` | warning | the SOA expire time is shorter than refresh + retry, or not greater than the minimum |
+| `zone.soa.minimum` | warning | the TTL of negative answers, min(SOA TTL, minimum), is over 7 days |
 | `zone.ns.missing` | error | the zone has no NS record at the apex |
 | `zone.catalog.version` | error | a catalog zone lacks its version TXT record |
 | `zone.catalog.name-too-long` | error | a name in a catalog zone is too long to check |

@@ -2,7 +2,7 @@
 # R-25 regression, the unit-test half of tests/run_rcu_tsan_test.sh: the unit tests of the lock-free parts under ThreadSanitizer.
 #   test_epoch_rcu-tsan (publish order, grace period, reuse stress); test_zone_dir-tsan (the zone directory, D1a);
 #   test_park-tsan, test_db_fetch-tsan, test_park_worker-tsan, test_db_stream-tsan, test_pdns_reader-tsan, test_db_registry-tsan (parked queries,
-#   D1a milestone 2); test_server_core-tsan (the logger threads and the control thread).
+#   D1a milestone 2; test_park_worker-tsan also the 0.7 work stealing: an owner and two thieves on one socket); test_server_core-tsan (the logger threads and the control thread).
 # A test of its own (0.6.2) so that it runs next to the other tests: the servers half stays "serial" (tests/run_all_suite.sh).
 # Any ThreadSanitizer report fails the test.
 

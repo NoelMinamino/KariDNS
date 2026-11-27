@@ -5,6 +5,7 @@
 
 /* view 名の上限 (NUL 込みのバイト数)。zone_db_entry_t などが view 名をこの長さの配列で持つ */
 #define KARIDNS_VIEW_NAME_MAX 64
+#define KARIDNS_ZONE_WAIT_MAX_MS 30000   /* program-timeout and forward-timeout (ms): the most a query may wait for a plugin or the forwarders (0.7, review D-L8) */
 #define KARIDNS_KEY_NAME_MAX 255   /* the longest name of a TSIG key (a DNS name: 255 bytes on the wire); a longer one is a configuration error */
 
 /* tcp-mss / tcp-window / udp-bufsize と zone-tcp-* / zone-udp-bufsize の許容範囲 */

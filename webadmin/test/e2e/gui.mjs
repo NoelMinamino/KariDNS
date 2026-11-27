@@ -41,7 +41,7 @@ const b = started.browser;
 fs.mkdirSync(path.join(DIR, 'shots'), { recursive: true });
 
 const home = () => b.get(`${BASE}/`);
-const h1 = async () => (await (await b.$('h1')).text()).trim();
+const h1 = () => retryStale(async () => (await (await b.$('h1')).text()).trim());
 const waitH1 = (re, o) => b.waitText('h1', re, o);
 const fill = async (name, value, scope = '') => retryStale(async () => { const e = await b.$(`${scope} input[name=${name}]`); await e.clear(); await e.type(value); });
 // a button or a link that looks like one, by its text

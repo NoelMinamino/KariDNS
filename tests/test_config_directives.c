@@ -1033,6 +1033,8 @@ static void test_zone_program_and_forward(void) {
     expect_reject("program-timeout trailing garbage", "zone \"d.test\" { type program; program-timeout 750ms; };");
     expect_reject("program-timeout negative", "zone \"d.test\" { type program; program-timeout -1; };");
     expect_reject("program-timeout above 2^31-1", "zone \"d.test\" { type program; program-timeout 4294968296; };");
+    expect_reject("program-timeout 0 (D-L8: 1..30000)", "zone \"d.test\" { type program; program-timeout 0; };");
+    expect_reject("program-timeout above 30000 (D-L8)", "zone \"d.test\" { type program; program-timeout 30001; };");
     expect_reject("program-max-failures not a number", "zone \"d.test\" { type program; program-max-failures x; };");
     expect_reject("program-reload-line not a boolean", "zone \"d.test\" { type program; program-reload-line maybe; };");
     expect_reject("program-reload-line ';' missing", "zone \"d.test\" { type program; program-reload-line yes };");
@@ -1056,6 +1058,14 @@ static void test_zone_program_and_forward(void) {
         }
     }
     expect_reject("forward-timeout above 2^31-1", "zone \"f.test\" { type forward; forwarders { 192.0.2.53; }; forward-timeout 99999999999; };");
+    expect_reject("forward-timeout 0 (D-L8: 1..30000)", "zone \"f.test\" { type forward; forwarders { 192.0.2.53; }; forward-timeout 0; };");
+    expect_reject("forward-timeout above 30000 (D-L8)", "zone \"f.test\" { type forward; forwarders { 192.0.2.53; }; forward-timeout 30001; };");
+    if (parse_ok("zone \"d.test\" { type program; program \"/bin/cat\"; program-timeout 30000; };\n"
+                 "zone \"f.test\" { type forward; forwarders { 192.0.2.53; }; forward-timeout 30000; };", &cfg)) {
+        const zone_config_t *z = first_zone(&cfg);   /* (the upper bound itself is accepted) */
+        CHECK(z && zext(z)->program_timeout_ms == 30000);
+        free_server_config_fields(&cfg);
+    }
 
     if (parse_ok("zone \"f.example\" { type forward; forwarders { 192.0.2.53; 198.51.100.53 port 5353; }; "
                  "forward-timeout 1500; };", &cfg)) {

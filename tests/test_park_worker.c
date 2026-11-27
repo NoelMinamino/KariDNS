@@ -34,6 +34,11 @@
 #include <syslog.h>
 #include <sys/socket.h>
 #include <arpa/inet.h>
+#include <errno.h>
+#include <pthread.h>
+#include <stdatomic.h>
+#include <sys/event.h>
+#include <sys/ioctl.h>
 
 #include "../dns_config_parser.h"
 #include "../dns_db_stream.h"
@@ -291,6 +296,151 @@ static zdir_elem_t *the_elem(void) {
     return e;
 }
 
+/* 0.7 work stealing, concurrently (run under ThreadSanitizer by test_park_worker-tsan): an owner and two thieves read one loopback UDP socket with the
+ * steal protocol of dns_server_core.c (steal_owner_note(), steal_pick(), steal_may_sleep(), steal_thief_step(), the EVFILT_USER wake-up) while a sender
+ * sends ST_N numbered datagrams.  Checked: every number is read exactly once (no loss, no duplicate), the thieves read some of them (the owner is
+ * slow on purpose and starts only when ST_HEAD are queued, so it is behind: a thief that does nothing fails), nobody stays asleep while the owner is
+ * behind (the run ends within its bound), and the shared state is race-free (TSan).  The datagrams are not DNS queries: the protocol is what is
+ * tested here; worker_udp_steal() itself is tested above on real queries. */
+#define ST_N 20000
+#define ST_HEAD 100
+#define ST_LEAD 200
+#define ST_THIEVES 2
+static int st_fd = -1;
+static _Atomic uint8_t st_seen[ST_N];
+static _Atomic int st_read_total, st_dups, st_bad, st_sent;
+static _Atomic int st_read_by[1 + ST_THIEVES];
+static _Atomic bool st_stop;
+static int st_kq[1 + ST_THIEVES];
+
+static int st_read_batch(int who) {
+    uint8_t b[UDP_BATCH_SIZE][16];
+    struct iovec iov[UDP_BATCH_SIZE];
+    struct mmsghdr m[UDP_BATCH_SIZE];
+    memset(m, 0, sizeof(m));
+    for (int k = 0; k < UDP_BATCH_SIZE; k++) {
+        iov[k].iov_base = b[k];
+        iov[k].iov_len = sizeof(b[k]);
+        m[k].msg_hdr.msg_iov = &iov[k];
+        m[k].msg_hdr.msg_iovlen = 1;
+    }
+    const int n = recvmmsg(st_fd, m, UDP_BATCH_SIZE, MSG_DONTWAIT, NULL);
+    for (int k = 0; k < n; k++) {
+        uint32_t v;
+        if (m[k].msg_len != sizeof(v)) { atomic_fetch_add(&st_bad, 1); continue; }
+        memcpy(&v, b[k], sizeof(v));
+        if (v >= ST_N) { atomic_fetch_add(&st_bad, 1); continue; }
+        if (atomic_exchange(&st_seen[v], 1)) atomic_fetch_add(&st_dups, 1);
+    }
+    if (n > 0) {
+        atomic_fetch_add(&st_read_total, n);
+        atomic_fetch_add(&st_read_by[who], n);
+    }
+    return n > 0 ? n : 0;
+}
+
+static void *st_owner(void *arg) {
+    (void)arg;
+    while (atomic_load(&st_sent) < ST_HEAD && !atomic_load(&st_stop)) usleep(1000);   /* (behind from the start) */
+    while (!atomic_load(&st_stop)) {
+        struct pollfd p = { st_fd, POLLIN, 0 };
+        if (poll(&p, 1, 10) != 1) continue;
+        int full = 0;
+        for (;;) {                                         /* worker_udp_rx(): batches until a short one; behind after the second full one */
+            const int n = st_read_batch(0);
+            usleep(1000);                                  /* (slow: the thieves have something to take) */
+            if (n < UDP_BATCH_SIZE) break;
+            (void)steal_owner_note(0, 0, ++full, false);
+        }
+        (void)steal_owner_note(0, 0, 0, true);
+    }
+    return NULL;
+}
+
+static void *st_thief(void *arg) {
+    const int self = (int)(intptr_t)arg;
+    steal_register(self, st_kq[self]);
+    steal_thief_t t = { 0 };
+    int mode = STEAL_BLOCK;
+    while (!atomic_load(&st_stop)) {                      /* worker_thread_func(): the wait, the steal round, the next wait */
+        struct kevent ev;
+        struct timespec ts = { 0, mode == STEAL_WARM ? (long)STEAL_POLL_US * 1000L : 0L }, longest = { 0, 50000000L };
+        const struct timespec *tp = &ts;
+        if (mode == STEAL_BLOCK && steal_may_sleep(self)) tp = &longest;   /* ("asleep": bounded only so that the test cannot hang; the wake-up itself is checked one step at a time above) */
+        (void)kevent(st_kq[self], NULL, 0, &ev, 1, tp);
+        steal_awake(self);
+        int a = -1, got = 0;
+        const int v = steal_pick(self, &a);
+        if (v == 0 && a == 0) got = st_read_batch(self);
+        else if (v >= 0) atomic_fetch_add(&st_bad, 1);
+        mode = steal_thief_step(&t, self, got);
+    }
+    return NULL;
+}
+
+static void test_steal_concurrent(void) {
+    printf("[work stealing: an owner and %d thieves on one socket]\n", ST_THIEVES);
+    const int saved_count = g_be_udp_count;
+    g_be_udp_count = 1;
+    steal_setup(1 + ST_THIEVES);
+    int sc = socket(AF_INET, SOCK_DGRAM, 0);
+    st_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    CHECK(st_fd >= 0 && sc >= 0);
+    int rb = 1 << 20;
+    setsockopt(st_fd, SOL_SOCKET, SO_RCVBUF, &rb, sizeof(rb));
+    struct sockaddr_in a;
+    memset(&a, 0, sizeof(a));
+    a.sin_family = AF_INET;
+#if defined(__FreeBSD__) || defined(__APPLE__)
+    a.sin_len = sizeof(a);
+#endif
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    socklen_t al = sizeof(a);
+    CHECK(bind(st_fd, (struct sockaddr *)&a, sizeof(a)) == 0 && getsockname(st_fd, (struct sockaddr *)&a, &al) == 0);
+    for (int i = 0; i <= ST_THIEVES; i++) {
+        st_kq[i] = kqueue();
+        CHECK(st_kq[i] >= 0);
+        struct kevent ev;
+        EV_SET(&ev, STEAL_WAKE_IDENT, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0, NULL);
+        CHECK(kevent(st_kq[i], &ev, 1, NULL, 0, NULL) == 0);
+    }
+    pthread_t th[1 + ST_THIEVES];
+    CHECK(pthread_create(&th[0], NULL, st_owner, NULL) == 0);
+    for (int i = 1; i <= ST_THIEVES; i++) CHECK(pthread_create(&th[i], NULL, st_thief, (void *)(intptr_t)i) == 0);
+    /* the sender: at most ST_LEAD ahead of the readers.  Loopback hands every datagram to the IP input queue of netisr first (net.route.netisr_maxqlen, 256
+     * by default), which drops what does not fit: 4000 ahead lost about 400 of 20000 in 2 of 6 runs (pc101, 2026-11-27).  Below that queue nothing is
+     * lost, so a missing datagram is the protocol's */
+    for (uint32_t v = 0; v < ST_N; v++) {
+        for (int t = 0; t < 30000 && (int)v - atomic_load(&st_read_total) >= ST_LEAD; t++) usleep(100);
+        ssize_t s;
+        while ((s = sendto(sc, &v, sizeof(v), 0, (struct sockaddr *)&a, sizeof(a))) < 0 && errno == ENOBUFS) usleep(100);
+        CHECK(s == (ssize_t)sizeof(v));
+        atomic_fetch_add(&st_sent, 1);
+    }
+    for (int t = 0; t < 60000 && atomic_load(&st_read_total) < ST_N; t++) usleep(1000);   /* (bounded: 60 s; TSan is slow) */
+    atomic_store(&st_stop, true);
+    for (int i = 1; i <= ST_THIEVES; i++) {
+        struct kevent ev;
+        EV_SET(&ev, STEAL_WAKE_IDENT, EVFILT_USER, 0, NOTE_TRIGGER, 0, NULL);
+        (void)kevent(st_kq[i], &ev, 1, NULL, 0, NULL);
+    }
+    for (int i = 0; i <= ST_THIEVES; i++) pthread_join(th[i], NULL);
+    int missing = 0;
+    for (int v = 0; v < ST_N; v++) missing += !atomic_load(&st_seen[v]);
+    const int stolen = atomic_load(&st_read_by[1]) + atomic_load(&st_read_by[2]);
+    CHECK(atomic_load(&st_read_total) == ST_N && missing == 0 && atomic_load(&st_dups) == 0 && atomic_load(&st_bad) == 0);
+    CHECK(stolen > 0);
+    printf("  read %d of %d (owner %d, thieves %d + %d), missing %d, duplicates %d, bad %d\n", atomic_load(&st_read_total), ST_N,
+           atomic_load(&st_read_by[0]), atomic_load(&st_read_by[1]), atomic_load(&st_read_by[2]), missing, atomic_load(&st_dups), atomic_load(&st_bad));
+    int sa;
+    CHECK(steal_pick(1, &sa) == -1);                       /* (the owner cleared its mark) */
+    for (int i = 0; i <= ST_THIEVES; i++) close(st_kq[i]);
+    close(st_fd);
+    close(sc);
+    steal_setup(0);
+    g_be_udp_count = saved_count;
+}
+
 int main(void) {
     printf("[a worker parks a query for a zone that is not in memory]\n");
     char dir[] = "/tmp/karidns_parkw_XXXXXX";
@@ -451,6 +601,153 @@ int main(void) {
         CHECK(worker_udp_rx(&w, us, 2, sk[0]) == 1);
         RAW_ANSWER(rh, rid);
         CHECK(rid == 0x6103 && rh.sock_fd_idx == 2);
+
+        /* -- 0.7 work stealing (planing_0.7.x_worker_steal.md): the socket `us` is worker 1's now; worker 0 (this pass, with the park table) is the
+         *    thief.  A stolen batch is run as worker 0's own: its frames go on worker 0's pair (sk) with the listen address's index 2, so the router
+         *    sends them on worker 0's socket of the same address (same address and port); stolen / lent count it; what is left stays for the owner */
+        {
+            int stk = kqueue();
+            CHECK(stk >= 0);
+            struct kevent kreg;
+            EV_SET(&kreg, STEAL_WAKE_IDENT, EVFILT_USER, EV_ADD | EV_CLEAR, 0, 0, NULL);  /* (as worker_thread_func() registers it) */
+            CHECK(kevent(stk, &kreg, 1, NULL, 0, NULL) == 0);
+            g_be_udp_fds[1][2] = us;
+            g_be_udp_fds[0][2] = -1;
+            steal_setup(1);
+            CHECK(!steal_on());                                      /* one worker: nobody to steal from */
+            CHECK(steal_owner_note(1, 2, 2, false) == 0 && worker_udp_steal(&w, 1, 2, sk[0]) == 0);
+            steal_setup(2);
+            CHECK(steal_on());
+            steal_register(0, stk);
+            steal_register(-1, stk);
+            steal_register(2, stk);                                  /* (no such worker: nothing) */
+            #define QUEUE(n, id0) do { for (int i_ = 0; i_ < (n); i_++) { size_t ql_ = build_query(qb, (uint16_t)((id0) + i_), true, 0); \
+                CHECK(sendto(uc, qb, ql_, 0, (struct sockaddr *)&ua, sizeof(ua)) == (ssize_t)ql_); } \
+                int nr_ = 0; for (int t_ = 0; t_ < 400; t_++) { if (ioctl(us, FIONREAD, &nr_) == 0 && nr_ >= (n) * (int)ql_one) break; usleep(5000); } \
+                CHECK(nr_ >= (n) * (int)ql_one); } while (0)
+            const size_t ql_one = build_query(qb, 0, true, 0);
+            /* the frames on the pair: how many, all with index 2 and this client; returns the number read */
+            #define FRAMES(want) do { int nf_ = 0, bad_ = 0; uint8_t fb_[65536]; for (int t_ = 0; t_ < 100 && nf_ < (want); t_++) { \
+                struct pollfd fp_ = { sk[1], POLLIN, 0 }; if (poll(&fp_, 1, 20) != 1) continue; ssize_t fn_ = recv(sk[1], fb_, sizeof(fb_), 0); \
+                size_t fo_ = 0; const udp_ipc_t *fm_; while (fn_ > 0 && udp_ipc_frame_next(fb_, (size_t)fn_, &fo_, &fm_) == UDP_IPC_FRAME_OK) { nf_++; \
+                if (fm_->sock_fd_idx != 2 || fm_->client_addr.sin.sin_port != ucl.sin_port) bad_++; } } \
+                CHECK(nf_ == (want) && bad_ == 0); if (nf_ != (want) || bad_) printf("    frames %d (want %d), bad %d\n", nf_, (want), bad_); \
+                CHECK(!read_answer(sk[1]).got); } while (0)
+
+            const uint64_t s0 = steal_stolen(0), l1 = steal_lent(1), r0w = ipcd_wrecv(0), q0w = atomic_load(&wctx.query_count);
+            QUEUE(40, 0x6200);
+            CHECK(worker_udp_steal(&w, 1, 2, sk[0]) == UDP_BATCH_SIZE);      /* one batch, not the whole queue */
+            CHECK(steal_stolen(0) == s0 + UDP_BATCH_SIZE && steal_lent(1) == l1 + UDP_BATCH_SIZE);
+            CHECK(ipcd_wrecv(0) == r0w + UDP_BATCH_SIZE && atomic_load(&wctx.query_count) == q0w + UDP_BATCH_SIZE);
+            FRAMES(UDP_BATCH_SIZE);
+            CHECK(worker_udp_rx(&w, us, 2, sk[0]) == 40 - UDP_BATCH_SIZE);  /* the rest is still there for the owner */
+            FRAMES(40 - UDP_BATCH_SIZE);
+            CHECK(worker_udp_steal(&w, 1, 2, sk[0]) == 0);                  /* empty: nothing, nothing counted */
+            CHECK(steal_stolen(0) == s0 + UDP_BATCH_SIZE);
+            /* arguments the thief must not act on: itself, a worker or an address that does not exist, a socket it does not hold */
+            CHECK(worker_udp_steal(&w, 0, 2, sk[0]) == 0 && worker_udp_steal(&w, 2, 2, sk[0]) == 0 && worker_udp_steal(&w, -1, 2, sk[0]) == 0);
+            CHECK(worker_udp_steal(&w, 1, 3, sk[0]) == 0 && worker_udp_steal(&w, 1, -1, sk[0]) == 0);
+            g_be_udp_fds[1][2] = -1;
+            CHECK(worker_udp_steal(&w, 1, 2, sk[0]) == 0);
+            g_be_udp_fds[1][2] = us;
+            w.worker_idx = 5;                                                /* (a thief that is not a worker) */
+            CHECK(worker_udp_steal(&w, 1, 2, sk[0]) == 0);
+            w.worker_idx = 0;
+
+            /* the owner's mark: one full batch is not "behind", the second in the same wake is; a short batch clears it; two addresses count once */
+            int sa = -1;
+            CHECK(steal_pick(0, &sa) == -1);
+            CHECK(steal_owner_note(1, 2, 1, false) == 0 && steal_pick(0, &sa) == -1);
+            CHECK(steal_owner_note(1, 2, 2, false) == 0 && steal_pick(0, &sa) == 1 && sa == 2);   /* (nobody sleeps: nobody woken) */
+            CHECK(steal_owner_note(1, 2, 3, false) == 0 && steal_pick(1, &sa) == -1);            /* (set already; a worker never picks itself) */
+            CHECK(steal_owner_note(1, 6, 2, false) == 0 && steal_pick(0, &sa) == 1 && sa == 2);
+            CHECK(steal_owner_note(1, 2, 0, true) == 0 && steal_pick(0, &sa) == 1 && sa == 6);
+            CHECK(steal_owner_note(1, 6, 0, true) == 0 && steal_pick(0, &sa) == -1);
+            CHECK(steal_owner_note(1, 6, 0, true) == 0);                    /* (cleared already) */
+            CHECK(steal_owner_note(1, -1, 2, false) == 0 && steal_owner_note(1, MAX_BIND_ADDRS, 2, false) == 0 && steal_owner_note(7, 2, 2, false) == 0);
+            CHECK(steal_pick(-1, &sa) == -1 && steal_pick(2, &sa) == -1);
+
+            /* the thief's waits: right away after a full batch, warm while a worker is busy and for STEAL_LINGER_POLLS looks after, then asleep */
+            steal_thief_t th = { 0 };
+            CHECK(steal_thief_step(&th, 0, 0) == STEAL_BLOCK);
+            CHECK(steal_thief_step(&th, 0, UDP_BATCH_SIZE) == STEAL_NOW);
+            for (int i = 0; i < STEAL_LINGER_POLLS; i++) CHECK(steal_thief_step(&th, 0, 3) == STEAL_WARM);
+            CHECK(steal_thief_step(&th, 0, 0) == STEAL_BLOCK);
+            CHECK(steal_owner_note(1, 2, 2, false) == 0);
+            for (int i = 0; i < STEAL_LINGER_POLLS + 2; i++) CHECK(steal_thief_step(&th, 0, 0) == STEAL_WARM);   /* (busy: warm however long) */
+            CHECK(steal_owner_note(1, 2, 0, true) == 0);
+
+            /* sleeping and waking: a worker that sleeps is woken once, by EVFILT_USER on its kqueue, when another falls behind; one that went to sleep
+             * while another was busy does not sleep (the order of the two stores and loads) */
+            struct kevent kev;
+            const struct timespec zero = { 0, 0 };
+            CHECK(steal_may_sleep(0));                                       /* nothing busy: it may sleep (marked cold) */
+            CHECK(steal_owner_note(1, 2, 2, false) == 1);                    /* worker 0 woken */
+            CHECK(kevent(stk, NULL, 0, &kev, 1, &zero) == 1 && kev.filter == EVFILT_USER && kev.ident == STEAL_WAKE_IDENT);
+            CHECK(kevent(stk, NULL, 0, &kev, 1, &zero) == 0);                /* once */
+            CHECK(!steal_may_sleep(0));                                      /* busy now: stays awake */
+            CHECK(steal_owner_note(1, 2, 0, true) == 0 && steal_owner_note(1, 2, 2, false) == 0);   /* (not cold: nobody woken) */
+            CHECK(steal_owner_note(1, 2, 0, true) == 0);
+            CHECK(steal_may_sleep(0));
+            steal_awake(0);                                                  /* woken by its own socket: no longer cold */
+            CHECK(steal_owner_note(1, 2, 2, false) == 0 && kevent(stk, NULL, 0, &kev, 1, &zero) == 0);
+            CHECK(steal_owner_note(1, 2, 0, true) == 0);
+            CHECK(steal_may_sleep(-1) && steal_may_sleep(2));                /* (not a worker: may sleep, nothing marked) */
+            steal_awake(-1);
+            steal_awake(1);                                                  /* (not cold: nothing to do) */
+            /* ... and a full stolen batch wakes one more sleeper (the thieves grow with the backlog) */
+            CHECK(steal_may_sleep(0));
+            CHECK(steal_thief_step(&th, 1, UDP_BATCH_SIZE) == STEAL_NOW);
+            CHECK(kevent(stk, NULL, 0, &kev, 1, &zero) == 1 && kev.ident == STEAL_WAKE_IDENT);
+
+            /* nobody asleep: a full stolen batch wakes nobody (the count of sleepers is read, not the slots); going to sleep twice counts once */
+            CHECK(steal_thief_step(&th, 1, UDP_BATCH_SIZE) == STEAL_NOW && kevent(stk, NULL, 0, &kev, 1, &zero) == 0);
+            CHECK(steal_may_sleep(0) && steal_may_sleep(0));
+            CHECK(steal_thief_step(&th, 1, UDP_BATCH_SIZE) == STEAL_NOW && kevent(stk, NULL, 0, &kev, 1, &zero) == 1);
+            CHECK(steal_thief_step(&th, 1, UDP_BATCH_SIZE) == STEAL_NOW && kevent(stk, NULL, 0, &kev, 1, &zero) == 0);   /* (once: the count is 0 again) */
+            /* a worker that ended (its kqueue given up, -1) is not triggered: its kqueue may be closed and the number reused */
+            steal_register(0, -1);
+            CHECK(steal_may_sleep(0) && steal_thief_step(&th, 1, UDP_BATCH_SIZE) == STEAL_NOW && kevent(stk, NULL, 0, &kev, 1, &zero) == 0);
+            steal_register(0, stk);
+
+            /* the owner's own read loop marks it: 40 queued = 16 + 16 + 8; the second full batch wakes the sleeping worker 0, the short one clears it */
+            w.worker_idx = 1;
+            CHECK(steal_may_sleep(0));
+            QUEUE(40, 0x6300);
+            CHECK(worker_udp_rx(&w, us, 2, sk[0]) == 40);
+            FRAMES(40);
+            CHECK(kevent(stk, NULL, 0, &kev, 1, &zero) == 1 && kev.ident == STEAL_WAKE_IDENT);
+            CHECK(steal_pick(0, &sa) == -1);                                 /* drained: not busy any more */
+            QUEUE(20, 0x6400);                                               /* 16 + 4: one full batch only, not behind */
+            CHECK(steal_may_sleep(0) && worker_udp_rx(&w, us, 2, sk[0]) == 20);
+            FRAMES(20);
+            CHECK(kevent(stk, NULL, 0, &kev, 1, &zero) == 0);
+            steal_awake(0);
+            w.worker_idx = 0;
+
+            /* a stolen query for the zone that is not in memory parks in the thief's table, with the thief's pair; after the wake-up its answer goes out
+             * the same way (the thief's pair, index 2) */
+            atomic_store(&el->entry, NULL);
+            QUEUE(1, 0x6501);
+            CHECK(worker_udp_steal(&w, 1, 2, sk[0]) == 1 && table.nwait == 1);
+            CHECK(park_fetch_pop(park_fetch_ring(0), &q) && strcmp(q.zone, "park.test.") == 0);
+            CHECK(!read_answer(sk[1]).got);
+            atomic_store(&el->entry, entry);
+            CHECK(park_wake_push(park_wake_ring(0), "default", "park.test.", false));
+            w.active_fd = -1;
+            park_service(&w, -1);
+            w.active_fd = sk[0];
+            CHECK(table.nwait == 0 && table.nready == 0);
+            RAW_ANSWER(rh, rid);
+            CHECK(rid == 0x6501 && rh.sock_fd_idx == 2 && rh.client_addr.sin.sin_port == ucl.sin_port);
+            CHECK(!read_answer(sk[1]).got);
+            #undef QUEUE
+            #undef FRAMES
+            g_be_udp_fds[1][2] = -1;
+            steal_setup(0);
+            close(stk);
+        }
+
         #undef UDP_IN
         #undef RAW_ANSWER
         g_be_udp_count = 0;
@@ -1326,6 +1623,7 @@ int main(void) {
     atomic_store(&el->entry, entry);
     unlink(zf);
     rmdir(dir);
+    test_steal_concurrent();
     gc_snapshot_wait_idle();
     printf("\n%d checks, %d failed\n", g_checks, g_failed);
     if (g_failed) return 1;

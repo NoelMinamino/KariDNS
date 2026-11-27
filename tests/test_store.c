@@ -2702,7 +2702,14 @@ static void test_private_tables(void) {
   CHECK_EQ(store_checkpoint_clean(s), 0);
   CHECK(store_test_files_match(s));                                      /* (the writers were out: the files are the memory) */
   store_stats(s, &st);
-  CHECK(st.checkpoint_table_bytes > 0 && st.checkpoint_table_last_bytes > 0);
+  /* the changed pages were written by a checkpoint since the puts: this clean one, or the fuzzy one the growth of the index during the puts asked for (ck_want,
+   * rg_build() -> bg_signal()), which the checkpoint thread may begin while store_reserve() waits (it did on pc101, a KVM guest, every time: the clean one then
+   * had nothing to write and its last_bytes was 0; under TSan it also ended before the stats above were read, and the pages it wrote were not given back yet).
+   * The store was opened empty just before the puts: the checkpoints since then wrote table bytes, and the files are the memory (checked above) */
+  CHECK(st.checkpoint_table_bytes > 0);
+  if (st.checkpoint_table_bytes == 0)
+    printf("  private %llu, table bytes written %llu (last %llu)\n", (unsigned long long)st.table_private_bytes, (unsigned long long)st.checkpoint_table_bytes,
+           (unsigned long long)st.checkpoint_table_last_bytes);
   /* fuzzy checkpoints while a writer changes the pages they copy: a clean checkpoint after them leaves the files equal to the memory (no page that changed was lost) */
   atomic_store(&store_test_ckpt_hook, pt_hook);
   atomic_store(&g_pt_stop, false);

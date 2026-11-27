@@ -1,4 +1,4 @@
-// Token buckets in memory (planning 8.2): login attempts per address and per user name, requests per principal, writes per principal.  One process serves
+// Token buckets in memory (planning 8.2): login attempts per address and per (user name, address), requests per principal, writes per principal.  One process serves
 // the API, so one process counts.  Keys that have been idle long enough to be full again are dropped, so an attacker cannot grow the table by sending
 // many different keys.
 
@@ -91,7 +91,7 @@ export function lockNetwork(ip) {
 
 // The lock of an account after failed logins, per account and client network (audit, 0.6.2): before, ten failures from anywhere locked the account for everybody, so
 // whoever knew a user name could keep its owner out.  Now `after` failures in a row from one network lock that network out of that account, for firstMs and twice as
-// long for every further failure, maxMs at most; the owner still gets in from another network.  (The pace of guesses per user name is the loginUser bucket's.)  In
+// long for every further failure, maxMs at most; the owner still gets in from another network.  (The pace of guesses per user name from one address is the loginUser bucket's, web review W2-L1.)  In
 // memory, like the buckets: a restart forgets the locks.  An entry that is not locked and had no failure for maxMs is dropped when the table is full.
 export class Lockouts {
   constructor({ after = 10, firstMs = 15 * 60 * 1000, maxMs = 24 * 3600 * 1000, max = 100000, now = () => Date.now() } = {}) {

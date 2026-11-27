@@ -634,17 +634,25 @@ send from one source port reach one router, however many routers there are.
 .PP
 With \fBudp\-receive backend\fR (the default, see \fBkaridns(8)\fR) the workers
 read the queries from their own UDP sockets, and the lines
-\fBipcworker.<n>.queries=<number>\fR (one per worker, from 0) count them; the
-router lines then count only what came in on the routers' NOTIFY sockets. The
-kernel shares the clients out over the workers by their address and port, as it
-does over the routers with \fBudp\-receive frontend\fR (no \fBipcworker\fR lines
-then). A reply still goes from the worker to a router (worker \fIn\fR to router
-\fIn\fR mod \fIrouters\fR), so \fBipc.worker.reply.*\fR and
-\fBipc.router.client.*\fR count the replies that were lost on the way;
-\fBipc.router.worker.*\fR and \fBipc.worker.rx.*\fR stay at 0 but for the NOTIFY
-sockets. A datagram that the kernel drops at a full UDP socket of a worker (the
-worker did not read it in time) is in \fBnetstat \-s \-p udp\fR, as for a
-router's.
+\fBipcworker.<n>.queries=<number>\fR (one per worker, from 0) count them,
+whichever worker's socket they came from. Since 0.7 a worker that is idle also
+reads a batch from the socket of a worker that is behind (work stealing, with 2
+or more workers): \fBipcworker.<n>.stolen=<number>\fR counts the queries worker
+\fIn\fR ran from other workers' sockets and \fBipcworker.<n>.lent=<number>\fR
+the queries other workers ran from its sockets, so the share of the clients the
+kernel gave to worker \fIn\fR's sockets is \fBqueries \- stolen + lent\fR and
+the work it did is \fBqueries\fR; the router lines then count only what came in
+on the routers' NOTIFY sockets. The kernel shares the clients out over the
+workers by their address and port, as it does over the routers with
+\fBudp\-receive frontend\fR (no \fBipcworker\fR lines then). A reply still goes
+from the worker to a router (worker \fIn\fR to router \fIn\fR mod \fIrouters\fR;
+a stolen query's reply goes through the router of the worker that ran it, on
+that worker's socket of the same address, which has the same address and port),
+so \fBipc.worker.reply.*\fR and \fBipc.router.client.*\fR count the replies that
+were lost on the way; \fBipc.router.worker.*\fR and \fBipc.worker.rx.*\fR stay
+at 0 but for the NOTIFY sockets. A datagram that the kernel drops at a full UDP
+socket of a worker (the worker did not read it in time) is in \fBnetstat \-s \-p
+udp\fR, as for a router's.
 .PP
 After the counters come the sizes of the socket buffers in force, as lines
 \fBipcbuf.<kind>.<direction>.asked=<bytes>\fR and \fB.got=<bytes>\fR:
