@@ -6,7 +6,8 @@
 # is given up (it stays a loss) and frees its place in the window: with WINDOW 1 one datagram the kernel drops must not stop the rest of the load.
 # Every answer is checked: QR set, the id of a query of that socket, NOERROR, one A record 192.0.2.1, and the datagram comes from the address and port that
 # the query went to (a wildcard socket of the server has to answer from the address the query came to, a socket bound to an address from that address).
-# Usage: perl udp_router_split_client.pl PORT N NSOCK WINDOW WAIT_S IP[,IP...] [BATCH [PAUSE_MS]]
+# Usage: perl udp_router_split_client.pl PORT N NSOCK WINDOW WAIT_S IP[,IP...] [BATCH [PAUSE_MS [LOST_S]]]
+#   LOST_S (default 3): a query unanswered this long is given up (tests/run_db_warm_test.sh: queries held by warm-before-serve wait longer).
 # Output (one line): "sent=S received=R answered=A unanswered=U bad=B socks=K secs=T senderr=E"
 #   bad = answers that failed a check above; socks = the sockets that were answered at least once.
 #   senderr = sends the kernel refused at first (tried again, every 5 ms, up to 200 times).  The client waits WAIT_S seconds after the last send for the answers (a bound).
@@ -16,8 +17,8 @@ use Socket;
 use Fcntl;
 use Time::HiRes qw(time sleep);
 
-my ($port, $n, $nsock, $window, $wait_s, $ips, $batch, $pause_ms) = @ARGV;
-die "usage: udp_router_split_client.pl PORT N NSOCK WINDOW WAIT_S IP[,IP...] [BATCH [PAUSE_MS]]\n" unless $port && $n && $nsock && $window && $ips;
+my ($port, $n, $nsock, $window, $wait_s, $ips, $batch, $pause_ms, $lost_arg) = @ARGV;
+die "usage: udp_router_split_client.pl PORT N NSOCK WINDOW WAIT_S IP[,IP...] [BATCH [PAUSE_MS [LOST_S]]]\n" unless $port && $n && $nsock && $window && $ips;
 die "N is at most 65536 (the DNS id is the number of the query)\n" if $n > 65536;
 $wait_s //= 5;
 $batch ||= 16;
@@ -46,7 +47,7 @@ sub pkt {
 my %pending;                                   # id => the number of the socket it went from
 my %want_ip;                                   # id => the index in @dest of the address it went to
 my %sent_at;                                   # id => the time it was sent (a query unanswered for $lost_s seconds is given up)
-my $lost_s = 3;
+my $lost_s = $lost_arg || 3;
 my %given_up;                                  # id => the socket of a query given up
 my ($sent, $received, $answered, $bad, $senderr) = (0, 0, 0, 0, 0);
 my (%seen, %socks_ok);

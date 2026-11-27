@@ -1885,7 +1885,7 @@ bool router_src_from_sockaddr(const struct sockaddr_storage *ss, router_src_t *o
 /* ---- 0.7 B3 phase 2: udp-receive backend (decision Q2) ----
  * The manager makes, before the Backend and the routers are forked, one SO_REUSEPORT_LB UDP socket per (worker, listen address): g_be_udp_fds[w][a],
  * a < g_be_udp_count (0: udp-receive frontend, the routers read the queries as before).  The Backend limits its descriptors to CAP_RECV + CAP_EVENT
- * (worker w reads only its own row, receive only: it never sends UDP, Rule 2); a router keeps the rows of the workers whose replies come to it
+ * (worker w reads its own row, and one batch of a busy worker's row when it is idle (0.7 work stealing), receive only: it never sends UDP, Rule 2); a router keeps the rows of the workers whose replies come to it
  * (be_udp_reply_router()), limited to CAP_SEND + CAP_CONNECT (sendmsg with a destination) + CAP_GETSOCKNAME, and never reads them.  The replies take
  * the Backend->Frontend IPC as before: sock_fd_idx a < g_be_udp_count names the address, and the router sends on its descriptor of that worker's
  * socket (router_reply_fd()), so the reply leaves from the socket and the address the query came to. */
@@ -1903,6 +1903,28 @@ bool be_udp_budget(int workers, int addrs, int routers, long long nofile, char *
 bool open_backend_udp_sockets(server_config_t *cfg, int num_workers, char *err, size_t errlen);
 void be_udp_close_all(void);
 int worker_udp_rx(udp_pass_t *pass, int fd, int sock_idx, int reply_fd);
+/* ---- 0.7 work stealing (udp-receive backend, 2 or more workers; planning: planing_0.7.x_worker_steal.md) ----
+ * The kernel gives each client flow to one worker's socket by a hash, so with few flows one worker's socket overflows while others idle.  An idle
+ * worker then reads one batch from a busy worker's socket (the Backend's threads hold every worker's receive-only descriptor already: nothing is
+ * handed over) and answers it as its own: on its own pair to its own router, which sends it on its own socket of the same listen address (every
+ * socket of an address has the same local address and port: RFC 1035 section 4.2.1 holds).  A worker is busy on an address after a second full
+ * batch in one wake (32 or more were queued), not busy when a batch comes back short.  The router is not changed. */
+#define STEAL_POLL_US 100u                   /* a warm thief looks again after this while some worker is busy */
+#define STEAL_LINGER_POLLS 5                 /* ... and for this many looks after the last busy one, then sleeps until woken */
+#define STEAL_WAKE_IDENT 0x7374656cu         /* "stel": EVFILT_USER on a sleeping worker's kqueue (a worker became busy) */
+enum { STEAL_BLOCK = 0, STEAL_WARM = 1, STEAL_NOW = 2 };   /* steal_thief_step(): how the next kevent() waits */
+typedef struct { int linger; } steal_thief_t;
+void steal_setup(int workers);               /* the Backend before the workers start: on with udp-receive backend and 2 or more workers */
+bool steal_on(void);
+void steal_register(int w, int kq);          /* the worker's kqueue, for the wake-up (-1: none, at the worker's exit) */
+int steal_owner_note(int w, int a, int full_batches, bool drained);   /* the owner after a batch of its socket a; returns the workers woken (0 or 1) */
+int steal_pick(int self, int *addr);         /* a busy worker other than self and its busy address, or -1 */
+bool steal_may_sleep(int self);              /* before a kevent() without a timeout: false = a worker is busy, do not sleep */
+void steal_awake(int self);                  /* after the kevent() */
+int steal_thief_step(steal_thief_t *t, int self, int got);   /* after a steal round that read `got` datagrams: STEAL_* */
+int worker_udp_steal(udp_pass_t *pass, int victim, int a, int reply_fd);   /* one batch of worker victim's socket a: the datagrams read */
+uint64_t steal_stolen(int w);                /* the queries worker w ran from other workers' sockets (ipcworker.<w>.stolen) */
+uint64_t steal_lent(int w);                  /* the queries other workers ran from worker w's sockets (ipcworker.<w>.lent) */
 void setup_udp_socket_buffers(int fd, int desired_rcv, int desired_snd);
 void apply_tcp_listen_opts(int fd, const server_config_t *cfg, bool verbose);
 void apply_tcp_mss(int fd, tcp_stream_ctx_t *c, int mss);
