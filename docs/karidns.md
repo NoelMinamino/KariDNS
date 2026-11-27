@@ -383,9 +383,9 @@ KariDNS follows the changes ISC announced on 2026-11-24 for BIND 9 ("Upcoming ch
   - It is checked before the zone data, the ACLs, the cookies and the response cache, for every transport, class and DO bit, and for zone files, tinydns zones and database zones alike.
   - An RRSIG listed in an MQTYPE-Query option (RFC 10029) is refused the same way.
   - `answer-rrsig-queries yes;` keeps the 0.6 answer: the name's RRSIG RRset, and at a CNAME owner its own RRSIGs (RFC 4035 section 2.5).
-- **A question for type NXNAME** (128, the meta-type of RFC 9824) is answered FORMERR with EDE 30 Invalid Query Type ("NXNAME queries are not allowed"), with the question echoed (RFC 9824 section 3.5, a MUST). It is checked at the same point as the RRSIG question, and also in forward and program zones, which do not pass it on (the same section). An MQTYPE-Query option that lists NXNAME is FORMERR (RFC 10029 section 3.3).
+- **A question for type NXNAME** (128, the meta-type of RFC 9824) is answered FORMERR with EDE 30 Invalid Query Type ("NXNAME queries are not allowed"), with the question echoed (RFC 9824 section 3.5, a MUST). It is checked at the same point as the RRSIG question. An MQTYPE-Query option that lists NXNAME is FORMERR (RFC 10029 section 3.3). Forward and program zones relay an NXNAME question as they relay every other one, and return the answer they get.
 - **`nocookie-udp-size`** (BIND 9.20): a UDP answer to a query without a valid server cookie is no larger than this value (RFC 7873 section 5.2); a larger one is truncated (TC=1). See the options table.
-- **Forward and program zones** relay or answer every query as before: ANY over UDP is relayed, RRSIG questions are relayed, and `nocookie-udp-size` does not limit their answers. BIND's refusal of recursive ANY queries (REFUSED with EDE 21) is not followed.
+- **Forward and program zones** relay or answer every query as before: ANY over UDP is relayed, RRSIG and NXNAME questions are relayed, and `nocookie-udp-size` does not limit their answers. BIND's refusal of recursive ANY queries (REFUSED with EDE 21) is not followed.
 
 ### `rate-limit { ... }` (in `options` or `zone`)
 

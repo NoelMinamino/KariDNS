@@ -244,9 +244,9 @@ Fixes from the external reviews and audits of the 0.7 cycle. Each has a test tha
 
 ### Bug fixes
 
-- **NXNAME questions** (RFC 9824 §3.5): a query for type NXNAME is answered FORMERR with EDE 30, also in forward and
-  program zones, which no longer pass it on; an MQTYPE-Query option that lists NXNAME is FORMERR (RFC 10029 §3.3).
-  Before, it was answered like any other type (NODATA) or relayed. `KariDNS_RFC_GUIDELINE.md` was checked against the
+- **NXNAME questions** (RFC 9824 §3.5): a query for type NXNAME is answered FORMERR with EDE 30 from this server's own
+  data, and an MQTYPE-Query option that lists NXNAME is FORMERR (RFC 10029 §3.3); before, it was answered NODATA.
+  Forward and program zones relay it as before. `KariDNS_RFC_GUIDELINE.md` was checked against the
   RFC texts: titles, section numbers and moved source files corrected.
 - **Zone store tables in private memory** (#262): a first fill of 100M zones was killed after 8.6 min (13.5 GB of private
   table pages, swap full). A fuzzy checkpoint now gives the written private pages back to their file, and a checkpoint is due

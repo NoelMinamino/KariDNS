@@ -3994,10 +3994,11 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
     }
   }
 
-  /* RFC 9824 3.5: an explicit query for the NXNAME meta-type MUST get FORMERR, and a resolver MUST NOT forward it upstream, so a forward
-   * or program zone does not relay it either.  EDE 30 Invalid Query Type is the MAY of the same section.  Before the zone, as the RRSIG
-   * question below. */
-  if (opcode == 0 && qdcount == 1 && qtype == 128) {
+  /* RFC 9824 3.5: an explicit query for the NXNAME meta-type MUST get FORMERR; EDE 30 Invalid Query Type is the MAY of the same section.
+   * Before the zone, as the RRSIG question below.  A forward or program zone is not this server's data: it relays the question and returns
+   * the forwarder's or the plugin's answer as it comes, as for ANY and RRSIG (qe_relayed_zone()); the "MUST NOT forward" of 3.5 is a
+   * resolver's rule. */
+  if (opcode == 0 && qdcount == 1 && qtype == 128 && !qe_relayed_zone(zone_cfg_any)) {
     qe_why("a question for the meta-type NXNAME (RFC 9824 3.5)");
     add_ede(&edns, send_ede, 30, "NXNAME queries are not allowed");
     return dns_build_error_response(req, req_len, res, max_res_len, 1, 0, dns_error_qd_echo(req, req_len), &edns, is_tcp, cfg); // FORMERR

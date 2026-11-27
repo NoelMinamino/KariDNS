@@ -7,7 +7,7 @@
 # minimal-any no (all RRsets) and the default, yes since 0.7 (HINFO "RFC8482", RFC 8482 section 4.2).
 # RRSIG: FORMERR with EDE 30 Invalid Query Type, the question echoed, over UDP and TCP, DO=0 and DO=1, at a CNAME
 # owner, for a tinydns zone and for a name in no zone (BIND 9.20.31 lib/ns/query.c ns_query_start()).
-# NXNAME (RFC 9824 3.5): FORMERR with EDE 30 everywhere, a forward zone included (it is not forwarded).
+# NXNAME (RFC 9824 3.5): FORMERR with EDE 30 for this server's own data; a forward zone relays it as it comes.
 # answer-rrsig-queries yes keeps the 0.6 answer: the name's RRSIG RRset (at a CNAME owner its own, RFC 4035 2.5).
 # The RRSIG records of the zone are not checked by anyone here (no validation), so the zone needs no real signing.
 
@@ -173,7 +173,7 @@ for a in "host.ar.test RRSIG +notcp" "host.ar.test RRSIG +tcp +dnssec" "alias.ar
     OUT=$(ask $PORT $a)
     expect "RRSIG ($a): FORMERR, EDE 30, question echoed, AA=0, no answer" "$OUT" " aa[ ;]" "status: FORMERR" "EDE: 30" "QUERY: 1, ANSWER: 0" "IN[[:space:]]+RRSIG$"
 done
-# --- NXNAME (RFC 9824 3.5): FORMERR (MUST), EDE 30 (MAY), in every zone kind and in none, with answer-rrsig-queries yes too ---
+# --- NXNAME (RFC 9824 3.5): FORMERR (MUST), EDE 30 (MAY), for zone files, tinydns zones and no zone, with answer-rrsig-queries yes too ---
 for a in "$PORT host.ar.test NXNAME +notcp" "$PORT host.ar.test NXNAME +tcp +dnssec" "$PORT www.td.test NXNAME" \
          "$PORT nosuch.example NXNAME +notcp" "$OPORT host.ar.test NXNAME +notcp"; do
     # shellcheck disable=SC2086
@@ -194,8 +194,8 @@ for p in $PORT $OPORT; do
     OUT=$(ask $p a.fw.test RRSIG +notcp)
     expect "forward zone ($p): RRSIG is relayed, not FORMERR" "$OUT" "status: FORMERR" "status: NOERROR"
     OUT=$(ask $p a.fw.test NXNAME +notcp)
-    expect "forward zone ($p): NXNAME is FORMERR here (RFC 9824 3.5: not forwarded)" "$OUT" "" "status: FORMERR" "EDE: 30"
-    if grep -q "^a\.fw\.test\.\{0,1\} 128 " "$TMP_DIR/fw.log"; then fail "forward zone ($p): NXNAME reached the forwarder"; else pass "forward zone ($p): NXNAME not forwarded"; fi
+    expect "forward zone ($p): NXNAME is relayed, not FORMERR" "$OUT" "status: FORMERR" "status: NOERROR"
+    if grep -q "^a\.fw\.test\.\{0,1\} 128 udp" "$TMP_DIR/fw.log"; then pass "forward zone ($p): the forwarder got the NXNAME question"; else fail "forward zone ($p): NXNAME not relayed: $(tr '\n' '|' < "$TMP_DIR/fw.log")"; fi
     if grep -q "^a\.fw\.test\.\{0,1\} 255 udp" "$TMP_DIR/fw.log" && grep -q "^a\.fw\.test\.\{0,1\} 46 udp" "$TMP_DIR/fw.log"; then   # (the mock logs the type as a number)
         pass "forward zone ($p): the forwarder got the ANY and the RRSIG questions"
     else
