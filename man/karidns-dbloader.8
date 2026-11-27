@@ -339,10 +339,11 @@ reads them together: the same view, the same priority (a query that waits is
 never held up by a batch of the background fill) and the same kind, bodies (mode
 0) or lookups (modes 2 and 3); a zone that is in the batch already stays queued
 for the next one. A batch of requests of queries, of the warm-up or of lookups
-is at most 16 requests and no more than the worker's share of what is queued
-(queued / workers, rounded up), so that the other workers of the pool still find
-requests; a batch of the fill (the background class, priority 2) takes up to 128
-(\fBDB_IN_MAX\fR, one \fBIN\fR statement per table), and only
+is at most 16 requests (64 while more than 16 of them queue: a batch costs about
+one read whatever its size) and no more than the worker's share of what is
+queued (queued / workers, rounded up), so that the other workers of the pool
+still find requests; a batch of the fill (the background class, priority 2)
+takes up to 128 (\fBDB_IN_MAX\fR, one \fBIN\fR statement per table), and only
 \fBloader\-threads\fR - 1 workers read the fill at a time, so that one is always
 free for a query (it waits for a request that is not of the fill); and with a
 single worker (\fBloader\-threads 1\fR) a batch of the fill is 128 only while no

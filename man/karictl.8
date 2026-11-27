@@ -1479,6 +1479,14 @@ first: a WARNING says so, a NOTICE when it goes on)
 0.7: table bytes bulk checkpoints wrote at 32 MiB/s because attaches of queries
 waited, and the time they gave way at that rate
 .TP 8
+\fBstore.bulk.presyncs\fR, \fBstore.bulk.presync_max_us\fR
+0.7: early syncs of the segments of an unlogged first fill, one each time 128
+MiB more were written (no commit syncs them in such a fill), so that a bulk
+checkpoint's own sync finds little; and the longest
+.TP 8
+\fBstore.fetch.query.rtt.p50_us\fR, \fB.p99_us\fR, \fB.max_us\fR
+0.7: the fetches of queries from the database, from the request to the install
+.TP 8
 \fBstore.lookup.rtt.p50_us\fR, \fB.p99_us\fR, \fB.max_us\fR, \fB.rtt.hist.*\fR
 The time from the request to the answer (without the body), as the attach times:
 the upper bound of the bucket that holds the percentile, the longest, the

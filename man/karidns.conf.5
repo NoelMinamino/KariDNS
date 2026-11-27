@@ -5288,14 +5288,15 @@ fill goes on by itself when the queries leave the loader room (a NOTICE says
 so). While the workers' attach rings hold 32 requests or more (the store threads
 are behind with the attaches of queries) the fill is held to its old share as
 while queries wait (\fBstore.ingest.fill_throttled\fR). The loader reads up to
-16 requests of queries together and up to 128 of the fill, and leaves one worker
-to the queries: \fBloader\-threads\fR - 1 workers read the fill and the last one
-only the queries, the warm-up and the lookups; with \fBloader\-threads 1\fR (a
-small server) the one worker does both, and a batch of the fill is 128 zones
-only while no query came in the last second. A zone that a query waits for is
-not read again by the fill (the query's read brings it). The loader says how it
-read in one line a minute while it reads, and once when it stops (\fBfetch reads
-in 60 s: queries 120 reads 130 zones, fill 400 reads 51200 zones (128.0 zones a
+16 requests of queries together (up to 64 while more than 16 of them queue) and
+up to 128 of the fill, and leaves one worker to the queries:
+\fBloader\-threads\fR - 1 workers read the fill and the last one only the
+queries, the warm-up and the lookups; with \fBloader\-threads 1\fR (a small
+server) the one worker does both, and a batch of the fill is 128 zones only
+while no query came in the last second. A zone that a query waits for is not
+read again by the fill (the query's read brings it). The loader says how it read
+in one line a minute while it reads, and once when it stops (\fBfetch reads in
+60 s: queries 120 reads 130 zones, fill 400 reads 51200 zones (128.0 zones a
 read)\fR, LOG_INFO). The ingest thread waits for the store's journal at 4 times
 its limit (the disk is behind the fill's writes) in slices of 5 ms and makes the
 requests of queries between them, so a lookup or a fetch of a query never waits
@@ -5881,10 +5882,12 @@ group that also writes the fill's segments: the reads of the attaches of queries
 queue behind it (measured on pc31, 10M zones under 2,500 cold queries a second:
 about five store threads at a time in \fBzfs_read\fR waiting for the disk during
 checkpoints of 24-31 s, and 40-96 % of the queries of those seconds
-lost). KariDNS does two things about it: while a checkpoint runs the fill is
-held to its old share of 32 bodies in flight
-(\fBstore.ingest.fill_throttled\fR), and while the attach rings hold requests a
-bulk checkpoint writes its tables at 32 MiB/s instead of 256
+lost). KariDNS does three things about it: in an unlogged fill the checkpoint
+thread syncs the segments each time 128 MiB more were written
+(\fBstore.bulk.presyncs\fR), so that a bulk checkpoint's own sync finds little
+left; while a checkpoint runs the fill is held to its old share of 32 bodies in
+flight (\fBstore.ingest.fill_throttled\fR), and while the attach rings hold
+requests a bulk checkpoint writes its tables at 32 MiB/s instead of 256
 (\fBstore.checkpoint.slow_bytes\fR, \fB.slow_paced_us\fR; the checkpoint takes
 longer, and the range a crash makes the fill read again grows with it). The read
 queue of the pool above (\fBvfs.zfs.vdev.sync_read_max_active\fR, and
