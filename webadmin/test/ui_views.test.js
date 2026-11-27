@@ -3,7 +3,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createApp } from '../ui/js/app.js';
+import { createApp, VERSION_WAIT_MS } from '../ui/js/app.js';
 import { GUI_VERSION } from '../ui/js/version.js';
 import { makeEnv, makeClock, makeBroadcast, FakeStorage, FakeEvent, reply, problem, flush, findAll, byText } from './fakedom.js';
 import en from '../ui/i18n/en.js';
@@ -248,7 +248,8 @@ test('S2: a session that must enrol sees nothing else: the QR code, the key hidd
   ui.type(ui.input('code'), '000000');
   await ui.submit(form);
   assert.equal(ui.q('p.msg.error').textContent, en['api.wrong-code']);
-  assert.equal(ui.count('POST', '/auth/totp'), 3, 'enroll once, two confirmations (one of them refused)');
+  // (the screen of the sign-in is drawn once: before 0.7 it was drawn twice, and so enrolled twice; "abc" is refused in the page, without a request)
+  assert.equal(ui.count('POST', '/auth/totp'), 2, 'enroll once, one confirmation (refused)');
   ui.type(ui.input('code'), '123456');
   await ui.submit(form);
   assert.equal(containsSecret(ui), false, 'the secret is gone from the page');
@@ -813,6 +814,136 @@ test('another tab signs out: this one shows the sign-in screen with a note; a si
   tab2.postMessage({ type: 'login' });
   await flush();
   assert.equal(ui.q('h1').textContent, 'Your account');
+});
+
+// GET /version held back by the test: the screen of a new session is drawn once, when it has come, whichever comes first (the session or the version), so a screen that
+// reads it (the account: require_totp) is never left without it, and a test in a browser does not find its page drawn again under it (flake row 86)
+function heldVersion(version = { ...VERSION, ui: { ...VERSION.ui, require_totp: 'all' } }) {
+  const waiting = [];
+  const v = {
+    hold: true,                    // false: answered at once
+    route: () => (v.hold ? new Promise((resolve) => { waiting.push(resolve); }) : reply(200, version)),
+    release: async (r = reply(200, version)) => { for (const resolve of waiting.splice(0)) resolve(r); await flush(); },
+    count: () => waiting.length,
+  };
+  return v;
+}
+const MANDATORY = /must use two-step verification/;
+
+test('a sign-in: the next screen is drawn once, when GET /version has come; with a fast version it is the same screen', async () => {
+  for (const slow of [true, false]) {
+    const v = heldVersion();
+    const ui = await boot({ st: { in: false, totpOn: true }, hash: '#/account', routes: { 'GET /version': v.route } });
+    const mains = [];
+    ui.type(ui.input('user'), 'alice');
+    ui.type(ui.input('password'), 'pw');
+    v.hold = slow;
+    await ui.submit(ui.q('form'));
+    if (slow) {
+      assert.equal(ui.q('h1').textContent, 'Sign in', 'nothing is drawn before the version');
+      assert.equal(v.count(), 1, 'the version is asked once');
+      await v.release();
+    }
+    await flush();
+    mains.push(ui.main());
+    assert.equal(ui.q('h1').textContent, 'Your account');
+    assert.match(ui.text(), MANDATORY, `slow=${slow}: the account is drawn with the version`);
+    await flush();
+    assert.equal(ui.main(), mains[0], 'and not drawn again');
+    assert.equal(ui.count('GET', '/version'), 1, 'one GET /version for the sign-in');
+  }
+});
+
+test('the TOTP confirmation of a session that must enrol: the screen after it is drawn with the version, and the enrolment is asked once', async () => {
+  const v = heldVersion();
+  const st = { in: false, enrol: true };
+  let confirmed = false;
+  const routes = {
+    'GET /version': v.route,
+    'POST /auth/totp': (body) => {
+      if (body.action === 'enroll') return reply(200, ENROLL);
+      confirmed = true;
+      st.totpOn = true;
+      st.sessOver = { csrf: 'csrf-2' };
+      return reply(200, { api: 1, csrf: 'csrf-2', expires_at: 'x', totp: { enabled: true, enrollment_required: false } });
+    },
+  };
+  const ui = await boot({ st, routes, hash: '#/account' });
+  st.me = () => ME(ui.clock, {}, { totp_ok: confirmed });
+  ui.type(ui.input('user'), 'alice');
+  ui.type(ui.input('password'), 'pw');
+  await ui.submit(ui.q('form'));
+  assert.equal(ui.q('h1').textContent, 'Set up two-step verification');
+  assert.equal(v.count(), 0, 'no version before the second step (the service answers 403)');
+  ui.type(ui.input('code'), '123456');
+  await ui.submit(ui.qa('form')[0]);
+  assert.equal(v.count(), 1);
+  assert.match(ui.text(), /Two-step verification is on/, 'the confirmation is told while the version comes');
+  await v.release();
+  assert.equal(ui.q('h1').textContent, 'Your account');
+  assert.match(ui.text(), MANDATORY, 'the account after the confirmation knows require_totp');
+  assert.equal(ui.count('POST', '/auth/totp'), 2, 'one enrolment, one confirmation');
+});
+
+test('a sign-in whose GET /version fails draws the next screen without it; a sign-in in another tab is drawn with the version', async () => {
+  const v = heldVersion();
+  const ui = await boot({ st: { in: false, totpOn: true }, hash: '#/account', routes: { 'GET /version': v.route } });
+  ui.type(ui.input('user'), 'alice');
+  ui.type(ui.input('password'), 'pw');
+  await ui.submit(ui.q('form'));
+  await v.release(problem(500, 'internal'));
+  assert.equal(ui.q('h1').textContent, 'Your account', 'a failed version does not keep the sign-in screen');
+  assert.doesNotMatch(ui.text(), MANDATORY);
+
+  v.hold = false;
+  const other = await boot({ st: { totpOn: true }, hash: '#/account', routes: { 'GET /version': v.route } });
+  v.hold = true;
+  const tab2 = new other.env.BroadcastChannel('karidns-webadmin');
+  other.state.in = false;
+  tab2.postMessage({ type: 'logout' });
+  await flush();
+  assert.equal(other.q('h1').textContent, 'Sign in');
+  other.state.in = true;
+  tab2.postMessage({ type: 'login' });
+  await flush();
+  assert.equal(other.q('h1').textContent, 'Sign in', 'not drawn before the version');
+  await v.release();
+  assert.equal(other.q('h1').textContent, 'Your account');
+  assert.match(other.text(), MANDATORY, 'the page of the other tab\'s sign-in has the version');
+});
+
+test('GET /version that does not answer: the screen is drawn without it at the deadline, and again with it when it comes', async () => {
+  const v = heldVersion();
+  const ui = await boot({ st: { in: false, totpOn: true }, hash: '#/account', routes: { 'GET /version': v.route } });
+  ui.type(ui.input('user'), 'alice');
+  ui.type(ui.input('password'), 'pw');
+  await ui.submit(ui.q('form'));
+  await ui.clock.advance(VERSION_WAIT_MS - 1);
+  await flush();
+  assert.equal(ui.q('h1').textContent, 'Sign in', 'not before the deadline');
+  await ui.clock.advance(1);
+  await flush();
+  assert.equal(ui.q('h1').textContent, 'Your account', 'drawn at the deadline');
+  assert.doesNotMatch(ui.text(), MANDATORY, 'without the version');
+  const first = ui.main();
+  await v.release();
+  assert.equal(ui.q('h1').textContent, 'Your account');
+  assert.match(ui.text(), MANDATORY, 'drawn again with the version when it comes');
+  assert.notEqual(ui.main(), first);
+  assert.equal(ui.count('GET', '/version'), 1);
+
+  // the version that comes in time: the deadline is cleared, no second drawing
+  const w = heldVersion();
+  const fast = await boot({ st: { in: false, totpOn: true }, hash: '#/account', routes: { 'GET /version': w.route } });
+  fast.type(fast.input('user'), 'alice');
+  fast.type(fast.input('password'), 'pw');
+  await fast.submit(fast.q('form'));
+  await w.release();
+  const drawn = fast.main();
+  await fast.clock.advance(VERSION_WAIT_MS * 2);
+  await flush();
+  assert.equal(fast.main(), drawn, 'the deadline does not draw it again');
+  assert.match(fast.text(), MANDATORY);
 });
 
 test('the session of a visitor that must enrol is not extended by the page, and a language change redraws the sign-in screen', async () => {
