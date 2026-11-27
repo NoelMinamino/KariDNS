@@ -902,13 +902,15 @@ counts of the start.
 \fIDescription:\fR Who reads the UDP queries (0.7 B3 phase 2). \fBbackend\fR:
 every worker thread reads its own UDP socket of each listen address (the manager
 makes them before the fork, one per worker and address, all in the address's
-\fBSO_REUSEPORT_LB\fR group; the worker's descriptor may only receive) and the
-routers only send the replies: the router no longer reads every query and passes
-it on, which was its main cost per query. \fBfrontend\fR: the routers read the
-queries on their own sockets and hand them to the workers over the IPC, as
-before 0.7 (kept for comparison). Both answer the same; \fBkarictl ipcstats\fR
-shows the queries of each worker as \fBipcworker.<n>.queries\fR with
-\fBbackend\fR and those of each router as \fBipcrouter.<n>.queries\fR with
+\fBSO_REUSEPORT_LB\fR group; the worker's descriptor may only receive), and with
+2 or more workers an idle worker also reads batches from the socket of a worker
+that is behind (work stealing, see "Frontend Router Processes") and the routers
+only send the replies: the router no longer reads every query and passes it on,
+which was its main cost per query. \fBfrontend\fR: the routers read the queries
+on their own sockets and hand them to the workers over the IPC, as before 0.7
+(kept for comparison). Both answer the same; \fBkarictl ipcstats\fR shows the
+queries of each worker as \fBipcworker.<n>.queries\fR with \fBbackend\fR and
+those of each router as \fBipcrouter.<n>.queries\fR with
 \fBfrontend\fR. \fBbackend\fR needs one socket per worker and listen address:
 more than 4096 (\fBworker\-threads\fR x listen addresses), or more descriptors
 than the limit (\fBRLIMIT_NOFILE\fR, about twice the sockets plus the IPC

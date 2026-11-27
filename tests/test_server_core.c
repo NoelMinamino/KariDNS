@@ -3564,7 +3564,7 @@ static void test_router_reply_fd_and_budget(void) {
     assert(be_udp_budget(1, 1, 1, 1024, err, sizeof(err)));                   /* (a small server under a low limit still starts) */
 
     /* karictl ipcstats: the queries of each worker (one writer per slot) with udp-receive backend only; the drops of the worker's own sockets */
-    static char fb[8192];
+    static char fb[24576];                                                     /* (the control thread's buffer: dns_server_core.c "ipcstats") */
     const uint64_t w1 = ipcd_wrecv(1);
     ipcd_wrecv_add(1, 5);
     ipcd_wrecv_add(1, 0);
@@ -3584,6 +3584,10 @@ static void test_router_reply_fd_and_budget(void) {
     char want[64];
     snprintf(want, sizeof(want), "ipcworker.1.queries=%llu\n", (unsigned long long)(w1 + 5));
     assert(strstr(fb, "ipcworker.0.queries=") && strstr(fb, want) && strstr(fb, "ipcworker.2.queries=") && !strstr(fb, "ipcworker.3."));
+    /* 0.7 work stealing: what each worker ran from the others' sockets and what the others ran from its own, after its queries line */
+    snprintf(want, sizeof(want), "ipcworker.1.stolen=%llu\nipcworker.1.lent=%llu\n", (unsigned long long)steal_stolen(1), (unsigned long long)steal_lent(1));
+    assert(strstr(fb, want) && strstr(fb, "ipcworker.0.stolen=") && strstr(fb, "ipcworker.2.lent=") && steal_stolen(-1) == 0 &&
+           steal_lent(KARIDNS_WORKER_THREADS_MAX) == 0);
     const char *dt = strstr(fb, "ipc.dropped.total=");
     uint64_t sum = 0;
     for (int i = 0; i < IPCD_COUNT; i++)
@@ -3591,7 +3595,7 @@ static void test_router_reply_fd_and_budget(void) {
     assert(dt && strtoull(dt + strlen("ipc.dropped.total="), NULL, 10) == sum);   /* (the worker queries are not drops; the new drops are) */
     g_num_workers = KARIDNS_WORKER_THREADS_MAX;                                 /* (the reply of 128 workers fits the control thread's buffer) */
     fl = ipcd_format(fb, sizeof(fb));
-    assert(strstr(fb, "ipcworker.127.queries=") && strstr(fb, "ipcbuf.udp.snd.got=") && fl < sizeof(fb));
+    assert(strstr(fb, "ipcworker.127.queries=") && strstr(fb, "ipcworker.127.lent=") && strstr(fb, "ipcbuf.udp.snd.got=") && fl < sizeof(fb));
     g_num_workers = saved_workers;
     g_be_udp_count = saved_count;
     printf("  -> router_reply_fd / be_udp_reply_router / be_udp_budget passed.\n");

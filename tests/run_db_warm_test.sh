@@ -12,6 +12,8 @@
 #   - a restart of the loader (kill -9) warms again what the Backend lost (needs the test hook of karidns-evict; that part is SKIPped without it)
 #   - warm-before-serve: the queries wait until the hot list is read (fetch-rate 1: about 10 s), or until the time is up; karictl dbstatus works meanwhile
 #   - karictl dbstatus: the new lines, and the old ones are still there; karicheck db checks the state file's directory and contents
+#   - 0.7 work stealing: while warm-before-serve holds the workers, 4000 queries of one source port queue on one worker's socket; afterwards several workers ran
+#     them (ipcworker.<w>.stolen = .lent > 0), each once, and every answer comes from the address and port its query went to
 # Needs root (the loader runs as nobody).  SKIP without karidns, dag, karictl, karidns-dbloader (SQLite3), sqlite3 or perl.
 . "$(dirname "$0")/lib_proc.sh"
 set -u
@@ -74,14 +76,15 @@ key "karictl" { algorithm hmac-sha256; secret "$SECRET"; };
 EOF
 chmod 600 "$T/karictl.conf"
 KCTL="./karictl -c $T/karictl.conf"
-conf() {   # conf LIMIT EXTRA-OPTIONS
+conf() {   # conf LIMIT EXTRA-DATABASE-OPTIONS [EXTRA-OPTIONS [EXTRA-STATEMENTS]]
     cat > "$T/k.conf" <<EOF
 options {
-    user "nobody"; pid-file "none"; listen-on { 127.0.0.1; }; port $PORT;
+    user "nobody"; pid-file "none"; listen-on { 127.0.0.1; }; port $PORT; ${3:-}
     database { driver sqlite3; database-file "$T/db/z.db"; loader-user "nobody"; loader-path "$T/karidns-dbloader"; acl-ceiling { 127.0.0.1; };
                memory-limit $1; loader-state-file "$ST"; hot-list-interval 1; park-timeout 4000; $2 };
 };
 control-channel { socket "$T/ctl.sock"; secret "$SECRET"; };
+${4:-}
 EOF
 }
 start_bg() {
@@ -338,6 +341,51 @@ echo "  the answer came after $EL s: $a"
 i=0; while ! grep -q 'warm-before-serve: the time is up' "$T/srv.log" && [ $i -lt 30 ]; do sleep 0.1; i=$((i + 1)); done   # (the ingest thread logs it a moment after the workers let the queries in)
 grep -q 'warm-before-serve: the time is up' "$T/srv.log" && pass "the log says the time was up" || fail "no 'time is up' line in the log"
 dbs | grep -q '^warm-before-serve: queries accepted after [0-9]* ms' && pass "dbstatus shows when the queries were let in" || fail "dbstatus: $(dbs | grep '^warm-before-serve')"
+stop_srv
+
+echo "== work stealing (0.7): the backlog of ONE client flow is answered by several workers"
+# warm-before-serve holds every worker before it reads its socket, so the 8000 queries of one source port (one flow: the kernel gives them all to one
+# worker's socket) are all queued when the workers start; the owner is behind (32 or more queued) and the idle workers read batches of its socket and
+# answer them through their own routers, on their own sockets of the same address (same address and port).  Without stealing one worker runs all 8000.
+# The queries are for a zone file zone (in memory): only the hold is the database's (the hot list of 12 zones at fetch-rate 1: about ten seconds).
+cp "$T/good.state" "$ST"; fix_state
+cat > "$T/ex.zone" <<'EOF'
+$ORIGIN example.test.
+$TTL 300
+@ IN SOA ns.example.test. h.example.test. 1 7200 3600 1209600 300
+@ IN NS ns.example.test.
+ns IN A 192.0.2.1
+* IN A 192.0.2.1
+EOF
+chmod 644 "$T/ex.zone"
+conf 256m "fetch-rate 1; warm-before-serve 60;" "router-threads 2; worker-threads 4;" "zone \"example.test\" { type master; file \"$T/ex.zone\"; };"
+start_bg
+ipcv() { v=$(printf '%s\n' "$1" | sed -n "s/^$2=//p" | head -1); echo "${v:-0}"; }
+isum() { printf '%s\n' "$1" | awk -F= -v s="$2" '$1 ~ "^ipcworker\\.[0-9]+\\." s "$" { t += $2 } END { print t + 0 }'; }
+udp_full() { v=$(netstat -s -p udp 2>/dev/null | awk '/dropped due to full socket buffers/ { print $1; exit }'); echo "${v:-0}"; }
+if waitfor 30 sh -c "./karictl -c $T/karictl.conf dbstatus 2>/dev/null | grep -q '^warm-before-serve: holding the queries'"; then
+    I0=$($KCTL ipcstats 2>/dev/null); U0=$(udp_full)
+    OUT=$(perl tests/udp_router_split_client.pl "$PORT" 4000 1 4000 30 127.0.0.1 16 1 60)
+    I1=$($KCTL ipcstats 2>/dev/null); U1=$(udp_full)
+    echo "  client: $OUT (UDP datagrams the kernel dropped for full socket buffers meanwhile: $((U1 - U0)))"
+    ANS=$(printf '%s\n' "$OUT" | sed -n 's/.* answered=\([0-9]*\).*/\1/p'); BAD=$(printf '%s\n' "$OUT" | sed -n 's/.* bad=\([0-9]*\).*/\1/p')
+    # (the answers of the backlog leave in one burst: loopback may drop some on the way to the client, in the kernel's queues, after the server sent
+    # them; what the server did is counted exactly below, the client checks the source of every answer it gets)
+    [ "${ANS:-0}" -ge 1000 ] && [ "${BAD:-1}" = 0 ] && pass "every answer the client got ($ANS of 4000) came from the address and port its query went to" || fail "client: $OUT"
+    DQ=$(( $(isum "$I1" queries) - $(isum "$I0" queries) )); DS=$(( $(isum "$I1" stolen) - $(isum "$I0" stolen) )); DL=$(( $(isum "$I1" lent) - $(isum "$I0" lent) ))
+    RAN=0; for wk in 0 1 2 3; do
+        d=$(( $(ipcv "$I1" "ipcworker.$wk.queries") - $(ipcv "$I0" "ipcworker.$wk.queries") )); [ "$d" -gt 0 ] && RAN=$((RAN + 1))
+    done
+    BS=$(( $(ipcv "$I1" ipc.router.reply.bad_socket) - $(ipcv "$I0" ipc.router.reply.bad_socket) ))
+    DR=$(( $(ipcv "$I1" ipc.dropped.total) - $(ipcv "$I0" ipc.dropped.total) ))
+    WHY="$(printf '%s\n' "$I1" | grep -E '^ipcworker|bad_socket|dropped.total' | tr '\n' ' ')"
+    [ "$DQ" = 4000 ] && [ "$DR" = 0 ] && pass "the workers ran the 4000 queries once each and lost no reply on the way to the routers" || fail "the workers ran $DQ queries (want 4000), $DR dropped: $WHY"
+    [ "$DS" -gt 0 ] && [ "$DS" = "$DL" ] && [ "$RAN" -ge 2 ] && pass "idle workers took part of the backlog ($DS stolen = $DS lent, $RAN workers ran queries of the one flow)" ||
+        fail "stolen $DS, lent $DL, $RAN worker(s) ran queries: $WHY"
+    [ "$BS" = 0 ] && pass "no reply named a socket of another worker (ipc.router.reply.bad_socket did not move)" || fail "bad_socket grew by $BS"
+else
+    fail "warm-before-serve did not hold the queries: $(dbs | grep '^warm-before-serve')"
+fi
 stop_srv
 
 echo "== karicheck db checks the state file"
