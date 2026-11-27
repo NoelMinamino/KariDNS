@@ -259,6 +259,48 @@ static void test_fstrm(void) {
         fstrm_reader_free(&r);
         free(big);
     }
+
+    /* 0.7 (review of the -l handshake read, CI flake row 96): a data frame header before START is an error at the header, before anything is allocated
+     * for its payload (karidns-tapstat reads a handshake while the sender is paused: a large data header there must cost nothing) */
+    {
+        uint8_t h[4];
+        be32(h, FSTRM_MAX_DATA_FRAME);
+        fstrm_reader_init(&r, true);                            /* (INIT: waiting for READY) */
+        assert(fstrm_feed(&r, h, 4, count_cb, NULL) == -1 && r.buf == NULL && r.buf_cap == 0);
+        fstrm_reader_free(&r);
+        fstrm_reader_init(&r, true);                            /* (WAIT_START: READY answered) */
+        n = ctl(stream, 4, true);
+        assert(fstrm_feed(&r, stream, n, count_cb, NULL) == 0 && r.state == FSTRM_ST_WAIT_START);
+        assert(fstrm_feed(&r, h, 4, count_cb, NULL) == -1 && r.buf == NULL && r.buf_cap == 0);
+        fstrm_reader_free(&r);
+        fstrm_reader_init(&r, false);                           /* (a file: waiting for START) */
+        assert(fstrm_feed(&r, h, 4, count_cb, NULL) == -1 && r.buf == NULL && r.buf_cap == 0);
+        fstrm_reader_free(&r);
+    }
+
+    /* fstrm_handshake_need(): read the handshake that many bytes at a time, and the read that ends START ends exactly there: the data frame behind it
+     * is not read with it (karidns-tapstat -l, a paused sender) */
+    {
+        n = 0;
+        n += ctl(stream + n, 4, true);                          /* READY */
+        n += ctl(stream + n, 2, true);                          /* START */
+        const size_t hs_end = n;
+        n += data_frame(stream + n, fr, fl);
+        fstrm_reader_init(&r, true);
+        g_data = 0;
+        size_t off = 0, reads = 0;
+        assert(fstrm_handshake_need(&r) == 4);                  /* (the first word of a frame) */
+        while (r.state != FSTRM_ST_DATA) {
+            const size_t want = fstrm_handshake_need(&r);
+            assert(want > 0 && want <= FSTRM_MAX_CONTROL && off + want <= n);
+            assert(fstrm_feed(&r, stream + off, want, count_cb, NULL) == 0);
+            off += want;
+            reads++;
+        }
+        assert(off == hs_end && g_data == 0 && reads == 6);     /* (READY and START: the escape, the length, the payload each) */
+        assert(fstrm_feed(&r, stream + off, n - off, count_cb, NULL) == 0 && g_data == 1);
+        fstrm_reader_free(&r);
+    }
 }
 
 static void test_decoder(void) {

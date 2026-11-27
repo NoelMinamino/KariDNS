@@ -251,11 +251,68 @@ if [ -n "$FAB" ]; then
     [ $((T1 - T0)) -ge "$MIN2" ] && pass "one bucket for the uid: 2 x $FAB bytes took $((T1 - T0)) s (at least $MIN2; per connection it would be half)" ||
         fail "the two connections got more than the sender's rate: 2 x $FAB bytes in $((T1 - T0)) s (want >= $MIN2)"
 fi
+# a connection of the same sender that comes while the other one is throttled in the middle of its flood (CI flake row 96: under the -j 4 suite the second
+# perl sender started late, and the first connection, read first in every round, took every refill of the shared bucket, so the newcomer's READY was not
+# read for seconds and it gave up "no ACCEPT"): its handshake is answered at once and it gets its share.  A flood of 1000 copies takes more than 7 s at
+# 64K; the second sender starts 1 s into it, when the bucket is surely empty and paused (the window is the flood's own length, not a wait for an event).
+# Without the fix the newcomer is not read until the other has finished: its ACCEPT does not come within the mock's 3 s.  With it the newcomer's 100
+# copies (a tenth of the bytes, half the rate) are done while the other is still sending.
+perl "$MOCK" send "$SOCK6" flood 1000 > "$TMP_DIR/fc.out" 2>&1 &
+FC=$!
+sleep 1
+perl "$MOCK" send "$SOCK6" flood 100 > "$TMP_DIR/fd.out" 2>&1; RD=$?
+kill -0 "$FC" 2>/dev/null; FC_RUNNING=$?
+wait "$FC"; RC=$?
+[ "$RD" -eq 0 ] && pass "a connection that comes while its sender is throttled is answered and served ($(cat "$TMP_DIR/fd.out"))" || fail "late connection of a throttled sender: $(cat "$TMP_DIR/fd.out")"
+[ "$RC" -eq 0 ] && pass "...and the throttled one finishes too ($(cat "$TMP_DIR/fc.out"))" || fail "the throttled connection: $(cat "$TMP_DIR/fc.out")"
+[ "$RD" -eq 0 ] && [ "$FC_RUNNING" -eq 0 ] && pass "the late connection got its share: it was done while the other was still sending" || fail "the late connection was served only after the other had finished ($(cat "$TMP_DIR/fd.out"); the other: $(cat "$TMP_DIR/fc.out"))"
 kill -TERM "$TAP_PID"; wait "$TAP_PID"; TAP_PID=""
 perl "$MOCK" sum "$TMP_DIR/s6.json" > "$TMP_DIR/s6.sum"
-grep -q "^frames=14007$" "$TMP_DIR/s6.sum" && pass "every frame of the slowed sender is counted (7 + 7000 + 2 x 3500)" || fail "frames of -l: $(grep '^frames=' "$TMP_DIR/s6.sum")"
+grep -q "^frames=21707$" "$TMP_DIR/s6.sum" && pass "every frame of the slowed sender is counted (7 + 7000 + 2 x 3500 + 7000 + 700)" || fail "frames of -l: $(grep '^frames=' "$TMP_DIR/s6.sum")"
 TH=$(sed -n 's/^senders_throttled=//p' "$TMP_DIR/s6.sum")
 [ "${TH:-0}" -gt 0 ] && pass "the pauses are counted (senders_throttled=$TH)" || fail "senders_throttled: $(cat "$TMP_DIR/s6.sum")"
+
+# two long floods of one sender at once share the rate: both make progress, so they end together.  A round that only refills reads nothing: turning the
+# order once per round left the same connection first every round (review of #298), and the other one waited for it to finish.  2 x 300 copies take
+# about 4.3 s at 64K; with turns both end at about that time, without them the first ends about 2 s before the second
+now_ms() { perl -MTime::HiRes=time -e 'printf "%d\n", time * 1000'; }
+SOCK8="$TMP_DIR/t8.sock"
+"$TAPSTAT" -s "$SOCK8" -i 60 -f json -u "$(id -u)" -l 64K > "$TMP_DIR/s8.json" 2> "$TMP_DIR/s8.err" &
+TAP_PID=$!
+for i in $(seq 1 50); do [ -S "$SOCK8" ] && break; sleep 0.1; done
+perl "$MOCK" send "$SOCK8" flood 150 > /dev/null 2>&1   # (the bucket is empty and paused when the two start)
+( perl "$MOCK" send "$SOCK8" flood 300 > "$TMP_DIR/fe.out" 2>&1; echo "$? $(now_ms)" > "$TMP_DIR/fe.end" ) &
+FE=$!
+( perl "$MOCK" send "$SOCK8" flood 300 > "$TMP_DIR/ff.out" 2>&1; echo "$? $(now_ms)" > "$TMP_DIR/ff.end" ) &
+FF=$!
+wait "$FE" "$FF"
+read -r RE TE < "$TMP_DIR/fe.end"; read -r RF TF < "$TMP_DIR/ff.end"
+DT=$((TE > TF ? TE - TF : TF - TE))
+[ "$RE" = 0 ] && [ "$RF" = 0 ] && [ "$DT" -le 1000 ] && pass "two floods of one sender at once end together ($DT ms apart: they share the rate)" ||
+    fail "two floods of one sender: $(cat "$TMP_DIR/fe.out" "$TMP_DIR/ff.out"), ended $DT ms apart (want <= 1000: one waited for the other)"
+kill -TERM "$TAP_PID"; wait "$TAP_PID"; TAP_PID=""
+
+# a handshake that is read while its sender is paused brings no data with it (review of #298: the read took FSTRM_MAX_CONTROL + 8 bytes, so START and
+# the data frames behind it came in, and a sender that reconnects got its data past -l).  The bucket (4K) is drained by a flood; then 16 connections,
+# one after another, each READY, then START with 7 data frames right behind it, and close.  What came in from the end of the drain to the stop
+# 0.2 s after the burst may not pass what 4K a second allows in that time (the bucket starts empty), plus 20 frames for the rounding: a handshake read
+# that took the data along let all 112 in at once
+SOCK9="$TMP_DIR/t9.sock"
+"$TAPSTAT" -s "$SOCK9" -i 60 -f json -u "$(id -u)" -l 4K > "$TMP_DIR/s9.json" 2> "$TMP_DIR/s9.err" &
+TAP_PID=$!
+for i in $(seq 1 50); do [ -S "$SOCK9" ] && break; sleep 0.1; done
+perl "$MOCK" send "$SOCK9" flood 30 > "$TMP_DIR/fg.out" 2>&1
+TS0=$(now_ms)
+perl "$MOCK" send "$SOCK9" sneak 16 > "$TMP_DIR/sn.out" 2>&1
+sleep 0.2
+kill -TERM "$TAP_PID"; wait "$TAP_PID"; TAP_PID=""
+TS1=$(now_ms)
+perl "$MOCK" sum "$TMP_DIR/s9.json" > "$TMP_DIR/s9.sum"
+SNF=$(( $(sed -n 's/^frames=//p' "$TMP_DIR/s9.sum") - 210 ))
+SNMAX=$(( 4096 * (TS1 - TS0) / 1000 / 67 + 20 ))      # (a frame of the known traffic is 67 bytes on average: 472054 bytes for 7000 frames)
+grep -q "^OK flood" "$TMP_DIR/fg.out" && grep -q "^OK sneak 16 of 16 accepted" "$TMP_DIR/sn.out" && pass "16 handshakes of a drained sender are answered ($(cat "$TMP_DIR/sn.out"))" || fail "sneak: $(cat "$TMP_DIR/fg.out" "$TMP_DIR/sn.out")"
+[ "$SNF" -ge 0 ] && [ "$SNF" -le "$SNMAX" ] && pass "the data behind their START waits for the rate: $SNF of 112 frames in $((TS1 - TS0)) ms (at most $SNMAX at 4K)" ||
+    fail "the handshakes of a drained sender brought their data past -l: $SNF of 112 frames in $((TS1 - TS0)) ms (want <= $SNMAX at 4K)"
 "$TAPSTAT" -s "$TMP_DIR/t7.sock" -u no-such-user-tapstat >/dev/null 2>&1; [ $? -eq 2 ] && pass "-u unknown user: exit 2" || fail "-u unknown user"
 "$TAPSTAT" -s "$TMP_DIR/t7.sock" -l 5X >/dev/null 2>&1; [ $? -eq 2 ] && pass "-l 5X: exit 2" || fail "-l 5X"
 "$TAPSTAT" -s "$TMP_DIR/t7.sock" -l 2000G >/dev/null 2>&1; [ $? -eq 2 ] && pass "-l 2000G: exit 2" || fail "-l 2000G"

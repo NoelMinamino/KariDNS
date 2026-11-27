@@ -268,6 +268,13 @@ Fixes from the external reviews and audits of the 0.7 cycle. Each has a test tha
 
 ### Bug fixes
 
+- **karidns-tapstat: a second connection of a throttled sender was starved** (`-l`): the connections of one sender
+  share its byte bucket, and the one read first in every round took every refill, so a second connection was not
+  read until the first had finished and its handshake went unanswered for seconds (the sender gave up waiting for
+  `ACCEPT`; the flake of run_tapstat_test under the -j 4 suite). Each refill now goes to the connection after the one
+  that read data last. A handshake is read while the sender is paused, exactly the rest of its current control frame
+  and never a data frame behind START. A data frame header before START is refused at the header, before anything is
+  allocated for it.
 - **Out of memory while a zone element is retired**: when the retire queue could not take an element (database
   zones: a zone taken out of memory, a staged attach), the element was freed after a wait of 60 seconds whether or
   not the readers had left. It is now freed only when they have; a reader that stays past the wait leaves it in

@@ -100,6 +100,14 @@ static int fstrm_control(fstrm_reader_t *r, const uint8_t *p, size_t n) {
     }
 }
 
+size_t fstrm_handshake_need(const fstrm_reader_t *r) {
+    if (r->phase == 0) {
+        const size_t need = (r->hdr_have >= 4 && rd32(r->hdr) == 0) ? 8 : 4;
+        return need - r->hdr_have;
+    }
+    return r->control ? (size_t)(r->plen - r->have) : 0;   /* (a data frame in the handshake is an error at its header: no payload is read for it) */
+}
+
 int fstrm_feed(fstrm_reader_t *r, const uint8_t *in, size_t len, fstrm_data_cb cb, void *ctx) {
     if (r->state == FSTRM_ST_ERROR) return -1;
     if (r->state == FSTRM_ST_DONE) return 1;
@@ -118,7 +126,9 @@ int fstrm_feed(fstrm_reader_t *r, const uint8_t *in, size_t len, fstrm_data_cb c
             r->control = (first == 0);
             r->plen = r->control ? rd32(r->hdr + 4) : first;
             r->hdr_have = 0;
-            if (r->control ? (r->plen < 4 || r->plen > FSTRM_MAX_CONTROL) : r->plen > FSTRM_MAX_DATA_FRAME) {
+            /* (a data frame before START is an error at its header: nothing is allocated for it; in a handshake read while the sender is paused,
+             * karidns_tapstat.c, a data header must cost nothing) */
+            if (r->control ? (r->plen < 4 || r->plen > FSTRM_MAX_CONTROL) : (r->plen > FSTRM_MAX_DATA_FRAME || r->state != FSTRM_ST_DATA)) {
                 r->state = FSTRM_ST_ERROR;
                 return -1;
             }

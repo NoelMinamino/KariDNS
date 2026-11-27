@@ -1,4 +1,4 @@
-.TH KARIDNS\-TAPSTAT 1 "2026-11-27" "KariDNS" "KariDNS Manual"
+.TH KARIDNS\-TAPSTAT 1 "2026-11-28" "KariDNS" "KariDNS Manual"
 .\" Generated from docs/karidns-tapstat.md by man/md2man.pl (make man): edit the Markdown manual, not this page.
 .SH NAME
 karidns\-tapstat \- Aggregates the dnstap stream of \fBkaridns\fR into periodic
@@ -191,9 +191,17 @@ sender no longer uses goes to another sender only once it is full again, and a
 new sender that finds none is refused (counted with \fBsenders refused\fR). A
 sender over it is not read until the bucket refills, so it waits on its socket
 (nothing it sent is lost or cut; \fBkaridns\fR counts what its ring could not
-hold as dnstap drops). Each pause is counted (\fBthrottled\fR in the summary). A
-dnstap message of \fBkaridns\fR takes a few hundred bytes, so \fB64M\fR is some
-200,000 messages a second; raise \fB\-l\fR for a busier server.
+hold as dnstap drops). Each pause is counted (\fBthrottled\fR in the
+summary). When several connections of one sender wait for the bucket, each
+refill goes to the connection after the one that read data last, so one that
+floods does not keep the others out. A connection whose handshake is not done is
+read while its sender is paused: exactly the rest of the control frame it is in,
+counted against the bucket, never a data frame behind it. So a second connection
+of a throttled sender gets its \fBACCEPT\fR at once, and its data waits for the
+rate (0.7; before, the first connection took every refill and the second one
+waited for it to finish). A dnstap message of \fBkaridns\fR takes a few hundred
+bytes, so \fB64M\fR is some 200,000 messages a second; raise \fB\-l\fR for a
+busier server.
 .TP 8
 \fB\-w seconds\fR
 Close a sender that has sent nothing for this long after the handshake, 1 to
