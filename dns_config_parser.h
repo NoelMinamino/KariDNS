@@ -940,6 +940,10 @@ typedef struct server_config_s {
   uint8_t udp_receive;         /* `udp-receive` (restart-only): UDP_RECEIVE_BACKEND (0, also when not written) or UDP_RECEIVE_FRONTEND */
   size_t response_cache_size;  /* 共有の応答キャッシュの大きさ (オクテット)。0 = 使わない */
   uint64_t generation;         /* 公開した設定ごとに増える (応答キャッシュの鍵) */
+  /* 0.7 (NSD gap 5): a number no other parse in this process had (parse_named_conf_ext() sets it when it succeeds; 0 = a configuration that was not parsed: a test's, or a
+   * failed parse).  The key of the zone { } an entry remembers (zone_entry_config()): every parse makes new zone_config_t blocks, also into the struct of the double buffer
+   * that held an earlier configuration, so a pointer remembered with another token is never used. */
+  uint64_t zcfg_token;
   additional_from_auth_t additional_from_auth;
   uint32_t query_log_max_qps;
   uint32_t query_log_buffer_size;

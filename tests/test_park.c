@@ -341,14 +341,21 @@ static void test_concurrent(void) {
   for (int i = 0; i < CW; i++) pthread_join(th[i], NULL);
   atomic_store(&g_stop, true);
   pthread_join(ig, NULL);
+  /* the requests the workers made after the ingest thread's last look (their queries were answered by the timeout) are still in the ring: take them here, so that the
+   * next test starts with an empty ring (CI 2026-11-27: 3 left behind made test_any's first park_fetch_next() true) */
+  park_fetch_req_t q;
+  uint64_t left = 0;
+  while (park_fetch_next(&q)) left++;
   uint64_t parked = 0, w = 0, to = 0;
   for (int i = 0; i < CW; i++) {
     parked += g_parked[i];
     w += g_served_wake[i];
     to += g_served_timeout[i];
   }
-  printf("  %llu parked, %llu answered after a wake, %llu after the timeout, %llu fetch requests (%llu taken)\n", (unsigned long long)parked,
-         (unsigned long long)w, (unsigned long long)to, (unsigned long long)atomic_load(&g_requested), (unsigned long long)atomic_load(&g_fetched));
+  printf("  %llu parked, %llu answered after a wake, %llu after the timeout, %llu fetch requests (%llu taken, %llu left at the end)\n", (unsigned long long)parked,
+         (unsigned long long)w, (unsigned long long)to, (unsigned long long)atomic_load(&g_requested), (unsigned long long)atomic_load(&g_fetched),
+         (unsigned long long)left);
+  CHECK(atomic_load(&g_fetched) + left == atomic_load(&g_requested));       /* every request that was queued is taken once */
   CHECK(parked == (uint64_t)CW * CROUNDS);
   CHECK(w + to == parked);                      /* every parked query was served exactly once */
   CHECK(w > 0 && to > 0);
