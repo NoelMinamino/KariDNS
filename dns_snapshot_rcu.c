@@ -5466,7 +5466,11 @@ static int cache_cand_cmp(const void *a, const void *b) {
 #ifdef KARIDNS_UNIT_TEST
 static _Atomic bool g_cache_paused;                       /* a test freezes the manager to look at the state between two rounds */
 void dbreg_cache_test_pause(bool on) { atomic_store_explicit(&g_cache_paused, on, memory_order_relaxed); }
+bool dbreg_cache_manager_paused(void) { return atomic_load_explicit(&g_cache_paused, memory_order_relaxed); }
 void dbreg_cache_test_set_victim_freq(uint32_t f) { atomic_store_explicit(&g_victim_freq, f, memory_order_relaxed); }
+#endif
+#ifndef KARIDNS_UNIT_TEST
+bool dbreg_cache_manager_paused(void) { return false; }
 #endif
 
 /* The registry is looked at in slices: a round visits at most CACHE_SCAN_MAX elements from where the last one stopped (whole buckets, the views one
@@ -5674,9 +5678,6 @@ uint32_t dbreg_cache_round(void) {
     uint64_t limit = atomic_load_explicit(&g_cache_limit, memory_order_relaxed);
     if (!limit) return 0;
     limit = cache_lim_eff(limit);
-#ifdef KARIDNS_UNIT_TEST
-    if (atomic_load_explicit(&g_cache_paused, memory_order_relaxed)) return 0;
-#endif
     zone_bytes_t zb;
     zone_bytes_get(ZBYTES_DB, &zb);
     (void)cache_reader_sample(burst_now_ms());

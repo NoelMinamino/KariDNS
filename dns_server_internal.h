@@ -1555,8 +1555,9 @@ void dbreg_hot_free(dbreg_hot_t *h);                   /* a pass that is given u
 /* what the directory holds (karictl dbstatus): zones with data in memory, without, and the queries the database zones in memory answered (and those of the entries taken out) */
 typedef struct { size_t total, resident, absent; uint64_t queries; } dbreg_residency_t;
 void dbreg_residency(dbreg_residency_t *out);
+bool dbreg_cache_manager_paused(void);                             /* false outside the unit tests: the cache thread (dns_db_ingest.c) skips its round while a test pauses the manager */
 #ifdef KARIDNS_UNIT_TEST
-void dbreg_cache_test_pause(bool on);                              /* TEST ONLY: the manager does nothing while paused */
+void dbreg_cache_test_pause(bool on);                              /* TEST ONLY: the manager's thread makes no rounds of its own while paused; dbreg_cache_round() called by the test still runs */
 void dbreg_test_pin(const char *view, const char *name, bool pin);       /* TEST ONLY: pins (or not) a zone of the store the way the settings do, with the bytes it adds to the pinned total */
 void dbreg_test_reg_waiter(int d);                                 /* TEST ONLY: as if d more threads waited for the registry lock to register attaches (a round of sampled detaches lets the lock go) */
 uint16_t dbreg_test_flags(const char *view, const char *name);               /* TEST ONLY: the flags of the registry's element (under the registry lock) */
