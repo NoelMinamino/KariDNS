@@ -48,6 +48,10 @@ jobs:
     env:
       # 1: this run saves the package and compiler caches (tests/ci_cache_env.sh); a pull request only reads them, so it can never put anything in them
       CI_SAVE_CACHE: ${{ github.event_name != 'pull_request' && '1' || '0' }}
+    # the attempt that made the build (artifact freebsd-bins-<release>-attempt-N): the artifacts of every attempt of a run stay, so a name alone can
+    # find an old one.  A job that is not re-run keeps its outputs: the test jobs of any attempt download the build of the attempt that made it
+    outputs:
+      attempt: ${{ github.run_attempt }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -168,7 +172,7 @@ jobs:
       - name: Upload the build
         uses: actions/upload-artifact@v4
         with:
-          name: freebsd-bins-${{ inputs.release }}
+          name: freebsd-bins-${{ inputs.release }}-attempt-${{ github.run_attempt }}
           path: freebsd-bins.tar.zst
           retention-days: 1
           compression-level: 0
@@ -215,7 +219,7 @@ jobs:
       - name: Download the build
         uses: actions/download-artifact@v4
         with:
-          name: freebsd-bins-${{ inputs.release }}
+          name: freebsd-bins-${{ inputs.release }}-attempt-${{ needs.build.outputs.attempt }}
 
       - name: Restore the package cache
         uses: actions/cache/restore@v4
@@ -333,7 +337,7 @@ jobs:
       - name: Download the build
         uses: actions/download-artifact@v4
         with:
-          name: freebsd-bins-${{ inputs.release }}
+          name: freebsd-bins-${{ inputs.release }}-attempt-${{ needs.build.outputs.attempt }}
 
       - name: Restore the package cache
         uses: actions/cache/restore@v4
@@ -393,7 +397,7 @@ jobs:
       - name: Download the build
         uses: actions/download-artifact@v4
         with:
-          name: freebsd-bins-${{ inputs.release }}
+          name: freebsd-bins-${{ inputs.release }}-attempt-${{ needs.build.outputs.attempt }}
 
       - name: Restore the package cache
         uses: actions/cache/restore@v4
@@ -521,7 +525,7 @@ jobs:
         if: steps.paths.outputs.run == 'true'
         uses: actions/download-artifact@v4
         with:
-          name: freebsd-bins-${{ inputs.release }}
+          name: freebsd-bins-${{ inputs.release }}-attempt-${{ needs.build.outputs.attempt }}
 
       - name: Restore the package cache
         if: steps.paths.outputs.run == 'true'

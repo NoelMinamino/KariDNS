@@ -377,6 +377,10 @@ jobs:
     env:
       # 1: this run saves the compiler cache (tests/ci_cache_env.sh); a pull request only reads it
       CI_SAVE_CACHE: ${{ github.event_name != 'pull_request' && '1' || '0' }}
+    # the attempt that made cov-bins (artifact cov-bins-attempt-N): the artifacts of every attempt of a run stay, so a name alone can find an old one.
+    # A job that is not re-run keeps its outputs: the shards and the gate of any attempt download the build of the attempt that made it
+    outputs:
+      attempt: ${{ github.run_attempt }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -446,7 +450,7 @@ jobs:
       - name: Upload the instrumented build
         uses: actions/upload-artifact@v4
         with:
-          name: cov-bins
+          name: cov-bins-attempt-${{ github.run_attempt }}
           path: cov-bins.tar.zst
           retention-days: 1
           compression-level: 0
@@ -482,7 +486,7 @@ jobs:
       - name: Download the instrumented build
         uses: actions/download-artifact@v4
         with:
-          name: cov-bins
+          name: cov-bins-attempt-${{ needs.coverage-build.outputs.attempt }}
 
       - name: Restore the package cache
         uses: actions/cache/restore@v4
@@ -565,7 +569,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: cov-shard-${{ matrix.shard }}
+          name: cov-shard-${{ matrix.shard }}-attempt-${{ github.run_attempt }}
           path: shard-out
           retention-days: 1
           if-no-files-found: error
@@ -591,15 +595,30 @@ jobs:
       - name: Download the instrumented build
         uses: actions/download-artifact@v4
         with:
-          name: cov-bins
+          name: cov-bins-attempt-${{ needs.coverage-build.outputs.attempt }}
 
-      # the parts that delivered (a part that did not has no artifact: the suite check below names it)
+      # the parts that delivered (a part that did not has no artifact: the suite check below names it).  Each attempt of a part uploads
+      # cov-shard-N-attempt-M, and the artifacts of the earlier attempts of the run stay: after a re-run the pattern finds them all, and with
+      # merge-multiple the files of an old attempt could win (PR #277: the gate of attempt 2 read the failed status of attempt 1 of part 4)
       - name: Download the results of the parts
         uses: actions/download-artifact@v4
         with:
           pattern: cov-shard-*
-          path: coverage_shards
-          merge-multiple: true
+          path: coverage_parts
+
+      # of each part, the last attempt (the latest result: a part re-run and failing again stays failed)
+      - name: Take the last attempt of each part
+        run: |
+          set -eu
+          mkdir -p coverage_shards coverage_parts
+          for n in $(ls coverage_parts | sed -n 's/^cov-shard-\([0-9]*\)-attempt-[0-9]*$/\1/p' | sort -n -u); do
+            attempts=$(ls coverage_parts | sed -n "s/^cov-shard-$n-attempt-\([0-9]*\)\$/\1/p" | sort -n)
+            last=$(echo "$attempts" | tail -n 1)
+            echo "part $n: attempt $last (artifacts of the attempts: $(echo $attempts))"
+            cp -R "coverage_parts/cov-shard-$n-attempt-$last/." coverage_shards/
+          done
+          rm -rf coverage_parts
+          ls -l coverage_shards
 
       - name: Restore the package cache
         uses: actions/cache/restore@v4
