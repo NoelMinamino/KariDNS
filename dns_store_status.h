@@ -151,13 +151,16 @@ typedef struct store_lookup {
   uint64_t asked, found, none, failed, refused, same_name, covered, shed, expired, body_inline, bad_body, take_fail;
   uint64_t pending, in_flight, peak;
   /* the queries that were dropped (overload: not answered, counted, like a query that RRL drops) and the ones answered "not ready": per lookup by why (no room in the park table, its time was up, the ingest thread's queue was full or it waited
-   * there until its time was up), the lookups that failed (SERVFAIL + EDE 14), and the same drops for a query that waits for a zone that is out of memory */
-  uint64_t drop_lk_room, drop_lk_timeout, drop_lk_queue, servfail, drop_zone_room, drop_zone_timeout, drop_zone_queue;
+   * there until its time was up, the lookup failed), and the same drops for a query that waits for a zone that is out of memory (0.7 first-fill latency: a failed read is a drop too, *_failed) */
+  uint64_t drop_lk_room, drop_lk_timeout, drop_lk_queue, drop_lk_failed, drop_zone_room, drop_zone_timeout, drop_zone_queue, drop_zone_failed;
+  uint64_t jw_slices;            /* 0.7 first-fill latency: slices of the ingest thread's wait for the store's journal in which it served the requests of queries (store.ingest.journal_wait_slices) */
+  uint64_t fill_throttled, fill_stalls, fill_failed_windows, fetch_timeouts;   /* 0.7 first-fill latency: times the fill was held to its old share because the attaches of queries waited (store.ingest.fill_throttled); windows of a minute in which the fill had work and made no progress (store.ingest.fill_stalled_windows) (review #279, 4) windows of a minute without progress because the fill's reads failed or a failed round waited (store.ingest.fill_failed_windows) */
   /* remembered: names whose lookup was shed that were put in the table of the shed names (park_shed_remember()); reask_suppressed: queries for such a name that their worker dropped without a request (also a drop,
    * PARK_CNT_LK_REMEMBERED); remember_releases: times the names were forgotten at once because the ingest thread had caught up.  drain_*: the passes of the ingest thread over the workers' rings and queues
    * (fetch_issue()) that handled a request: how many, how many ended at the time slice with work left, the most requests one handled, the longest one ran (ns); since the start */
   uint64_t remembered, reask_suppressed, remember_releases, drain_passes, drain_cut, drain_pass_max, drain_pass_max_ns;
   uint64_t hist[STORE_STATUS_HIST_BUCKETS];
+  uint64_t qf_hist[STORE_STATUS_HIST_BUCKETS], qf_max_ns;   /* 0.7 first-fill latency: the fetches of queries, from the request to the install (store.fetch.query.rtt.*) */
   uint64_t max_ns;
 } store_lookup_t;
 void store_status_set_lookup_fn(bool (*fn)(store_lookup_t *out));

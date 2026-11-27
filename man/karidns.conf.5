@@ -930,6 +930,29 @@ loops of those). The router checks every frame as it checked a whole message
 (\fBipc.router.reply.short\fR, \fB.bad_length\fR, and \fBipc.router.reply.cut\fR
 when it was not the first, see \fBkarictl ipcstats\fR in \fBkarictl(8)\fR).
 .TP 8
+\fBnot\-ready\-answer drop|servfail;\fR
+\fIDefault:\fR \fBdrop\fR
+.br
+\fIDescription:\fR 0.7, reloadable: what an ordinary query (opcode QUERY, not
+AXFR / IXFR) gets when the data of its answer is being loaded and it cannot be
+answered: a database zone at a first fill or out of memory whose read failed,
+whose \fBpark\-timeout\fR ran out or whose database cannot be read, a name that
+was being looked up (see "The first fill and the queries"), and a secondary zone
+before its first transfer (or before the restore of its stored copy). \fBdrop\fR
+sends nothing and counts it (\fBkarictl stats\fR:
+\fBkaridns_not_ready_dropped_total\fR; for database zones also
+\fBstore.park.drop.*\fR / \fBstore.lookup.drop.*\fR), the responses log
+(\fBcategory responses\fR) says \fB[DROP:NOT\-READY]\fR with the name and type,
+and over TCP the connection stays open for the next message (whatever
+\fBtcp\-connection\-reuse\fR says): a resolver retries or asks another server
+and caches no error. \fBservfail\fR answers SERVFAIL with Extended DNS Error 14,
+Not Ready (RFC 8914 4.15), AA=0, as BIND does (a resolver may cache it for up to
+5 minutes, RFC 2308 7.1). Not changed by it: zone transfers (AXFR, IXFR) and
+UPDATE always get SERVFAIL + EDE 14; a zone whose file failed to load is
+SERVFAIL; a query dropped for overload (the park table or the wait queue full,
+\fBrate\-limit\fR) is dropped. The value is read only when a query cannot be
+answered: answered queries do not look at it.
+.TP 8
 \fBresponse\-cache\-size <size>;\fR
 \fIDefault:\fR \fB32M\fR
 .br
@@ -2234,24 +2257,26 @@ record is too large.
 failed (<RCODE>) for <name>/<class>/<type>: <reason>\fR. The reason is the text
 of the Extended DNS Error the answer carries (\fBQuery refused due to access
 control\fR, \fBThis server is not authoritative for the queried zone\fR, \fBZone
-expired (SOA EXPIRE exceeded)\fR, \fBZone not ready (empty)\fR, \fBInvalid
-TSIG\fR, \fBThis opcode is not supported by this server\fR ...; the text is used
-also when \fBsend\-extended\-errors\fR is off and the client does not see it),
-or what the server found wrong with a malformed query (\fBthe question count is
-not valid for this opcode (RFC 9619)\fR, \fBa query without a question and
-without a COOKIE option (RFC 9619, RFC 7873 5.4)\fR, \fBthe question name is
-compressed (RFC 1035 4.1.4)\fR, \fBthe question is cut short (no QTYPE and
-QCLASS)\fR, \fBmalformed COOKIE option (RFC 7873 5.2.2)\fR, \fBmalformed EDNS
-Client Subnet option (RFC 7871 6)\fR, \fBinvalid MQTYPE\-Query option ...\fR,
-\fBthe OPT record cannot be used ...\fR, \fBthe TSIG record cannot be
-parsed\fR). A query whose question cannot be read is \fB\-/\-/\-\fR. SERVFAIL is
-logged at \fBdebug 1\fR, the other results at \fBdebug 3\fR (BIND's levels), and
-everything at \fBinfo\fR while the query log is on (BIND:
-\fBNS_SERVER_LOGQUERIES\fR), so an operator who wants them writes a channel with
-\fBseverity debug 3;\fR (or turns \fBquerylog yes\fR on). UPDATE, NOTIFY and the
-transfers are not query errors (their own categories); an answer that was
-dropped (RRL, a message too short to have a header) has no line. UDP and TCP go
-through the same code (the server has no TLS or HTTPS listener).
+expired (SOA EXPIRE exceeded)\fR, \fBZone not ready (empty)\fR (a secondary
+before its first transfer: a zone transfer of it, or any query with
+\fBnot\-ready\-answer servfail\fR; an ordinary query is not answered by default
+and has no line), \fBInvalid TSIG\fR, \fBThis opcode is not supported by this
+server\fR ...; the text is used also when \fBsend\-extended\-errors\fR is off
+and the client does not see it), or what the server found wrong with a malformed
+query (\fBthe question count is not valid for this opcode (RFC 9619)\fR, \fBa
+query without a question and without a COOKIE option (RFC 9619, RFC 7873
+5.4)\fR, \fBthe question name is compressed (RFC 1035 4.1.4)\fR, \fBthe question
+is cut short (no QTYPE and QCLASS)\fR, \fBmalformed COOKIE option (RFC 7873
+5.2.2)\fR, \fBmalformed EDNS Client Subnet option (RFC 7871 6)\fR, \fBinvalid
+MQTYPE\-Query option ...\fR, \fBthe OPT record cannot be used ...\fR, \fBthe
+TSIG record cannot be parsed\fR). A query whose question cannot be read is
+\fB\-/\-/\-\fR. SERVFAIL is logged at \fBdebug 1\fR, the other results at
+\fBdebug 3\fR (BIND's levels), and everything at \fBinfo\fR while the query log
+is on (BIND: \fBNS_SERVER_LOGQUERIES\fR), so an operator who wants them writes a
+channel with \fBseverity debug 3;\fR (or turns \fBquerylog yes\fR on). UPDATE,
+NOTIFY and the transfers are not query errors (their own categories); an answer
+that was dropped (RRL, a message too short to have a header) has no line. UDP
+and TCP go through the same code (the server has no TLS or HTTPS listener).
 .IP \(bu 2
 \fBupdate\fR (besides the \fB[Update]\fR lines): \fBupdate failed: <zone>: not
 authoritative for update zone (NOTAUTH)\fR, \fBupdate failed: zone section is
@@ -3883,9 +3908,16 @@ waits for it and asks for nothing. After a reload with another value the places
 in use are not taken away: a lower limit takes effect as the fetches end. The
 loader reads that many requests in parallel on \fBloader\-threads\fR workers
 (each with its own database connection); the warm-up and the walk for apexes use
-at most half of it (and at most 8) so that the queries keep the
-rest. \fBdbstatus\fR shows the value as \fBconcurrency=\fR in the \fBfetch:\fR
-line, and the requests that wait as \fBqueued=\fR in the \fBfetchq:\fR line.
+at most half of it (and at most 8) so that the queries keep the rest. The bodies
+of a fill (the first fill, the reconcile) take no place of it (0.7 first-fill
+latency): they have their own limit in flight, 128 for each worker of the loader
+that reads the fill (\fBloader\-threads\fR - 1), at least 256 and at most 1024
+(the old share, a quarter of this value and at most 32, while a request of a
+query waits), and the load they put on the database is bounded by
+\fBloader\-threads\fR, as the workers of the loader read; see "The first fill
+and the queries". \fBdbstatus\fR shows the value as \fBconcurrency=\fR in the
+\fBfetch:\fR line, and the requests that wait as \fBqueued=\fR in the
+\fBfetchq:\fR line.
 .TP 8
 \fBfetch\-rate unlimited|<n>;\fR
 \fIDefault:\fR \fBunlimited\fR
@@ -4100,28 +4132,35 @@ second filled in a few milliseconds); every operation on the table is one step
 per query of the zone, whatever the size; a query beyond that is \fBdropped\fR
 (0.7: nothing is answered, \fBstore.park.drop.room\fR counts it; the client
 retries, as for a query that \fBrate\-limit\fR drops), one longer than 4096
-bytes is answered "not ready" at once. \fBpark\-timeout\fR (10..60000
-milliseconds): how long a parked query waits; when the time is up and the zone
-is not there the query is \fBdropped\fR and counted (0.7:
-\fBstore.park.drop.timeout\fR; a cold query that cannot be served in time is
-overload, and overload is never answered REFUSED or SERVFAIL for a zone that the
-database may have; on TCP only that message is discarded: the connection stays
-open and the queries behind it, for zones in memory, are answered). The answer
-is SERVFAIL with Extended DNS Error 14, Not Ready (RFC 8914 4.15) when the fetch
-of the zone, or the lookup of a name, \fBfailed\fR (signed with the key of a
-validly signed request, RFC 8945 5.3; it counts for
-\fBrate\-limit\fR). \fBallow\-query\fR (and \fBallow\-query\-on\fR) is evaluated
-first, with the same chain as for a zone in memory, before a query parks or the
-zone is asked for: a client that may not ask gets REFUSED + EDE 18, uses no
-entry of the park table, makes the server read nothing and learns nothing about
-the zone. DoT and DoH, which do not park, answer SERVFAIL + EDE 14 for such a
-zone (REFUSED for a client that may not ask). A DB zone's own settings cannot
-contain \fBallow\-query\fR, so for a zone out of memory the view's and options'
-statements decide. With no limit in force (\fBmemory\-limit unlimited\fR, or
-none written without the zone store; 0.7: with the store an unset
-\fBmemory\-limit\fR is the default from the RAM) nothing takes a zone out of
-memory, so no query parks for that and these options change nothing (see "Memory
-limit" below and \fBkaridns\-dbloader(8)\fR, "The fetch stream").
+bytes is dropped at once and counted
+(\fBstore.park.drop.failed\fR). \fBpark\-timeout\fR (10..60000 milliseconds):
+how long a parked query waits; when the time is up and the zone is not there the
+query is \fBdropped\fR and counted (0.7: \fBstore.park.drop.timeout\fR; a cold
+query that cannot be served in time is overload, and overload is never answered
+REFUSED or SERVFAIL for a zone that the database may have; on TCP only that
+message is discarded: the connection stays open and the queries behind it, for
+zones in memory, are answered). When the fetch of the zone, or the lookup of a
+name, \fBfailed\fR (the database or the loader), an ordinary query is not
+answered either (0.7 first-fill latency: never SERVFAIL while the data of the
+answer is being loaded, at a first fill or any time later, unless
+\fBnot\-ready\-answer servfail;\fR; \fBstore.park.drop.failed\fR,
+\fBstore.lookup.drop.failed\fR, and one WARNING a minute, see "A database that
+cannot be read" under "The first fill and the queries"); zone transfers (AXFR,
+IXFR) and UPDATE, which are not ordinary queries, get SERVFAIL with Extended DNS
+Error 14, Not Ready (RFC 8914 4.15), signed with the key of a validly signed
+request (RFC 8945 5.3). \fBallow\-query\fR (and \fBallow\-query\-on\fR) is
+evaluated first, with the same chain as for a zone in memory, before a query
+parks or the zone is asked for: a client that may not ask gets REFUSED + EDE 18,
+uses no entry of the park table, makes the server read nothing and learns
+nothing about the zone. A query that cannot park (a worker without a park table)
+is dropped and counted the same way (REFUSED for a client that may not ask). A
+DB zone's own settings cannot contain \fBallow\-query\fR, so for a zone out of
+memory the view's and options' statements decide. With no limit in force
+(\fBmemory\-limit unlimited\fR, or none written without the zone store; 0.7:
+with the store an unset \fBmemory\-limit\fR is the default from the RAM) nothing
+takes a zone out of memory, so no query parks for that and these options change
+nothing (see "Memory limit" below and \fBkaridns\-dbloader(8)\fR, "The fetch
+stream").
 .PP
 | \fBserver\-id "<id>";\fR | the host name | postgresql (milestone B11): the
 name under which this server writes its row of \fBkaridns_server_status\fR
@@ -4910,22 +4949,22 @@ park_timeout=N loader_busy=N ingest_busy=P% fill_busy=P% hist=A,B,C,D,E\fR right
 after the \fBfetch:\fR line. Everything is counted since the server started,
 except \fBin_flight\fR (now) and \fBingest_busy\fR (the last window). Read it
 from the query to the install: \fBpark_full\fR counts queries that found the
-worker's table of parked queries full (\fBpark\-max\fR) and were answered "not
-ready" at once; \fBring_dropped\fR, queries whose request for the zone could not
-be handed from the worker to the ingest thread (the worker's ring of 128 was
-full: the ingest thread is behind; the query stays parked and the request is
-made again, so this counts refusals, not lost queries); \fBfetch\-rate\fR,
-\fBfetch\-concurrency\fR and \fBmemory\-limit\fR refuse requests before the
-fetch is made (\fBrefused_by_rate=\fR and \fBshed=\fR of the other lines);
-\fBtable_full\fR, requests refused because all 256 places of the fetch table
-were taken (reachable only without \fBmemory\-limit\fR, which stops requests at
-\fBfetch\-concurrency\fR, at most 256, first); \fBin_flight\fR and \fBpeak\fR
-are the fetches on their way now and the most there have been at one time
-(compare \fBpeak\fR with \fBfetch\-concurrency\fR to see whether the limit is
-the one that held requests back); \fBloader_busy\fR, fetches the loader turned
-away because its own queue of requests was full; \fBhist\fR is the time from the
-request to the install of the zone, for the fetches that succeeded, in five
-counts (up to 1 ms, up to 10 ms, up to 100 ms, up to 1 s, more);
+worker's table of parked queries full (\fBpark\-max\fR) and were dropped at once
+(\fBstore.park.drop.room\fR); \fBring_dropped\fR, queries whose request for the
+zone could not be handed from the worker to the ingest thread (the worker's ring
+of 128 was full: the ingest thread is behind; the query stays parked and the
+request is made again, so this counts refusals, not lost queries);
+\fBfetch\-rate\fR, \fBfetch\-concurrency\fR and \fBmemory\-limit\fR refuse
+requests before the fetch is made (\fBrefused_by_rate=\fR and \fBshed=\fR of the
+other lines); \fBtable_full\fR, requests refused because all 256 places of the
+fetch table were taken (reachable only without \fBmemory\-limit\fR, which stops
+requests at \fBfetch\-concurrency\fR, at most 256, first); \fBin_flight\fR and
+\fBpeak\fR are the fetches on their way now and the most there have been at one
+time (compare \fBpeak\fR with \fBfetch\-concurrency\fR to see whether the limit
+is the one that held requests back); \fBloader_busy\fR, fetches the loader
+turned away because its own queue of requests was full; \fBhist\fR is the time
+from the request to the install of the zone, for the fetches that succeeded, in
+five counts (up to 1 ms, up to 10 ms, up to 100 ms, up to 1 s, more);
 \fBpark_timeout\fR, parked queries whose zone was not there before
 \fBpark\-timeout\fR ran out; \fBingest_busy\fR is the share of the last ten
 seconds in which the ingest thread was working and not waiting for something to
@@ -5255,13 +5294,52 @@ body the fill has not brought yet is read from the database for the query (the
 loader serves a request of a query before one of the fill); the ingest thread
 hands the requests of the workers to the loader between slices of about a
 millisecond of what the loader sends (a manifest pass, the bodies), so a request
-never waits for a whole pass; a place of \fBfetch\-concurrency\fR goes to the
-oldest query that waits, but the fill has a share of its own, a quarter of the
-places (at least one), that the queries leave free while the fill is below it,
-so that a flood of queries does not stop the fill (the zones the queries ask for
-then come out of the fill's sequential reads, which are much cheaper than
-reading a zone by name) and the fill does not stop the queries (a query waits
-for one of the places the fill does not hold, not for the fill). \fBkarictl
+never waits for a whole pass; every place of \fBfetch\-concurrency\fR is the
+queries' (their fetches and the lookups of names; a place goes to the oldest
+query that waits), and the fill takes none: it has a limit of its own, \fB128
+bodies in flight for each worker of the loader that reads the fill\fR
+(\fBloader\-threads\fR - 1; at least 256, at most 1024) while no request of a
+query waits, so that the loader reads whole statements of up to 128 zones in
+parallel (one \fBIN\fR list per table; with 32 bodies spread over the loader's
+workers it read about 2 zones a statement, and PostgreSQL took five times as
+long as SQLite3 for the same 10M zones; measured on a 4-core host with
+\fBloader\-threads 8\fR, 10M zones: PostgreSQL 2556 s before, see the pull
+request for the figures now), and its old share, a quarter of
+\fBfetch\-concurrency\fR (at least one, at most 32), while a request of a query
+waits for a place: the fill makes no new request then, so a flood of queries
+does not stop the fill (the zones the queries ask for then come out of the
+fill's sequential reads, which are much cheaper than reading a zone by name) and
+the fill does not stop the queries. \fBWhat bounds the load of the database
+during a fill is \fBloader\-threads\fB\fR: the loader's workers read (each one
+statement at a time); the requests in flight only wait in the loader's queue
+(1280 requests; more are answered "busy"). The loader takes every request of a
+query (or of the warm-up) before one of the fill, however long that one waited
+(a query whose zone is on its way as a body of the fill does not wait for it:
+the Backend asks for the zone itself, and the second body is dropped as
+unchanged); a flood of queries can stall the fill, which is counted
+(\fBstore.ingest.fill_stalled_windows\fR) and said once a minute (\fB[DB] the
+fill of the store made no progress in the last 60 s ...\fR, WARNING), and the
+fill goes on by itself when the queries leave the loader room (a NOTICE says
+so); a window without progress in which reads of the database failed is counted
+and said apart (\fBstore.ingest.fill_failed_windows\fR, "reads of the database
+failed"); bodies the loader answered busy or did not answer in time
+(\fBstore.ingest.fetch_timeouts\fR) leave it a stall of the queries. While the
+workers' attach rings hold 32 requests or more (the store threads are behind
+with the attaches of queries) the fill is held to its old share as while queries
+wait (\fBstore.ingest.fill_throttled\fR). The loader reads up to 16 requests of
+queries together (up to 64 while more than 16 of them queue) and up to 128 of
+the fill, and leaves one worker to the queries: \fBloader\-threads\fR - 1
+workers read the fill and the last one only the queries, the warm-up and the
+lookups; with \fBloader\-threads 1\fR (a small server) the one worker does both,
+and a batch of the fill is 128 zones only while no query came in the last
+second. A zone that a query waits for is not read again by the fill (the query's
+read brings it). The loader says how it read in one line a minute while it
+reads, and once when it stops (\fBfetch reads in 60 s: queries 120 reads 130
+zones, fill 400 reads 51200 zones (128.0 zones a read)\fR, LOG_INFO). The ingest
+thread waits for the store's journal at 4 times its limit (the disk is behind
+the fill's writes) in slices of 5 ms and makes the requests of queries between
+them, so a lookup or a fetch of a query never waits for a checkpoint
+(\fBstore.ingest.journal_wait_slices\fR counts the slices). \fBkarictl
 dbstatus\fR shows the share of the ingest thread the bodies of the fill took
 (\fBfill_busy=P%\fR in the \fBfetchq:\fR line, next to \fBingest_busy\fR). A
 name that no stored zone covers is the one thing the store cannot answer by
@@ -5276,35 +5354,35 @@ answers, the Backend records the zone as a manifest entry would (a known zone,
 whose body is read as for any zone the fill has not brought yet), and the query
 is answered from it.  A name that no zone has is REFUSED, as for any name the
 server does not serve (also when the loader has no lookup); when the loader does
-not answer within \fBpark\-timeout\fR the query is dropped, and SERVFAIL + EDE
-14 is for a lookup that failed (see below).  A loader that is away for a while
-(it was restarted, its stream broke) does not turn this into REFUSED: while the
-pass of the view is pending the lookup waits in the Backend's queue for the
-loader and is dropped when \fBpark\-timeout\fR is up; REFUSED is for a loader
-that has no lookup (its HELLO says so), a view that takes no database zones, and
-a pass that has ended.  The same holds for the moment after a start, before the
-first loader has said its HELLO: the Backend expects a loader that looks names
-up (the one of the package), so a query that comes in that moment waits for it
-as well (until then such queries were REFUSED for about the first second of a
-first start); a loader whose HELLO says it has no lookup ends the wait, and the
-queries are REFUSED as before.  A loader that answers "busy" is overload, and
-the queries are dropped, not answered SERVFAIL.  This is done only for a QUERY
-of the class IN, only while the first pass of that view has not ended and the
-loader offers it (after the pass an unknown name is REFUSED at once, with no
-round trip, so that random names never reach the database), once per query (a
-query that comes back with the answer of the lookup, or after its time was up,
-is not parked again; one that is woken without the answer, by the wake of every
-query after a wake ring that overflowed, is parked again for the lookup until
-its first deadline, so that a zone that exists is not refused for a lost
-wake-up).  A lookup is a fetch of the class of the queries' fetches: it takes a
-place of \fBfetch\-concurrency\fR like the fetch of a zone and waits for one in
-a queue of its own (until \fBpark\-timeout\fR) when there is none, so a query is
-not REFUSED for the lack of a place (the fixed window of 32 lookups of the first
-0.7 builds is gone): when the worker cannot make the request now, because its
-ring to the ingest thread is full, the query stays parked as pending and the
-worker asks again (\fBtake_fail\fR), as for the fetch of a zone.  What is
-bounded: the queries that wait for a lookup may take three quarters of a
-worker's park table (a query that finds no room is \fBdropped\fR and counted,
+not answer within \fBpark\-timeout\fR the query is dropped, and so is a query
+whose lookup failed (see below).  A loader that is away for a while (it was
+restarted, its stream broke) does not turn this into REFUSED: while the pass of
+the view is pending the lookup waits in the Backend's queue for the loader and
+is dropped when \fBpark\-timeout\fR is up; REFUSED is for a loader that has no
+lookup (its HELLO says so), a view that takes no database zones, and a pass that
+has ended.  The same holds for the moment after a start, before the first loader
+has said its HELLO: the Backend expects a loader that looks names up (the one of
+the package), so a query that comes in that moment waits for it as well (until
+then such queries were REFUSED for about the first second of a first start); a
+loader whose HELLO says it has no lookup ends the wait, and the queries are
+REFUSED as before.  A loader that answers "busy" is overload, and the queries
+are dropped, not answered SERVFAIL.  This is done only for a QUERY of the class
+IN, only while the first pass of that view has not ended and the loader offers
+it (after the pass an unknown name is REFUSED at once, with no round trip, so
+that random names never reach the database), once per query (a query that comes
+back with the answer of the lookup, or after its time was up, is not parked
+again; one that is woken without the answer, by the wake of every query after a
+wake ring that overflowed, is parked again for the lookup until its first
+deadline, so that a zone that exists is not refused for a lost wake-up).  A
+lookup is a fetch of the class of the queries' fetches: it takes a place of
+\fBfetch\-concurrency\fR like the fetch of a zone and waits for one in a queue
+of its own (until \fBpark\-timeout\fR) when there is none, so a query is not
+REFUSED for the lack of a place (the fixed window of 32 lookups of the first 0.7
+builds is gone): when the worker cannot make the request now, because its ring
+to the ingest thread is full, the query stays parked as pending and the worker
+asks again (\fBtake_fail\fR), as for the fetch of a zone.  What is bounded: the
+queries that wait for a lookup may take three quarters of a worker's park table
+(a query that finds no room is \fBdropped\fR and counted,
 \fBstore.lookup.drop.room\fR: nothing is answered, so a flood of names that no
 zone has cannot fill the table that the queries for zones need), the lookups out
 take three quarters of the places at most (the fetches of zones keep the rest,
@@ -5333,10 +5411,11 @@ hundred times a second cannot keep up with at 400,000 queries a second);
 slice with work left), \fB.drain.pass_max\fR and \fB.drain.pass_max_us\fR (the
 most requests, and the longest time, of one pass since the start) show it.  What
 is answered: REFUSED for a name that the loader said no zone has (and for every
-unknown name once the pass has ended), and SERVFAIL + EDE 14 when the lookup
-failed (a database error, no answer of the loader, an answer that cannot be
-believed: \fBstore.lookup.servfail\fR), as for the fetch of a zone that
-fails.  Overload is never answered REFUSED or SERVFAIL for a name whose zone the
+unknown name once the pass has ended), and nothing when the lookup failed (a
+database error, no answer of the loader, an answer that cannot be believed: the
+query is dropped and counted, \fBstore.lookup.drop.failed\fR), as for the fetch
+of a zone that fails (0.7 first-fill latency: before, SERVFAIL + EDE
+14).  Overload is never answered REFUSED or SERVFAIL for a name whose zone the
 database may have, for the queries that wait for a zone that is out of memory
 either (\fBstore.park.drop.*\fR).  With a loader that has
 \fBKDB_FEAT_LOOKUP_BODY\fR (karidns-dbloader(8), "THE STORE PROTOCOL") the
@@ -5352,52 +5431,93 @@ thread), \fBsame_name\fR, \fBin_flight\fR, \fBpending\fR (waiting for a place),
 \fBbody_inline\fR (zones that came with the answer), \fBtake_fail\fR,
 \fBcovered\fR (the zone was known by the time the name was to go), \fBshed\fR,
 \fBexpired\fR, \fBdrop_room\fR, \fBdrop_timeout\fR, \fBdrop_queue\fR,
-\fBservfail\fR, \fBzone_drop_room\fR, \fBzone_drop_timeout\fR,
-\fBzone_drop_queue\fR (the queries that were dropped, by why), \fBremembered\fR,
-\fBreask_suppressed\fR, \fBremember_releases\fR, \fBdrain_passes\fR,
-\fBdrain_cut\fR, \fBdrain_pass_max\fR, \fBdrain_pass_max_us\fR (the shed names
-and the passes over the rings, above), \fBbad_body\fR and the time to the answer
-(\fBrtt_p50_us\fR, \fBrtt_p99_us\fR); \fBkarictl store\fR has the same as
-\fBstore.lookup.*\fR. \fBwarm\-before\-serve <s>\fR holds the queries (the
-sockets stay unread, the kernel queues what comes) until the first pass has
-ended, as well as until the hot list of the loader is read, for at most that
-many seconds. Without a store (\fBstore none;\fR, or a directory that cannot be
-used) every database zone is a zone of the heap directory, as before 0.7, and
-the hot list works as described under "Warm-up". \fBThe manifest pass: the
-reconcile thread and group commit (0.7).\fR The list of the zones that the
-loader sends (a pass: pages of up to 16,384 entries) is not decoded and recorded
-on the thread that answers the fetches and the lookups of the queries. The
-ingest thread only checks that a page may come at that point of the stream (the
-state of the stream: a page inside a pass) and copies it into a ring of 8 slots;
-the \fBreconcile thread\fR (\fBdns_db_recon.c\fR) decodes it, checks it against
-the pass (the batch, the view, the number of the page, and at the end the sum of
-the pages: the checks that were made when the page was decoded on the ingest
-thread, with the same reasons; a failure ends the stream as any other protocol
-error and nothing after the bad page is applied) and records its entries in the
-store in \fBgroups of up to 32\fR (a group is applied inside the store's writer
-mutex: at ten million zones a group of 64 kept it 15 to 45 ms): one journal
-record, one hold of the mutex that orders the writers of the records and one
-decision of the commit policy for the group, where a record, a \fBwrite()\fR and
-two locks were made for each zone. The order of the effects is the order of the
-entries: a zone that already has a record (a changed stamp, a rename, a name
-another id held) first writes the group and is then decided as before, and an
-entry that has the name or the id of one that waits in the group writes the
-group before it looks. A group is one journal record with one checksum, so after
-\fBkill \-9\fR (or a power loss in the middle of the write) it is there whole or
-not at all, and the loader's cursor, which is made durable only after the
-entries it covers, has not passed it; the format of the journal did not change
-(a record with more entries), an older store replays as before. When the ring is
-full the ingest thread does not read the stream (the loader waits on its socket:
-nothing is dropped and nothing grows; the fetch stream, the lookups and the
-bodies are served all the time). Every other frame of the stream (the end of the
-batch and its answer, the next batch, a \fBCHANGES\fR message, a delete, the
-sweep at the end of the pass, which also runs on the reconcile thread) waits
-until the thread has recorded everything before it, so that it sees the pass
-whole: the numbers of \fBBATCH_RESULT\fR, the log lines and the cursor are the
-ones of the whole pass. The ingest thread stops reading the stream after about a
-millisecond of work (whether or not a request waits) and goes to the other
-streams and the requests first; the longest read is
-\fBstore.ingest.stream_max_us\fR. \fBkarictl store\fR has
+\fBdrop_failed\fR, \fBzone_drop_room\fR, \fBzone_drop_timeout\fR,
+\fBzone_drop_queue\fR, \fBzone_drop_failed\fR (the queries that were dropped, by
+why), \fBremembered\fR, \fBreask_suppressed\fR, \fBremember_releases\fR,
+\fBdrain_passes\fR, \fBdrain_cut\fR, \fBdrain_pass_max\fR,
+\fBdrain_pass_max_us\fR (the shed names and the passes over the rings, above),
+\fBbad_body\fR and the time to the answer (\fBrtt_p50_us\fR, \fBrtt_p99_us\fR);
+\fBkarictl store\fR has the same as \fBstore.lookup.*\fR. \fBwarm\-before\-serve
+<s>\fR holds the queries (the sockets stay unread, the kernel queues what comes)
+until the first pass has ended, as well as until the hot list of the loader is
+read, for at most that many seconds. Without a store (\fBstore none;\fR, or a
+directory that cannot be used) every database zone is a zone of the heap
+directory, as before 0.7, and the hot list works as described under
+"Warm-up". The unlogged first fill of an empty store (the store keeps no journal
+until the fill is over, "THE BULK FILL") is begun when the store opens empty for
+a database, before any query is served (0.7 first-fill latency; it used to begin
+with the first pass, and the zones that the lookups of the first seconds
+recorded made the store not empty, so that under queries from the start the
+whole fill ran with its journal and about 45 checkpoints of up to 33 s on 10M
+zones, in which the attaches of queries stalled). A crash in it goes back to the
+checkpoint that began it, as for any unlogged fill: what came after, the zones
+the lookups recorded included, is read or looked up again. It ends as before, at
+the end of the first fill; a clean stop keeps it for the next start; when no
+pass of the database begins within 10 minutes of the start (no loader comes, the
+database cannot be read) it is given up and the store keeps its journal (a
+NOTICE says so). It is not begun when secondary zones of the configuration keep
+their copies in the store, and the copy of a secondary (of the configuration or
+of the database) is never written in an unlogged fill: a transfer that comes
+during it ends the fill first and its copy is stored once that end is on disk
+(the zone is served from memory meanwhile), so a crash never leaves a copy
+written in part; a copy that was not stored yet is transferred again after the
+restart.
+.PP
+\fBA database that cannot be read (0.7).\fR An ordinary query (opcode QUERY) is
+never answered SERVFAIL or another error while the data of its answer is being
+loaded: at a first fill, for a zone that is out of memory, for a name that is
+looked up. When the read cannot be made (the database is down or refuses the
+loader, the loader is gone, a request cannot wait) the query is dropped and
+counted (\fBstore.park.drop.failed\fR for a zone, \fBstore.lookup.drop.failed\fR
+for a name, \fBstore.park.drop.timeout\fR for one whose time was up); a resolver
+asks again or another server, as for a server that does not answer, and does not
+cache an error (\fBnot\-ready\-answer servfail;\fR answers these queries, and
+the ones whose \fBpark\-timeout\fR ran out, SERVFAIL + EDE 14 instead, as BIND;
+see the option). So that this is heard once and not once a query, the ingest
+thread writes at most one WARNING a minute: \fB[DB] 120 queries were not
+answered in the last 60 s: 35 reads of the database failed (the last: ...);
+store.park.drop.failed 100, store.lookup.drop.failed 20, store.park.drop.timeout
+0\fR (or \fBthe loader was not connected\fR), and one NOTICE when a read ends
+well again (\fB[DB] the database is read again\fR); the failure of a single
+fetch is a WARNING once a minute as well, the others go to the \fBdatabase\fR
+log category at level 2. Zone transfers (AXFR, IXFR) and UPDATE are not ordinary
+queries: the secondary or the updater gets SERVFAIL with Extended DNS Error 14,
+Not Ready (RFC 8914 4.15), an answer it can act on, as before.
+.PP
+\fBThe manifest pass: the reconcile thread and group commit (0.7).\fR The list
+of the zones that the loader sends (a pass: pages of up to 16,384 entries) is
+not decoded and recorded on the thread that answers the fetches and the lookups
+of the queries. The ingest thread only checks that a page may come at that point
+of the stream (the state of the stream: a page inside a pass) and copies it into
+a ring of 8 slots; the \fBreconcile thread\fR (\fBdns_db_recon.c\fR) decodes it,
+checks it against the pass (the batch, the view, the number of the page, and at
+the end the sum of the pages: the checks that were made when the page was
+decoded on the ingest thread, with the same reasons; a failure ends the stream
+as any other protocol error and nothing after the bad page is applied) and
+records its entries in the store in \fBgroups of up to 32\fR (a group is applied
+inside the store's writer mutex: at ten million zones a group of 64 kept it 15
+to 45 ms): one journal record, one hold of the mutex that orders the writers of
+the records and one decision of the commit policy for the group, where a record,
+a \fBwrite()\fR and two locks were made for each zone. The order of the effects
+is the order of the entries: a zone that already has a record (a changed stamp,
+a rename, a name another id held) first writes the group and is then decided as
+before, and an entry that has the name or the id of one that waits in the group
+writes the group before it looks. A group is one journal record with one
+checksum, so after \fBkill \-9\fR (or a power loss in the middle of the write)
+it is there whole or not at all, and the loader's cursor, which is made durable
+only after the entries it covers, has not passed it; the format of the journal
+did not change (a record with more entries), an older store replays as
+before. When the ring is full the ingest thread does not read the stream (the
+loader waits on its socket: nothing is dropped and nothing grows; the fetch
+stream, the lookups and the bodies are served all the time). Every other frame
+of the stream (the end of the batch and its answer, the next batch, a
+\fBCHANGES\fR message, a delete, the sweep at the end of the pass, which also
+runs on the reconcile thread) waits until the thread has recorded everything
+before it, so that it sees the pass whole: the numbers of \fBBATCH_RESULT\fR,
+the log lines and the cursor are the ones of the whole pass. The ingest thread
+stops reading the stream after about a millisecond of work (whether or not a
+request waits) and goes to the other streams and the requests first; the longest
+read is \fBstore.ingest.stream_max_us\fR. \fBkarictl store\fR has
 \fBstore.recon.thread\fR, \fB.busy_pct\fR, \fB.entries_per_s\fR, \fB.queued\fR,
 \fB.apply_ns_per_entry\fR, \fB.ring_full_stops\fR, \fB.group_records\fR and
 \fB.group_entries\fR, and \fBstore.ingest.loop_max_us\fR
@@ -5433,13 +5553,13 @@ room, and the stored zone is not read from the loader for a query (\fBfetch
 issued\fR stays 0 for it, whatever the load; a burst of first queries for zones
 that are all stored is answered from the store). The attach is given 200 ms; a
 query whose attach is still queued then goes on waiting for the rest of its
-\fBpark\-timeout\fR and is not answered "not ready" earlier. The query path
-never sleeps for the store: a worker that finds a table cell of the store being
-written spins a few hundred times and then parks the query for a store thread,
-which looks again. The answer is the one the zone read from the database gives,
-byte for byte. A record that is missing or damaged (checksum, structure) falls
-back to the read from the database (a zone the store knows without an image,
-"known", is read from the database): the queries that wait for it are given the
+\fBpark\-timeout\fR and is not dropped earlier. The query path never sleeps for
+the store: a worker that finds a table cell of the store being written spins a
+few hundred times and then parks the query for a store thread, which looks
+again. The answer is the one the zone read from the database gives, byte for
+byte. A record that is missing or damaged (checksum, structure) falls back to
+the read from the database (a zone the store knows without an image, "known", is
+read from the database): the queries that wait for it are given the
 \fBpark\-timeout\fR again, a damaged record is logged (\fB[Store] the record of
 zone ... cannot be used\fR) and set back to "known", and the next install writes
 it again. Taking a zone out of memory (\fBmemory\-limit\fR) is what it always
@@ -5794,40 +5914,57 @@ that is not aligned yet, \fBvfs.zfs.vdev.sync_read_max_active=32\fR (in
 longer the limit). A host whose zones fit in memory-limit does not need it. The
 setting was measured as a test and put back (\fBsysctl
 vfs.zfs.vdev.sync_read_max_active=10\fR restores the default at once; remove the
-line from \fB/etc/sysctl.conf\fR to keep it). \fBScrub.\fR Every
-\fBstore\-scrub\-interval\fR the store reads every record, at 16 MiB a second at
-the most: the table record (its CRC), the way the name and source indexes lead
-to the zone, and for a stored zone the whole image: its checksum and the
-structure check that is made at every attach. A zone whose image is bad becomes
-known without an image and is read from the database again (the log says which
-zone; \fBstore.scrub.bad_images\fR); the cleaner does the same for a record that
-fails its checksum when it is to be copied. A zone that is in memory with that
-image (the store is in MAP mode: the zone serves the mapped pages) is taken out
-of memory too, even when it is pinned, so that it is read again and does not go
-on serving damaged pages (when a reader or a transfer holds it, the store tries
-again at the next tick). A table record that is damaged or an index entry that
-does not lead to its zone is repaired at the end of the pass: the indexes are
-built again from the zone table, and a record that cannot be read is dropped and
-comes again with the next pass of the loader. \fBkarictl store scrub start\fR
-starts a pass now, \fBstore scrub stop\fR ends it. \fBError ring.\fR
-\fBerr.ring\fR (14 MB, sparse until used) keeps the last 65,536 texts of zones
-that were refused or failed (which zone id, which version, when, why), written
-in place and wrapped; it is not journaled and holds no heap
-(\fBstore.errors.total\fR). The server keeps the last 512 texts in memory as
-well (\fBzonestatus\fR asks the memory first, then the file): a rejected zone of
-the store has no registry element, so after a text is pushed out of memory, or
-after a restart, the file still has it, by zone id. A text is forgotten when a
-version of the zone is registered. A zone id is reused after a delete, so a text
-is only shown for a zone whose record is still the one it was made for. The
-NOTIFY that is due for a zone is a flag of its record (\fBNOTIFY_DUE\fR,
-journaled, so a NOTIFY that was due at a crash is due after the
-restart). \fBWhat a zone in memory costs.\fR A zone that is attached takes one
-slot of 256 octets of the pool of zone entries (a light entry: name, serial and
-timers, the zone's version, the settings, counters; what a zone seldom needs,
-such as transfer state, an IXFR ring or the full per-zone statistics, is made
-when it is first needed) plus its image: measured, about 739 octets of heap for
-a small attached zone in \fBmap\fR mode (the image is a pointer into the mapped
-segment, and counted by \fBmemory\-limit\fR) and about 1,251 octets in
+line from \fB/etc/sysctl.conf\fR to keep it). \fBA first fill under queries
+(ZFS, 0.7).\fR The bulk checkpoints of a first fill write the tables (about
+500-670 MB at 10M zones) and sync them, and that sync waits for the transaction
+group that also writes the fill's segments: the reads of the attaches of queries
+queue behind it (measured on pc31, 10M zones under 2,500 cold queries a second:
+about five store threads at a time in \fBzfs_read\fR waiting for the disk during
+checkpoints of 24-31 s, and 40-96 % of the queries of those seconds
+lost). KariDNS does three things about it: in an unlogged fill the checkpoint
+thread syncs the segments each time 128 MiB more were written
+(\fBstore.bulk.presyncs\fR), so that a bulk checkpoint's own sync finds little
+left; while a checkpoint runs the fill is held to its old share of 32 bodies in
+flight (\fBstore.ingest.fill_throttled\fR), and while the attach rings hold
+requests a bulk checkpoint writes its tables at 32 MiB/s instead of 256
+(\fBstore.checkpoint.slow_bytes\fR, \fB.slow_paced_us\fR; the checkpoint takes
+longer, and the range a crash makes the fill read again grows with it). The read
+queue of the pool above (\fBvfs.zfs.vdev.sync_read_max_active\fR, and
+\fBvfs.zfs.vdev.sync_read_min_active\fR for the reads the pool serves first)
+stays an operator's choice: KariDNS does not change it, and the defaults are
+kept. \fBScrub.\fR Every \fBstore\-scrub\-interval\fR the store reads every
+record, at 16 MiB a second at the most: the table record (its CRC), the way the
+name and source indexes lead to the zone, and for a stored zone the whole image:
+its checksum and the structure check that is made at every attach. A zone whose
+image is bad becomes known without an image and is read from the database again
+(the log says which zone; \fBstore.scrub.bad_images\fR); the cleaner does the
+same for a record that fails its checksum when it is to be copied. A zone that
+is in memory with that image (the store is in MAP mode: the zone serves the
+mapped pages) is taken out of memory too, even when it is pinned, so that it is
+read again and does not go on serving damaged pages (when a reader or a transfer
+holds it, the store tries again at the next tick). A table record that is
+damaged or an index entry that does not lead to its zone is repaired at the end
+of the pass: the indexes are built again from the zone table, and a record that
+cannot be read is dropped and comes again with the next pass of the
+loader. \fBkarictl store scrub start\fR starts a pass now, \fBstore scrub
+stop\fR ends it. \fBError ring.\fR \fBerr.ring\fR (14 MB, sparse until used)
+keeps the last 65,536 texts of zones that were refused or failed (which zone id,
+which version, when, why), written in place and wrapped; it is not journaled and
+holds no heap (\fBstore.errors.total\fR). The server keeps the last 512 texts in
+memory as well (\fBzonestatus\fR asks the memory first, then the file): a
+rejected zone of the store has no registry element, so after a text is pushed
+out of memory, or after a restart, the file still has it, by zone id. A text is
+forgotten when a version of the zone is registered. A zone id is reused after a
+delete, so a text is only shown for a zone whose record is still the one it was
+made for. The NOTIFY that is due for a zone is a flag of its record
+(\fBNOTIFY_DUE\fR, journaled, so a NOTIFY that was due at a crash is due after
+the restart). \fBWhat a zone in memory costs.\fR A zone that is attached takes
+one slot of 256 octets of the pool of zone entries (a light entry: name, serial
+and timers, the zone's version, the settings, counters; what a zone seldom
+needs, such as transfer state, an IXFR ring or the full per-zone statistics, is
+made when it is first needed) plus its image: measured, about 739 octets of heap
+for a small attached zone in \fBmap\fR mode (the image is a pointer into the
+mapped segment, and counted by \fBmemory\-limit\fR) and about 1,251 octets in
 \fBcopy\fR mode (the image is a copy). \fBkarictl dbstatus\fR has the line
 \fBzone entries:\fR (slots in use, slabs and their size, the octets of a slot,
 the zones that left memory and kept their counters, the rejection texts in
@@ -5882,21 +6019,21 @@ right after the \fBfetch:\fR line. Everything is counted since the server
 started, except \fBin_flight\fR and \fBqueued\fR (now) and \fBingest_busy\fR
 (the last window). Read it from the query to the install: \fBpark_full\fR counts
 queries that found the worker's table of parked queries full (\fBpark\-max\fR)
-and were answered "not ready" at once (true overload); \fBring_dropped\fR,
-queries whose request for the zone could not be handed from the worker to the
-ingest thread (the worker's ring of 128 was full: the ingest thread is behind;
-the query stays parked and the request is made again, so this counts refusals,
-not lost queries); the requests that cannot be made at once because of
-\fBfetch\-concurrency\fR, \fBfetch\-rate\fR or \fBmemory\-limit\fR \fBwait\fR
-(0.7): \fBqueued\fR is how many wait now, \fBqueue_peak\fR the most there have
-been, \fBwaited\fR how many had to wait (since the start), \fBqueue_dropped\fR
-how many ran out of \fBpark\-timeout\fR while they waited (their queries are
-dropped by their workers, see \fBpark_timeout\fR), and \fBqueue_full\fR how many
-were shed because the queue (8192 requests) was full: true overload, the only
-loss of a query left; its queries are dropped and counted
-(\fBstore.park.drop.queue\fR, also counted in \fBshed\fR of the \fBcache:\fR
-line); a \fBqueued\fR that stays above 0 while \fBin_flight\fR is 0 and the
-bucket is not empty would be a request that is stuck: please report it;
+and were dropped at once (\fBstore.park.drop.room\fR) (true overload);
+\fBring_dropped\fR, queries whose request for the zone could not be handed from
+the worker to the ingest thread (the worker's ring of 128 was full: the ingest
+thread is behind; the query stays parked and the request is made again, so this
+counts refusals, not lost queries); the requests that cannot be made at once
+because of \fBfetch\-concurrency\fR, \fBfetch\-rate\fR or \fBmemory\-limit\fR
+\fBwait\fR (0.7): \fBqueued\fR is how many wait now, \fBqueue_peak\fR the most
+there have been, \fBwaited\fR how many had to wait (since the start),
+\fBqueue_dropped\fR how many ran out of \fBpark\-timeout\fR while they waited
+(their queries are dropped by their workers, see \fBpark_timeout\fR), and
+\fBqueue_full\fR how many were shed because the queue (8192 requests) was full:
+true overload, the only loss of a query left; its queries are dropped and
+counted (\fBstore.park.drop.queue\fR, also counted in \fBshed\fR of the
+\fBcache:\fR line); a \fBqueued\fR that stays above 0 while \fBin_flight\fR is 0
+and the bucket is not empty would be a request that is stuck: please report it;
 \fBtable_full\fR, requests refused because all 256 places of the fetch table
 were taken (normally 0: \fBfetch\-concurrency\fR, at most the 256 places, stops
 the requests of whole zones first, so only a request that comes while summaries
@@ -6032,29 +6169,29 @@ way.
 \fBOver the hard line: room on demand (0.7).\fR The 110% line that keeps the
 overshoot bounded (above) never turns a query away. A query for a zone that is
 out of memory while the zones in memory are above the line is parked like any
-other (UDP and TCP; DoT and DoH do not park and get SERVFAIL + EDE 14 for such a
-zone) and its zone is asked for; the ingest thread, seeing the zones in memory
-above the hard line, takes zones out of memory \fBnow\fR (no waiting for the
-next round of the manager) and makes the request when the zones in memory are
-back under the line; the query is answered from the zone, on its first try (this
-is for servers on which queries for zones that do not fit \fBmemory\-limit\fR
-are normal: a million zones and a small limit). The request waits in the same
-queue as the requests that wait for a place of \fBfetch\-concurrency\fR or a
-token of \fBfetch\-rate\fR: the oldest first, one entry per zone (a second query
-for the same zone asks for nothing), holding the mark of its zone and nothing
-else (no place and no token are taken until the request is made, so the requests
-that wait cannot use up the pool). If there is no room before
-\fBpark\-timeout\fR (nothing can be taken out: everything that is left is
-pinned, changed by an UPDATE, or too young), the request is dropped and the
-queries are dropped when their own time is up, like any parked query (counted in
-\fBpark_timeout\fR of the \fBfetchq:\fR line, in \fBstore.park.drop.timeout\fR
-and in \fBroom_timeouts\fR; the retry of the client then finds the zones that
-the manager has taken out meanwhile). A reload (\fBkarictl reconfig\fR, SIGHUP)
-while requests wait loses none of them and leaves nothing behind: they go on
-waiting for what the new settings ask (a reload that takes \fBmemory\-limit\fR
-away makes them go at once). Zone transfers wait in the same queue; the
-background fetches (a CNAME or the glue of a name server) and the warm-up are
-not queries and do not wait: they are dropped above the line as before.
+other (UDP and TCP, the transports the server listens on) and its zone is asked
+for; the ingest thread, seeing the zones in memory above the hard line, takes
+zones out of memory \fBnow\fR (no waiting for the next round of the manager) and
+makes the request when the zones in memory are back under the line; the query is
+answered from the zone, on its first try (this is for servers on which queries
+for zones that do not fit \fBmemory\-limit\fR are normal: a million zones and a
+small limit). The request waits in the same queue as the requests that wait for
+a place of \fBfetch\-concurrency\fR or a token of \fBfetch\-rate\fR: the oldest
+first, one entry per zone (a second query for the same zone asks for nothing),
+holding the mark of its zone and nothing else (no place and no token are taken
+until the request is made, so the requests that wait cannot use up the pool). If
+there is no room before \fBpark\-timeout\fR (nothing can be taken out:
+everything that is left is pinned, changed by an UPDATE, or too young), the
+request is dropped and the queries are dropped when their own time is up, like
+any parked query (counted in \fBpark_timeout\fR of the \fBfetchq:\fR line, in
+\fBstore.park.drop.timeout\fR and in \fBroom_timeouts\fR; the retry of the
+client then finds the zones that the manager has taken out meanwhile). A reload
+(\fBkarictl reconfig\fR, SIGHUP) while requests wait loses none of them and
+leaves nothing behind: they go on waiting for what the new settings ask (a
+reload that takes \fBmemory\-limit\fR away makes them go at once). Zone
+transfers wait in the same queue; the background fetches (a CNAME or the glue of
+a name server) and the warm-up are not queries and do not wait: they are dropped
+above the line as before.
 .RS 2
 .IP \(bu 2
 \fBWhat is taken out, and how thrashing is avoided.\fR The same order as the
@@ -6262,19 +6399,20 @@ accepts none) is REFUSED , an UPDATE for it is checked (SOA question, apex,
 \fBallow\-update\fR from the settings kept in the element); one that may be made
 waits for the zone like a query (UDP and TCP; the zone is read, the UPDATE is
 applied to it when it is there, and it does not count for the zone's frequency),
-and gets SERVFAIL + EDE 14 only where nothing can wait (TLS, DoH) or the fetch
-failed; with a full park table, a full wait queue or when the time is up it is
-dropped and counted like a query. A zone changed by a dynamic UPDATE is
-\fBpinned\fR: it is never taken out of memory until the next load from the
-database replaces it (the change would be lost, since UPDATEs are kept in memory
-only); \fBkarictl dbstatus\fR shows how many zones are pinned that way
-(\fBupdated: N zone(s)\fR) and \fBkarictl dbstatus <zone>\fR marks the
-zone. These come with the next steps of D1 (design 7). The settings of a zone
-out of memory are the ones it had when it was taken out (an edit of its metadata
-reaches it when the zone is read or sent again), and \fBallow\-query\fR is
-checked from them. A zone of the database that another view shares by
-\fBin\-view\fR is looked up in the directory of its own view (see "Zones shared
-between views"), so the cache manager may take it out of memory like any other.
+and gets SERVFAIL + EDE 14 when the fetch failed (an UPDATE is not an ordinary
+query: \fBnot\-ready\-answer\fR does not change it); with a full park table, a
+full wait queue or when the time is up it is dropped and counted like a query. A
+zone changed by a dynamic UPDATE is \fBpinned\fR: it is never taken out of
+memory until the next load from the database replaces it (the change would be
+lost, since UPDATEs are kept in memory only); \fBkarictl dbstatus\fR shows how
+many zones are pinned that way (\fBupdated: N zone(s)\fR) and \fBkarictl
+dbstatus <zone>\fR marks the zone. These come with the next steps of D1 (design
+7). The settings of a zone out of memory are the ones it had when it was taken
+out (an edit of its metadata reaches it when the zone is read or sent again),
+and \fBallow\-query\fR is checked from them. A zone of the database that another
+view shares by \fBin\-view\fR is looked up in the directory of its own view (see
+"Zones shared between views"), so the cache manager may take it out of memory
+like any other.
 .SS Settings of database zones (milestone B7a)
 A zone in \fBkaridns.conf\fR takes its per-zone options from its \fBzone { }\fR
 statement; a database zone takes them from its PowerDNS \fBdomainmetadata\fR

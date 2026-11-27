@@ -56,7 +56,7 @@ for z in za zb zc zd ze zf zg zh zi sx sy sz sw sv; do zone "$z.test"; done
 KEYS="key \"nk\" { algorithm hmac-sha256; secret \"$NK\"; };
 key \"zk\" { algorithm hmac-sha256; secret \"$ZK\"; };"
 cat > "$W/m.conf" <<EOF
-options { port $PM; bind-address { 127.0.0.1; }; pid-file "none"; $USER_OPT
+options { not-ready-answer servfail; port $PM; bind-address { 127.0.0.1; }; pid-file "none"; $USER_OPT
           also-notify { 127.0.0.1 port $L1; }; };
 control-channel { socket "$W/ctl.sock"; algorithm hmac-sha256; secret "$SECRET"; };
 $KEYS
@@ -132,7 +132,7 @@ else fail "an unsigned zone sent a signed NOTIFY"; fi
 #   sz: the zone's tsig-key                                         sw: a wrong zone tsig-key, overridden by the key of the primary
 #   sv: key of the primary; the primary NOTIFYs it unsigned (refused); notify primary-only: the secondary passes nothing on
 cat > "$W/p.conf" <<EOF
-options { port $PP; bind-address { 127.0.0.1; }; pid-file "none"; $USER_OPT };
+options { not-ready-answer servfail; port $PP; bind-address { 127.0.0.1; }; pid-file "none"; $USER_OPT };
 control-channel { socket "$W/p.sock"; algorithm hmac-sha256; secret "$SECRET"; };
 key "nk" { algorithm hmac-sha256; secret "$NK"; };
 zone "sx.test" { type master; file "$W/sx.test.zone"; allow-transfer { key "nk"; }; also-notify { 127.0.0.1 port $PS key nk; }; };
@@ -142,7 +142,7 @@ zone "sw.test" { type master; file "$W/sw.test.zone"; allow-transfer { key "nk";
 zone "sv.test" { type master; file "$W/sv.test.zone"; allow-transfer { key "nk"; }; also-notify { 127.0.0.1 port $PS; }; };
 EOF
 cat > "$W/s.conf" <<EOF
-options { port $PS; bind-address { 127.0.0.1; }; pid-file "none"; $USER_OPT };
+options { not-ready-answer servfail; port $PS; bind-address { 127.0.0.1; }; pid-file "none"; $USER_OPT };
 control-channel { socket "$W/s.sock"; algorithm hmac-sha256; secret "$SECRET"; };
 key "nk" { algorithm hmac-sha256; secret "$NK"; };
 key "wk" { algorithm hmac-sha256; secret "$WK"; };
@@ -198,36 +198,36 @@ chk() { # chk LABEL EXPECT(ok|error) PATTERN CONF-BODY
 }
 Z="zone \"za.test\" { type master; file \"$W/za.test.zone\"; %s };"
 zc() { printf "$Z" "$1"; }
-chk "every valid form is accepted without a word" ok "" "options { also-notify port 5353 { sec; 192.0.2.9 key nk; }; };
+chk "every valid form is accepted without a word" ok "" "options { not-ready-answer servfail; also-notify port 5353 { sec; 192.0.2.9 key nk; }; };
 $KEYS
 $(zc 'also-notify { 192.0.2.1; 2001:db8::1 port 5301 key "zk"; };')
 remote-servers sec port 5300 { 192.0.2.7; sec2 key nk; };
 primaries sec2 { 2001:db8::7; };"
-chk "an unknown list name names the file and line" error "c.conf:3: zone 'za.test.' also-notify: 'nolist'" "options { };
+chk "an unknown list name names the file and line" error "c.conf:3: zone 'za.test.' also-notify: 'nolist'" "options { not-ready-answer servfail; };
 
 $(zc 'also-notify { nolist; };')"
-chk "an unknown list name in options" error "c.conf:2: options also-notify: 'nolist'" "options {
+chk "an unknown list name in options" error "c.conf:2: options also-notify: 'nolist'" "options { not-ready-answer servfail;
   also-notify { nolist; }; };"
-chk "an undefined key" error "c.conf:2: .*key 'nokey' is not defined" "options {
+chk "an undefined key" error "c.conf:2: .*key 'nokey' is not defined" "options { not-ready-answer servfail;
   also-notify { 192.0.2.1 key nokey; }; };"
-chk "a syntax error (missing ';') names the line" error "c.conf:2: options also-notify: expected ';' after '192.0.2.1'" "options { also-notify {
+chk "a syntax error (missing ';') names the line" error "c.conf:2: options also-notify: expected ';' after '192.0.2.1'" "options { not-ready-answer servfail; also-notify {
   192.0.2.1 }; };"
-chk "tls is refused" error "'tls' is not supported" "options { also-notify { 192.0.2.1 tls t; }; };"
-chk "a list that includes itself" error "nested more than" "options { also-notify { l; }; };
+chk "tls is refused" error "'tls' is not supported" "options { not-ready-answer servfail; also-notify { 192.0.2.1 tls t; }; };"
+chk "a list that includes itself" error "nested more than" "options { not-ready-answer servfail; also-notify { l; }; };
 remote-servers l { 192.0.2.1; l; };"
 chk "masters syntax error names the line" error "c.conf:2: zone 'za.test.' masters" "$(zc 'masters {
   192.0.2.1 port x; };')"
 
-chk "primaries / masters lists, notify in options, view and zone are accepted without a word" ok "" "options { notify explicit; };
+chk "primaries / masters lists, notify in options, view and zone are accepted without a word" ok "" "options { not-ready-answer servfail; notify explicit; };
 $KEYS
 zone \"s.test\" { type slave; primaries port 5300 { sec; 192.0.2.9 key nk; }; notify primary-only; };
 masters sec { 192.0.2.7 key zk; };"
-chk "an unknown primaries list names the file and line" error "c.conf:2: zone 's.test.' primaries: 'nolist'" "options { };
+chk "an unknown primaries list names the file and line" error "c.conf:2: zone 's.test.' primaries: 'nolist'" "options { not-ready-answer servfail; };
 zone \"s.test\" { type slave; primaries { nolist; }; };"
 chk "an undefined primary key" error "c.conf:2: .*key 'nokey' is not defined" "zone \"s.test\" { type slave;
  masters { 192.0.2.1 key nokey; }; };"
 chk "tls on a primary is refused" error "'tls' is not supported" "zone \"s.test\" { type slave; primaries { 192.0.2.1 tls t; }; };"
-chk "a bad notify value names the line" error "c.conf:2: options notify: invalid value 'maybe'" "options {
+chk "a bad notify value names the line" error "c.conf:2: options notify: invalid value 'maybe'" "options { not-ready-answer servfail;
  notify maybe; };"
 chk "notify is no longer reported as a BIND-only option" ok "" "zone \"s.test\" { type slave; masters { 192.0.2.1; }; notify yes; };"
 

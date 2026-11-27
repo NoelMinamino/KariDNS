@@ -64,7 +64,7 @@ cp "$DIR/plugins/dnstestscript.pl" "$W/plugin.pl"
 chmod 755 "$W/plugin.pl"
 
 cat > "$W/primary.conf" <<EOF
-options { port $PPORT; bind-address { 127.0.0.1; }; pid-file "none"; send-extended-errors yes;
+options { not-ready-answer servfail; port $PPORT; bind-address { 127.0.0.1; }; pid-file "none"; send-extended-errors yes;
           ecs-enable yes; ecs-trusted-resolvers { 127.0.0.1; }; allow-program-zones yes; $USER_OPT };
 zone "example.test" { type master; file "$W/example.test.zone"; allow-transfer { 127.0.0.1; }; };
 zone "fwd.test" { type forward; forwarders { 127.0.0.1 port 9; }; };
@@ -73,7 +73,7 @@ zone "prog.test" { type program; program "$W/plugin.pl"; };
 EOF
 
 cat > "$W/secondary.conf" <<EOF
-options { port $SPORT; bind-address { 127.0.0.1; }; pid-file "none"; send-extended-errors yes; serve-stale no; $USER_OPT };
+options { not-ready-answer servfail; port $SPORT; bind-address { 127.0.0.1; }; pid-file "none"; send-extended-errors yes; serve-stale no; $USER_OPT };
 zone "example.test" { type slave; masters { 127.0.0.1 port $PPORT; }; };
 EOF
 

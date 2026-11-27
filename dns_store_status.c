@@ -582,7 +582,7 @@ static void add_lookup(list_t *l) {
   U("store.lookup.drop.room", k->drop_lk_room);
   U("store.lookup.drop.timeout", k->drop_lk_timeout);
   U("store.lookup.drop.queue", k->drop_lk_queue);
-  U("store.lookup.servfail", k->servfail);
+  U("store.lookup.drop.failed", k->drop_lk_failed);
   U("store.lookup.remembered", k->remembered);
   U("store.lookup.reask_suppressed", k->reask_suppressed);
   U("store.lookup.remember_releases", k->remember_releases);
@@ -593,9 +593,18 @@ static void add_lookup(list_t *l) {
   U("store.park.drop.room", k->drop_zone_room);
   U("store.park.drop.timeout", k->drop_zone_timeout);
   U("store.park.drop.queue", k->drop_zone_queue);
+  U("store.park.drop.failed", k->drop_zone_failed);
+  U("store.ingest.journal_wait_slices", k->jw_slices);
+  U("store.ingest.fill_throttled", k->fill_throttled);
+  U("store.ingest.fill_stalled_windows", k->fill_stalls);
+  U("store.ingest.fill_failed_windows", k->fill_failed_windows);
+  U("store.ingest.fetch_timeouts", k->fetch_timeouts);
   U("store.lookup.rtt.p50_us", store_status_hist_pct(k->hist, 50, k->max_ns));
   U("store.lookup.rtt.p99_us", store_status_hist_pct(k->hist, 99, k->max_ns));
   U("store.lookup.rtt.max_us", (k->max_ns + 999) / 1000);
+  U("store.fetch.query.rtt.p50_us", store_status_hist_pct(k->qf_hist, 50, k->qf_max_ns));
+  U("store.fetch.query.rtt.p99_us", store_status_hist_pct(k->qf_hist, 99, k->qf_max_ns));
+  U("store.fetch.query.rtt.max_us", (k->qf_max_ns + 999) / 1000);
   add_hist(l, "store.lookup.rtt", k->hist);
   free(k);
 }
@@ -727,6 +736,8 @@ static void add_store(list_t *l, const store_t *s, const store_attach_stats_t *a
   U("store.bulk.recoveries", st->bulk_recoveries);
   U("store.bulk.recovered_known", st->recovery.bulk_known);
   U("store.bulk.checkpoints", st->bulk_checkpoints);
+  U("store.bulk.presyncs", st->bulk_presyncs);
+  U("store.bulk.presync_max_us", st->bulk_presync_max_us);
   U("store.bulk.unlogged_records", st->bulk_unlogged_records);
   U("store.bulk.since_unix", st->bulk_since_unix);
   U("store.bulk.ended_unix", st->bulk_ended_unix);
@@ -811,6 +822,8 @@ static void add_store(list_t *l, const store_t *s, const store_attach_stats_t *a
   U("store.checkpoint.table_bytes", st->checkpoint_table_bytes);
   U("store.checkpoint.table_last_bytes", st->checkpoint_table_last_bytes);
   U("store.checkpoint.paced_us", st->checkpoint_paced_us);
+  U("store.checkpoint.slow_bytes", st->checkpoint_slow_bytes);
+  U("store.checkpoint.slow_paced_us", st->checkpoint_slow_paced_us);
   U("store.tables.private_bytes", st->table_private_bytes);
   U("store.tables.private_index_bytes", st->table_private_index_bytes);
   U("store.tables.budget_bytes", st->table_budget_bytes);

@@ -1,4 +1,4 @@
-.TH KARICTL 8 "2026-11-27" "KariDNS" "KariDNS Manual"
+.TH KARICTL 8 "2026-11-28" "KariDNS" "KariDNS Manual"
 .\" Generated from docs/karictl.md by man/md2man.pl (make man): edit the Markdown manual, not this page.
 .SH NAME
 karictl \- Remote Control and Management Utility for KariDNS
@@ -767,46 +767,47 @@ server does not serve); \fBfailed\fR, lookups that ended in a failure (the
 loader or its fetch stream went away, the loader named a zone that does not
 enclose the name, the zone could not be recorded, or the zone the lookup found
 could not be read from the database (the body that came with it failed); each is
-logged as \fB[DB] lookup of the name ... failed\fR, and the query is answered
-SERVFAIL + EDE 14, not refused; a loader that said it is busy is overload and
-the query is dropped, see \fBstore.lookup.drop.queue\fR); \fBrefused\fR,
-requests of the workers that the ingest thread did not send because there is
-nothing to ask (a name the stream does not take, a view that takes no database
-zones, a loader that does not look names up; a loader that is only away does not
-count: the lookup waits for it and is dropped at its time); \fBsame_name\fR,
-requests that joined a lookup of the same name that was on its way), with the
-zone store the state of its journal (0.7: \fBstore: journal=ok|nospace|failed
-error=N failed_at=T unwritten=N batch_commit_errors=N\fR, see
-\fBstore.journal.state\fR under \fBstore\fR), the NOTIFY of zones that are out
-of memory (D1a: \fBnotify of zones out of memory: queued=N deferred=N\fR, the
-zones whose serial changed while their data was out of memory that were handed
-to the control thread, and the ones that did not fit in the ring of 1024 and are
-queued later), the zone transfers of zones that are out of memory (D1a,
-\fBtransfers of zones out of memory: waited=N loaded=N failed=N
-summary_answers=N marked=N timeout=Nms\fR: transfers that had to wait for the
-zone, the zones they got, the ones that ended with SERVFAIL, the IXFRs answered
-from the summary without reading the zone, the zones marked evict-next, and
-\fBtransfer\-fetch\-timeout\fR) and the cost of the zone directory (\fBzone
-directory: N elements, B bytes in the registry + I bytes in the indexes of the
-views (P bytes per zone)\fR; the entries and images are not in it), then
-\fBalias: scans=N\fR (0.7: how many times the thread that resolves the targets
-of ALIAS records scanned the zone directory for them since the start; a scan
-follows a zone with ALIAS records coming, changing, going or being taken out of
-memory and a reconfiguration, not every zone that is fetched or evicted, so the
-number stays where it is while zones without ALIAS records come and go; see
-"Expansion" under POWERDNS ALIAS AND LUA RECORDS in \fBkaridns(8)\fR). The
-warm-up and the cache (D1a step 7): \fBresidency: directory=N resident=N
-out_of_memory=N evictions=N\fR (the zones of the directory with and without data
-in memory), \fBqueries: answered=N parked=N hit_rate=P%\fR (the queries the
-zones answered, and the ones that had to wait for their zone; the hit rate is
-the share answered by a zone already in memory), \fBwarm: received=0|1 queued=N
-loaded=N skipped=N (memory limit N, already in memory or gone N) failed=N
-pending=N in_flight=N\fR (the zones of the loader's hot list: queued to read,
-read, not read because the memory limit's high water mark was reached or because
-they were in memory or gone, failed, still waiting, being read),
-\fBwarm\-before\-serve: off\fR, \fBholding the queries (N ms left)\fR or
-\fBqueries accepted after N ms\fR (the queries are held while the hot list is
-read; the control channel is not), and \fBstate\-file: <path>
+logged as \fB[DB] lookup of the name ... failed\fR, and the query is not
+answered (0.7 first-fill latency: dropped and counted,
+\fBstore.lookup.drop.failed\fR; SERVFAIL + EDE 14 with \fBnot\-ready\-answer
+servfail\fR), not refused; a loader that said it is busy is overload and the
+query is dropped, see \fBstore.lookup.drop.queue\fR); \fBrefused\fR, requests of
+the workers that the ingest thread did not send because there is nothing to ask
+(a name the stream does not take, a view that takes no database zones, a loader
+that does not look names up; a loader that is only away does not count: the
+lookup waits for it and is dropped at its time); \fBsame_name\fR, requests that
+joined a lookup of the same name that was on its way), with the zone store the
+state of its journal (0.7: \fBstore: journal=ok|nospace|failed error=N
+failed_at=T unwritten=N batch_commit_errors=N\fR, see \fBstore.journal.state\fR
+under \fBstore\fR), the NOTIFY of zones that are out of memory (D1a: \fBnotify
+of zones out of memory: queued=N deferred=N\fR, the zones whose serial changed
+while their data was out of memory that were handed to the control thread, and
+the ones that did not fit in the ring of 1024 and are queued later), the zone
+transfers of zones that are out of memory (D1a, \fBtransfers of zones out of
+memory: waited=N loaded=N failed=N summary_answers=N marked=N timeout=Nms\fR:
+transfers that had to wait for the zone, the zones they got, the ones that ended
+with SERVFAIL, the IXFRs answered from the summary without reading the zone, the
+zones marked evict-next, and \fBtransfer\-fetch\-timeout\fR) and the cost of the
+zone directory (\fBzone directory: N elements, B bytes in the registry + I bytes
+in the indexes of the views (P bytes per zone)\fR; the entries and images are
+not in it), then \fBalias: scans=N\fR (0.7: how many times the thread that
+resolves the targets of ALIAS records scanned the zone directory for them since
+the start; a scan follows a zone with ALIAS records coming, changing, going or
+being taken out of memory and a reconfiguration, not every zone that is fetched
+or evicted, so the number stays where it is while zones without ALIAS records
+come and go; see "Expansion" under POWERDNS ALIAS AND LUA RECORDS in
+\fBkaridns(8)\fR). The warm-up and the cache (D1a step 7): \fBresidency:
+directory=N resident=N out_of_memory=N evictions=N\fR (the zones of the
+directory with and without data in memory), \fBqueries: answered=N parked=N
+hit_rate=P%\fR (the queries the zones answered, and the ones that had to wait
+for their zone; the hit rate is the share answered by a zone already in memory),
+\fBwarm: received=0|1 queued=N loaded=N skipped=N (memory limit N, already in
+memory or gone N) failed=N pending=N in_flight=N\fR (the zones of the loader's
+hot list: queued to read, read, not read because the memory limit's high water
+mark was reached or because they were in memory or gone, failed, still waiting,
+being read), \fBwarm\-before\-serve: off\fR, \fBholding the queries (N ms
+left)\fR or \fBqueries accepted after N ms\fR (the queries are held while the
+hot list is read; the control channel is not), and \fBstate\-file: <path>
 at_start=... hot_lists_sent=N ... acks: written=N unchanged=N failed=N ...\fR
 (what the loader found in its state file at its start, how many hot lists the
 Backend sent, and what the loader answered; \fBstate\-file: none\fR without
@@ -1437,13 +1438,15 @@ view without database zones); the same name already on its way; the zone of the
 name was known when it was to go; dropped because the queue was full; dropped
 because they waited \fBpark\-timeout\fR
 .TP 8
-\fBstore.lookup.drop.room\fR, \fB.drop.timeout\fR, \fB.drop.queue\fR, \fB.servfail\fR
+\fBstore.lookup.drop.room\fR, \fB.drop.timeout\fR, \fB.drop.queue\fR, \fB.drop.failed\fR
 0.7: queries that were dropped (nothing is answered, like a query that
 \fBrate\-limit\fR drops; a TCP connection stays open and its next message is
 read) because the lookup found no room in the worker's park table, its
 \fBpark\-timeout\fR was up before the lookup was answered, or the ingest thread
 dropped the lookup (its queue was full, or it waited there until its time was
-up); and queries answered SERVFAIL + EDE 14 because their lookup failed
+up); and queries not answered because their lookup failed (the database or the
+loader: 0.7 first-fill latency, before SERVFAIL + EDE 14; this was
+\fBstore.lookup.servfail\fR)
 .TP 8
 \fBstore.lookup.remembered\fR, \fB.reask_suppressed\fR, \fB.remember_releases\fR
 0.7: names whose lookup the ingest thread shed (its queue was full, they waited
@@ -1463,10 +1466,44 @@ and the longest one ran (microseconds), since the start. A \fBpass_max\fR of a
 few thousand with \fBstore.lookup.take_fail\fR and \fBdrop.room\fR still rising
 means the thread does not keep up
 .TP 8
-\fBstore.park.drop.room\fR, \fB.drop.timeout\fR, \fB.drop.queue\fR
+\fBstore.park.drop.room\fR, \fB.drop.timeout\fR, \fB.drop.queue\fR, \fB.drop.failed\fR
 The same for a query that waits for a zone that is out of memory: the park table
 was full (\fBpark\-max\fR), its \fBpark\-timeout\fR was up before the zone was
-there, the wait queue of the ingest thread was full
+there, the wait queue of the ingest thread was full, the read of the zone failed
+or the query could not wait (0.7 first-fill latency: never SERVFAIL while the
+data is being loaded; zone transfers and UPDATE still get SERVFAIL + EDE 14)
+.TP 8
+\fBstore.ingest.journal_wait_slices\fR
+0.7: slices of 5 ms in which the ingest thread waited for the store's journal
+(at 4 times its limit: the disk is behind the writes) and made the requests of
+queries meanwhile
+.TP 8
+\fBstore.ingest.fill_throttled\fR, \fBstore.ingest.fill_stalled_windows\fR, \fBstore.ingest.fill_failed_windows\fR
+0.7: times the fill was held to its old share (32 bodies in flight) because
+attaches of queries waited or a checkpoint of the store ran; windows of a minute
+in which the fill had work and no body of it came (queries took the loader
+first: a WARNING says so, a NOTICE when it goes on); \fBfill_failed_windows\fR:
+windows without progress in which reads of the database failed (the fill's, or
+any), which the WARNING says instead ("reads of the database failed"); a body
+the loader answered busy or did not answer in time is the loader being behind,
+as under a flood of queries, and leaves the window a stall of the queries
+.TP 8
+\fBstore.ingest.fetch_timeouts\fR
+0.7: fetches the loader did not answer within the time the ingest thread waits
+(30 s); counted apart from reads that failed, in the window's line of the
+queries not answered too ("the loader did not answer N requests in time")
+.TP 8
+\fBstore.checkpoint.slow_bytes\fR, \fBstore.checkpoint.slow_paced_us\fR
+0.7: table bytes bulk checkpoints wrote at 32 MiB/s because attaches of queries
+waited, and the time they gave way at that rate
+.TP 8
+\fBstore.bulk.presyncs\fR, \fBstore.bulk.presync_max_us\fR
+0.7: early syncs of the segments of an unlogged first fill, one each time 128
+MiB more were written (no commit syncs them in such a fill), so that a bulk
+checkpoint's own sync finds little; and the longest
+.TP 8
+\fBstore.fetch.query.rtt.p50_us\fR, \fB.p99_us\fR, \fB.max_us\fR
+0.7: the fetches of queries from the database, from the request to the install
 .TP 8
 \fBstore.lookup.rtt.p50_us\fR, \fB.p99_us\fR, \fB.max_us\fR, \fB.rtt.hist.*\fR
 The time from the request to the answer (without the body), as the attach times:

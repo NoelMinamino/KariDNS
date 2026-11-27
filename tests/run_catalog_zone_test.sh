@@ -54,7 +54,7 @@ EOF
 
 # Create the config file
 cat << EOF > karidns.conf
-options {
+options { not-ready-answer servfail;
     port ${PORT};
     bind-address { 127.0.0.1; };
     user "nobody";
@@ -174,7 +174,7 @@ echo "[+] karicheck properly detected orphaned group."
 
 echo "[+] Phase 2 CoO Test: Setting up two catalog zones for transfer..."
 cat << EOF > karidns.conf
-options {
+options { not-ready-answer servfail;
     port ${PORT};
     bind-address { 127.0.0.1; };
     user "nobody";

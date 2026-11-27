@@ -110,10 +110,10 @@ start() { # start NAME : karidns on $W/NAME.conf
 }
 
 # ------------------------------------------------------------------------------------------------ E: start-up refusals
-printf 'options { port %s; bind-address { 127.0.0.1; }; pid-file "none"; %s\n  transfer-source 192.0.2.77;\n};\n' "$PE" "$USER_OPT" > "$W/e1.conf"
-printf 'options { port %s; bind-address { 127.0.0.1; }; pid-file "none"; %s };\nzone "a.test" { type master; file "%s/a.zone";\n  notify-source 192.0.2.77; };\n' "$PE" "$USER_OPT" "$W" > "$W/e2.conf"
-printf 'options { port %s; bind-address { 127.0.0.1; }; pid-file "none"; %s };\nzone "a.test" { type slave;\n  primaries source 192.0.2.77 { 127.0.0.1 port 1; }; };\n' "$PE" "$USER_OPT" > "$W/e3.conf"
-printf 'options { port %s; bind-address { 127.0.0.1; }; pid-file "none"; %s };\nzone "a.test" { type master; file "%s/a.zone"; also-notify\n  source 192.0.2.77 { 127.0.0.1 port 1; }; };\n' "$PE" "$USER_OPT" "$W" > "$W/e4.conf"
+printf 'options { not-ready-answer servfail; port %s; bind-address { 127.0.0.1; }; pid-file "none"; %s\n  transfer-source 192.0.2.77;\n};\n' "$PE" "$USER_OPT" > "$W/e1.conf"
+printf 'options { not-ready-answer servfail; port %s; bind-address { 127.0.0.1; }; pid-file "none"; %s };\nzone "a.test" { type master; file "%s/a.zone";\n  notify-source 192.0.2.77; };\n' "$PE" "$USER_OPT" "$W" > "$W/e2.conf"
+printf 'options { not-ready-answer servfail; port %s; bind-address { 127.0.0.1; }; pid-file "none"; %s };\nzone "a.test" { type slave;\n  primaries source 192.0.2.77 { 127.0.0.1 port 1; }; };\n' "$PE" "$USER_OPT" > "$W/e3.conf"
+printf 'options { not-ready-answer servfail; port %s; bind-address { 127.0.0.1; }; pid-file "none"; %s };\nzone "a.test" { type master; file "%s/a.zone"; also-notify\n  source 192.0.2.77 { 127.0.0.1 port 1; }; };\n' "$PE" "$USER_OPT" "$W" > "$W/e4.conf"
 zone "$W/a.zone" a.test 1
 e=1
 for want in "e1.conf:2:transfer-source" "e2.conf:3:notify-source" "e3.conf:3:primaries source" "e4.conf:3:also-notify source"; do
@@ -140,7 +140,7 @@ done
 
 # ------------------------------------------------------------------------------------------------ K: karicheck conf notes
 cat > "$W/k.conf" <<EOF
-options { startup-notify-rate 5; transfers-in 0; transfers-out 0; transfers-per-ns 0; try-tcp-refresh no;
+options { not-ready-answer servfail; startup-notify-rate 5; transfers-in 0; transfers-out 0; transfers-per-ns 0; try-tcp-refresh no;
   min-refresh-time 900; max-refresh-time 600; min-retry-time 900; max-retry-time 600; };
 zone "pri.test" { type master; file "$W/a.zone"; min-refresh-time 5; transfer-source 127.0.0.1; };
 zone "sec.test" { type slave; primaries { 127.0.0.1 port 1; }; multi-master yes; };
@@ -161,7 +161,7 @@ PIDS="$PIDS $!"
 for n in 1 2 3 4; do zone "$W/dn$n.zone" "dn$n.test" 1; done
 zone "$W/dm.zone" "dm.test" 1
 cat > "$W/d.conf" <<EOF
-options { port $PD; bind-address { 127.0.0.1; }; pid-file "none"; $USER_OPT
+options { not-ready-answer servfail; port $PD; bind-address { 127.0.0.1; }; pid-file "none"; $USER_OPT
   notify explicit; notify-rate 1; notify-delay 3; };
 control-channel { socket "$W/d.sock"; algorithm hmac-sha256; secret "$SECRET"; };
 zone "dn1.test" { type master; file "$W/dn1.zone"; also-notify { 127.0.0.1 port $D1; }; };
@@ -225,7 +225,7 @@ else
         V6ZONE="zone \"zg.test\" { type master; file \"$W/zg.zone\"; also-notify { ::1 port $SG; }; };"
     fi
     cat > "$W/n.conf" <<EOF
-options { port $PN; bind-address { 127.0.0.1; }; pid-file "none"; $USER_OPT
+options { not-ready-answer servfail; port $PN; bind-address { 127.0.0.1; }; pid-file "none"; $USER_OPT
   notify explicit; notify-source 127.0.0.2; $V6OPT };
 control-channel { socket "$W/n.sock"; algorithm hmac-sha256; secret "$SECRET"; };
 view "v1" { match-clients { any; }; notify-source 127.0.0.3;
@@ -275,12 +275,12 @@ if [ "$HAVE_ALIAS" -ne 1 ]; then
 else
     for z in za zc zd ze zv1 zv2; do zone "$W/t$z.zone" "$z.test" 1; done
     {
-        echo "options { port $PP; bind-address { 127.0.0.1; }; pid-file \"none\"; $USER_OPT notify no; };"
+        echo "options { not-ready-answer servfail; port $PP; bind-address { 127.0.0.1; }; pid-file \"none\"; $USER_OPT notify no; };"
         echo "control-channel { socket \"$W/p.sock\"; algorithm hmac-sha256; secret \"$SECRET\"; };"
         for z in za zc zd ze zv1 zv2; do echo "zone \"$z.test\" { type master; file \"$W/t$z.zone\"; allow-transfer { 127.0.0.2; }; };"; done
     } > "$W/p.conf"
     cat > "$W/s.conf" <<EOF
-options { port $PS; bind-address { 127.0.0.1; }; pid-file "none"; $USER_OPT
+options { not-ready-answer servfail; port $PS; bind-address { 127.0.0.1; }; pid-file "none"; $USER_OPT
   min-refresh-time 1; min-retry-time 1; transfer-source 127.0.0.2; };
 control-channel { socket "$W/s.sock"; algorithm hmac-sha256; secret "$SECRET"; };
 primaries pl source 127.0.0.2 { 127.0.0.1 port $PP; };
@@ -290,7 +290,7 @@ zone "zd.test" { type slave; primaries { 127.0.0.1 port $PP; }; transfer-source 
 zone "ze.test" { type slave; primaries { 127.0.0.1 port $PP; }; transfer-source 127.0.0.3; };
 EOF
     cat > "$W/v.conf" <<EOF
-options { port $PV; bind-address { 127.0.0.1; }; pid-file "none"; $USER_OPT
+options { not-ready-answer servfail; port $PV; bind-address { 127.0.0.1; }; pid-file "none"; $USER_OPT
   min-refresh-time 1; min-retry-time 1; transfer-source 127.0.0.3; };
 view "v1" { match-clients { any; }; transfer-source 127.0.0.2;
   zone "zv1.test" { type slave; primaries { 127.0.0.1 port $PP; }; };

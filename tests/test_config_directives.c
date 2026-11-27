@@ -510,6 +510,23 @@ static void test_thread_options(void) {
     expect_an_error("udp-receive without a value", "options { udp-receive; };", "udp-receive: a value is required");
     expect_an_error("udp-receive without a semicolon", "options { udp-receive backend };", "udp-receive: missing ';'");
     expect_an_error("udp-receive with a number", "options { udp-receive 1; };", "udp-receive: invalid value '1'");
+
+    /* 0.7 W6: not-ready-answer drop | servfail (reloadable); not written = drop; any letter case; the last statement wins */
+    if (parse_ok("options { };", &cfg)) {
+        CHECK(cfg.not_ready_answer == NOT_READY_DROP);
+        free_server_config_fields(&cfg);
+    }
+    if (parse_ok("options { not-ready-answer servfail; };", &cfg)) {
+        CHECK(cfg.not_ready_answer == NOT_READY_SERVFAIL);
+        free_server_config_fields(&cfg);
+    }
+    if (parse_ok("options { not-ready-answer SERVFAIL; not-ready-answer Drop; };", &cfg)) {
+        CHECK(cfg.not_ready_answer == NOT_READY_DROP);
+        free_server_config_fields(&cfg);
+    }
+    expect_an_error("not-ready-answer with another word", "\n\noptions { not-ready-answer refused; };", "line 3|not-ready-answer: invalid value 'refused'|drop or servfail");
+    expect_an_error("not-ready-answer without a value", "options { not-ready-answer; };", "not-ready-answer: a value is required");
+    expect_an_error("not-ready-answer without a semicolon", "options { not-ready-answer drop };", "not-ready-answer: missing ';'");
 }
 
 static void test_options_syntax_errors(void) {
