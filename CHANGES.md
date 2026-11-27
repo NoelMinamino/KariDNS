@@ -51,9 +51,9 @@ What changes, what it breaks, and what to do. The step-by-step version is [docs/
   256). The loader logs its reads once a minute (`fetch reads in 60 s: ... zones a read`).
   A request of the fill never goes before a query in the loader, and a query does not wait for a body of the fill on
   its way; a fill that queries stall is counted (`store.ingest.fill_stalled_windows`, one WARNING a minute) and goes on
-  by itself; one whose own reads fail is counted apart (`store.ingest.fill_failed_windows`). The loader drops a request
-  of the fill that waited 30 s (the Backend gave it up), and a request it did not answer in time is not counted as a
-  failed read of the database. While attaches of queries queue up the fill is held to 32 in flight (`store.ingest.fill_throttled`).
+  by itself; one in which reads of the database fail is counted apart (`store.ingest.fill_failed_windows`). The loader
+  drops a request of the fill that waited 30 s (the Backend gave it up), and a request it did not answer in time is
+  counted apart (`store.ingest.fetch_timeouts`), not as a failed read of the database. While attaches of queries queue up the fill is held to 32 in flight (`store.ingest.fill_throttled`).
 - **The unlogged first fill begins when the store opens empty** (first-fill latency PR), not at the first pass: under
   queries from the start the lookups used to make the store non-empty and the whole fill ran with its journal. With
   no pass in 10 minutes it is given up (logged fill). Secondary copies are never written in it (put off to its end).

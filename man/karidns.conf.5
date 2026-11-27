@@ -5313,92 +5313,93 @@ unchanged); a flood of queries can stall the fill, which is counted
 (\fBstore.ingest.fill_stalled_windows\fR) and said once a minute (\fB[DB] the
 fill of the store made no progress in the last 60 s ...\fR, WARNING), and the
 fill goes on by itself when the queries leave the loader room (a NOTICE says
-so); a window without progress because the fill's own reads failed or a failed
-round waits to be made again is counted and said apart
-(\fBstore.ingest.fill_failed_windows\fR, "its reads failed or are
-paused"). While the workers' attach rings hold 32 requests or more (the store
-threads are behind with the attaches of queries) the fill is held to its old
-share as while queries wait (\fBstore.ingest.fill_throttled\fR). The loader
-reads up to 16 requests of queries together (up to 64 while more than 16 of them
-queue) and up to 128 of the fill, and leaves one worker to the queries:
-\fBloader\-threads\fR - 1 workers read the fill and the last one only the
-queries, the warm-up and the lookups; with \fBloader\-threads 1\fR (a small
-server) the one worker does both, and a batch of the fill is 128 zones only
-while no query came in the last second. A zone that a query waits for is not
-read again by the fill (the query's read brings it). The loader says how it read
-in one line a minute while it reads, and once when it stops (\fBfetch reads in
-60 s: queries 120 reads 130 zones, fill 400 reads 51200 zones (128.0 zones a
-read)\fR, LOG_INFO). The ingest thread waits for the store's journal at 4 times
-its limit (the disk is behind the fill's writes) in slices of 5 ms and makes the
-requests of queries between them, so a lookup or a fetch of a query never waits
-for a checkpoint (\fBstore.ingest.journal_wait_slices\fR counts the
-slices). \fBkarictl dbstatus\fR shows the share of the ingest thread the bodies
-of the fill took (\fBfill_busy=P%\fR in the \fBfetchq:\fR line, next to
-\fBingest_busy\fR). A name that no stored zone covers is the one thing the store
-cannot answer by itself: until the first pass has listed a zone (about a second
-at 100,000 zones, about a minute at ten million) the store does not know it.  So
-that such a query is not refused for a zone that is in the database, it is
-\fIlooked up\fR: the worker parks the query and asks the loader, on the fetch
-stream (which a pass on the first stream does not hold up), which zone of the
-view encloses the name (the name and its parent names, never the root; the
-longest one that the view serves and that is a primary zone); the loader finds
-it with one statement and answers, the Backend records the zone as a manifest
-entry would (a known zone, whose body is read as for any zone the fill has not
-brought yet), and the query is answered from it.  A name that no zone has is
-REFUSED, as for any name the server does not serve (also when the loader has no
-lookup); when the loader does not answer within \fBpark\-timeout\fR the query is
-dropped, and so is a query whose lookup failed (see below).  A loader that is
-away for a while (it was restarted, its stream broke) does not turn this into
-REFUSED: while the pass of the view is pending the lookup waits in the Backend's
-queue for the loader and is dropped when \fBpark\-timeout\fR is up; REFUSED is
-for a loader that has no lookup (its HELLO says so), a view that takes no
-database zones, and a pass that has ended.  The same holds for the moment after
-a start, before the first loader has said its HELLO: the Backend expects a
-loader that looks names up (the one of the package), so a query that comes in
-that moment waits for it as well (until then such queries were REFUSED for about
-the first second of a first start); a loader whose HELLO says it has no lookup
-ends the wait, and the queries are REFUSED as before.  A loader that answers
-"busy" is overload, and the queries are dropped, not answered SERVFAIL.  This is
-done only for a QUERY of the class IN, only while the first pass of that view
-has not ended and the loader offers it (after the pass an unknown name is
-REFUSED at once, with no round trip, so that random names never reach the
-database), once per query (a query that comes back with the answer of the
-lookup, or after its time was up, is not parked again; one that is woken without
-the answer, by the wake of every query after a wake ring that overflowed, is
-parked again for the lookup until its first deadline, so that a zone that exists
-is not refused for a lost wake-up).  A lookup is a fetch of the class of the
-queries' fetches: it takes a place of \fBfetch\-concurrency\fR like the fetch of
-a zone and waits for one in a queue of its own (until \fBpark\-timeout\fR) when
-there is none, so a query is not REFUSED for the lack of a place (the fixed
-window of 32 lookups of the first 0.7 builds is gone): when the worker cannot
-make the request now, because its ring to the ingest thread is full, the query
-stays parked as pending and the worker asks again (\fBtake_fail\fR), as for the
-fetch of a zone.  What is bounded: the queries that wait for a lookup may take
-three quarters of a worker's park table (a query that finds no room is
-\fBdropped\fR and counted, \fBstore.lookup.drop.room\fR: nothing is answered, so
-a flood of names that no zone has cannot fill the table that the queries for
-zones need), the lookups out take three quarters of the places at most (the
-fetches of zones keep the rest, and a lookup that is answered "none" gives its
-place back at once), the queue of 16,384 (a lookup that finds it full is dropped
-and counted as \fBshed\fR, and its queries as \fBstore.lookup.drop.queue\fR),
-and every wait by \fBpark\-timeout\fR (a query whose lookup was not answered in
-time is dropped, \fBstore.lookup.drop.timeout\fR; so is one whose lookup waited
-in the queue until its time was up, \fBexpired\fR). A name whose lookup was shed
-(the queue was full, it expired there, or the loader said it was busy) is
-\fBremembered\fR for \fBpark\-timeout\fR, in a table of 262,144 slots (2 MB of
-address space, touched as names are remembered) that the ingest thread writes
-and every worker reads without a lock: a query for a remembered name is dropped
-by its worker at once and asks nothing (\fBstore.lookup.reask_suppressed\fR; it
-is a drop, like the others), because the request would be shed again while the
-ingest thread is behind and the asks only fill the rings.  The names are
-forgotten early when the ingest thread has caught up (its queue is empty and a
-place is free; at most eight times in a \fBpark\-timeout\fR,
-\fBstore.lookup.remember_releases\fR), so that they are asked again as soon as
-there is room; a name that finds its window of eight slots full takes the place
-of the oldest.  \fBstore.lookup.remembered\fR counts the names put in the
-table.  The ingest thread takes the requests out of the workers' rings by a time
-slice of about 1 ms for each pass (it was 64 requests, which a loop that passes
-a few hundred times a second cannot keep up with at 400,000 queries a second);
+so); a window without progress in which reads of the database failed is counted
+and said apart (\fBstore.ingest.fill_failed_windows\fR, "reads of the database
+failed"); bodies the loader answered busy or did not answer in time
+(\fBstore.ingest.fetch_timeouts\fR) leave it a stall of the queries. While the
+workers' attach rings hold 32 requests or more (the store threads are behind
+with the attaches of queries) the fill is held to its old share as while queries
+wait (\fBstore.ingest.fill_throttled\fR). The loader reads up to 16 requests of
+queries together (up to 64 while more than 16 of them queue) and up to 128 of
+the fill, and leaves one worker to the queries: \fBloader\-threads\fR - 1
+workers read the fill and the last one only the queries, the warm-up and the
+lookups; with \fBloader\-threads 1\fR (a small server) the one worker does both,
+and a batch of the fill is 128 zones only while no query came in the last
+second. A zone that a query waits for is not read again by the fill (the query's
+read brings it). The loader says how it read in one line a minute while it
+reads, and once when it stops (\fBfetch reads in 60 s: queries 120 reads 130
+zones, fill 400 reads 51200 zones (128.0 zones a read)\fR, LOG_INFO). The ingest
+thread waits for the store's journal at 4 times its limit (the disk is behind
+the fill's writes) in slices of 5 ms and makes the requests of queries between
+them, so a lookup or a fetch of a query never waits for a checkpoint
+(\fBstore.ingest.journal_wait_slices\fR counts the slices). \fBkarictl
+dbstatus\fR shows the share of the ingest thread the bodies of the fill took
+(\fBfill_busy=P%\fR in the \fBfetchq:\fR line, next to \fBingest_busy\fR). A
+name that no stored zone covers is the one thing the store cannot answer by
+itself: until the first pass has listed a zone (about a second at 100,000 zones,
+about a minute at ten million) the store does not know it.  So that such a query
+is not refused for a zone that is in the database, it is \fIlooked up\fR: the
+worker parks the query and asks the loader, on the fetch stream (which a pass on
+the first stream does not hold up), which zone of the view encloses the name
+(the name and its parent names, never the root; the longest one that the view
+serves and that is a primary zone); the loader finds it with one statement and
+answers, the Backend records the zone as a manifest entry would (a known zone,
+whose body is read as for any zone the fill has not brought yet), and the query
+is answered from it.  A name that no zone has is REFUSED, as for any name the
+server does not serve (also when the loader has no lookup); when the loader does
+not answer within \fBpark\-timeout\fR the query is dropped, and so is a query
+whose lookup failed (see below).  A loader that is away for a while (it was
+restarted, its stream broke) does not turn this into REFUSED: while the pass of
+the view is pending the lookup waits in the Backend's queue for the loader and
+is dropped when \fBpark\-timeout\fR is up; REFUSED is for a loader that has no
+lookup (its HELLO says so), a view that takes no database zones, and a pass that
+has ended.  The same holds for the moment after a start, before the first loader
+has said its HELLO: the Backend expects a loader that looks names up (the one of
+the package), so a query that comes in that moment waits for it as well (until
+then such queries were REFUSED for about the first second of a first start); a
+loader whose HELLO says it has no lookup ends the wait, and the queries are
+REFUSED as before.  A loader that answers "busy" is overload, and the queries
+are dropped, not answered SERVFAIL.  This is done only for a QUERY of the class
+IN, only while the first pass of that view has not ended and the loader offers
+it (after the pass an unknown name is REFUSED at once, with no round trip, so
+that random names never reach the database), once per query (a query that comes
+back with the answer of the lookup, or after its time was up, is not parked
+again; one that is woken without the answer, by the wake of every query after a
+wake ring that overflowed, is parked again for the lookup until its first
+deadline, so that a zone that exists is not refused for a lost wake-up).  A
+lookup is a fetch of the class of the queries' fetches: it takes a place of
+\fBfetch\-concurrency\fR like the fetch of a zone and waits for one in a queue
+of its own (until \fBpark\-timeout\fR) when there is none, so a query is not
+REFUSED for the lack of a place (the fixed window of 32 lookups of the first 0.7
+builds is gone): when the worker cannot make the request now, because its ring
+to the ingest thread is full, the query stays parked as pending and the worker
+asks again (\fBtake_fail\fR), as for the fetch of a zone.  What is bounded: the
+queries that wait for a lookup may take three quarters of a worker's park table
+(a query that finds no room is \fBdropped\fR and counted,
+\fBstore.lookup.drop.room\fR: nothing is answered, so a flood of names that no
+zone has cannot fill the table that the queries for zones need), the lookups out
+take three quarters of the places at most (the fetches of zones keep the rest,
+and a lookup that is answered "none" gives its place back at once), the queue of
+16,384 (a lookup that finds it full is dropped and counted as \fBshed\fR, and
+its queries as \fBstore.lookup.drop.queue\fR), and every wait by
+\fBpark\-timeout\fR (a query whose lookup was not answered in time is dropped,
+\fBstore.lookup.drop.timeout\fR; so is one whose lookup waited in the queue
+until its time was up, \fBexpired\fR). A name whose lookup was shed (the queue
+was full, it expired there, or the loader said it was busy) is \fBremembered\fR
+for \fBpark\-timeout\fR, in a table of 262,144 slots (2 MB of address space,
+touched as names are remembered) that the ingest thread writes and every worker
+reads without a lock: a query for a remembered name is dropped by its worker at
+once and asks nothing (\fBstore.lookup.reask_suppressed\fR; it is a drop, like
+the others), because the request would be shed again while the ingest thread is
+behind and the asks only fill the rings.  The names are forgotten early when the
+ingest thread has caught up (its queue is empty and a place is free; at most
+eight times in a \fBpark\-timeout\fR, \fBstore.lookup.remember_releases\fR), so
+that they are asked again as soon as there is room; a name that finds its window
+of eight slots full takes the place of the
+oldest.  \fBstore.lookup.remembered\fR counts the names put in the table.  The
+ingest thread takes the requests out of the workers' rings by a time slice of
+about 1 ms for each pass (it was 64 requests, which a loop that passes a few
+hundred times a second cannot keep up with at 400,000 queries a second);
 \fBstore.lookup.drain.passes\fR, \fB.drain.cut\fR (passes that ended at the
 slice with work left), \fB.drain.pass_max\fR and \fB.drain.pass_max_us\fR (the
 most requests, and the longest time, of one pass since the start) show it.  What

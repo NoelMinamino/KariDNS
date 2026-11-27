@@ -1483,11 +1483,15 @@ queries meanwhile
 attaches of queries waited or a checkpoint of the store ran; windows of a minute
 in which the fill had work and no body of it came (queries took the loader
 first: a WARNING says so, a NOTICE when it goes on); \fBfill_failed_windows\fR:
-windows without progress because the fill's own reads failed (busy, unread, not
-answered in time) or a failed round waited to be made again, which the WARNING
-says instead ("its reads failed or are paused"); a request the loader did not
-answer in time is counted apart from a read that failed in the window's line of
-the queries not answered
+windows without progress in which reads of the database failed (the fill's, or
+any), which the WARNING says instead ("reads of the database failed"); a body
+the loader answered busy or did not answer in time is the loader being behind,
+as under a flood of queries, and leaves the window a stall of the queries
+.TP 8
+\fBstore.ingest.fetch_timeouts\fR
+0.7: fetches the loader did not answer within the time the ingest thread waits
+(30 s); counted apart from reads that failed, in the window's line of the
+queries not answered too ("the loader did not answer N requests in time")
 .TP 8
 \fBstore.checkpoint.slow_bytes\fR, \fBstore.checkpoint.slow_paced_us\fR
 0.7: table bytes bulk checkpoints wrote at 32 MiB/s because attaches of queries
