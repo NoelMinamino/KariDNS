@@ -520,7 +520,7 @@ static void test_domain_names_match_ci(void) {
     CHECK(domain_names_match_ci("example.com", "example.com."));   /* only one side has the root dot */
     CHECK(domain_names_match_ci("example.com.", "EXAMPLE.com"));
     CHECK(!domain_names_match_ci("example.com.", "example.org."));
-    CHECK(!domain_names_match_ci("example.com", "example.co"));
+    CHECK(!domain_names_match_ci("example.localhost", "example.local"));   /* a string prefix; both names reserved (RFC 6761, RFC 6762) */
     CHECK(!domain_names_match_ci("a.example.com.", "example.com."));
     CHECK(!domain_names_match_ci(NULL, "example.com"));
     CHECK(!domain_names_match_ci("example.com", NULL));

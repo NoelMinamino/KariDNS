@@ -375,7 +375,7 @@ sh tests/run_all_suite.sh
 # The browser tests of the web interface (Firefox, geckodriver) are left out unless asked for: --with-gui, or --only-gui
 sh tests/run_all_suite.sh --with-gui
 
-# Coverage report (clang source-based coverage; see docs/COVERAGE_STATUS.md)
+# Coverage report (clang source-based coverage; tiers, thresholds and the latest figures: tests/TEST_MATRIX.md section 4.3)
 make coverage
 ```
 

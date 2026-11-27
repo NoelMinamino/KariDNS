@@ -6,8 +6,8 @@ page and PowerDNS's [Compliance](https://www.powerdns.com/compliance) page.
 
 **This document is based on direct source-code inspection.** Each entry cites the relevant file /
 function name as evidence. Test coverage is tracked separately: the tests are indexed in
-[`tests/TEST_MATRIX.md`](tests/TEST_MATRIX.md) (section 2 maps each RFC to its tests) and line/branch coverage in
-[`docs/COVERAGE_STATUS.md`](docs/COVERAGE_STATUS.md). **Implementation status and test coverage are two different axes.**
+[`tests/TEST_MATRIX.md`](tests/TEST_MATRIX.md) (section 2 maps each RFC to its tests) and line/branch coverage by the coverage gate
+([`tests/TEST_MATRIX.md` section 4.3](tests/TEST_MATRIX.md#43-coverage-gate-tiers-and-thresholds)). **Implementation status and test coverage are two different axes.**
 
 Legend:
 - ✅ **Full** — Core requirements (MUST/SHOULD) are implemented. Deliberate deviations are named in the notes.

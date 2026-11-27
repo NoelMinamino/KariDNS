@@ -8,8 +8,8 @@ A pull request that changes behaviour adds its line here (docs/RELEASING.md).
 
 ## 0.7.0 (unreleased)
 
-The pull requests of this section are #178 to #256 (the 0.6.2 tag is at #177). Figures are the ones the pull
-request bodies report; the host, load and method are in the pull request.
+The pull requests of this section are the ones merged after the 0.6.2 tag (#177), from #178 on. Figures are the
+ones the pull request bodies report; the host, load and method are in the pull request.
 
 ### Upgrade notes / incompatible changes
 
@@ -99,7 +99,8 @@ What changes, what it breaks, and what to do. The step-by-step version is [docs/
   error with file and line, for: an invalid `rate-limit` value (negative, above INT_MAX, not a number, `window 0`,
   prefix length out of range; it was a warning and the default stayed, #248); an `alias-max-refresh-time` outside 5 s
   .. 1 day (#234); a `store-max-zones` outside 1024..2^31 (#211); `router-threads` / `worker-threads` out of range
-  (#220). Fix: correct the value; `karicheck conf` finds them before the upgrade.
+  (#220); a `program-timeout` or `forward-timeout` of 0 or above 30000 ms (#287). Fix: correct the value;
+  `karicheck conf` finds them before the upgrade.
 - **Stricter zone files** (#247). 0.7 refuses what 0.6 loaded wrongly or dropped silently. Fix: run `karicheck zone`
   on every zone file before the upgrade (docs/UPGRADING.md lists them).
   - tinydns IPv4: exactly four decimal octets 0-255 in every line type (`999.1.1.1`, `1.2.3.4junk` and `not-an-ip`
@@ -159,7 +160,9 @@ What changes, what it breaks, and what to do. The step-by-step version is [docs/
 - **WebAdmin / signer file and connection checks** (#187). The TOTP key file and the TLS key must be owned by the
   service user and are opened once with `O_NOFOLLOW` and checked on the descriptor; `sslmode` `allow` / `prefer` to a
   host that is not local is refused (node-pg would send plain text); the service refuses to start while
-  `totp.key.new` exists.
+  `totp.key.new` exists. `karidns-signer.conf` and `karidns-webadmin.conf` must be regular files of root or the
+  service user that group and others cannot write, and the signer's SQLite3 file must not be readable by others
+  (#253; `service karidns_signer configtest` names the file and the fix).
 - **`karidns-zone` uses libidn2** when it is found (`karidns-zone idn`, #196, #200); the FreeBSD packages already
   depend on it through dag. dag's `+idnin` follows dig 9.20 exactly: an ASCII name is sent as typed (no lower
   casing) and a name libidn2 rejects as DISALLOWED is converted again transitionally (#197).
@@ -174,14 +177,20 @@ What changes, what it breaks, and what to do. The step-by-step version is [docs/
   change an existing `/var/log/named`, signer work directory or WebAdmin key directory; a missing one is made for the
   configuration's user, or the start is refused and says what to set (`karidns_log_owner`); no fallback to `bind`.
   `karidns-signer` requires `karidns-zone` (docs/distribution.md has the upgrade order).
-- **Defaults still to land**: the `memory-limit` default for small VPS installs is not in main yet (see
-  docs/UPGRADING.md).
+
+### Not in 0.7
+
+- **Program zones are TEST-ONLY** (`type program`, `allow-program-zones`): the plugin drops to `program-user` but
+  runs outside the Capsicum sandbox, not confined. Do not use them in production; a confined ("guarded") mode is
+  planned for 0.8.
+- **XoT and DoT are not supported**: the server has no TLS listener, so zone transfers over TLS (RFC 9103) and
+  queries over TLS (RFC 7858) are planned for 0.8. dag, the client, does speak TLS and HTTPS.
 
 ### Security
 
 Fixes from the external reviews and audits of the 0.7 cycle. Each has a test that fails before the fix.
 
-- **Program and forward zones, review D-L8**: `program-timeout` and `forward-timeout` are 1 to 30000 ms. They took 0 to
+- **Program and forward zones, review D-L8** (#287): `program-timeout` and `forward-timeout` are 1 to 30000 ms. They took 0 to
   2^31-1 (24 days), so a hung plugin or forwarder could hold an async thread and a reload's reader that long; 0 (which
   meant the default, 2000) and larger values are configuration errors now.
 
@@ -259,9 +268,18 @@ Fixes from the external reviews and audits of the 0.7 cycle. Each has a test tha
 
 ### Bug fixes
 
-- **Zone store tables and swap**: above `store-table-memory` (new, restart-only; default the RAM less `memory-limit`
-  and a quarter of the RAM) the server deactivates the clean file pages of the store's tables, index and first-fill
-  runs a slice at a time, so the kernel frees them before it swaps other memory (100M zones on 16 GB swapped before).
+- **Zone store tables in private memory** (#262): a first fill of 100M zones was killed after 8.6 min (13.5 GB of private
+  table pages, swap full). A fuzzy checkpoint now gives the written private pages back to their file, and a checkpoint is due
+  when the private pages grew by `tables_private_max` (default RAM/32, 64 MiB .. 1 GiB); new `store.tables.private_*` stats.
+- **Zone store indexes in a first fill** (#263): the ix / sx indexes no longer grow in anonymous memory during the
+  listing pass of a first fill (about 165 B a name, never given back; 100M zones x 10 went to swap on a 16 GB host).
+  New names go to a bounded index delta, and after the pass the indexes are built once, in files, within an eighth
+  of `memory-limit` (`store.index.delta.*`, `store.index.build.*`). 1M zones x 10 at `memory-limit 256M`: peak private
+  index memory 42.7 MB to 16 KiB, fill time 37-41 s to 40-43 s. No format change.
+- **Zone store tables and swap** (#263): above `store-table-memory` (new, restart-only; default the RAM less
+  `memory-limit` and a quarter of the RAM) the server deactivates the clean file pages of the store's tables, index
+  and first-fill runs a slice at a time, so the kernel frees them before it swaps other memory (100M zones on 16 GB
+  swapped before).
 - **Stop with a zone store**: the manager gives a backend that is writing the clean checkpoint of its zone store up
   to 120 seconds (it logs at 10 seconds that it waits; a second SIGTERM still kills at once). Before, a kill at 10
   seconds while the fsync() calls waited for the disk made the next start go back to the last bulk checkpoint of a
@@ -303,6 +321,13 @@ server on pc31 with 8 CPUs and a one-queue em0, or on a VM; the client on anothe
   - workers reading their own sockets (#227) and reply packing (#230): worker CPU at 550k 72 % to 55 %, router CPU
     46 % to 36 %, `memset` of `edns_info_t` 9.5 % to 1.2 % of the worker; 1 CPU 120k to at least 210k, 2 CPUs 225k to
     300k. Known: with packing the routers lose 0.13-0.23 % at 650k and above on the one-queue NIC (#230).
+- **Work stealing between workers** (#283; `udp-receive backend`, 2 or more workers, no option): an idle worker reads
+  a batch at a time from the socket of a worker that is behind, so a few client flows no longer fill one worker's
+  socket while the others wait; `karictl ipcstats` shows `ipcworker.<w>.stolen` and `.lent`. pc31, default 4R+4W,
+  20,000 zone-file zones, `minimal-responses yes`, dnsqps from pc41, at most 0.1 % loss: 24 flows 800k to 1.0M qps;
+  192 flows unchanged at 1.0M, about the 1 GbE wire for these answers. 4R+8W at 24 flows: 825k.
+- **No per-query lookup of the zone's configuration** (#275): the entry remembers its `zone { }` block for the
+  configuration in force. Same setup as above: 192 flows 900k to 1.0M qps, 24 flows 775k to 800k.
 - **Database fetch path** (#184): 500 to 2,638 zones/s with defaults, average latency 8 to 1.5 ms, maximum 0.65 s to
   22 ms.
 - **Cold start of 10M zones on ZFS COPY** (#193, #194; 8 vCPU VM): 95 % of the steady rate after 4-5 s instead of

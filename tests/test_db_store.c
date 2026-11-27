@@ -4126,6 +4126,22 @@ static int rq_collect(ch_t *fc, rq_t *out, int max, int ms) {
     }
     return n;
 }
+/* the requests when at least one is expected: up to first_ms for the first one (it can come after a batch's commit, behind a slow fsync: CI flakes row 91), then
+ * the usual quiet window, so that a passing run is not slower */
+static int rq_collect_q(ch_t *fc, rq_t *out, int max, int first_ms, int quiet_ms) {
+    int n = 0;
+    kdb_msg_t m;
+    int wait = first_ms;
+    while (ch_next(fc, &m, wait)) {
+        if (m.type == KDB_T_FETCH_REQ) wait = quiet_ms;
+        if (m.type != KDB_T_FETCH_REQ || n >= max) continue;
+        snprintf(out[n].name, sizeof(out[n].name), "%s", m.u.fetch_req.name);
+        out[n].id = m.u.fetch_req.request_id;
+        out[n].sid = m.u.fetch_req.source_id;
+        n++;
+    }
+    return n;
+}
 
 static bool wait_rec(store_t *st, const char *name, uint8_t state, uint32_t serial, uint64_t gen, bool stale, int ms);
 static int run_fixes(const char *dir) {
@@ -4787,7 +4803,7 @@ static int run_stamp_race(const char *dir) {
         p_changes(a[0], &e, bid, ++cur, true, rc0, 1);
         p_batch_end(a[0], &e, bid++, 1, 0);
         CHECK(p_result(&mainc, &m, 10000));
-        n = rq_collect(&fetchc, rq, 16, 1500);
+        n = rq_collect_q(&fetchc, rq, 16, 10000, 300);
         CHECK(n == 1 && rq_find(rq, n, "."));
         hk_set(4, HK_UPSERT, ".", 9100, 2, 5);
         atomic_store(&g_hk_arrived, 0);
@@ -4808,7 +4824,7 @@ static int run_stamp_race(const char *dir) {
         p_changes(a[0], &e, bid, ++cur, true, rc0, 1);
         p_batch_end(a[0], &e, bid++, 1, 0);
         CHECK(p_result(&mainc, &m, 10000));
-        n = rq_collect(&fetchc, rq, 16, 1500);
+        n = rq_collect_q(&fetchc, rq, 16, 10000, 300);
         CHECK(n == 1 && rq_find(rq, n, "."));
         hk_set(5, HK_DELETE, ".", 9100, 0, 0);
         atomic_store(&g_hk_arrived, 0);
@@ -4831,7 +4847,7 @@ static int run_stamp_race(const char *dir) {
     p_changes(a[0], &e, bid, ++cur, true, c, 1);
     p_batch_end(a[0], &e, bid++, 1, 0);
     CHECK(p_result(&mainc, &m, 10000));
-    n = rq_collect(&fetchc, rq, 16, 1500);
+    n = rq_collect_q(&fetchc, rq, 16, 10000, 300);
     CHECK(n == 1 && rq_find(rq, n, nc));
     hk_set(6, HK_FAULT, nc, p_sid(ZC), 0, 0);
     qc = rq_find(rq, n, nc);
@@ -4927,10 +4943,19 @@ static int run_stamp_race(const char *dir) {
 }
 
 /* The ZONE_RESULTs with a source id (the answers to upserts with KDB_EF_HOLD that were not held) up to BATCH_RESULT: their number, or -1 (no BATCH_RESULT) */
-static int p_result_holds(ch_t *mainc, kdb_msg_t *m, int ms, int64_t *sid, uint8_t *status, int max) {
+/* the wait for the answer of a batch: BATCH_RESULT comes once the batch is durable (db_store_batch_end(): store_commit() waits for the flusher's fsync), and
+ * under a loaded suite one fsync took more than 10 s (CI flakes row 91).  A late answer of an earlier batch is skipped by its batch id, so one slow
+ * batch is one failure, not a cascade of every check after it */
+#define STORE_IO_WAIT_MS 60000
+static int p_result_holds(ch_t *mainc, kdb_msg_t *m, int ms, uint64_t want_bid, int64_t *sid, uint8_t *status, int max) {
     int n = 0;
     while (ch_next(mainc, m, ms)) {
-        if (m->type == KDB_T_BATCH_RESULT) return n;
+        if (m->type == KDB_T_BATCH_RESULT) {
+            if (m->u.batch_result.batch_id == want_bid) return n;
+            printf("  (a late BATCH_RESULT of batch %llu skipped, waiting for %llu)\n", (unsigned long long)m->u.batch_result.batch_id, (unsigned long long)want_bid);
+            n = 0;                                                   /* (its hold answers were the other batch's) */
+            continue;
+        }
         if (m->type == KDB_T_ZONE_RESULT && m->u.zone_result.has_source_id && n < max) {
             sid[n] = m->u.zone_result.source_id;
             status[n] = m->u.zone_result.status;
@@ -5013,7 +5038,7 @@ static int run_signer_hold(const char *dir) {
     p_changes(a[0], &e, bid, ++cur, true, c, 1);
     p_batch_end(a[0], &e, bid++, 1, 0);
     CHECK(p_result(&mainc, &m, 10000));
-    int n = rq_collect(&fetchc, rq, 16, 1500);
+    int n = rq_collect_q(&fetchc, rq, 16, 10000, 300);
     CHECK(n == 1 && rq_find(rq, n, nh));
     if (n == 1) send_zone(f[0], &e, nh, 1, rq[0].id, p_sid(ZH));
     CHECK(wait_rec(st, rh, STORE_STATE_STORED, 1, 1, false, 10000));
@@ -5025,10 +5050,10 @@ static int run_signer_hold(const char *dir) {
     p_batch_begin(a[0], &e, bid, KDB_BATCH_AUTO, 0);
     p_changes(a[0], &e, bid, ++cur, true, c, 2);
     p_batch_end(a[0], &e, bid++, 2, 0);
-    int nhs = p_result_holds(&mainc, &m, 10000, hs, hst, 8);
+    int nhs = p_result_holds(&mainc, &m, STORE_IO_WAIT_MS, bid - 1, hs, hst, 8);
     CHECK(nhs == 1 && hs[0] == p_sid(ZN) && hst[0] == KDB_ST_APPLIED);
     if (nhs != 1) printf("  (hold answers: %d, first sid %lld)\n", nhs, nhs > 0 ? (long long)hs[0] : 0LL);
-    n = rq_collect(&fetchc, rq, 16, 1500);
+    n = rq_collect_q(&fetchc, rq, 16, 10000, 300);
     CHECK(n == 1 && rq_find(rq, n, nn) && !rq_find(rq, n, nh));
     if (n >= 1 && rq_find(rq, n, nn)) send_zone(f[0], &e, nn, 1, rq_find(rq, n, nn)->id, p_sid(ZN));
     CHECK(wait_rec(st, rn, STORE_STATE_STORED, 1, 1, false, 10000));
@@ -5039,7 +5064,7 @@ static int run_signer_hold(const char *dir) {
     p_batch_begin(a[0], &e, bid, KDB_BATCH_AUTO, 0);
     p_changes(a[0], &e, bid, ++cur, true, c, 2);
     p_batch_end(a[0], &e, bid++, 2, 0);
-    nhs = p_result_holds(&mainc, &m, 10000, hs, hst, 8);
+    nhs = p_result_holds(&mainc, &m, STORE_IO_WAIT_MS, bid - 1, hs, hst, 8);
     CHECK(nhs == 1 && hs[0] == p_sid(ZN) && hst[0] == KDB_ST_UNCHANGED);
     n = rq_collect(&fetchc, rq, 16, 1000);
     CHECK(n == 0);
@@ -5050,9 +5075,9 @@ static int run_signer_hold(const char *dir) {
     p_batch_begin(a[0], &e, bid, KDB_BATCH_AUTO, 0);
     p_changes(a[0], &e, bid, ++cur, true, c, 1);
     p_batch_end(a[0], &e, bid++, 1, 0);
-    CHECK(p_result_holds(&mainc, &m, 10000, hs, hst, 8) == 0);
+    CHECK(p_result_holds(&mainc, &m, STORE_IO_WAIT_MS, bid - 1, hs, hst, 8) == 0);
     CHECK(zrec(st, rh, &z) && (z.flags & STORE_F_STALE) && !(z.flags & STORE_F_SIGNER_HELD));
-    n = rq_collect(&fetchc, rq, 16, 1500);
+    n = rq_collect_q(&fetchc, rq, 16, 10000, 300);
     CHECK(n == 1 && rq_find(rq, n, nh));
     if (n == 1) send_zone(f[0], &e, nh, 2, rq[0].id, p_sid(ZH));
     CHECK(wait_rec(st, rh, STORE_STATE_STORED, 2, 2, false, 10000));
@@ -5065,7 +5090,7 @@ static int run_signer_hold(const char *dir) {
     p_batch_begin(a[0], &e, bid, KDB_BATCH_AUTO, 0);
     p_changes(a[0], &e, bid, ++cur, true, c, 1);
     p_batch_end(a[0], &e, bid++, 1, 0);
-    CHECK(p_result_holds(&mainc, &m, 10000, hs, hst, 8) == 0);
+    CHECK(p_result_holds(&mainc, &m, STORE_IO_WAIT_MS, bid - 1, hs, hst, 8) == 0);
     CHECK(zrec(st, rh, &z) && z.serial == 2 && z.stamp_gen == 3 && (z.flags & STORE_F_SIGNER_HELD));
     CHECK(!scan_wants(p_sid(ZH)));
     db_recon_held_reset();                                              /* (what the HELLO of a loader did before 0.7 (d)) */
@@ -5075,7 +5100,7 @@ static int run_signer_hold(const char *dir) {
     p_batch_begin(a[0], &e, bid, KDB_BATCH_AUTO, 0);
     p_changes(a[0], &e, bid, ++cur, true, c, 1);
     p_batch_end(a[0], &e, bid++, 1, 0);
-    CHECK(p_result_holds(&mainc, &m, 10000, hs, hst, 8) == 0);
+    CHECK(p_result_holds(&mainc, &m, STORE_IO_WAIT_MS, bid - 1, hs, hst, 8) == 0);
     CHECK(zrec(st, rh, &z) && (z.flags & STORE_F_SIGNER_HELD) && z.stamp_gen == 3);
     db_recon_held_carry();
     CHECK(!scan_wants(p_sid(ZH)));                                      /* (carried: the scan passes it until the first batch has said which zones wait) */
@@ -5086,7 +5111,7 @@ static int run_signer_hold(const char *dir) {
     p_batch_begin(a[0], &e, bid, KDB_BATCH_STARTUP, 0);
     p_changes(a[0], &e, bid, ++cur, true, c, 1);
     p_batch_end(a[0], &e, bid++, 1, 0);
-    CHECK(p_result_holds(&mainc, &m, 10000, hs, hst, 8) == 0);
+    CHECK(p_result_holds(&mainc, &m, STORE_IO_WAIT_MS, bid - 1, hs, hst, 8) == 0);
     CHECK(rq_collect(&fetchc, rq, 16, 1000) == 0);
     CHECK(zrec(st, rh, &z) && z.serial == 2 && z.stamp_gen == 4 && (z.flags & STORE_F_SIGNER_HELD) && !(z.flags & STORE_F_STALE));
     CHECK(!scan_wants(p_sid(ZH)));
@@ -5101,7 +5126,7 @@ static int run_signer_hold(const char *dir) {
     kdb_enc_u64(&e, 1, bid++); kdb_enc_u32(&e, 2, 1); kdb_enc_u32(&e, 3, 0); kdb_enc_u32(&e, 4, 0); kdb_enc_u8(&e, 5, KDB_BEF_SIGNER_SET);
     kdb_enc_end(&e);
     ch_send(a[0], &e);
-    CHECK(p_result_holds(&mainc, &m, 10000, hs, hst, 8) == 0);
+    CHECK(p_result_holds(&mainc, &m, STORE_IO_WAIT_MS, bid - 1, hs, hst, 8) == 0);
     db_recon_status(&rst);
     CHECK(rst.signer_carried == carried0 + 1);
     CHECK(db_recon_held_carry_end() == 0);                              /* (the batch end ended it already) */
@@ -5132,7 +5157,7 @@ static int p_hold_batch(int fd, ch_t *mainc, kdb_enc_t *e, uint64_t *bid, uint64
     p_batch_begin(fd, e, *bid, KDB_BATCH_AUTO, 0);
     p_changes(fd, e, *bid, ++*cur, true, &c, 1);
     p_batch_end(fd, e, (*bid)++, 1, 0);
-    return p_result_holds(mainc, &m, 10000, hs, hst, 8);
+    return p_result_holds(mainc, &m, STORE_IO_WAIT_MS, *bid - 1, hs, hst, 8);
 }
 
 /* the zone is in the store with the stamp (1,10), serial 1, and in memory (attached by a worker; store-mode copy: the version is a copy of the image) */
@@ -5257,7 +5282,7 @@ static int run_signer_presign(const char *dir) {
     /* released (no flag, the stamp the record has): asked for, installed, the hold of the version in memory let go */
     nhs = p_hold_batch(a[0], &mainc, &e, &bid, &cur, nk, p_sid(ZK), 2, false, hs, hst);
     CHECK(nhs == 0);
-    n = rq_collect(&fetchc, rq, 16, 1500);
+    n = rq_collect_q(&fetchc, rq, 16, 10000, 300);
     CHECK(n == 1 && rq_find(rq, n, nk));
     if (n == 1) send_zone(f[0], &e, nk, 2, rq[0].id, p_sid(ZK));
     CHECK(wait_rec(st, rk, STORE_STATE_STORED, 2, 2, false, 10000));
@@ -5269,7 +5294,7 @@ static int run_signer_presign(const char *dir) {
     /* -- (b) S: STALE (the body of (2,20) asked for, not here yet); a held version (3,30) keeps the image, and the body of (2,20) that comes late is dropped */
     CHECK(p_stored_resident(a[0], &mainc, &fetchc, &e, st, &bid, &cur, ZS));
     nhs = p_hold_batch(a[0], &mainc, &e, &bid, &cur, ns, p_sid(ZS), 2, false, hs, hst);
-    n = rq_collect(&fetchc, rq, 16, 1500);
+    n = rq_collect_q(&fetchc, rq, 16, 10000, 300);
     CHECK(nhs == 0 && n == 1 && rq_find(rq, n, ns));
     const uint64_t late = n == 1 ? rq[0].id : 0;
     CHECK(zrec(st, rs_, &z) && z.state == STORE_STATE_STORED && (z.flags & STORE_F_STALE));
@@ -5286,7 +5311,7 @@ static int run_signer_presign(const char *dir) {
     /* -- (b) R: the version (2,20) is refused (REJECTED_NEW); a held version (3,30) keeps the image */
     CHECK(p_stored_resident(a[0], &mainc, &fetchc, &e, st, &bid, &cur, ZR));
     nhs = p_hold_batch(a[0], &mainc, &e, &bid, &cur, nr, p_sid(ZR), 2, false, hs, hst);
-    n = rq_collect(&fetchc, rq, 16, 1500);
+    n = rq_collect_q(&fetchc, rq, 16, 10000, 300);
     CHECK(nhs == 0 && n == 1 && rq_find(rq, n, nr));
     if (n == 1) send_bad_zone(f[0], &e, nr, 2, rq[0].id, p_sid(ZR));
     bool rej = false;
@@ -5306,7 +5331,7 @@ static int run_signer_presign(const char *dir) {
     /* -- B, N: new to the Backend: read as it is (answered, asked for), marked; the image keeps the mark; a held version of it later keeps that image (still marked: it is not signed either) */
     nhs = p_hold_batch(a[0], &mainc, &e, &bid, &cur, nn, p_sid(ZN), 1, true, hs, hst);
     CHECK(nhs == 1 && hs[0] == p_sid(ZN) && hst[0] == KDB_ST_APPLIED);
-    n = rq_collect(&fetchc, rq, 16, 1500);
+    n = rq_collect_q(&fetchc, rq, 16, 10000, 300);
     CHECK(n == 1 && rq_find(rq, n, nn));
     CHECK_MSG(zrec(st, rn, &z) && (z.flags & STORE_F_SIGNER_UNSIGNED), "a new zone of the signer is not marked (flags 0x%x)", (unsigned)z.flags);
     if (n == 1) send_zone(f[0], &e, nn, 1, rq[0].id, p_sid(ZN));
@@ -5322,7 +5347,7 @@ static int run_signer_presign(const char *dir) {
     CHECK(rs.signer_unsigned == 1);                                    /* (said once for the zone) */
     /* the signer signs it: the release clears the mark */
     nhs = p_hold_batch(a[0], &mainc, &e, &bid, &cur, nn, p_sid(ZN), 3, false, hs, hst);
-    n = rq_collect(&fetchc, rq, 16, 1500);
+    n = rq_collect_q(&fetchc, rq, 16, 10000, 300);
     CHECK(nhs == 0 && n == 1 && rq_find(rq, n, nn));
     CHECK(zrec(st, rn, &z) && !(z.flags & (STORE_F_SIGNER_HELD | STORE_F_SIGNER_UNSIGNED)));
     if (n == 1) send_zone(f[0], &e, nn, 3, rq[0].id, p_sid(ZN));
@@ -5339,7 +5364,7 @@ static int run_signer_presign(const char *dir) {
     wait_retired();
     CHECK(!in_memory(nl));
     CHECK(park_fetch_request(0, "default", nl, KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL));
-    n = rq_collect(&fetchc, rq, 16, 1500);
+    n = rq_collect_q(&fetchc, rq, 16, 10000, 300);
     CHECK(n == 1 && rq_find(rq, n, nl));
     if (n == 1) send_zone(f[0], &e, nl, 2, rq[0].id, p_sid(ZL));
     CHECK(wait_rec(st, rl, STORE_STATE_STORED, 2, 2, false, 10000));

@@ -119,14 +119,11 @@ const rowIs = async (name, type, want, what) => {
     .catch((e) => { throw new Failed(`${e.message} (it holds ${JSON.stringify(got)})`); });
 };
 const setSelect = (name, value, scope = '') => b.exec((n, v, s) => { const el = document.querySelector(`${s} select[name=${n}]`); el.value = v; el.dispatchEvent(new Event('change', { bubbles: true })); }, name, value, scope);
-// (done when the second drawing after the sign-in is there: the one after GET /version, wd.mjs countDraws)
 const signIn = async (user, password) => {
   await fill('user', user);
   await fill('password', password);
-  await b.countDraws();
   await click('Sign in', 'form');
   await waitH1(/^Welcome, /);
-  await b.waitDraws(2, { message: 'the second drawing after the sign-in (GET /version)' });
 };
 const logout = async () => {
   await click('Log out', 'header');

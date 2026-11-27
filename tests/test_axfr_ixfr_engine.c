@@ -2011,23 +2011,23 @@ static void test_parse_xfr_packet_error_and_out_of_zone_rejections(void) {
     assert(standby.count == 0);
     assert(session.out_of_zone_skipped == 2);
 
-    // 4b. Suffix look-alike (label boundary): xexample.com. is not in example.com.
+    // 4b. Suffix look-alike (label boundary): xexample.test. is not in example.test. (both names reserved, RFC 6761)
     uint8_t look_pkt[256] = {0};
     look_pkt[6] = 0; look_pkt[7] = 2; // ANCOUNT = 2
     off = 12;
-    off += write_uncompressed_name(look_pkt, off, sizeof(look_pkt), "xexample.com.");
+    off += write_uncompressed_name(look_pkt, off, sizeof(look_pkt), "xexample.test.");
     look_pkt[off++] = 0; look_pkt[off++] = 1; look_pkt[off++] = 0; look_pkt[off++] = 1;
     look_pkt[off++] = 0; look_pkt[off++] = 0; look_pkt[off++] = 1; look_pkt[off++] = 0x2C;
     look_pkt[off++] = 0; look_pkt[off++] = 4;
     look_pkt[off++] = 192; look_pkt[off++] = 0; look_pkt[off++] = 2; look_pkt[off++] = 1;
-    off += write_uncompressed_name(look_pkt, off, sizeof(look_pkt), "in.example.com.");
+    off += write_uncompressed_name(look_pkt, off, sizeof(look_pkt), "in.example.test.");
     look_pkt[off++] = 0; look_pkt[off++] = 1; look_pkt[off++] = 0; look_pkt[off++] = 1;
     look_pkt[off++] = 0; look_pkt[off++] = 0; look_pkt[off++] = 1; look_pkt[off++] = 0x2C;
     look_pkt[off++] = 0; look_pkt[off++] = 4;
     look_pkt[off++] = 192; look_pkt[off++] = 0; look_pkt[off++] = 2; look_pkt[off++] = 2;
-    assert(parse_xfr_packet(look_pkt, off, &standby, &active.ver, &session, "example.com.") == 0);
+    assert(parse_xfr_packet(look_pkt, off, &standby, &active.ver, &session, "example.test.") == 0);
     assert(session.out_of_zone_skipped == 3);
-    assert(standby.count == 1 && strcasecmp(standby.records[0].name, "in.example.com.") == 0);
+    assert(standby.count == 1 && strcasecmp(standby.records[0].name, "in.example.test.") == 0);
     standby.count = 0;
 
     // 4c. An SOA whose owner is outside the zone is a protocol error: the transfer is rejected

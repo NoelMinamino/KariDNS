@@ -6,7 +6,7 @@
 
 ## WHAT IS CLAIMED
 
-The interface is built to meet **WCAG 2.1 level AA**. It is not certified: no audit by a third party, no test with people who use assistive technology, no test with a screen reader by the project (part 4 below says how to do one). The browsers are Firefox ESR (the two current ESR lines), Chrome and Edge (current and previous), Safari 17 or newer; Firefox is run by the tests, the others by part 3.
+The interface is built to meet **WCAG 2.1 level AA**. It is not certified: no audit by a third party, no test with people who use assistive technology, no test with a screen reader by the project (part 4 below says how to do one). The browsers are Firefox (the current release and the two current ESR lines), Chrome and Edge (current and previous), Safari 17 or newer. The automated tests run Firefox: CI installs the regular `firefox` package from FreeBSD's quarterly repository, and the test helper also takes `firefox-esr` when that is the one installed. The others are checked by part 3.
 
 ## 1. THE WCAG 2.1 AA CHECKLIST
 
