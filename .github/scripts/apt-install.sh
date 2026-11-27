@@ -6,6 +6,17 @@
 # update up to three times; if some lists still could not be fetched, use archive.ubuntu.com and update again.
 set -eu
 
+# The packages come from the Ubuntu archive only.  The runner image also lists the repositories of its own tools (packages.microsoft.com, ...): one
+# that answers 403 or is no longer signed makes every apt-get update fail, and the job with it (CI main run 45926251540, 2026-11-27: exit 100 on
+# packages.microsoft.com).  A source file that names neither the Ubuntu archive nor the runner's mirror list (ubuntu.sources: mirror+file:
+# /etc/apt/apt-mirrors.txt) is left out for this job.
+for f in /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
+    [ -f "$f" ] || continue
+    grep -q -E 'ubuntu\.com|apt-mirrors\.txt' "$f" && continue
+    echo "apt-install.sh: leaving out $f (not the Ubuntu archive)"
+    sudo mv "$f" "$f.apt-install-off"
+done
+
 fetched=no
 for try in 1 2 3; do
     out=$(sudo apt-get update -o Acquire::Retries=3 2>&1) || true
