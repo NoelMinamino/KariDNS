@@ -309,6 +309,8 @@ typedef struct {
   bool dd_warned;                /* the WARNING of one failed fetch was written in the window */
   bool dd_reported;              /* the last line said the queries were dropped (the NOTICE of a window whose last read ended well says that is over) */
   bool dd_last_ok;               /* the last read (since the start) ended well */
+  uint32_t fs_done;              /* 0.7 first-fill latency: bodies of the fill that came in the window of dd_tick() (a window without one while the fill has work: a stall) */
+  bool fs_reported;              /* the last window said the fill stalled (the next one with progress says it goes on) */
   char dd_why[KDB_REASON_LEN];   /* the reason of the last failed read */
   bool rf_has;                   /* what the job of the request fetch became (fetch_job_finish() to fetch_complete()) */
   uint64_t rf_id;
@@ -1650,7 +1652,24 @@ static uint32_t fill_max_for(uint32_t loader_threads) {
 static _Atomic uint32_t g_fill_max = ING_FILL_NFREQ_MIN;   /* fill_max_for(loader-threads), set_fetch_limits() */
 static void fill_max_set(uint32_t loader_threads) { atomic_store_explicit(&g_fill_max, fill_max_for(loader_threads), memory_order_relaxed); }
 static uint32_t fill_limit_calc(uint32_t nwq, uint32_t nlq, uint32_t conc, uint32_t fmax) { return nwq == 0 && nlq == 0 ? fmax : bulk_reserve_for(conc); }
-static uint32_t fill_limit(const ing_t *g) { return fill_limit_calc(g->nwq, g->nlq, atomic_load_explicit(&g_fetch_conc, memory_order_relaxed), atomic_load_explicit(&g_fill_max, memory_order_relaxed)); }
+/* 0.7 first-fill latency (W2): the attaches of stored zones for queries wait behind the fill's writes (the store threads read the segments while the fill writes them and its checkpoints sync
+ * them: pc31, PostgreSQL 10M zones under load, store.cold.p99 1.4 s).  While the workers' attach rings hold ING_FILL_ATT_BACKLOG requests or more (the store threads are behind) the fill is
+ * held to its old share as while queries wait (store.ingest.fill_throttled counts the times it began) */
+#define ING_FILL_ATT_BACKLOG 32
+static _Atomic uint64_t g_fill_throttled;
+static uint32_t fill_limit(const ing_t *g) {
+  uint32_t nwq = g->nwq;
+  if (nwq == 0 && g->nlq == 0) {
+    uint64_t shed, newest, queued;
+    park_attach_counts(&shed, &newest, &queued);
+    static bool s_held;                                      /* (this thread only: the last call held the fill back; a hold is counted once, when it begins) */
+    const bool hold = queued >= ING_FILL_ATT_BACKLOG;
+    if (hold && !s_held) atomic_fetch_add_explicit(&g_fill_throttled, 1, memory_order_relaxed);
+    s_held = hold;
+    if (hold) nwq = 1;                                       /* (the same limit as for a query that waits) */
+  }
+  return fill_limit_calc(nwq, g->nlq, atomic_load_explicit(&g_fetch_conc, memory_order_relaxed), atomic_load_explicit(&g_fill_max, memory_order_relaxed));
+}
 #ifdef KARIDNS_UNIT_TEST
 /* tests: the fill's limit of bodies in flight with nwq requests of queries and nlq lookups waiting, at fetch-concurrency conc and loader-threads lt */
 uint32_t db_ingest_test_fill_limit(uint32_t nwq, uint32_t nlq, uint32_t conc, uint32_t lt) { return fill_limit_calc(nwq, nlq, conc, fill_max_for(lt)); }
@@ -1673,6 +1692,7 @@ static _Atomic uint32_t g_fp_max_n;                        /* the most requests 
 static _Atomic uint64_t g_fp_max_ns;                       /* the longest one pass of fetch_issue() ran (and handled something), since the start */
 static _Atomic uint64_t g_fp_passes, g_fp_cut;             /* the passes that handled something, and those that ended at their bound (the time slice) with work left */
 static _Atomic uint64_t g_ing_jw_slices;                   /* 0.7 first-fill latency: slices of the journal wait in which the requests of queries were served (ing_journal_wait(), store.ingest.journal_wait_slices) */
+static _Atomic uint64_t g_fill_stalls;                     /* 0.7 first-fill latency: windows of dd_tick() in which the fill had work and no body of it came (store.ingest.fill_stalled_windows) */
 
 /* ---- 0.7 first-fill latency (W3): a database that cannot be read ----
  * The queries whose data cannot be read are not answered (never SERVFAIL while the data is being loaded, DNS_NR_DROP) and are counted (store.park.drop.failed, store.lookup.drop.failed; a
@@ -1721,6 +1741,18 @@ static void dd_tick(ing_t *g, int64_t now) {
     syslog(LOG_NOTICE, "[DB] the database is read again (%u reads ended well in the last %lld s)", g->dd_ok, secs);
     g->dd_reported = false;
   }
+  /* 0.7 first-fill latency: the fill waits while queries take the loader (queries first, fq_pick()); a window in which the fill has work and no body of it came is a stall: counted, and said
+   * once a window; the fill goes on by itself when the queries leave the loader a worker, which a NOTICE says */
+  if (g->bg_on && g->fetch_fd >= 0 && g->fs_done == 0) {
+    atomic_fetch_add_explicit(&g_fill_stalls, 1, memory_order_relaxed);
+    syslog(LOG_WARNING, "[DB] the fill of the store made no progress in the last %lld s: the queries take the loader first (%u fetches of queries and %u lookups waiting, %u in flight); it goes on when they leave it room (store.ingest.fill_stalled_windows)",
+           secs, g->nwq, g->nlq, g->nfreq);
+    g->fs_reported = true;
+  } else if (g->fs_reported && g->fs_done > 0) {
+    syslog(LOG_NOTICE, "[DB] the fill of the store goes on (%u bodies in the last %lld s)", g->fs_done, secs);
+    g->fs_reported = false;
+  }
+  g->fs_done = 0;
   g->dd_start = now;
   memcpy(g->dd_c0, c, sizeof(c));
   g->dd_fail = g->dd_ok = 0;
@@ -1788,6 +1820,8 @@ bool db_ingest_lookup_stats(store_lookup_t *out) {
   out->drop_zone_queue = park_cnt_get(PARK_CNT_ZONE_QUEUE);
   out->drop_zone_failed = park_cnt_get(PARK_CNT_ZONE_FAILED);
   out->jw_slices = atomic_load_explicit(&g_ing_jw_slices, memory_order_relaxed);
+  out->fill_throttled = atomic_load_explicit(&g_fill_throttled, memory_order_relaxed);
+  out->fill_stalls = atomic_load_explicit(&g_fill_stalls, memory_order_relaxed);
   out->remembered = park_shed_remembered();
   out->reask_suppressed = park_cnt_get(PARK_CNT_LK_REMEMBERED);
   out->remember_releases = park_shed_releases();
@@ -2110,6 +2144,7 @@ static void on_hello(ing_t *g, const kdb_msg_t *m) {
   as_reset();
   g->hello_done = true;
   g->loader_feat = h->features;
+  if (!(h->features & KDB_FEAT_STORE)) db_store_bulk_early_cancel();      /* (0.7 first-fill latency: a loader without the store protocol makes no pass: the unlogged fill begun at the start is ended, on disk) */
   scan_set(g, false);
   send_config(g, "handshake");
   atomic_store_explicit(&g_lookup_on, g->stream_fd >= 0 && g->store_proto && (h->features & KDB_FEAT_LOOKUP) != 0, memory_order_release);      /* (send_config() may have dropped the stream) */
@@ -4052,6 +4087,7 @@ static void fetch_complete(ing_t *g, ing_freq_t *r, bool ok, const char *why) {
     db_recon_note_fetch(DBR_IN_FLIGHT, g->nbulk);
     if (ok) {
       db_recon_note_fetch(DBR_FETCHED, 1);
+      g->fs_done++;                                      /* (0.7 first-fill latency: the fill moved in this window, dd_tick()) */
     } else {
       db_recon_note_fetch(DBR_FETCH_FAILED, 1);
       if (!done.loader_failed) g->bg_fail++;             /* (a busy or lost loader: the round is made again; a zone the loader cannot read is marked refused below) */
@@ -4549,7 +4585,10 @@ static void fetch_issue(ing_t *g) {
     /* in flight for the same thing: its answer wakes this worker too.  A summary does not stand in for the zone (it wakes nobody, and the query would have to ask
      * again: the request for the zone is made); the zone in flight stands in for the summary (the apex of a zone that leaves memory is made from its image) */
     ing_freq_t *r = fetch_find_zone(g, (uint16_t)vi, q.zone, q.mode);
-    if (r) continue;
+    /* 0.7 first-fill latency: a request of a query (or a transfer) does not join a body of the fill on its way: the loader reads the fill after every query (fq_pick(), karidns_dbloader.c),
+     * so the query would wait behind the fill.  It makes its own request, of its priority; the body that comes second is dropped as unchanged (the version is the one the first installed) */
+    if (r && !(r->bulk && q.mode == KDB_FETCH_FULL && q.prio == KDB_FETCH_PRIO_QUERY && !bulk && !warm)) continue;
+    r = NULL;
     /* a worker that found the zone claimed asked without a claim (B2 M1): the claimed request is queued, and it takes the place and the token, starts the fetch and wakes every
      * worker (the completion), or fails them all (fetch_refuse()).  This request would be a second one for the same zone, so it is dropped. */
     if (!q.claimed && !warm && q.mode == KDB_FETCH_FULL && q.worker >= 0 && park_claim_held(park_claim_key(q.view, q.zone))) {

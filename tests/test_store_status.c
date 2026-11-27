@@ -336,7 +336,7 @@ static bool lookup_fn(store_lookup_t *o) {
   o->ready = true;
   o->asked = 90; o->found = 40; o->none = 45; o->failed = 2; o->pending = 3; o->peak = 17; o->in_flight = 5; o->take_fail = 6; o->body_inline = 38; o->bad_body = 1; o->refused = 4;
   o->same_name = 7; o->covered = 8; o->shed = 9; o->expired = 10;
-  o->drop_lk_room = 11; o->drop_lk_timeout = 12; o->drop_lk_queue = 13; o->drop_lk_failed = 14; o->drop_zone_room = 15; o->drop_zone_timeout = 16; o->drop_zone_queue = 17; o->drop_zone_failed = 18; o->jw_slices = 19;
+  o->drop_lk_room = 11; o->drop_lk_timeout = 12; o->drop_lk_queue = 13; o->drop_lk_failed = 14; o->drop_zone_room = 15; o->drop_zone_timeout = 16; o->drop_zone_queue = 17; o->drop_zone_failed = 18; o->jw_slices = 19; o->fill_throttled = 20; o->fill_stalls = 21;
   o->remembered = 18; o->reask_suppressed = 19; o->remember_releases = 20; o->drain_passes = 21; o->drain_cut = 22; o->drain_pass_max = 23; o->drain_pass_max_ns = 24001;
   o->hist[10] = 90;                                                   /* (<= 1024 us) */
   o->max_ns = 1000000;
@@ -447,6 +447,8 @@ static void test_none(void) {
   CHECK_EQ(kv_num("store.lookup.drop.failed"), 14);
   CHECK_EQ(kv_num("store.park.drop.failed"), 18);
   CHECK_EQ(kv_num("store.ingest.journal_wait_slices"), 19);
+  CHECK_EQ(kv_num("store.ingest.fill_throttled"), 20);
+  CHECK_EQ(kv_num("store.ingest.fill_stalled_windows"), 21);
   CHECK_EQ(kv_num("store.lookup.remembered"), 18);
   CHECK_EQ(kv_num("store.lookup.reask_suppressed"), 19);
   CHECK_EQ(kv_num("store.lookup.remember_releases"), 20);

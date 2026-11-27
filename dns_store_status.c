@@ -595,6 +595,8 @@ static void add_lookup(list_t *l) {
   U("store.park.drop.queue", k->drop_zone_queue);
   U("store.park.drop.failed", k->drop_zone_failed);
   U("store.ingest.journal_wait_slices", k->jw_slices);
+  U("store.ingest.fill_throttled", k->fill_throttled);
+  U("store.ingest.fill_stalled_windows", k->fill_stalls);
   U("store.lookup.rtt.p50_us", store_status_hist_pct(k->hist, 50, k->max_ns));
   U("store.lookup.rtt.p99_us", store_status_hist_pct(k->hist, 99, k->max_ns));
   U("store.lookup.rtt.max_us", (k->max_ns + 999) / 1000);

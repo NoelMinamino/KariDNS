@@ -154,6 +154,7 @@ typedef struct store_lookup {
    * there until its time was up, the lookup failed), and the same drops for a query that waits for a zone that is out of memory (0.7 first-fill latency: a failed read is a drop too, *_failed) */
   uint64_t drop_lk_room, drop_lk_timeout, drop_lk_queue, drop_lk_failed, drop_zone_room, drop_zone_timeout, drop_zone_queue, drop_zone_failed;
   uint64_t jw_slices;            /* 0.7 first-fill latency: slices of the ingest thread's wait for the store's journal in which it served the requests of queries (store.ingest.journal_wait_slices) */
+  uint64_t fill_throttled, fill_stalls;   /* 0.7 first-fill latency: times the fill was held to its old share because the attaches of queries waited (store.ingest.fill_throttled); windows of a minute in which the fill had work and made no progress (store.ingest.fill_stalled_windows) */
   /* remembered: names whose lookup was shed that were put in the table of the shed names (park_shed_remember()); reask_suppressed: queries for such a name that their worker dropped without a request (also a drop,
    * PARK_CNT_LK_REMEMBERED); remember_releases: times the names were forgotten at once because the ingest thread had caught up.  drain_*: the passes of the ingest thread over the workers' rings and queues
    * (fetch_issue()) that handled a request: how many, how many ended at the time slice with work left, the most requests one handled, the longest one ran (ns); since the start */

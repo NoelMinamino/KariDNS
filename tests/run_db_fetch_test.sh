@@ -85,18 +85,22 @@ order=$(grep -E '^(ANS|FAILED)' "$T/out" | sed -E 's/^[A-Z]+ id=([0-9]+).*/\1/' 
 [ "$order" = "1 4 3 2 " ] && pass "the answers come in the order 1 (busy), 4 (priority 0), 3 (1), 2 (2)" || { fail "answer order '$order'"; cat "$T/out"; }
 has "the big zone arrived whole" '^ANS id=1 zone=big.test. kind=primary summary=0 .* rr=30003 '
 
-echo "== aging: a request that waited longer than the bound (200 ms) goes first"
-# one worker, kept busy by 1; 2 (priority 2) waits 600 ms; then 3, 4 (priority 0) and 20 more (priority 1) come: 2 is the only one older than the bound
+echo "== aging: a request of the warm-up that waited longer than the bound (200 ms) goes before the queries"
+# one worker, kept busy by 1; 2 (priority 1) waits 600 ms; then 3, 4 (priority 0) and 20 more (priority 1) come: 2 is the only one older than the bound
 fetch_order() { grep -E '^(ANS|FAILED)' "$T/out" | sed -E 's/^[A-Z]+ id=([0-9]+).*/\1/' | tr '\n' ' '; }
-run req:1:big.test.:1:0 begin:1 req:2:small.test.:2:0 hold:600 req:3:small.test.:0:0 req:4:small.test.:0:0 flood:20:small.test. wait:24
+run req:1:big.test.:1:0 begin:1 req:2:small.test.:1:0 hold:600 req:3:small.test.:0:0 req:4:small.test.:0:0 flood:20:small.test. wait:24
 order=$(fetch_order | cut -d' ' -f1-4)
-[ "$order" = "1 2 3 4" ] && pass "the old priority 2 request is answered right after the busy one, before priority 0 and 1" || { fail "answer order '$order'"; head -30 "$T/out"; }
+[ "$order" = "1 2 3 4" ] && pass "the old priority 1 request is answered right after the busy one, before priority 0" || { fail "answer order '$order'"; head -30 "$T/out"; }
 echo "== aging switched off: the same requests are served by priority (so the test above shows the aging)"
 KARIDNS_FETCH_AGING_MS=3600000; export KARIDNS_FETCH_AGING_MS
-run req:1:big.test.:1:0 begin:1 req:2:small.test.:2:0 hold:600 req:3:small.test.:0:0 req:4:small.test.:0:0 flood:20:small.test. wait:24
+run req:1:big.test.:1:0 begin:1 req:2:small.test.:1:0 hold:600 req:3:small.test.:0:0 req:4:small.test.:0:0 wait:4
 unset KARIDNS_FETCH_AGING_MS
+order=$(fetch_order)
+[ "$order" = "1 3 4 2 " ] && pass "without aging the priority 1 request comes after the priority 0 ones" || { fail "answer order '$order'"; head -30 "$T/out"; }
+echo "== 0.7 first-fill latency: a request of the fill (priority 2) never goes first, however long it waited"
+run req:1:big.test.:1:0 begin:1 req:2:small.test.:2:0 hold:600 req:3:small.test.:0:0 req:4:small.test.:0:0 flood:20:small.test. wait:24
 order=$(fetch_order | awk '{print $1, $NF}')
-[ "$order" = "1 2" ] && pass "without aging the priority 2 request is the last one" || { fail "first and last answer '$order'"; head -30 "$T/out"; }
+[ "$order" = "1 2" ] && pass "the priority 2 request that waited 600 ms is the last one" || { fail "first and last answer '$order'"; head -30 "$T/out"; }
 
 echo "== more requests than the queue holds"
 run req:1:big.test.:1:0 begin:1 flood:1500:small.test. hold:300 sleep:6000 req:77:small.test.:0:0 begin:77 sleep:500

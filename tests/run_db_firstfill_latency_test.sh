@@ -66,9 +66,9 @@ PA=$(kari_port 0 $((23000 + $$ % 15000)))
 SECRET="dGVzdC1zZWNyZXQtMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3"
 export ASAN_OPTIONS="detect_leaks=0:abort_on_error=0"      # (the evict command leaks what it takes out of memory on purpose)
 
-PHASES=${FFL_PHASES:-1 2}                    # (1: the fills, 2: the database that cannot be read)
+PHASES=${FFL_PHASES:-1 3 2}                  # (1: the fills, 3: a flood that stalls the fill, 2: the database that cannot be read)
 mkdir "$T/db"
-case " $PHASES " in *" 1 "*)
+case " $PHASES " in *" 1 "*|*" 3 "*)
     echo "== the database: $NZ zones, the loader waits $DELAY ms before every read of its fetch pool"
     sh tests/db/gen_sqlite3_zones.sh "$T/db/z.db" "$NZ" 11 > "$T/gen.log" 2>&1 || { echo "gen failed"; cat "$T/gen.log"; exit 1; }
     chown -R nobody "$T/db"; chmod 600 "$T/db/z.db"*
@@ -193,6 +193,26 @@ ZPR=$(echo "$FR" | sed -n 's/.*(\([0-9.]*\) zones a read).*/\1/p')
 echo "  loader: $FR"
 perl -e "exit(!(${ZPR:-0} >= 32))" && pass "the fill reads ${ZPR} zones a read (at least 32: before, about 2)" || fail "the fill reads ${ZPR:-?} zones a read"
 stop_srv
+;; esac
+
+case " $PHASES " in *" 3 "*)
+# queries first (0.7, fq_pick()): a flood of queries that keeps the one worker of loader-threads 1 busy stalls the fill; the stall is counted and said once a window, and the fill goes on by
+# itself when the flood stops (a NOTICE), to the end
+echo "== a flood of queries stalls the fill (loader-threads 1, 20 ms a read), which goes on when it stops"
+printf '#!/bin/sh\nKARIDNS_TEST_FETCH_DELAY_MS=20; export KARIDNS_TEST_FETCH_DELAY_MS\nexec %s "$@"\n' "$T/karidns-dbloader.real" > "$T/karidns-dbloader"
+rm -rf "$T/store"
+conf "$T/db/z.db" "loader-threads 1; store \"$T/store\"; memory-limit 4g;"
+start_srv
+waitfor 60 ctl_up || fail "the control channel did not answer"
+awk -v n=40000 -v hi="$NZ" 'BEGIN { srand(77); for (i = 0; i < n; i++) printf "z%d.test SOA\n", 1 + int(rand() * hi) }' > "$T/qf_flood"
+./dnsqps -s 127.0.0.1 -p "$PA" -d "$T/qf_flood" -Q 4000 -l 10 -t 1 -T 1 --json > "$T/flood.json" 2>/dev/null
+FS=$(sf store.ingest.fill_stalled_windows)
+[ "${FS:-0}" -ge 1 ] && grep -q 'the fill of the store made no progress' "$T/a.log" && pass "the flood stalled the fill: counted (store.ingest.fill_stalled_windows $FS) and said ($(grep -c 'made no progress' "$T/a.log") lines)" \
+    || fail "no stall seen: store.ingest.fill_stalled_windows ${FS:-?}, stored $(sf store.zones.stored); $(grep 'fetch reads in' "$T/a.log" | tail -1)"
+waitfor 30 grep -q 'the fill of the store goes on' "$T/a.log" && pass "the NOTICE that the fill goes on" || fail "no NOTICE that the fill goes on"
+waitfor "$MAXS" stored_all && pass "the fill went on to the end: the store holds all $NZ zones" || fail "the fill did not end: $(sf store.zones.stored) of $NZ zones"
+stop_srv
+printf '#!/bin/sh\nKARIDNS_TEST_FETCH_DELAY_MS=%s; export KARIDNS_TEST_FETCH_DELAY_MS\nexec %s "$@"\n' "$DELAY" "$T/karidns-dbloader.real" > "$T/karidns-dbloader"
 ;; esac
 
 case " $PHASES " in *" 2 "*)

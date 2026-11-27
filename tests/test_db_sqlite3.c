@@ -5208,7 +5208,7 @@ static void test_fetch_pick(void) {
     q[2].prio = KDB_FETCH_PRIO_QUERY;      q[2].at = 1002;
     q[3].prio = KDB_FETCH_PRIO_QUERY;      q[3].at = 1003;
     CHECK_MSG(fq_pick(q, 4, 1100, 200) == 2, "a query before the fill and the warm-up: %zu", fq_pick(q, 4, 1100, 200));
-    CHECK_MSG(fq_pick(q, 4, 1200, 200) == 0, "the oldest goes first once aged: %zu", fq_pick(q, 4, 1200, 200));
+    CHECK_MSG(fq_pick(q, 4, 1200, 200) == 2 && fq_pick(q, 4, 99999, 200) == 1, "the fill never goes first, aged or not; an aged warm-up request goes before a query: %zu %zu", fq_pick(q, 4, 1200, 200), fq_pick(q, 4, 99999, 200));
     CHECK(fq_pick(q, 2, 1100, 200) == 1);
     CHECK(fq_pick(q, 1, 1100, 200) == 0);
     /* one worker: DB_IN_MAX unless a query came recently; more workers: the last one never reads a large batch of the fill */

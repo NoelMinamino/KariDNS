@@ -315,6 +315,7 @@ static struct {
   _Atomic uint64_t pin_waits, pinned_peak;
   /* 0.7 fix 7 (the worker's attach): on only in MAP mode; what it did and why it did not */
   _Atomic bool nondb_writers;           /* 0.7: the configuration has secondary zones whose copies the store keeps: a first fill stays logged (db_recon_begin()) */
+  _Atomic int64_t bulk_early_ms;        /* 0.7 first-fill latency: when the unlogged fill was begun at the start, before any pass (bulk_begin_early()); 0: not begun so, or a pass has begun since */
   _Atomic uint32_t dir_pending;         /* 0.7 fix 8: the views whose list of zones (the name index) is not complete: no valid cursor at the start, and no complete pass since; bit = the view's id in the store */
   _Atomic bool wa_on;
   _Atomic uint64_t wa_ok, wa_cold, wa_over, wa_claim, wa_fail, wa_decline, wa_full, wa_adopted, wa_lost;
@@ -1900,7 +1901,23 @@ static void tables_charge(uint64_t priv, int64_t now_ms, int64_t *warned_ms) {
  * row: no pass runs, no body of the fill is in flight, and no zone waits for its body (known_now == 0), or the scan of the wanted bodies has gone through the store since the passes ended and found
  * nothing more to ask for (db_ingest_fill_scan(): the KNOWN records left are the ones the fill does not fetch, refused or not stored; after a restart the scan begins only with the loader, so the
  * fill does not end before it).  The end itself is the checkpoint thread's (store_bulk_end() does not wait), and only while no pass began meanwhile (STORE_BULK_END_IF_PASSED).  Ticker thread only */
+#define BULK_EARLY_MAX_MS (10 * 60 * 1000)
+#ifdef KARIDNS_UNIT_TEST
+_Atomic int64_t db_store_test_bulk_early_max_ms;           /* (tests: a shorter bound than BULK_EARLY_MAX_MS; 0 = the constant) */
+#define BULK_EARLY_BOUND() (atomic_load_explicit(&db_store_test_bulk_early_max_ms, memory_order_relaxed) > 0 ? atomic_load_explicit(&db_store_test_bulk_early_max_ms, memory_order_relaxed) : BULK_EARLY_MAX_MS)
+#else
+#define BULK_EARLY_BOUND() BULK_EARLY_MAX_MS
+#endif
 static void bulk_end_check(store_t *st) {
+  {                                                          /* (0.7 first-fill latency: a fill begun at the start whose first pass never began: the database cannot be read, no loader came) */
+    const int64_t e = atomic_load_explicit(&G.bulk_early_ms, memory_order_relaxed);
+    if (e && store_bulk(st) == 1 && mono_ns() / 1000000 - e >= (int64_t)BULK_EARLY_BOUND()) {
+      syslog(LOG_NOTICE, "[Store] no pass of the database began in %d minutes since the start: the unlogged first fill is given up, the store keeps its journal (the fill goes on logged when the loader comes)",
+             BULK_EARLY_MAX_MS / 60000);
+      atomic_store_explicit(&G.bulk_early_ms, 0, memory_order_relaxed);
+      (void)store_bulk_end(st, 0);
+    }
+  }
   static bool armed;
   static bool asked;                                         /* (0.7: with an index delta the end waits for its build: the call is repeated, the line said once) */
   static uint64_t idle0;
@@ -3916,6 +3933,7 @@ bool db_recon_begin(const char *view, uint64_t estimate, bool force, char *why, 
    * reserve, so that the checkpoint that makes it durable does not write the reserved index.  A fill that goes on (a pass that failed or was cut off, a restart in the middle of it) stays one) */
   /* A configuration whose secondaries keep their copies in this store does not begin one: a transfer stored during the fill would be acknowledged and not durable (dns_xfr_store.c ends a fill
    * before it writes, as a guard).  The phase is set under the store's writer mutex, which store_bulk_end() takes too: a fill that the ticker ended meanwhile is seen by store_bulk() after it */
+  atomic_store_explicit(&G.bulk_early_ms, 0, memory_order_relaxed);      /* (a pass began: a fill begun at the start is this pass's fill now, bulk_end_check() ends it as any) */
   bool unlogged = store_bulk(st) != 0;
   if (!unlogged && want > have && have == 0) {
     if (atomic_load_explicit(&G.nondb_writers, memory_order_relaxed)) syslog(LOG_INFO, "[Store] view '%s': the first fill keeps its journal: secondary zones of the configuration keep their copies in the store", view);
@@ -4466,6 +4484,33 @@ static store_t *core_start(const server_config_t *cfg, bool *created_out, bool *
   return st;
 }
 
+/* 0.7 first-fill latency: the unlogged first fill (store_bulk_begin()) of a store that is empty is begun when the store opens for a database, before any query is served.  Before, it began with
+ * the first pass, and only while the store held no zone record: under queries from the start the lookups of the first seconds record zones (db_recon_lookup()) before the pass begins, and the
+ * whole fill ran logged (pc31, PostgreSQL 10M zones under 2500 queries a second: 2.5 GB of journal, about 45 checkpoints of up to 33 s, and the attaches of queries stalled in them).  A crash goes
+ * back to the checkpoint that began it, as for any unlogged fill: what came after (the zones the lookups recorded too) is read again (store_bulk_cut()).  It ends as a fill begun by a pass does
+ * (bulk_end_check()), at a clean stop it is kept for the next start, and when no pass begins in BULK_EARLY_MAX_MS (no loader comes, the database cannot be read) it is given up and the store
+ * keeps its journal.  Not with secondaries whose copies the store keeps (nondb_writers): a copy written in an unlogged fill would not be durable (dns_xfr_store.c ends the fill before it writes
+ * one, xs_unbulk(), so a copy is never written half; it is transferred again after a crash). */
+#ifdef KARIDNS_UNIT_TEST
+_Atomic bool db_store_test_no_early_bulk;                  /* (tests of other things on an empty store, written without passes: the store keeps its journal from the start) */
+#endif
+static void bulk_begin_early(store_t *st) {
+  if (atomic_load_explicit(&G.nondb_writers, memory_order_relaxed)) return;
+#ifdef KARIDNS_UNIT_TEST
+  if (atomic_load_explicit(&db_store_test_no_early_bulk, memory_order_relaxed)) return;
+#endif
+  /* (a fill that a stop left before its passes ended goes on, and is given up the same way when no pass comes) */
+  if (store_bulk(st) == 1 || (!store_bulk(st) && store_bulk_begin(st) == 0)) atomic_store_explicit(&G.bulk_early_ms, mono_ns() / 1000000, memory_order_relaxed);
+}
+
+/* a loader without the store protocol makes no pass (its startup batch installs the zones as before 0.7): the fill begun at the start is ended, and the end is on disk before the batch writes */
+void db_store_bulk_early_cancel(void) {
+  store_t *st = atomic_load_explicit(&G.st, memory_order_acquire);
+  if (!st || !atomic_load_explicit(&G.bulk_early_ms, memory_order_relaxed) || store_bulk(st) != 1) return;
+  atomic_store_explicit(&G.bulk_early_ms, 0, memory_order_relaxed);
+  (void)store_bulk_end(st, STORE_BULK_END_WAIT);
+}
+
 bool db_store_start(const server_config_t *cfg) {
   if (!cfg) return true;
   if (g_dir.dirfd < 0) {                                     /* (no store: the secondaries made restore-pending by the initial load run without a restore) */
@@ -4543,6 +4588,7 @@ bool db_store_start(const server_config_t *cfg) {
   }
   for (int vid = 0; vid < STORE_MAX_VIEWS; vid++)
     if (vid != xvid) dmax_refresh(st, vid);                  /* (2.2: the reserved view is no directory of the query path) */
+  bulk_begin_early(st);
   atomic_fetch_add(&G.view_gen, 1);
   store_status_set_attached_fn(attached_fn);
   store_status_set_zdetail_fn(zdetail_fn);

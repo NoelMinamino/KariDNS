@@ -690,8 +690,10 @@ static bool wk_wait_answer(wk_t *k, uint8_t *out, int *len, int ms) {
 }
 
 static const char *g_self = "";
+extern _Atomic bool db_store_test_no_early_bulk;
 static int run_mode(const char *mode) {
     printf("[the zone store is the directory of the database zones: %s mode]\n", mode);
+    atomic_store(&db_store_test_no_early_bulk, true);       /* (0.7 first-fill latency: the zones here are installed without passes, the scrub and the cleaner are tested: no unlogged fill from the start) */
     char dir[] = "/tmp/test_db_store.XXXXXX";
     if (!mkdtemp(dir)) { perror("mkdtemp"); return 1; }
     char sdir[600];
@@ -4585,6 +4587,7 @@ static bool attach_mem(const char *zone, int ms) {
 
 static int run_stamp_race(const char *dir) {
     printf("[the store protocol: a fetched body is installed only for the stamp it was asked for (phase 6)]\n");
+    atomic_store(&db_store_test_no_early_bulk, true);       /* (0.7 first-fill latency: the journal faults below need a logged store) */
     char sdir[600];
     snprintf(sdir, sizeof(sdir), "%s/s", dir);
     static server_config_t cfg;
@@ -7047,6 +7050,72 @@ static int run_bulkcut(int phase, const char *dir) {
     return g_failed ? 1 : 0;
 }
 
+/* 0.7 first-fill latency: the unlogged first fill is begun when the store opens empty for a database, before any query (bulk_begin_early()).  Phase 0: the start begins it; a lookup records a
+ * zone in it (as the queries of the first seconds do); SIGKILL.  Phase 1: the start finds the fill cut off; the zone of the lookup is gone (it is looked up again), the store checks clean, the
+ * fill goes on, and since no pass begins (no loader) it is given up after the bound (shortened here) and the store keeps its journal. */
+extern _Atomic int64_t db_store_test_bulk_early_max_ms;
+static int run_bulkearly(int phase, const char *dir) {
+    printf("[the unlogged first fill begun at the start (phase %d)]\n", phase);
+    if (phase == 0) {
+        fflush(stdout);
+        const pid_t pid = fork();
+        if (pid > 0) {
+            int status = 0;
+            CHECK(waitpid(pid, &status, 0) == pid && WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL);
+            printf("%d checks, %d failed\n", g_checks, g_failed);
+            return g_failed ? 1 : 0;
+        }
+        if (pid < 0) return 1;
+    }
+    char sdir[600];
+    snprintf(sdir, sizeof(sdir), "%s/s", dir);
+    static server_config_t cfg;
+    char conf[2048];
+    snprintf(conf, sizeof(conf),
+             "options { database { driver sqlite3; database-file \"/nonexistent/z.db\"; loader-user \"nobody\"; loader-path \"/bin/true\"; store \"%s\"; store-mode copy; "
+             "store-threads 2; }; };\n"
+             "view \"default\" { match-clients { any; }; zone \"static.test\" { type master; }; };\n", sdir);
+    CHECK(parse_named_conf(conf, &cfg) == 0);
+    atomic_store_explicit(&g_config_db.active, &cfg, memory_order_release);
+    rebuild_zone_db_from_config(&cfg, false);
+    char msg[400];
+    CHECK(db_store_frontend_open(&cfg.database, false, (uid_t)-1, (gid_t)-1, msg, sizeof(msg)) && db_store_dir_fd() >= 0);
+    if (phase == 1) atomic_store(&db_store_test_bulk_early_max_ms, 300);
+    CHECK(db_store_start(&cfg) && db_store_enabled());
+    store_t *st = db_store_handle();
+    CHECK(st != NULL);
+    if (!st) return 1;
+    db_recon_entry_t e;
+    memset(&e, 0, sizeof(e));
+    e.source_id = 7001; e.name = "early.lk.test."; e.kind = KDB_ZK_PRIMARY; e.stamped = true; e.gen = 1; e.time = 10;
+    uint32_t zid = STORE_NONE;
+    dbdir_rec_t rec;
+    if (phase == 0) {
+        CHECK_MSG(store_bulk(st) == 1, "the fill is begun at the start: store_bulk %d", store_bulk(st));
+        CHECK(db_recon_lookup("default", &e, &zid) == DBR_NEW && zid != STORE_NONE);
+        CHECK(dbdir()->rec_get("default", "early.lk.test.", &rec) && rec.state == STORE_STATE_KNOWN);
+        fflush(stdout);
+        if (g_failed) return 1;
+        kill(getpid(), SIGKILL);
+    }
+    CHECK(store_bulk_cut(st) || !dbdir()->rec_get("default", "early.lk.test.", &rec));      /* (the store went back to the checkpoint that began the fill) */
+    CHECK_MSG(!dbdir()->rec_get("default", "early.lk.test.", &rec), "the zone of the lookup was unlogged: gone after the crash, looked up again");
+    {
+        store_check_report_t rep;
+        CHECK(store_check(st, &rep) == 0);
+    }
+    CHECK(store_bulk(st) == 1);                                          /* (the fill goes on) */
+    for (int i = 0; i < 400 && store_bulk(st) != 0; i++) usleep(10000);    /* (no pass begins: given up after the bound, at a tick of the ticker) */
+    CHECK_MSG(store_bulk(st) == 0, "the fill with no pass is given up: store_bulk %d", store_bulk(st));
+    CHECK(db_recon_lookup("default", &e, &zid) == DBR_NEW && zid != STORE_NONE);   /* (logged now) */
+    {
+        store_check_report_t rep;
+        CHECK(store_check(st, &rep) == 0);
+    }
+    printf("%d checks, %d failed\n", g_checks, g_failed);
+    return g_failed ? 1 : 0;
+}
+
 static int proto_main(const char *self) {
     char dir[600];
     const char *tmp = getenv("TMPDIR");
@@ -7259,6 +7328,7 @@ int main(int argc, char **argv) {
     if (argc > 2 && strcmp(argv[1], "attab") == 0) return run_attab(argv[2]);
     if (argc > 1 && strcmp(argv[1], "s5") == 0) return run_s5(argc > 2 ? argv[2] : "map");
     if (argc > 1 && strcmp(argv[1], "heap") == 0) return run_heap(argc > 2 ? atoi(argv[2]) : 100000, argc > 3 ? argv[3] : "map");
+    if (argc > 3 && strcmp(argv[1], "bulkearly") == 0) return run_bulkearly(atoi(argv[2]), argv[3]);
     if (argc > 2 && strcmp(argv[1], "proto12") == 0) return run_signer_hold(argv[2]);
     if (argc > 2 && strcmp(argv[1], "proto13") == 0) return run_signer_presign(argv[2]);
     if (argc > 2 && strncmp(argv[1], "proto", 5) == 0 && argv[1][5] == '3') return run_fixes(argv[2]);
@@ -7278,9 +7348,22 @@ int main(int argc, char **argv) {
     int rc = run_part(cmd);
     int rc2 = run_mode("map");
     int rc3 = proto_main(argv[0]);
+    int rc6 = 0;
+    {                                                       /* (0.7 first-fill latency: the fill begun at the start, a crash in it) */
+        char bdir[600];
+        const char *tmp = getenv("TMPDIR");
+        snprintf(bdir, sizeof(bdir), "%s/test_db_store_be.XXXXXX", tmp && *tmp ? tmp : "/tmp");
+        if (!mkdtemp(bdir)) rc6 = 1;
+        for (int ph = 0; ph < 2 && !rc6; ph++) {
+            snprintf(cmd, sizeof(cmd), "%s bulkearly %d %s", argv[0], ph, bdir);
+            if (run_part(cmd) != 0) rc6 = 1;
+        }
+        snprintf(cmd, sizeof(cmd), "rm -rf %s", bdir);
+        (void)!system(cmd);
+    }
     snprintf(cmd, sizeof(cmd), "%s s5 map", argv[0]);
     int rc4 = run_part(cmd);
     snprintf(cmd, sizeof(cmd), "%s s5 copy", argv[0]);
     int rc5 = run_part(cmd);
-    return (rc != 0 || rc2 != 0 || rc3 != 0 || rc4 != 0 || rc5 != 0) ? 1 : 0;
+    return (rc != 0 || rc2 != 0 || rc3 != 0 || rc4 != 0 || rc5 != 0 || rc6 != 0) ? 1 : 0;
 }

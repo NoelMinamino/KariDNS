@@ -48,6 +48,12 @@ What changes, what it breaks, and what to do. The step-by-step version is [docs/
   while one does), and the loader reads up to 128 zones of the fill a statement (16 for queries) with one worker left
   to the queries. The load on the database is bounded by `loader-threads`. The loader's queue holds 1280 requests (was
   256). The loader logs its reads once a minute (`fetch reads in 60 s: ... zones a read`).
+  A request of the fill never goes before a query in the loader, and a query does not wait for a body of the fill on
+  its way; a fill that queries stall is counted (`store.ingest.fill_stalled_windows`, one WARNING a minute) and goes on
+  by itself. While attaches of queries queue up the fill is held to 32 in flight (`store.ingest.fill_throttled`).
+- **The unlogged first fill begins when the store opens empty** (first-fill latency PR), not at the first pass: under
+  queries from the start the lookups used to make the store non-empty and the whole fill ran with its journal. With
+  no pass in 10 minutes it is given up (logged fill). Secondary copies are never written in it (put off to its end).
 - **More threads by default, and different ones** (#220, #226, #227).
   - Router and worker counts follow the CPUs the process may run on (`cpuset`, jails); from 4 CPUs half of them are
     routers (4: 2+2, 8: 4+4, 16: 8+8; 1-3 CPUs: unchanged). New restart-only `router-threads` (1..8) and

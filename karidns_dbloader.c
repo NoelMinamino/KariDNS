@@ -644,8 +644,8 @@ struct fbatch {
     int64_t lk_id[FB_MAX];
     char lk_name[FB_MAX][DNS_NAME_TEXT_SIZE];
 };
-/* A request that has waited this long in fq goes before the priorities (the oldest first): a Backend query that joined a request in flight (the background
- * fetch of a zone) would otherwise wait for it behind every later priority 0 request, for as long as those keep coming, and run into the park time-out.
+/* A request of a query or of the warm-up that has waited this long in fq goes before the priorities between them (the oldest first), so that neither starves the other;
+ * a request of the fill (the background class) never goes before them, however long it waited (0.7 first-fill latency, fq_pick()).
  * KARIDNS_FETCH_AGING_MS in the environment replaces it (a test switch: the supervisor starts the loader with a cleared environment). */
 #define FQ_AGING_MS 200
 static int64_t g_fq_aging_ms = FQ_AGING_MS;
@@ -5967,14 +5967,17 @@ static void fetch_workers_stop(struct lio *io) {
 
 /* The most urgent of the n queued requests fq[] (arrival order: [0] is the oldest, and if it is not aged none is): priority 0 before 1 before 2, the oldest first; but one that has waited
  * `aging` ms goes first (see FQ_AGING_MS). */
+static size_t fq_pick_fg(const freq_t *fq, size_t n, int64_t now, int64_t aging);
+/* 0.7 first-fill latency: a request of the fill never goes before one of a query or of the warm-up, however long it waited (with up to 1024 bodies of the fill queued the oldest request was
+ * nearly always one of the fill, and the queries waited behind it: pc31, PostgreSQL 10M zones under 2500 queries a second, 23 % lost).  The aging is kept between the queries and the
+ * warm-up; a query never joins a body of the fill on its way (the Backend asks for the zone itself, dns_db_ingest.c), which is what the aging of a background request was for.  Under a flood
+ * of queries the fill waits: queries first. */
 static size_t fq_pick(const freq_t *fq, size_t n, int64_t now, int64_t aging) {
-    size_t best = 0;
-    if (n > 0 && now - fq[0].at < aging)
-        for (size_t i = 1; i < n; i++)
-            if (fq[i].prio < fq[best].prio) best = i;
-    return best;
+    const size_t fg = fq_pick_fg(fq, n, now, aging);
+    return fg < n ? fg : 0;                                  /* (only the fill is queued: the oldest of it) */
 }
-/* the same among the requests that are not of the fill (priority < KDB_FETCH_PRIO_BACKGROUND): for a worker that may not read the fill now (fq_bg_limit()); n when there is none */
+/* the most urgent among the requests that are not of the fill (priority < KDB_FETCH_PRIO_BACKGROUND): the first of them in arrival order when it has waited `aging` ms, else the lowest
+ * priority, the oldest first; n when there is none */
 static size_t fq_pick_fg(const freq_t *fq, size_t n, int64_t now, int64_t aging) {
     size_t best = n;
     for (size_t i = 0; i < n; i++) {
