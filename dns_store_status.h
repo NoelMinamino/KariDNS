@@ -151,8 +151,9 @@ typedef struct store_lookup {
   uint64_t asked, found, none, failed, refused, same_name, covered, shed, expired, body_inline, bad_body, take_fail;
   uint64_t pending, in_flight, peak;
   /* the queries that were dropped (overload: not answered, counted, like a query that RRL drops) and the ones answered "not ready": per lookup by why (no room in the park table, its time was up, the ingest thread's queue was full or it waited
-   * there until its time was up), the lookups that failed (SERVFAIL + EDE 14), and the same drops for a query that waits for a zone that is out of memory */
-  uint64_t drop_lk_room, drop_lk_timeout, drop_lk_queue, servfail, drop_zone_room, drop_zone_timeout, drop_zone_queue;
+   * there until its time was up, the lookup failed), and the same drops for a query that waits for a zone that is out of memory (0.7 first-fill latency: a failed read is a drop too, *_failed) */
+  uint64_t drop_lk_room, drop_lk_timeout, drop_lk_queue, drop_lk_failed, drop_zone_room, drop_zone_timeout, drop_zone_queue, drop_zone_failed;
+  uint64_t jw_slices;            /* 0.7 first-fill latency: slices of the ingest thread's wait for the store's journal in which it served the requests of queries (store.ingest.journal_wait_slices) */
   /* remembered: names whose lookup was shed that were put in the table of the shed names (park_shed_remember()); reask_suppressed: queries for such a name that their worker dropped without a request (also a drop,
    * PARK_CNT_LK_REMEMBERED); remember_releases: times the names were forgotten at once because the ingest thread had caught up.  drain_*: the passes of the ingest thread over the workers' rings and queues
    * (fetch_issue()) that handled a request: how many, how many ended at the time slice with work left, the most requests one handled, the longest one ran (ns); since the start */

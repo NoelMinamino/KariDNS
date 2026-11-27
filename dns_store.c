@@ -5519,36 +5519,72 @@ static uint64_t jbound(const store_t *s, unsigned factor) {
   const uint64_t m = jmax(s);
   return factor && m > UINT64_MAX / factor ? UINT64_MAX : (uint64_t)factor * m;
 }
-uint64_t store_journal_wait(store_t *s, unsigned factor) {
-  if (!s || factor == 0 || !s->fl_on) return 0;                  /* (without the flusher the writers make the checkpoints themselves: the journal does not run ahead) */
-  const uint64_t lim = jbound(s, factor);
-  if (atomic_load_explicit(&s->jbytes, memory_order_relaxed) < lim) return 0;
-  const uint64_t t0 = st_now_us();
-  bool waited = false, warn = false;
+/* One slice of the wait (0.7 first-fill latency): w holds the wait across slices (zeroed by the caller before the first).  slice_ms 0 waits to the end.  true: the wait goes on (the slice
+ * ran out; the caller may do work that writes nothing to the store and calls again); false: there was no wait, or it is over (counted then, as one wait from its first slice). */
+bool store_journal_wait_slice(store_t *s, unsigned factor, store_jwait_t *w, unsigned slice_ms) {
+  if (!s) {                                              /* (the store is gone between two slices: nothing to wait for) */
+    w->on = false;
+    w->us = 0;
+    return false;
+  }
+  if (!w->on) {
+    if (!s || factor == 0 || !s->fl_on) return false;            /* (without the flusher the writers make the checkpoints themselves: the journal does not run ahead) */
+    w->lim = jbound(s, factor);
+    if (atomic_load_explicit(&s->jbytes, memory_order_relaxed) < w->lim) return false;
+    w->t0 = st_now_us();
+    w->waited = w->warn = false;
+    pthread_mutex_lock(&s->bg_mu);
+    w->ends = s->ck_ends;
+    pthread_mutex_unlock(&s->bg_mu);
+    w->on = true;
+  }
+  struct timespec dl;
+  if (slice_ms) {
+    clock_gettime(CLOCK_MONOTONIC, &dl);                 /* (bg_cv runs on CLOCK_MONOTONIC) */
+    dl.tv_sec += slice_ms / 1000u;
+    dl.tv_nsec += (long)(slice_ms % 1000u) * 1000000L;
+    if (dl.tv_nsec >= 1000000000L) { dl.tv_sec++; dl.tv_nsec -= 1000000000L; }
+  }
   pthread_mutex_lock(&s->bg_mu);
-  const uint64_t ends = s->ck_ends;
-  while (!s->bg_stop && s->ck_ends == ends && atomic_load_explicit(&s->jbytes, memory_order_relaxed) >= lim) {
-    if (!waited) {
+  while (!s->bg_stop && s->ck_ends == w->ends && atomic_load_explicit(&s->jbytes, memory_order_relaxed) >= w->lim) {
+    if (!w->waited) {
       const uint64_t now = st_now_ms();
-      warn = s->jw_warn_ms == 0 || now - s->jw_warn_ms >= 60000u;
-      if (warn) s->jw_warn_ms = now ? now : 1;
+      w->warn = s->jw_warn_ms == 0 || now - s->jw_warn_ms >= 60000u;
+      if (w->warn) s->jw_warn_ms = now ? now : 1;
       s->bg_kick = true;                                 /* (the checkpoint thread begins one when none runs: the journal is over journal_max_bytes) */
       pthread_cond_broadcast(&s->bg_cv);
-      waited = true;
+      w->waited = true;
     }
-    pthread_cond_wait(&s->bg_cv, &s->bg_mu);             /* (bg_release() broadcasts: the baton after a switch, the end of a checkpoint) */
+    if (!slice_ms) {
+      pthread_cond_wait(&s->bg_cv, &s->bg_mu);           /* (bg_release() broadcasts: the baton after a switch, the end of a checkpoint) */
+    } else if (pthread_cond_timedwait(&s->bg_cv, &s->bg_mu, &dl) == ETIMEDOUT) {
+      const bool more = !s->bg_stop && s->ck_ends == w->ends && atomic_load_explicit(&s->jbytes, memory_order_relaxed) >= w->lim;
+      if (more) {
+        pthread_mutex_unlock(&s->bg_mu);
+        return true;
+      }
+    }
   }
   pthread_mutex_unlock(&s->bg_mu);
-  if (!waited) return 0;
-  const uint64_t us = st_now_us() - t0;
+  w->on = false;
+  w->us = w->waited ? st_now_us() - w->t0 : 0;
+  if (!w->waited) return false;
+  if (w->us == 0) w->us = 1;
+  const uint64_t us = w->us;
   const uint64_t n = atomic_fetch_add_explicit(&s->jw_n, 1, memory_order_relaxed) + 1;
   atomic_fetch_add_explicit(&s->jw_us, us, memory_order_relaxed);
   uint64_t m = atomic_load_explicit(&s->jw_max_us, memory_order_relaxed);
   while (us > m && !atomic_compare_exchange_weak_explicit(&s->jw_max_us, &m, us, memory_order_relaxed, memory_order_relaxed)) {}
-  if (warn)
+  if (w->warn)
     st_log(s, 4, "store: the journal reached %u x journal_max_bytes (%" PRIu64 " bytes) before a checkpoint could cut it: a writer waited %" PRIu64 " ms (%" PRIu64 " waits since the open); "
-                 "the disk does not keep up with the writes (store.journal.limit_waits, store.checkpoint.max_us)", factor, lim, us / 1000u, n);
-  return us ? us : 1;
+                 "the disk does not keep up with the writes (store.journal.limit_waits, store.checkpoint.max_us)", factor, w->lim, us / 1000u, n);
+  return false;
+}
+uint64_t store_journal_wait(store_t *s, unsigned factor) {
+  store_jwait_t w;
+  memset(&w, 0, sizeof(w));
+  (void)store_journal_wait_slice(s, factor, &w, 0);
+  return w.us;
 }
 
 /* A bulk fill begins (on) or ends (off): see jmax().  Idempotent, no lock: the flag is read by the writers' checks.  The end of the fill: the journal may be past the normal size

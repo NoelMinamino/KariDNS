@@ -3,7 +3,7 @@
  *
  * Pure functions: the estimate from zone and record counts (the three bases), the share of zones that fit, the levels (INFO / NOTICE / WARNING / ERROR) and
  * their edges, the recommended memory-limit, the formatting of sizes and limits, the texts, the decision to say the lines again, and the run-time check
- * (fetch capacity from the histogram, the ingest thread's busy share and fetch-rate; SERVFAIL for overload; once a minute).  The figures are checked
+ * (fetch capacity from the histogram, the ingest thread's busy share and fetch-rate; the queries not answered for overload; once a minute).  The figures are checked
  * against the W9 measurements the constants come from (docs/karidns.md "Memory by number of zones"): the estimate must be within the manual's 10% of them.
  */
 #include "../dns_mem_advice.h"
@@ -243,7 +243,7 @@ static void test_texts(void) {
     in = mk(1000, 1000ull * 100000, 1ull << 20);                 /* zones of 10 MB: the smallest limit holds none */
     ma_estimate(&in, &e);
     l = ma_text_advice(t, sizeof(t), &e);
-    CHECK(l > 0 && strstr(t, "is too small") && strstr(t, "SERVFAIL (EDE 14)"), "advice, error: %s", t);
+    CHECK(l > 0 && strstr(t, "is too small") && strstr(t, "is not answered (not-ready-answer)"), "advice, error: %s", t);
     in = mk(1000000, 0, 0);
     in.have_records = false;
     ma_estimate(&in, &e);
@@ -386,7 +386,7 @@ static void test_runtime(void) {
     b.park_full = 2;
     b.refused = 1;                                               /* 10 in all */
     p = ma_rt_tick(&st, &b, &e, t, sizeof(t));
-    CHECK(p == LOG_WARNING && strstr(t, "10 queries were answered SERVFAIL + EDE 14") && strstr(t, "park table full 2") && strstr(t, "park-timeout 7") && strstr(t, "refused 1") &&
+    CHECK(p == LOG_WARNING && strstr(t, "10 queries were not answered for overload") && strstr(t, "with not-ready-answer servfail") && strstr(t, "park table full 2") && strstr(t, "park-timeout 7") && strstr(t, "refused 1") &&
           strstr(t, "fetch capacity") == NULL, "overload text: %d %s", p, t);
     memset(&st, 0, sizeof(st));
     a = rt0(0);

@@ -570,6 +570,11 @@ int  store_commit(store_t *s);
  * the microseconds it waited (0: no wait).  The bulk writer (the reconcile thread of a pass) uses 2, the thread that also answers lookups 4: the journal stays below 2 x
  * journal_max_bytes while the disk keeps up with the checkpoints, and below 4 x in any case (store.journal.limit_waits counts the waits).  The store's own calls never wait for it. */
 uint64_t store_journal_wait(store_t *s, unsigned factor);
+/* 0.7 first-fill latency: the same wait in slices of slice_ms (0: to the end), for a thread that has other work between them (the ingest thread: the requests of queries).  w is the wait (zeroed
+ * before the first slice); true: it goes on, call again; false: no wait, or it is over (counted once, w->us the microseconds from its first slice). */
+typedef struct { bool on, waited, warn; uint64_t t0, ends, lim, us; } store_jwait_t;
+bool store_journal_wait_slice(store_t *s, unsigned factor, store_jwait_t *w, unsigned slice_ms);
+
 /* 0.7: the bulk producer of new zones (the reconcile thread of a pass), holding no lock, calls this between its groups: while a build of the next index generation runs (it begins at
  * 3/8 of the index) and the index is past 7/16, it waits for the build to end instead of filling the old index to one half, where the growth would be made inside the writer mutex (the
  * build dropped, every zone put in again: seconds at millions of zones).  Bounded (30 s): a build that does not end is given up on once, with a WARNING, and the pass goes on.  Returns

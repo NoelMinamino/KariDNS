@@ -46,6 +46,8 @@
 static int g_checks = 0, g_failed = 0;
 #define CHECK(cond) do { g_checks++; if (!(cond)) { g_failed++; \
     printf("  [FAIL] %s:%d: %s\n", __FILE__, __LINE__, #cond); } } while (0)
+#define CHECK_MSG(cond, ...) do { g_checks++; if (!(cond)) { g_failed++; \
+    printf("  [FAIL] %s:%d: %s: ", __FILE__, __LINE__, #cond); printf(__VA_ARGS__); printf("\n"); } } while (0)
 
 void udp_one(udp_pass_t *w, udp_ipc_t *ipc_msg, uint8_t *req_buf, ssize_t payload_received);
 void park_service(udp_pass_t *w, int kq);
@@ -489,23 +491,34 @@ int main(void) {
     park_service(&w, -1);
     a = read_answer(sk[1]);
     CHECK(!a.got && table.nwait == 0 && table.nready == 0 && park_cnt_get(PARK_CNT_ZONE_TIMEOUT) == zt0 + 1);
+    /* ... with options { not-ready-answer servfail; } (0.7 W6) the same query is answered SERVFAIL + EDE 14 when its time is up, and counted the same */
+    cfg.not_ready_answer = NOT_READY_SERVFAIL;
+    SEND_QUERY(0x4002, true, 0);
+    CHECK(table.nwait == 1);
+    (void)park_fetch_pop(park_fetch_ring(0), &q);
+    usleep(30000);
+    park_service(&w, -1);
+    a = read_answer(sk[1]);
+    CHECK(a.got && a.id == 0x4002 && a.rcode == 2 && a.ede == 14 && table.nwait == 0 && park_cnt_get(PARK_CNT_ZONE_TIMEOUT) == zt0 + 2);
+    cfg.not_ready_answer = NOT_READY_DROP;
     w.park_timeout_ms = 5000;
 
-    /* -- a failed fetch: answered at once, with the same answer */
+    /* -- a failed fetch: not answered (0.7 first-fill latency: never SERVFAIL while the data is being loaded), counted at once */
+    uint64_t zfd = park_cnt_get(PARK_CNT_ZONE_FAILED);
     SEND_QUERY(0x5001, true, 0);
     CHECK(table.nwait == 1);
     (void)park_fetch_pop(park_fetch_ring(0), &q);
     CHECK(park_wake_push(park_wake_ring(0), "default", "park.test.", true));
     park_service(&w, -1);
     a = read_answer(sk[1]);
-    CHECK(a.got && a.id == 0x5001 && a.rcode == 2 && a.ede == 14 && table.nwait == 0);
-    /* ... without EDNS there is no OPT to carry the error: SERVFAIL alone */
+    CHECK(!a.got && table.nwait == 0 && park_cnt_get(PARK_CNT_ZONE_FAILED) == zfd + 1);
+    /* ... without EDNS the same */
     SEND_QUERY(0x5002, false, 0);
     (void)park_fetch_pop(park_fetch_ring(0), &q);
     CHECK(park_wake_push(park_wake_ring(0), "default", "park.test.", true));
     park_service(&w, -1);
     a = read_answer(sk[1]);
-    CHECK(a.got && a.id == 0x5002 && a.rcode == 2 && a.ede == -1);
+    CHECK(!a.got && park_cnt_get(PARK_CNT_ZONE_FAILED) == zfd + 2);
 
     /* -- a lost wake-up (the ring overflowed): every parked query looks again */
     SEND_QUERY(0x5101, true, 0);
@@ -517,12 +530,13 @@ int main(void) {
     CHECK(a.got && a.id == 0x5101 && a.rcode == 0 && a.ancount == 1);
     atomic_store(&el->entry, NULL);
 
-    /* -- a request too big to park (more than PARK_UDP_MAX bytes) and a worker without a park table: "not ready" at once; a full table is overload: the query is dropped and counted */
+    /* -- a request too big to park (more than PARK_UDP_MAX bytes) and a worker without a park table: dropped at once and counted (0.7 first-fill latency: not "not ready"); a full
+     *    table is overload: the query is dropped and counted */
     SEND_QUERY(0x6001, true, PARK_UDP_MAX);
-    CHECK(w.n_tx == 1 && table.nwait == 0 && table.n_toobig == 1);
+    CHECK(w.n_tx == 0 && table.nwait == 0 && table.n_toobig == 1 && park_cnt_get(PARK_CNT_ZONE_FAILED) == zfd + 3);
     FLUSH();
     a = read_answer(sk[1]);
-    CHECK(a.got && a.id == 0x6001 && a.rcode == 2 && a.ede == 14);
+    CHECK(!a.got);
     park_table_t tiny;
     CHECK(park_init(&tiny, 1));
     w.park = &tiny;
@@ -535,10 +549,10 @@ int main(void) {
     CHECK(!a.got);
     w.park = NULL;
     SEND_QUERY(0x6004, true, 0);
-    CHECK(w.n_tx == 1);
+    CHECK(w.n_tx == 0 && park_cnt_get(PARK_CNT_ZONE_FAILED) == zfd + 4);
     FLUSH();
     a = read_answer(sk[1]);
-    CHECK(a.got && a.id == 0x6004 && a.rcode == 2 && a.ede == 14);
+    CHECK(!a.got);
     park_free(&tiny);
 
     /* -- the time is up, but the zone is there when the request is looked at again: it is answered from the zone, not "not ready" (the TCP
@@ -639,7 +653,8 @@ int main(void) {
             w.park = &table;
             park_free(&small);
         }
-        /* the lookup failed (the database, the loader): SERVFAIL + EDE 14 at once, as the fetch of a zone that fails.  The query has an OPT record: the answer must carry the Extended DNS Error 14 (Not Ready, RFC 8914 4.15) */
+        /* the lookup failed (the database, the loader): not answered (0.7 first-fill latency: never SERVFAIL while the data is being loaded), counted once as a failed lookup (not again as a zone) */
+        const uint64_t zf_lk = park_cnt_get(PARK_CNT_ZONE_FAILED);
         {
             size_t ql_ = build_lk_query_edns(rx + sizeof(udp_ipc_t), 0x7102);
             mk_ipc((udp_ipc_t *)rx, 7, ql_); w.n_tx = 0; udp_one(&w, (udp_ipc_t *)rx, rx + sizeof(udp_ipc_t), (ssize_t)ql_);
@@ -648,7 +663,7 @@ int main(void) {
         CHECK(park_wake_push(park_wake_ring(0), "default", "www.late.test.", true));
         park_service(&w, -1);
         a = read_answer(sk[1]);
-        CHECK(a.got && a.id == 0x7102 && a.rcode == 2 && a.ancount == 0 && a.ede == 14 && table.nwait == 0 && table.nlook == 0 && park_cnt_get(PARK_CNT_LK_SERVFAIL) == 1);        /* (a failed lookup: SERVFAIL + EDE 14, as for a zone whose fetch failed) */
+        CHECK(!a.got && table.nwait == 0 && table.nlook == 0 && park_cnt_get(PARK_CNT_LK_FAILED) == 1 && park_cnt_get(PARK_CNT_ZONE_FAILED) == zf_lk);
         /* the ingest thread shed the lookup of the name lately and remembers it (park_shed_remember()): a query for it is dropped at once with no request, counted; when the names are released (the ingest thread has caught
          * up) the next query asks again.  A name that is not remembered is asked for as before. */
         {
@@ -698,7 +713,8 @@ int main(void) {
         #undef SEND_LK
     }
 
-    /* -- a caller that does not park (DoT, DoH: the engine looks the zone up itself): "not ready", not REFUSED */
+    /* -- a caller that does not park (the engine looks the zone up itself): not REFUSED; an ordinary query is not answered (DNS_NR_DROP, 0.7 first-fill latency: zone transfers and
+     *    UPDATE keep SERVFAIL + EDE 14, tests/run_db_firstfill_latency_test.sh) */
     {
         uint8_t qb2[512], rb2[4096];
         size_t ql2 = build_query(qb2, 0x7401, true, 0);
@@ -706,10 +722,20 @@ int main(void) {
         zone_db_snapshot_t *sn = acquire_zone_snapshot();
         int rl2 = process_dns_query_cap(qb2, ql2, rb2, 1232, 0, "www.park.test.", 1, "127.0.0.1", &cc, false, NULL, sn);
         rcu_reader_exit(&wctx);
-        CHECK(rl2 > 12 && rb2[0] == 0x74 && rb2[1] == 0x01 && (rb2[3] & 0x0F) == 2);
+        CHECK_MSG(rl2 == DNS_NR_DROP, "an ordinary query: %d", rl2);
+        /* not-ready-answer servfail (0.7 W6): SERVFAIL + EDE 14 "Not Ready", AA=0, as BIND */
+        const uint64_t nd0 = atomic_load(&g_not_ready_dropped_total);
+        cfg.not_ready_answer = NOT_READY_SERVFAIL;
+        ql2 = build_query(qb2, 0x7402, true, 0);
+        rcu_reader_enter(&wctx);
+        sn = acquire_zone_snapshot();
+        rl2 = process_dns_query_cap(qb2, ql2, rb2, 1232, 0, "www.park.test.", 1, "127.0.0.1", &cc, false, NULL, sn);
+        rcu_reader_exit(&wctx);
+        cfg.not_ready_answer = NOT_READY_DROP;
         bool found = false;                                                     /* the EDE option: code 15, a length, info code 14 */
         for (int i = 12; i + 6 <= rl2; i++) if (rb2[i] == 0 && rb2[i + 1] == 15 && rb2[i + 4] == 0 && rb2[i + 5] == 14) found = true;
-        CHECK(found);
+        CHECK_MSG(rl2 > 12 && rb2[0] == 0x74 && rb2[1] == 0x02 && (rb2[3] & 0x0F) == 2 && !(rb2[2] & 0x04) && found && atomic_load(&g_not_ready_dropped_total) == nd0,
+                  "servfail: %d rcode %d EDE 14 %d", rl2, rl2 > 12 ? rb2[3] & 0x0F : -1, found);
     }
 
     /* -- the request to fetch cannot be handed over (the ring is full): the query is not answered "not ready" for that; it stays parked, the request is marked pending and the
@@ -722,11 +748,12 @@ int main(void) {
     while (park_fetch_pop(park_fetch_ring(0), &q)) {}                           /* (the ingest thread took them: there is room) */
     park_service(&w, -1);
     CHECK(table.nwait == 1 && table.nunsent == 0 && park_fetch_pop(park_fetch_ring(0), &q) && strcmp(q.zone, "park.test.") == 0 && q.prio == KDB_FETCH_PRIO_QUERY && !park_fetch_pop(park_fetch_ring(0), &q));
-    (void)park_fail(&table, "default", "park.test.");                           /* (the fetch failed: the query is answered) */
+    const uint64_t zf_ring = park_cnt_get(PARK_CNT_ZONE_FAILED);
+    (void)park_fail(&table, "default", "park.test.");                           /* (the fetch failed: the query is dropped, counted) */
     park_service(&w, -1);
     FLUSH();
     a = read_answer(sk[1]);
-    CHECK(a.got && a.id == 0x7101 && a.rcode == 2 && a.ede == 14 && table.nwait == 0 && table.nfree == table.cap);
+    CHECK(!a.got && table.nwait == 0 && table.nfree == table.cap && park_cnt_get(PARK_CNT_ZONE_FAILED) == zf_ring + 1);
 
     /* -- a TSIG-signed request gets a signed "not ready" answer (RFC 8945 5.3: the key of the verified request, the request's MAC): the same
      *    handling as every other answer of the engine */
@@ -744,20 +771,19 @@ int main(void) {
         CHECK(k1 && tsig_verify_packet(req_copy, sl, k1, NULL, 0, NULL, 0, false, req_mac, &req_mac_len) == 0);
         mk_ipc((udp_ipc_t *)rx, 7, sl);
         w.n_tx = 0;
+        const uint64_t zf_ts = park_cnt_get(PARK_CNT_ZONE_FAILED);
         udp_one(&w, (udp_ipc_t *)rx, qb, (ssize_t)sl);
-        CHECK(w.n_tx == 1);
+        CHECK(w.n_tx == 0 && park_cnt_get(PARK_CNT_ZONE_FAILED) == zf_ts + 1);     /* (0.7 first-fill latency: a validly signed ordinary query is not answered "not ready" either: it is dropped) */
         FLUSH();
-        uint8_t raw[sizeof(udp_ipc_t) + 4096];
-        struct pollfd pf = { sk[1], POLLIN, 0 };
-        ssize_t rn = poll(&pf, 1, 1000) > 0 ? recv(sk[1], raw, sizeof(raw), MSG_PEEK) : -1;
-        CHECK(rn > (ssize_t)sizeof(udp_ipc_t) + 12);
-        tsig_rr_t trr;
-        const uint8_t *rm = raw + sizeof(udp_ipc_t);
-        size_t rml = rn > (ssize_t)sizeof(udp_ipc_t) ? (size_t)rn - sizeof(udp_ipc_t) : 0;
-        CHECK(rml > 0 && tsig_parse_rr(rm, rml, &trr) == 1 && strcasecmp(trr.key_name, "k1.") == 0);
-        CHECK(rml > 0 && k1 && tsig_verify_packet(rm, rml, k1, req_mac, req_mac_len, NULL, 0, false, resp_mac, &resp_mac_len) == 0);
         a = read_answer(sk[1]);
-        CHECK(a.got && a.id == 0x7201 && a.rcode == 2 && a.ede == 14);
+        CHECK(!a.got);
+        (void)resp_mac;
+        (void)resp_mac_len;
+        uint8_t raw[sizeof(udp_ipc_t) + 4096];
+        ssize_t rn;
+        tsig_rr_t trr;
+        const uint8_t *rm;
+        size_t rml;
         /* a request with a wrong MAC is NOTAUTH, not "not ready" (the TSIG is checked first, RFC 8945 5.2) */
         sl = build_query(qb, 0x7202, true, 0);
         CHECK(k1 && tsig_sign_packet(qb, &sl, 2000, k1, 0, NULL, NULL, NULL, 0, false) == 0);
@@ -805,7 +831,7 @@ int main(void) {
         }
     }
 
-    /* -- the answer is counted by response rate limiting like any error answer: the same request again and again from one address is cut
+    /* -- with rate limiting on: an ordinary query for a zone that cannot be had is still not answered (0.7 first-fill latency; before, the "not ready" answer was rate limited: cut
      *    off (slip 0: dropped) */
     {
         static server_config_t cfg2;
@@ -821,7 +847,7 @@ int main(void) {
             answered += w.n_tx;
             FLUSH();
         }
-        CHECK(answered >= 1 && answered < 12);
+        CHECK_MSG(answered == 0, "%d answered", answered);                               /* (0.7 first-fill latency: an ordinary query that cannot wait is dropped before rate limiting, never answered "not ready") */
         while (read_answer(sk[1]).got) {}
         atomic_store_explicit(&g_config_db.active, &cfg, memory_order_release);
     }
@@ -862,7 +888,7 @@ int main(void) {
         CHECK(park_wake_push(park_wake_ring(0), "default", "park.test.", true));
         park_service(&w, -1);
         a = read_answer(sk[1]);
-        CHECK(a.got && a.id == 0x7503 && a.rcode == 2 && a.ede == 14 && table.nwait == 0);
+        CHECK(!a.got && table.nwait == 0);                                    /* (the fetch failed: dropped, 0.7 first-fill latency) */
         atomic_store_explicit(&g_config_db.active, &cfg, memory_order_release);
     }
 
@@ -1142,9 +1168,7 @@ int main(void) {
         park_service(&w, -1);
         FLUSH();
         a = read_answer(sk[1]);
-        CHECK(a.got && a.rcode == 2 && a.ede == 14);
-        a = read_answer(sk[1]);
-        CHECK(a.got && a.rcode == 2 && a.ede == 14 && table.nwait == 0 && park_places_used() == 0);
+        CHECK(!a.got && table.nwait == 0 && park_places_used() == 0);           /* (both woken with "failed": dropped, 0.7 first-fill latency) */
         park_stats_get(&g1);
         CHECK(g1.full == g0.full && g1.ring_dropped == g0.ring_dropped);
 

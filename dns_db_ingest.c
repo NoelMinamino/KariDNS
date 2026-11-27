@@ -73,7 +73,7 @@ _Static_assert(ZDIR_APEX_GLUE_PER_NS == KDB_NOTIFY_ADDR_PER_NS && ZDIR_APEX_NADD
 #define ING_MAX_BUILDERS 16
 #define ING_RBUF 65536
 #define ING_FLUSH_AT 16384        /* queued bytes that are written at once; the rest goes out after the event round */
-#define ING_FETCH_MAX 256         /* fetches in flight (D1a): more is refused, the queries then wait for their own deadline */
+#define ING_FETCH_MAX 512         /* fetches in flight (D1a): more is refused, the queries then wait for their own deadline.  0.7 first-fill latency: the fill's ING_FILL_NFREQ (256) and fetch-concurrency (at most 256) both fit */
 #define ING_WQ_MAX 8192           /* 0.7 P-B: requests of queries that wait for a place, a token or room ("the wait queue"); the park tables bound the queries behind them, and a request is made once per zone */
 #define ING_LQ_MAX 16384          /* 0.7: lookups that wait for a place ("the lookup queue"); a request that finds it full is dropped and counted (true overload: the queries behind it time out) */
 #define ING_WQ_TICK_MS 10         /* ... and how often the thread looks again while some wait: the bucket, a new attempt to make room, their deadlines */
@@ -186,6 +186,7 @@ typedef struct {
   char lk_q[DNS_NAME_TEXT_SIZE];
   uint32_t bzid;
   int64_t sent_ms;
+  uint32_t zh;                           /* dns_name_hash_ci(zone), kept with every write of `zone`: fetch_find_zone() compares it before the names (256 bodies of the fill in flight, looked through for every request) */
   char view_name[KARIDNS_VIEW_NAME_MAX];
   char zone[DNS_NAME_TEXT_SIZE];
 } ing_freq_t;
@@ -297,6 +298,16 @@ typedef struct {
   uint64_t all_force_id;       /* the request id of the last `reload -force` of everything */
   bool ch_failed;                /* an entry of this pass / drain could not be recorded: its cursor is not kept */
   uint32_t nbulk;                /* fetches of the wanted bodies in flight */
+  bool qonly;                    /* 0.7 first-fill latency: fetch_issue() makes the requests of queries only (no fill, no warm-up): the ingest thread waits for the store's journal (ing_journal_wait()) */
+  /* 0.7 first-fill latency (W3): the window of dd_tick(): the queries that were dropped because their data could not be read are counted, and said in one line a window, not one a query */
+  int64_t dd_start;              /* when the window began (CLOCK_MONOTONIC ms; 0: not begun) */
+  uint64_t dd_c0[3];             /* store.park.drop.failed, store.lookup.drop.failed, store.park.drop.timeout at its beginning */
+  uint32_t dd_fail, dd_ok;       /* reads that failed / ended well in the window */
+  bool dd_nolink;                /* the loader was not connected at some time in the window */
+  bool dd_warned;                /* the WARNING of one failed fetch was written in the window */
+  bool dd_reported;              /* the last line said the queries were dropped (the NOTICE of a window whose last read ended well says that is over) */
+  bool dd_last_ok;               /* the last read (since the start) ended well */
+  char dd_why[KDB_REASON_LEN];   /* the reason of the last failed read */
   bool rf_has;                   /* what the job of the request fetch became (fetch_job_finish() to fetch_complete()) */
   uint64_t rf_id;
   uint8_t rf_status;
@@ -1605,37 +1616,27 @@ static uint32_t fetch_sub_limit(uint32_t cap) {
 }
 /* 0.7 fix 8, the first fill and the queries: the queries come first (the loader serves a request of a query before one of the fill, and a place goes to the oldest query that waits), but the fill is not
  * left to the places the queries do not use: a first fill that queries keep waiting for would read its zones one by one when a query asks for them (a read for one zone from the database is dearer
- * than one in the order of the scan), and the zones that the queries have not asked for yet would come when the queries stop.  So the fill has a share of its own: a quarter of the places of
- * fetch-concurrency, at least one (up to ING_BULK_NFREQ), which the requests of queries leave free (qplace_ok()) while the fill has fewer fetches in flight than that, and which it may use whatever
- * waits. */
+ * than one in the order of the scan), and the zones that the queries have not asked for yet would come when the queries stop.  So the fill keeps a share whatever waits: a quarter of
+ * fetch-concurrency, at least one, at most ING_BULK_NFREQ, its bodies in flight while requests of queries wait (fill_limit(); since the first-fill latency work these take no place of
+ * fetch-concurrency). */
+#define ING_BULK_NFREQ 32
 static uint32_t bulk_reserve_for(uint32_t conc) {
   uint32_t q = conc / 4;
   if (q < 1) q = 1;
-  return q < 32u ? q : 32u;                      /* (ING_BULK_NFREQ) */
+  return q < ING_BULK_NFREQ ? q : ING_BULK_NFREQ;
 }
 static uint32_t bulk_reserve(void) { return bulk_reserve_for(atomic_load_explicit(&g_fetch_conc, memory_order_relaxed)); }
-/* does the fill have a request to make now?  Not in the pause after a round with failures (bg_retry_ms), not when the scan of the store is over (bg_on ends with it), not with no loader. */
-static bool bulk_wants_place(const ing_t *g) {
-  return g->bg_on && g->fetch_fd >= 0 && !(g->bg_retry_ms && now_ms() < g->bg_retry_ms);
-}
-/* may a query's request take a place?  Not when the places that are left are the fill's share. */
-static bool qplace_calc(const ing_t *g, uint32_t used, uint32_t conc) {
-  const uint32_t res = bulk_reserve_for(conc);
-  const uint32_t keep = bulk_wants_place(g) && g->nbulk < res ? res - g->nbulk : 0;   /* (the share is kept for a fill that has work: its fetches in flight hold places already) */
-  return used + keep < conc;
-}
-static bool qplace_ok(const ing_t *g) { return qplace_calc(g, park_places_used(), atomic_load_explicit(&g_fetch_conc, memory_order_relaxed)); }
+/* 0.7 first-fill latency (W1, W5): the bodies of the fill take no place of fetch-concurrency: every place is the queries' (their fetches and lookups), and the fill has a limit of its own, its
+ * bodies in flight: ING_FILL_NFREQ while no request of a query waits (the wait queue and the lookup queue are empty), so that the loader reads whole IN statements (DB_IN_MAX zones; with
+ * 32 in flight spread over the workers it read about 2 zones a statement, PostgreSQL 10M zones 2556 s against SQLite3's 490 s), and back to the old share (bulk_reserve(), at most 32) while
+ * one waits: the fill makes no new request then, and the queries come first.  What bounds the load of the database is loader-threads (the loader's workers read; the requests in flight only
+ * wait in its queue), and the loader leaves one worker to the queries (fq_bg_cap(), karidns_dbloader.c). */
+#define ING_FILL_NFREQ 256
+static uint32_t fill_limit_calc(uint32_t nwq, uint32_t nlq, uint32_t conc) { return nwq == 0 && nlq == 0 ? ING_FILL_NFREQ : bulk_reserve_for(conc); }
+static uint32_t fill_limit(const ing_t *g) { return fill_limit_calc(g->nwq, g->nlq, atomic_load_explicit(&g_fetch_conc, memory_order_relaxed)); }
 #ifdef KARIDNS_UNIT_TEST
-/* tests: may a query's request take a place, for a fill in the given state (bg_on, a loader, the fill's fetches in flight, the pause until retry_ms), `used` places taken, fetch-concurrency conc */
-bool db_ingest_test_qplace(bool bg_on, bool loader, uint32_t nbulk, int64_t retry_ms, uint32_t used, uint32_t conc) {
-  static ing_t g;                                          /* (static: the struct is big) */
-  memset(&g, 0, sizeof(g));
-  g.bg_on = bg_on;
-  g.fetch_fd = loader ? 0 : -1;
-  g.nbulk = nbulk;
-  g.bg_retry_ms = retry_ms;
-  return qplace_calc(&g, used, conc);
-}
+/* tests: the fill's limit of bodies in flight with nwq requests of queries and nlq lookups waiting, at fetch-concurrency conc */
+uint32_t db_ingest_test_fill_limit(uint32_t nwq, uint32_t nlq, uint32_t conc) { return fill_limit_calc(nwq, nlq, conc); }
 #endif
 static _Atomic uint32_t g_ing_fill_pct;                    /* the share of the last window (~10 s) the ingest thread spent on the bodies of the fill (what a first fill takes of it) */
 static _Atomic uint64_t g_fetch_issued;   /* fetches of a whole zone sent to the loader (queries, transfers, the warm-up) */
@@ -1654,6 +1655,61 @@ static _Atomic uint64_t g_lk_asked, g_lk_body, g_lk_covered, g_lk_shed, g_lk_exp
 static _Atomic uint32_t g_fp_max_n;                        /* the most requests one pass of fetch_issue() handled, since the start */
 static _Atomic uint64_t g_fp_max_ns;                       /* the longest one pass of fetch_issue() ran (and handled something), since the start */
 static _Atomic uint64_t g_fp_passes, g_fp_cut;             /* the passes that handled something, and those that ended at their bound (the time slice) with work left */
+static _Atomic uint64_t g_ing_jw_slices;                   /* 0.7 first-fill latency: slices of the journal wait in which the requests of queries were served (ing_journal_wait(), store.ingest.journal_wait_slices) */
+
+/* ---- 0.7 first-fill latency (W3): a database that cannot be read ----
+ * The queries whose data cannot be read are not answered (never SERVFAIL while the data is being loaded, DNS_NR_DROP) and are counted (store.park.drop.failed, store.lookup.drop.failed; a
+ * query that waited for a loader that is not there runs into park-timeout, store.park.drop.timeout).  So that the operator hears of it once, not once a query: every DD_WINDOW_MS the ingest
+ * thread writes one WARNING when queries were dropped in the window because reads failed (with the reason of the last one) or because the loader was not connected, and one NOTICE when a
+ * window after that has reads that ended well and no such drop. */
+#define DD_WINDOW_MS 60000
+static int64_t g_dd_window_ms = DD_WINDOW_MS;              /* (the test builds: KARIDNS_TEST_DBDOWN_LOG_S, db_ingest_start()) */
+static void dd_note(ing_t *g, bool ok, const char *why) {
+  g->dd_last_ok = ok;
+  if (ok) {
+    g->dd_ok++;
+    return;
+  }
+  g->dd_fail++;
+  snprintf(g->dd_why, sizeof(g->dd_why), "%s", why && why[0] ? why : "no reason given");
+}
+static void dd_counts(uint64_t c[3]) {
+  c[0] = park_cnt_get(PARK_CNT_ZONE_FAILED);
+  c[1] = park_cnt_get(PARK_CNT_LK_FAILED);
+  c[2] = park_cnt_get(PARK_CNT_ZONE_TIMEOUT) + park_cnt_get(PARK_CNT_LK_TIMEOUT);
+}
+static void dd_tick(ing_t *g, int64_t now) {
+  if (g->fetch_fd < 0) g->dd_nolink = true;
+  if (g->dd_start == 0) {
+    g->dd_start = now;
+    dd_counts(g->dd_c0);
+    return;
+  }
+  if (now - g->dd_start < g_dd_window_ms) return;
+  uint64_t c[3];
+  dd_counts(c);
+  const uint64_t failed = c[0] - g->dd_c0[0], lkfailed = c[1] - g->dd_c0[1], timeout = c[2] - g->dd_c0[2];
+  const long long secs = (long long)((now - g->dd_start + 500) / 1000);
+  if (failed + lkfailed > 0 || (g->dd_nolink && timeout > 0)) {
+    if (g->dd_fail > 0)
+      syslog(LOG_WARNING, "[DB] %llu queries were not answered in the last %lld s: %u reads of the database failed (the last: %s); store.park.drop.failed %llu, store.lookup.drop.failed %llu, store.park.drop.timeout %llu",
+             (unsigned long long)(failed + lkfailed + timeout), secs, g->dd_fail, g->dd_why, (unsigned long long)failed, (unsigned long long)lkfailed, (unsigned long long)timeout);
+    else
+      syslog(LOG_WARNING, "[DB] %llu queries were not answered in the last %lld s: %s; store.park.drop.failed %llu, store.lookup.drop.failed %llu, store.park.drop.timeout %llu",
+             (unsigned long long)(failed + lkfailed + timeout), secs, g->dd_nolink ? "the loader was not connected" : "the data of their zones could not be read",
+             (unsigned long long)failed, (unsigned long long)lkfailed, (unsigned long long)timeout);
+    g->dd_reported = true;
+  }
+  if (g->dd_reported && g->dd_ok > 0 && g->dd_last_ok && g->fetch_fd >= 0) {      /* (the last read of the window ended well: said once, also in the window of the WARNING) */
+    syslog(LOG_NOTICE, "[DB] the database is read again (%u reads ended well in the last %lld s)", g->dd_ok, secs);
+    g->dd_reported = false;
+  }
+  g->dd_start = now;
+  memcpy(g->dd_c0, c, sizeof(c));
+  g->dd_fail = g->dd_ok = 0;
+  g->dd_nolink = g->fetch_fd < 0;
+  g->dd_warned = false;
+}
 static _Atomic uint32_t g_lk_pending, g_lk_inflight, g_lk_peak;     /* waiting for a place now, out now (the lookups and the fetches that came of them), the most that waited */
 static _Atomic uint64_t g_lk_hist[STORE_STATUS_HIST_BUCKETS];       /* the time from the request to the answer: <= 1 us, <= 2 us, ... (dns_store_status.h) */
 /* tests (always compiled: the coverage of the test programs and of karidns merges): a smaller bound of the lookup queue and of the wait queue than ING_LQ_MAX / ING_WQ_MAX (0: the constants), so that a full queue can be made with a few requests */
@@ -1709,10 +1765,12 @@ bool db_ingest_lookup_stats(store_lookup_t *out) {
   out->drop_lk_room = park_cnt_get(PARK_CNT_LK_ROOM);
   out->drop_lk_timeout = park_cnt_get(PARK_CNT_LK_TIMEOUT);
   out->drop_lk_queue = park_cnt_get(PARK_CNT_LK_QUEUE);
-  out->servfail = park_cnt_get(PARK_CNT_LK_SERVFAIL);
+  out->drop_lk_failed = park_cnt_get(PARK_CNT_LK_FAILED);
   out->drop_zone_room = park_cnt_get(PARK_CNT_ZONE_ROOM);
   out->drop_zone_timeout = park_cnt_get(PARK_CNT_ZONE_TIMEOUT);
   out->drop_zone_queue = park_cnt_get(PARK_CNT_ZONE_QUEUE);
+  out->drop_zone_failed = park_cnt_get(PARK_CNT_ZONE_FAILED);
+  out->jw_slices = atomic_load_explicit(&g_ing_jw_slices, memory_order_relaxed);
   out->remembered = park_shed_remembered();
   out->reask_suppressed = park_cnt_get(PARK_CNT_LK_REMEMBERED);
   out->remember_releases = park_shed_releases();
@@ -3606,8 +3664,9 @@ static ing_freq_t *fetch_find(ing_t *g, uint64_t id) {
 /* the request in flight for the zone in this mode (the whole zone, or its summary: the two do not stand in for each other, see fetch_issue()) */
 static ing_freq_t *fetch_find_zone(ing_t *g, uint16_t view, const char *zone, uint8_t mode) {
   if (g->nfreq == 0) return NULL;
+  const uint32_t zh = dns_name_hash_ci(zone);
   for (uint32_t i = 0; i < ING_FETCH_MAX; i++)
-    if (g->freq[i].active && g->freq[i].view == view && g->freq[i].mode == mode && domain_names_match_ci(g->freq[i].zone, zone)) return &g->freq[i];
+    if (g->freq[i].active && g->freq[i].zh == zh && g->freq[i].view == view && g->freq[i].mode == mode && domain_names_match_ci(g->freq[i].zone, zone)) return &g->freq[i];
   return NULL;
 }
 
@@ -3624,20 +3683,14 @@ static void freq_stamp(ing_freq_t *r, const char *view, const char *zone) {
 }
 
 /* The next body the reconcile wants (the scan of the store, db_recon_scan(): the records without an image, the ones whose version the database changed, the secondary and catalog
- * zones once a run), as a fetch request of the lowest priority.  Only when the fetches in flight leave room (a part of fetch-concurrency: the queries have the rest), and in
+ * zones once a run), as a fetch request of the lowest priority.  Only while its bodies in flight are under its limit (fill_limit(): no place of fetch-concurrency, which is the queries'), and in
  * slices, so that a store of ten million records is not looked at in one go.  A round with failures is made again after a pause; a round that finds nothing ends the work (bg_on).
  * *back: where the scan stood before the zone, for a request that cannot be made now. */
-#define ING_BULK_NFREQ 32          /* fetches of the wanted bodies in flight (at most half of fetch-concurrency) */
-#define ING_BULK_LOOK 4096         /* records the scan looks at in one call */
+#define ING_BULK_LOOK 4096        /* records the scan looks at in one call */
 static bool bulk_take(ing_t *g, park_fetch_req_t *q, uint32_t *zid, uint32_t *back, bool *np, int64_t *sid) {
   if (!g->bg_on || g->fetch_fd < 0 || !dbdir()) return false;
   if (g->bg_retry_ms && now_ms() < g->bg_retry_ms) return false;
-  {
-    const uint32_t others = g->nfreq > g->nbulk ? g->nfreq - g->nbulk : 0, sub = fetch_sub_limit(ING_BULK_NFREQ);
-    uint32_t allowed = sub > others ? sub - others : 0;      /* (what the queries leave of the half that the fill and the warm-up share) */
-    if (allowed < bulk_reserve()) allowed = bulk_reserve();   /* (and at least its own share) */
-    if (g->nbulk >= allowed) return false;
-  }
+  if (g->nbulk >= fill_limit(g) || g->nfreq >= ING_FETCH_MAX) return false;      /* (0.7 first-fill latency: its own limit, not places of fetch-concurrency) */
   for (int round = 0; round < 4; round++) {
     db_scan_item_t it;
     *back = g->bg_zid;
@@ -3668,6 +3721,12 @@ static bool bulk_take(ing_t *g, park_fetch_req_t *q, uint32_t *zid, uint32_t *ba
         break;
       }
     if (vi < 0 || fetch_find_zone(g, (uint16_t)vi, it.zone, KDB_FETCH_FULL)) continue;      /* a view that left the configuration, or the body is on its way already */
+    /* 0.7 first-fill latency: a request of a query holds the claim mark of the zone (it waits for a place, or is being made): its fetch brings the body, the fill does not read it a
+     * second time (with 256 bodies in flight the fill overtakes the queries that wait); a zone whose request is dropped is wanted still and comes in a later round of the scan */
+    if (park_claim_held(park_claim_key(it.view, it.zone))) {
+      g->bg_again = true;                                /* (the scan goes through the store once more: the zone is looked at again then) */
+      continue;
+    }
     memset(q, 0, sizeof(*q));
     q->worker = -1;
     snprintf(q->view, sizeof(q->view), "%s", it.view);
@@ -3729,9 +3788,9 @@ static uint32_t lk_share(void) { return lk_share_for(atomic_load_explicit(&g_fet
 uint32_t db_ingest_test_lk_share(uint32_t conc) { return lk_share_for(conc); }    /* tests: the places the lookups may take at a fetch-concurrency */
 #endif
 
-/* can a lookup be made now?  A stream, a free slot of the table, its share, and a place that is not the fill's share (as for the request of a query, qplace_ok()) */
+/* can a lookup be made now?  A stream, a free slot of the table, its share, and a place (every place is the queries': the fill takes none) */
 static bool lookup_ready(const ing_t *g) {
-  return g->fetch_fd >= 0 && atomic_load_explicit(&g_lookup_on, memory_order_acquire) && g->nfreq < ING_FETCH_MAX && g->nlook < lk_share() && park_place_avail() && qplace_ok(g);
+  return g->fetch_fd >= 0 && atomic_load_explicit(&g_lookup_on, memory_order_acquire) && g->nfreq < ING_FETCH_MAX && g->nlook < lk_share() && park_place_avail();
 }
 
 /* the mode of the request: with the body of the zone when the loader sends it, there is no fetch-rate to keep (it counts the zones read for queries) and the zones in memory are below the hard line */
@@ -3852,6 +3911,7 @@ static void lookup_start(ing_t *g, const park_fetch_req_t *q, int vi, uint64_t c
   r->lk_t0 = mono_ns();
   snprintf(r->view_name, sizeof(r->view_name), "%s", g->view_names[vi]);
   snprintf(r->zone, sizeof(r->zone), "%s", q->zone);
+  r->zh = dns_name_hash_ci(r->zone);
   snprintf(r->lk_q, sizeof(r->lk_q), "%s", q->zone);
   g->nfreq++;
   g->nlook++;
@@ -3943,6 +4003,7 @@ static void lookup_offer(ing_t *g, const park_fetch_req_t *q, int vi) {
 static void fetch_complete(ing_t *g, ing_freq_t *r, bool ok, const char *why) {
   ing_freq_t done = *r;
   r->active = false;
+  if (!done.busy && !done.quiet) dd_note(g, ok, why);    /* (0.7 first-fill latency: the reads that failed, for the line of dd_tick(); "busy" is overload, not a database that cannot be read) */
   if (done.placed) park_place_give();                    /* (B2 W5: the one place of the fetch goes back, whichever way it ended: installed, failed, dropped, the loader gone) */
   g->nfreq--;
   atomic_store_explicit(&g_fq_inflight, g->nfreq, memory_order_relaxed);
@@ -3967,8 +4028,11 @@ static void fetch_complete(ing_t *g, ing_freq_t *r, bool ok, const char *why) {
     atomic_store_explicit(&g_wl_flight, g->nhot_flight, memory_order_relaxed);
     atomic_fetch_add_explicit(ok ? &g_wl_loaded : &g_wl_failed, 1, memory_order_relaxed);
   }
-  if (!ok)
+  if (!ok && !g->dd_warned) {                            /* (one WARNING in a window of dd_tick(): a database that cannot be read fails every fetch, and the line of the window counts them) */
+    g->dd_warned = true;
     syslog(LOG_WARNING, "[DB] fetch of zone '%s' (view '%s') failed: %s", done.zone, done.view_name, why && why[0] ? why : "no reason given");
+  } else if (!ok)
+    logev_post(LOGC_DATABASE, 2, NULL, 0, "[DB] fetch of zone '%s' (view '%s') failed: %s", done.zone, done.view_name, why && why[0] ? why : "no reason given");
   else
     logev_post(LOGC_DATABASE, 2, NULL, 0, "[DB] fetch %llu of zone '%s' (view '%s') done in %lld ms%s", (unsigned long long)done.id, done.zone, done.view_name,
                (long long)(now_ms() - done.sent_ms), done.dropped ? ": unchanged, the version in memory stays" : "");
@@ -4051,6 +4115,7 @@ static void req_fetch_start(ing_t *g, uint16_t view, const char *view_name, cons
   r->sent_ms = now_ms();
   snprintf(r->view_name, sizeof(r->view_name), "%s", view_name);
   snprintf(r->zone, sizeof(r->zone), "%s", zone);
+  r->zh = dns_name_hash_ci(r->zone);
   if (!nonstore) {
     r->v_valid = dbreg_zone_version(view_name, zone, &r->v_sid, &r->v_serial);
     freq_stamp(r, view_name, zone);
@@ -4187,7 +4252,7 @@ static void warm_drop_hot(ing_t *g) {
   atomic_store_explicit(&g_warm_n, (uint32_t)g->nwarm, memory_order_relaxed);
 }
 static int warm_hot_gate(ing_t *g) {
-  if (g->nfreq >= fetch_sub_limit(ING_WARM_NFREQ)) return 0;
+  if (g->nfreq - g->nbulk >= fetch_sub_limit(ING_WARM_NFREQ)) return 0;      /* (the fill's bodies do not count: they have their own limit, fill_limit()) */
   if (dbreg_cache_limit()) {
     /* the zones in flight are not in the resident bytes yet: estimate them from what the zones of the list added so far (a zone of the list is about that big);
      * until one is in, one at a time.  The mark is the cache manager's high water mark: no zone is taken out of memory to make room for the warm-up. */
@@ -4203,7 +4268,7 @@ static int warm_hot_gate(ing_t *g) {
       warm_drop_hot(g);
       return -1;
     }
-    if (g->nfreq >= atomic_load_explicit(&g_fetch_conc, memory_order_relaxed) || dbreg_cache_over_limit()) return 0;
+    if (g->nfreq - g->nbulk >= atomic_load_explicit(&g_fetch_conc, memory_order_relaxed) || dbreg_cache_over_limit()) return 0;
   }
   return park_rate_check(now_ms(), true) ? 1 : 0;        /* the bucket is at least half full (and has a token): the queries come first */
 }
@@ -4305,7 +4370,7 @@ static bool wq_head_ready(ing_t *g, int64_t now) {
       return false;
     }
   }
-  if (!park_place_avail() || !qplace_ok(g) || g->nfreq >= ING_FETCH_MAX) return false;      /* (a place of fetch-concurrency that is not the fill's share, and a slot of the table: summaries and the warm-up use some) */
+  if (!park_place_avail() || g->nfreq >= ING_FETCH_MAX) return false;      /* (a place of fetch-concurrency, and a slot of the table: summaries and the warm-up use some) */
   return park_rate_check(now, false);
 }
 
@@ -4385,7 +4450,7 @@ static void fetch_issue(ing_t *g) {
       g->fmore = true;
       break;
     }
-    if (handled == 1 && g->nbulk < bulk_reserve() && bulk_take(g, &q, &bulk_zid, &bulk_back, &bulk_np, &bulk_sid)) {      /* 0.7 fix 8: the fill's own share, once in a pass, whatever waits */
+    if (handled == 1 && !g->qonly && g->nbulk < bulk_reserve() && bulk_take(g, &q, &bulk_zid, &bulk_back, &bulk_np, &bulk_sid)) {      /* 0.7 fix 8: the fill's own share, once in a pass, whatever waits */
       warm = hot = false;
       bulk = true;
     } else if (g->nlq > 0 && g->lq_turn && lq_pump_one(g)) {      /* 0.7: a lookup, in its turn (the lookups and the fetches that wait take places by turns) */
@@ -4410,7 +4475,7 @@ static void fetch_issue(ing_t *g) {
         hold_key = park_claim_key(q.view, q.zone);
         park_claim_note_worker(hold_key, q.worker);
       }
-    } else if (g->nwarm > 0 && warm_left > 0 && g->nwq == 0 && g->nlq == 0) {      /* (the warm-up does not take what queries wait for) */
+    } else if (g->nwarm > 0 && warm_left > 0 && g->nwq == 0 && g->nlq == 0 && !g->qonly) {      /* (the warm-up does not take what queries wait for) */
       size_t wi = 0;                                     /* the item to take: the head, or (hot items that cannot be read now) the first that is not hot */
       if (g->warm[0].hot) {                              /* (a hot item is not taken out of the list until it can be read, so that the order of the list holds) */
         int gate = warm_hot_gate(g);
@@ -4445,11 +4510,11 @@ static void fetch_issue(ing_t *g) {
       } else if (!dbreg_warm_take(q.view, q.zone, &whole)) continue;
       /* it came into memory meanwhile, was deleted, or has nothing to read for (not pinned, has an apex) */
       q.mode = whole ? KDB_FETCH_FULL : KDB_FETCH_SUMMARY;         /* a pinned zone whole; any other zone in the list is there for its apex */
-      if ((whole && g->nfreq >= fetch_sub_limit(ING_WARM_NFREQ)) || (!whole && g->nsum >= fetch_sub_limit(ING_SUMMARY_NFREQ))) {      /* the zones nobody asked for yet wait for a free place */
+      if ((whole && g->nfreq - g->nbulk >= fetch_sub_limit(ING_WARM_NFREQ)) || (!whole && g->nsum >= fetch_sub_limit(ING_SUMMARY_NFREQ))) {      /* the zones nobody asked for yet wait for a free place */
         warm_add_ex(g, q.view, q.zone, hot, false);
         break;
       }
-    } else if ((g->nwq == 0 || g->nbulk < bulk_reserve()) && bulk_take(g, &q, &bulk_zid, &bulk_back, &bulk_np, &bulk_sid)) {      /* 0.7 WP7b: the bodies the reconcile wants, after the queries and the warm-up */
+    } else if (!g->qonly && (g->nwq == 0 || g->nbulk < bulk_reserve()) && bulk_take(g, &q, &bulk_zid, &bulk_back, &bulk_np, &bulk_sid)) {      /* 0.7 WP7b: the bodies the reconcile wants, after the queries and the warm-up */
       warm = hot = false;
       bulk = true;
     } else {
@@ -4518,8 +4583,8 @@ static void fetch_issue(ing_t *g) {
             continue;
           }
         }
-        if (!over && !hold_place && (can_wait || g->nwq == 0 || (bulk && g->nbulk < bulk_reserve()))) hold_place = (!can_wait || qplace_ok(g)) && park_place_take();
-        if (over || !hold_place) {
+        if (!over && !hold_place && !bulk && (can_wait || g->nwq == 0)) hold_place = park_place_take();
+        if (over || (!hold_place && !bulk)) {      /* (0.7 first-fill latency: a body of the fill takes no place, bulk_take() kept it to fill_limit()) */
           if (can_wait) {                                /* every place is taken */
             if (!wq_wait(g, &q, &hold_place, &hold_tok, &hold_key, wq_deadline, wq_room, from_wq, now_ms())) wq_overflow(&q);
             continue;
@@ -4638,6 +4703,7 @@ static void fetch_issue(ing_t *g) {
     r->sent_ms = now_ms();
     snprintf(r->view_name, sizeof(r->view_name), "%s", g->view_names[vi]);
     snprintf(r->zone, sizeof(r->zone), "%s", q.zone);
+    r->zh = dns_name_hash_ci(r->zone);
     g->nfreq++;
     atomic_store_explicit(&g_fq_inflight, g->nfreq, memory_order_relaxed);
     if (g->nfreq > atomic_load_explicit(&g_fq_peak, memory_order_relaxed)) atomic_store_explicit(&g_fq_peak, g->nfreq, memory_order_relaxed);
@@ -4801,6 +4867,7 @@ static void on_lookup_result(ing_t *g, const kdb_lookup_result_t *l) {
   /* mode 3: the body of the zone follows, with this request id.  The request is the fetch of the zone from here on (the same place, the same id): LOADING for the queries that look at the zone, the record's
    * stamp (the one the answer made) for the check at the install.  When the zone is not started by this request (another fetch has it, it is in memory) the body is read through and thrown away. */
   snprintf(r->zone, sizeof(r->zone), "%s", l->name);
+  r->zh = dns_name_hash_ci(r->zone);
   r->lk_sid = l->source_id;
   if (dbreg_fetch_begin(r->view_name, r->zone) == DBREG_FETCH_STARTED) {
     r->lkst = LKS_BODY;
@@ -5308,6 +5375,28 @@ static void zone_stall_check(ing_t *g) {
   }
 }
 
+/* 0.7 first-fill latency (W1): the bound of the store's journal (4 x its limit) at the end of a pass of the loop.  It used to be one wait for the checkpoint (seconds on ZFS during a first fill),
+ * with no request of a query made meanwhile: the lookups and the fetches of the queries waited behind the fill's writes.  Now the wait is cut into ING_JW_SLICE_MS slices, and between them the
+ * thread makes the requests of queries (fetch_issue() with qonly: the workers' rings, the wait queue, the lookup queue; no body of the fill, no warm-up), sends them and wakes the workers.
+ * What it may touch there: the fetch table, the queues, the fetch stream's output and the park rings, all of this thread; the store is only read (the stamps, lookup_covered()); nothing is
+ * installed (the streams are not read: that is the back-pressure).  No reentry: this runs at the end of the loop, where no pass, job or stream message is half done, and qonly keeps
+ * fetch_issue() off the paths that write. */
+#define ING_JW_SLICE_MS 5
+static void ing_journal_wait(ing_t *g) {
+  store_jwait_t w;
+  memset(&w, 0, sizeof(w));
+  while (db_store_journal_wait_slice(4, &w, ING_JW_SLICE_MS)) {
+    atomic_fetch_add_explicit(&g_ing_jw_slices, 1, memory_order_relaxed);
+    if (g->nwq > 0 || g->nlq > 0 || park_fetch_pending()) {
+      g->qonly = true;
+      fetch_issue(g);
+      g->qonly = false;
+    }
+    if (g->fetch_fd >= 0 && g->fout_off < g->fout_len) fetch_flush(g);
+    wake_flush(g);
+  }
+}
+
 static void *ingest_thread(void *arg) {
   ing_t *g = arg;
   rcu_aux_thread_pin();
@@ -5405,11 +5494,12 @@ static void *ingest_thread(void *arg) {
     shed_release_check(g);
     apex_walk_step(g);
     fetch_expire(g);
+    dd_tick(g, now_ms());                               /* (0.7 first-fill latency: the line of the queries a database that cannot be read left unanswered) */
     wake_flush(g);
     hold_check(g);
     if (g->stream_fd >= 0 && g->out_off < g->out_len) out_flush(g);
     if (g->fetch_fd >= 0 && g->fout_off < g->fout_len) fetch_flush(g);
-    (void)db_store_journal_wait(4);                      /* 0.7: the hard bound of the store's journal (4 x its limit; the reconcile thread waits at 2 x), with no lock held */
+    ing_journal_wait(g);                                 /* 0.7: the hard bound of the store's journal (4 x its limit; the reconcile thread waits at 2 x), with no lock held */
     {
       int64_t t1 = mono_ns();
       busy_ns += t1 - t_wake;
@@ -5430,6 +5520,13 @@ bool db_ingest_start(int stream_fd, int ctrl_fd, int fetch_fd) {
   g_ram = ma_host_ram();                                   /* (before the sandbox: the Backend cannot read hw.physmem in capability mode) */
   const char *tram = getenv("KARIDNS_TEST_PHYSMEM");       /* test switch (tests/run_db_memdefault_test.sh): the RAM the default memory-limit is derived from, in bytes */
   if (tram && *tram) g_ram = strtoull(tram, NULL, 10);
+#ifdef KARIDNS_TEST_EVICT
+  {
+    const char *dd = getenv("KARIDNS_TEST_DBDOWN_LOG_S");  /* (the test builds only: the window of dd_tick() in seconds, tests/run_db_firstfill_latency_test.sh) */
+    const unsigned long v = dd && *dd ? strtoul(dd, NULL, 10) : 0;
+    if (v >= 1 && v <= 3600) g_dd_window_ms = (int64_t)v * 1000;
+  }
+#endif
   static struct ing_wq *s_wq;
   static struct ing_lq *s_lq;
   memset(g, 0, sizeof(*g));
@@ -6012,11 +6109,11 @@ size_t db_ingest_status(const char *zone, const char *view, char *out, size_t ca
     {
       store_lookup_t lk;
       db_ingest_lookup_stats(&lk);
-      st_append(&c, "lookup of names while the first pass has not listed every zone: ready=%s in_flight=%u pending=%u asked=%llu found=%llu none=%llu failed=%llu refused=%llu same_name=%llu body_inline=%llu take_fail=%llu covered=%llu shed=%llu expired=%llu drop_room=%llu drop_timeout=%llu drop_queue=%llu servfail=%llu zone_drop_room=%llu zone_drop_timeout=%llu zone_drop_queue=%llu bad_body=%llu rtt_p50_us=%llu rtt_p99_us=%llu remembered=%llu reask_suppressed=%llu remember_releases=%llu drain_passes=%llu drain_cut=%llu drain_pass_max=%u drain_pass_max_us=%llu\n",
+      st_append(&c, "lookup of names while the first pass has not listed every zone: ready=%s in_flight=%u pending=%u asked=%llu found=%llu none=%llu failed=%llu refused=%llu same_name=%llu body_inline=%llu take_fail=%llu covered=%llu shed=%llu expired=%llu drop_room=%llu drop_timeout=%llu drop_queue=%llu drop_failed=%llu zone_drop_room=%llu zone_drop_timeout=%llu zone_drop_queue=%llu zone_drop_failed=%llu bad_body=%llu rtt_p50_us=%llu rtt_p99_us=%llu remembered=%llu reask_suppressed=%llu remember_releases=%llu drain_passes=%llu drain_cut=%llu drain_pass_max=%u drain_pass_max_us=%llu\n",
                 lk.ready ? "yes" : "no", (unsigned)lk.in_flight, (unsigned)lk.pending, (unsigned long long)lk.asked, (unsigned long long)lk.found, (unsigned long long)lk.none, (unsigned long long)lk.failed,
                 (unsigned long long)lk.refused, (unsigned long long)lk.same_name, (unsigned long long)lk.body_inline, (unsigned long long)lk.take_fail, (unsigned long long)lk.covered, (unsigned long long)lk.shed,
-                (unsigned long long)lk.expired, (unsigned long long)lk.drop_lk_room, (unsigned long long)lk.drop_lk_timeout, (unsigned long long)lk.drop_lk_queue, (unsigned long long)lk.servfail,
-                (unsigned long long)lk.drop_zone_room, (unsigned long long)lk.drop_zone_timeout, (unsigned long long)lk.drop_zone_queue, (unsigned long long)lk.bad_body, (unsigned long long)store_status_hist_pct(lk.hist, 50, lk.max_ns), (unsigned long long)store_status_hist_pct(lk.hist, 99, lk.max_ns),
+                (unsigned long long)lk.expired, (unsigned long long)lk.drop_lk_room, (unsigned long long)lk.drop_lk_timeout, (unsigned long long)lk.drop_lk_queue, (unsigned long long)lk.drop_lk_failed,
+                (unsigned long long)lk.drop_zone_room, (unsigned long long)lk.drop_zone_timeout, (unsigned long long)lk.drop_zone_queue, (unsigned long long)lk.drop_zone_failed, (unsigned long long)lk.bad_body, (unsigned long long)store_status_hist_pct(lk.hist, 50, lk.max_ns), (unsigned long long)store_status_hist_pct(lk.hist, 99, lk.max_ns),
                 (unsigned long long)lk.remembered, (unsigned long long)lk.reask_suppressed, (unsigned long long)lk.remember_releases, (unsigned long long)lk.drain_passes, (unsigned long long)lk.drain_cut,
                 (unsigned)lk.drain_pass_max, (unsigned long long)((lk.drain_pass_max_ns + 999) / 1000));
     }

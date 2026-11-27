@@ -415,8 +415,8 @@ static void *reader_thread(void *arg) {
                 if (out[i] == 192 && out[i + 1] == 0 && out[i + 2] == 2 && out[i + 3] >= 80 && out[i + 3] <= 83) found = true;
             if (found) atomic_fetch_add(&g_rd_ok, 1);
             else atomic_fetch_add(&g_rd_bad, 1);
-        } else if (rl > 12) {
-            atomic_fetch_add(&g_rd_gone, 1);                      /* (not ready, or refused: the zone was out of memory) */
+        } else if (rl > 12 || rl == DNS_NR_DROP) {
+            atomic_fetch_add(&g_rd_gone, 1);                      /* (not answered (0.7 first-fill latency: DNS_NR_DROP), or refused: the zone was out of memory) */
         } else {
             atomic_fetch_add(&g_rd_bad, 1);
         }
@@ -939,16 +939,13 @@ static int run_mode(const char *mode) {
         CHECK(park_att_take(sv, bogus) == PARK_ATT_ALL);                       /* (the claim was taken with it) */
     }
 
-    /* review L4: a query's request leaves the fill's share of the places free only while the fill has work (not in the pause after a failed round, not without a loader, not when its scan is over) */
+    /* 0.7 first-fill latency: the fill takes no place of fetch-concurrency; its own limit of bodies in flight is ING_FILL_NFREQ (256) while no request of a query waits, and the old share
+     * (a quarter of fetch-concurrency, at least one, at most 32) while one waits in the wait queue or the lookup queue */
     {
-        extern bool db_ingest_test_qplace(bool bg_on, bool loader, uint32_t nbulk, int64_t retry_ms, uint32_t used, uint32_t conc);
-        CHECK(!db_ingest_test_qplace(true, true, 0, 0, 7, 8));                   /* (8 places, the fill's share is 2: 7 used leave room for the fill only) */
-        CHECK(!db_ingest_test_qplace(true, true, 0, 1, 7, 8));                   /* (a pause that is over) */
-        CHECK(db_ingest_test_qplace(true, true, 0, INT64_MAX / 2, 7, 8));        /* (in the pause: the places are the queries') */
-        CHECK(db_ingest_test_qplace(false, true, 0, 0, 7, 8));                   /* (the scan is over) */
-        CHECK(db_ingest_test_qplace(true, false, 0, 0, 7, 8));                   /* (no loader) */
-        CHECK(db_ingest_test_qplace(true, true, 2, 0, 7, 8));                    /* (the fill has its share in flight: those places are used already) */
-        CHECK(!db_ingest_test_qplace(true, true, 0, 0, 8, 8) && !db_ingest_test_qplace(false, true, 0, 0, 8, 8));   /* (all places used: nobody) */
+        extern uint32_t db_ingest_test_fill_limit(uint32_t nwq, uint32_t nlq, uint32_t conc);
+        CHECK(db_ingest_test_fill_limit(0, 0, 8) == 256 && db_ingest_test_fill_limit(0, 0, 256) == 256);
+        CHECK(db_ingest_test_fill_limit(1, 0, 8) == 2 && db_ingest_test_fill_limit(0, 1, 8) == 2);
+        CHECK(db_ingest_test_fill_limit(5, 5, 256) == 32 && db_ingest_test_fill_limit(1, 0, 2) == 1 && db_ingest_test_fill_limit(1, 0, 64) == 16);
         {   /* the places the lookups may take (lk_share()): three quarters, but one place is always left to the fetches of zones (the share was all of the places at 1 to 3) */
             extern uint32_t db_ingest_test_lk_share(uint32_t conc);
             CHECK(db_ingest_test_lk_share(1) == 1 && db_ingest_test_lk_share(2) == 1 && db_ingest_test_lk_share(3) == 2 && db_ingest_test_lk_share(4) == 3 && db_ingest_test_lk_share(5) == 4);
@@ -3363,7 +3360,7 @@ static int run_proto(int phase, const char *dir) {
                 store_zone_t lz;
                 CHECK(!zrec(st, "other.test", &lz));
             }
-            /* a database error (ZONE_FAILED with the request id) fails the lookup: the queries are told "not ready" (SERVFAIL + EDE 14, as for the fetch of a zone that fails), and nothing is recorded */
+            /* a database error (ZONE_FAILED with the request id) fails the lookup: the queries are woken with "failed" (their workers drop them, 0.7 first-fill latency: no SERVFAIL while data is being loaded), and nothing is recorded */
             drain_wakes();
             CHECK(park_fetch_request(0, "default", "x.fail.test.", KDB_FETCH_PRIO_QUERY, KDB_FETCH_LOOKUP));
             CHECK(ch_next(&fetchc, &m, 5000) && m.type == KDB_T_FETCH_REQ && strcmp(m.u.fetch_req.name, "x.fail.test.") == 0);
@@ -3528,7 +3525,7 @@ static int run_proto(int phase, const char *dir) {
             CHECK(zref_of("m4000.test.", &zr) && zr.entry == NULL && zr.zid != ZREF_NOZID && zr.zstate == ZREF_ST_KNOWN);      /* (the name index is complete: the zone is known) */
         }
         /* -- A1. the queries come first, and the fill has a share of its own (0.7 fix 8): forty queries ask for zones of the pass; the loader answers the requests of the fill at once and the
-         *        requests of the queries not at all.  The places of fetch-concurrency (16) are not all the queries': they have 12 at the most, and the fill goes on (before, it was held back while
+         *        requests of the queries not at all.  Every place of fetch-concurrency (16) is the queries' (0.7 first-fill latency: the fill takes none), and the fill goes on (before 0.7 fix 8 it was held back while
          *        a query waited, and the loader saw the 8 requests it had had before the queries came and no more) */
         drain_wakes();
         {
@@ -3567,10 +3564,10 @@ static int run_proto(int phase, const char *dir) {
                     }
                 }
                 clock_gettime(CLOCK_MONOTONIC, &t1);
-            } while (nb < 200 && (t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000 < 600);
+            } while ((t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000 < 600);
             fill_asked = nb;
-            printf("  40 queries waiting, none answered: %d requests of queries, %d of the fill in 600 ms\n", nq, fill_asked);
-            CHECK(nq >= 4 && nq <= 12);                                                    /* (the queries have the places the fill's share leaves) */
+            printf("  40 queries waiting, none answered: %d requests of queries, %d of the fill in 600 ms (places used %u)\n", nq, fill_asked, park_places_used());
+            CHECK(nq == 16 && park_places_used() == 16);                                   /* (0.7 first-fill latency: every place is the queries'; the fill takes none) */
             CHECK(fill_asked >= 100);                                                      /* (the fill went on: its fetches are answered and made again, whatever waits) */
             for (int i = 0; i < nrq1; i++) {                                                  /* (the queries are answered now) */
                 const int zi = pn_index(rq1[i].name);
@@ -3585,7 +3582,7 @@ static int run_proto(int phase, const char *dir) {
         drain_wakes();
         CHECK(park_fetch_request(0, "default", "m4000.test.", KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL));
         int n = serve_fetches(&fetchc, f[0], &e, 1500, -1, -1);
-        CHECK(n >= PN - 400);                                          /* (the 200 or so that A1 answered are not in the count) */
+        CHECK(n > 0);                                                  /* (the rest of the fill: what A1 answered is not in the count; wait_stored() and `bad` below check that every zone came, once) */
         CHECK(wake_for("m4000.test.", &k, 5000) && !k.failed && !k.retry);
         CHECK(g_pprio[4000] == 0 && g_psid[4000] == p_sid(4000));       /* (asked for by the query, and with the id the record holds) */
         CHECK(g_pprio[1000] == KDB_FETCH_PRIO_BACKGROUND && g_psid[1000] == p_sid(1000));
@@ -6032,7 +6029,7 @@ static int run_lookup_body(const char *dir) {
         kdb_enc_u16(&e, 1, 0); kdb_enc_name(&e, 2, "knownz.test."); kdb_enc_i64(&e, 3, 777999); kdb_enc_str(&e, 4, "reading the records: the database is busy"); kdb_enc_u64(&e, 5, rid);
         kdb_enc_end(&e);
         ch_send(f[0], &e);
-        CHECK(wake_for("w.knownz.test.", &k, 5000) && k.failed && k.ask == 0 && places_are(0, 2000));       /* (the lookup found the zone and the database could not give it: SERVFAIL + EDE 14 for the queries, not a silent drop at park-timeout) */
+        CHECK(wake_for("w.knownz.test.", &k, 5000) && k.failed && k.ask == 0 && places_are(0, 2000));       /* (the lookup found the zone and the database could not give it: the queries are told at once (dropped and counted, store.lookup.drop.failed), not left to park-timeout) */
         {
             store_zone_t lz;
             CHECK(zrec(st, "knownz.test", &lz) && lz.state == STORE_STATE_KNOWN && !in_memory("knownz.test."));

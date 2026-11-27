@@ -221,7 +221,7 @@ size_t ma_text_advice(char *buf, size_t n, const ma_est_t *e) {
     int w;
     if (e->level == MA_LEVEL_ERROR)
         w = snprintf(buf, n, "memory-limit %s is too small: it cannot hold the zones of the reads that run at once (%u zones of about %s: %s), so nearly every query "
-                             "for a database zone waits for a read of the database or is answered SERVFAIL (EDE 14); set memory-limit to at least %s, recommended %s (every zone in memory, %s of zone data)",
+                             "for a database zone waits for a read of the database or is not answered (not-ready-answer); set memory-limit to at least %s, recommended %s (every zone in memory, %s of zone data)",
                      lim, e->fit_zones, av, fm, wm, rec, data);
     else if (e->level == MA_LEVEL_WARNING)
         w = snprintf(buf, n, "memory-limit %s keeps only %u%% of the %" PRIu64 " zones in memory (%s of zone data): unless the traffic is concentrated on a small part of them, most queries will "
@@ -361,7 +361,9 @@ int ma_rt_tick(ma_rt_t *st, const ma_rt_in_t *in, const ma_est_t *e, char *buf, 
         l += snprintf_len(w, n - l);
     }
     if (over) {
-        w = snprintf(buf + l, n - l, "; %" PRIu64 " queries were answered SERVFAIL + EDE 14 for overload (park table full %" PRIu64 ", park-timeout %" PRIu64 ", refused %" PRIu64 ")", over, pfull, ptime, refused);
+        /* (0.7 W3 / W6: these queries are dropped, never SERVFAIL by default; with not-ready-answer servfail the ones whose park-timeout ran out get SERVFAIL + EDE 14) */
+    w = snprintf(buf + l, n - l, "; %" PRIu64 " queries were not answered for overload (park table full %" PRIu64 ", park-timeout %" PRIu64 ", refused %" PRIu64
+                 "; dropped, or SERVFAIL + EDE 14 after park-timeout with not-ready-answer servfail)", over, pfull, ptime, refused);
         l += snprintf_len(w, n - l);
     }
     snprintf(buf + l, n - l, "; the zones that are asked for do not fit: set memory-limit to at least %s (half of the zones), recommended %s (every zone in memory, %u%% fit now)", wm, rec, e->fit_pct);

@@ -1429,13 +1429,15 @@ view without database zones); the same name already on its way; the zone of the
 name was known when it was to go; dropped because the queue was full; dropped
 because they waited \fBpark\-timeout\fR
 .TP 8
-\fBstore.lookup.drop.room\fR, \fB.drop.timeout\fR, \fB.drop.queue\fR, \fB.servfail\fR
+\fBstore.lookup.drop.room\fR, \fB.drop.timeout\fR, \fB.drop.queue\fR, \fB.drop.failed\fR
 0.7: queries that were dropped (nothing is answered, like a query that
 \fBrate\-limit\fR drops; a TCP connection stays open and its next message is
 read) because the lookup found no room in the worker's park table, its
 \fBpark\-timeout\fR was up before the lookup was answered, or the ingest thread
 dropped the lookup (its queue was full, or it waited there until its time was
-up); and queries answered SERVFAIL + EDE 14 because their lookup failed
+up); and queries not answered because their lookup failed (the database or the
+loader: 0.7 first-fill latency, before SERVFAIL + EDE 14; this was
+\fBstore.lookup.servfail\fR)
 .TP 8
 \fBstore.lookup.remembered\fR, \fB.reask_suppressed\fR, \fB.remember_releases\fR
 0.7: names whose lookup the ingest thread shed (its queue was full, they waited
@@ -1455,10 +1457,17 @@ and the longest one ran (microseconds), since the start. A \fBpass_max\fR of a
 few thousand with \fBstore.lookup.take_fail\fR and \fBdrop.room\fR still rising
 means the thread does not keep up
 .TP 8
-\fBstore.park.drop.room\fR, \fB.drop.timeout\fR, \fB.drop.queue\fR
+\fBstore.park.drop.room\fR, \fB.drop.timeout\fR, \fB.drop.queue\fR, \fB.drop.failed\fR
 The same for a query that waits for a zone that is out of memory: the park table
 was full (\fBpark\-max\fR), its \fBpark\-timeout\fR was up before the zone was
-there, the wait queue of the ingest thread was full
+there, the wait queue of the ingest thread was full, the read of the zone failed
+or the query could not wait (0.7 first-fill latency: never SERVFAIL while the
+data is being loaded; zone transfers and UPDATE still get SERVFAIL + EDE 14)
+.TP 8
+\fBstore.ingest.journal_wait_slices\fR
+0.7: slices of 5 ms in which the ingest thread waited for the store's journal
+(at 4 times its limit: the disk is behind the writes) and made the requests of
+queries meanwhile
 .TP 8
 \fBstore.lookup.rtt.p50_us\fR, \fB.p99_us\fR, \fB.max_us\fR, \fB.rtt.hist.*\fR
 The time from the request to the answer (without the body), as the attach times:

@@ -110,6 +110,20 @@ EOF
 run "${TMP_DIR}/r3b" conf "${TMP_DIR}/zero_timeout.conf"
 check "Rule 3: tcp-idle-timeout 0ms (default) is accepted" 0 "${TMP_DIR}/r3b" "^\[OK\] Config file .* is valid\.$"
 
+# Rule 3d (0.7 W6): not-ready-answer is drop or servfail; another word is an error with the file and the line
+cat > "${TMP_DIR}/nra.conf" <<EOF
+options {
+    directory "/tmp";
+    not-ready-answer refused;
+};
+EOF
+run "${TMP_DIR}/r3d" conf "${TMP_DIR}/nra.conf"
+check "Rule 3d: not-ready-answer refused is an error at line 3" 1 "${TMP_DIR}/r3d" \
+    "^\[ERROR\] .*nra\.conf:3: .*not-ready-answer: invalid value 'refused' \(expected drop or servfail\)$"
+printf 'options {\n    not-ready-answer servfail;\n};\n' > "${TMP_DIR}/nra_ok.conf"
+run "${TMP_DIR}/r3e" conf "${TMP_DIR}/nra_ok.conf"
+check "Rule 3d: not-ready-answer servfail is accepted" 0 "${TMP_DIR}/r3e" "^\[OK\] Config file .* is valid\.$"
+
 # Rule 4: SSHFP fingerprint type outside the registry
 { zone_head; echo "host.example.com. IN SSHFP 1 99 123456789ABCDEF67890123456789ABCDEF67890"; } > "${TMP_DIR}/bad_sshfp_fptype.zone"
 run "${TMP_DIR}/r4" zone example.com "${TMP_DIR}/bad_sshfp_fptype.zone"
