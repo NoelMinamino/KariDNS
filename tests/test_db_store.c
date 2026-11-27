@@ -207,6 +207,13 @@ static bool places_are(uint32_t n, int ms) {
     return park_places_used() == n;
 }
 
+/* lq_expire() (ingest thread) counts and sheds each queue entry whose time is up, waking its queries, and sets the pending count after the last one
+ * (lookup_note()): after the last wake the counts are read through a wait, not once (CI flake row 97: pending was still 1 at the check of phase 7) */
+static bool lk_settled(uint64_t expired, int ms) {
+    for (int i = 0; i < ms / 5 && !(lk_stats().expired == expired && lk_stats().pending == 0); i++) usleep(5000);
+    return lk_stats().expired == expired && lk_stats().pending == 0;
+}
+
 /* the claim mark goes after the wake (lookup_shed(), lookup_drop(): wake, then park_claim_clear()), on the ingest thread: wait for it, do not read it once right after the wake */
 static bool claim_gone(uint64_t key, int ms) {
     for (int i = 0; i < ms / 5 && park_claim_held(key); i++) usleep(5000);
@@ -6259,7 +6266,7 @@ static int run_lookup_body(const char *dir) {
             snprintf(nm, sizeof(nm), "q%d.nz.test.", i);
             CHECK(wake_for(nm, &k, 5000) && !k.failed && k.ask == PARK_ASK_DROP);                 /* (the queries are dropped, not woken to be refused) */
         }
-        CHECK(lk_stats().expired == exp0 + 3 && lk_stats().pending == 0 && !ch_next(&fetchc, &m, 300));
+        CHECK(lk_settled(exp0 + 3, 2000) && !ch_next(&fetchc, &m, 300));
         for (int i = 1; i <= 6; i++) lk_none(f[0], &e, qr[i]);
         CHECK(places_are(0, 3000) && lk_stats().in_flight == 0);
         /* the claim of a name that was dropped is free: it can be asked for again */
@@ -6305,7 +6312,7 @@ static int run_lookup_body(const char *dir) {
             CHECK(wake_for(nm, &k, 5000) && k.ask == PARK_ASK_DROP);
             CHECK(shed_held_now(nm));                                                             /* (and so are the ones whose time was up in the queue) */
         }
-        CHECK(lk_stats().expired == exp0 + 3 && lk_stats().pending == 0 && !ch_next(&fetchc, &m, 200));
+        CHECK(lk_settled(exp0 + 3, 2000) && !ch_next(&fetchc, &m, 200));
         CHECK(lk_stats().remembered == rem0 + 6);
         for (int i = 0; i < 6; i++) lk_none(f[0], &e, sr[i]);
         CHECK(places_are(0, 3000));
