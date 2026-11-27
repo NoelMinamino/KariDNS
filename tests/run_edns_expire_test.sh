@@ -61,7 +61,7 @@ www     IN  A   192.0.2.10
 EOF
 
 cat << EOF > "$TMP_DIR/primary.conf"
-options { port $PORT1; bind-address { 127.0.0.1; }; $USER_OPT };
+options { not-ready-answer servfail; port $PORT1; bind-address { 127.0.0.1; }; $USER_OPT };
 zone "exp.example.com" {
     type master;
     file "$TMP_DIR/exp.zone";
@@ -70,7 +70,7 @@ zone "exp.example.com" {
 EOF
 
 cat << EOF > "$TMP_DIR/secA.conf"
-options { port $PORT2; bind-address { 127.0.0.1; }; serve-stale no; $USER_OPT };
+options { not-ready-answer servfail; port $PORT2; bind-address { 127.0.0.1; }; serve-stale no; $USER_OPT };
 zone "exp.example.com" {
     type slave;
     masters { 127.0.0.1 port $PORT1; };
@@ -79,7 +79,7 @@ zone "exp.example.com" {
 EOF
 
 cat << EOF > "$TMP_DIR/secB.conf"
-options { port $PORT3; bind-address { 127.0.0.1; }; serve-stale no; $USER_OPT };
+options { not-ready-answer servfail; port $PORT3; bind-address { 127.0.0.1; }; serve-stale no; $USER_OPT };
 zone "exp.example.com" {
     type slave;
     masters { 127.0.0.1 port $PORT2; };

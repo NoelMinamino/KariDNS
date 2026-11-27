@@ -520,6 +520,7 @@ typedef struct {
     db_schema_info_t keep_si;
     int64_t keep_si_at;
     bool keep_si_ok;
+    bool fetch_bg;                    /* 0.7: the request being served is of the background class (KDB_FETCH_PRIO_BACKGROUND: the fill, the reconcile): its reads are counted apart (fr_note()) */
     bool fetch_summary;
     const char *fetch_vname;          /* D1a: the view of the request being served (the fetch thread tells the inventory what it served) */
     bool dir_only;                    /* D1a milestone 4: CONFIG dir_only (memory-limit): zones the Backend has no data of are sent as summaries */
@@ -617,13 +618,26 @@ typedef struct { uint64_t id; uint16_t view; bool force; char zone[DNS_NAME_TEXT
 
 /* D1a: a FETCH_REQ waiting for the fetch thread (priority 0 = a parked query waits, 1 = warm-up, 2 = background) */
 typedef struct { uint64_t id; uint16_t view; uint8_t prio, mode; bool range; int64_t source_id; int64_t at; char zone[DNS_NAME_TEXT_SIZE]; } freq_t;   /* at: CLOCK_MONOTONIC ms of the enqueue */
-#define FQ_MAX 256                           /* more than this is answered "busy" (design 6.1) */
+/* more than this is answered "busy" (design 6.1).  0.7 first-fill latency: the Backend keeps up to 1024 bodies of the fill in flight (fill_max_for(), dns_db_ingest.c) beside the
+ * requests of queries (fetch-concurrency, at most 256): 1280, so that neither is turned away */
+#ifndef FQ_MAX
+#define FQ_MAX 1280
+#endif
 /* 0.7: a fetch worker that finds several requests of the same kind queued reads them together (fetch_batch()): one snapshot, one statement per table for
- * the zones instead of about a dozen statements for every one.  The most requests of one batch (bodies and lookups); at most FB_MAX. */
-#define FB_MAX 64
+ * the zones instead of about a dozen statements for every one.  The most requests of one batch: FETCH_BATCH_MAX for the requests of queries, the warm-up and the
+ * lookups (a query waits for its batch: small batches keep its time short), FETCH_BG_BATCH_MAX (DB_IN_MAX, one IN statement) for the bodies of the fill (the background class):
+ * PostgreSQL 10M zones, 2556 s with about 2 zones a statement against SQLite3's 490 s (2026-11-27: the statements were the cost).  At most FB_MAX. */
+#define FB_MAX DB_IN_MAX
 #ifndef FETCH_BATCH_MAX
 #define FETCH_BATCH_MAX 16
 #endif
+#define FETCH_BG_BATCH_MAX DB_IN_MAX
+/* 0.7 first-fill latency: while more than FETCH_BATCH_MAX requests of queries queue, their batches take up to FETCH_QUEUED_BATCH_MAX (a batch costs about one read whatever its size: pc31, PostgreSQL
+ * 10M zones under 2500 cold queries a second, the queries read about 7 zones a read and queued past park-timeout); with few queued they stay small (a query waits for its batch) */
+#define FETCH_QUEUED_BATCH_MAX 64
+/* a request of a query (or of the warm-up) came this recently: with a single worker (loader-threads 1) a batch of the fill stays at FETCH_BATCH_MAX, so that the
+ * next query does not wait behind a read of DB_IN_MAX zones (fq_bg_cap()) */
+#define FQ_FG_RECENT_MS 1000
 struct fbatch {
     size_t n;
     bool lookup;                              /* the requests are lookups of names (modes KDB_FETCH_LOOKUP, _LOOKUP_FULL); else bodies of zones (KDB_FETCH_FULL) */
@@ -633,11 +647,25 @@ struct fbatch {
     int64_t lk_id[FB_MAX];
     char lk_name[FB_MAX][DNS_NAME_TEXT_SIZE];
 };
-/* A request that has waited this long in fq goes before the priorities (the oldest first): a Backend query that joined a request in flight (the background
- * fetch of a zone) would otherwise wait for it behind every later priority 0 request, for as long as those keep coming, and run into the park time-out.
+/* A request of a query or of the warm-up that has waited this long in fq goes before the priorities between them (the oldest first), so that neither starves the other;
+ * a request of the fill (the background class) never goes before them, however long it waited (0.7 first-fill latency, fq_pick()).
  * KARIDNS_FETCH_AGING_MS in the environment replaces it (a test switch: the supervisor starts the loader with a cleared environment). */
 #define FQ_AGING_MS 200
 static int64_t g_fq_aging_ms = FQ_AGING_MS;
+#ifdef KARIDNS_TEST_EVICT
+/* the test builds only (KARIDNS_TEST_EVICT: `make coverage`, karidns-dbloader-evict): KARIDNS_TEST_FETCH_DELAY_MS, a slow database; every read of the fetch pool (one request or a
+ * batch) waits this long first (tests/run_db_firstfill_latency_test.sh; the supervisor clears the environment, so the test starts the loader through a script that sets it) */
+static int64_t g_test_fetch_delay_ms;
+/* (review #279, B) KARIDNS_TEST_FILL_FAIL=1: every request of the fill (the background class) is answered ZONE_FAILED, a read error of the database, so that a test can see a fill whose reads fail */
+static bool g_test_fill_fail;
+#endif
+/* 0.7: the reads of the fetch pool, for the line of fr_report(): statements of zones (scan_records_in() or the one-zone reads), and the zones they read; [0] the requests of queries,
+ * the warm-up and the lookups, [1] the background class (the fill).  The workers add, the fetch thread reports. */
+static _Atomic uint64_t g_fr_calls[2], g_fr_zones[2];
+static void fr_note(bool bg, uint64_t zones) {
+    atomic_fetch_add_explicit(&g_fr_calls[bg], 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&g_fr_zones[bg], zones, memory_order_relaxed);
+}
 
 #define LREQ_MAX 64
 #define IDX_SLOTS 65536                      /* view indexes are u16 */
@@ -712,6 +740,8 @@ struct lio {
     pthread_mutex_t fq_lock, wlock;
     pthread_cond_t fq_cond;
     size_t fq_idle, fq_allowed;
+    size_t fq_bg_active;                     /* 0.7: workers reading requests of the fill now (at most fq_bg_limit(): the others are the queries') */
+    int64_t fq_fg_at;                        /* ... when the last request of a query or of the warm-up was queued (CLOCK_MONOTONIC ms, 0 = never) */
     _Atomic bool wstop;
     uint64_t fq_busy;                        /* requests turned away because fq was full (the thread answers them) */
     freq_t fbusy[8];                         /* ... the first few, to be answered "busy" */
@@ -2050,6 +2080,7 @@ static int run_group(wk_t *w, size_t a, size_t b) {
         w->grouped = true;
         w->wi = pos;
         w->wend = e;
+        if (w->x->fetch) fr_note(w->x->fetch_bg, e - pos);
         int rc = drv->scan_metadata_in(w->conn, ids, e - pos, meta_cb, &w->zmeta);
         if (rc == 0 && nr && w->x->has_ext) rc = eset_load_in(drv, w->conn, rids, nr, &w->zext);
         if (rc == 0 && nr) rc = drv->scan_records_in(w->conn, rids, nr, rec_cb, w);
@@ -2104,6 +2135,7 @@ static int run_task(wk_t *w, size_t a, size_t b, bool bulk, bool all) {
     for (size_t pos = a; pos < b; pos++) {
         int64_t id = WZ(w, pos)->id;
         w->wi = pos;
+        if (w->x->fetch) fr_note(w->x->fetch_bg, 1);
         mset_reset(&w->zmeta);
         bool sec = zinfo_no_rows(WZ(w, pos));     /* B7b: no records are read for a secondary zone */
         eset_reset(&w->zext);
@@ -5232,6 +5264,7 @@ static int hot_run(ctx_t *x, struct lio *io) {
     return send_enc(x);
 }
 
+static size_t fq_drop_stale(struct lio *io, int64_t now);
 static void io_dispatch(struct lio *io, const kdb_frame_t *fr) {
     kdb_msg_t m;
     char why[KDB_REASON_LEN];
@@ -5251,6 +5284,7 @@ static void io_dispatch(struct lio *io, const kdb_frame_t *fr) {
         const kdb_fetch_req_t *q = &m.u.fetch_req;
         freq_t *f = NULL;
         pthread_mutex_lock(&io->fq_lock);                      /* (only the fetch stream gets a FETCH_REQ, and its lock is initialised) */
+        if (io->nfq == FQ_MAX) (void)fq_drop_stale(io, now_ms());      /* (review #279, 2: the requests of the fill the Backend gave up make room first) */
         if (io->nfq < FQ_MAX) f = &io->fq[io->nfq++];
         else if (io->nfbusy < sizeof(io->fbusy) / sizeof(io->fbusy[0])) f = &io->fbusy[io->nfbusy++];
         else io->fq_busy++;                                    /* beyond even that: the Backend's request times out */
@@ -5262,6 +5296,7 @@ static void io_dispatch(struct lio *io, const kdb_frame_t *fr) {
             f->range = q->has_range;
             f->source_id = q->source_id;
             f->at = now_ms();
+            if (f->prio < KDB_FETCH_PRIO_BACKGROUND) io->fq_fg_at = f->at;
             snprintf(f->zone, sizeof(f->zone), "%s", q->name);
             pthread_cond_broadcast(&io->fq_cond);          /* (broadcast: a worker above fq_allowed would take the wake-up) */
         }
@@ -5799,6 +5834,7 @@ static void fetch_setup(ctx_t *x, const lcfg_t *lc, const db_driver_t *drv, cons
     x->fetch_vname = lc->store_proto ? NULL : v->name;     /* (the store protocol keeps no inventory for the fetch thread to tell) */
     x->fetch_source_id = r->source_id;
     x->fetch_summary = r->mode == KDB_FETCH_SUMMARY;
+    x->fetch_bg = r->prio >= KDB_FETCH_PRIO_BACKGROUND;
     x->fetch_lookup = is_lookup;
     x->lk_full = r->mode == KDB_FETCH_LOOKUP_FULL;
     x->lk_found = false;
@@ -5936,16 +5972,92 @@ static void fetch_workers_stop(struct lio *io) {
     pthread_mutex_unlock(&io->fq_lock);
 }
 
+/* The most urgent of the n queued requests fq[] (arrival order: [0] is the oldest, and if it is not aged none is): priority 0 before 1 before 2, the oldest first; but one that has waited
+ * `aging` ms goes first (see FQ_AGING_MS). */
+static size_t fq_pick_fg(const freq_t *fq, size_t n, int64_t now, int64_t aging);
+/* 0.7 first-fill latency: a request of the fill never goes before one of a query or of the warm-up, however long it waited (with up to 1024 bodies of the fill queued the oldest request was
+ * nearly always one of the fill, and the queries waited behind it: pc31, PostgreSQL 10M zones under 2500 queries a second, 23 % lost).  The aging is kept between the queries and the
+ * warm-up; a query never joins a body of the fill on its way (the Backend asks for the zone itself, dns_db_ingest.c), which is what the aging of a background request was for.  Under a flood
+ * of queries the fill waits: queries first. */
+static size_t fq_pick(const freq_t *fq, size_t n, int64_t now, int64_t aging) {
+    const size_t fg = fq_pick_fg(fq, n, now, aging);
+    return fg < n ? fg : 0;                                  /* (only the fill is queued: the oldest of it) */
+}
+/* the most urgent among the requests that are not of the fill (priority < KDB_FETCH_PRIO_BACKGROUND): the first of them in arrival order when it has waited `aging` ms, else the lowest
+ * priority, the oldest first; n when there is none */
+static size_t fq_pick_fg(const freq_t *fq, size_t n, int64_t now, int64_t aging) {
+    size_t best = n;
+    for (size_t i = 0; i < n; i++) {
+        if (fq[i].prio >= KDB_FETCH_PRIO_BACKGROUND) continue;
+        if (best == n) {
+            best = i;
+            if (now - fq[i].at >= aging) break;              /* (the oldest of them has waited long enough: it goes first) */
+        } else if (fq[i].prio < fq[best].prio) {
+            best = i;
+        }
+    }
+    return best;
+}
+
+/* 0.7 first-fill latency: how many workers may read requests of the fill (the background class) at once, and the most requests one such batch takes.  The cost of a read of PostgreSQL is
+ * mostly its statements (a batch of DB_IN_MAX zones is one statement per table) but PostgreSQL is CPU-bound and the reads in parallel count too: pc31, 10M zones, loader-threads 8, the Backend's
+ * fill in flight 256: 7 workers on the fill 12.1k zones/s at 20 zones a read, 4 workers 11.2k at 41, 2 workers 8.9k at 127; 7 workers with 896 in flight 13.8k at 112.  So loader-threads - 1
+ * workers read the fill (the Backend keeps DB_IN_MAX bodies in flight for each, fill_max_for()), and one only the queries, the warm-up and the lookups: a query never waits behind the fill while
+ * loader-threads is 2 or more.  With a single worker (loader-threads 1, a small server) the batch of the
+ * fill is DB_IN_MAX only while no query or warm-up request came for FQ_FG_RECENT_MS (fg_recent), FETCH_BATCH_MAX otherwise. */
+static size_t fq_bg_limit(size_t workers) { return workers <= 1 ? 1 : workers - 1; }
+/* the most requests of queries (or the warm-up, lookups) that one batch takes, with nfg of them queued: FETCH_BATCH_MAX, or FETCH_QUEUED_BATCH_MAX while more than that queue */
+static size_t fq_fg_cap_n(size_t nfg) { return nfg > FETCH_BATCH_MAX ? FETCH_QUEUED_BATCH_MAX : FETCH_BATCH_MAX; }
+static size_t fq_fg_cap(const struct lio *io) {          /* (fq_lock held) */
+    size_t nfg = 0;
+    for (size_t i = 0; i < io->nfq; i++)
+        if (io->fq[i].prio < KDB_FETCH_PRIO_BACKGROUND) nfg++;
+    return fq_fg_cap_n(nfg);
+}
+static size_t fq_bg_cap(size_t workers, bool fg_recent) {
+    return workers <= 1 && fg_recent ? FETCH_BATCH_MAX : FETCH_BG_BATCH_MAX;
+}
+/* (review #279, 2) a request of the fill that waited in the queue as long as the Backend waits for an answer (its g_ing_fetch_timeout_ms, 30 s) is not read: the Backend has given it up
+ * and asks again for the zone, so it would only take a read of the database and a place of the queue (a long flood of queries kept up to FQ_MAX of them, and the requests of queries were
+ * then answered busy).  The requests are in arrival order: the first request of the fill is its oldest.  Drops them (fq_lock held) and returns how many. */
+#define FQ_BG_STALE_MS 30000
+static _Atomic uint64_t g_fq_stale;                        /* requests of the fill dropped for their age, since the start */
+static size_t fq_drop_stale(struct lio *io, int64_t now) {
+    size_t i = 0;
+    while (i < io->nfq && io->fq[i].prio < KDB_FETCH_PRIO_BACKGROUND) i++;
+    if (i == io->nfq || now - io->fq[i].at < FQ_BG_STALE_MS) return 0;
+    const size_t n0 = io->nfq;
+    size_t j = i;
+    for (; i < n0; i++) {
+        if (io->fq[i].prio >= KDB_FETCH_PRIO_BACKGROUND && now - io->fq[i].at >= FQ_BG_STALE_MS) continue;
+        if (j != i) io->fq[j] = io->fq[i];
+        j++;
+    }
+    io->nfq = j;
+    atomic_fetch_add_explicit(&g_fq_stale, n0 - j, memory_order_relaxed);
+    return n0 - j;
+}
+/* may a worker take a request now: one of a query (or the warm-up, a lookup), or one of the fill while fewer than fq_bg_limit() workers read the fill (fq_lock held) */
+static bool fq_takeable(const struct lio *io) {
+    if (io->nfq == 0) return false;
+    if (io->fq_bg_active < fq_bg_limit(io->fq_allowed)) return true;
+    for (size_t i = 0; i < io->nfq; i++)
+        if (io->fq[i].prio < KDB_FETCH_PRIO_BACKGROUND) return true;
+    return false;
+}
+
 /* 0.7: the worker has taken request *r as the most urgent; more requests of the same kind join it (fq_lock held; `queued` = what was queued before r was taken).  Same view, same priority (a query that
  * waits is never held up by a batch of the background fill), same kind: bodies of zones (KDB_FETCH_FULL), or lookups of names (the candidate names of all together fit one find_zones_in()); a zone that is
- * already in the batch is left for the next one.  The batch is at most FETCH_BATCH_MAX, and no more than this worker's share of what is queued, so that the other workers of the pool still have requests.
+ * already in the batch is left for the next one.  The batch is at most maxn (fq_bg_cap(): FETCH_BATCH_MAX, or FETCH_BG_BATCH_MAX for the fill), and no more than this worker's share of what is
+ * queued, so that the other workers of the pool still have requests.
  * fb->n < 2 afterwards: nothing joined, r is read as a single request. */
-static void fetch_take(struct lio *io, struct fbatch *fb, const freq_t *r, size_t queued) {
+static void fetch_take(struct lio *io, struct fbatch *fb, const freq_t *r, size_t queued, size_t maxn) {
     fb->n = 0;
     if (r->range || (r->mode != KDB_FETCH_FULL && r->mode != KDB_FETCH_LOOKUP && r->mode != KDB_FETCH_LOOKUP_FULL)) return;
     const size_t workers = io->fq_allowed ? io->fq_allowed : 1;
     size_t cap = (queued + workers - 1) / workers;
-    if (cap > FETCH_BATCH_MAX) cap = FETCH_BATCH_MAX;
+    if (maxn > FETCH_BATCH_MAX && cap < maxn) cap = maxn;    /* (0.7: a large batch of the fill takes what is queued, up to maxn: one statement of DB_IN_MAX zones is the point; the queries keep a worker, fq_bg_cap()) */
+    if (cap > maxn) cap = maxn;
     if (cap > FB_MAX) cap = FB_MAX;
     if (cap < 2) return;
     const char *tmp[DB_LOOKUP_MAX];
@@ -5991,7 +6103,7 @@ static void *fetch_worker(void *arg) {
     struct fbatch *fb = calloc(1, sizeof(*fb));            /* (NULL: no batches, every request is read alone) */
     for (;;) {
         pthread_mutex_lock(&io->fq_lock);
-        while (!atomic_load(&io->wstop) && !(io->nfq > 0 && a->idx < io->fq_allowed)) {
+        while (!atomic_load(&io->wstop) && !(a->idx < io->fq_allowed && (fq_drop_stale(io, now_ms()), fq_takeable(io)))) {      /* (review #279, 2: a request of the fill the Backend gave up is not read) */
             io->fq_idle++;
             pthread_cond_wait(&io->fq_cond, &io->fq_lock);
             io->fq_idle--;
@@ -6000,16 +6112,23 @@ static void *fetch_worker(void *arg) {
             pthread_mutex_unlock(&io->fq_lock);
             break;
         }
-        size_t best = 0;                                          /* (fq is in arrival order: [0] is the oldest, and if it is not aged none is) */
-        if (now_ms() - io->fq[0].at < g_fq_aging_ms)
-            for (size_t i = 1; i < io->nfq; i++)
-                if (io->fq[i].prio < io->fq[best].prio) best = i;
-        freq_t r = io->fq[best];
+        const int64_t tnow = now_ms();
+        const bool fill_ok = io->fq_bg_active < fq_bg_limit(io->fq_allowed);
+        const size_t best = fill_ok ? fq_pick(io->fq, io->nfq, tnow, g_fq_aging_ms) : fq_pick_fg(io->fq, io->nfq, tnow, g_fq_aging_ms);
+        freq_t r = io->fq[best];                                  /* (fq_takeable(): there is one) */
         const size_t queued = io->nfq;
         memmove(&io->fq[best], &io->fq[best + 1], (io->nfq - best - 1) * sizeof(io->fq[0]));
         io->nfq--;
-        if (fb) fetch_take(io, fb, &r, queued);
+        const bool bg = r.prio >= KDB_FETCH_PRIO_BACKGROUND;      /* (this worker reads the fill: one place of fq_bg_active until the read is over) */
+        if (bg) io->fq_bg_active++;
+        if (fb) fetch_take(io, fb, &r, queued, bg ? fq_bg_cap(io->fq_allowed, io->fq_fg_at && tnow - io->fq_fg_at < FQ_FG_RECENT_MS) : fq_fg_cap(io));
         pthread_mutex_unlock(&io->fq_lock);
+#ifdef KARIDNS_TEST_EVICT
+        if (g_test_fetch_delay_ms > 0) {                          /* (a test build: a slow database, a read costs this much whatever its size, as a statement of PostgreSQL does) */
+            struct timespec ts = { g_test_fetch_delay_ms / 1000, (long)(g_test_fetch_delay_ms % 1000) * 1000000L };
+            nanosleep(&ts, NULL);
+        }
+#endif
         pthread_mutex_lock(&g_fcfg_lock);
         if (g_fcfg_seq != seen) {
             cfg_free(&lc);
@@ -6017,7 +6136,31 @@ static void *fetch_worker(void *arg) {
             seen = g_fcfg_seq;
         }
         pthread_mutex_unlock(&g_fcfg_lock);
-        if ((fb && fb->n >= 2 ? fetch_batch(&x, &lc, fb) : fetch_one(&x, &lc, &r)) != 0) {
+#ifdef KARIDNS_TEST_EVICT
+        if (bg && g_test_fill_fail) {                         /* (a test build: the fill's reads fail, see g_test_fill_fail) */
+            int frc = 0;
+            if (fb && fb->n >= 2) for (size_t i = 0; i < fb->n && frc == 0; i++) frc = fetch_fail(&x, &fb->rq[i], "test: an injected read error of the database");
+            else frc = fetch_fail(&x, &r, "test: an injected read error of the database");
+            pthread_mutex_lock(&io->fq_lock);
+            io->fq_bg_active--;
+            pthread_cond_broadcast(&io->fq_cond);
+            pthread_mutex_unlock(&io->fq_lock);
+            if (frc != 0) {
+                atomic_store(&g_fetch_died, true);
+                fetch_workers_stop(io);
+                break;
+            }
+            continue;
+        }
+#endif
+        const int frc = fb && fb->n >= 2 ? fetch_batch(&x, &lc, fb) : fetch_one(&x, &lc, &r);
+        if (bg) {
+            pthread_mutex_lock(&io->fq_lock);
+            io->fq_bg_active--;
+            pthread_cond_broadcast(&io->fq_cond);                 /* (a worker that waited because the fill had its workers may take it now) */
+            pthread_mutex_unlock(&io->fq_lock);
+        }
+        if (frc != 0) {
             atomic_store(&g_fetch_died, true);                    /* (the stream or the memory is gone: this process does not serve the fetch stream again) */
             fetch_workers_stop(io);
             break;
@@ -6029,6 +6172,47 @@ static void *fetch_worker(void *arg) {
     keep_drop(&x);
     kdb_enc_free(&x.enc);
     return NULL;
+}
+
+/* 0.7: the reads of the fetch pool in one line (LOG_INFO): every FR_REPORT_MS while they go on, and once FR_IDLE_MS after they stopped (the end of a fill), so that the zones of a read
+ * (zones / reads) can be seen without a debug level: "fetch reads in 60 s: queries 120 reads 130 zones, fill 400 reads 51200 zones (128.0 zones a read)"; a read is one IN statement per table for a group of zones, or the reads of one zone. */
+#define FR_REPORT_MS 60000
+#define FR_IDLE_MS 2000
+typedef struct {
+    uint64_t calls[2], zones[2];     /* the counters at the last line */
+    uint64_t seen;                   /* the sum of the calls at the last look (a change means reads went on) */
+    int64_t since, last_change;      /* when the last line was written; when the last change was seen */
+    uint64_t stale;                  /* (review #279, 2) g_fq_stale at the last line of it */
+} fr_state_t;
+static void fr_report(fr_state_t *s, int64_t now) {
+    const uint64_t st = atomic_load_explicit(&g_fq_stale, memory_order_relaxed);
+    if (st != s->stale) {
+        lg(LOG_INFO, "dropped %llu requests of the fill that waited %d s in the queue (the Backend gave them up and asks for the zones again)", (unsigned long long)(st - s->stale), FQ_BG_STALE_MS / 1000);
+        s->stale = st;
+    }
+    uint64_t c[2], z[2];
+    for (int i = 0; i < 2; i++) {
+        c[i] = atomic_load_explicit(&g_fr_calls[i], memory_order_relaxed);
+        z[i] = atomic_load_explicit(&g_fr_zones[i], memory_order_relaxed);
+    }
+    if (c[0] + c[1] != s->seen) {
+        s->seen = c[0] + c[1];
+        s->last_change = now;
+    }
+    const uint64_t dc0 = c[0] - s->calls[0], dc1 = c[1] - s->calls[1];
+    if (dc0 + dc1 == 0) {
+        s->since = now;
+        return;
+    }
+    if (now - s->since < FR_REPORT_MS && now - s->last_change < FR_IDLE_MS) return;
+    const uint64_t dz0 = z[0] - s->zones[0], dz1 = z[1] - s->zones[1];
+    lg(LOG_INFO, "fetch reads in %lld s: queries %llu reads %llu zones, fill %llu reads %llu zones (%.1f zones a read)", (long long)((now - s->since + 500) / 1000),
+       (unsigned long long)dc0, (unsigned long long)dz0, (unsigned long long)dc1, (unsigned long long)dz1, dc1 ? (double)dz1 / (double)dc1 : 0.0);
+    for (int i = 0; i < 2; i++) {
+        s->calls[i] = c[i];
+        s->zones[i] = z[i];
+    }
+    s->since = now;
 }
 
 /* the thread that owns the fetch stream: reads the requests into the queue (a request beyond FQ_MAX is answered "busy"), keeps the pool at loader-threads
@@ -6060,6 +6244,9 @@ static void *fetch_main(void *arg) {
     fw_arg_t warg[FW_MAX];
     pthread_t wtid[FW_MAX];
     unsigned nw = 0;
+    fr_state_t fr;
+    memset(&fr, 0, sizeof(fr));
+    fr.since = now_ms();
     while (!g_stop && !atomic_load(&g_fetch_stop) && !atomic_load(&io->wstop) && !io->eof && !io->failed) {
         while (io->nfbusy > 0) {                              /* the requests that did not fit the queue (only this thread uses them) */
             freq_t *b = &io->fbusy[--io->nfbusy];
@@ -6069,6 +6256,7 @@ static void *fetch_main(void *arg) {
         int pr = poll(&p, 1, 200);
         if (pr < 0 && errno != EINTR) break;
         if (pr > 0) io_pump(io);
+        fr_report(&fr, now_ms());
         pthread_mutex_lock(&g_fcfg_lock);
         unsigned want = g_fcfg.loader_threads >= 1 && g_fcfg.loader_threads <= FW_MAX ? g_fcfg.loader_threads : 1;
         pthread_mutex_unlock(&g_fcfg_lock);
@@ -7352,6 +7540,15 @@ int main(int argc, char **argv) {
         unsigned long av;
         if (parse_uint(aging_env, 1, 3600000, &av)) g_fq_aging_ms = (int64_t)av;
     }
+#ifdef KARIDNS_TEST_EVICT
+    const char *delay_env = getenv("KARIDNS_TEST_FETCH_DELAY_MS");            /* (the test builds only, see g_test_fetch_delay_ms) */
+    if (delay_env) {
+        unsigned long dv;
+        if (parse_uint(delay_env, 0, 10000, &dv)) g_test_fetch_delay_ms = (int64_t)dv;
+    }
+    const char *ff_env = getenv("KARIDNS_TEST_FILL_FAIL");                    /* (the test builds only, see g_test_fill_fail) */
+    g_test_fill_fail = ff_env && strcmp(ff_env, "1") == 0;
+#endif
     const char *stuck_env = getenv("KARIDNS_SIGNER_STUCK_MS");                /* (a test switch, see SIGW_STUCK_MS) */
     if (stuck_env) {
         unsigned long sv;

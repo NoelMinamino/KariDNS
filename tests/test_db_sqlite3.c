@@ -5126,22 +5126,22 @@ static void test_fetch_take(void) {
         fq_put(io, 100 + (uint64_t)i, KDB_FETCH_FULL, KDB_FETCH_PRIO_BACKGROUND, 1, nm);
     }
     io->fq_allowed = 1;
-    fetch_take(io, fb, &r, 41);
+    fetch_take(io, fb, &r, 41, FETCH_BATCH_MAX);
     CHECK_MSG(fb->n == (FETCH_BATCH_MAX < 41 ? FETCH_BATCH_MAX : 41) && !fb->lookup && fb->rq[0].id == 1 && io->nfq == 41 - fb->n, "one worker: %zu taken, %zu left", fb->n, io->nfq);
     size_t left = io->nfq;
     io->fq_allowed = 4;
-    fetch_take(io, fb, &r, left + 1);
+    fetch_take(io, fb, &r, left + 1, FETCH_BATCH_MAX);
     CHECK_MSG(fb->n == (left + 1 + 3) / 4 || fb->n == FETCH_BATCH_MAX, "four workers: %zu taken of %zu", fb->n, left + 1);
     /* nothing queued, or too few for a share of two: the request is read alone */
     io->nfq = 0;
-    fetch_take(io, fb, &r, 1);
+    fetch_take(io, fb, &r, 1, FETCH_BATCH_MAX);
     CHECK(fb->n == 0);
     io->fq_allowed = 4;
     fq_put(io, 7, KDB_FETCH_FULL, KDB_FETCH_PRIO_BACKGROUND, 1, "q.test.");
-    fetch_take(io, fb, &r, 2);
+    fetch_take(io, fb, &r, 2, FETCH_BATCH_MAX);
     CHECK(fb->n == 0 && io->nfq == 1);
     io->fq_allowed = 1;
-    fetch_take(io, fb, &r, 2);
+    fetch_take(io, fb, &r, 2, FETCH_BATCH_MAX);
     CHECK(fb->n == 2 && io->nfq == 0);
     /* what does not join: another view, another priority, a range, another kind, a summary, a name that is in the batch already (any capitalisation, with or without the dot) */
     io->nfq = 0;
@@ -5154,15 +5154,15 @@ static void test_fetch_take(void) {
     io->fq[io->nfq - 1].range = true;
     fq_put(io, 16, KDB_FETCH_FULL, KDB_FETCH_PRIO_BACKGROUND, 1, "ok.test.");
     io->fq_allowed = 1;
-    fetch_take(io, fb, &r, 8);
+    fetch_take(io, fb, &r, 8, FETCH_BATCH_MAX);
     CHECK_MSG(fb->n == 2 && fb->rq[1].id == 16 && io->nfq == 6, "joined %zu, left %zu", fb->n, io->nfq);
     /* a request that is no batch kind (a summary, a range) takes nothing */
     r.mode = KDB_FETCH_SUMMARY;
-    fetch_take(io, fb, &r, 8);
+    fetch_take(io, fb, &r, 8, FETCH_BATCH_MAX);
     CHECK(fb->n == 0);
     r.mode = KDB_FETCH_FULL;
     r.range = true;
-    fetch_take(io, fb, &r, 8);
+    fetch_take(io, fb, &r, 8, FETCH_BATCH_MAX);
     CHECK(fb->n == 0);
     r.range = false;
     /* lookups: only lookups, and their candidate names (one for each label) fit one statement of DB_LOOKUP_MAX names */
@@ -5178,10 +5178,103 @@ static void test_fetch_take(void) {
     fq_put(io, 23, KDB_FETCH_LOOKUP, KDB_FETCH_PRIO_BACKGROUND, 1, longname);   /* (the third batch member would be 3 + 3 + 62 + 62 > 128: it stays) */
     fq_put(io, 24, KDB_FETCH_LOOKUP_FULL, KDB_FETCH_PRIO_BACKGROUND, 1, "x.example.test.");
     io->fq_allowed = 1;
-    fetch_take(io, fb, &r, 6);
+    fetch_take(io, fb, &r, 6, FETCH_BATCH_MAX);
     CHECK_MSG(fb->lookup && fb->n == 4 && fb->rq[1].id == 21 && fb->rq[2].id == 22 && fb->rq[3].id == 24 && io->nfq == 2, "lookups: %zu joined, %zu left", fb->n, io->nfq);
+    /* 0.7 first-fill latency: a batch of the fill takes up to FETCH_BG_BATCH_MAX (one IN statement) when fq_bg_cap() allows it */
+    io->nfq = 0;
+    r.mode = KDB_FETCH_FULL;
+    r.prio = KDB_FETCH_PRIO_BACKGROUND;
+    snprintf(r.zone, sizeof(r.zone), "z0.test.");
+    for (int i = 1; i <= 300; i++) {
+        snprintf(nm, sizeof(nm), "z%d.test.", i);
+        fq_put(io, 1000 + (uint64_t)i, KDB_FETCH_FULL, KDB_FETCH_PRIO_BACKGROUND, 1, nm);
+    }
+    io->fq_allowed = 1;
+    fetch_take(io, fb, &r, 301, fq_bg_cap(1, false));
+    CHECK_MSG(fb->n == FETCH_BG_BATCH_MAX && io->nfq == 301 - FETCH_BG_BATCH_MAX, "the fill, one worker, no query: %zu taken", fb->n);
+    fetch_take(io, fb, &r, io->nfq + 1, fq_bg_cap(1, true));
+    CHECK_MSG(fb->n == FETCH_BATCH_MAX, "the fill, one worker, a query came: %zu taken", fb->n);
     free(io);
     free(fb);
+}
+
+/* 0.7 first-fill latency: which request a worker takes (fq_pick()), and how large a batch of the fill may be (fq_bg_cap()) */
+static void test_fetch_pick(void) {
+    printf("fetch order and batch size of the fill (0.7 first-fill latency)\n");
+    freq_t q[4];
+    memset(q, 0, sizeof(q));
+    q[0].prio = KDB_FETCH_PRIO_BACKGROUND; q[0].at = 1000;
+    q[1].prio = KDB_FETCH_PRIO_WARM;       q[1].at = 1001;
+    q[2].prio = KDB_FETCH_PRIO_QUERY;      q[2].at = 1002;
+    q[3].prio = KDB_FETCH_PRIO_QUERY;      q[3].at = 1003;
+    CHECK_MSG(fq_pick(q, 4, 1100, 200) == 2, "a query before the fill and the warm-up: %zu", fq_pick(q, 4, 1100, 200));
+    CHECK_MSG(fq_pick(q, 4, 1200, 200) == 2 && fq_pick(q, 4, 99999, 200) == 1, "the fill never goes first, aged or not; an aged warm-up request goes before a query: %zu %zu", fq_pick(q, 4, 1200, 200), fq_pick(q, 4, 99999, 200));
+    CHECK(fq_pick(q, 2, 1100, 200) == 1);
+    CHECK(fq_pick(q, 1, 1100, 200) == 0);
+    /* one worker: DB_IN_MAX unless a query came recently; more workers: the last one never reads a large batch of the fill */
+    CHECK(fq_bg_cap(1, false) == FETCH_BG_BATCH_MAX && fq_bg_cap(1, true) == FETCH_BATCH_MAX && fq_bg_cap(0, false) == FETCH_BG_BATCH_MAX);
+    CHECK(fq_bg_cap(2, true) == FETCH_BG_BATCH_MAX && fq_bg_cap(8, true) == FETCH_BG_BATCH_MAX);
+    CHECK(fq_bg_limit(0) == 1 && fq_bg_limit(1) == 1 && fq_bg_limit(2) == 1 && fq_bg_limit(8) == 7);
+    CHECK(fq_fg_cap_n(0) == FETCH_BATCH_MAX && fq_fg_cap_n(FETCH_BATCH_MAX) == FETCH_BATCH_MAX && fq_fg_cap_n(FETCH_BATCH_MAX + 1) == FETCH_QUEUED_BATCH_MAX);   /* (queries queue: larger batches) */
+    /* the worker that may not read the fill takes the most urgent of the others (the oldest when it is aged), and none when only the fill is queued */
+    CHECK(fq_pick_fg(q, 4, 1100, 200) == 2 && fq_pick_fg(q, 1, 1100, 200) == 1 && fq_pick_fg(q, 2, 1300, 200) == 1);
+    {
+        struct lio *io2 = calloc(1, sizeof(*io2));
+        CHECK(io2 != NULL);
+        if (io2) {
+            io2->fq_allowed = 2;
+            io2->nfq = 1;
+            io2->fq[0] = q[0];                                     /* (the fill only) */
+            CHECK(fq_takeable(io2));
+            io2->fq_bg_active = 1;
+            CHECK(!fq_takeable(io2));                              /* (the one worker of the fill is busy: the other waits for a query) */
+            io2->fq[1] = q[2];
+            io2->nfq = 2;
+            CHECK(fq_takeable(io2));
+            io2->nfq = 0;
+            CHECK(!fq_takeable(io2));
+            /* (review #279, 2) the requests of the fill that waited FQ_BG_STALE_MS are dropped (the Backend gave them up); the queries' and the younger ones of the fill stay, in order */
+            for (int i = 0; i < 6; i++) {
+                io2->fq[i] = q[0];
+                io2->fq[i].id = 100 + (uint64_t)i;
+                io2->fq[i].prio = (i == 1 || i == 4) ? KDB_FETCH_PRIO_QUERY : KDB_FETCH_PRIO_BACKGROUND;
+                io2->fq[i].at = i < 3 ? 1000 : 20000;                /* (0, 2 of the fill: old; 3, 5 of the fill: young) */
+            }
+            io2->nfq = 6;
+            const uint64_t st0 = atomic_load(&g_fq_stale);
+            CHECK(fq_drop_stale(io2, 1000 + FQ_BG_STALE_MS - 1) == 0 && io2->nfq == 6);      /* (not yet) */
+            CHECK(fq_drop_stale(io2, 1000 + FQ_BG_STALE_MS) == 2 && io2->nfq == 4);
+            CHECK(io2->fq[0].id == 101 && io2->fq[1].id == 103 && io2->fq[2].id == 104 && io2->fq[3].id == 105 && atomic_load(&g_fq_stale) == st0 + 2);
+            CHECK(fq_drop_stale(io2, 1000 + FQ_BG_STALE_MS) == 0);                           /* (the oldest of the fill is young now: nothing to look at) */
+            io2->nfq = 1;
+            io2->fq[0].prio = KDB_FETCH_PRIO_QUERY;
+            io2->fq[0].at = 0;
+            CHECK(fq_drop_stale(io2, 999999) == 0 && io2->nfq == 1);                         /* (a query is never dropped for its age) */
+            free(io2);
+        }
+    }
+    /* the line of the reads: nothing until reads stopped for FR_IDLE_MS (or FR_REPORT_MS went by), then once */
+    fr_state_t s;
+    memset(&s, 0, sizeof(s));
+    s.since = 0;
+    for (int i = 0; i < 2; i++) {
+        atomic_store(&g_fr_calls[i], 0);
+        atomic_store(&g_fr_zones[i], 0);
+    }
+    fr_report(&s, 10);
+    CHECK(s.stale == atomic_load(&g_fq_stale) && s.stale >= 2);  /* (the requests of the fill dropped above for their age: said once) */
+    fr_note(true, 128);
+    fr_note(false, 1);
+    fr_report(&s, 100);
+    CHECK(s.calls[1] == 0);                                       /* (still reading) */
+    fr_report(&s, 100 + FR_IDLE_MS);
+    CHECK(s.calls[1] == 1 && s.zones[1] == 128 && s.calls[0] == 1 && s.zones[0] == 1);
+    fr_note(true, 64);
+    for (int64_t t = 200 + FR_IDLE_MS; t < 200 + FR_IDLE_MS + FR_REPORT_MS + 1000; t += 500) {
+        fr_note(true, 64);
+        fr_report(&s, t);
+    }
+    CHECK_MSG(s.calls[1] > 1, "a line every FR_REPORT_MS while the reads go on: %llu", (unsigned long long)s.calls[1]);
 }
 
 int main(int argc, char **argv) {
@@ -5245,6 +5338,7 @@ int main(int argc, char **argv) {
     test_find_zones_classes();
     test_fetch_batch();
     test_fetch_take();
+    test_fetch_pick();
     test_manifest_rate();
     test_schema_versions();
     test_audit_actor();

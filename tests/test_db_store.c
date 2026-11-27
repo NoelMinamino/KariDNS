@@ -415,8 +415,8 @@ static void *reader_thread(void *arg) {
                 if (out[i] == 192 && out[i + 1] == 0 && out[i + 2] == 2 && out[i + 3] >= 80 && out[i + 3] <= 83) found = true;
             if (found) atomic_fetch_add(&g_rd_ok, 1);
             else atomic_fetch_add(&g_rd_bad, 1);
-        } else if (rl > 12) {
-            atomic_fetch_add(&g_rd_gone, 1);                      /* (not ready, or refused: the zone was out of memory) */
+        } else if (rl > 12 || rl == DNS_NR_DROP) {
+            atomic_fetch_add(&g_rd_gone, 1);                      /* (not answered (0.7 first-fill latency: DNS_NR_DROP), or refused: the zone was out of memory) */
         } else {
             atomic_fetch_add(&g_rd_bad, 1);
         }
@@ -690,8 +690,10 @@ static bool wk_wait_answer(wk_t *k, uint8_t *out, int *len, int ms) {
 }
 
 static const char *g_self = "";
+extern _Atomic bool db_store_test_no_early_bulk;
 static int run_mode(const char *mode) {
     printf("[the zone store is the directory of the database zones: %s mode]\n", mode);
+    atomic_store(&db_store_test_no_early_bulk, true);       /* (0.7 first-fill latency: the zones here are installed without passes, the scrub and the cleaner are tested: no unlogged fill from the start) */
     char dir[] = "/tmp/test_db_store.XXXXXX";
     if (!mkdtemp(dir)) { perror("mkdtemp"); return 1; }
     char sdir[600];
@@ -939,16 +941,14 @@ static int run_mode(const char *mode) {
         CHECK(park_att_take(sv, bogus) == PARK_ATT_ALL);                       /* (the claim was taken with it) */
     }
 
-    /* review L4: a query's request leaves the fill's share of the places free only while the fill has work (not in the pause after a failed round, not without a loader, not when its scan is over) */
+    /* 0.7 first-fill latency: the fill takes no place of fetch-concurrency; its own limit of bodies in flight, 128 for each worker of the fill (loader-threads - 1), 256..1024, while no request of a query waits, and the old share
+     * (a quarter of fetch-concurrency, at least one, at most 32) while one waits in the wait queue or the lookup queue */
     {
-        extern bool db_ingest_test_qplace(bool bg_on, bool loader, uint32_t nbulk, int64_t retry_ms, uint32_t used, uint32_t conc);
-        CHECK(!db_ingest_test_qplace(true, true, 0, 0, 7, 8));                   /* (8 places, the fill's share is 2: 7 used leave room for the fill only) */
-        CHECK(!db_ingest_test_qplace(true, true, 0, 1, 7, 8));                   /* (a pause that is over) */
-        CHECK(db_ingest_test_qplace(true, true, 0, INT64_MAX / 2, 7, 8));        /* (in the pause: the places are the queries') */
-        CHECK(db_ingest_test_qplace(false, true, 0, 0, 7, 8));                   /* (the scan is over) */
-        CHECK(db_ingest_test_qplace(true, false, 0, 0, 7, 8));                   /* (no loader) */
-        CHECK(db_ingest_test_qplace(true, true, 2, 0, 7, 8));                    /* (the fill has its share in flight: those places are used already) */
-        CHECK(!db_ingest_test_qplace(true, true, 0, 0, 8, 8) && !db_ingest_test_qplace(false, true, 0, 0, 8, 8));   /* (all places used: nobody) */
+        extern uint32_t db_ingest_test_fill_limit(uint32_t nwq, uint32_t nlq, uint32_t conc, uint32_t lt);
+        CHECK(db_ingest_test_fill_limit(0, 0, 8, 1) == 256 && db_ingest_test_fill_limit(0, 0, 256, 3) == 256);      /* (at least 256) */
+        CHECK(db_ingest_test_fill_limit(0, 0, 16, 4) == 384 && db_ingest_test_fill_limit(0, 0, 16, 8) == 896 && db_ingest_test_fill_limit(0, 0, 16, 16) == 1024);   /* (128 for each worker of the fill, at most 1024) */
+        CHECK(db_ingest_test_fill_limit(1, 0, 8, 8) == 2 && db_ingest_test_fill_limit(0, 1, 8, 8) == 2);
+        CHECK(db_ingest_test_fill_limit(5, 5, 256, 8) == 32 && db_ingest_test_fill_limit(1, 0, 2, 1) == 1 && db_ingest_test_fill_limit(1, 0, 64, 1) == 16);
         {   /* the places the lookups may take (lk_share()): three quarters, but one place is always left to the fetches of zones (the share was all of the places at 1 to 3) */
             extern uint32_t db_ingest_test_lk_share(uint32_t conc);
             CHECK(db_ingest_test_lk_share(1) == 1 && db_ingest_test_lk_share(2) == 1 && db_ingest_test_lk_share(3) == 2 && db_ingest_test_lk_share(4) == 3 && db_ingest_test_lk_share(5) == 4);
@@ -2470,11 +2470,19 @@ static bool at_fill_to_prep(const dbdir_ops_t *ops, uint32_t base, zdir_elem_t *
     }
     return ops->counters(9) != 0;
 }
+/* the grace period after elements were taken out of the table: true when every reader that may have found them has left, and only then may they be freed.  The thread that makes a bigger table
+ * (att_prep_thread()) reads the elements in its read section, and on a loaded host (ASan, the suite in parallel) that section can outlast a short wait: an element freed after a wait that ran out
+ * was read after its free (heap-use-after-free in att_zid() under ASan).  A wait that runs out is a failure, and the elements are then left unfreed (a leak in a test, not a use after free) */
+static bool at_grace(void) {
+    const bool ok = rcu_writer_wait_until_safe(rcu_writer_advance_epoch(), 60000);
+    CHECK_MSG(ok, "a reader stayed in its read section for 60 s: the elements taken out are not freed");
+    return ok;
+}
 static void at_drop_all(const dbdir_ops_t *ops, zdir_elem_t **arr, uint32_t n) {
     CHECK(at_wait_prep(ops, false, 20000));                                       /* (a thread that makes a table reads the elements: they are not freed meanwhile) */
     for (uint32_t i = 0; i < n; i++) ops->attach_remove(arr[i]);
-    (void)rcu_writer_wait_until_safe(rcu_writer_advance_epoch(), 5000);
-    for (uint32_t i = 0; i < n; i++) free(arr[i]);
+    if (at_grace())
+        for (uint32_t i = 0; i < n; i++) free(arr[i]);
     free(arr);
 }
 
@@ -2586,14 +2594,14 @@ static void at_scenarios(const dbdir_ops_t *ops) {
         ring[slot] = at_new(next++);
         CHECK(at_put(ops, ring[slot]));
         if (ngone == 4096) {
-            (void)rcu_writer_wait_until_safe(rcu_writer_advance_epoch(), 5000);
-            for (int g = 0; g < ngone; g++) free(gone[g]);
+            if (at_grace())
+                for (int g = 0; g < ngone; g++) free(gone[g]);
             ngone = 0;
         }
         if ((k & 1023) == 0) usleep(100);
     }
-    (void)rcu_writer_wait_until_safe(rcu_writer_advance_epoch(), 5000);
-    for (int g = 0; g < ngone; g++) free(gone[g]);
+    if (at_grace())
+        for (int g = 0; g < ngone; g++) free(gone[g]);
     CHECK(at_wait_prep(ops, false, 20000));
     const uint64_t gr3 = ops->counters(6) - gr2, bg3 = ops->counters(8) - bg2;
     printf("  tombstones: %llu table(s) made at %llu slots, %llu of them outside the lock; prepared growths started: %d\n", (unsigned long long)gr3, (unsigned long long)slots2, (unsigned long long)bg3, atomic_load(&g_pp_calls));
@@ -2701,8 +2709,8 @@ static int run_attab(const char *dir) {
     for (uint32_t i = 1; i <= AT_N && g_at_el; i++) {                            /* (the table is emptied: nothing is freed that a reader could have) */
         if (!(i % 7 == 0 && i + 50 <= AT_N)) ops->attach_remove(g_at_el[i]);
     }
-    (void)rcu_writer_wait_until_safe(rcu_writer_advance_epoch(), 5000);
-    for (uint32_t i = 1; i <= AT_N && g_at_el; i++) free(g_at_el[i]);
+    if (at_grace())
+        for (uint32_t i = 1; i <= AT_N && g_at_el; i++) free(g_at_el[i]);
     free(g_at_el);
     at_scenarios(ops);
     at_stop_scenario(ops);                                                       /* (this stops the store) */
@@ -3047,6 +3055,8 @@ static int g_pasked[PN + 16];                                           /* FETCH
 static int g_pprio[PN + 16];
 static int64_t g_psid[PN + 16];
 static int g_pother;                                                    /* requests for names that are not mNNNN */
+static int g_ffl_shadow = -1; static int g_ffl_shadow2 = -1;                                           /* (review #279, 1) the zone of A1 whose body of the fill failed while the query's own request was on its way */
+bool dbreg_test_loading(const char *view, const char *zone);   /* (dns_snapshot_rcu.c, KARIDNS_UNIT_TEST) */
 static char g_pothername[16][64];
 
 /* answer the FETCH_REQs that arrive within `ms` of silence (the loader of the store protocol: the body of every zone asked for); returns how many were answered.  skip: leave the answer out of
@@ -3363,7 +3373,7 @@ static int run_proto(int phase, const char *dir) {
                 store_zone_t lz;
                 CHECK(!zrec(st, "other.test", &lz));
             }
-            /* a database error (ZONE_FAILED with the request id) fails the lookup: the queries are told "not ready" (SERVFAIL + EDE 14, as for the fetch of a zone that fails), and nothing is recorded */
+            /* a database error (ZONE_FAILED with the request id) fails the lookup: the queries are woken with "failed" (their workers drop them, 0.7 first-fill latency: no SERVFAIL while data is being loaded), and nothing is recorded */
             drain_wakes();
             CHECK(park_fetch_request(0, "default", "x.fail.test.", KDB_FETCH_PRIO_QUERY, KDB_FETCH_LOOKUP));
             CHECK(ch_next(&fetchc, &m, 5000) && m.type == KDB_T_FETCH_REQ && strcmp(m.u.fetch_req.name, "x.fail.test.") == 0);
@@ -3528,13 +3538,15 @@ static int run_proto(int phase, const char *dir) {
             CHECK(zref_of("m4000.test.", &zr) && zr.entry == NULL && zr.zid != ZREF_NOZID && zr.zstate == ZREF_ST_KNOWN);      /* (the name index is complete: the zone is known) */
         }
         /* -- A1. the queries come first, and the fill has a share of its own (0.7 fix 8): forty queries ask for zones of the pass; the loader answers the requests of the fill at once and the
-         *        requests of the queries not at all.  The places of fetch-concurrency (16) are not all the queries': they have 12 at the most, and the fill goes on (before, it was held back while
+         *        requests of the queries not at all.  Every place of fetch-concurrency (16) is the queries' (0.7 first-fill latency: the fill takes none), and the fill goes on (before 0.7 fix 8 it was held back while
          *        a query waited, and the loader saw the 8 requests it had had before the queries came and no more) */
         drain_wakes();
         {
             enum { NQ1 = 40 };
             typedef struct { char name[24]; uint64_t id; int64_t sid; uint8_t prio; } req1_t;
             static req1_t rq1[64];
+            static req1_t held[600];
+            int nheld = 0;
             int nrq1 = 0, nq = 0, nb = 0, fill_asked = 0;
             for (int i = 0; i < NQ1; i++) {
                 char zn[24];
@@ -3558,7 +3570,14 @@ static int run_proto(int phase, const char *dir) {
                         nq++;
                     } else {
                         nb++;
-                        if (zi >= 0 && zi < PN) {
+                        if (zi >= 0 && zi < PN && nb > 300 && nheld < (int)(sizeof(held) / sizeof(held[0]))) {      /* (0.7 first-fill latency: the fill keeps 256 in flight; past 300 its bodies are held back, so that
+                                                                                                                            most zones stay known without a body for the cases below; answered after the loop) */
+                            req1_t *h = &held[nheld++];
+                            snprintf(h->name, sizeof(h->name), "%s", m.u.fetch_req.name);
+                            h->id = m.u.fetch_req.request_id;
+                            h->sid = m.u.fetch_req.source_id;
+                            h->prio = m.u.fetch_req.priority;
+                        } else if (zi >= 0 && zi < PN) {
                             g_pasked[zi]++;
                             g_pprio[zi] = m.u.fetch_req.priority;
                             g_psid[zi] = m.u.fetch_req.source_id;
@@ -3567,11 +3586,33 @@ static int run_proto(int phase, const char *dir) {
                     }
                 }
                 clock_gettime(CLOCK_MONOTONIC, &t1);
-            } while (nb < 200 && (t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000 < 600);
+            } while ((t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000 < 600);
             fill_asked = nb;
-            printf("  40 queries waiting, none answered: %d requests of queries, %d of the fill in 600 ms\n", nq, fill_asked);
-            CHECK(nq >= 4 && nq <= 12);                                                    /* (the queries have the places the fill's share leaves) */
+            printf("  40 queries waiting, none answered: %d requests of queries, %d of the fill in 600 ms (places used %u)\n", nq, fill_asked, park_places_used());
+            CHECK(nq == 16 && park_places_used() == 16);                                   /* (0.7 first-fill latency: every place is the queries'; the fill takes none) */
             CHECK(fill_asked >= 100);                                                      /* (the fill went on: its fetches are answered and made again, whatever waits) */
+            /* (review #279, D) every place is taken: a query for a zone whose body of the fill is on its way waits in the wait queue (the zone's claim held); the fill's body fails (busy): the
+             * query is not dropped for it, its own request is made when a place is free (answered in the loop of case 1 below) */
+            {
+                int dzi = nheld - 1;
+                while (dzi >= 0 && pn_index(held[dzi].name) >= 2000 && pn_index(held[dzi].name) < 2000 + NQ1) dzi--;
+                CHECK(dzi >= 0);
+                if (dzi >= 0) {
+                    req1_t dz = held[dzi];
+                    held[dzi] = held[--nheld];
+                    drain_wakes();
+                    CHECK(park_fetch_request(0, "default", dz.name, KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL));
+                    const uint64_t dkey = park_claim_key("default", dz.name);
+                    for (int t = 0; t < 300 && !park_claim_held(dkey); t++) usleep(10000);
+                    CHECK_MSG(park_claim_held(dkey), "the query for %s does not wait in the queue (places used %u)", dz.name, park_places_used());
+                    kdb_enc_begin(&e, KDB_T_ZONE_FAILED);
+                    kdb_enc_u16(&e, 1, 0); kdb_enc_name(&e, 2, dz.name); kdb_enc_i64(&e, 3, dz.sid); kdb_enc_str(&e, 4, KDB_FETCH_BUSY_REASON); kdb_enc_u64(&e, 5, dz.id);
+                    kdb_enc_end(&e);
+                    ch_send(f[0], &e);
+                    CHECK_MSG(!wake_for(dz.name, &k, 400), "the failed body of the fill woke (dropped) the queued queries of %s (failed=%d retry=%d)", dz.name, (int)k.failed, (int)k.retry);
+                    g_ffl_shadow2 = pn_index(dz.name);
+                }
+            }
             for (int i = 0; i < nrq1; i++) {                                                  /* (the queries are answered now) */
                 const int zi = pn_index(rq1[i].name);
                 CHECK(zi >= 0 && zi < PN);
@@ -3580,12 +3621,87 @@ static int run_proto(int phase, const char *dir) {
                 g_psid[zi] = rq1[i].sid;
                 send_zone(f[0], &e, rq1[i].name, g_pserial[zi] ? g_pserial[zi] : 1, rq1[i].id, rq1[i].sid);
             }
+            /* (review #279, 1) a query for a zone whose body of the fill is on its way makes its own request; the fill's body fails (the loader is busy): the queries of the zone are not dropped
+             * for it, the zone stays the query's (LOADING), and the query's own body answers them.  (C) A second zone the same way whose body of the fill comes: it wakes the queries at once
+             * (they are answered from it, not after their own read), and the query's own body that comes after it is dropped as unchanged */
+            int hzi = nheld - 1, h2i;                                                        /* (held bodies of zones no query of A1 asks for: 2000..2039 are the queries') */
+            while (hzi >= 0 && pn_index(held[hzi].name) >= 2000 && pn_index(held[hzi].name) < 2000 + NQ1) hzi--;
+            h2i = hzi - 1;
+            while (h2i >= 0 && pn_index(held[h2i].name) >= 2000 && pn_index(held[h2i].name) < 2000 + NQ1) h2i--;
+            CHECK(hzi >= 0 && h2i >= 0);
+            if (hzi >= 0 && h2i >= 0) {
+                req1_t hzc = held[hzi], h2c = held[h2i];
+                held[hzi] = held[--nheld];                                                   /* (hzi > h2i: h2i stays where it is) */
+                held[h2i] = held[--nheld];
+                req1_t *hz = &hzc;
+                const int zz = pn_index(hz->name), z2 = pn_index(h2c.name);
+                drain_wakes();
+                CHECK(park_fetch_request(0, "default", hz->name, KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL));
+                CHECK(park_fetch_request(0, "default", h2c.name, KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL));
+                uint64_t qid = 0, q2id = 0;
+                int64_t qsid = 0, q2sid = 0;
+                struct timespec u0, u1;
+                clock_gettime(CLOCK_MONOTONIC, &u0);
+                do {                                                                             /* (the queries' own requests come; the fill's others are answered meanwhile) */
+                    if (ch_next(&fetchc, &m, 20) && m.type == KDB_T_FETCH_REQ) {
+                        const int zi = pn_index(m.u.fetch_req.name);
+                        if (zi == zz && m.u.fetch_req.priority == KDB_FETCH_PRIO_QUERY) {
+                            qid = m.u.fetch_req.request_id;
+                            qsid = m.u.fetch_req.source_id;
+                        } else if (zi == z2 && m.u.fetch_req.priority == KDB_FETCH_PRIO_QUERY) {
+                            q2id = m.u.fetch_req.request_id;
+                            q2sid = m.u.fetch_req.source_id;
+                        } else if (zi >= 0 && zi < PN && m.u.fetch_req.priority == KDB_FETCH_PRIO_QUERY) {        /* (the other queries of A1 that waited for a place: answered, so the places go round) */
+                            g_pasked[zi]++;
+                            g_pprio[zi] = m.u.fetch_req.priority;
+                            g_psid[zi] = m.u.fetch_req.source_id;
+                            send_zone(f[0], &e, m.u.fetch_req.name, g_pserial[zi] ? g_pserial[zi] : 1, m.u.fetch_req.request_id, m.u.fetch_req.source_id);
+                        } else if (zi >= 0 && zi < PN && nheld < (int)(sizeof(held) / sizeof(held[0]))) {    /* (held back with the others: answered after the loop) */
+                            req1_t *h = &held[nheld++];
+                            snprintf(h->name, sizeof(h->name), "%s", m.u.fetch_req.name);
+                            h->id = m.u.fetch_req.request_id;
+                            h->sid = m.u.fetch_req.source_id;
+                            h->prio = m.u.fetch_req.priority;
+                        }
+                    }
+                    clock_gettime(CLOCK_MONOTONIC, &u1);
+                } while ((qid == 0 || q2id == 0) && (u1.tv_sec - u0.tv_sec) * 1000 + (u1.tv_nsec - u0.tv_nsec) / 1000000 < 3000);
+                CHECK_MSG(qid != 0 && q2id != 0, "no request of the query for %s (%d) or %s (%d), whose bodies of the fill are on their way", hz->name, qid != 0, h2c.name, q2id != 0);
+                /* (C) the fill's body of z2 comes first: the queries are woken by it */
+                g_pasked[z2]++;
+                g_pprio[z2] = h2c.prio;
+                g_psid[z2] = h2c.sid;
+                send_zone(f[0], &e, h2c.name, g_pserial[z2] ? g_pserial[z2] : 1, h2c.id, h2c.sid);
+                CHECK_MSG(wake_for(h2c.name, &k, 3000) && !k.failed && !k.retry, "the body of the fill that came did not wake the queries of %s", h2c.name);
+                if (q2id) send_zone(f[0], &e, h2c.name, g_pserial[z2] ? g_pserial[z2] : 1, q2id, q2sid);      /* (the query's own body after it: dropped as unchanged) */
+                kdb_enc_begin(&e, KDB_T_ZONE_FAILED);                                            /* (the fill's body: the loader was busy) */
+                kdb_enc_u16(&e, 1, 0); kdb_enc_name(&e, 2, hz->name); kdb_enc_i64(&e, 3, hz->sid); kdb_enc_str(&e, 4, KDB_FETCH_BUSY_REASON); kdb_enc_u64(&e, 5, hz->id);
+                kdb_enc_end(&e);
+                ch_send(f[0], &e);
+                CHECK_MSG(!wake_for(hz->name, &k, 400), "the failed body of the fill woke the queries of %s (failed=%d retry=%d)", hz->name, (int)k.failed, (int)k.retry);
+                CHECK(dbreg_test_loading("default", hz->name));                                    /* (the zone is still the query's: LOADING, its element of the fetch is kept) */
+                if (qid) {
+                    g_pasked[zz]++;
+                    g_pprio[zz] = KDB_FETCH_PRIO_QUERY;
+                    g_psid[zz] = qsid;
+                    send_zone(f[0], &e, hz->name, g_pserial[zz] ? g_pserial[zz] : 1, qid, qsid);
+                    CHECK(wake_for(hz->name, &k, 5000) && !k.failed && !k.retry);              /* (the query's own body answers it) */
+                }
+                g_ffl_shadow = zz;
+            }
+            for (int i = 0; i < nheld; i++) {                                                 /* (and the bodies of the fill that were held back) */
+                const int zi = pn_index(held[i].name);
+                g_pasked[zi]++;
+                g_pprio[zi] = held[i].prio;
+                g_psid[zi] = held[i].sid;
+                send_zone(f[0], &e, held[i].name, g_pserial[zi] ? g_pserial[zi] : 1, held[i].id, held[i].sid);
+            }
         }
         /* a query for a zone that is known and has no body goes to the fetch queue (priority 0, with the domain id) and is answered */
         drain_wakes();
         CHECK(park_fetch_request(0, "default", "m4000.test.", KDB_FETCH_PRIO_QUERY, KDB_FETCH_FULL));
-        int n = serve_fetches(&fetchc, f[0], &e, 1500, -1, -1);
-        CHECK(n >= PN - 400);                                          /* (the 200 or so that A1 answered are not in the count) */
+        int n = serve_fetches(&fetchc, f[0], &e, g_ffl_shadow >= 0 ? 7000 : 1500, -1, -1);      /* (review #279, 1: the fill's round with a body that failed is made again after 5 s) */
+        CHECK(n > 0);                                                  /* (the rest of the fill: what A1 answered is not in the count; wait_stored() and `bad` below check that every zone came, once) */
         CHECK(wake_for("m4000.test.", &k, 5000) && !k.failed && !k.retry);
         CHECK(g_pprio[4000] == 0 && g_psid[4000] == p_sid(4000));       /* (asked for by the query, and with the id the record holds) */
         CHECK(g_pprio[1000] == KDB_FETCH_PRIO_BACKGROUND && g_psid[1000] == p_sid(1000));
@@ -3598,7 +3714,7 @@ static int run_proto(int phase, const char *dir) {
             CHECK(zrec(st, "m0010.test", &z) && z.state == STORE_STATE_STORED && z.serial == 1 && z.stamp_gen == 1 && z.stamp_time == 10 && !(z.flags & STORE_F_STALE));
         }
         int bad = 0;
-        for (int i = 0; i < PN; i++) bad += g_pasked[i] != 1;
+        for (int i = 0; i < PN; i++) bad += g_pasked[i] != 1 && !((i == g_ffl_shadow || i == g_ffl_shadow2) && g_pasked[i] == 2);   /* (review #279, 1: the zone whose fill body failed may be asked again by the fill's next round) */
         CHECK(bad == 0);                                                 /* (every zone was asked for once) */
 
         /* -- B. changes: a new stamp, the same stamp, an unstamped zone, a forced one, deletes by id and by name, a rename */
@@ -4587,6 +4703,7 @@ static bool attach_mem(const char *zone, int ms) {
 
 static int run_stamp_race(const char *dir) {
     printf("[the store protocol: a fetched body is installed only for the stamp it was asked for (phase 6)]\n");
+    atomic_store(&db_store_test_no_early_bulk, true);       /* (0.7 first-fill latency: the journal faults below need a logged store) */
     char sdir[600];
     snprintf(sdir, sizeof(sdir), "%s/s", dir);
     static server_config_t cfg;
@@ -6057,7 +6174,7 @@ static int run_lookup_body(const char *dir) {
         kdb_enc_u16(&e, 1, 0); kdb_enc_name(&e, 2, "knownz.test."); kdb_enc_i64(&e, 3, 777999); kdb_enc_str(&e, 4, "reading the records: the database is busy"); kdb_enc_u64(&e, 5, rid);
         kdb_enc_end(&e);
         ch_send(f[0], &e);
-        CHECK(wake_for("w.knownz.test.", &k, 5000) && k.failed && k.ask == 0 && places_are(0, 2000));       /* (the lookup found the zone and the database could not give it: SERVFAIL + EDE 14 for the queries, not a silent drop at park-timeout) */
+        CHECK(wake_for("w.knownz.test.", &k, 5000) && k.failed && k.ask == 0 && places_are(0, 2000));       /* (the lookup found the zone and the database could not give it: the queries are told at once (dropped and counted, store.lookup.drop.failed), not left to park-timeout) */
         {
             store_zone_t lz;
             CHECK(zrec(st, "knownz.test", &lz) && lz.state == STORE_STATE_KNOWN && !in_memory("knownz.test."));
@@ -7120,6 +7237,72 @@ static int run_bulkcut(int phase, const char *dir) {
     return g_failed ? 1 : 0;
 }
 
+/* 0.7 first-fill latency: the unlogged first fill is begun when the store opens empty for a database, before any query (bulk_begin_early()).  Phase 0: the start begins it; a lookup records a
+ * zone in it (as the queries of the first seconds do); SIGKILL.  Phase 1: the start finds the fill cut off; the zone of the lookup is gone (it is looked up again), the store checks clean, the
+ * fill goes on, and since no pass begins (no loader) it is given up after the bound (shortened here) and the store keeps its journal. */
+extern _Atomic int64_t db_store_test_bulk_early_max_ms;
+static int run_bulkearly(int phase, const char *dir) {
+    printf("[the unlogged first fill begun at the start (phase %d)]\n", phase);
+    if (phase == 0) {
+        fflush(stdout);
+        const pid_t pid = fork();
+        if (pid > 0) {
+            int status = 0;
+            CHECK(waitpid(pid, &status, 0) == pid && WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL);
+            printf("%d checks, %d failed\n", g_checks, g_failed);
+            return g_failed ? 1 : 0;
+        }
+        if (pid < 0) return 1;
+    }
+    char sdir[600];
+    snprintf(sdir, sizeof(sdir), "%s/s", dir);
+    static server_config_t cfg;
+    char conf[2048];
+    snprintf(conf, sizeof(conf),
+             "options { database { driver sqlite3; database-file \"/nonexistent/z.db\"; loader-user \"nobody\"; loader-path \"/bin/true\"; store \"%s\"; store-mode copy; "
+             "store-threads 2; }; };\n"
+             "view \"default\" { match-clients { any; }; zone \"static.test\" { type master; }; };\n", sdir);
+    CHECK(parse_named_conf(conf, &cfg) == 0);
+    atomic_store_explicit(&g_config_db.active, &cfg, memory_order_release);
+    rebuild_zone_db_from_config(&cfg, false);
+    char msg[400];
+    CHECK(db_store_frontend_open(&cfg.database, false, (uid_t)-1, (gid_t)-1, msg, sizeof(msg)) && db_store_dir_fd() >= 0);
+    if (phase == 1) atomic_store(&db_store_test_bulk_early_max_ms, 300);
+    CHECK(db_store_start(&cfg) && db_store_enabled());
+    store_t *st = db_store_handle();
+    CHECK(st != NULL);
+    if (!st) return 1;
+    db_recon_entry_t e;
+    memset(&e, 0, sizeof(e));
+    e.source_id = 7001; e.name = "early.lk.test."; e.kind = KDB_ZK_PRIMARY; e.stamped = true; e.gen = 1; e.time = 10;
+    uint32_t zid = STORE_NONE;
+    dbdir_rec_t rec;
+    if (phase == 0) {
+        CHECK_MSG(store_bulk(st) == 1, "the fill is begun at the start: store_bulk %d", store_bulk(st));
+        CHECK(db_recon_lookup("default", &e, &zid) == DBR_NEW && zid != STORE_NONE);
+        CHECK(dbdir()->rec_get("default", "early.lk.test.", &rec) && rec.state == STORE_STATE_KNOWN);
+        fflush(stdout);
+        if (g_failed) return 1;
+        kill(getpid(), SIGKILL);
+    }
+    CHECK(store_bulk_cut(st) || !dbdir()->rec_get("default", "early.lk.test.", &rec));      /* (the store went back to the checkpoint that began the fill) */
+    CHECK_MSG(!dbdir()->rec_get("default", "early.lk.test.", &rec), "the zone of the lookup was unlogged: gone after the crash, looked up again");
+    {
+        store_check_report_t rep;
+        CHECK(store_check(st, &rep) == 0);
+    }
+    CHECK(store_bulk(st) == 1);                                          /* (the fill goes on) */
+    for (int i = 0; i < 400 && store_bulk(st) != 0; i++) usleep(10000);    /* (no pass begins: given up after the bound, at a tick of the ticker) */
+    CHECK_MSG(store_bulk(st) == 0, "the fill with no pass is given up: store_bulk %d", store_bulk(st));
+    CHECK(db_recon_lookup("default", &e, &zid) == DBR_NEW && zid != STORE_NONE);   /* (logged now) */
+    {
+        store_check_report_t rep;
+        CHECK(store_check(st, &rep) == 0);
+    }
+    printf("%d checks, %d failed\n", g_checks, g_failed);
+    return g_failed ? 1 : 0;
+}
+
 static int proto_main(const char *self) {
     char dir[600];
     const char *tmp = getenv("TMPDIR");
@@ -7332,6 +7515,7 @@ int main(int argc, char **argv) {
     if (argc > 2 && strcmp(argv[1], "attab") == 0) return run_attab(argv[2]);
     if (argc > 1 && strcmp(argv[1], "s5") == 0) return run_s5(argc > 2 ? argv[2] : "map");
     if (argc > 1 && strcmp(argv[1], "heap") == 0) return run_heap(argc > 2 ? atoi(argv[2]) : 100000, argc > 3 ? argv[3] : "map");
+    if (argc > 3 && strcmp(argv[1], "bulkearly") == 0) return run_bulkearly(atoi(argv[2]), argv[3]);
     if (argc > 2 && strcmp(argv[1], "proto12") == 0) return run_signer_hold(argv[2]);
     if (argc > 2 && strcmp(argv[1], "proto13") == 0) return run_signer_presign(argv[2]);
     if (argc > 2 && strncmp(argv[1], "proto", 5) == 0 && argv[1][5] == '3') return run_fixes(argv[2]);
@@ -7351,9 +7535,22 @@ int main(int argc, char **argv) {
     int rc = run_part(cmd);
     int rc2 = run_mode("map");
     int rc3 = proto_main(argv[0]);
+    int rc6 = 0;
+    {                                                       /* (0.7 first-fill latency: the fill begun at the start, a crash in it) */
+        char bdir[600];
+        const char *tmp = getenv("TMPDIR");
+        snprintf(bdir, sizeof(bdir), "%s/test_db_store_be.XXXXXX", tmp && *tmp ? tmp : "/tmp");
+        if (!mkdtemp(bdir)) rc6 = 1;
+        for (int ph = 0; ph < 2 && !rc6; ph++) {
+            snprintf(cmd, sizeof(cmd), "%s bulkearly %d %s", argv[0], ph, bdir);
+            if (run_part(cmd) != 0) rc6 = 1;
+        }
+        snprintf(cmd, sizeof(cmd), "rm -rf %s", bdir);
+        (void)!system(cmd);
+    }
     snprintf(cmd, sizeof(cmd), "%s s5 map", argv[0]);
     int rc4 = run_part(cmd);
     snprintf(cmd, sizeof(cmd), "%s s5 copy", argv[0]);
     int rc5 = run_part(cmd);
-    return (rc != 0 || rc2 != 0 || rc3 != 0 || rc4 != 0 || rc5 != 0) ? 1 : 0;
+    return (rc != 0 || rc2 != 0 || rc3 != 0 || rc4 != 0 || rc5 != 0 || rc6 != 0) ? 1 : 0;
 }

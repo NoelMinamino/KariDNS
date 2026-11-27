@@ -281,7 +281,7 @@ static bool zone_nsec3(const zone_image_t *img, const char *apex_name, zone_n3_t
 
 static bool is_non_data_rrtype(uint16_t t) {
     switch (t) {
-        case 41: case 249: case 250: case 251: case 252: case 253: case 254: case 255:
+        case 41: case 128 /* NXNAME, a meta-type (RFC 9824 3.5) */: case 249: case 250: case 251: case 252: case 253: case 254: case 255:
             return true;
         default:
             return false;
@@ -2676,6 +2676,7 @@ void server_responses_get(uint64_t resp[16], uint64_t unzoned[16], uint64_t *tcp
 }
 /* D1a: process_dns_not_ready_routed() is asked whether the query may be parked (see there) */
 static _Thread_local bool t_nr_probe;
+_Atomic uint64_t g_not_ready_dropped_total;                /* 0.7 W6 (dns_query_engine.h) */
 /* X-20: 直前の要求の TSIG の状態 (鍵は設定スナップショット内)。RRL の slip 応答の署名に使う */
 static _Thread_local tsig_request_t t_query_tsig;
 
@@ -3994,6 +3995,16 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
     }
   }
 
+  /* RFC 9824 3.5: an explicit query for the NXNAME meta-type MUST get FORMERR; EDE 30 Invalid Query Type is the MAY of the same section.
+   * Before the zone, as the RRSIG question below.  A forward or program zone is not this server's data: it relays the question and returns
+   * the forwarder's or the plugin's answer as it comes, as for ANY and RRSIG (qe_relayed_zone()); the "MUST NOT forward" of 3.5 is a
+   * resolver's rule. */
+  if (opcode == 0 && qdcount == 1 && qtype == 128 && !qe_relayed_zone(zone_cfg_any)) {
+    qe_why("a question for the meta-type NXNAME (RFC 9824 3.5)");
+    add_ede(&edns, send_ede, 30, "NXNAME queries are not allowed");
+    return dns_build_error_response(req, req_len, res, max_res_len, 1, 0, dns_error_qd_echo(req, req_len), &edns, is_tcp, cfg); // FORMERR
+  }
+
   /* 0.7: a question for type RRSIG alone is a FORMERR with EDE 30 Invalid Query Type (IANA EDE registry), whatever the name, the class, the
    * transport, DO or the zone, as BIND (9.20.31 / main, lib/ns/query.c ns_query_start(): "Standalone RRSIG queries are not supported"):
    * the signatures come with the RRsets they cover when DO=1 (RFC 4035 3.1.1), and an RRSIG question only collects every signature at a
@@ -4138,6 +4149,15 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
       }
     }
     if (t_nr_probe && opcode == 0) return DNS_NR_PERMITTED;
+    /* 0.7 first-fill latency (W3, user 2026-11-27): an ordinary query is never answered SERVFAIL (or another error) while the data of its answer is being loaded, whatever kept it from the
+     * data (its fetch or lookup failed, the loader is gone, it could not wait): nothing is sent, and the caller counts it (store.park.drop.failed).  A resolver retries a silent server; a
+     * SERVFAIL it caches and holds against the server.  Zone transfers (AXFR, IXFR: above, and dns_axfr_ixfr.c) and UPDATE (above) are not ordinary queries: the secondary or the updater
+     * gets SERVFAIL + EDE 14 "Not Ready", an answer it can act on (a NOTIFY was REFUSED above, the other opcodes NOTIMP before the zone). */
+    /* options { not-ready-answer servfail; } (W6) answers it SERVFAIL + EDE 14, as BIND does; read only here, on the branch of a query that cannot be answered */
+    if (opcode == 0 && qtype != 251 && qtype != 252 && !(cfg && cfg->not_ready_answer == NOT_READY_SERVFAIL)) {
+      atomic_fetch_add_explicit(&g_not_ready_dropped_total, 1, memory_order_relaxed);
+      return DNS_NR_DROP;
+    }
 
     return build_not_ready_response(req, req_len, res, max_res_len, is_tcp, cfg);
   }
@@ -4555,6 +4575,13 @@ static int process_query_body(const uint8_t *req, size_t req_len, uint8_t *res,
   }
 
   if (!current_zone->image || current_zone->image->n_rrs == 0) {
+    /* 0.7 W6: a secondary that has not loaded yet (its first transfer, or the restore of its stored copy, has not come: no version with data) is data being loaded: an ordinary query
+     * gets what options { not-ready-answer } says, nothing (the default, counted) or the SERVFAIL + EDE 14 below.  Any other zone without data (a zone file that failed to load) is
+     * SERVFAIL as before.  Read only on this branch. */
+    if (db_entry && db_entry->is_secondary && opcode == 0 && qtype != 251 && qtype != 252 && !(cfg && cfg->not_ready_answer == NOT_READY_SERVFAIL)) {
+      atomic_fetch_add_explicit(&g_not_ready_dropped_total, 1, memory_order_relaxed);
+      return DNS_NR_DROP;
+    }
     res[2] &= ~0x04; // R-27: データを持たないので AA=0
     res[3] = (res[3] & 0xF0) | 2; // SERVFAIL
     add_ede(&edns, send_ede, 14, "Zone not ready (empty)");

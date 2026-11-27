@@ -784,6 +784,8 @@ static void prom_server(const karidns_status_t *st, const karidns_stats_total_t 
     prom_family("karidns_secondaries_expired", "gauge", "Secondary zones past their expire deadline, by how they answer (stale: serve-stale with EDE 3; servfail: EDE 24).");
     printf("karidns_secondaries_expired{answer=\"stale\"} %llu\n", ULL(st->secondaries_expired_stale));
     printf("karidns_secondaries_expired{answer=\"servfail\"} %llu\n", ULL(st->secondaries_expired_servfail));
+    prom_family("karidns_not_ready_dropped_total", "counter", "Ordinary queries not answered because the data of their answer was being loaded (not-ready-answer drop).");
+    printf("karidns_not_ready_dropped_total %llu\n", ULL(st->not_ready_dropped));
     prom_family("karidns_queries_total", "counter", "Queries answered for a zone, by transport (queries no zone answered are in karidns_unzoned_responses_total).");
     printf("karidns_queries_total{proto=\"udp\"} %llu\n", ULL(t->queries_total - t->tcp_queries));
     printf("karidns_queries_total{proto=\"tcp\"} %llu\n", ULL(t->tcp_queries));
@@ -866,6 +868,7 @@ static void json_server(const karidns_status_t *st, const karidns_stats_total_t 
            ULL(st->reclaim_snapshots_waiting), ULL(st->reclaim_oldest_age_ms), ULL(st->reclaim_zone_versions_waiting), ULL(st->reclaim_warnings));
     printf(",\"secondaries_expired\":{\"total\":%llu,\"stale\":%llu,\"servfail\":%llu}", ULL(st->secondaries_expired), ULL(st->secondaries_expired_stale),
            ULL(st->secondaries_expired_servfail));
+    printf(",\"not_ready_dropped\":%llu", ULL(st->not_ready_dropped));
     printf(",\"queries\":{\"udp\":%llu,\"tcp\":%llu}", ULL(t->queries_total - t->tcp_queries), ULL(t->tcp_queries));
     printf(",\"responses\":{\"NOERROR\":%llu,\"FORMERR\":%llu,\"SERVFAIL\":%llu,\"NXDOMAIN\":%llu,\"NOTIMP\":%llu,\"REFUSED\":%llu",
            ULL(t->responses_noerror + t->responses_nodata + t->unzoned_responses[0]), ULL(t->unzoned_responses[1]),
@@ -1493,6 +1496,7 @@ int main(int argc, char **argv) {
             /* 0.7 (secondary store 4.5): secondaries past their expire deadline (the gauges of the control thread's last walk of the secondaries) */
             printf("secondaries expired: %llu (%llu serving stale, %llu SERVFAIL)\n", (unsigned long long)st.secondaries_expired,
                    (unsigned long long)st.secondaries_expired_stale, (unsigned long long)st.secondaries_expired_servfail);
+            printf("queries not answered while their data was being loaded (not-ready-answer drop): %llu\n", (unsigned long long)st.not_ready_dropped);
             printf("server is up and running%s\n", st.frontend_alive ? "" : " (Frontend is down)");
             
             printf("\n--- Security & Rate Limit Stats ---\n");

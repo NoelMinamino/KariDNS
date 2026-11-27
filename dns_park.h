@@ -417,11 +417,12 @@ enum {
   PARK_CNT_LK_ROOM = 0,    /* lookup: no room in the park table (three quarters are the lookups') ... dropped */
   PARK_CNT_LK_TIMEOUT,     /* ... its park-timeout was up before the lookup was answered: dropped */
   PARK_CNT_LK_QUEUE,       /* ... the lookup queue of the ingest thread was full, or the lookup waited there until its time was up: dropped */
-  PARK_CNT_LK_SERVFAIL,    /* ... the lookup failed (the database, the loader): SERVFAIL + EDE 14, as the fetch of a known zone that fails */
+  PARK_CNT_LK_FAILED,      /* ... the lookup failed (the database, the loader): its queries are dropped (0.7 first-fill latency: not SERVFAIL while data is being loaded; store.lookup.drop.failed) */
   PARK_CNT_ZONE_ROOM,      /* a query for a zone out of memory: the park table was full: dropped */
   PARK_CNT_ZONE_TIMEOUT,   /* ... its park-timeout was up before the zone was there: dropped */
   PARK_CNT_ZONE_QUEUE,     /* ... the wait queue of the ingest thread was full: dropped */
   PARK_CNT_LK_REMEMBERED,  /* a query for a name whose lookup was shed lately (park_shed_held()): dropped at the worker, no request made (store.lookup.reask_suppressed) */
+  PARK_CNT_ZONE_FAILED,    /* a query for a zone whose data could not be read (the fetch failed, the loader is gone, no park): dropped, not SERVFAIL + EDE 14 (0.7 first-fill latency; store.park.drop.failed) */
   PARK_CNT_N
 };
 void park_cnt_note(int what);

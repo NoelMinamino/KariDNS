@@ -119,6 +119,8 @@ typedef struct {
     uint64_t secondaries_expired;
     uint64_t secondaries_expired_stale;
     uint64_t secondaries_expired_servfail;
+    /* 0.7 W6: ordinary queries not answered because the data of their answer was being loaded (options { not-ready-answer drop; }, g_not_ready_dropped_total).  Appended (8 bytes) */
+    uint64_t not_ready_dropped;
 } karidns_status_t;
 
 #define KARIDNS_DNSTAP_LINK_OFF  0   /* no dnstap block */

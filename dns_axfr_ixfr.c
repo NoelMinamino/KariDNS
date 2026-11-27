@@ -1859,7 +1859,7 @@ static int xfr_try_primary_with(void *arg, int idx, tsig_key_t *kst) {
     ext_ver = 2;
     axfr_res = xfr_attempt(ctx, p, &master_addr, domain_family, ext_ver, false, tsig_key_ptr, ixfr_serial, &session);
   }
-  /* R-19, RFC 1995 §4: IXFR を扱えないプライマリ (FORMERR / NOTIMP) からは AXFR で1回だけ取り直す。
+  /* R-19, RFC 1995 §2: IXFR を扱えないプライマリ (FORMERR / NOTIMP) からは AXFR で1回だけ取り直す。
    * I1: 差分列が手元の版から始まらない (または連続しない) IXFR も同じ (RFC 1995 §4、parse_xfr_packet()) */
   if (axfr_res < 0 && ixfr_serial != 0 && (session.rcode == 1 || session.rcode == 4 || session.ixfr_bad_sequence)) {
     syslog(LOG_NOTICE, "[AXFR] zone %s: %s %s, retrying with AXFR", ctx->domain, p->ip,

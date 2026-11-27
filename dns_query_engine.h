@@ -99,9 +99,15 @@ int process_dns_query_cap_routed(const uint8_t *req, size_t req_len, uint8_t *re
  * The arguments are those of process_dns_query_cap_routed().
  * probe: ask whether the query may wait for the zone.  DNS_NR_PERMITTED is returned (nothing written) when it may; any other value is a final
  * answer built into res (REFUSED for an ACL denial, FORMERR / NOTAUTH for a request or TSIG that is wrong, 0 for a message not to be answered)
- * and the query must neither park nor ask for the zone. */
+ * and the query must neither park nor ask for the zone.
+ * Not a probe: DNS_NR_DROP (nothing written) for an ordinary query (opcode QUERY, not AXFR / IXFR): it is not answered while the data of its answer is being loaded (0.7, never SERVFAIL
+ * then); the caller sends nothing and counts it (PARK_CNT_ZONE_FAILED).  Zone transfers and UPDATE get SERVFAIL + EDE 14 "Not Ready". */
 struct zref;
 #define DNS_NR_PERMITTED (-2)
+#define DNS_NR_DROP (-3)
+/* 0.7 W6: ordinary queries the engine did not answer because the data of the answer was being loaded (DNS_NR_DROP: a database zone, a secondary before its first transfer;
+ * options { not-ready-answer drop; }); karictl stats karidns_not_ready_dropped_total */
+extern _Atomic uint64_t g_not_ready_dropped_total;
 int process_dns_not_ready_routed(const uint8_t *req, size_t req_len, uint8_t *res, size_t max_res_len, size_t res_cap, const char *qname,
                                  uint16_t qtype, const char *client_ip, compress_ctx_t *comp_ctx, bool is_tcp,
                                  const rate_limit_config_t **out_rrl_cfg, zone_db_snapshot_t *snap, const query_route_t *route,

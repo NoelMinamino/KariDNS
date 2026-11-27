@@ -9177,6 +9177,34 @@ static int parse_named_conf_internal(token_ctx_t *ctx, server_config_t *config) 
             return -1;
           }
           free_token(&tok);
+        } else if (strcmp(key, "not-ready-answer") == 0) {
+          /* 0.7 first-fill latency W6 (reloadable): drop | servfail (NOT_READY_*); a second statement replaces the first */
+          tok = get_next_token(ctx);
+          if (tok.type != TOKEN_STRING || !tok.value) {
+            conf_error(ctx, "options", "not-ready-answer: a value is required (drop or servfail)");
+            free(key);
+            free_token(&tok);
+            return -1;
+          }
+          if (strcasecmp(tok.value, "drop") == 0) {
+            config->not_ready_answer = NOT_READY_DROP;
+          } else if (strcasecmp(tok.value, "servfail") == 0) {
+            config->not_ready_answer = NOT_READY_SERVFAIL;
+          } else {
+            conf_error(ctx, "options", "not-ready-answer: invalid value '%.64s' (expected drop or servfail)", tok.value);
+            free(key);
+            free_token(&tok);
+            return -1;
+          }
+          free_token(&tok);
+          tok = get_next_token(ctx);
+          if (tok.type != TOKEN_SEMICOLON) {
+            conf_error(ctx, "options", "not-ready-answer: missing ';'");
+            free(key);
+            free_token(&tok);
+            return -1;
+          }
+          free_token(&tok);
         } else if (strcmp(key, "response-cache-size") == 0) {
           /* 0 = 使わない。それ以外は 4K/16M のような大きさ (上限 1024M)。書き損じは誤りにする */
           int sz = 0;

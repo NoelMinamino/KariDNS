@@ -1,4 +1,4 @@
-.TH KARIDNS\-DBLOADER 8 "2026-11-22" "KariDNS" "KariDNS Manual"
+.TH KARIDNS\-DBLOADER 8 "2026-11-28" "KariDNS" "KariDNS Manual"
 .\" Generated from docs/karidns-dbloader.md by man/md2man.pl (make man): edit the Markdown manual, not this page.
 .SH NAME
 karidns\-dbloader \- reads the PowerDNS 5.1 tables of a SQLite3 or PostgreSQL
@@ -323,25 +323,44 @@ parked query waits for it.
 \fBRequests.\fR \fBFETCH_REQ\fR (request id, view, zone, priority 0 query / 1
 warm-up / 2 background, mode 0 the zone / 1 its summary; an optional range,
 which this loader refuses). A thread of the loader reads them into a queue of
-256, takes the most urgent first (the oldest within a priority; but a request
-that has waited 200 ms goes before every priority, the oldest such request
-first, so that a steady flow of priority 0 requests cannot keep a priority 2
-request, such as the background fetch of a zone that a query has joined, waiting
-past the Backend's park time-out. Every priority and mode is covered: the age
-counts, not the class) and reads the zone through the same code as a one-zone
-reload: its own connection and snapshot, no batch, no inventory, no results. A
-request beyond the queue is answered \fBZONE_FAILED\fR "busy" (the first eight;
-more are dropped and the Backend's own time-out ends them).
+1280, takes the most urgent first (the oldest within a priority; a request of
+priority 0 or 1 that has waited 200 ms goes before the other of the two, the
+oldest such request first, so that neither starves the other; a request of
+priority 2, the fill, never goes before them, however long it waited (0.7): a
+query does not join a body of the fill on its way, the Backend asks for its zone
+itself. Every priority and mode is covered: the age counts, not the class) and
+reads the zone through the same code as a one-zone reload: its own connection
+and snapshot, no batch, no inventory, no results. A request beyond the queue is
+answered \fBZONE_FAILED\fR "busy" (the first eight; more are dropped and the
+Backend's own time-out ends them). A request of the fill that waited 30 s in the
+queue (the time the Backend waits for an answer: it has given the request up and
+asks for the zone again) is dropped unread, so that a long flood of queries does
+not leave the queue full of them and the requests of queries answered busy; a
+line at LOG_INFO counts them (\fBdropped N requests of the fill that waited 30 s
+in the queue ...\fR, 0.7).
 .IP \(bu 2
 \fBBatches (0.7).\fR A worker that finds more requests of the same kind queued
 reads them together: the same view, the same priority (a query that waits is
 never held up by a batch of the background fill) and the same kind, bodies (mode
 0) or lookups (modes 2 and 3); a zone that is in the batch already stays queued
-for the next one. The batch is at most 16 requests and no more than the worker's
-share of what is queued (queued / workers, rounded up), so that the other
-workers of the pool still find requests; with one request alone nothing
-changes. A batch of bodies is one snapshot, one \fBfind_zones_in()\fR for the
-zones (\fBfind_zone()\fR for a name that statement did not give back: the other
+for the next one. A batch of requests of queries, of the warm-up or of lookups
+is at most 16 requests (64 while more than 16 of them queue: a batch costs about
+one read whatever its size) and no more than the worker's share of what is
+queued (queued / workers, rounded up), so that the other workers of the pool
+still find requests; a batch of the fill (the background class, priority 2)
+takes up to 128 (\fBDB_IN_MAX\fR, one \fBIN\fR statement per table), and only
+\fBloader\-threads\fR - 1 workers read the fill at a time, so that one is always
+free for a query (it waits for a request that is not of the fill); and with a
+single worker (\fBloader\-threads 1\fR) a batch of the fill is 128 only while no
+request of a query or of the warm-up came in the last second, 16 otherwise; with
+one request alone nothing changes. Which request a worker takes: priority 0 (a
+query) before 1 (the warm-up) before 2 (the fill), the oldest first; a query or
+warm-up request that has waited 200 ms goes before the other of the two, and the
+fill never goes before them. The queue holds 1280 requests (more are answered
+"busy"): the Backend keeps up to 128 bodies of a fill in flight for each worker
+of the fill (at least 256, at most 1024) beside the requests of queries. A batch
+of bodies is one snapshot, one \fBfind_zones_in()\fR for the zones
+(\fBfind_zone()\fR for a name that statement did not give back: the other
 capitalisation on PostgreSQL, a zone that is not there), the keys and the
 profiles once, and one statement per table for the metadata, the records and the
 extension rows (\fBscan_*_in()\fR, the zones in \fBdomains.id\fR order); each
@@ -353,10 +372,14 @@ because the batch failed (the database could not be read) is answered
 \fBfind_zones_in()\fR for the candidate names of all of them (at most 128
 together) and one \fBLOOKUP_RESULT\fR for each; the lookups of mode 3 that found
 a zone are followed by the bodies of those zones as a batch with the same
-request ids. The Backend keeps at most half of \fBfetch\-concurrency\fR (32)
-background fetches in flight, so a batch of the background fill is a few zones;
-the zones of a request with a deeper queue (a lookup storm,
-\fBfetch\-concurrency\fR raised) go together in larger ones.
+request ids. The loader writes one line a minute while its workers read, and one
+when they stop (LOG_INFO): \fBfetch reads in 60 s: queries 120 reads 130 zones,
+fill 400 reads 51200 zones (128.0 zones a read)\fR, a read being one statement
+per table for a group of zones (or the reads of one zone). The test builds
+(\fBmake karidns\-dbloader\-evict\fR, the loader of \fBmake coverage\fR) read
+\fBKARIDNS_TEST_FETCH_DELAY_MS\fR: every read of the pool waits that many
+milliseconds first (a slow database, tests/run_db_firstfill_latency_test.sh);
+the switch does not exist in the loader that is installed.
 .IP \(bu 2
 \fBAnswers.\fR \fBZONE_BEGIN\fR .. \fBZONE_IMAGE\fR .. \fBZONE_END\fR with the
 request id in \fBZONE_BEGIN\fR (a secondary or catalog zone has no data, as in a

@@ -55,7 +55,7 @@ done
 USER_OPT=""
 [ "$(id -u)" = "0" ] && USER_OPT="user \"nobody\"; group \"nobody\";"
 cat > "$TEST_DIR/karidns.conf" <<EOF
-options {
+options { not-ready-answer servfail;
     port $PORT;
     bind-address { 127.0.0.1; };
     pid-file "none";

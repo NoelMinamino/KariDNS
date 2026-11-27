@@ -1136,7 +1136,8 @@ extern _Atomic(program_plugin_table_t *) g_program_plugin_table;
 typedef enum {
     LOG_ACT_SENT,
     LOG_ACT_DROP_RRL,
-    LOG_ACT_DROP_MALFORMED
+    LOG_ACT_DROP_MALFORMED,
+    LOG_ACT_DROP_NOT_READY      /* 0.7 first-fill latency: not answered while the data of its zone is being loaded (not-ready-answer drop) */
 } log_action_t;
 
 typedef struct {

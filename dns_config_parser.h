@@ -20,6 +20,10 @@
  * reads its own receive-only sockets (one per listen address, made by the manager before the fork) and the routers only send the replies; frontend:
  * the routers read the queries and hand them to the workers over the IPC, as before */
 enum { UDP_RECEIVE_BACKEND = 0, UDP_RECEIVE_FRONTEND = 1 };
+/* options { not-ready-answer drop | servfail; } (0.7 first-fill latency W6, reloadable): what an ordinary query (opcode QUERY, not AXFR / IXFR) gets when the data of its answer is being
+ * loaded (a database zone: the first fill, a cold zone, park-timeout, a database that cannot be read; a secondary before its first transfer): drop (the default) sends nothing and counts it,
+ * servfail answers SERVFAIL + EDE 14 "Not Ready" (RFC 8914 4.15), as BIND.  Transfers and UPDATE always get SERVFAIL + EDE 14; a zone whose file failed to load is SERVFAIL as before */
+enum { NOT_READY_DROP = 0, NOT_READY_SERVFAIL = 1 };
 #define KARIDNS_NSID_MAX        128                 /* options { nsid }: octets (RFC 5001 §2.3 puts no limit; a long one would not fit a 512-octet response) */
 #define KARIDNS_UDP_BUFSIZE_MIN  512                /* RFC 6891 §6.2.3 */
 #define KARIDNS_UDP_BUFSIZE_MAX  4096
@@ -939,6 +943,7 @@ typedef struct server_config_s {
   uint32_t router_threads;     /* `router-threads` (restart-only): the Frontend routers, 1..KARIDNS_ROUTER_THREADS_MAX; 0 = by the CPUs this process may run on */
   uint32_t worker_threads;     /* `worker-threads` (restart-only): the Backend workers, 1..KARIDNS_WORKER_THREADS_MAX; 0 = by the CPUs this process may run on */
   uint8_t udp_receive;         /* `udp-receive` (restart-only): UDP_RECEIVE_BACKEND (0, also when not written) or UDP_RECEIVE_FRONTEND */
+  uint8_t not_ready_answer;    /* `not-ready-answer` (reloadable): NOT_READY_DROP (0, also when not written) or NOT_READY_SERVFAIL; read only on the not-ready branches of the engine */
   size_t response_cache_size;  /* 共有の応答キャッシュの大きさ (オクテット)。0 = 使わない */
   uint64_t generation;         /* 公開した設定ごとに増える (応答キャッシュの鍵) */
   /* 0.7 (NSD gap 5): a number no other parse in this process had (parse_named_conf_ext() sets it when it succeeds; 0 = a configuration that was not parsed: a test's, or a

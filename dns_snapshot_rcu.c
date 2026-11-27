@@ -4691,6 +4691,18 @@ void dbreg_fetch_end(const char *view, const char *zone) {
     pthread_mutex_unlock(&g_zone_db_rebuild_lock);
 }
 
+#ifdef KARIDNS_UNIT_TEST
+/* tests (review #279, 1): the zone has a fetch of its data on its way (LOADING) and no data in memory */
+bool dbreg_test_loading(const char *view, const char *zone) {
+    pthread_mutex_lock(&g_zone_db_rebuild_lock);
+    dbreg_view_t *rv = dbreg_view_get(view, false);
+    dbreg_zone_t *z = rv ? dbreg_find(rv, zone, zdir_name_hash(zone)) : NULL;
+    const bool r = z && !zdir_entry(z) && atomic_load_explicit(&z->state, memory_order_relaxed) == ZDIR_ST_LOADING;
+    pthread_mutex_unlock(&g_zone_db_rebuild_lock);
+    return r;
+}
+#endif
+
 /* The entry of a zone, held (a reference and active_axfr: the cache manager does not take it out of memory) until xfr_entry_release(): the store's write-through keeps the
  * version it copies alive this way.  NULL: no entry. */
 zone_db_entry_t *dbreg_pin_entry(const char *view, const char *zone) {

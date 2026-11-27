@@ -2477,7 +2477,7 @@ int main(void) {
             drain_wakes();
         }
 
-        /* a table of 256 places with a summary in flight: the 256th request finds it full (table_full), the place goes back, the workers are woken (the claim speaks for them all) */
+        /* 256 places of fetch-concurrency with a summary in flight (a summary takes no place): the last place, then a request that waits for one (0.7 first-fill latency: 512 slots of the table) */
         gate_cfg("fetch-concurrency 256; memory-limit 1024g;", 256, 0, 0);
         {
             static char names[256][24];
@@ -2501,22 +2501,25 @@ int main(void) {
             }
             CHECK(got == 256 && park_places_used() == 255 && ST("fetchq", "in_flight") == 256);
             drain_wakes();
-            /* (0.7 store) the 256th query finds every slot of the table taken (255 queries and the summary): it waits for one, like a request that finds the places of fetch-concurrency taken;
-             * it is not refused (before: table_full, and the workers were told "not ready") */
-            CHECK(IS_COLD(300) && worker_ask(0, COLD_EL(300), "default", cz[300], KDB_FETCH_FULL) == 1);        /* (255 places taken: the 256th is free) */
+            /* (0.7 first-fill latency) the table has 512 slots, room for the fill's 256 bodies beside fetch-concurrency: the 256th query takes the last place and goes out; the 257th finds
+             * every place taken and waits for one (it is not refused: before the store, table_full and "not ready"), and goes out when a fetch of a query is answered */
+            CHECK(IS_COLD(300) && worker_ask(0, COLD_EL(300), "default", cz[300], KDB_FETCH_FULL) == 1);
+            CHECK(req_next(&fetch5, &m2, 5000) && strcmp(m2.u.fetch_req.name, cz[300]) == 0 && park_places_used() == 256 && ST("fetchq", "in_flight") == 257);
+            const uint64_t id300 = m2.u.fetch_req.request_id;
+            CHECK(IS_COLD(301) && worker_ask(0, COLD_EL(301), "default", cz[301], KDB_FETCH_FULL) == 1);
             for (int i = 0; i < 100 && ST("fetchq", "queued") != 1; i++) usleep(2000);
-            CHECK(ST("fetchq", "queued") == 1 && ST("fetchq", "table_full") == t0 && !ch_next(&fetch5, &m2, 200) && park_claim_held(park_claim_key("default", cz[300])));
-            send_failed(f5[0], &e, 0, names[0], ids[0]);                                                      /* (the summary is answered: a slot is free) */
-            CHECK(req_next(&fetch5, &m2, 5000) && strcmp(m2.u.fetch_req.name, cz[300]) == 0 && ST("fetchq", "queued") == 0 && NOT_CLAIMED(park_claim_key("default", cz[300])));
-            send_failed(f5[0], &e, 0, cz[300], m2.u.fetch_req.request_id);
+            CHECK(ST("fetchq", "queued") == 1 && ST("fetchq", "table_full") == t0 && !ch_next(&fetch5, &m2, 200) && park_claim_held(park_claim_key("default", cz[301])));
+            send_failed(f5[0], &e, 0, cz[300], id300);                                                        /* (a query's fetch is answered: its place is free) */
+            CHECK(req_next(&fetch5, &m2, 5000) && strcmp(m2.u.fetch_req.name, cz[301]) == 0 && ST("fetchq", "queued") == 0 && NOT_CLAIMED(park_claim_key("default", cz[301])));
+            send_failed(f5[0], &e, 0, cz[301], m2.u.fetch_req.request_id);
             CHECK(wait_places(255, 2000) && ST("fetchq", "table_full") == t0);
-            for (int i = 1; i < got; i++) {
+            for (int i = 0; i < got; i++) {
                 send_failed(f5[0], &e, 0, names[i], ids[i]);
                 if (i % 32 == 31) drain_wakes();
             }
             CHECK(wait_places(0, 5000));
             for (int i = 0; i < 100 && ST("fetchq", "in_flight") != 0; i++) usleep(20000);
-            CHECK(ST("fetchq", "in_flight") == 0 && ST("fetchq", "peak") == 256);
+            CHECK(ST("fetchq", "in_flight") == 0 && ST("fetchq", "peak") == 257);
             drain_wakes();
         }
 

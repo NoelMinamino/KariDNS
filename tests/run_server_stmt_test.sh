@@ -129,7 +129,7 @@ keydef() { printf 'key "%s" { algorithm hmac-sha256; secret "%s"; };\n' "$1" "$2
 
 # ------------------------------------------------------------------------------------------------ K: karicheck conf
 cat > "$W/k1.conf" <<EOF
-options { directory "$W"; };
+options { not-ready-answer servfail; directory "$W"; };
 $(keydef k1 "$XK")
 server 192.0.2.0/24 { keys k1; bogus yes; tcp-only yes; tcp-keepalive yes; padding 600; send-cookie no; require-cookie no;
   query-source 192.0.2.9; transfers 3; request-nsid yes; edns-udp-size 1400; max-udp-size 1200; transfer-format one-answer; };
@@ -156,7 +156,7 @@ kc_err() { # kc_err NAME TEXT EXPECTED : the file is refused and the message has
     if grep -q -- "$3" "$W/kc.out"; then pass "K $1: refused; the message has '$3'"
     else fail "K $1: refused but without '$3'"; cat "$W/kc.out"; fi
 }
-kc_err e1 "options { };
+kc_err e1 "options { not-ready-answer servfail; };
 server 192.0.2.1 { frobnicate yes; };" "e1.conf:2: server '192.0.2.1': unknown option 'frobnicate'"
 kc_err e2 "$(keydef k1 "$XK")
 view v1 { match-clients { 127.0.0.1; }; key k1 { algorithm hmac-sha256; secret \"$VKA\"; }; };" "view 'v1': key 'k1' already exists as a top-level key"
@@ -170,17 +170,17 @@ kc_err e5 "server 192.0.2.1/24 { };" "e5.conf:1: server '192.0.2.1/24': '192.0.2
 kc_err e6 "server 192.0.2.1 { transfer-source-v6 2001:db8::1; };" "e6.conf:1: server '192.0.2.1': transfer-source-v6 is not legal for an IPv4 server"
 kc_err e7 "server 192.0.2.1 { };
 server 192.0.2.1 { };" "e7.conf:2: server '192.0.2.1': already exists, previous definition: $W/e7.conf:1"
-kc_err e9 "options {
+kc_err e9 "options { not-ready-answer servfail;
   notify-tcp-timeout 301;
 };" "e9.conf:2: Invalid notify-tcp-timeout value '301' (expected 1..300)"
 kc_err e10 "zone \"a.test\" { type master; file \"$W/k1.zone\";
   notify-tcp-timeout 0; };" "e10.conf:2: zone 'a.test.': invalid notify-tcp-timeout value '0' (expected 1..300)"
-printf 'options { notify-retries 2; notify-retry-interval 5; notify-retry-backoff fixed; notify-tcp-timeout 300; };\nzone "a.test" { type master; file "%s/k1.zone"; notify-tcp-timeout 1; };\n' "$W" > "$W/k2.conf"
+printf 'options { not-ready-answer servfail; notify-retries 2; notify-retry-interval 5; notify-retry-backoff fixed; notify-tcp-timeout 300; };\nzone "a.test" { type master; file "%s/k1.zone"; notify-tcp-timeout 1; };\n' "$W" > "$W/k2.conf"
 "$KARICHECK" conf "$W/k2.conf" > "$W/kc.out" 2>&1 && pass "K: notify-tcp-timeout 1..300 in options and zone is accepted by karicheck conf" || { fail "K: karicheck conf refused notify-tcp-timeout 300 / 1"; cat "$W/kc.out"; }
 kc_err e8 "view v1 { key k { algorithm hmac-sha256; secret \"$XK\"; }; key k { algorithm hmac-sha256; secret \"$VKA\"; }; };" "view 'v1': duplicate TSIG key 'k' defined"
 
 # ------------------------------------------------------------------------------------------------ E: start-up refusal
-printf 'options { port %s; bind-address { 127.0.0.1; }; pid-file "none"; %s };\nserver 127.0.0.1 {\n  transfer-source 192.0.2.77;\n};\n' "$PE" "$USER_OPT" > "$W/e1.conf"
+printf 'options { not-ready-answer servfail; port %s; bind-address { 127.0.0.1; }; pid-file "none"; %s };\nserver 127.0.0.1 {\n  transfer-source 192.0.2.77;\n};\n' "$PE" "$USER_OPT" > "$W/e1.conf"
 "$KARIDNS" -f "$W/e1.conf" > "$W/e.log" 2>&1 &
 epid=$!
 i=0
@@ -203,7 +203,7 @@ zone "$W/sk3.zone" sk3.test 5 2 1 3600
 zone "$W/sk4.zone" sk4.test 5 2 1 3600
 zone "$W/np.zone" np.test 5 2 1 3600
 {
-    echo "options { port $PP; bind-address { 127.0.0.1; }; pid-file \"none\"; $USER_OPT notify no; };"
+    echo "options { not-ready-answer servfail; port $PP; bind-address { 127.0.0.1; }; pid-file \"none\"; $USER_OPT notify no; };"
     ctlblock pp
     keydef xk "$XK"; keydef goodk "$GK"
     echo "zone \"ready.test\" { type master; file \"$W/ready.zone\"; };"
@@ -218,7 +218,7 @@ out=$("$DAG" @127.0.0.1 -p "$PP" sk1.test SOA +nohexdump +time=1 +tries=1 2>&1)
 case "$out" in *REFUSED*) pass "A0: the primary refuses an unsigned query for sk1.test (so a signed refresh check proves the key)" ;; *) fail "A0: an unsigned SOA query was not refused"; echo "$out" ;; esac
 
 {
-    echo "options { port $S1; bind-address { 127.0.0.1; }; pid-file \"none\"; $USER_OPT min-refresh-time 1; min-retry-time 1; };"
+    echo "options { not-ready-answer servfail; port $S1; bind-address { 127.0.0.1; }; pid-file \"none\"; $USER_OPT min-refresh-time 1; min-retry-time 1; };"
     keydef xk "$XK"; keydef goodk "$GK"; keydef badk "$BK"
     echo "server 127.0.0.1 { keys xk; bogus yes; request-nsid yes; edns-udp-size 1400; transfer-format many-answers; };"
     echo "zone \"sk1.test\" { type slave; primaries { 127.0.0.1 port $PP; }; };"
@@ -226,13 +226,13 @@ case "$out" in *REFUSED*) pass "A0: the primary refuses an unsigned query for sk
     echo "zone \"sk4.test\" { type slave; tsig-key badk; primaries { 127.0.0.1 port $PP; }; };"
 } > "$W/s1.conf"
 {
-    echo "options { port $S2; bind-address { 127.0.0.1; }; pid-file \"none\"; $USER_OPT min-refresh-time 1; min-retry-time 1; };"
+    echo "options { not-ready-answer servfail; port $S2; bind-address { 127.0.0.1; }; pid-file \"none\"; $USER_OPT min-refresh-time 1; min-retry-time 1; };"
     keydef xk "$XK"
     echo "server 127.0.0.1 { keys xk; request-ixfr no; edns no; };"
     echo "zone \"sk1.test\" { type slave; primaries { 127.0.0.1 port $PP; }; };"
 } > "$W/s2.conf"
 {
-    echo "options { port $S3; bind-address { 127.0.0.1; }; pid-file \"none\"; $USER_OPT min-refresh-time 1; min-retry-time 1; };"
+    echo "options { not-ready-answer servfail; port $S3; bind-address { 127.0.0.1; }; pid-file \"none\"; $USER_OPT min-refresh-time 1; min-retry-time 1; };"
     echo "zone \"sk1.test\" { type slave; primaries { 127.0.0.1 port $PP; }; };"
 } > "$W/s3.conf"
 start s1; start s2; start s3
@@ -262,7 +262,7 @@ perl "$DIR/mock_notify_sink.pl" --log "$W/sink4.log" --ports "$SK4,$SK5" --key "
 PIDS="$PIDS $!"
 for z in za zb zc zd ze; do zone "$W/$z.zone" "$z.test" 1; done
 {
-    echo "options { port $PN1; bind-address { 127.0.0.1; }; pid-file \"none\"; $USER_OPT notify explicit; };"
+    echo "options { not-ready-answer servfail; port $PN1; bind-address { 127.0.0.1; }; pid-file \"none\"; $USER_OPT notify explicit; };"
     ctlblock pn1
     keydef xk "$XK"; keydef ek "$EK"; keydef zk "$ZK"
     echo "server 127.0.0.1 { keys xk; };"
@@ -271,7 +271,7 @@ for z in za zb zc zd ze; do zone "$W/$z.zone" "$z.test" 1; done
     echo "zone \"zc.test\" { type master; file \"$W/zc.zone\"; tsig-key zk; also-notify { 127.0.0.1 port $SK3; }; };"
 } > "$W/pn1.conf"
 {
-    echo "options { port $PN2; bind-address { 127.0.0.1; }; pid-file \"none\"; $USER_OPT notify explicit; };"
+    echo "options { not-ready-answer servfail; port $PN2; bind-address { 127.0.0.1; }; pid-file \"none\"; $USER_OPT notify explicit; };"
     ctlblock pn2
     keydef zk "$ZK"
     echo "zone \"zd.test\" { type master; file \"$W/zd.zone\"; tsig-key zk; also-notify { 127.0.0.1 port $SK4; }; };"
@@ -301,7 +301,7 @@ else
     PIDS="$PIDS $!"
     for z in zs1 zs2 zs3; do zone "$W/$z.zone" "$z.test" 1; done
     {
-        echo "options { port $PN3; bind-address { 127.0.0.1; }; pid-file \"none\"; $USER_OPT notify explicit; notify-source 127.0.0.3; };"
+        echo "options { not-ready-answer servfail; port $PN3; bind-address { 127.0.0.1; }; pid-file \"none\"; $USER_OPT notify explicit; notify-source 127.0.0.3; };"
         ctlblock pn3
         echo "server 127.0.0.1 { notify-source 127.0.0.2; };"
         echo "server 127.0.0.5 { notify-source *; };"
@@ -335,13 +335,13 @@ else
     zone "$W/o1.zone" o1.test 3
     zone "$W/o2.zone" o2.test 3
     {
-        echo "options { port $PO; bind-address { 127.0.0.1; 127.0.0.5; }; pid-file \"none\"; $USER_OPT notify no; };"
+        echo "options { not-ready-answer servfail; port $PO; bind-address { 127.0.0.1; 127.0.0.5; }; pid-file \"none\"; $USER_OPT notify no; };"
         echo "zone \"ready.test\" { type master; file \"$W/ready.zone\"; };"
         echo "zone \"o1.test\" { type master; file \"$W/o1.zone\"; allow-transfer { 127.0.0.2; }; };"
         echo "zone \"o2.test\" { type master; file \"$W/o2.zone\"; allow-transfer { 127.0.0.2; }; };"
     } > "$W/po.conf"
     {
-        echo "options { port $SO; bind-address { 127.0.0.1; }; pid-file \"none\"; $USER_OPT min-refresh-time 1; min-retry-time 1; transfer-source 127.0.0.4; };"
+        echo "options { not-ready-answer servfail; port $SO; bind-address { 127.0.0.1; }; pid-file \"none\"; $USER_OPT min-refresh-time 1; min-retry-time 1; transfer-source 127.0.0.4; };"
         echo "server 127.0.0.1 { transfer-source 127.0.0.2; };"
         echo "server 127.0.0.5 { transfer-source *; };"
         echo "zone \"o1.test\" { type slave; primaries source 127.0.0.3 { 127.0.0.1 port $PO; }; };"
@@ -364,13 +364,13 @@ $M xfr-primary --port "$MG5" --zone g3.test --mode stall --log "$W/mg5.log" & PI
 $M xfr-primary --port "$MG6" --zone g4.test --mode stall --log "$W/mg6.log" & PIDS="$PIDS $!"
 sleep 1
 {
-    echo "options { port $ST1; bind-address { 127.0.0.1; }; pid-file \"none\"; $USER_OPT max-transfer-idle-in 1; };"
+    echo "options { not-ready-answer servfail; port $ST1; bind-address { 127.0.0.1; }; pid-file \"none\"; $USER_OPT max-transfer-idle-in 1; };"
     echo "server 127.0.0.1 { transfers 1; };"
     echo "zone \"g1.test\" { type slave; primaries { 127.0.0.1 port $MG3; }; };"
     echo "zone \"g2.test\" { type slave; primaries { 127.0.0.1 port $MG4; }; };"
 } > "$W/st1.conf"
 {
-    echo "options { port $ST2; bind-address { 127.0.0.1; }; pid-file \"none\"; $USER_OPT max-transfer-idle-in 1; transfers-per-ns 1; };"
+    echo "options { not-ready-answer servfail; port $ST2; bind-address { 127.0.0.1; }; pid-file \"none\"; $USER_OPT max-transfer-idle-in 1; transfers-per-ns 1; };"
     echo "server 127.0.0.1 { transfers 5; };"
     echo "zone \"g3.test\" { type slave; primaries { 127.0.0.1 port $MG5; }; };"
     echo "zone \"g4.test\" { type slave; primaries { 127.0.0.1 port $MG6; }; };"
@@ -401,7 +401,7 @@ else
     zone "$W/va.zone" vz.test 7 2 1 3600
     zone "$W/vb.zone" vz.test 8 2 1 3600
     {
-        echo "options { port $PV; bind-address { 127.0.0.1; }; pid-file \"none\"; $USER_OPT notify no; };"
+        echo "options { not-ready-answer servfail; port $PV; bind-address { 127.0.0.1; }; pid-file \"none\"; $USER_OPT notify no; };"
         echo "view va { match-clients { 127.0.0.2; }; $(keydef vk "$VKA")"
         echo "  zone \"vz.test\" { type master; file \"$W/va.zone\"; allow-transfer { key vk; }; allow-update { key vk; }; }; };"
         echo "view vb { match-clients { 127.0.0.3; }; $(keydef vk "$VKB")"
@@ -437,7 +437,7 @@ else
     else fail "V8: new1 in va='$qa' (expected 192.0.2.99), in vb='$qb' (expected empty), refused new2='$q2' (expected empty)"; fi
 
     {
-        echo "options { port $SV; bind-address { 127.0.0.1; }; pid-file \"none\"; $USER_OPT min-refresh-time 1; min-retry-time 1; };"
+        echo "options { not-ready-answer servfail; port $SV; bind-address { 127.0.0.1; }; pid-file \"none\"; $USER_OPT min-refresh-time 1; min-retry-time 1; };"
         echo "view sv1 { match-clients { 127.0.0.2; }; transfer-source 127.0.0.2; $(keydef vk "$VKA")"
         echo "  zone \"vz.test\" { type slave; primaries { 127.0.0.1 port $PV key vk; }; }; };"
         echo "view sv2 { match-clients { 127.0.0.3; }; transfer-source 127.0.0.3; $(keydef vk "$VKA")"
@@ -457,7 +457,7 @@ fi
 
 # ------------------------------------------------------------------------------------------------ P: nested primaries ports
 {
-    echo "options { port $SNP; bind-address { 127.0.0.1; }; pid-file \"none\"; $USER_OPT min-refresh-time 1; min-retry-time 1; };"
+    echo "options { not-ready-answer servfail; port $SNP; bind-address { 127.0.0.1; }; pid-file \"none\"; $USER_OPT min-refresh-time 1; min-retry-time 1; };"
     echo "primaries inner { 127.0.0.1; };"
     echo "primaries outer port $PP { inner; };"
     echo "zone \"np.test\" { type slave; primaries { outer; }; };"
@@ -471,7 +471,7 @@ perl -e 'print "\$TTL 300\n\$ORIGIN big.test.\n\@ IN SOA ns1 hostmaster 2 3600 6
 for n in pf1 pf2; do
     p=$PF1; [ $n = pf2 ] && p=$PF2
     {
-        echo "options { port $p; bind-address { 127.0.0.1; }; pid-file \"none\"; $USER_OPT notify no; };"
+        echo "options { not-ready-answer servfail; port $p; bind-address { 127.0.0.1; }; pid-file \"none\"; $USER_OPT notify no; };"
         ctlblock $n
         [ $n = pf1 ] && echo "server 127.0.0.1 { transfer-format one-answer; provide-ixfr no; max-udp-size 512; };"
         echo "zone \"big.test\" { type master; file \"$W/big.zone\"; allow-transfer { 127.0.0.1; }; };"
@@ -520,7 +520,7 @@ PIDS="$PIDS $!"
 perl "$DIR/mock_notify_sink.pl" --log "$W/sinkf.log" --ports "$(cp_of 15)" --tcp-ports "$(cp_of 15):answer" 2>/dev/null &
 PIDS="$PIDS $!"
 {
-    echo "options { port $(cp_of 30); bind-address { 127.0.0.1; }; pid-file \"none\"; $USER_OPT notify explicit; };"
+    echo "options { not-ready-answer servfail; port $(cp_of 30); bind-address { 127.0.0.1; }; pid-file \"none\"; $USER_OPT notify explicit; };"
     ctlblock pc1
     keydef xk "$XK"
     echo "server 127.0.0.1 { tcp-only yes; keys xk; };"
@@ -532,7 +532,7 @@ PIDS="$PIDS $!"
     echo "zone \"c11.test\" { type master; file \"$W/c11.zone\"; notify-tcp-timeout 3; also-notify { 127.0.0.1 port $(cp_of 14); }; };"
 } > "$W/pc1.conf"
 {
-    echo "options { port $(cp_of 31); bind-address { 127.0.0.1; }; pid-file \"none\"; $USER_OPT notify explicit; notify-retries 1; notify-retry-interval 1; };"
+    echo "options { not-ready-answer servfail; port $(cp_of 31); bind-address { 127.0.0.1; }; pid-file \"none\"; $USER_OPT notify explicit; notify-retries 1; notify-retry-interval 1; };"
     ctlblock pc2
     keydef xk "$XK"
     echo "zone \"d1.test\" { type master; file \"$W/d1.zone\"; notify-retry-interval 5; also-notify { 127.0.0.1 port $(cp_of 11); }; };"
@@ -541,7 +541,7 @@ PIDS="$PIDS $!"
 } > "$W/pc2.conf"
 # pc4: nothing about notify-retry-* or notify-tcp-timeout in the file
 {
-    echo "options { port $(cp_of 33); bind-address { 127.0.0.1; }; pid-file \"none\"; $USER_OPT notify explicit; };"
+    echo "options { not-ready-answer servfail; port $(cp_of 33); bind-address { 127.0.0.1; }; pid-file \"none\"; $USER_OPT notify explicit; };"
     ctlblock pc4
     echo "zone \"f1.test\" { type master; file \"$W/f1.zone\"; also-notify { 127.0.0.1 port $(cp_of 15); }; };"
 } > "$W/pc4.conf"
@@ -637,7 +637,7 @@ else
         --tcp-bind "127.0.0.5:$(cp_of 42):answer,127.0.0.4:$(cp_of 43):answer" 2>/dev/null &
     PIDS="$PIDS $!"
     {
-        echo "options { port $(cp_of 32); bind-address { 127.0.0.1; }; pid-file \"none\"; $USER_OPT notify explicit; notify-source 127.0.0.3; };"
+        echo "options { not-ready-answer servfail; port $(cp_of 32); bind-address { 127.0.0.1; }; pid-file \"none\"; $USER_OPT notify explicit; notify-source 127.0.0.3; };"
         ctlblock pc3
         keydef xk "$XK"
         echo "server 127.0.0.1 { tcp-only yes; keys xk; notify-source 127.0.0.2; };"
@@ -670,14 +670,14 @@ fi
 # the new serial arrives through the NOTIFY (the primary never sends a datagram)
 zone "$W/m.zone" m.test 1 3600 3600 86400
 {
-    echo "options { port $(cp_of 50); bind-address { 127.0.0.1; }; pid-file \"none\"; $USER_OPT notify explicit; };"
+    echo "options { not-ready-answer servfail; port $(cp_of 50); bind-address { 127.0.0.1; }; pid-file \"none\"; $USER_OPT notify explicit; };"
     ctlblock pcm
     keydef xk "$XK"
     echo "server 127.0.0.1 { tcp-only yes; keys xk; };"
     echo "zone \"m.test\" { type master; file \"$W/m.zone\"; allow-transfer { key xk; }; also-notify { 127.0.0.1 port $(cp_of 51); }; };"
 } > "$W/pcm.conf"
 {
-    echo "options { port $(cp_of 51); bind-address { 127.0.0.1; }; pid-file \"none\"; $USER_OPT };"
+    echo "options { not-ready-answer servfail; port $(cp_of 51); bind-address { 127.0.0.1; }; pid-file \"none\"; $USER_OPT };"
     keydef xk "$XK"
     echo "zone \"m.test\" { type slave; tsig-key xk; primaries { 127.0.0.1 port $(cp_of 50) key xk; }; };"
 } > "$W/pcsec.conf"
@@ -700,7 +700,7 @@ zone "$W/i1.zone" i1.test 1 3600 3600 86400
 zone "$W/i2.zone" i2.test 1 3600 3600 86400
 zone "$W/i3.zone" i3.test 1 3600 3600 86400
 {
-    echo "options { port $PI; bind-address { 127.0.0.1; }; pid-file \"none\"; $USER_OPT };"
+    echo "options { not-ready-answer servfail; port $PI; bind-address { 127.0.0.1; }; pid-file \"none\"; $USER_OPT };"
     keydef xk "$XK"
     keydef gk "$GK"
     keydef zk "$ZK"

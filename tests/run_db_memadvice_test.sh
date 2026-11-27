@@ -9,7 +9,7 @@
 #      records") and says nothing more; after every zone has been asked for (about 230 fit) the size is the measured one and the server says it again, with a
 #      NOTICE (below what every zone needs, about 80% fit); a reconfig to 8m says an INFO line only (keeps 100%); dbstatus shows each state.
 #   C  at run time: memory-limit 1m, park-timeout 500, the loader stopped (SIGSTOP: no fetch is ever answered) and a burst of queries for zones that are not
-#      in memory: one WARNING that names the queries that waited and were answered SERVFAIL + EDE 14 for overload (the park-timeout counter), the numbers
+#      in memory: one WARNING that names the queries that waited and were not answered for overload (the park-timeout counter), the numbers
 #      and the recommended memory-limit; not said again within a minute.
 #   D  karicheck db counts the database (the loader's M line) and says the same about it: INFO with the records counted, the WARNING of a small limit, no
 #      warning of a limit that holds everything, an estimate without a limit.
@@ -178,7 +178,7 @@ wait $BP 2>/dev/null
 W=$(grep "is too small for the traffic" "$T/srv.log" | tail -1)
 echo "  $W" | cut -c1-700
 echo "$W" | grep -q "memory-limit 1M is too small for the traffic" && echo "$W" | grep -q "queries (" && echo "$W" | grep -q "had to wait for a zone" && pass "it names the limit and the queries that waited" || fail "text: $W"
-echo "$W" | grep -q "answered SERVFAIL + EDE 14 for overload" && echo "$W" | grep -q "park-timeout" && echo "$W" | grep -q "refused" && pass "... and the queries that were answered SERVFAIL + EDE 14 for overload, with the counters" || fail "overload text: $W"
+echo "$W" | grep -q "were not answered for overload" && echo "$W" | grep -q "park-timeout" && echo "$W" | grep -q "refused" && pass "... and the queries that were not answered for overload, with the counters" || fail "overload text: $W"
 echo "$W" | grep -q "recommended [0-9]*[MG] (every zone in memory" && pass "... and the recommended memory-limit" || fail "recommendation: $W"
 perl "$T/burst.pl" "$PORT" $NZ 300 14
 [ -n "$LP" ] && kill -CONT "$LP"

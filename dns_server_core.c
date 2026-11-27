@@ -1087,6 +1087,13 @@ void submit_response_log(log_action_t action, const char *client_ip, int client_
     // データ書き込み完了をConsumerに通知
     atomic_store_explicit(&entry->ready, true, memory_order_release);
 }
+
+/* (review #279, 3) the log of a query that got no answer: one that is not answered while the data of its zone is being loaded (DNS_NR_DROP: a database zone, a secondary before its
+ * first transfer) is said as such, with its name and type; anything else is a message that could not be answered (malformed) */
+static void submit_unanswered_log(int res_len, const char *client_ip, int client_port, const char *qname, uint16_t qclass, uint16_t qtype, bool has_edns, bool dnssec_ok) {
+  if (res_len == DNS_NR_DROP) submit_response_log(LOG_ACT_DROP_NOT_READY, client_ip, client_port, qname, qclass, qtype, 2, has_edns, dnssec_ok);
+  else submit_response_log(LOG_ACT_DROP_MALFORMED, client_ip, client_port, "<malformed>", 0, 0, 0, false, false);
+}
 void escape_qname_for_log(const char *src, char *dst, size_t dst_size) {
   if (!dst || dst_size == 0) return;
   if (!src) {
@@ -1384,6 +1391,7 @@ void *response_logger_thread_func(void *arg) {
                 const char *action_str = "";
                 if (entry->action == LOG_ACT_DROP_RRL) action_str = " [DROP:RRL]";
                 else if (entry->action == LOG_ACT_DROP_MALFORMED) action_str = " [DROP:MALFORMED]";
+                else if (entry->action == LOG_ACT_DROP_NOT_READY) action_str = " [DROP:NOT-READY]";
 
                 char safe_qname[512];
                 escape_qname_for_log(entry->qname, safe_qname, sizeof(safe_qname));
@@ -1992,6 +2000,14 @@ static void tcp_client_close(int kq, int client_fd, tcp_stream_ctx_t *ctx_tcp,
 
 /* 0.7: a TCP query that is dropped (overload: no room, the time was up, the ingest thread shed what it waits for) is discarded and counted; the connection is NOT closed (the client may have pipelined queries
  * for zones that are in memory, RFC 7766 §6.2.1.1).  The state is the one after an answered message: the next message is read from the start. */
+/* 0.7 W6: options { not-ready-answer servfail; }: a query whose park-timeout ran out is answered "not ready" (SERVFAIL + EDE 14, as BIND), not dropped.  Read only on that cold branch */
+static bool not_ready_servfail(void) {
+  server_config_t *cfg = acquire_config_snapshot();
+  const bool sf = cfg && cfg->not_ready_answer == NOT_READY_SERVFAIL;
+  release_config_snapshot(cfg);
+  return sf;
+}
+
 static void tcp_drop_message(tcp_stream_ctx_t *c) {
   c->state = TCP_STATE_READ_LEN;
   c->accumulated = 0;
@@ -2598,8 +2614,7 @@ STATIC_TEST void *async_io_worker_func(void *arg) {
                               task.qclass, task.qtype, res_buf[3] & 0x0F, task.has_edns, task.dnssec_ok);
         }
       } else {
-        submit_response_log(LOG_ACT_DROP_MALFORMED, task.client_ip, task.client_port, "<malformed>",
-                            0, 0, 0, false, false);
+        submit_unanswered_log(res_len, task.client_ip, task.client_port, task.qname, task.qclass, task.qtype, task.has_edns, task.dnssec_ok);
       }
       rcu_slot_reader_exit(&g_async_io_rcu_ctxs[thread_idx]);
       release_zone_snapshot(task.snap);
@@ -2619,8 +2634,7 @@ STATIC_TEST void *async_io_worker_func(void *arg) {
           submit_response_log(LOG_ACT_SENT, task.client_ip, task.client_port, task.qname, task.qclass, task.qtype,
                               tcp_res[3] & 0x0F, task.has_edns, task.dnssec_ok);
         } else {
-          submit_response_log(LOG_ACT_DROP_MALFORMED, task.client_ip, task.client_port, "<malformed>",
-                              0, 0, 0, false, false);
+          submit_unanswered_log(res_len, task.client_ip, task.client_port, task.qname, task.qclass, task.qtype, task.has_edns, task.dnssec_ok);
         }
         rcu_slot_reader_exit(&g_async_io_rcu_ctxs[thread_idx]);
         release_zone_snapshot(task.snap);
@@ -3261,8 +3275,11 @@ STATIC_TEST void udp_one(udp_pass_t *w, udp_ipc_t *ipc_msg, uint8_t *req_buf, ss
             }
             if (__builtin_expect(w->expired == 2, 0) && !route.entry && !zref_present(&pel) && lookup_wanted(route.view, req_buf[2], qclass)) {      /* 0.7: the time of the lookup was up and still no zone has the name: dropped, counted */
               park_cnt_note(PARK_CNT_LK_TIMEOUT);
-              rcu_reader_exit(ctx);
-              return;
+              if (!not_ready_servfail()) {
+                rcu_reader_exit(ctx);
+                return;
+              }
+              w->lookup_failed = true;                    /* (0.7 W6, not-ready-answer servfail: answered "not ready" as a failed lookup is, below) */
             }
             if (__builtin_expect(w->lookup_failed, 0) && !route.entry && !zref_present(&pel)) {      /* 0.7: the lookup failed: the answer is "not ready", as for a zone whose fetch failed, built for a name with no zone */
               char lname[DNS_NAME_TEXT_SIZE];
@@ -3294,10 +3311,12 @@ STATIC_TEST void udp_one(udp_pass_t *w, udp_ipc_t *ipc_msg, uint8_t *req_buf, ss
                   rcu_reader_exit(ctx);
                   return;
                 }
-                if (w->expired) {                         /* 0.7: its time was up and the zone is still not there: dropped, counted (a failure is answered "not ready", below) */
+                if (w->expired) {                         /* 0.7: its time was up and the zone is still not there: dropped, counted (W6: answered "not ready" with not-ready-answer servfail) */
                   park_cnt_note(w->expired == 2 ? PARK_CNT_LK_TIMEOUT : PARK_CNT_ZONE_TIMEOUT);
-                  rcu_reader_exit(ctx);
-                  return;
+                  if (!not_ready_servfail()) {
+                    rcu_reader_exit(ctx);
+                    return;
+                  }
                 }
                 not_ready = true;
               }
@@ -3362,6 +3381,13 @@ STATIC_TEST void udp_one(udp_pass_t *w, udp_ipc_t *ipc_msg, uint8_t *req_buf, ss
               res_len = process_dns_query_cap_routed(req_buf, payload_received, res_buf, UDP_DEFAULT_MAX_RES_LEN,
                                                      UDP_IPC_BUFFER_SIZE - sizeof(udp_ipc_t), qname,
                                                      qtype, client_ip, &(*w->cc), false, &rrl_cfg, snap, &route);
+            }
+            if (res_len == DNS_NR_DROP) {                 /* 0.7 first-fill latency: an ordinary query is not answered SERVFAIL while its data is being loaded (a database zone, counted: a failed lookup was counted at
+                                                           * its wake-up; a secondary before its first transfer, review #279, 3): dropped and logged as such */
+              if (not_ready && !w->lookup_failed) park_cnt_note(PARK_CNT_ZONE_FAILED);
+              if (rlog_enabled) submit_unanswered_log(res_len, client_ip, client_port, qname, qclass, qtype, has_edns, dnssec_ok);
+              rcu_reader_exit(ctx);
+              return;
             }
             if (res_len > 0) {
               bool drop_packet = false;
@@ -3506,7 +3532,7 @@ STATIC_TEST void park_service(udp_pass_t *w, int kq) {
       continue;
     }
     const uint8_t expired = ((timed_out && !failed) || late) ? (uint8_t)(lk ? 2 : 1) : 0;
-    if (failed && lk) park_cnt_note(PARK_CNT_LK_SERVFAIL);
+    if (failed && lk) park_cnt_note(PARK_CNT_LK_FAILED);
     if (e->kind == PARK_UDP) {
       udp_ipc_t *ipc = (udp_ipc_t *)w->batch->rx_buffers[0];
       *ipc = *park_entry_ipc(e);
@@ -4591,11 +4617,15 @@ process_tcp_client: ;
             route.entry = route.view ? find_zone_for_query_zref(route.view, qname, ((msg[2] >> 3) & 0x0F) == 0 ? qtype : 0, &pel) : NULL;
             bool not_ready = false, answered = false;
             int res_len = 0;
+            const bool lk_failed_tcp = ctx_tcp->lookup_failed;   /* (the state is cleared below, before the answer is built: a failed lookup was counted at its wake-up) */
             if (__builtin_expect(ctx_tcp->expired == 2, 0) && !route.entry && !zref_present(&pel) && lookup_wanted(route.view, msg[2], qclass)) {      /* 0.7: as udp_one(): the time of the lookup was up and still no zone has the name: dropped (the connection stays open), counted */
               park_cnt_note(PARK_CNT_LK_TIMEOUT);
-              tcp_drop_message(ctx_tcp);
-              rcu_reader_exit(ctx);
-              continue;
+              if (!not_ready_servfail()) {
+                tcp_drop_message(ctx_tcp);
+                rcu_reader_exit(ctx);
+                continue;
+              }
+              ctx_tcp->lookup_failed = true;              /* (0.7 W6, not-ready-answer servfail: answered "not ready" as a failed lookup is, below) */
             }
             if (__builtin_expect(ctx_tcp->lookup_failed, 0) && !route.entry && !zref_present(&pel)) {      /* 0.7: the lookup failed: "not ready" for a name with no zone (udp_one()) */
               char lname[DNS_NAME_TEXT_SIZE];
@@ -4691,9 +4721,11 @@ process_tcp_client: ;
               }
               if (ctx_tcp->expired || (park_on && !ctx_tcp->not_ready_now && left <= 0)) {      /* 0.7: its time was up and the zone is still not there: dropped (the connection stays open), counted */
                 park_cnt_note(ctx_tcp->expired == 2 ? PARK_CNT_LK_TIMEOUT : PARK_CNT_ZONE_TIMEOUT);
-                tcp_drop_message(ctx_tcp);
-                rcu_reader_exit(ctx);
-                continue;
+                if (!not_ready_servfail()) {
+                  tcp_drop_message(ctx_tcp);
+                  rcu_reader_exit(ctx);
+                  continue;
+                }
               }
               not_ready = true;
             }
@@ -4767,14 +4799,21 @@ process_tcp_client: ;
                                                      qname, qtype, ctx_tcp->client_ip,
                                                      &thread_compress_ctx, true, NULL, snap, &route);
             }
+            if (res_len == DNS_NR_DROP) {                 /* 0.7 first-fill latency: not answered SERVFAIL while its data is being loaded (a database zone, counted; a secondary before its first transfer, review #279, 3):
+                                                           * the message is dropped and logged as such, and the connection stays open (as tcp_drop_message() says), whatever tcp-connection-reuse says */
+              if (not_ready && !lk_failed_tcp) park_cnt_note(PARK_CNT_ZONE_FAILED);
+              submit_unanswered_log(res_len, ctx_tcp->client_ip, client_port, qname, qclass, qtype, has_edns, dnssec_ok);
+              tcp_drop_message(ctx_tcp);
+              rcu_reader_exit(ctx);
+              continue;
+            }
             if (res_len > 0) {
               submit_response_log(LOG_ACT_SENT, ctx_tcp->client_ip, client_port, qname, qclass, qtype,
                                   tcp_res_buf[3] & 0x0F, has_edns, dnssec_ok);
               write_dnstap_event(ctx, 2 /*AUTH_RESPONSE*/, tcp_res_buf, res_len, &ctx_tcp->client_addr, ctx_tcp->client_len,
                                  ctx_tcp->has_server_addr ? &ctx_tcp->server_addr : NULL, ctx_tcp->has_server_addr, IPPROTO_TCP);
             } else {
-              submit_response_log(LOG_ACT_DROP_MALFORMED, ctx_tcp->client_ip, client_port, "<malformed>",
-                                  0, 0, 0, false, false);
+              submit_unanswered_log(res_len, ctx_tcp->client_ip, client_port, qname, qclass, qtype, has_edns, dnssec_ok);
             }
             /* the configuration is read in the read section only (config_standby_reap()) */
             server_config_t *cfg = acquire_config_snapshot();
@@ -6694,6 +6733,7 @@ void *control_thread_func(void *arg) {
               }
               /* (0.7: the gauges of the tick's last walk of the secondaries) */
               xfr_store_expired(&st.secondaries_expired, &st.secondaries_expired_stale, &st.secondaries_expired_servfail);
+              st.not_ready_dropped = atomic_load_explicit(&g_not_ready_dropped_total, memory_order_relaxed);   /* (0.7 W6) */
               snprintf(st.version, sizeof(st.version), "%s", KARIDNS_VERSION);
               snprintf(st.hostname, sizeof(st.hostname), "%s", g_host_status_info.un.nodename);
               snprintf(st.os_name, sizeof(st.os_name), "%s", g_host_status_info.un.sysname);

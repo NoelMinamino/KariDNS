@@ -387,6 +387,7 @@ typedef struct store_stats {
   uint64_t checkpoint_table_bytes;  /* bytes of the tables that checkpoints wrote since the open */
   uint64_t checkpoint_table_last_bytes; /* ... the last one */
   uint64_t checkpoint_paced_us;     /* the time fuzzy checkpoints waited to stay under their write rate (ck_pace()) */
+  uint64_t checkpoint_slow_bytes, checkpoint_slow_paced_us;   /* 0.7 first-fill latency: table bytes bulk checkpoints wrote at the slow rate because reads waited, and the time they waited at it (ck_pace()) */
   /* ---- 0.7: the journal ring (the record is written after the writer mutex) ---- */
   int      journal_state;           /* STORE_JOURNAL_* */
   int      journal_error;           /* the errno of the last write that failed (0: none since the state was ok) */
@@ -410,6 +411,7 @@ typedef struct store_stats {
   uint64_t bulk_resumed;            /* opens that found one going on (a clean stop or a crash in the middle of it): 0 or 1 */
   uint64_t bulk_recoveries;         /* ... of them the ones after a crash: 0 or 1 */
   uint64_t bulk_checkpoints;        /* bulk checkpoints made (the durable points of the body fill) */
+  uint64_t bulk_presyncs, bulk_presync_max_us;   /* 0.7 first-fill latency: early syncs of the segments of an unlogged fill (every 128 MiB written), and the longest (bulk_presync()) */
   uint64_t bulk_unlogged_records;   /* writer records applied without a journal record */
   uint64_t bulk_since_unix;         /* when the fill began or was resumed (0: none) */
   uint64_t bulk_ended_unix;         /* when the last one ended (store_bulk_end(); 0: none in this session) */
@@ -570,6 +572,14 @@ int  store_commit(store_t *s);
  * the microseconds it waited (0: no wait).  The bulk writer (the reconcile thread of a pass) uses 2, the thread that also answers lookups 4: the journal stays below 2 x
  * journal_max_bytes while the disk keeps up with the checkpoints, and below 4 x in any case (store.journal.limit_waits counts the waits).  The store's own calls never wait for it. */
 uint64_t store_journal_wait(store_t *s, unsigned factor);
+/* 0.7 first-fill latency: the same wait in slices of slice_ms (0: to the end), for a thread that has other work between them (the ingest thread: the requests of queries).  w is the wait (zeroed
+ * before the first slice); true: it goes on, call again; false: no wait, or it is over (counted once, w->us the microseconds from its first slice). */
+typedef struct { bool on, waited, warn; uint64_t t0, ends, lim, us; } store_jwait_t;
+bool store_journal_wait_slice(store_t *s, unsigned factor, store_jwait_t *w, unsigned slice_ms);
+/* 0.7 first-fill latency (W2): fn says that reads wait (the attaches of queries): a bulk checkpoint then writes its tables at a slow rate (store.checkpoint.slow_*); store_ck_running(): a checkpoint runs (no lock) */
+void store_set_ck_slow_fn(store_t *s, bool (*fn)(void));
+bool store_ck_running(const store_t *s);
+
 /* 0.7: the bulk producer of new zones (the reconcile thread of a pass), holding no lock, calls this between its groups: while a build of the next index generation runs (it begins at
  * 3/8 of the index) and the index is past 7/16, it waits for the build to end instead of filling the old index to one half, where the growth would be made inside the writer mutex (the
  * build dropped, every zone put in again: seconds at millions of zones).  Bounded (30 s): a build that does not end is given up on once, with a WARNING, and the pass goes on.  Returns

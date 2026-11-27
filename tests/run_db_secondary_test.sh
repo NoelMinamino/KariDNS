@@ -95,7 +95,7 @@ mkzone m3.test 7 192.0.2.99 > "$T/z/m3db.zone"
 mkzone flip.test 5 192.0.2.50 > "$T/z/flipdb.zone"
 
 cat > "$T/p1.conf" <<EOF
-options { user "nobody"; pid-file "none"; listen-on { 127.0.0.1; }; port $PM1; };
+options { not-ready-answer servfail; user "nobody"; pid-file "none"; listen-on { 127.0.0.1; }; port $PM1; };
 key "xfr" { algorithm hmac-sha256; secret "$S_XFR"; };
 control-channel { socket "$T/p1.sock"; secret "$S_CTL"; };
 zone "slv.test" { type primary; file "$T/z/slv.zone"; tsig-key "xfr"; allow-transfer { key "xfr"; }; allow-update { 127.0.0.1; };
@@ -111,7 +111,7 @@ zone "m4.test" { type primary; file "$T/z/m4.zone"; allow-transfer { 127.0.0.1; 
 zone "cat.test" { type primary; file "$T/z/cat.zone"; allow-transfer { 127.0.0.1; }; also-notify { 127.0.0.1 port $PS; }; notify-retry-interval 1; };
 EOF
 cat > "$T/p2.conf" <<EOF
-options { user "nobody"; pid-file "none"; listen-on { 127.0.0.1; }; port $PM2; };
+options { not-ready-answer servfail; user "nobody"; pid-file "none"; listen-on { 127.0.0.1; }; port $PM2; };
 zone "recon.test" { type primary; file "$T/z/recon2.zone"; allow-transfer { 127.0.0.1; }; };
 EOF
 cat > "$T/p1ctl.conf" <<EOF
@@ -154,7 +154,7 @@ KCTL1="./karictl -c $T/p1ctl.conf"
 
 write_sconf() {   # write_sconf FILE: the server under test
     cat > "$1" <<EOF
-options {
+options { not-ready-answer servfail;
     user "nobody"; pid-file "none"; listen-on { 127.0.0.1; }; port $PS;
     database { driver sqlite3; database-file "$T/db/z.db"; loader-user "nobody"; loader-path "$T/karidns-dbloader"; db-reload-timeout 4;
                acl-ceiling { 127.0.0.1; }; };
