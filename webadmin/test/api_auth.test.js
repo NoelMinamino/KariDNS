@@ -120,6 +120,39 @@ test('the rate limit per name is separate from the one per address', withDeploy(
   problem(await bad(), 429, 'rate-limited');
 }));
 
+// web review W2-L1 (0.7): the bucket of a user name is per address.  Before, it was the name's alone, shared by every address: anyone who knew a user name could
+// keep it empty (a few requests a minute) and its owner got 429 with the right password.
+test('a user name that is guessed from one address does not lock its owner out from another (W2-L1)', withDeploy({ settings: { 'rate-login': 3, 'trusted-proxy': '127.0.0.1, ::1' } }, async (d) => {
+  await cast(d);
+  const clock = { t: Date.now() };
+  d.app.now = () => clock.t;
+  d.app.buckets.loginIp.now = () => clock.t;
+  d.app.buckets.loginUser.now = () => clock.t;
+  const from = (ip, password) => d.request('POST', '/auth/login', { body: { user: 'root', password }, headers: { 'X-Forwarded-For': ip } });
+  // the attacker empties the bucket of root from its addresses (a different address each time: the per-address bucket is never the limit)
+  for (let i = 0; i < 6; i++) problem(await from(`192.0.2.${100 + i}`, 'wrong password!'), 401, 'invalid-credentials');
+  // ... and from one address: that address's bucket of root is empty
+  for (let i = 0; i < 3; i++) await from('198.51.100.7', 'wrong password!');
+  problem(await from('198.51.100.7', 'correct horse battery'), 429, 'rate-limited');
+  // the owner, from an address of its own whose buckets are not empty, gets in with the right password
+  assert.equal((await from('203.0.113.5', 'correct horse battery')).status, 200);
+  // the same name from another address has its own bucket: the guesses from 198.51.100.7 did not use it
+  const other = '203.0.113.9';
+  for (let i = 0; i < 2; i++) problem(await from(other, 'wrong password!'), 401, 'invalid-credentials');
+  assert.equal((await from(other, 'correct horse battery')).status, 200);
+  // the key is the name in lower case and the address: three attempts on ROOT / Root from one address empty that address's bucket of root, and another name
+  // from the same address has a bucket of its own (the address's bucket is made larger for this part, so that it is not the one that answers 429)
+  d.app.buckets.loginIp.burst = 100;
+  const fresh = '203.0.113.77';
+  for (const u of ['ROOT', 'ROOT', 'Root']) problem(await d.request('POST', '/auth/login', { body: { user: u, password: 'x' }, headers: { 'X-Forwarded-For': fresh } }), 401, 'invalid-credentials');
+  problem(await from(fresh, 'correct horse battery'), 429, 'rate-limited');
+  problem(await d.request('POST', '/auth/login', { body: { user: 'someone', password: 'x' }, headers: { 'X-Forwarded-For': fresh } }), 401, 'invalid-credentials');
+  d.app.buckets.loginIp.burst = 3;
+  // the bucket refills: after a minute the owner gets in from the address that was emptied as well
+  clock.t += 61 * 1000;
+  assert.equal((await from('198.51.100.7', 'correct horse battery')).status, 200);
+}));
+
 test('requests without credentials, with bad ones, with both', withDeploy({ settings: { 'rate-login': 5 } }, async (d) => {
   await cast(d);
   const s = await d.login('root', 'correct horse battery');
