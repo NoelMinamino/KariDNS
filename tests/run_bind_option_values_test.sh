@@ -71,7 +71,7 @@ expect_absent() {
 
 printf '$TTL 300\n$ORIGIN ex.test.\n@ IN SOA ns1 hostmaster 1 3600 600 86400 60\n@ IN NS ns1\nns1 IN A 192.0.2.1\nwww IN A 192.0.2.80\n' > "$W/ex.test.zone"
 cat > "$W/e.conf" <<EOF
-options { directory "$W"; tcp-idle-timeout 10000; };
+options { not-ready-answer servfail; directory "$W"; tcp-idle-timeout 10000; };
 zone "ex.test" { type master; file "$W/ex.test.zone"; };
 EOF
 expect_check "tcp-idle-timeout 10000 is an error that names the suffix" 1 "$W/e.conf" "\[ERROR\] .*e\.conf:1: options tcp-idle-timeout: 10000 is more than the maximum of 1200 .*write 10000ms"
@@ -123,7 +123,7 @@ EOF
 mkconf() { # mkconf FILE OPTIONS [ZONE_STATEMENTS]
     _zs=${3:-}
     cat > "$1" <<EOF
-options { directory "$W"; $2 };
+options { not-ready-answer servfail; directory "$W"; $2 };
 zone "ck.test" { type master; file "$W/chk.zone"; $_zs };
 EOF
 }
@@ -146,7 +146,7 @@ mkconf "$W/c3.conf" "check-mx-cname fail; check-names primary fail;" "check-name
 expect_zones "the zone's values beat options" 0 "$W/c3.conf" "\[WARNING\] MX record 'ck\.test\.' points to CNAME target"
 expect_absent "zone check-names ignore" "not a valid host name"
 cat > "$W/c4.conf" <<EOF
-options { directory "$W"; check-names primary fail; };
+options { not-ready-answer servfail; directory "$W"; check-names primary fail; };
 view v { match-clients { any; }; check-names primary ignore;
   zone "ck.test" { type master; file "$W/chk.zone"; }; };
 EOF
@@ -154,11 +154,11 @@ expect_zones "a view's check-names replaces options'" 1 "$W/c4.conf" "points to 
 expect_absent "view check-names ignore" "not a valid host name"
 printf '$TTL 300\n$ORIGIN ig.test.\n@ IN SOA ns1 hostmaster 1 3600 600 86400 60\n@ IN NS ns1.ig.test.\n@ IN MX 10 mail.ig.test.\n@ IN MX 20 mail2\n' > "$W/ig.zone"
 cat > "$W/c5.conf" <<EOF
-options { directory "$W"; };
+options { not-ready-answer servfail; directory "$W"; };
 zone "ig.test" { type master; file "$W/ig.zone"; };
 EOF
 expect_zones "an NS with no glue is an error by default" 1 "$W/c5.conf" "In-bailiwick NS target 'ns1\.ig\.test\.' lacks A/AAAA glue"
-sed 's/options { directory "\(.*\)"; };/options { directory "\1"; check-integrity no; };/' "$W/c5.conf" > "$W/c6.conf"
+sed 's/options { not-ready-answer servfail; directory "\(.*\)"; };/options { not-ready-answer servfail; directory "\1"; check-integrity no; };/' "$W/c5.conf" > "$W/c6.conf"
 expect_zones "check-integrity no: the missing glue and MX addresses are not looked for" 0 "$W/c6.conf" "\[OK\] Zone .* is valid\."
 mkconf "$W/c7.conf" "check-sibling no; check-svcb no; check-spf ignore;"
 expect_check "check-sibling, check-svcb and check-spf: read, with a note that they have no effect" 0 "$W/c7.conf" \
@@ -190,7 +190,7 @@ d() { # d PORT args...: dag against the server
 
 # server 1: CHAOS texts, the zone limits and serial-update-method, dynamic update with a key
 cat > "$W/s1.conf" <<EOF
-options { port $P1; pid-file "none"; bind-address { 127.0.0.1; }; $USER_OPT
+options { not-ready-answer servfail; port $P1; pid-file "none"; bind-address { 127.0.0.1; }; $USER_OPT
   version "9.99-test"; hostname "ns1.example.test"; server-id "node-7";
   max-zone-ttl 200; max-records 8; serial-update-method unixtime; };
 key "upd" { algorithm hmac-sha256; secret "$KEYSECRET"; };
@@ -231,7 +231,7 @@ grep -q "exceeds max-records\|more than max-records" "$W/s1.log" && pass "the re
 
 # server 2: minimal-responses no-auth, then a server with no-auth-recursive and one with none
 cat > "$W/s2.conf" <<EOF
-options { port $P2; pid-file "none"; bind-address { 127.0.0.1; }; $USER_OPT minimal-responses no-auth; };
+options { not-ready-answer servfail; port $P2; pid-file "none"; bind-address { 127.0.0.1; }; $USER_OPT minimal-responses no-auth; };
 zone "ex.test" { type master; file "$W/s.zone"; };
 EOF
 start s2
@@ -252,7 +252,7 @@ kari_kill_tree $PIDS; PIDS=""
 
 # server 4: version none, hostname none, server-id not written; a zone that breaks max-records is not loaded
 cat > "$W/s4.conf" <<EOF
-options { port $P4; pid-file "none"; bind-address { 127.0.0.1; }; $USER_OPT version none; hostname none; };
+options { not-ready-answer servfail; port $P4; pid-file "none"; bind-address { 127.0.0.1; }; $USER_OPT version none; hostname none; };
 zone "ex.test" { type master; file "$W/s.zone"; };
 zone "big.test" { type master; file "$W/many.zone"; max-records 5; };
 EOF
@@ -272,7 +272,7 @@ kari_kill_tree $PIDS; PIDS=""
 # server 5: require-server-cookie, update-policy, the BIND dnstap grammar, catalog-zones, buffer aliases (all read without a warning)
 P5=$(kari_port 5 15905)
 cat > "$W/s5.conf" <<EOF
-options { port $P5; pid-file "none"; bind-address { 127.0.0.1; }; $USER_OPT require-server-cookie yes;
+options { not-ready-answer servfail; port $P5; pid-file "none"; bind-address { 127.0.0.1; }; $USER_OPT require-server-cookie yes;
   udp-receive-buffer 262144; udp-send-buffer 262144; tcp-receive-buffer 65536; tcp-send-buffer 65536; max-udp-size 1400;
   dnstap { auth; }; dnstap-output unix "$W/dnstap.sock"; dnstap-identity "optval"; fstrm-set-buffer-hint 8192;
   catalog-zones { zone "ex.test" in-memory yes; }; };
@@ -301,7 +301,7 @@ kari_kill_tree $PIDS; PIDS=""
 P6=$(kari_port 6 15906)
 P7=$(kari_port 7 15907)
 cat > "$W/s6.conf" <<EOF
-options { port $P6; pid-file "none"; bind-address { 127.0.0.1; }; $USER_OPT };
+options { not-ready-answer servfail; port $P6; pid-file "none"; bind-address { 127.0.0.1; }; $USER_OPT };
 zone "ex.test" { type master; file "$W/s.zone"; allow-transfer { 127.0.0.1; }; };
 EOF
 start s6
@@ -309,7 +309,7 @@ if ! wait_up $P6; then fail "server 6 did not start"; tail -20 "$W/s6.log"; else
     # the zone has 6 records and 3 types at the apex (SOA, NS, MX)
     for lim in "max-records 5;" "max-types-per-name 2;" "max-records 6; max-records-per-type 1; max-types-per-name 3;"; do
         cat > "$W/s7.conf" <<EOF
-options { port $P7; pid-file "none"; bind-address { 127.0.0.1; }; $USER_OPT };
+options { not-ready-answer servfail; port $P7; pid-file "none"; bind-address { 127.0.0.1; }; $USER_OPT };
 zone "ex.test" { type secondary; primaries { 127.0.0.1 port $P6; }; $lim };
 EOF
         # the log of the case before holds its "not installed" line, and the shell that starts the server truncates the log only when it

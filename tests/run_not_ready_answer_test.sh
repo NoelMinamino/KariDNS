@@ -15,6 +15,9 @@ for b in "$KARIDNS" ./karictl ./dag; do
     [ -x "$b" ] || { echo "SKIP: $b is not built"; exit 0; }
 done
 T=$(mktemp -d "${TMPDIR:-/tmp}/karidns_nra.XXXXXX") || exit 1
+chmod 755 "$T"
+RUNAS=""
+[ "$(id -u)" = 0 ] && RUNAS='user "nobody";'          # (as root the server must drop its privileges: the directory and the zone file are readable by nobody)
 SRV=""
 cleanup() {
     set +e
@@ -38,7 +41,7 @@ EOF
 conf() {   # conf "not-ready-answer statement or nothing"
     cat > "$T/k.conf" <<EOF
 options {
-    pid-file "none"; directory "$T"; listen-on { 127.0.0.1; }; port $P; notify no; zone-store none; allow-transfer { 127.0.0.1; }; send-extended-errors yes;
+    $RUNAS pid-file "none"; directory "$T"; listen-on { 127.0.0.1; }; port $P; notify no; zone-store none; allow-transfer { 127.0.0.1; }; send-extended-errors yes;
     $1
 };
 control-channel { socket "$T/ctl.sock"; secret "$SECRET"; };

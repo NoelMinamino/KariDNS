@@ -80,7 +80,7 @@ cat > "$T/nc.data" <<'EOF'
 a.nc.test A 60 192.0.2.60
 EOF
 cat > "$T/k.conf" <<EOF
-options { pid-file "none"; bind-address { 127.0.0.1; }; port $P_K; $USER_OPT };
+options { not-ready-answer servfail; pid-file "none"; bind-address { 127.0.0.1; }; port $P_K; $USER_OPT };
 zone "fw.test." { type forward; forwarders { 127.0.0.1 port $P_CK; }; forward-timeout 3000; };
 zone "nc.test." { type forward; forwarders { 127.0.0.1 port $P_NC; }; forward-timeout 3000; };
 zone "sec.test." { type secondary; primaries { 127.0.0.1 port $P_DEAD; }; };
@@ -88,7 +88,7 @@ EOF
 # the second server: require-server-cookie, the same forwarder, and a primary zone to compare with
 printf '$ORIGIN au.test.\n$TTL 300\n@ SOA ns hostmaster 1 3600 600 86400 300\n@ NS ns\nns A 192.0.2.1\nwww A 192.0.2.2\n' > "$T/au.test.zone"
 cat > "$T/k2.conf" <<EOF
-options { pid-file "none"; bind-address { 127.0.0.1; }; port $P_K2; require-server-cookie yes; $USER_OPT };
+options { not-ready-answer servfail; pid-file "none"; bind-address { 127.0.0.1; }; port $P_K2; require-server-cookie yes; $USER_OPT };
 zone "fw.test." { type forward; forwarders { 127.0.0.1 port $P_CK; }; forward-timeout 3000; };
 zone "au.test." { type primary; file "$T/au.test.zone"; };
 EOF

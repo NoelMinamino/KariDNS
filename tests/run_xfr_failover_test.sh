@@ -80,7 +80,7 @@ zone() { # zone FILE ORIGIN SERIAL [REFRESH RETRY EXPIRE]
 }
 primary() { # primary NAME PORT [OPTIONS] : $W/NAME.conf serving the zones listed in ZONES ("origin:file"), allow-transfer 127.0.0.1
     {
-        echo "options { port $2; bind-address { 127.0.0.1; }; pid-file \"none\"; $USER_OPT notify no; ${3:-} };"
+        echo "options { not-ready-answer servfail; port $2; bind-address { 127.0.0.1; }; pid-file \"none\"; $USER_OPT notify no; ${3:-} };"
         echo "control-channel { socket \"$W/$1.sock\"; algorithm hmac-sha256; secret \"$SECRET\"; };"
         for zf in $ZONES; do
             echo "zone \"${zf%%:*}\" { type master; file \"${zf#*:}\"; allow-transfer { 127.0.0.1; }; };"
@@ -103,7 +103,7 @@ primary p2 "$P2"
 start p2
 kari_wait_answer "$DAG" "$P2" f.test. || true
 cat > "$W/sa.conf" <<EOF
-options { port $SA; bind-address { 127.0.0.1; }; pid-file "none"; $USER_OPT min-refresh-time 1; min-retry-time 1; };
+options { not-ready-answer servfail; port $SA; bind-address { 127.0.0.1; }; pid-file "none"; $USER_OPT min-refresh-time 1; min-retry-time 1; };
 control-channel { socket "$W/sa.sock"; algorithm hmac-sha256; secret "$SECRET"; };
 zone "f.test" { type slave; primaries { 127.0.0.1 port $P1; 127.0.0.1 port $P2; }; };
 EOF
@@ -129,7 +129,7 @@ else pass "F2b: the primary that is behind is not logged as a failed transfer"; 
 [ "$(serial_of "$SA" f.test)" = "5" ] && pass "F3: the zone stays at serial 5 (the older primary is not followed)" || fail "F3: the serial of the secondary is $(serial_of "$SA" f.test)"
 
 cat > "$W/sb.conf" <<EOF
-options { port $SB; bind-address { 127.0.0.1; }; pid-file "none"; $USER_OPT min-refresh-time 1; min-retry-time 1; multi-master yes; };
+options { not-ready-answer servfail; port $SB; bind-address { 127.0.0.1; }; pid-file "none"; $USER_OPT min-refresh-time 1; min-retry-time 1; multi-master yes; };
 control-channel { socket "$W/sb.sock"; algorithm hmac-sha256; secret "$SECRET"; };
 zone "f.test" { type slave; primaries { 127.0.0.1 port $P1; 127.0.0.1 port $P2; }; };
 EOF
@@ -148,7 +148,7 @@ else fail "F6: after the first primary reached serial 7 the secondaries are at $
 
 # ------------------------------------------------------------------------------------------------ C: timers
 cat > "$W/sc.conf" <<EOF
-options { port $SC; bind-address { 127.0.0.1; }; pid-file "none"; $USER_OPT
+options { not-ready-answer servfail; port $SC; bind-address { 127.0.0.1; }; pid-file "none"; $USER_OPT
   min-refresh-time 4; max-refresh-time 6; min-retry-time 3; max-retry-time 5; };
 control-channel { socket "$W/sc.sock"; algorithm hmac-sha256; secret "$SECRET"; };
 zone "t1.test" { type slave; primaries { 127.0.0.1 port $P2; }; };
@@ -165,7 +165,7 @@ case "$st" in *"refresh=4 retry=3 expire=7"*) pass "C2: SOA refresh 1 / retry 1 
 zone "$W/r.zone" r.test 5
 zone "$W/pn.zone" pn.test 5
 {
-    echo "options { port $P3; bind-address { 127.0.0.1; }; pid-file \"none\"; $USER_OPT notify no; };"
+    echo "options { not-ready-answer servfail; port $P3; bind-address { 127.0.0.1; }; pid-file \"none\"; $USER_OPT notify no; };"
     echo "control-channel { socket \"$W/p3.sock\"; algorithm hmac-sha256; secret \"$SECRET\"; };"
     echo "zone \"r.test\" { type master; file \"$W/r.zone\"; allow-transfer { 127.0.0.1; }; };"
     echo "zone \"pn.test\" { type master; file \"$W/pn.zone\"; allow-transfer { 127.0.0.1; }; provide-ixfr no; };"
@@ -186,7 +186,7 @@ tco=$("$DAG" @127.0.0.1 -p "$P3" pn.test IXFR=4 +notcp +nohexdump 2>&1 | grep -c
 if [ "$tcn" -eq 0 ] && [ "$tcp" -eq 0 ] && [ "$tco" -ge 1 ]; then pass "I1b: over UDP a client that is up to date gets the SOA also with provide-ixfr no (no TC); one that is behind is sent to TCP (TC, dag retries in TCP)"
 else fail "I1b: UDP IXFR: TC retries default/current $tcn, provide-ixfr no/current $tcp (expected 0 and 0), provide-ixfr no/older $tco (expected >= 1)"; fi
 cat > "$W/sr.conf" <<EOF
-options { port $SR; bind-address { 127.0.0.1; }; pid-file "none"; $USER_OPT min-refresh-time 1; min-retry-time 1; request-ixfr no; };
+options { not-ready-answer servfail; port $SR; bind-address { 127.0.0.1; }; pid-file "none"; $USER_OPT min-refresh-time 1; min-retry-time 1; request-ixfr no; };
 control-channel { socket "$W/sr.sock"; algorithm hmac-sha256; secret "$SECRET"; };
 zone "r.test" { type slave; primaries { 127.0.0.1 port $P3; }; };
 EOF
@@ -206,7 +206,7 @@ $M xfr-primary --port "$MEA" --zone ea.test --mode ok --serial 10 --log "$W/mea.
 $M xfr-primary --port "$MEB" --zone eb.test --mode ok --serial 10 --log "$W/meb.log" & PIDS="$PIDS $!"
 sleep 1
 cat > "$W/se.conf" <<EOF
-options { port $SE; bind-address { 127.0.0.1; }; pid-file "none"; $USER_OPT };
+options { not-ready-answer servfail; port $SE; bind-address { 127.0.0.1; }; pid-file "none"; $USER_OPT };
 zone "ea.test" { type slave; primaries { 127.0.0.1 port $MEA; }; request-expire no; };
 zone "eb.test" { type slave; primaries { 127.0.0.1 port $MEB; }; };
 EOF
@@ -223,7 +223,7 @@ $M xfr-primary --port "$MG4" --zone g2.test --mode stall --log "$W/mg4.log" & PI
 $M xfr-primary --port "$MH" --zone h.test --mode drip --log "$W/mh.log" & PIDS="$PIDS $!"
 sleep 1
 cat > "$W/sg.conf" <<EOF
-options { port $SG; bind-address { 127.0.0.1; }; pid-file "none"; $USER_OPT max-transfer-idle-in 1; max-transfer-time-in 40320; };
+options { not-ready-answer servfail; port $SG; bind-address { 127.0.0.1; }; pid-file "none"; $USER_OPT max-transfer-idle-in 1; max-transfer-time-in 40320; };
 zone "g1.test" { type slave; primaries { 127.0.0.1 port $MG1; }; };
 zone "h.test" { type slave; primaries { 127.0.0.1 port $MH; }; max-transfer-idle-in 40320; max-transfer-time-in 2; };
 EOF
@@ -236,7 +236,7 @@ else fail "S2: the endless transfer of h.test was not given up"; fi
 [ -z "$(dag_soa "$SG" g1.test)" ] && [ -z "$(dag_soa "$SG" h.test)" ] && pass "S3: nothing of a given-up transfer is served" || fail "S3: a zone of a given-up transfer is served"
 
 cat > "$W/sq.conf" <<EOF
-options { port $SQ; bind-address { 127.0.0.1; }; pid-file "none"; $USER_OPT transfers-in 1; max-transfer-idle-in 1; };
+options { not-ready-answer servfail; port $SQ; bind-address { 127.0.0.1; }; pid-file "none"; $USER_OPT transfers-in 1; max-transfer-idle-in 1; };
 zone "g1.test" { type slave; primaries { 127.0.0.1 port $MG3; }; };
 zone "g2.test" { type slave; primaries { 127.0.0.1 port $MG4; }; };
 EOF
@@ -295,7 +295,7 @@ primary pz "$PZ"
 start pz
 kari_wait_answer "$DAG" "$PZ" z0.test. || true
 cat > "$W/sz.conf" <<EOF
-options { port $SZ; bind-address { 127.0.0.1; }; pid-file "none"; $USER_OPT min-refresh-time 1; min-retry-time 1; };
+options { not-ready-answer servfail; port $SZ; bind-address { 127.0.0.1; }; pid-file "none"; $USER_OPT min-refresh-time 1; min-retry-time 1; };
 control-channel { socket "$W/sz.sock"; algorithm hmac-sha256; secret "$SECRET"; };
 zone "z0.test" { type slave; primaries { 127.0.0.1 port $PZ; }; };
 EOF
@@ -324,7 +324,7 @@ for i in 1 2 3 4 5; do zone "$W/q$i.zone" "q$i.test" 1; ZONES="$ZONES q$i.test:$
 primary pq "$PQ"
 start pq
 {
-    echo "options { port $SX; bind-address { 127.0.0.1; }; pid-file \"none\"; $USER_OPT min-refresh-time 1; min-retry-time 1; serial-query-rate 1; };"
+    echo "options { not-ready-answer servfail; port $SX; bind-address { 127.0.0.1; }; pid-file \"none\"; $USER_OPT min-refresh-time 1; min-retry-time 1; serial-query-rate 1; };"
     for i in 1 2 3 4 5; do echo "zone \"q$i.test\" { type slave; primaries { 127.0.0.1 port $PQ; }; };"; done
 } > "$W/sx.conf"
 kari_wait_answer "$DAG" "$PQ" q1.test. || true
