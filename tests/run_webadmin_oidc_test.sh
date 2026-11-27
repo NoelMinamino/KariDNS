@@ -73,8 +73,8 @@ wait_started() {
 }
 stop_server() {
     kill -TERM "$SRV" 2>/dev/null
-    i=0; while [ $i -lt 100 ] && kill -0 "$SRV" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
-    if kill -0 "$SRV" 2>/dev/null; then bad "the server did not stop after SIGTERM"; kill -KILL "$SRV" 2>/dev/null; else ok "the server stops on SIGTERM"; fi
+    i=0; while [ $i -lt 100 ] && kari_alive "$SRV"; do sleep 0.1; i=$((i + 1)); done
+    if kari_alive "$SRV"; then bad "the server did not stop after SIGTERM"; kill -KILL "$SRV" 2>/dev/null; else ok "the server stops on SIGTERM"; fi
     SRV=""
 }
 # checks_after LOG: what must hold for the log of every service of this test

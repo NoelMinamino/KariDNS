@@ -360,14 +360,15 @@ EOF
         ./dag @127.0.0.1 -p "$PORT" signed.test DNSKEY +dnssec +noall +answer +nohexdump 2>&1 | grep -q DNSKEY && ok "the DNSKEY RRset is served" || bad "no DNSKEY in the answer"
     fi
     kill -TERM "$SG" 2>/dev/null
-    i=0; while [ $i -lt 100 ] && kill -0 "$SG" 2>/dev/null; do sleep 0.2; i=$((i + 1)); done
-    if kill -0 "$SG" 2>/dev/null; then bad "the signer did not stop after SIGTERM"; kill -KILL "$SG" 2>/dev/null; else wait "$SG" 2>/dev/null; [ $? = 0 ] && ok "the signer stops on SIGTERM with status 0" || bad "the signer stopped with a status"; fi
+    i=0; while [ $i -lt 100 ] && kari_alive "$SG"; do sleep 0.2; i=$((i + 1)); done
+    if kari_alive "$SG"; then bad "the signer did not stop after SIGTERM"; kill -KILL "$SG" 2>/dev/null; else wait "$SG" 2>/dev/null; [ $? = 0 ] && ok "the signer stops on SIGTERM with status 0" || bad "the signer stopped with a status"; fi
     SG=""
     grep -q "unexpected error\|Unhandled\|TypeError" "$P/signer.log" && bad "the signer logged an unexpected error" "$(grep 'unexpected error\|Unhandled\|TypeError' "$P/signer.log" | head -3)" || ok "no unexpected error in the signer's log"
 }
 
 logs_clean() {
-    [ -n "$WEB" ] && { kill -TERM "$WEB" 2>/dev/null; i=0; while [ $i -lt 100 ] && kill -0 "$WEB" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done; kill -0 "$WEB" 2>/dev/null && { bad "the API did not stop after SIGTERM" "$(kari_log_tail "$P/server.log")"; kill -KILL "$WEB" 2>/dev/null; } || ok "the API stops on SIGTERM"; WEB=""; }
+    [ -n "$WEB" ] && { kill -TERM "$WEB" 2>/dev/null; i=0; while [ $i -lt 100 ] && kari_alive "$WEB"; do sleep 0.1; i=$((i + 1)); done; kari_alive "$WEB" && { bad "the API did not stop after SIGTERM" "$(kari_log_tail "$P/server.log")
+$(kari_proc_line "$WEB")"; kill -KILL "$WEB" 2>/dev/null; } || ok "the API stops on SIGTERM"; WEB=""; }
     grep -q "(a bug)" "$P/server.log" && bad "row level security refused what the API had allowed" "$(grep '(a bug)' "$P/server.log" | head -3)" || ok "the API never logged a disagreement with the database"
     grep -Eq '^[^ ]+ error ' "$P/server.log" && bad "the API logged an error" "$(grep ' error ' "$P/server.log" | head -3)" || ok "the API logged no error"
     [ -f "$P/karidns.log" ] && { grep -q "ERROR\|assertion\|Assertion" "$P/karidns.log" && bad "karidns logged an error" "$(grep 'ERROR\|ssertion' "$P/karidns.log" | head -3)" || ok "karidns logged no error"; }

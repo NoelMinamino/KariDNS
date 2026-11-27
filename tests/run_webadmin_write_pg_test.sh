@@ -223,8 +223,9 @@ same "karidns_auth.sweep_expired() as the API role deletes the expired sessions 
 
 echo "-- afterwards"
 kill -TERM "$WEB" 2>/dev/null
-i=0; while [ $i -lt 100 ] && kill -0 "$WEB" 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
-if kill -0 "$WEB" 2>/dev/null; then bad "the API did not stop after SIGTERM" "$(kari_log_tail "$T/server.log")"; kill -KILL "$WEB" 2>/dev/null; else ok "the API stops on SIGTERM"; fi
+i=0; while [ $i -lt 100 ] && kari_alive "$WEB"; do sleep 0.1; i=$((i + 1)); done
+if kari_alive "$WEB"; then bad "the API did not stop after SIGTERM" "$(kari_log_tail "$T/server.log")
+$(kari_proc_line "$WEB")"; kill -KILL "$WEB" 2>/dev/null; else ok "the API stops on SIGTERM"; fi
 WEB=""
 grep -q "(a bug)" "$T/server.log" && bad "row level security refused what the API had allowed" "$(grep '(a bug)' "$T/server.log" | head -3)" || ok "row level security never disagreed with the API"
 grep -Eq '^[^ ]+ error ' "$T/server.log" && bad "the API logged an error" "$(grep ' error ' "$T/server.log" | head -3)" || ok "the API logged no error"

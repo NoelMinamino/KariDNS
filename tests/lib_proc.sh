@@ -18,6 +18,21 @@ export KARIDNS_NOSYSLOG
 KARIDNS_NO_DEFAULT_STORE=${KARIDNS_NO_DEFAULT_STORE:-1}
 export KARIDNS_NO_DEFAULT_STORE
 
+# kari_alive PID : the process runs (it exists and is no zombie).  kill -0 succeeds on a zombie too: a program started through su (tests/db/pg_lib.sh
+# as_pg) that has exited stays one until su reaps it, and su, asleep in wait() since the start of the test, may be swapped out on a loaded FreeBSD 14
+# host (CI flake row 8: "the API did not stop after SIGTERM" with "stopped" in its log; the routers' loop of dns_server_core.c says why), so the
+# reap can take seconds.  kari_proc_line PID : the process and its parent (pid, ppid, state, wait channel, command), for the message of a check.
+kari_alive() {
+    _ka_st=$(ps -o stat= -p "$1" 2>/dev/null | tr -d ' ')
+    [ -n "$_ka_st" ] || return 1
+    case $_ka_st in Z*) return 1 ;; esac
+    return 0
+}
+kari_proc_line() {
+    _kpl_pp=$(ps -o ppid= -p "$1" 2>/dev/null | tr -d ' ')
+    ps -o pid,ppid,stat,wchan,command -p "$1${_kpl_pp:+,$_kpl_pp}" 2>&1 | cut -c1-200
+}
+
 # kari_wait_no_proc PATTERN SECONDS : wait until no process command line matches PATTERN (pgrep -f), at most SECONDS.  A server that was stopped
 # leaves its loader / children for a moment: one look after a fixed sleep reports them as left over on a busy host.
 kari_wait_no_proc() {
