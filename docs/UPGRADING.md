@@ -24,7 +24,7 @@ is the order of work. The manuals have the detail: [karidns(8)](karidns.md), [ka
    karicheck --json conf /usr/local/etc/karidns/karidns.conf     # one document, a code for every message
    ```
 
-   0.7 refuses to start on values that 0.6 accepted with a warning (#248, #234, #211, #220):
+   0.7 refuses to start on values that 0.6 accepted (#248, #234, #211, #220, #287):
 
    | Statement | What 0.7 refuses |
    |---|---|
@@ -32,6 +32,7 @@ is the order of work. The manuals have the detail: [karidns(8)](karidns.md), [ka
    | `alias-max-refresh-time` | below 5 seconds or above 1 day (`conf.alias-max-refresh-time`) |
    | `store-max-zones` | below 1024 or above 2^31 |
    | `router-threads`, `worker-threads` | outside 1..8 and 1..128 |
+   | `program-timeout`, `forward-timeout` | 0 (it meant the default, 2000) or above 30000 ms (#287) |
 
    Fix what `karicheck conf` reports with its file and line before you install the new server.
 3. **Check every zone file** with the new `karicheck` (0.7 is stricter, #247, #180). A file that loaded under 0.6
@@ -68,6 +69,11 @@ is the order of work. The manuals have the detail: [karidns(8)](karidns.md), [ka
      store (the default directory);
    - `sslmode` `allow` / `prefer` in a PostgreSQL `conninfo` to a host that is not local is refused by the WebAdmin and
      the signer (node-pg would send plain text): use `require` or better (`disable` stays a warning).
+   - `karidns-signer.conf` and `karidns-webadmin.conf` must be regular files (not symbolic links) owned by root or the
+     service user, with no write bit for group or others, and the signer's SQLite3 `sqlite-file` must not be readable
+     by others (#253; 0.6 only warned about the SQLite3 file): `chown root <file>; chmod go-w <file>`, and
+     `chmod o-rwx <sqlite-file>`. `service karidns_signer configtest` and `service karidns_webadmin configtest` name
+     the file and the fix ([distribution.md](distribution.md)).
    - every `karictl.conf` that holds a `secret` must be private to its owner (#257): `karictl` refuses one that group
      or others can read or write (exit status 2, the message names the file and the fix). Check them before the
      upgrade, including the ones of the signer and the WebAdmin (`karictl-config`) and any `karidns.conf` you pass
@@ -261,17 +267,14 @@ WARNING after it means the default keeps only part of the zones in memory; set `
 
 - **Server and tools**: `pkg add` the 0.6.x packages (with `-f` to replace). `karictl` and `karidns` must be of the
   same release.
-- **Configuration**: a 0.7 configuration that uses `store-*`, `zone-store`, `router-threads`, `worker-threads`,
-  `udp-receive`, `secondary-stale-max`, `alias-max-refresh-time` or `memory-limit unlimited` is not understood by 0.6: remove those lines first
-  (0.6 does not know them).
+- **Configuration**: a 0.7 configuration that uses `store-*` (`store-align` and `store-table-memory` included),
+  `zone-store`, `router-threads`, `worker-threads`, `udp-receive`, `secondary-stale-max`, `alias-max-refresh-time`,
+  `answer-rrsig-queries`, `minimal-any hinfo` / `minimal-any rrset` (0.6 takes only `yes` / `no`) or
+  `memory-limit unlimited` is not understood by 0.6: remove those lines first (0.6 refuses to start on them). 0.6
+  answers ANY and RRSIG queries as before 0.7 (`minimal-any` defaults to `no` there).
 - **The store**: 0.6 reads no store. Stop the server cleanly first (the manual says to downgrade only after a clean stop, #199), then the directory can be removed; database zones are read from the database as in 0.6.
   Secondary zones start as in 0.6 (zone file or nothing, then a transfer) and lose their stored copies and expire
   clocks (docs/karidns.md "Upgrade and downgrade").
 - **Database**: the SQL files only add objects (`auth.preferences`, `group_tokens()`, grants) that 0.6 ignores; a
   schema rollback is not needed. Restore from the backup of step 1 if you changed data.
 - **WebAdmin**: rotate-key writes `totp.key.old`; to go back keep the key file that matches the database.
-
-## Pending items
-
-- Open pull request #253 (signer / WebAdmin review group A: key order, re-sign floor, file checks, atomic failure
-  record, column allowlist) is not in main; add its notes if it merges before the release.

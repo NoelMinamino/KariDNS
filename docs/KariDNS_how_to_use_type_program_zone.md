@@ -1,12 +1,15 @@
 # KariDNS: Complete Guide to 'type program' Zones (Plugin Zone Architecture & Implementation)
 
-The `type program` zone feature in KariDNS delegates authoritative DNS queries for specific zones to an external program or script over standard input and output pipes. This mechanism allows developers and administrators to **generate dynamic, context-aware DNS wire-format responses** with minimal overhead.
+> [!WARNING]
+> **TEST-ONLY FEATURE in 0.7.** Program zones are for testing and anomaly fuzzing, not for production. The plugin is started by the manager process, outside the Capsicum sandbox, and only drops privileges to `program-user`: it is not confined, and it can do whatever that user can. `allow-program-zones yes;` must be set to use them (see [karidns(8)](karidns.md), "PROGRAM ZONE PLUGINS (TEST-ONLY FEATURE)"). A confined ("guarded") mode is planned for 0.8.
 
-Typical use cases include:
-- Real-time database-driven name resolution (MySQL, PostgreSQL, Redis).
-- GeoDNS and client-IP-based traffic steering.
-- Dynamic load balancing and health-check failover.
-- Generating crafted malformed packets, protocol edge-case testing, and mock servers.
+The `type program` zone feature in KariDNS delegates authoritative DNS queries for specific zones to an external program or script over standard input and output pipes. This mechanism lets developers **generate dynamic, context-aware DNS wire-format responses** with minimal overhead, in a test setup.
+
+What it lets you try out in testing:
+- Generating crafted malformed packets, protocol edge-case testing, and mock servers (the intended use).
+- Prototypes of database-driven name resolution (MySQL, PostgreSQL, Redis).
+- Prototypes of GeoDNS and client-IP-based traffic steering.
+- Prototypes of load balancing and health-check failover.
 
 ---
 
@@ -181,7 +184,7 @@ zone "dynamic.example.com." {
     # OS user under which the plugin process runs (optional; defaults to options.user)
     program-user "nobody";
 
-    # Plugin response timeout in milliseconds (default: 2000)
+    # Plugin response timeout in milliseconds, 1..30000 (default: 2000; 0 or above 30000 is a configuration error)
     program-timeout 1500;
 
     # Maximum consecutive communication failures before isolation (default: 5)
@@ -428,7 +431,7 @@ int main(void) {
 
 ### Rust Implementation
 
-Combining memory safety with zero-cost abstractions for production-grade throughput.
+Combining memory safety with zero-cost abstractions, for a plugin that keeps up with high query rates in load tests.
 
 ```rust
 use std::io::{self, BufRead, Read, Write};

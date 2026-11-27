@@ -38,19 +38,20 @@ In a tinydns data file (`file-format tinydns;`), location prefixes are defined w
 
 ```text
 # Syntax: %<2-char-code>:<ipv4-prefix>
+# lo: this host; in: the internal (private) client network; ex: an external partner network
 %lo:127.0.0.1/32
 %in:192.168.
-%ex:172.16.
+%ex:203.0.113.
 %df:
 
 # Syntax: +<fqdn>:<ip>:<ttl>:<timestamp>:<location>
 +srv.example.com:10.10.1.1:300::lo
 +srv.example.com:192.168.1.10:300::in
-+srv.example.com:172.16.1.10:300::ex
-+srv.example.com:10.10.0.1:300
++srv.example.com:198.51.100.10:300::ex
++srv.example.com:192.0.2.10:300
 
 # Records without location tag match ALL clients:
-+def.example.com:10.99.99.1:300
++def.example.com:192.0.2.99:300
 ```
 
 #### Syntax Rules:
@@ -263,8 +264,9 @@ Test client source-IP steering:
 # Query matching $LOCATION local (127.0.0.1):
 dag loc-test.example.com A @127.0.0.1 -p 53 +short
 
-# Query matching tinydns %in (using local source binding -b):
-dag www.example.com A @127.0.0.1 -p 53 -b 192.168.1.100 +short
+# Query matching tinydns %in (using local source binding -b; 192.168.1.100 must be an address of this host):
+# srv.example.com returns 192.168.1.10 and the unrestricted 192.0.2.10
+dag srv.example.com A @127.0.0.1 -p 53 -b 192.168.1.100 +short
 ```
 
 Test EDNS Client Subnet steering:

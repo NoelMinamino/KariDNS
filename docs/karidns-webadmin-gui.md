@@ -10,7 +10,7 @@ The web interface is a page in your browser that talks to the API of [`karidns-w
 
 - **Languages.** English and Japanese. The page follows the language of your browser; change it under *Your account*, *Language*. Names, record data and codes are never translated.
 - **Colours.** A light and a dark scheme. The page follows the scheme of your system; under *Your account*, *Appearance* you can choose light or dark instead. The choice is kept in this browser only (like the language), not by the service.
-- **Browsers.** Firefox ESR, Chrome and Edge (the current and the previous version), Safari 17 or newer. Nothing needs to be installed. The page needs JavaScript and shows nothing without it.
+- **Browsers.** Firefox (the current release and ESR), Chrome and Edge (the current and the previous version), Safari 17 or newer. Nothing needs to be installed. The page needs JavaScript and shows nothing without it.
 - **The menu** (top of every page): Home, Zones, Templates, Servers, Administration (global masters only), Audit log (global and domain masters), Account, About. *Skip to the content* is the first thing the Tab key reaches.
 - **What you see depends on your role.** Hiding a button is only a hint; the service decides every time, and a refusal is shown in words (see MESSAGES AND WHAT TO DO).
 

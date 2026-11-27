@@ -1,6 +1,6 @@
 # KariDNS Test Suite Matrix & RFC Traceability Document
 
-This document provides a comprehensive traceability matrix mapping every test in the KariDNS test suite (287 test targets registered in `tests/run_all_suite.sh` — C unit test binaries, integration shell scripts, sanitizer tests and fuzzing harnesses — plus the targets listed in §3.13) to its corresponding **IETF RFC / Technical Specification**, target **KariDNS Component**, and **Test Classification** (Positive, Negative, Boundary, Concurrency/RCU, Memory/ASan, Fuzzing).
+This document provides a comprehensive traceability matrix mapping every test in the KariDNS test suite (the test targets registered in `tests/run_all_suite.sh` — C unit test binaries, integration shell scripts, sanitizer tests and fuzzing harnesses; `sh tests/run_all_suite.sh --list` lists them with their categories and prints their number — plus the targets listed in §3.13) to its corresponding **IETF RFC / Technical Specification**, target **KariDNS Component**, and **Test Classification** (Positive, Negative, Boundary, Concurrency/RCU, Memory/ASan, Fuzzing).
 
 It directly cross-references the implementation status documented in [`KariDNS_RFC_GUIDELINE.md`](../KariDNS_RFC_GUIDELINE.md).
 
