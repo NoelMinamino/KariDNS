@@ -9,7 +9,7 @@
 gui_browser_check() {
     FIREFOX=${FIREFOX:-$(command -v firefox 2>/dev/null || command -v firefox-esr 2>/dev/null)}
     GECKODRIVER=${GECKODRIVER:-$(command -v geckodriver 2>/dev/null)}
-    [ -n "$FIREFOX" ] && [ -x "$FIREFOX" ] || { echo "SKIP: Firefox is not installed (pkg install firefox-esr, or firefox)"; return 1; }
+    [ -n "$FIREFOX" ] && [ -x "$FIREFOX" ] || { echo "SKIP: Firefox is not installed (pkg install firefox, or firefox-esr)"; return 1; }
     [ -n "$GECKODRIVER" ] && [ -x "$GECKODRIVER" ] || { echo "SKIP: geckodriver is not installed (pkg install geckodriver)"; return 1; }
     "$FIREFOX" --version > /dev/null 2>&1 || { echo "SKIP: $FIREFOX does not run"; return 1; }
     # (Firefox crashes at the start when the system has no font at all)
