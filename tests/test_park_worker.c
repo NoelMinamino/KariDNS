@@ -698,6 +698,16 @@ int main(void) {
             CHECK(steal_thief_step(&th, 1, UDP_BATCH_SIZE) == STEAL_NOW);
             CHECK(kevent(stk, NULL, 0, &kev, 1, &zero) == 1 && kev.ident == STEAL_WAKE_IDENT);
 
+            /* nobody asleep: a full stolen batch wakes nobody (the count of sleepers is read, not the slots); going to sleep twice counts once */
+            CHECK(steal_thief_step(&th, 1, UDP_BATCH_SIZE) == STEAL_NOW && kevent(stk, NULL, 0, &kev, 1, &zero) == 0);
+            CHECK(steal_may_sleep(0) && steal_may_sleep(0));
+            CHECK(steal_thief_step(&th, 1, UDP_BATCH_SIZE) == STEAL_NOW && kevent(stk, NULL, 0, &kev, 1, &zero) == 1);
+            CHECK(steal_thief_step(&th, 1, UDP_BATCH_SIZE) == STEAL_NOW && kevent(stk, NULL, 0, &kev, 1, &zero) == 0);   /* (once: the count is 0 again) */
+            /* a worker that ended (its kqueue given up, -1) is not triggered: its kqueue may be closed and the number reused */
+            steal_register(0, -1);
+            CHECK(steal_may_sleep(0) && steal_thief_step(&th, 1, UDP_BATCH_SIZE) == STEAL_NOW && kevent(stk, NULL, 0, &kev, 1, &zero) == 0);
+            steal_register(0, stk);
+
             /* the owner's own read loop marks it: 40 queued = 16 + 16 + 8; the second full batch wakes the sleeping worker 0, the short one clears it */
             w.worker_idx = 1;
             CHECK(steal_may_sleep(0));

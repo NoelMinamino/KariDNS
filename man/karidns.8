@@ -45,24 +45,25 @@ queries of a worker that is behind (0.7 work stealing): the kernel gives each
 client flow to one worker's socket by a hash, so a few busy clients can fill one
 socket while other workers wait; a worker that read a second full batch (16
 queries) in one go is marked busy for that address until a read comes back
-short, and a worker with nothing of its own to do reads one batch at a time from
-its socket, with the receive-only descriptor it already has (nothing is handed
-over or opened), and answers through its own router on its own socket of the
-same listen address. Every socket of an address has the same local address and
-port, so the reply leaves from the address and port the query went to (RFC 1035
-section 4.2.1), and a router still sends only on the sockets of the worker whose
-pair the reply came on. A worker that sleeps is woken by the one that falls
-behind; with no worker behind the cost is a few memory accesses per wake-up, and
-with one worker it is off. The replies of one client may then leave in another
-order than its queries came (UDP DNS matches them by ID); \fBkarictl ipcstats\fR
-shows what each worker stole and lent. With \fBudp\-receive frontend\fR the
-routers read the queries on sockets of their own and dispatch them to the
-workers over the IPC, as before. One router is started when the server may run
-on up to 3 CPUs, from 4 CPUs on half of the CPUs the server may run on, at most
-8 (4 CPUs: 2 routers, 8: 4, 16 and more: 8; \fBrouter\-threads\fR sets the
-number). A router costs about as much CPU per query as a worker: with 2 routers
-and 6 workers on 8 CPUs the routers were the limit (about 90 % of a CPU each at
-550,000 queries a second) while the machine was 38 % idle.
+short, and a worker that read less than a batch (16) of its own in a turn reads
+one batch at a time from its socket, with the receive-only descriptor it already
+has (nothing is handed over or opened), and answers through its own router on
+its own socket of the same listen address. Every socket of an address has the
+same local address and port, so the reply leaves from the address and port the
+query went to (RFC 1035 section 4.2.1), and a router still sends only on the
+sockets of the worker whose pair the reply came on. A worker that sleeps is
+woken by the one that falls behind; with no worker behind the cost is a few
+memory accesses per wake-up, and with one worker it is off. The replies of one
+client may then leave in another order than its queries came (UDP DNS matches
+them by ID); \fBkarictl ipcstats\fR shows what each worker stole and lent. With
+\fBudp\-receive frontend\fR the routers read the queries on sockets of their own
+and dispatch them to the workers over the IPC, as before. One router is started
+when the server may run on up to 3 CPUs, from 4 CPUs on half of the CPUs the
+server may run on, at most 8 (4 CPUs: 2 routers, 8: 4, 16 and more: 8;
+\fBrouter\-threads\fR sets the number). A router costs about as much CPU per
+query as a worker: with 2 routers and 6 workers on 8 CPUs the routers were the
+limit (about 90 % of a CPU each at 550,000 queries a second) while the machine
+was 38 % idle.
 .IP \(bu 2
 \fBBackend Process\fR: Operates in FreeBSD Capsicum capability mode
 (\fBcap_enter(2)\fR). DNS packet parsing and response generation are performed

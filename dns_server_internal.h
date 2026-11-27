@@ -1916,7 +1916,7 @@ enum { STEAL_BLOCK = 0, STEAL_WARM = 1, STEAL_NOW = 2 };   /* steal_thief_step()
 typedef struct { int linger; } steal_thief_t;
 void steal_setup(int workers);               /* the Backend before the workers start: on with udp-receive backend and 2 or more workers */
 bool steal_on(void);
-void steal_register(int w, int kq);          /* the worker's kqueue, for the wake-up */
+void steal_register(int w, int kq);          /* the worker's kqueue, for the wake-up (-1: none, at the worker's exit) */
 int steal_owner_note(int w, int a, int full_batches, bool drained);   /* the owner after a batch of its socket a; returns the workers woken (0 or 1) */
 int steal_pick(int self, int *addr);         /* a busy worker other than self and its busy address, or -1 */
 bool steal_may_sleep(int self);              /* before a kevent() without a timeout: false = a worker is busy, do not sleep */

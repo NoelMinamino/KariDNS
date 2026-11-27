@@ -344,9 +344,9 @@ dbs | grep -q '^warm-before-serve: queries accepted after [0-9]* ms' && pass "db
 stop_srv
 
 echo "== work stealing (0.7): the backlog of ONE client flow is answered by several workers"
-# warm-before-serve holds every worker before it reads its socket, so the 8000 queries of one source port (one flow: the kernel gives them all to one
+# warm-before-serve holds every worker before it reads its socket, so the 4000 queries of one source port (one flow: the kernel gives them all to one
 # worker's socket) are all queued when the workers start; the owner is behind (32 or more queued) and the idle workers read batches of its socket and
-# answer them through their own routers, on their own sockets of the same address (same address and port).  Without stealing one worker runs all 8000.
+# answer them through their own routers, on their own sockets of the same address (same address and port).  Without stealing one worker runs all 4000.
 # The queries are for a zone file zone (in memory): only the hold is the database's (the hot list of 12 zones at fetch-rate 1: about ten seconds).
 cp "$T/good.state" "$ST"; fix_state
 cat > "$T/ex.zone" <<'EOF'

@@ -3547,21 +3547,24 @@ int worker_udp_rx(udp_pass_t *pass, int fd, int sock_idx, int reply_fd) {
 
 /* ---- 0.7 work stealing (dns_server_internal.h; planning: planing_0.7.x_worker_steal.md) ----
  * One slot per worker.  busy: the owner's addresses that are behind (one writer, the owner; MAX_BIND_ADDRS = 64 bits).  stolen: written by the worker
- * itself.  lent: added to by the thieves, once per stolen batch.  cold: the worker sleeps in kevent() without a timeout; a waker takes it with an
- * exchange, so one worker is woken once.  kq1: the worker's kqueue + 1 (0: none), for the EVFILT_USER wake-up.
- * g_steal_nbusy counts the busy workers (changed only when a worker's busy goes 0 <-> non-0): the one load an idle worker pays.
- * Lost wake-up: the thief stores cold and then loads g_steal_nbusy, the owner changes g_steal_nbusy and then loads cold (both seq_cst); an
- * EVFILT_USER trigger stays pending until the kevent() that reads it. */
+ * itself.  cold: the worker sleeps in kevent() without a timeout; a waker takes it with an exchange, so one worker is woken once.  kq1: the worker's
+ * kqueue + 1 (0: none), for the EVFILT_USER wake-up.  These are the worker's own (and on the line the thieves read for busy); lent, added to by the
+ * thieves once per stolen batch, has a line of its own.
+ * g_steal_nbusy counts the busy workers (changed only when a worker's busy goes 0 <-> non-0): the load an idle worker pays.  g_steal_ncold counts the
+ * cold flags that are set (changed with each flag, by the exchange that changed it), so a waker reads the slots only when someone sleeps.
+ * Lost wake-up: the thief sets cold, adds itself to g_steal_ncold and then loads g_steal_nbusy; the owner changes g_steal_nbusy and then loads
+ * g_steal_ncold and the flags (all seq_cst): one of the two sees the other.  An EVFILT_USER trigger stays pending until the kevent() that reads it. */
 _Static_assert(MAX_BIND_ADDRS <= 64, "one busy bit per listen address");
 typedef struct {
   alignas(64) _Atomic uint64_t busy;
   _Atomic uint64_t stolen;
-  alignas(64) _Atomic uint64_t lent;
   _Atomic int kq1;
   _Atomic bool cold;
+  alignas(64) _Atomic uint64_t lent;
 } steal_slot_t;
 static steal_slot_t g_steal[KARIDNS_WORKER_THREADS_MAX];
 static _Atomic int g_steal_nbusy;
+static _Atomic int g_steal_ncold;
 STATIC_TEST int g_steal_workers;          /* the workers that may steal (0: off); set before they start */
 
 void steal_setup(int workers) {
@@ -3571,14 +3574,22 @@ void steal_setup(int workers) {
 bool steal_on(void) { return g_steal_workers >= 2; }
 
 void steal_register(int w, int kq) {
-  if (w >= 0 && w < g_steal_workers) atomic_store_explicit(&g_steal[w].kq1, kq + 1, memory_order_release);
+  if (w >= 0 && w < g_steal_workers) atomic_store_explicit(&g_steal[w].kq1, kq >= 0 ? kq + 1 : 0, memory_order_release);
 }
 
-/* One sleeping worker other than `from` is woken (the first after it, round the workers): 1, or 0 when none sleeps */
+/* The cold flag of slot s is cleared if it was set (and the count follows): true when this call cleared it */
+static bool steal_uncold(steal_slot_t *s) {
+  if (!atomic_load_explicit(&s->cold, memory_order_seq_cst) || !atomic_exchange_explicit(&s->cold, false, memory_order_seq_cst)) return false;
+  atomic_fetch_sub_explicit(&g_steal_ncold, 1, memory_order_seq_cst);
+  return true;
+}
+
+/* One sleeping worker other than `from` is woken (the first after it, round the workers): 1, or 0 when none sleeps (one load when nobody does) */
 static int steal_wake_one(int from) {
+  if (atomic_load_explicit(&g_steal_ncold, memory_order_seq_cst) <= 0) return 0;
   for (int k = 1; k < g_steal_workers; k++) {
     steal_slot_t *s = &g_steal[(from + k) % g_steal_workers];
-    if (!atomic_load_explicit(&s->cold, memory_order_seq_cst) || !atomic_exchange_explicit(&s->cold, false, memory_order_seq_cst)) continue;
+    if (!steal_uncold(s)) continue;
     const int kq = atomic_load_explicit(&s->kq1, memory_order_acquire) - 1;
 #ifdef __FreeBSD__
     if (kq >= 0) {
@@ -3627,15 +3638,14 @@ int steal_pick(int self, int *addr) {
 bool steal_may_sleep(int self) {
   if (self < 0 || self >= g_steal_workers) return true;
   steal_slot_t *s = &g_steal[self];
-  atomic_store_explicit(&s->cold, true, memory_order_seq_cst);
+  if (!atomic_exchange_explicit(&s->cold, true, memory_order_seq_cst)) atomic_fetch_add_explicit(&g_steal_ncold, 1, memory_order_seq_cst);
   if (atomic_load_explicit(&g_steal_nbusy, memory_order_seq_cst) <= 0) return true;
   /* a worker became busy meanwhile: stay awake, unless a waker took the mark already (its trigger is pending: the kevent() returns at once) */
-  return !atomic_exchange_explicit(&s->cold, false, memory_order_seq_cst);
+  return !steal_uncold(s);
 }
 
 void steal_awake(int self) {
-  if (self >= 0 && self < g_steal_workers && atomic_load_explicit(&g_steal[self].cold, memory_order_relaxed))
-    atomic_store_explicit(&g_steal[self].cold, false, memory_order_relaxed);
+  if (self >= 0 && self < g_steal_workers) (void)steal_uncold(&g_steal[self]);
 }
 
 int steal_thief_step(steal_thief_t *t, int self, int got) {
@@ -3898,6 +3908,7 @@ worker_startup_success:;
     release_config_snapshot(active);
     rcu_reader_exit(ctx);
 
+    int own_udp = 0;                     /* (0.7 work stealing: the queries this turn read from this worker's own UDP sockets) */
     for (int i = 0; i < n_events; i++) {
       if (ev_list[i].udata == (void *)(uintptr_t)1001) {
         backend_shutdown(0); /* Supervisor が終了した (O-15: exit() は使わない) */
@@ -3976,7 +3987,7 @@ worker_startup_success:;
       } else if (ev_list[i].filter == EVFILT_READ && (uintptr_t)ev_list[i].udata >= WORKER_UDP_UDATA &&
                  (uintptr_t)ev_list[i].udata < WORKER_UDP_UDATA + MAX_BIND_ADDRS) {
         // UDP (udp-receive backend: this worker's own socket of one listen address; the replies go to a router over the IPC)
-        (void)worker_udp_rx(&pass, (int)ev_list[i].ident, (int)((uintptr_t)ev_list[i].udata - WORKER_UDP_UDATA), be_reply_fd);
+        own_udp += worker_udp_rx(&pass, (int)ev_list[i].ident, (int)((uintptr_t)ev_list[i].udata - WORKER_UDP_UDATA), be_reply_fd);
       } else if (ev_list[i].filter == EVFILT_USER && ev_list[i].ident == STEAL_WAKE_IDENT) {
         /* 0.7 work stealing: woken because another worker fell behind; the steal round after this loop reads its socket */
       } else if (ev_list[i].udata == (void *)2) {
@@ -4739,9 +4750,14 @@ process_tcp_client: ;
         }
       }
     }
-    if (steal_active) {
-      /* 0.7 work stealing: this worker's own events were served above; now one batch of a busy worker's socket, answered on this worker's pair and
-       * socket of the same address (worker_udp_steal()), and the next kevent() looks at its own sockets again before any further batch */
+    if (steal_active && own_udp >= UDP_BATCH_SIZE) {
+      /* 0.7 work stealing: this turn read a full batch or more of its own: it has its own work and does not look at the others (with many flows
+       * every worker is here near saturation, and pays nothing for the others' marks).  Not "no own query at all": a worker with a few flows of its
+       * own reads one or two queries nearly every turn and would never help.  It sleeps as usual; a worker that falls behind can wake it */
+      steal_mode = STEAL_BLOCK;
+    } else if (steal_active) {
+      /* 0.7 work stealing: less than a batch of its own this turn (served above); now one batch of a busy worker's socket, answered on this worker's
+       * pair and socket of the same address (worker_udp_steal()), and the next kevent() looks at its own sockets again before any further batch */
       int steal_addr = -1, got = 0;
       const int victim = steal_pick(w, &steal_addr);
       if (victim >= 0) got = worker_udp_steal(&pass, victim, steal_addr, be_reply_fd);   /* (the pass's flags: this turn's snapshot, above) */
@@ -4753,6 +4769,7 @@ process_tcp_client: ;
     park_unregister_worker(ctx->thread_id);
     park_free(&park);
   }
+  if (steal_active) steal_register(w, -1);       /* (no wake-up goes to the kqueue once it is closed) */
   close(kq);
   free(tcp_res_buf);
   pthread_exit(NULL);
