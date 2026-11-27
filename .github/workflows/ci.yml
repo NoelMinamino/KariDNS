@@ -548,6 +548,8 @@ jobs:
             echo "::group::🔎 [Evidence] the checks of this part that SKIPped before 0.7 (IDN, BIND, ldns, the PostgreSQL wrong password)"
             # the log of a passing test is not printed: the lines that show these checks ran (a part has only the tests of its shard)
             grep -h -E '^=== run_(dag|karidns_zone)_idn_test:|a wrong password: exit 4|BIND differential tests matched|equal to BIND named for|karicheck ZONEMD vs ldns: all checks passed' tests/.test_logs/test_*.log || true
+            # a query to a test's server that got no answer on a try, in a test that passed (tests/lib_proc.sh kari_noanswer_diag: CI flake rows 9, 90)
+            grep -h -E -A70 '^ *(\(note: [0-9]+ of the tries|\[no answer diag\])' tests/.test_logs/test_*.log | grep -v '^ *\[ OK \]' | head -400 || true
             echo "::endgroup::"
 
             echo "::group::📦 [Result] the profile data and the status of this part"

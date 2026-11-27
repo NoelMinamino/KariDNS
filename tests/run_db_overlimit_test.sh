@@ -146,7 +146,7 @@ rounds() {
             esac
             k=$((k + 1))
         done
-        [ -n "$LOST" ] && kari_noanswer_diag "$T/nad" "$KCTL" "$T/srv.log" "$PORT" "$LOST" A
+        [ -n "$LOST" ] && kari_noanswer_diag "$T/nad" "$KCTL" "$T/srv.log" "$PORT" "$LOST" A "$T/k.conf"
         r=$((r + 1))
     done
 }
@@ -186,7 +186,7 @@ for b in 1 2 3; do
     grep -q '192.0.2.80' "$T/b.$b" && BG=$((BG + 1)) || echo "  [other] www.b$b.test A: $(grep -E 'status:|EDE|timed out|no servers|error' "$T/b.$b" | head -3 | tr '\n' ' ')"
     grep -q 'status:' "$T/b.$b" || BL="www.b$b.test"
 done
-[ "$BG" = 3 ] && pass "the 3 queries for zones larger than the hard line were answered" || { fail "answered $BG of 3"; [ -n "$BL" ] && kari_noanswer_diag "$T/nad" "$KCTL" "$T/srv.log" "$PORT" "$BL" A; state; }
+[ "$BG" = 3 ] && pass "the 3 queries for zones larger than the hard line were answered" || { fail "answered $BG of 3"; [ -n "$BL" ] && kari_noanswer_diag "$T/nad" "$KCTL" "$T/srv.log" "$PORT" "$BL" A "$T/k.conf"; state; }
 RE=$(field cache room_evictions)
 [ "${RE:-0}" -gt 0 ] && pass "zones were taken out of memory on demand ($RE, $(field cache room_relaxed) of them younger than the minimum residency; room_waits=$(field cache room_waits))" || { fail "no zone was taken out on demand"; state; }
 [ "$(field cache room_timeouts)" = "0" ] && [ "$(field cache shed)" = "0" ] && pass "no request ran out of time waiting for room, nothing was shed" || fail "room_timeouts=$(field cache room_timeouts) shed=$(field cache shed)"
