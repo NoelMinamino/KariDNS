@@ -3793,7 +3793,14 @@ static int run_proto(int phase, const char *dir) {
             p_changes(a[0], &e, 21, 0, false, c1, 1);
             p_batch_end(a[0], &e, 21, 1, 0);
             CHECK(!p_result(&mainc, &m, 300));                           /* (the answer waits for the body) */
-            CHECK(serve_fetches(&fetchc, f[0], &e, 500, -1, -1) == 1 && g_pasked[300] == 1);
+            {                                                            /* (the body of m0300 is asked for once; it may wait for a place behind the lookups the section above left: served until it comes, at most 10 s) */
+                int nf = 0, w = 0;
+                const int64_t t0 = mono_ms();
+                for (; w < 20 && g_pasked[300] == 0; w++) nf += serve_fetches(&fetchc, f[0], &e, 500, -1, -1);
+                const int64_t dt = mono_ms() - t0;
+                CHECK_MSG(g_pasked[300] == 1, "m0300 asked %d times, %d bodies sent in %lld ms (%d windows)", g_pasked[300], nf, (long long)dt, w);
+                if (nf != 1 || dt > 1000) printf("  (the body of m0300 was asked for after %lld ms, with %d other bodies sent first)\n", (long long)dt, nf - 1);
+            }
             CHECK(p_result(&mainc, &m, 5000) && m.u.batch_result.n_applied == 1);
             have = false;
             for (int t = 0; t < 200 && !have; t++) { have = db_ingest_reload_result(&rr); if (!have) usleep(10000); }
@@ -4157,10 +4164,10 @@ static int run_fixes(const char *dir) {
     {
       db_recon_status_t rs0, rs1;
       db_recon_status(&rs0);
+      atomic_store(&g_dbs_jw_nospc, 1);                                 /* (before the pass: set after it, the tick's group commit could make every record of the pass durable first, and the */
+      store_test_jw_fault = dbs_jw_fault;                               /*  batch end, with nothing left to commit, answered 0: CI 2026-11-27, coverage 3/4) */
       p_batch_begin(a[0], &e, 40, KDB_BATCH_AUTO, 0);
       fx_pass(a[0], &e, 40, NF, omit, 350, true);
-      atomic_store(&g_dbs_jw_nospc, 1);
-      store_test_jw_fault = dbs_jw_fault;
       p_batch_end(a[0], &e, 40, NF - 1, 0);
       CHECK(p_result(&mainc, &m, 10000) && m.u.batch_result.batch_id == 40 && m.u.batch_result.store_error == ENOSPC);
       db_recon_status(&rs1);
@@ -4290,7 +4297,16 @@ static int run_fixes(const char *dir) {
     {
         char why[200];
         store_stats_t s1;
-        dbreg_cache_set_limit(1500000ull * 43 * 4);
+        /* (the limit is the configuration's memory-limit: the cache thread of dns_db_ingest.c writes that back every 50 ms, and a limit set only with dbreg_cache_set_limit() was sometimes undone
+         *  before db_recon_begin() read it, which then reserved the whole 4M: CI flakes row 65) */
+        static server_config_t cfgm;
+        const uint64_t lim11 = 1500000ull * 43 * 4;
+        cfgm = cfg;
+        cfgm.database.memory_limit = lim11;
+        cfgm.database.memory_limit_unlimited = false;
+        atomic_store_explicit(&g_config_db.active, &cfgm, memory_order_release);
+        for (int i = 0; i < 300 && dbreg_cache_limit() != lim11; i++) usleep(10000);
+        CHECK(dbreg_cache_limit() == lim11);
         CHECK(db_recon_begin("default", 4000000, false, why, sizeof(why)));
         store_stats(st, &s1);
         CHECK(s1.zt_capacity >= 1400000 && s1.zt_capacity < 3000000);
@@ -4301,7 +4317,7 @@ static int run_fixes(const char *dir) {
         store_stats(st, &s1);
         CHECK(s1.journal_boost == 0 && s1.journal_boosts == boosts);     /* (a pass that was cut off ends it) */
         db_recon_abort();                                                /* (nothing is active now: no effect) */
-        dbreg_cache_set_limit(1500000ull * 43 * 4);
+        CHECK(dbreg_cache_limit() == lim11);
         CHECK(db_recon_begin("default", 4000000, false, why, sizeof(why)));
         store_stats(st, &s1);
         CHECK(s1.journal_boost == 1 && s1.journal_boosts == boosts + 1);
@@ -4316,7 +4332,9 @@ static int run_fixes(const char *dir) {
         db_recon_end(false, 0, false, 0, NULL, 0, &oe);                  /* (the end of the entries: the loader did not finish the list, nothing is swept; the flag goes first) */
         store_stats(st, &s1);
         CHECK(s1.journal_boost == 0);
-        dbreg_cache_set_limit(0);
+        atomic_store_explicit(&g_config_db.active, &cfg, memory_order_release);
+        for (int i = 0; i < 300 && dbreg_cache_limit() == lim11; i++) usleep(10000);
+        CHECK(dbreg_cache_limit() != lim11);
     }
 
     /* -- L7: the guard holds a pass that lists 100 of the zones; the hold is in the store (the cursor of the view is not valid), and nothing is deleted.  (Before: the old cursor stayed, and a restart read
