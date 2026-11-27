@@ -314,7 +314,10 @@ for ty in RRSIG NSEC NSEC3 NSEC3PARAM DNSKEY CDS CDNSKEY TYPE46 TYPE0048; do
 done
 a_err "SOA at the apex" "$RLSERR" $API $DM "$(ri $EX example.com SOA 'ns1.example.com hm.example.com 1 2 3 4 5' 300)"
 a_err "a name outside the zone (evil.test)" "$RLSERR" $API $DM "$(ri $EX evil.test A 192.0.2.15 300)"
-a_err "a name that only ends like the zone (notexample.com)" "$RLSERR" $API $DM "$(ri $EX notexample.com A 192.0.2.15 300)"
+# the label boundary on a .test zone (a look-alike of example.com would be a registrable name): eve may write into other.test (g_ops), not notother.test
+a_ok "eve (g_ops: other.test) writes a name under its zone" $API $EVE "$(ri $OTHER lb.other.test A 192.0.2.15 300)"
+a_err "...not a name that only ends like the zone (notother.test)" "$RLSERR" $API $EVE "$(ri $OTHER notother.test A 192.0.2.15 300)"
+a_n "...and deletes its record again" 1 $API $EVE "DELETE FROM records WHERE name = 'lb.other.test'"
 a_err "a name with a trailing dot" "$RLSERR" $API $DM "$(ri $EX 'trail.example.com.' A 192.0.2.15 300)"
 a_err "a record of another zone (domain_id of other.test)" "$RLSERR" $API $DM "$(ri $OTHER www2.other.test A 192.0.2.16 300)"
 a_err "a record in the other zone's domain_id with a name of the own zone" "$RLSERR" $API $DM "$(ri $OTHER www2.example.com A 192.0.2.16 300)"
