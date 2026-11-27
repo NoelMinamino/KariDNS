@@ -271,7 +271,7 @@ Fixes from the external reviews and audits of the 0.7 cycle. Each has a test tha
 - **Replies seconds late on FreeBSD 14 under memory pressure**: FreeBSD 14 swaps out a whole process that has
   slept longer than `vm.swap_idle_threshold1` (2 s) when memory is short, and an idle UDP router was swapped out:
   the replies of its workers waited until it was read back from swap (3 to 12 s on the loaded 14.4 CI runners, the
-  flake of run_webadmin_versions_test). The routers and the connect broker now wake once a second. FreeBSD 15 does
+  flake of run_webadmin_versions_test). The routers, the connect broker and the manager now wake once a second. FreeBSD 15 does
   not swap processes out.
 - **NXNAME questions** (RFC 9824 §3.5): a query for type NXNAME is answered FORMERR with EDE 30 from this server's own
   data, and an MQTYPE-Query option that lists NXNAME is FORMERR (RFC 10029 §3.3); before, it was answered NODATA.

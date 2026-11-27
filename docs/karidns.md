@@ -1617,12 +1617,12 @@ When memory is short, FreeBSD 14 swaps out a whole process all of whose threads 
 
 Since 0.7 the processes on the path of an answer never sleep that long:
 
-- The routers and the connect broker (transfers, NOTIFY over TCP, forward zones, dnstap) wake once a second with nothing to do, at a cost of one empty `kevent(2)` or `poll(2)` a second each.
+- The routers, the connect broker (transfers, NOTIFY over TCP, forward zones, dnstap) and the manager (the plugins' UP relay, the forward of `SIGHUP`, the shutdown) wake once a second with nothing to do, at a cost of one empty `kevent(2)`, `poll(2)` or `sigtimedwait(2)` a second each.
 - `karidns-dbloader` waits at most a second.
 - The plugin supervisor waits at most 100 ms.
 - The Backend always has threads that nap for milliseconds.
 
-Only the manager may still be swapped out on an idle host. It supervises the other processes and takes no part in an answer. `tests/run_aux_wake_test.sh` checks the wake-ups.
+`tests/run_aux_wake_test.sh` checks the wake-ups. A program-zone plugin is an external process that the operator runs, and the same FreeBSD 14 swap-out applies to it: a plugin that answers queries should not sleep longer than 2 s either (a timeout of a second on its wait is enough).
 
 ## ROLLBACK (`karictl rollback`)
 

@@ -361,7 +361,7 @@ STATIC_TEST _Atomic int g_worker_start_failures = 0;
 
 STATIC_TEST void auxlog_changed(void);   /* 0.7 M2 (below, with the control commands) */
 
-/* 0.7: the longest the routers and the connect broker sleep with nothing to do (their loops): below vm.swap_idle_threshold1 of FreeBSD 14 (2 s), so that they are never
+/* 0.7: the longest the routers, the connect broker and the manager sleep with nothing to do (their loops): below vm.swap_idle_threshold1 of FreeBSD 14 (2 s), so that they are never
  * swapped out (CI flake rows 9 and 90, the routers' loop) */
 #define KARIDNS_AUX_WAKE_MS 1000
 
@@ -9794,10 +9794,13 @@ int main(int argc, char **argv) {
       int nap_ms = log_more ? 0 : db_sup_wait_ms(&dbsup);
       int plug_ms = plug_sup_wait_ms(&g_plug_sup);
       if (plug_ms >= 0 && (nap_ms < 0 || plug_ms < nap_ms)) nap_ms = plug_ms;
+      /* never longer than KARIDNS_AUX_WAKE_MS (0.7): without a loader or a plugin the manager slept here until a signal, and FreeBSD 14 swapped it out
+       * (the routers' loop says why); the plugins' UP relay, a SIGHUP's forward and a shutdown then waited for its swap-in */
+      if (nap_ms < 0 || nap_ms > KARIDNS_AUX_WAKE_MS) nap_ms = KARIDNS_AUX_WAKE_MS;
       nap.tv_sec = nap_ms / 1000;
       nap.tv_nsec = (long)(nap_ms % 1000) * 1000000L;
       siginfo_t si;
-      int sig = nap_ms >= 0 ? sigtimedwait(&loop_block, &si, &nap) : sigwaitinfo(&loop_block, &si);
+      int sig = sigtimedwait(&loop_block, &si, &nap);
       if (sig == SIGHUP)
         g_supervisor_got_sighup = 1;
       else if (sig == SIGTERM || sig == SIGINT)
