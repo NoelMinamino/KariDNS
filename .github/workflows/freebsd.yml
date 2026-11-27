@@ -548,10 +548,12 @@ jobs:
             # The packages preinstalled in the VM image can be older than the repository: pkg keeps an installed library whose soname
             # is unchanged (libffi.so.8 lacked the LIBFFI_CALL_PLAN_8.4 symbol version libxul.so needs), so bring them up to date first.
             pkg upgrade -y
-            pkg install -y perl5 sqlite3 node24 npm-node24 curl postgresql17-server postgresql17-client firefox geckodriver dejavu
+            # firefox-esr, not firefox: the action switches the VM to the latest repository, and FreeBSD:15:amd64/latest had no firefox package at times (2026-11-27: only
+            # firefox-esr 153.8 and geckodriver), while ESR is in quarterly and latest of every release.  Firefox ESR is also a browser the web interface supports.
+            pkg install -y perl5 sqlite3 node24 npm-node24 curl postgresql17-server postgresql17-client firefox-esr geckodriver dejavu
             (cd webadmin && npm ci --ignore-scripts)
             node --version
-            firefox --version
+            "$(command -v firefox || command -v firefox-esr)" --version
             geckodriver --version | head -1
             sysrc postgresql_enable=YES
             service postgresql initdb

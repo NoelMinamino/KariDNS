@@ -6,7 +6,7 @@
 # The names come from the "pkg install -y" lines of .github/workflows/ci.yml and freebsd.yml themselves, so the list cannot fall behind them:
 # for 14.4 the lines of freebsd.yml without the browser job (it runs on 15.1 only), for 15.1 all of them (the coverage jobs are 15.1).
 # "llvm${V}-lite" is the one of the base clang, as the coverage jobs install it.  pkg fetch -d takes the dependencies as well.  One name at a
-# time: a name the repository does not have (firefox, now and then) costs its own line, not the others.
+# time: a name the repository does not have (firefox on 15 latest, now and then: the jobs install firefox-esr) costs its own line, not the others.
 set -u
 rel="${1:-}"
 [ -n "$rel" ] || { echo "usage: $0 RELEASE" >&2; exit 2; }
