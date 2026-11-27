@@ -660,9 +660,19 @@ try {
   console.log('-- the keyboard alone');
   await scenario('a record set is added and previewed without the mouse', async () => {
     await zonePage('text.test.');
-    await b.exec(() => { [...document.querySelectorAll('button')].find((x) => x.textContent.trim() === 'Add a record set').focus(); });
+    await b.exec(() => {
+      const btn = [...document.querySelectorAll('button')].find((x) => x.textContent.trim() === 'Add a record set');
+      window.__kbdSeen = [];
+      for (const t of ['keydown', 'keypress', 'keyup', 'click']) btn.addEventListener(t, (ev) => window.__kbdSeen.push(`${t}:${ev.key || ''}`));
+      btn.focus();
+    });
     await b.keys(NAMED_KEYS.Enter);
-    await b.waitCss('dialog[open]');
+    try {
+      await b.waitCss('dialog[open]');
+    } catch (e) {        // (what reached the button: a diagnosis for the browser job, which runs Firefox ESR since the latest repository of FreeBSD 15 lost firefox)
+      const d = await b.exec(() => ({ seen: window.__kbdSeen, hasFocus: document.hasFocus(), active: `${document.activeElement && document.activeElement.tagName} ${document.activeElement && document.activeElement.textContent.trim().slice(0, 30)}`, ua: navigator.userAgent }));
+      throw new Error(`${e.message}; after Enter: ${JSON.stringify(d)}`);
+    }
     must(await b.exec(() => document.activeElement.name === 'name' && document.activeElement.closest('dialog') !== null), 'the focus is not in the name box');
     await b.keys(...'kbd'.split(''), NAMED_KEYS.Tab, NAMED_KEYS.Tab);          // the type box, then the TTL
     await b.keys(...'300'.split(''), NAMED_KEYS.Tab);                            // the records box
