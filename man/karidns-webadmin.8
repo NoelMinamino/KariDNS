@@ -1,4 +1,4 @@
-.TH KARIDNS\-WEBADMIN 8 "2026-11-27" "KariDNS" "KariDNS Manual"
+.TH KARIDNS\-WEBADMIN 8 "2026-11-28" "KariDNS" "KariDNS Manual"
 .\" Generated from docs/karidns-webadmin.md by man/md2man.pl (make man): edit the Markdown manual, not this page.
 .SH NAME
 karidns\-webadmin \- the service that gives people and programs an HTTP API for
@@ -701,19 +701,20 @@ page opens the sign-in over what is on the screen; the same person goes on,
 another person starts at the start page. A sign-out in one tab signs out the
 others (a \fBBroadcastChannel\fR).
 .IP \(bu 2
-\fBBrowsers.\fR Firefox ESR, Chrome and Edge (current and previous), Safari 17
-or newer; no polyfills. The accessibility target is WCAG 2.1 level AA (not
-certified); the checklist says how each point is met and has the manual check
-for Chrome, Edge and Safari that the project runs before a release. The
-automated tests run Firefox (\fBtests/run_webadmin_gui_test.sh\fR on SQLite3 and
-\fBtests/run_webadmin_gui_pg_test.sh\fR on PostgreSQL, headless through
-geckodriver; the screens of zones need root and a real \fBkaridns\fR, so that
-the update button is checked with \fBdag\fR; on the FreeBSD build host that
-needs \fBpkg install firefox geckodriver dejavu\fR (or \fBfirefox\-esr\fR):
-Firefox crashes at the start on a system without a font). They are the category
-\fBgui\fR of \fBtests/run_all_suite.sh\fR (with
-\fBtests/run_webadmin_oidc_gui_test.sh\fR, the browser part of the sign-in with
-a provider): a plain suite run leaves them out and says so; \fBsh
+\fBBrowsers.\fR Firefox (current release and ESR), Chrome and Edge (current and
+previous), Safari 17 or newer; no polyfills. The accessibility target is WCAG
+2.1 level AA (not certified); the checklist says how each point is met and has
+the manual check for Chrome, Edge and Safari that the project runs before a
+release. The automated tests run Firefox (\fBtests/run_webadmin_gui_test.sh\fR
+on SQLite3 and \fBtests/run_webadmin_gui_pg_test.sh\fR on PostgreSQL, headless
+through geckodriver; the screens of zones need root and a real \fBkaridns\fR, so
+that the update button is checked with \fBdag\fR; on the FreeBSD build host that
+needs \fBpkg install firefox geckodriver dejavu\fR, or \fBfirefox\-esr\fR
+instead of \fBfirefox\fR (the tests take either; CI installs \fBfirefox\fR from
+FreeBSD's quarterly repository): Firefox crashes at the start on a system
+without a font). They are the category \fBgui\fR of \fBtests/run_all_suite.sh\fR
+(with \fBtests/run_webadmin_oidc_gui_test.sh\fR, the browser part of the sign-in
+with a provider): a plain suite run leaves them out and says so; \fBsh
 tests/run_all_suite.sh \-\-with\-gui\fR or \fB\-\-only\-gui\fR runs them, and CI
 runs them in a job of their own (\fBwebadmin\-gui\-freebsd\fR), so that a
 browser step cannot fail the build of the server (0.7).

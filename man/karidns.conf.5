@@ -1,4 +1,4 @@
-.TH KARIDNS.CONF 5 "2026-11-27" "KariDNS" "KariDNS Manual"
+.TH KARIDNS.CONF 5 "2026-11-28" "KariDNS" "KariDNS Manual"
 .\" Generated from docs/karidns.md by man/md2man.pl (make man): edit the Markdown manual, not this page.
 .SH NAME
 karidns.conf \- the configuration file of karidns(8)
@@ -303,7 +303,8 @@ silently). Combined with \fBlisten\-on\fR / \fBlisten\-on\-v6\fR: the union (see
 IPv6 addresses of this host that the list allows, at the port of the
 statement. See "Listening addresses". \fBtls\fR, \fBhttp\fR and \fBproxy\fR are
 configuration errors (this server has no DNS-over-TLS, DNS-over-HTTPS or PROXYv2
-listener).
+listener). DNS over TLS (DoT, RFC 7858) and zone transfers over TLS (XoT, RFC
+9103) are not supported in 0.7; they are planned for 0.8.
 .TP 8
 \fBblackhole { <address match list>; ... };\fR
 \fIDefault:\fR none
@@ -2242,8 +2243,8 @@ everything at \fBinfo\fR while the query log is on (BIND:
 \fBNS_SERVER_LOGQUERIES\fR), so an operator who wants them writes a channel with
 \fBseverity debug 3;\fR (or turns \fBquerylog yes\fR on). UPDATE, NOTIFY and the
 transfers are not query errors (their own categories); an answer that was
-dropped (RRL, a message too short to have a header) has no line. UDP, TCP, TLS
-and DoH go through the same code.
+dropped (RRL, a message too short to have a header) has no line. UDP and TCP go
+through the same code (the server has no TLS or HTTPS listener).
 .IP \(bu 2
 \fBupdate\fR (besides the \fB[Update]\fR lines): \fBupdate failed: <zone>: not
 authoritative for update zone (NOTAUTH)\fR, \fBupdate failed: zone section is
@@ -3030,8 +3031,7 @@ a referencing view; a CNAME that leaves the zone is followed in the client's
 view the same way. Answers of a shared zone that has such targets are not put
 into (or taken from) the response cache when the client came through a view that
 does not own the zone. The ACLs are checked before the cache is looked at on
-every path (UDP, TCP, TLS, DoH), so a client that is refused is not served from
-it.
+every path (UDP and TCP), so a client that is refused is not served from it.
 .PP
 \fB\fBin\-view\-settings owner|view;\fB\fR (KariDNS; in \fBoptions\fR,
 \fBview\fR and the zone; the zone's value wins over the view's, which wins over
