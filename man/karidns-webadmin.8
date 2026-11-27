@@ -701,14 +701,15 @@ page opens the sign-in over what is on the screen; the same person goes on,
 another person starts at the start page. A sign-out in one tab signs out the
 others (a \fBBroadcastChannel\fR).
 .IP \(bu 2
-\fBBrowsers.\fR Firefox (current release and ESR), Chrome and Edge (current and
-previous), Safari 17 or newer; no polyfills. The accessibility target is WCAG
-2.1 level AA (not certified); the checklist says how each point is met and has
-the manual check for Chrome, Edge and Safari that the project runs before a
-release. The automated tests run Firefox (\fBtests/run_webadmin_gui_test.sh\fR
-on SQLite3 and \fBtests/run_webadmin_gui_pg_test.sh\fR on PostgreSQL, headless
-through geckodriver; the screens of zones need root and a real \fBkaridns\fR, so
-that the update button is checked with \fBdag\fR; on the FreeBSD build host that
+\fBBrowsers.\fR Firefox (the current release and ESR), Chrome and Edge (the
+current and the previous version), Safari 17 or newer; no polyfills. The
+accessibility target is WCAG 2.1 level AA (not certified); the checklist says
+how each point is met and has the manual check for Chrome, Edge and Safari that
+the project runs before a release. The automated tests run Firefox
+(\fBtests/run_webadmin_gui_test.sh\fR on SQLite3 and
+\fBtests/run_webadmin_gui_pg_test.sh\fR on PostgreSQL, headless through
+geckodriver; the screens of zones need root and a real \fBkaridns\fR, so that
+the update button is checked with \fBdag\fR; on the FreeBSD build host that
 needs \fBpkg install firefox geckodriver dejavu\fR, or \fBfirefox\-esr\fR
 instead of \fBfirefox\fR (the tests take either; CI installs \fBfirefox\fR from
 FreeBSD's quarterly repository): Firefox crashes at the start on a system

@@ -169,7 +169,7 @@ test('the tests the checklist points at exist, and the script checks it claims a
 test('the manual of the web interface and the service manual agree on the list of browsers', () => {
   const svc = read('docs/karidns-webadmin.md');
   for (const md of [MANUAL, svc, CHECK]) assert.match(md, /Safari 17/);
-  assert.match(MANUAL, /Firefox ESR, Chrome and Edge/);
+  for (const md of [MANUAL, svc]) assert.match(md, /Firefox \(the current release and ESR\), Chrome and Edge \(the current and the previous version\)/);
 });
 
 test('the files exist where the fileURLToPath of the test finds them', () => {
