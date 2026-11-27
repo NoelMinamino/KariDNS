@@ -178,7 +178,7 @@ for a in "$PORT host.ar.test NXNAME +notcp" "$PORT host.ar.test NXNAME +tcp +dns
          "$PORT nosuch.example NXNAME +notcp" "$OPORT host.ar.test NXNAME +notcp"; do
     # shellcheck disable=SC2086
     OUT=$(ask $a)
-    expect "NXNAME ($a): FORMERR, EDE 30, question echoed, AA=0" "$OUT" " aa[ ;]" "status: FORMERR" "EDE: 30" "QUERY: 1, ANSWER: 0" "IN[[:space:]]+(NXNAME|TYPE128)$"
+    expect "NXNAME ($a): FORMERR, EDE 30, question echoed, AA=0" "$OUT" " aa[ ;]" "status: FORMERR" "EDE: 30" "QUERY: 1, ANSWER: 0" "IN[[:space:]]+NXNAME$"
 done
 
 OUT=$(ask $OPORT host.ar.test RRSIG +notcp)

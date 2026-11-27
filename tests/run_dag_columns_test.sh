@@ -71,9 +71,12 @@ check() {
         echo "--- got"; printf '%s\n' "$got" | sed "s/$T/<T>/g"
         FAILED=1
     fi
+    # $4: dig's output where dag differs on purpose (docs/dag.md), else dig prints what dag prints
     if command -v dig >/dev/null 2>&1; then
         dig_out=$(eval "dig @127.0.0.1 -p $PORT $2" 2>&1 || true)
-        if [ "$dig_out" != "$got" ]; then
+        dig_want=$got
+        [ -n "${4:-}" ] && dig_want=$(printf '%s\n' "$4" | sed "s/<T>/$T/g")
+        if [ "$dig_out" != "$dig_want" ]; then
             echo "[FAIL] $1: differs from dig"
             echo "--- dig"; printf '%s\n' "$dig_out" | sed "s/$T/<T>/g"
             FAILED=1
@@ -97,7 +100,8 @@ check "question line (';' not counted)" "www.col.test A +noall +question" \
     ";www.col.test.<T><T><T>IN<T>A"
 check "question line +multiline" "www.col.test A +multiline +noall +question" \
     ";www.col.test.<T><T>IN A"
-check "type 128 (RFC 9824 NXNAME) printed as TYPE128 like dig 9.20" "nx.col.test NSEC +noall +answer" \
+check "type 128 (RFC 9824 NXNAME) printed as NXNAME (dig 9.20 prints TYPE128)" "nx.col.test NSEC +noall +answer" \
+    "nx.col.test.<T><T>300<T>IN<T>NSEC<T>nx2.col.test. RRSIG NSEC NXNAME" \
     "nx.col.test.<T><T>300<T>IN<T>NSEC<T>nx2.col.test. RRSIG NSEC TYPE128"
 check "+multiline SOA (BIND soa_6.c layout)" "col.test SOA +multiline +noall +answer" \
 "col.test.<T><T>300 IN SOA ns1.col.test. hostmaster.col.test. (
