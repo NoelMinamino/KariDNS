@@ -1413,10 +1413,25 @@ void *response_logger_thread_func(void *arg) {
  * room from the query log or bring it to the 80% at which it stops itself.  The query logger thread formats it and routes it to the channels.  Fixed
  * size, nothing allocated; the texts are cut.  Inside the event ring a debug record may fill it only to half, so that a debug flood always leaves the
  * other half to info and above; what does not fit is counted in ev_dropped.  Called only when a channel passes the message (logev_wanted()) and the
- * rate limit has admitted it. */
+ * rate limit has admitted it.  0.7 review M-3: the general log lines of the thread (kdns_syslog(), dns_log.c klog_route()) come here too, after the
+ * rate limit of their call site, so a worker never writes a log line itself. */
+static void qlog_ring_post_event(qlog_ring_t *ring, int cat, int level, const char *client_ip, int client_port, const char *msg);
+
 STATIC_TEST void qlog_event_sink(void *vctx, int cat, int level, const char *client_ip, int client_port, const char *msg) {
     worker_ctx_t *ctx = vctx;
-    qlog_ring_t *ring = &ctx->ev_ring;
+    qlog_ring_post_event(&ctx->ev_ring, cat, level, client_ip, client_port, msg);
+}
+
+/* 0.7 review M-3: the threads of the async I/O pool (program and forward zones, dns_query_engine.c) are on the query path as well: each has an
+ * event ring of its own (one producer, the query logger thread the consumer, as a worker's), made by init_async_io_pool() before the threads */
+#define ASYNC_EV_RING_SIZE 64
+static qlog_ring_t g_async_ev_rings[ASYNC_IO_POOL_SIZE];
+
+static void async_event_sink(void *vctx, int cat, int level, const char *client_ip, int client_port, const char *msg) {
+    qlog_ring_post_event((qlog_ring_t *)vctx, cat, level, client_ip, client_port, msg);
+}
+
+static void qlog_ring_post_event(qlog_ring_t *ring, int cat, int level, const char *client_ip, int client_port, const char *msg) {
     if (!ring->events) return;
     uint32_t h = atomic_load_explicit(&ring->head, memory_order_relaxed);
     uint32_t t = atomic_load_explicit(&ring->tail, memory_order_acquire);
@@ -1521,6 +1536,28 @@ void write_query_log(worker_ctx_t *ctx,
     atomic_store_explicit(&ring->head, h + 1, memory_order_release);
 }
 
+/* 0.7 review M-3: the records of a ring that carries event lines only (an async I/O pool thread's) to the channels; rt NULL = no runtime, dropped.
+ * true when there were records. */
+static bool qlog_drain_event_ring(log_runtime_t *rt, qlog_ring_t *ring) {
+    if (!ring->events) return false;
+    uint32_t t = atomic_load_explicit(&ring->tail, memory_order_relaxed);
+    const uint32_t h = atomic_load_explicit(&ring->head, memory_order_acquire);
+    if (t == h) return false;
+    for (; t != h; t++) {
+        qlog_event_t *ev = &ring->events[t & ring->mask];
+        if (!rt || ev->kind != QLOG_KIND_EVENT || ev->cat >= LOGC_COUNT) continue;
+        char line[KLOG_MSG_MAX];
+        ev->client_text[sizeof(ev->client_text) - 1] = '\0';
+        ev->qname[sizeof(ev->qname) - 1] = '\0';
+        logev_format_line(line, sizeof(line), ev->client_text, ev->client_port, ev->qname);
+        for (char *p = line; *p; p++)
+            if (((unsigned char)*p < 0x20 && *p != '\t') || *p == 0x7f) *p = '?';
+        klog_record(rt, ev->cat, ev->level, &ev->ts, line);
+    }
+    atomic_store_explicit(&ring->tail, t, memory_order_release);
+    return true;
+}
+
 void *query_logger_thread_func(void *arg) {
     (void)arg;
     static klog_batch_t batches[LOG_ROUTE_MAX];   /* one per channel of the category: the lines of a drain of the rings, written at once */
@@ -1545,7 +1582,10 @@ void *query_logger_thread_func(void *arg) {
         log_runtime_t *rt = log_runtime_acquire();
         int nch = 0;
         log_channel_t *const *route = rt && enabled ? log_runtime_route(rt, LOGC_QUERIES, &nch) : NULL;
-        if (rt) logev_flush_suppressed((int64_t)time(NULL));
+        if (rt) {
+            logev_flush_suppressed((int64_t)time(NULL));
+            klog_sites_flush((int64_t)time(NULL));     /* 0.7 review M-3: the reports of the general path's rate limit */
+        }
         /* each channel is held to its own limit (the rings admit what the most generous channel allows: get_effective_query_log_max_qps()) */
         uint32_t chan_limit[LOG_ROUTE_MAX];
         for (int i = 0; i < nch; i++) chan_limit[i] = qlog_channel_limit(opt_qps, route[i]->max_qps_specified, route[i]->max_qps);
@@ -1554,6 +1594,7 @@ void *query_logger_thread_func(void *arg) {
         int num_workers = atomic_load_explicit(&g_worker_count, memory_order_acquire);
         worker_ctx_t *workers = atomic_load_explicit(&g_worker_ctxs, memory_order_acquire);
         bool any_work = false;
+        for (int i = 0; i < ASYNC_IO_POOL_SIZE; i++) any_work |= qlog_drain_event_ring(rt, &g_async_ev_rings[i]);   /* (no runtime: the records are dropped) */
 
         if (rt && num_workers > 0 && workers) {
             /* 0.7 (K-11): two rings per worker, each with one producer (the worker) and this one consumer.  Each pass takes, worker by worker, the
@@ -1661,6 +1702,7 @@ void *query_logger_thread_func(void *arg) {
                 }
                 uint64_t ev_total = 0;
                 for (int w = 0; w < num_workers; w++) ev_total += atomic_load_explicit(&workers[w].ev_ring.ev_dropped, memory_order_relaxed);
+                for (int i = 0; i < ASYNC_IO_POOL_SIZE; i++) ev_total += atomic_load_explicit(&g_async_ev_rings[i].ev_dropped, memory_order_relaxed);
                 if (ev_total > last_reported_ev_dropped) {
                     uint64_t diff = ev_total - last_reported_ev_dropped;
                     last_reported_ev_dropped = ev_total;
@@ -2467,6 +2509,9 @@ STATIC_TEST void *async_io_worker_func(void *arg) {
   if (thread_idx < 0 || thread_idx >= MAX_ASYNC_IO_RCU_WORKERS) {
     thread_idx = 0;
   }
+  /* 0.7 review M-3: the log lines of this thread (events and kdns_syslog()) go to its ring, never to a write() here (an index past the rings, which
+   * init_async_io_pool() does not make, keeps the thread without a sink) */
+  if (thread_idx < ASYNC_IO_POOL_SIZE && g_async_ev_rings[thread_idx].events) logev_set_thread_sink(async_event_sink, &g_async_ev_rings[thread_idx]);
   compress_ctx_t thread_compress_ctx = {0};
   while (1) {
     pthread_mutex_lock(&g_async_io_pool.lock);
@@ -2587,6 +2632,18 @@ bool init_async_io_pool(void) {
   pthread_mutex_init(&g_async_io_pool.lock, NULL);
   pthread_cond_init(&g_async_io_pool.cond_not_empty, NULL);
   g_async_io_pool.running = true;
+  for (int i = 0; i < ASYNC_IO_POOL_SIZE; i++) {   /* 0.7 review M-3: the event rings of the threads, before the threads (never freed: they live as long as the process) */
+    qlog_ring_t *r = &g_async_ev_rings[i];
+    if (!r->events) {
+      r->events = calloc(ASYNC_EV_RING_SIZE, sizeof(qlog_event_t));
+      if (!r->events) {
+        syslog(LOG_ERR, "[Backend] Failed to allocate the event ring of async I/O thread %d", i);
+        return false;
+      }
+      r->size = ASYNC_EV_RING_SIZE;
+      r->mask = ASYNC_EV_RING_SIZE - 1;
+    }
+  }
   for (int i = 0; i < ASYNC_IO_POOL_SIZE; i++) {
     if (pthread_create(&g_async_io_pool.threads[i], NULL, async_io_worker_func, (void *)(uintptr_t)i) != 0) {
       syslog(LOG_ERR, "[Backend] Failed to start async I/O thread %d: %m", i);

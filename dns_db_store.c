@@ -3056,7 +3056,10 @@ typedef struct un_zone {
   uint32_t serial, id;
 } un_zone_t;
 
-/* All of it is the ingest thread's, but the figures (RC.s, the guard) are read by the control thread (karictl store, dbstatus): under RC.mu */
+/* The state of the reconcile.  Three threads use it: the reconcile thread (dns_db_recon.c rt_main(): db_recon_begin(), _entry_n(), _end(), _abort(), the one writer of the pass), the ingest thread
+ * (db_recon_lookup(): lk_mark(), the records the store cannot name) and the control thread (db_recon_status(): karictl store, dbstatus).  0.7 review: every field is read and written under RC.mu, by
+ * every thread, the writer included (the pass's fields are copied under it where a long step follows: the sweep, the apply of a page); lk_any alone is atomic, the hint that lets lk_has() skip the
+ * lock.  tests/test_db_store.c recon_status_during_pass() reads the state from another thread during passes, under ThreadSanitizer (test_db_store-tsan). */
 static struct {
   pthread_mutex_t mu;
   /* the pass */
@@ -3547,6 +3550,13 @@ static bool lk_has(uint32_t zid) {
   rc_unlock();
   return b;
 }
+/* the sweep: did the pass list the record, or did a lookup's answer make it (under RC.mu, as the bits are written: 0.7 review) */
+static bool rc_listed(uint32_t zid) {
+  rc_lock();
+  const bool b = bits_get(&RC.seen, zid) || (zid != STORE_NONE && atomic_load_explicit(&RC.lk_any, memory_order_relaxed) && bits_get(&RC.lk, zid));
+  rc_unlock();
+  return b;
+}
 static void lk_mark(const char *view, uint32_t zid) {
   rc_lock();
   if (RC.active && zid != STORE_NONE && strcmp(view, RC.view) == 0 && bits_set(&RC.lk, zid)) atomic_store_explicit(&RC.lk_any, true, memory_order_release);
@@ -3892,7 +3902,14 @@ bool db_recon_begin(const char *view, uint64_t estimate, bool force, char *why, 
     snprintf(why, whylen, "the zone store has no room for the view (%s)", strerror(-vid));
     return false;
   }
-  if (RC.active) syslog(LOG_WARNING, "[Store] the pass of view '%s' did not end; it is dropped", RC.view);
+  {
+    char pv[STORE_VIEW_NAME_MAX + 1];
+    rc_lock();
+    const bool was = RC.active;
+    snprintf(pv, sizeof(pv), "%s", RC.view);
+    rc_unlock();
+    if (was) syslog(LOG_WARNING, "[Store] the pass of view '%s' did not end; it is dropped", pv);
+  }
   store_stats_t *ss = malloc(sizeof(*ss));
   uint64_t have = 0;
   if (ss) {
@@ -3953,8 +3970,8 @@ bool db_recon_begin(const char *view, uint64_t estimate, bool force, char *why, 
   s->swept = s->unlisted = s->total = 0;
   s->passes++;
   snprintf(s->view, sizeof(s->view), "%s", view);
-  rc_unlock();
   (void)bits_grow(&RC.seen, (uint32_t)(have + want + 4096));
+  rc_unlock();
   return true;
 }
 
@@ -3963,8 +3980,20 @@ void (*_Atomic db_recon_test_entry_hook)(void);
 /* The entries of one page of a pass (0.7 M2): one group commit (db_recon_apply_n()), the counters under one hold of RC.mu.
  * A zone the database lists is seen, whatever became of its record: one that could not be recorded (a full disk, an I/O error) and one whose bit could not be set (no memory) must not be swept as
  * unlisted at the end of the pass.  Either failure also ends the pass without a sweep and without a cursor (db_recon_end()): the next pass has to make it good. */
+static bool rc_active(void) {
+  rc_lock();
+  const bool a = RC.active;
+  rc_unlock();
+  return a;
+}
+
 void db_recon_entry_n(const db_recon_entry_t *e, size_t n, int *res, uint32_t *zid) {
-  if (!RC.active) {
+  char view[STORE_VIEW_NAME_MAX + 1];
+  rc_lock();
+  const bool active = RC.active;
+  snprintf(view, sizeof(view), "%s", RC.view);               /* (the apply below takes the store's locks and the registry's: not under RC.mu, lock order at the top of the file) */
+  rc_unlock();
+  if (!active) {
     for (size_t i = 0; i < n; i++) res[i] = DBR_ERROR, zid[i] = STORE_NONE;
     return;
   }
@@ -3972,18 +4001,20 @@ void db_recon_entry_n(const db_recon_entry_t *e, size_t n, int *res, uint32_t *z
   if (hook)
     for (size_t i = 0; i < n; i++) hook();                           /* (tests: an entry of a pass that takes time) */
   t_pass_apply = true;
-  db_recon_apply_n(RC.view, e, n, res, zid);
+  db_recon_apply_n(view, e, n, res, zid);
   t_pass_apply = false;
+  rc_lock();
   for (size_t i = 0; i < n; i++) {
     bool seen_ok = bits_set(&RC.seen, zid[i]);
     if (atomic_load_explicit(&db_store_test_bits_fail, memory_order_relaxed) > 0 && atomic_fetch_sub_explicit(&db_store_test_bits_fail, 1, memory_order_relaxed) == 1) seen_ok = false;      /* (tests: the bit of the n-th entry of a pass could not be set: no memory) */
     if (!seen_ok || res[i] == DBR_ERROR) RC.failed = true;
   }
+  rc_unlock();
   rc_count_n(res, n, true);
 }
 
 int db_recon_entry(const db_recon_entry_t *e, uint32_t *zid_out) {
-  if (!RC.active) return DBR_ERROR;
+  if (!rc_active()) return DBR_ERROR;
   int r;
   uint32_t zid = STORE_NONE;
   db_recon_entry_n(e, 1, &r, &zid);
@@ -4017,22 +4048,27 @@ typedef struct { char zone[STORE_NAME_MAX + 2]; int64_t sid; uint32_t zid; } rc_
 void db_recon_end(bool complete, uint64_t n_skipped, bool cursor_valid, uint64_t cursor, const uint8_t *ident, size_t ident_len, db_recon_end_t *out) {
   memset(out, 0, sizeof(*out));
   store_t *st = atomic_load_explicit(&G.st, memory_order_acquire);
-  if (!RC.active || !st) return;
-  store_journal_boost(st, false);                           /* (the entries are in: a first fill is over, the journal goes back to its size; the sweep and the cursor follow) */
-  const int vid = RC.vid;
+  if (!st) return;
+  /* (the pass's fields, copied under RC.mu: the sweep below holds the store's locks and the registry's) */
   char view[STORE_VIEW_NAME_MAX + 1];
+  rc_lock();
+  const bool active = RC.active;
+  const int vid = RC.vid;
   snprintf(view, sizeof(view), "%s", RC.view);
   const bool force = RC.force;
-  out->duration_ms = (uint64_t)((mono_ns() - RC.t0_ns) / 1000000);
-  if (complete && !RC.failed && vid >= 0 && vid < 32) atomic_fetch_and(&G.dir_pending, ~(1u << vid));         /* (every zone of the view is listed in the name index now, whatever the sweep does) */
-  rc_lock();
-  RC.s.skipped = n_skipped;
+  const int64_t t0_ns = RC.t0_ns;
+  const bool pass_failed = RC.failed;
+  if (active) RC.s.skipped = n_skipped;
   rc_unlock();
+  if (!active) return;
+  store_journal_boost(st, false);                           /* (the entries are in: a first fill is over, the journal goes back to its size; the sweep and the cursor follow) */
+  out->duration_ms = (uint64_t)((mono_ns() - t0_ns) / 1000000);
+  if (complete && !pass_failed && vid >= 0 && vid < 32) atomic_fetch_and(&G.dir_pending, ~(1u << vid));         /* (every zone of the view is listed in the name index now, whatever the sweep does) */
   if (!complete) {
     syslog(LOG_WARNING, "[Store] view '%s': the pass was not complete (the loader had a database error): nothing is swept, no cursor is kept; the next pass starts again", view);
     goto done;
   }
-  if (RC.failed) {
+  if (pass_failed) {
     syslog(LOG_ERR, "[Store] view '%s': an entry of the pass could not be recorded in the store (disk full, an I/O error, or no memory): NOTHING IS SWEPT and no cursor is kept; the zones keep being served and the next pass (at the next start, or `karictl reload`) starts again", view);
     out->failed = true;
     goto done;
@@ -4051,7 +4087,7 @@ void db_recon_end(bool complete, uint64_t n_skipped, bool cursor_valid, uint64_t
       }
       if (more < 0 || z.view != (uint16_t)vid) continue;
       total++;
-      if (!bits_get(&RC.seen, z.zid) && !lk_has(z.zid)) unlisted++;
+      if (!rc_listed(z.zid)) unlisted++;
     }
     store_read_unlock();
   }
@@ -4103,7 +4139,7 @@ void db_recon_end(bool complete, uint64_t n_skipped, bool cursor_valid, uint64_t
             end = true;
             break;
           }
-          if (more < 0 || z.view != (uint16_t)vid || bits_get(&RC.seen, z.zid) || lk_has(z.zid)) continue;
+          if (more < 0 || z.view != (uint16_t)vid || rc_listed(z.zid)) continue;
           snprintf(vic[nv].zone, sizeof(vic[nv].zone), "%s.", z.name);
           vic[nv].sid = z.source_id;
           vic[nv].zid = z.zid;

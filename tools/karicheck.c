@@ -127,6 +127,37 @@ KARIDNS_TOOL_FN char *read_file_or_die(const char *path, bool *out_failed) {
 #define KC_STDIN_NAME "<stdin>"
 #define KC_STDIN_MAX ((size_t)64 << 20)
 
+/* T4-L4 (tools review 2026-11-23): the user the parsers run as when root runs karicheck.  -u user names it; without -u a zone file of the
+ * standalone mode is parsed as `nobody`, and the commands that read the server's configuration (conf, zones, zone <domain> [config], db)
+ * keep root: they read what karidns itself reads as root at its start, before its own drop (the configuration, its includes, the TSIG
+ * key files and the zone files, which are often root's alone, mode 0600), and the parsers open those by path while they parse, so there is
+ * no set of files to open first.  With -u they too run as that user, from the start (a file that user cannot read is then an error). */
+static const char *g_kc_user;
+KARIDNS_TOOL_FN const char *kc_pr(const char *s);
+
+/* Drop root for good (setgroups, setgid, setuid, then a check that it held) to `user`; nothing when karicheck is not root or the user is
+ * root.  0 = done (or nothing to do), -1 = refused or failed (reported; the caller stops: a check never goes on as root by accident). */
+KARIDNS_TOOL_FN int kc_drop_privileges(const char *user) {
+    if (geteuid() != 0 || strcmp(user, "root") == 0) return 0;
+    struct passwd *pw = getpwnam(user);
+    if (!pw) {
+        dns_diag(DIAG_ERROR, DC_IO_PRIVILEGE_DROP, NULL, 0, "karicheck: the user '%s' to parse as does not exist (-u user)\n", kc_pr(user));
+        return -1;
+    }
+    const uid_t uid = pw->pw_uid;
+    const gid_t gid = pw->pw_gid;
+    if (uid == 0 || gid == 0) {
+        dns_diag(DIAG_ERROR, DC_IO_PRIVILEGE_DROP, NULL, 0, "karicheck: the user '%s' is root by another name (uid %u, gid %u); use -u root to keep root\n", kc_pr(user),
+                 (unsigned)uid, (unsigned)gid);
+        return -1;
+    }
+    if (setgroups(0, NULL) != 0 || setgid(gid) != 0 || setuid(uid) != 0 || getuid() != uid || geteuid() != uid || getgid() != gid || getegid() != gid || setuid(0) == 0) {
+        dns_diag(DIAG_ERROR, DC_IO_PRIVILEGE_DROP, NULL, 0, "karicheck: could not drop root to the user '%s': %s\n", kc_pr(user), strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
 KARIDNS_TOOL_FN char *kc_read_stdin(bool *out_failed) {
     size_t len = 0, cap = 65536;
     char *buf = malloc(cap + 1);
@@ -406,6 +437,15 @@ KARIDNS_TOOL_FN int check_zone_run(const char *domain_raw, const char *file_arg,
         dns_diag(DIAG_ERROR | DIAG_UNTAGGED, DC_IO_STAT, file_path, 0, "Failed to stat root zone file: %s\n", file_path);
         free((void*)base_dir);
         free(root_path);
+        return 1;
+    }
+    /* T4-L4: a zone file of the standalone mode is often one from elsewhere.  The file (or standard input) is read and examined above with
+     * the rights of whoever runs karicheck; when that is root, the parsers run as `nobody` (or the -u user): an $INCLUDE is then opened with
+     * that user's rights, and a parser fault has no root to give away.  `-u root` keeps root (an $INCLUDE only root may read). */
+    if (is_standalone && kc_drop_privileges(g_kc_user ? g_kc_user : "nobody") != 0) {
+        free((void*)base_dir);
+        free(root_path);
+        zone_arena_destroy(&arena);
         return 1;
     }
 
@@ -2164,6 +2204,10 @@ KARIDNS_TOOL_FN void print_usage(FILE *fp, const char *prog) {
     fprintf(fp, "  %s db [view] [config_path]\n", prog);
     fprintf(fp, "  %s zone <domain> -\n", prog);
     fprintf(fp, "  %s --json <command> ...\n", prog);
+    fprintf(fp, "  %s [--json] -u <user> <command> ...\n", prog);
+    fprintf(fp, "\n");
+    fprintf(fp, "Run by root, zone <domain> <zone_file_path | -> reads the file as root and parses it as the user nobody (-u <user>: as that user;\n");
+    fprintf(fp, "-u root keeps root).  The commands that read karidns.conf keep root unless -u names a user: karidns reads those files as root.\n");
     fprintf(fp, "\n");
     fprintf(fp, "zone <domain> - reads the zone text (BIND format, up to 64 MiB) from standard input.  --json, before the command, writes one JSON\n");
     fprintf(fp, "document on standard output instead of the text lines (docs/karicheck.md, JSON OUTPUT); the exit status is the same.\n");
@@ -2215,7 +2259,24 @@ KARIDNS_TOOL_FN int kc_run(int argc, char **argv) {
         return 0;
     }
 
+    /* -u user (T4-L4): the user the parsers run as when root runs karicheck (g_kc_user) */
+    if (strcmp(argv[1], "-u") == 0) {
+        if (argc < 3 || !argv[2][0]) return kc_usage(argv[0], DC_USAGE_OPTION, "-u needs a user name");
+        if (!getpwnam(argv[2])) return kc_usage(argv[0], DC_USAGE_OPTION, "-u: no user '%.64s'", argv[2]);
+        g_kc_user = argv[2];
+        argv[2] = argv[0];
+        argv += 2;
+        argc -= 2;
+        if (argc < 2) return kc_usage(argv[0], DC_USAGE_COMMAND_MISSING, "no command given");
+    }
+
     const char *cmd = argv[1];
+    /* the commands that read the server's configuration keep root unless -u names a user (g_kc_user above says why); the standalone zone
+     * mode drops in check_zone_run(), after its file is read */
+    const bool standalone_zone = strcmp(cmd, "zone") == 0 && argc >= 4 && strstr(argv[3], ".conf") == NULL;
+    if (g_kc_user && !standalone_zone && (strcmp(cmd, "conf") == 0 || strcmp(cmd, "zones") == 0 || strcmp(cmd, "zone") == 0 || strcmp(cmd, "db") == 0) &&
+        kc_drop_privileges(g_kc_user) != 0)
+        return 1;
     const char *default_config = KARIDNS_CONFDIR "/karidns.conf";
     if (access(default_config, F_OK) != 0 && access(KARIDNS_SYSCONFDIR "/karidns.conf", F_OK) == 0) {
         default_config = KARIDNS_SYSCONFDIR "/karidns.conf";
@@ -2257,13 +2318,7 @@ KARIDNS_TOOL_FN int kc_run(int argc, char **argv) {
         const char *domain = argv[2];
         if (argc >= 4 && strstr(argv[3], ".conf") == NULL) {
             // Standalone mode: karicheck zone <domain> <zone_file_path>
-            /* T4-L4: a zone file that is not one of the server's (often one received from elsewhere) is parsed with the rights of whoever runs
-             * karicheck.  The parsers do not drop privileges themselves (the configuration and the zones it names are the server's own files,
-             * which the server reads as root at start-up too, and a lower user could not read the ones only root may): so say it, once, on
-             * stderr when that is a terminal: to the person who typed it, not to a program that runs karicheck and reads what it says. */
-            if (geteuid() == 0 && isatty(STDERR_FILENO))
-                fprintf(stderr, "karicheck: note: checking %s as root; a zone file from elsewhere is better checked as an unprivileged user\n",
-                        strcmp(argv[3], "-") == 0 ? "standard input" : argv[3]);
+            /* T4-L4: run by root, the file is read as root and parsed as nobody (or the -u user): check_zone_run() */
             dns_diag_counts(1, 0);
             return check_zone(domain, argv[3], true, false, NULL, NULL, NULL, NULL);
         } else {
@@ -2334,7 +2389,8 @@ int main(int argc, char **argv) {
         argv[1] = argv[0];
         argv++;
         argc--;
-        const char *cmd = argc >= 2 ? argv[1] : NULL;
+        const int ci = argc >= 3 && strcmp(argv[1], "-u") == 0 ? 3 : 1;      /* (-u user comes between --json and the command) */
+        const char *cmd = argc > ci ? argv[ci] : NULL;
         bool known = cmd && (strcmp(cmd, "conf") == 0 || strcmp(cmd, "zones") == 0 || strcmp(cmd, "zone") == 0 || strcmp(cmd, "db") == 0);
         dns_diag_json_start(known ? cmd : NULL, KARIDNS_VERSION);
     }

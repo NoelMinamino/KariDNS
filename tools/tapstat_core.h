@@ -92,6 +92,8 @@ void tapstat_render(const tapstat_t *s, tapstat_format_t fmt, FILE *fp, time_t s
 /* counters of the current interval */
 uint64_t tapstat_frames(const tapstat_t *s);
 uint64_t tapstat_bad_frames(const tapstat_t *s);
+/* T4-L5: the program counts the senders it refused and the times it paused a sender over its rate (-l); they are part of the interval */
+void tapstat_note_senders(tapstat_t *s, uint64_t refused, uint64_t throttled);
 
 /* helpers shared with the program and the tests */
 bool tapstat_name_to_wire(const char *name, uint8_t *out, size_t *out_len);

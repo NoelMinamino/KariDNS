@@ -85,6 +85,18 @@ is the order of work. The manuals have the detail: [karidns(8)](karidns.md), [ka
    - `dag --replay` refuses pcapng files (exit status 1): convert them first (`editcap -F pcap in.pcapng out.pcap`).
    - `karidns-tapstat` closes a sender that is silent for `-w` seconds (default 600) after the handshake; with a
      quiet server raise `-w` above its quietest stretch (each close costs about a second of dnstap messages).
+   - `karidns-tapstat` reads at most `-l` bytes a second from one sender (default `64M`, about 200,000 dnstap
+     messages a second; `-l 0` = no limit), and `-u <the user karidns runs as>` admits only that sender. Its
+     summaries have two more counters (`senders refused`, `throttled`; JSON `senders_refused`, `senders_throttled`;
+     Prometheus `karidns_tapstat_senders`): parsers that expect the old text lines exactly need the new line.
+   - `karicheck zone <domain> <file>` run by root parses the file as `nobody` (`-u user` to choose, `-u root` to keep
+     root): an `$INCLUDE` that only root may read is an error there now.
+   - `karicheck zone` and `karidns-dbloader --check` warn about NSEC chains (order, closure, gaps, type bitmaps) and
+     SOA timers (retry > refresh, expire < refresh + retry or <= minimum, minimum over a day): a check that counted
+     warnings may see more.
+   - Every log line of the server passes a rate limit of its call site (200 a second, 20 on the query path; a
+     `[Logging] N line(s) like "..." suppressed` line reports the rest), and the workers hand their lines to the
+     query logger thread (docs/karidns.md, logging).
 7. **Plan the disk**: with a database or secondary zones the store is on by default (section 3). About 1.2-1.6 KB of
    disk per small database zone (#185), and free space for the first fill and the cleaner.
 8. Read "CHANGES.md / Upgrade notes" once for the items that are specific to your setup (DNS Cookies, `signer-wait`).

@@ -851,8 +851,116 @@ static void klog_sanitize(char *msg) {
     if (((unsigned char)*p < 0x20 && *p != '\t') || *p == 0x7f) *p = '?';
 }
 
+/* ---- 0.7 review M-3: the rate limit of the general path, per call site (dns_log.h KLOG_SITE_RATE) ----
+ * A call site is its format string (a literal: its address names the site).  A fixed table, no allocation: a site takes a free slot near its
+ * hash when it first logs (the slot is reserved, its label written, then the key published with release, so a reader that finds the key sees
+ * the label); a site that finds none within a few probes shares the last slot.  The counting is logev_admit_at()'s, per slot. */
+#define KLOG_SITES 512                      /* (a power of two) */
+#define KLOG_SITE_PROBES 8
+#define KLOG_SITE_LABEL 64
+#define KLOG_SITE_BUSY ((uintptr_t)1)
+typedef struct {
+  _Atomic uintptr_t key;                    /* the format string, 0 = free, KLOG_SITE_BUSY = being taken */
+  char label[KLOG_SITE_LABEL];              /* the start of the site's first line (for the report); written before the key is published */
+  _Atomic int64_t sec;                      /* the second being counted */
+  _Atomic uint32_t count;                   /* lines passed in it */
+  _Atomic uint32_t suppressed;              /* lines dropped since the last report */
+  _Atomic int level, cat;                   /* of the last line dropped (the report is made at that level, in that category) */
+} klog_site_t;
+static klog_site_t g_klog_sites[KLOG_SITES + 1] = { [KLOG_SITES] = { .key = KLOG_SITE_BUSY, .label = "(lines of several sites)" } };
+static _Atomic int64_t g_klog_sites_flushed;   /* the second klog_sites_flush() last ran in */
+static _Atomic uint32_t g_klog_site_test_limit;  /* tests (klog_sites_test_limit()): 0 = the limits of dns_log.h */
+
+void klog_sites_test_limit(uint32_t limit) { atomic_store(&g_klog_site_test_limit, limit); }
+
+void klog_sites_reset(void) {
+  for (int i = 0; i <= KLOG_SITES; i++) {
+    if (i < KLOG_SITES) atomic_store(&g_klog_sites[i].key, 0);
+    atomic_store(&g_klog_sites[i].sec, 0);
+    atomic_store(&g_klog_sites[i].count, 0);
+    atomic_store(&g_klog_sites[i].suppressed, 0);
+  }
+  atomic_store(&g_klog_sites_flushed, 0);
+}
+
+static klog_site_t *klog_site_for(const char *fmt, const char *msg) {
+  const uintptr_t k = (uintptr_t)fmt;
+  if (k <= KLOG_SITE_BUSY) return &g_klog_sites[KLOG_SITES];
+  const size_t h = (size_t)(((uint64_t)k * 0x9E3779B97F4A7C15ull) >> 40);
+  for (int p = 0; p < KLOG_SITE_PROBES; p++) {
+    klog_site_t *s = &g_klog_sites[(h + (size_t)p) & (KLOG_SITES - 1)];
+    uintptr_t cur = atomic_load_explicit(&s->key, memory_order_acquire);
+    if (cur == k) return s;
+    if (cur != 0) continue;
+    if (atomic_compare_exchange_strong_explicit(&s->key, &cur, KLOG_SITE_BUSY, memory_order_acquire, memory_order_acquire)) {
+      snprintf(s->label, sizeof(s->label), "%s", msg);
+      atomic_store_explicit(&s->key, k, memory_order_release);
+      return s;
+    }
+    if (cur == k) return s;                 /* (another thread took it for this site meanwhile) */
+  }
+  return &g_klog_sites[KLOG_SITES];
+}
+
+static uint32_t klog_site_limit(bool query_path) {
+  const uint32_t t = atomic_load_explicit(&g_klog_site_test_limit, memory_order_relaxed);
+  if (t) return t;
+  if (klog_debug_level() > 0) return LOGEV_DEBUG_RATE;
+  return query_path ? KLOG_SITE_RATE_QUERY : KLOG_SITE_RATE;
+}
+
+/* true = the line passes; *report = the lines of the site dropped in its last second (to be said once, at *report_level) */
+static bool klog_site_admit(klog_site_t *s, int cat, int level, int64_t now, uint32_t limit, uint32_t *report, int *report_level) {
+  *report = 0;
+  int64_t sec = atomic_load_explicit(&s->sec, memory_order_relaxed);
+  if (sec != now && atomic_compare_exchange_strong(&s->sec, &sec, now)) {
+    atomic_store_explicit(&s->count, 0, memory_order_relaxed);
+    *report = atomic_exchange_explicit(&s->suppressed, 0, memory_order_relaxed);
+    *report_level = atomic_load_explicit(&s->level, memory_order_relaxed);
+  }
+  if (atomic_load_explicit(&s->count, memory_order_relaxed) >= limit || atomic_fetch_add_explicit(&s->count, 1, memory_order_relaxed) >= limit) {
+    atomic_fetch_add_explicit(&s->suppressed, 1, memory_order_relaxed);
+    atomic_store_explicit(&s->level, level, memory_order_relaxed);
+    atomic_store_explicit(&s->cat, cat, memory_order_relaxed);
+    return false;
+  }
+  return true;
+}
+
+/* the report of a site: through this thread's sink when it has one (the query path never writes), else to the channels at once */
+static void klog_site_report(klog_site_t *s, uint32_t n, int level, bool query_path) {
+  const uintptr_t k = atomic_load_explicit(&s->key, memory_order_acquire);
+  const char *label = (k > KLOG_SITE_BUSY || s == &g_klog_sites[KLOG_SITES]) ? s->label : "?";
+  int cat = atomic_load_explicit(&s->cat, memory_order_relaxed);
+  if (cat < 0 || cat >= LOGC_COUNT) cat = LOGC_GENERAL;
+  char text[KLOG_MSG_MAX];
+  snprintf(text, sizeof(text), "[Logging] %u line(s) like \"%.60s\" suppressed by the rate limit of %u per second", (unsigned)n, label,
+           (unsigned)klog_site_limit(query_path));
+  klog_sanitize(text);
+  if (query_path && logev_thread_sink_post(cat, level, text)) return;
+  klog_emit_level(cat, level, text);
+}
+
+/* the reports of the sites whose second is over; at most once a second for the process (the query logger thread calls it, and so does any log
+ * line of a later second, so a process without that thread reports too) */
+void klog_sites_flush(int64_t now) {
+  int64_t last = atomic_load_explicit(&g_klog_sites_flushed, memory_order_relaxed);
+  if (last == now || !atomic_compare_exchange_strong(&g_klog_sites_flushed, &last, now)) return;
+  const bool qp = logev_thread_has_sink();
+  for (int i = 0; i <= KLOG_SITES; i++) {
+    klog_site_t *s = &g_klog_sites[i];
+    if (atomic_load_explicit(&s->suppressed, memory_order_relaxed) == 0) continue;
+    if (atomic_load_explicit(&s->sec, memory_order_relaxed) == now) continue;      /* its second is not over */
+    const uint32_t n = atomic_exchange_explicit(&s->suppressed, 0, memory_order_relaxed);
+    if (n) klog_site_report(s, n, atomic_load_explicit(&s->level, memory_order_relaxed), qp);
+  }
+}
+
 /* The hook of kdns_syslog() / kdns_logc().  A message logged while a message is being written (a rotation that fails, say) goes to syslog()
- * directly, so that a log call cannot wait for the channel lock its own thread holds. */
+ * directly, so that a log call cannot wait for the channel lock its own thread holds.  0.7 review M-3: every line passes the rate limit of
+ * its call site first, and a thread on the query path (one with an event sink: the workers, the async I/O pool) hands the finished line to its
+ * ring, which the query logger thread writes: the format of the line is the same (klog_record() on both sides, with the time of the call), it is
+ * cut at the ring's 255 octets, and when the ring is full it is dropped and counted ("[QueryLog] Dropped N event log messages"). */
 static void klog_route(int cat, int prio, const char *fmt, va_list ap, int saved_errno) {
   const int level = klog_level_from_priority(prio);
   if (cat < 0 || cat >= LOGC_COUNT) cat = klog_category_for_message(fmt);
@@ -862,6 +970,18 @@ static void klog_route(int cat, int prio, const char *fmt, va_list ap, int saved
   char msg[KLOG_MSG_MAX];
   klog_vformat(msg, sizeof(msg), fmt, ap, saved_errno);
   klog_sanitize(msg);
+  if (!t_inside) {
+    const bool qp = logev_thread_has_sink();
+    const int64_t now = (int64_t)time(NULL);
+    klog_site_t *site = klog_site_for(fmt, msg);
+    uint32_t rep = 0;
+    int rep_level = level;
+    const bool pass = klog_site_admit(site, cat, level, now, klog_site_limit(qp), &rep, &rep_level);
+    if (rep) klog_site_report(site, rep, rep_level, qp);
+    klog_sites_flush(now);
+    if (!pass) return;
+    if (qp && logev_thread_sink_post(cat, level, msg)) return;
+  }
   log_runtime_t *rt = t_inside ? NULL : log_runtime_acquire();
   if (!rt) {
     klog_syslog_text(prio, msg);

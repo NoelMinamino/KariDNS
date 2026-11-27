@@ -391,6 +391,7 @@ struct tapstat {
     uint32_t zslots;     /* power of two, 0 = none */
     size_t nzones;
     uint64_t frames, bad_frames, queries, responses, other_msgs, no_question, malformed;
+    uint64_t senders_refused, senders_throttled;   /* T4-L5: the program's counters of the senders (tapstat_note_senders()) */
 };
 
 static const size_t dim_keymax[TAPSTAT_DIMS] = { 255, 255, 2, 1, 17 };
@@ -426,6 +427,10 @@ void tapstat_free(tapstat_t *s) {
 size_t tapstat_zone_count(const tapstat_t *s) { return s->nzones; }
 uint64_t tapstat_frames(const tapstat_t *s) { return s->frames; }
 uint64_t tapstat_bad_frames(const tapstat_t *s) { return s->bad_frames; }
+void tapstat_note_senders(tapstat_t *s, uint64_t refused, uint64_t throttled) {
+    s->senders_refused += refused;
+    s->senders_throttled += throttled;
+}
 
 static zname_t *zset_find(const tapstat_t *s, const uint8_t *w, size_t n) {
     if (s->zslots == 0 || n == 0 || n > 255) return NULL;
@@ -477,6 +482,7 @@ bool tapstat_add_zone(tapstat_t *s, const char *name) {
 void tapstat_reset(tapstat_t *s) {
     for (int d = 0; d < TAPSTAT_DIMS; d++) ttab_reset(&s->tab[d]);
     s->frames = s->bad_frames = s->queries = s->responses = s->other_msgs = s->no_question = s->malformed = 0;
+    s->senders_refused = s->senders_throttled = 0;
 }
 
 static void client_key(const tapstat_t *s, const uint8_t *a, size_t alen, uint8_t key[17], size_t *klen) {
@@ -662,6 +668,7 @@ void tapstat_render(const tapstat_t *s, tapstat_format_t fmt, FILE *fp, time_t s
                 (unsigned long long)s->frames, (unsigned long long)s->bad_frames, (unsigned long long)s->queries,
                 (unsigned long long)s->responses, (unsigned long long)s->other_msgs, (unsigned long long)s->no_question,
                 (unsigned long long)s->malformed);
+        fprintf(fp, "senders refused %llu  throttled %llu\n", (unsigned long long)s->senders_refused, (unsigned long long)s->senders_throttled);
         for (int d = 0; d < TAPSTAT_DIMS; d++) {
             const ttab_t *t = &s->tab[d];
             fprintf(fp, "%s: events %llu  keys %u  evictions %llu\n", dim_name[d], (unsigned long long)t->total, t->used,
@@ -677,10 +684,10 @@ void tapstat_render(const tapstat_t *s, tapstat_format_t fmt, FILE *fp, time_t s
         }
     } else if (fmt == TAPSTAT_JSON) {
         fprintf(fp, "{\"start\":\"%s\",\"end\":\"%s\",\"seconds\":%.3f,\"frames\":%llu,\"bad_frames\":%llu,\"queries\":%llu,"
-                    "\"responses\":%llu,\"other_messages\":%llu,\"no_question\":%llu,\"malformed\":%llu,\"dimensions\":{",
+                    "\"responses\":%llu,\"other_messages\":%llu,\"no_question\":%llu,\"malformed\":%llu,\"senders_refused\":%llu,\"senders_throttled\":%llu,\"dimensions\":{",
                 t0, t1, secs, (unsigned long long)s->frames, (unsigned long long)s->bad_frames, (unsigned long long)s->queries,
                 (unsigned long long)s->responses, (unsigned long long)s->other_msgs, (unsigned long long)s->no_question,
-                (unsigned long long)s->malformed);
+                (unsigned long long)s->malformed, (unsigned long long)s->senders_refused, (unsigned long long)s->senders_throttled);
         for (int d = 0; d < TAPSTAT_DIMS; d++) {
             const ttab_t *t = &s->tab[d];
             fprintf(fp, "%s\"%s\":{\"events\":%llu,\"keys\":%u,\"evictions\":%llu,\"top\":[", d ? "," : "", dim_name[d],
@@ -712,6 +719,10 @@ void tapstat_render(const tapstat_t *s, tapstat_format_t fmt, FILE *fp, time_t s
         fprintf(fp, "karidns_tapstat_messages{kind=\"other\"} %llu\n", (unsigned long long)s->other_msgs);
         fprintf(fp, "karidns_tapstat_messages{kind=\"no_question\"} %llu\n", (unsigned long long)s->no_question);
         fprintf(fp, "karidns_tapstat_messages{kind=\"malformed\"} %llu\n", (unsigned long long)s->malformed);
+        fputs("# HELP karidns_tapstat_senders Senders refused (not a -u user, or not allowed by the socket mode) and pauses of a sender over the -l rate, in the interval.\n"
+              "# TYPE karidns_tapstat_senders gauge\n", fp);
+        fprintf(fp, "karidns_tapstat_senders{kind=\"refused\"} %llu\n", (unsigned long long)s->senders_refused);
+        fprintf(fp, "karidns_tapstat_senders{kind=\"throttled\"} %llu\n", (unsigned long long)s->senders_throttled);
         fputs("# HELP karidns_tapstat_events Events counted per dimension in the interval, and those whose key replaced another key in the full table.\n"
               "# TYPE karidns_tapstat_events gauge\n", fp);
         for (int d = 0; d < TAPSTAT_DIMS; d++) {

@@ -17,6 +17,7 @@
 #include <fcntl.h>
 #include <getopt.h>
 #include <poll.h>
+#include <pwd.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -46,7 +47,15 @@ typedef struct {
     fstrm_reader_t rd;
     int64_t t_connect_ms;
     int64_t t_last_ms;      /* the last bytes from the sender (T4-L5: a sender that stays silent in the data phase gives its place up) */
+    int64_t tokens;         /* T4-L5: the bytes this sender may still send now (-l: a bucket of one second, refilled at the rate) */
+    int64_t t_fill_ms;      /* when the bucket was last refilled */
+    bool paused;            /* over the rate: not read until the bucket refills (the kernel's socket buffer holds the rest, then the sender waits) */
 } conn_t;
+
+#define MAX_SENDER_UIDS 16
+/* T4-L5: the senders -u names (uids); none = what the socket mode allows (peer_allowed()) */
+static uid_t g_sender_uids[MAX_SENDER_UIDS];
+static int g_n_sender_uids;
 
 static volatile sig_atomic_t g_stop = 0;
 
@@ -78,6 +87,14 @@ static void usage(FILE *fp) {
 "  -6 BITS      client prefix length for IPv6 (default 56)\n"
 "  -m MODE      permission of the socket file, octal (default 660).  A sender must be root, this user, or (g+w) in the\n"
 "               group of the socket; o+w lets every local user send and is warned about\n"
+"  -u USER      the only sender allowed: a user name or a numeric uid (repeatable, up to 16).  karidns connects as the\n"
+"               user it runs as (options { user }; at its start, after the drop, and through its broker when it reconnects),\n"
+"               so -u with that user admits karidns and refuses every other user the socket mode lets in, root included.\n"
+"               Needs the peer's credentials (FreeBSD LOCAL_PEERCRED, Linux SO_PEERCRED); where there are none, -u is\n"
+"               refused and only the socket mode decides\n"
+"  -l RATE      bytes per second one sender may send, with K, M or G (default 64M, 0 = no limit).  A sender over it is\n"
+"               not read until its one-second bucket refills (it waits on its socket); each pause is counted (throttled);\n"
+"               0 or at least 4K\n"
 "  -w SECONDS   close a sender that sends nothing for SECONDS after the handshake, 1 to 86400 (default 600);\n"
 "               karidns reconnects at its next message (about a second of messages is lost)\n"
 "  -V           print the version\n"
@@ -253,12 +270,22 @@ static bool conn_flush_reply(conn_t *c) {
  * or owner changed later, or a system does not check sockets): root, this process's user, a member of the socket's group when -m gives the group
  * write access, anyone when -m gives it to others.  The credentials are the peer's at connect(2) time (LOCAL_PEERCRED on FreeBSD, SO_PEERCRED on
  * Linux; elsewhere only the mode counts). */
+static bool sender_uid_listed(uid_t u) {
+    for (int i = 0; i < g_n_sender_uids; i++)
+        if (g_sender_uids[i] == u) return true;
+    return false;
+}
+
+/* With -u, the designated senders only: the peer's uid must be one -u names, whatever the mode lets in (main() refuses -u where the
+ * credentials cannot be read, so this never falls back to the mode). */
 static bool peer_allowed(int fd, mode_t mode, gid_t sock_gid) {
-    if (mode & S_IWOTH) return true;
 #if defined(LOCAL_PEERCRED)
     struct xucred cr;
     socklen_t cl = sizeof(cr);
-    if (getsockopt(fd, SOL_LOCAL, LOCAL_PEERCRED, &cr, &cl) != 0 || cr.cr_version != XUCRED_VERSION) return false;
+    const bool have = getsockopt(fd, SOL_LOCAL, LOCAL_PEERCRED, &cr, &cl) == 0 && cr.cr_version == XUCRED_VERSION;
+    if (g_n_sender_uids) return have && sender_uid_listed(cr.cr_uid);
+    if (mode & S_IWOTH) return true;
+    if (!have) return false;
     if (cr.cr_uid == 0 || cr.cr_uid == geteuid()) return true;
     if (mode & S_IWGRP)
         for (int i = 0; i < cr.cr_ngroups; i++)
@@ -267,16 +294,33 @@ static bool peer_allowed(int fd, mode_t mode, gid_t sock_gid) {
 #elif defined(SO_PEERCRED)
     struct ucred cr;
     socklen_t cl = sizeof(cr);
-    if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cr, &cl) != 0) return false;
+    const bool have = getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cr, &cl) == 0;
+    if (g_n_sender_uids) return have && sender_uid_listed(cr.uid);
+    if (mode & S_IWOTH) return true;
+    if (!have) return false;
     if (cr.uid == 0 || cr.uid == geteuid()) return true;
     return (mode & S_IWGRP) && cr.gid == sock_gid;   /* (only the primary group is known here) */
 #else
-    (void)fd; (void)sock_gid;
+    /* no peer credentials on this system: only the socket mode decides, as before (main() refuses -u here) */
+    (void)fd; (void)mode; (void)sock_gid;
     return true;
 #endif
 }
 
-static int run_socket(tapstat_t *st, const char *sockpath, mode_t mode, unsigned interval, unsigned idle_s, tapstat_format_t fmt, const char *outpath) {
+/* -l: the bucket of a sender, refilled at `rate` bytes per second up to one second's worth.  0 = no limit. */
+static void conn_refill(conn_t *c, uint64_t rate, int64_t now) {
+    if (!rate) return;
+    const int64_t dt = now - c->t_fill_ms;
+    if (dt <= 0) return;
+    const int64_t cap = (int64_t)rate;
+    const int64_t add = (int64_t)((rate * (uint64_t)dt) / 1000);
+    if (add == 0) return;                                 /* (less than a byte yet: the time stays counted) */
+    c->tokens = c->tokens + add > cap ? cap : c->tokens + add;
+    c->t_fill_ms = now;
+    if (c->paused && c->tokens > 0) c->paused = false;
+}
+
+static int run_socket(tapstat_t *st, const char *sockpath, mode_t mode, unsigned interval, unsigned idle_s, uint64_t rate, tapstat_format_t fmt, const char *outpath) {
     if (mode & S_IWOTH)
         fprintf(stderr, "karidns-tapstat: warning: -m %03o lets every local user connect and send dnstap (made-up statistics); "
                         "give the sender access through the group instead (default 660)\n", (unsigned)mode);
@@ -299,12 +343,18 @@ static int run_socket(tapstat_t *st, const char *sockpath, mode_t mode, unsigned
         int map[MAX_CONN + 1];
         int np = 0;
         pfds[np].fd = lfd; pfds[np].events = POLLIN; map[np] = -1; np++;
-        for (int i = 0; i < MAX_CONN; i++)
-            if (conns[i].fd >= 0) { pfds[np].fd = conns[i].fd; pfds[np].events = POLLIN; map[np] = i; np++; }
-
         int64_t now = now_ms();
+        bool any_paused = false;
+        for (int i = 0; i < MAX_CONN; i++) {
+            if (conns[i].fd < 0) continue;
+            conn_refill(&conns[i], rate, now);
+            if (conns[i].paused) { any_paused = true; continue; }    /* T4-L5: over its rate, not read until its bucket refills */
+            pfds[np].fd = conns[i].fd; pfds[np].events = POLLIN; map[np] = i; np++;
+        }
+
         int64_t wait = deadline - now;
         if (wait > 1000) wait = 1000; /* also the granularity of the handshake timeout */
+        if (any_paused && wait > 10) wait = 10;   /* (the refill of a paused sender) */
         if (wait < 0) wait = 0;
         int pr = poll(pfds, (nfds_t)np, (int)wait);
         if (pr < 0 && errno != EINTR) { fprintf(stderr, "karidns-tapstat: poll: %s\n", strerror(errno)); rc = 1; break; }
@@ -317,10 +367,12 @@ static int run_socket(tapstat_t *st, const char *sockpath, mode_t mode, unsigned
                     if (nfd < 0) continue;
                     int slot = -1;
                     for (int i = 0; i < MAX_CONN; i++) if (conns[i].fd < 0) { slot = i; break; }
-                    if (slot < 0) { close(nfd); fprintf(stderr, "karidns-tapstat: too many senders, connection refused\n"); continue; }
+                    if (slot < 0) { close(nfd); tapstat_note_senders(st, 1, 0); fprintf(stderr, "karidns-tapstat: too many senders, connection refused\n"); continue; }
                     if (!peer_allowed(nfd, mode, sock_gid)) {
                         close(nfd);
-                        fprintf(stderr, "karidns-tapstat: a sender that the socket mode %03o does not allow, connection refused\n", (unsigned)mode);
+                        tapstat_note_senders(st, 1, 0);
+                        if (g_n_sender_uids) fprintf(stderr, "karidns-tapstat: a sender that is not a -u user, connection refused\n");
+                        else fprintf(stderr, "karidns-tapstat: a sender that the socket mode %03o does not allow, connection refused\n", (unsigned)mode);
                         continue;
                     }
                     int fl = fcntl(nfd, F_GETFL, 0);
@@ -328,14 +380,22 @@ static int run_socket(tapstat_t *st, const char *sockpath, mode_t mode, unsigned
                     fcntl(nfd, F_SETFD, FD_CLOEXEC);
                     conns[slot].fd = nfd;
                     fstrm_reader_init(&conns[slot].rd, true);
-                    conns[slot].t_connect_ms = conns[slot].t_last_ms = now_ms();
+                    conns[slot].t_connect_ms = conns[slot].t_last_ms = conns[slot].t_fill_ms = now_ms();
+                    conns[slot].tokens = (int64_t)rate;
+                    conns[slot].paused = false;
                     continue;
                 }
                 conn_t *c = &conns[map[k]];
-                ssize_t n = read(c->fd, buf, sizeof(buf));
+                size_t want = sizeof(buf);
+                if (rate && (uint64_t)c->tokens < want) want = (size_t)c->tokens;    /* (tokens > 0 here: a paused sender is not polled) */
+                ssize_t n = read(c->fd, buf, want);
                 if (n < 0 && (errno == EAGAIN || errno == EINTR)) continue;
                 if (n <= 0) { conn_close(c); continue; } /* the sender went away; it reconnects */
                 c->t_last_ms = now_ms();
+                if (rate) {
+                    c->tokens -= n;
+                    if (c->tokens <= 0) { c->paused = true; tapstat_note_senders(st, 0, 1); }
+                }
                 int r = fstrm_feed(&c->rd, buf, (size_t)n, frame_cb, st);
                 if (c->rd.reply_len > 0 && !conn_flush_reply(c)) { conn_close(c); continue; }
                 if (r < 0) {
@@ -385,8 +445,36 @@ int main(int argc, char **argv) {
     size_t nzf = 0;
     int c;
 
-    while ((c = getopt_long(argc, argv, "s:r:z:Z:i:f:o:k:n:t:4:6:m:w:Vh", longopts, NULL)) != -1) {
+    uint64_t rate = 64ull << 20;
+    while ((c = getopt_long(argc, argv, "s:r:z:Z:i:f:o:k:n:t:4:6:m:w:u:l:Vh", longopts, NULL)) != -1) {
         switch (c) {
+        case 'u': {   /* T4-L5: a designated sender */
+#if !defined(LOCAL_PEERCRED) && !defined(SO_PEERCRED)
+            fprintf(stderr, "karidns-tapstat: -u needs the peer's credentials, which this system does not give; only the socket mode (-m) decides here\n");
+            return 2;
+#else
+            if (g_n_sender_uids >= MAX_SENDER_UIDS) { fprintf(stderr, "karidns-tapstat: at most %d -u\n", MAX_SENDER_UIDS); return 2; }
+            const struct passwd *pw = getpwnam(optarg);
+            if (pw) g_sender_uids[g_n_sender_uids++] = pw->pw_uid;
+            else if (parse_uint(optarg, 0, (unsigned long)UINT32_MAX - 1, &v)) g_sender_uids[g_n_sender_uids++] = (uid_t)v;
+            else { fprintf(stderr, "karidns-tapstat: -u: no user '%s'\n", optarg); return 2; }
+            break;
+#endif
+        }
+        case 'l': {   /* T4-L5: bytes per second per sender */
+            char *end;
+            errno = 0;
+            if (!*optarg || *optarg == '-') { fprintf(stderr, "karidns-tapstat: -l must be a byte rate (K, M or G), 0 = no limit\n"); return 2; }
+            unsigned long long r = strtoull(optarg, &end, 10);
+            unsigned sh = 0;
+            if (*end == 'K' || *end == 'k') { sh = 10; end++; }
+            else if (*end == 'M' || *end == 'm') { sh = 20; end++; }
+            else if (*end == 'G' || *end == 'g') { sh = 30; end++; }
+            if (errno || end == optarg || *end || r > (1ull << 40) >> sh) { fprintf(stderr, "karidns-tapstat: -l must be a byte rate up to 1024G (K, M or G), 0 = no limit\n"); return 2; }
+            rate = (uint64_t)r << sh;
+            if (rate && rate < 4096) { fprintf(stderr, "karidns-tapstat: -l must be 0 or at least 4K (a slower sender could not finish its handshake in time)\n"); return 2; }
+            break;
+        }
         case 's': sockpath = optarg; break;
         case 'r': filepath = optarg; break;
         case 'z':
@@ -461,5 +549,5 @@ int main(int argc, char **argv) {
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
     signal(SIGPIPE, SIG_IGN);
-    return run_socket(st, sockpath, (mode_t)mode, (unsigned)interval, (unsigned)idle, fmt, outpath);
+    return run_socket(st, sockpath, (mode_t)mode, (unsigned)interval, (unsigned)idle, rate, fmt, outpath);
 }

@@ -206,6 +206,45 @@ grep -q "warning: -m 666 lets every local user connect" "$TMP_DIR/s3.err" && pas
 kill -TERM "$TAP_PID"; wait "$TAP_PID"; TAP_PID=""
 "$TAPSTAT" -s "$TMP_DIR/t4.sock" -w 0 >/dev/null 2>&1; [ $? -eq 2 ] && pass "-w 0: exit 2" || fail "-w 0"
 
+# ---- 3c. T4-L5: the designated sender (-u) and the rate of a sender (-l) ----
+echo "[3c] socket mode: -u, -l"
+SOCK5="$TMP_DIR/t5.sock"
+"$TAPSTAT" -s "$SOCK5" -i 60 -f json -m 666 -u nobody -u 4000000000 > "$TMP_DIR/s5.json" 2> "$TMP_DIR/s5.err" &
+TAP_PID=$!
+for i in $(seq 1 50); do [ -S "$SOCK5" ] && break; sleep 0.1; done
+if [ "$(id -un)" != "nobody" ]; then
+    # the socket mode lets everyone in (666); -u names other users, so this one (root included) is refused, and counted
+    perl "$MOCK" send "$SOCK5" refused > "$TMP_DIR/m.out" 2>&1 && pass "-u: a sender that is not a -u user is refused" || fail "-u refused: $(cat "$TMP_DIR/m.out")"
+    for i in $(seq 1 50); do grep -q "not a -u user, connection refused" "$TMP_DIR/s5.err" && break; sleep 0.1; done
+    grep -q "not a -u user, connection refused" "$TMP_DIR/s5.err" && pass "the -u refusal is reported" || fail "no -u refusal message: $(cat "$TMP_DIR/s5.err")"
+fi
+kill -TERM "$TAP_PID"; wait "$TAP_PID"; TAP_PID=""
+perl "$MOCK" sum "$TMP_DIR/s5.json" > "$TMP_DIR/s5.sum"
+grep -q "^senders_refused=1$" "$TMP_DIR/s5.sum" && pass "the refusal is counted (senders_refused)" || fail "senders_refused: $(cat "$TMP_DIR/s5.sum")"
+SOCK6="$TMP_DIR/t6.sock"
+"$TAPSTAT" -s "$SOCK6" -i 60 -f json -u "$(id -u)" -l 64K > "$TMP_DIR/s6.json" 2> "$TMP_DIR/s6.err" &
+TAP_PID=$!
+for i in $(seq 1 50); do [ -S "$SOCK6" ] && break; sleep 0.1; done
+perl "$MOCK" send "$SOCK6" good > "$TMP_DIR/m.out" 2>&1 && pass "-u this user: served" || fail "-u this user: $(cat "$TMP_DIR/m.out")"
+# 1000 copies of the known traffic (7 frames each, well over 64 KiB): the sender waits for the rate, nothing is lost, FINISH comes
+perl "$MOCK" send "$SOCK6" flood 1000 > "$TMP_DIR/fl.out" 2>&1 && pass "-l 64K: a fast sender is slowed, not dropped ($(cat "$TMP_DIR/fl.out"))" || fail "flood: $(cat "$TMP_DIR/fl.out")"
+FLB=$(sed -n 's/^OK flood \([0-9]*\) bytes in \([0-9]*\) s$/\1/p' "$TMP_DIR/fl.out")
+FLS=$(sed -n 's/^OK flood \([0-9]*\) bytes in \([0-9]*\) s$/\2/p' "$TMP_DIR/fl.out")
+# the bucket holds one second (64 KiB): the rest cannot come in fewer than (bytes - 64 KiB) / 64 KiB seconds, less one for the rounding of time()
+if [ -n "$FLB" ] && [ -n "$FLS" ]; then
+    MIN=$(( (FLB - 65536) / 65536 - 1 ))
+    [ "$FLS" -ge "$MIN" ] && pass "the rate holds: $FLB bytes took $FLS s (at least $MIN)" || fail "the rate does not hold: $FLB bytes in $FLS s (want >= $MIN)"
+fi
+kill -TERM "$TAP_PID"; wait "$TAP_PID"; TAP_PID=""
+perl "$MOCK" sum "$TMP_DIR/s6.json" > "$TMP_DIR/s6.sum"
+grep -q "^frames=7007$" "$TMP_DIR/s6.sum" && pass "every frame of the slowed sender is counted (7 + 7000)" || fail "frames of -l: $(grep '^frames=' "$TMP_DIR/s6.sum")"
+TH=$(sed -n 's/^senders_throttled=//p' "$TMP_DIR/s6.sum")
+[ "${TH:-0}" -gt 0 ] && pass "the pauses are counted (senders_throttled=$TH)" || fail "senders_throttled: $(cat "$TMP_DIR/s6.sum")"
+"$TAPSTAT" -s "$TMP_DIR/t7.sock" -u no-such-user-tapstat >/dev/null 2>&1; [ $? -eq 2 ] && pass "-u unknown user: exit 2" || fail "-u unknown user"
+"$TAPSTAT" -s "$TMP_DIR/t7.sock" -l 5X >/dev/null 2>&1; [ $? -eq 2 ] && pass "-l 5X: exit 2" || fail "-l 5X"
+"$TAPSTAT" -s "$TMP_DIR/t7.sock" -l 2000G >/dev/null 2>&1; [ $? -eq 2 ] && pass "-l 2000G: exit 2" || fail "-l 2000G"
+"$TAPSTAT" -s "$TMP_DIR/t7.sock" -l 1K >/dev/null 2>&1; [ $? -eq 2 ] && pass "-l 1K (below 4K): exit 2" || fail "-l 1K"
+
 # ---- 4. a real karidns ----
 echo "[4] karidns -> karidns-tapstat"
 USER_OPT=""

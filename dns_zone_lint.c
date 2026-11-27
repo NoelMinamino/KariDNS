@@ -1051,7 +1051,160 @@ static void lint_nsec3(const char *domain, const zone_arena_t *arena, kc_tally_t
     }
 }
 
+/* ---- 0.7 review: the NSEC chain (RFC 4034 section 4, RFC 4035 section 2.3) ---- */
 
+static bool lint_is_dname(const dns_record_t *r, const void *ctx) { (void)ctx; return r->type_code == 39; }
+
+/* what a name is for the NSEC chain: 0 authoritative data, 1 a delegation point (an NS RRset below the apex), 2 occluded (below a delegation
+ * or a DNAME: no NSEC belongs there, RFC 4035 2.3 / RFC 6672 2.3), 3 outside the zone */
+static int lint_nsec_name_kind(const zone_arena_t *a, const char *domain, const char *name) {
+    if (!is_subdomain_of(name, domain)) return 3;
+    const bool apex = domain_names_match_ci(name, domain);
+    if (!apex && lint_first_at(a, domain, SIZE_MAX, lint_is_dname, NULL) >= 0) return 2;
+    for (const char *anc = strchr_unescaped(name, '.'); !apex && anc && anc[1]; anc = strchr_unescaped(anc + 1, '.')) {
+        const char *up = anc + 1;
+        if (domain_names_match_ci(up, domain) || !is_strict_subdomain_of(up, domain)) break;
+        if (lint_first_at(a, up, SIZE_MAX, lint_is_ns, NULL) >= 0 || lint_first_at(a, up, SIZE_MAX, lint_is_dname, NULL) >= 0) return 2;
+    }
+    return (!apex && lint_first_at(a, name, SIZE_MAX, lint_is_ns, NULL) >= 0) ? 1 : 0;
+}
+
+#define LINT_NSEC_TYPES 256
+static bool lint_type_in(const uint16_t *v, int n, uint16_t x) {
+    for (int i = 0; i < n; i++)
+        if (v[i] == x) return true;
+    return false;
+}
+
+/* the types the NSEC of `name` must list (RFC 4034 4.1.2): every type at the name, the NSEC and its RRSIGs included; at a delegation point
+ * only NS, DS, NSEC and RRSIG (the rest there is glue or occluded, RFC 4035 2.3) */
+static int lint_nsec_types_at(const zone_arena_t *a, const char *name, bool cut, uint16_t *out) {
+    int n = 0;
+    for (long j = lint_at_from(a, name, 0, SIZE_MAX, NULL, NULL); j >= 0 && n < LINT_NSEC_TYPES; j = lint_at_from(a, name, (size_t)j + 1, SIZE_MAX, NULL, NULL)) {
+        const uint16_t ty = a->records[j].type_code;
+        if (ty == 0 || (cut && ty != 2 && ty != 43 && ty != 46 && ty != 47)) continue;
+        if (!lint_type_in(out, n, ty)) out[n++] = ty;
+    }
+    return n;
+}
+
+static void lint_type_list(const uint16_t *v, int n, char *out, size_t cap) {
+    size_t o = 0;
+    out[0] = '\0';
+    for (int i = 0; i < n && o + 16 < cap; i++) {
+        char tb[24];
+        const char *tn = format_type_name(v[i], tb, sizeof(tb));
+        o += (size_t)snprintf(out + o, cap - o, "%s%s", i ? " " : "", tn);
+    }
+}
+
+/* The chain of a zone that has NSEC records: one NSEC per name with authoritative data and per delegation point, none elsewhere
+ * (RFC 4035 2.3); in canonical order (RFC 4034 6.1) each names the next, and the last names the apex (RFC 4034 4.1.1); the type bitmap lists the
+ * types at its owner (RFC 4034 4.1.2).  The RFCs say MUST; these are warnings all the same: the server serves such a zone as it is (its
+ * denials are then wrong for the names concerned), and named-checkzone does not look at the chain (dnssec-verify does). */
+static void lint_nsec(const char *domain, const zone_arena_t *arena, kc_tally_t *t) {
+    if (arena->nsec_count == 0 || !arena->nsec_records) return;
+    dns_record_t **nv = arena->nsec_records;                    /* sorted by owner in canonical order (build_zone_index()) */
+    size_t *chain = malloc(arena->nsec_count * sizeof(*chain));
+    if (!chain) {
+        kc_error(t, DC_INTERNAL_OOM, "out of memory while checking the NSEC chain of zone '%s'\n", domain);
+        return;
+    }
+    size_t nc = 0;
+    for (size_t i = 0; i < arena->nsec_count; i++) {
+        const dns_record_t *r = nv[i];
+        if (i > 0 && compare_canonical_name(r->name, nv[i - 1]->name) == 0) {
+            kc_warning(t, DC_ZONE_NSEC_DUPLICATE, "Name '%s' in zone '%s' has more than one NSEC record; a name has one NSEC (RFC 4035 section 2.3)\n", r->name, domain);
+            continue;
+        }
+        const int kind = lint_nsec_name_kind(arena, domain, r->name);
+        if (kind >= 2) {
+            kc_warning(t, DC_ZONE_NSEC_NOT_AUTHORITATIVE, "NSEC record at '%s' in zone '%s': the name is %s, where no NSEC belongs (RFC 4035 section 2.3)\n", r->name, domain,
+                       kind == 2 ? "below a delegation or a DNAME" : "outside the zone");
+            continue;
+        }
+        chain[nc++] = i;
+    }
+    /* the next names, and the closure at the apex */
+    for (size_t k = 0; k < nc; k++) {
+        const dns_record_t *r = nv[chain[k]];
+        const char *next = r->rdata_count >= 1 ? r->rdata[0] : NULL;
+        const char *want = k + 1 < nc ? nv[chain[k + 1]]->name : domain;
+        if (next && domain_names_match_ci(next, want)) continue;
+        if (k + 1 == nc)
+            kc_warning(t, DC_ZONE_NSEC_NOT_CLOSED, "The NSEC chain of zone '%s' is not closed: the last NSEC (at '%s') names '%s', not the apex (RFC 4034 section 4.1.1)\n", domain, r->name,
+                       next ? next : "");
+        else
+            kc_warning(t, DC_ZONE_NSEC_NEXT, "NSEC record at '%s' in zone '%s' names '%s' as the next name; the next owner of the chain in canonical order is '%s' (RFC 4034 sections 4.1.1, 6.1)\n",
+                       r->name, domain, next ? next : "", want);
+    }
+    /* the gaps: a name with authoritative data, or a delegation point, without an NSEC */
+    for (size_t i = 0; i < arena->sorted_unique_count; i++) {
+        const char *name = arena->sorted_unique_names[i];
+        if (lint_nsec_name_kind(arena, domain, name) >= 2) continue;
+        bool found = false;
+        size_t lo = 0, hi = nc;
+        while (lo < hi && !found) {
+            const size_t mid = lo + (hi - lo) / 2;
+            const int c = compare_canonical_name(nv[chain[mid]]->name, name);
+            if (c == 0) found = true;
+            else if (c < 0) lo = mid + 1;
+            else hi = mid;
+        }
+        if (!found)
+            kc_warning(t, DC_ZONE_NSEC_MISSING, "Name '%s' in zone '%s' has %s but no NSEC record; the zone has an NSEC chain, which must cover it (RFC 4035 section 2.3)\n", name, domain,
+                       lint_nsec_name_kind(arena, domain, name) == 1 ? "a delegation" : "authoritative data");
+    }
+    /* the type bitmaps */
+    for (size_t k = 0; k < nc; k++) {
+        const dns_record_t *r = nv[chain[k]];
+        uint16_t have[LINT_NSEC_TYPES], listed[LINT_NSEC_TYPES], missing[LINT_NSEC_TYPES], extra[LINT_NSEC_TYPES];
+        const int nh = lint_nsec_types_at(arena, r->name, lint_nsec_name_kind(arena, domain, r->name) == 1, have);
+        int nl = 0, nm = 0, ne = 0;
+        for (int f = 1; f < r->rdata_count && nl < LINT_NSEC_TYPES; f++) {
+            const uint16_t ty = get_type_code(r->rdata[f]);
+            if (ty && !lint_type_in(listed, nl, ty)) listed[nl++] = ty;
+        }
+        for (int i = 0; i < nh; i++)
+            if (!lint_type_in(listed, nl, have[i])) missing[nm++] = have[i];
+        for (int i = 0; i < nl; i++)
+            if (!lint_type_in(have, nh, listed[i])) extra[ne++] = listed[i];
+        if (nm == 0 && ne == 0) continue;
+        char ms[512], es[512];
+        lint_type_list(missing, nm, ms, sizeof(ms));
+        lint_type_list(extra, ne, es, sizeof(es));
+        kc_warning(t, DC_ZONE_NSEC_BITMAP, "The type bitmap of the NSEC record at '%s' in zone '%s' does not match the types there:%s%s%s%s (RFC 4034 section 4.1.2)\n", r->name, domain,
+                   nm ? " not listed: " : "", ms, ne ? (nm ? "; listed but not there: " : " listed but not there: ") : "", es);
+    }
+    free(chain);
+}
+
+/* ---- 0.7 review: the SOA timers (RFC 1035 3.3.13, RFC 1912 2.2, RFC 2308 5) ----
+ * Warnings: the values work, but not as a secondary needs them.  RFC 1912 2.2: the retry interval is "some fraction of the refresh interval",
+ * and the expire time "must be greater than the minimum and retry intervals"; a zone whose expire is shorter than refresh + retry expires on a
+ * secondary that misses one refresh and its retry.  RFC 2308 5: negative answers live min(SOA MINIMUM, SOA TTL), and values over a day "have been
+ * found to be problematic". */
+static void lint_soa_timers(const char *domain, const zone_arena_t *arena, kc_tally_t *t) {
+    for (long j = lint_first_at(arena, domain, SIZE_MAX, NULL, NULL); j >= 0; j = lint_at_from(arena, domain, (size_t)j + 1, SIZE_MAX, NULL, NULL)) {
+        const dns_record_t *r = &arena->records[j];
+        if (r->type_code != 6 || r->rdata_count < 7) continue;
+        uint32_t refresh, retry, expire, minimum;
+        if (!parse_ttl_strict(r->rdata[3], UINT32_MAX, &refresh) || !parse_ttl_strict(r->rdata[4], UINT32_MAX, &retry) ||
+            !parse_ttl_strict(r->rdata[5], UINT32_MAX, &expire) || !parse_ttl_strict(r->rdata[6], UINT32_MAX, &minimum))
+            continue;                                            /* (the parser judged the fields) */
+        if (retry > refresh)
+            kc_warning(t, DC_ZONE_SOA_RETRY, "SOA of zone '%s': the retry interval %u is longer than the refresh interval %u; retry is a fraction of refresh (RFC 1912 section 2.2)\n",
+                       domain, retry, refresh);
+        if ((uint64_t)expire < (uint64_t)refresh + retry)
+            kc_warning(t, DC_ZONE_SOA_EXPIRE, "SOA of zone '%s': the expire time %u is shorter than refresh + retry (%u + %u); a secondary that misses one refresh expires the zone "
+                       "before it retries (RFC 1912 section 2.2)\n", domain, expire, refresh, retry);
+        else if (expire <= minimum)
+            kc_warning(t, DC_ZONE_SOA_EXPIRE, "SOA of zone '%s': the expire time %u is not greater than the minimum %u (RFC 1912 section 2.2)\n", domain, expire, minimum);
+        if (minimum > 86400)
+            kc_warning(t, DC_ZONE_SOA_MINIMUM, "SOA of zone '%s': the minimum %u (the TTL of negative answers, RFC 2308 section 4) is over a day; RFC 2308 section 5 finds such values "
+                       "problematic\n", domain, minimum);
+    }
+}
 
 /* ------------------------------------------------------------------------------------------------------------- */
 /* checks on a whole parsed zone (called by karicheck zone and karidns-dbloader --check)                          */
@@ -1883,6 +2036,8 @@ void zone_lint_records(const zone_arena_t *arena, const zone_lint_in_t *in, kc_t
     lint_mx_address(in, arena, t);
     lint_check_names(in, arena, t);
     lint_nsec3(domain, arena, t);
+    lint_nsec(domain, arena, t);
+    lint_soa_timers(domain, arena, t);
     /* K-02: 他のエラーがあっても ZONEMD は検証する (結果は件数に入る) */
     verify_zonemd(domain, arena, t);
 }

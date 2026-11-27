@@ -77,6 +77,21 @@ static inline int klog_debug_level(void) {
 
 typedef void (*logev_sink_t)(void *ctx, int cat, int level, const char *client_ip, int client_port, const char *msg);
 void logev_set_thread_sink(logev_sink_t fn, void *ctx);
+/* 0.7 review M-3: a thread with a sink is on the query path (the workers, the async I/O pool): its general log lines (kdns_syslog()) go to the sink
+ * too, never to a write() of its own.  logev_thread_sink_post() hands one finished line to it (false: this thread has none). */
+bool logev_thread_has_sink(void);
+bool logev_thread_sink_post(int cat, int level, const char *msg);
+
+/* 0.7 review M-3: the rate limit of the general path (kdns_syslog() / kdns_logc(), dns_log.c klog_route()), per call site (the format string) and
+ * second: KLOG_SITE_RATE lines from a thread that is not on the query path, KLOG_SITE_RATE_QUERY from one that is (a client can make those
+ * happen at will), LOGEV_DEBUG_RATE while the debug level is above 0.  The lines over it are counted and said once, "[Logging] N line(s) like
+ * "..." suppressed by the rate limit of R per second", when the second is over (at the next line of that site, the next line of any site in a
+ * later second, or klog_sites_flush(), which the query logger thread calls with logev_flush_suppressed()). */
+#define KLOG_SITE_RATE 200u
+#define KLOG_SITE_RATE_QUERY 20u
+void klog_sites_flush(int64_t now);
+void klog_sites_reset(void);               /* tests */
+void klog_sites_test_limit(uint32_t limit);     /* tests: every site's limit (0 = the ones above) */
 /* The line of a record for the channels: "client <ip>#<port>: <msg>" (no client: msg).  Returns the length. */
 size_t logev_format_line(char *out, size_t n, const char *client_ip, int client_port, const char *msg);
 /* Routes a finished line to the channels of the category at once (dns_log.c: klog_emit_level()); null = no routing (tools, unit tests). */

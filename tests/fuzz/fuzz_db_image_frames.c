@@ -11,8 +11,9 @@
  *   bit 5      tiny limits (6 records, 4096 bytes: the caps are reachable)
  *   bit 3      the fetch stream machine (kdb_sm_init_fetch())
  *   bits 0-1   how the image is cut into ZONE_IMAGE messages: 0 one, 1 the header and the rest, 2 thirds (the first holds the header), 3 pieces of 997 octets (the first holds the header)
- * Deviations (byte 1 % 12): 0 none; 1 rr_count + 1; 2 announced size + 8; 3 serial + 1; 4 extended flag toggled; 5 tinydns flag toggled; 6 the last ZONE_IMAGE message missing;
- *   7 one more ZONE_IMAGE message; 8 the zone name of ZONE_BEGIN is another; 9 ZONE_END with rr_count + 1; 10 the magic of the header flipped; 11 the first message cut in the header.
+ * Deviations (byte 1 % 13): 0 none; 1 rr_count + 1; 2 announced size + 8; 3 serial + 1; 4 extended flag toggled; 5 tinydns flag toggled; 6 the last ZONE_IMAGE message missing;
+ *   7 one more ZONE_IMAGE message; 8 the zone name of ZONE_BEGIN is another; 9 ZONE_END with rr_count + 1; 10 the magic of the header flipped; 11 the first message cut in the header;
+ *   12 the loader announces max-zone-bytes (the header says the same) and sends only the image it has (review D-L1: the reassembly holds what came, not what was announced).
  * The stream is run whole and in chunks and must give the same verdict, the same number of frames and the same accepted images.
  */
 #include <stdint.h>
@@ -148,10 +149,11 @@ static void run_one(const uint8_t *p, size_t n, size_t chunk, uint8_t sel, run_t
                     if (z.size != sm.zone_image_size || z.size > lim.max_zone_bytes || z.size < sizeof(zone_image_t) + 8 || (z.size & 7)) abort();
                 }
             } else if (fr.type == KDB_T_ZONE_IMAGE) {
-                /* the octets come to the size that was announced and never past it; the buffer is the Backend's own reassembly (zone_image_asm_add(), what dns_db_ingest.c job_image() calls): one buffer of the announced size */
+                /* the octets come to the size that was announced and never past it; the buffer is the Backend's own reassembly (zone_image_asm_add(), what dns_db_ingest.c job_image() calls) */
                 if (!z.open || sm.zone_image_have > z.size || sm.zone_image_have != z.have + m.u.zone_image.len) abort();
-                if (zone_image_asm_add(&z.img, &z.have, &z.cap, z.size, m.u.zone_image.body, m.u.zone_image.len) != 0) abort();     /* (the machine accepted the message: it is within the size, and the memory is there) */
-                if (z.cap != z.size || z.have != sm.zone_image_have) abort();
+                if (zone_image_asm_add(&z.img, &z.have, &z.cap, z.size, lim.max_zone_bytes, m.u.zone_image.body, m.u.zone_image.len) != 0) abort();     /* (the machine accepted the message: it is within the size, and the memory is there) */
+                /* the buffer holds what came (review D-L1): at most the announced size, and never more than twice the octets once past the first megabyte */
+                if (z.cap > z.size || z.cap < z.have || (z.cap > ZONE_IMAGE_ASM_FIRST && z.cap > 2 * z.have) || z.have != sm.zone_image_have) abort();
                 mix(&r->sum, m.u.zone_image.len);
             } else if (fr.type == KDB_T_ZONE_END) {
                 if (z.open) {
@@ -169,7 +171,7 @@ static void run_one(const uint8_t *p, size_t n, size_t chunk, uint8_t sel, run_t
 }
 
 /* the image as the loader sends it, wrapped in ZONE_BEGIN .. ZONE_END with the deviation the fuzzer asked for; 0 = e is filled */
-static int wrap(kdb_enc_t *e, const uint8_t *img, size_t len, uint8_t sel, uint8_t dev) {
+static int wrap(kdb_enc_t *e, const uint8_t *img, size_t len, uint8_t sel, uint8_t dev, uint64_t max_bytes) {
     uint8_t digest[KDB_DIGEST_LEN];
     memset(digest, 0x5A, sizeof(digest));
     zone_image_t h;
@@ -193,7 +195,7 @@ static int wrap(kdb_enc_t *e, const uint8_t *img, size_t len, uint8_t sel, uint8
             if (vi->flags & ZONE_IMAGE_F_TINYDNS) flags |= KDB_ZF_TINYDNS;
         }
     }
-    dev %= 12;
+    dev %= 13;
     if (dev == 1) rr++;
     if (dev == 2) size += 8;
     if (dev == 3) serial++;
@@ -202,6 +204,13 @@ static int wrap(kdb_enc_t *e, const uint8_t *img, size_t len, uint8_t sel, uint8
     if (dev == 8) name = "other.fuzz.";
     if (dev == 9) end_rr++;
     if (dev == 10) copy[0] ^= 1;
+    if (dev == 12 && max_bytes >= len) {                       /* a huge announcement, a tiny body */
+        size = max_bytes & ~(uint64_t)7;
+        zone_image_t ch;
+        memcpy(&ch, copy, sizeof(ch));
+        ch.total_size = (uint32_t)size;
+        memcpy(copy, &ch, sizeof(ch));
+    }
     kdb_enc_begin(e, KDB_T_ZONE_BEGIN);
     kdb_enc_u16(e, 1, 0); kdb_enc_name(e, 2, name); kdb_enc_i64(e, 3, 1); kdb_enc_u8(e, 4, KDB_ZK_PRIMARY);
     kdb_enc_u32(e, 5, serial); kdb_enc_u32(e, 6, flags); kdb_enc_u64(e, 7, rr); kdb_enc_bytes(e, 8, digest, sizeof(digest));
@@ -256,7 +265,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     kdb_enc_t e;
     kdb_enc_init(&e);
     if (sel & 0x40) {
-        if (wrap(&e, p, n, sel, dev) != 0) { kdb_enc_free(&e); return 0; }
+        if (wrap(&e, p, n, sel, dev, (sel & 0x20) ? 4096 : KDB_DEFAULT_MAX_ZONE_BYTES) != 0) { kdb_enc_free(&e); return 0; }
         p = e.buf;
         n = e.len;
     }
