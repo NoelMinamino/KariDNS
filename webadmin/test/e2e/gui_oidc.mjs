@@ -45,7 +45,7 @@ const started = await startBrowser({ driver: process.env.GUI_GECKODRIVER, firefo
 });
 const b = started.browser;
 fs.mkdirSync(path.join(DIR, 'shots'), { recursive: true });
-const h1 = async () => (await (await b.$('h1')).text()).trim();
+const h1 = () => retryStale(async () => (await (await b.$('h1')).text()).trim());
 const fill = async (name, value, scope = '') => retryStale(async () => { const e = await b.$(`${scope} input[name=${name}]`); await e.clear(); await e.type(value); });
 const control = async (text, scope = 'body') => {
   const r = await b.exec((t, s) => [...document.querySelector(s).querySelectorAll('button, a[href]')].find((e) => e.textContent.trim() === t && e.offsetParent !== null) ?? null, text, scope);
