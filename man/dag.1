@@ -1,4 +1,4 @@
-.TH DAG 1 "2026-11-26" "KariDNS" "KariDNS Manual"
+.TH DAG 1 "2026-11-28" "KariDNS" "KariDNS Manual"
 .\" Generated from docs/dag.md by man/md2man.pl (make man): edit the Markdown manual, not this page.
 .SH NAME
 dag \- DNS Anomaly Generator, Protocol Inspector, and Multi-Server Verification
@@ -1138,8 +1138,9 @@ line has no TTL and always shows the class. Continuation lines of
 \fB+multiline\fR RDATA are indented to the RDATA column (four tabs). Scripts
 that split the output should split on white space, not on single spaces.
 .IP \(bu 2
-Type 128 (RFC 9824 \fBNXNAME\fR) is printed as \fBTYPE128\fR, as \fBdig\fR 9.20
-does (also in NSEC type bit maps); \fBNXNAME\fR is still accepted as input.
+Type 128 (RFC 9824 \fBNXNAME\fR) is printed as \fBNXNAME\fR (also in NSEC type
+bit maps); \fBdig\fR 9.20 has no mnemonic for it and prints \fBTYPE128\fR, which
+is still accepted as input. An intentional difference from \fBdig\fR.
 .IP \(bu 2
 Names are printed in presentation format like \fBdig\fR: besides \fB.\fR and
 \fB\e\fR, the characters \fB"\fR \fB(\fR \fB)\fR \fB;\fR \fB@\fR \fB$\fR are
