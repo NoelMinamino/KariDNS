@@ -32,6 +32,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <pthread.h>
+#include <sched.h>
 #include <stdarg.h>
 #include <unistd.h>
 #include <syslog.h>
@@ -917,6 +918,139 @@ static void test_concurrent(void) {
     release_zone_snapshot(s);
     zone_retire_process(true);
     dbreg_reset();
+}
+
+/* ---------------------------------------------------------------- 4a. the zone { } an entry remembers (0.7, NSD gap 5) */
+#define ZC_CONF(extra) "view \"a\" { match-clients { 127.0.0.1; }; zone \"z1.test\" { type master; file \"z1\"; }; " extra " };\n" \
+                       "view \"b\" { match-clients { any; }; zone \"z1.test\" { in-view \"a\"; }; zone \"z3.test\" { type master; file \"z3\"; }; };\n"
+static void test_zcfg_cache(void) {
+    printf("[TEST] zone_entry_config(): the zone { } of a parsed configuration is remembered in the entry, keyed by its token...\n");
+    server_config_t *c1 = load_conf(ZC_CONF("zone \"z2.test\" { type master; file \"z2\"; };"));
+    server_config_t *c2 = load_conf(ZC_CONF(""));
+    CHECK(c1->zcfg_token != 0 && c2->zcfg_token > c1->zcfg_token);              /* every parse has a new token */
+    zone_db_entry_t *e1 = create_new_zone_entry("z1.test.", "a"), *e2 = create_new_zone_entry("z2.test.", "a");
+    zone_db_entry_t *eb = create_new_zone_entry("z1.test.", "b"), *en = create_new_zone_entry("none.test.", "a");
+    CHECK(e1 && e2 && eb && en && atomic_load(&e1->zcfg_token) == 0);
+    const zone_config_t *w1 = find_zone_config_in_view(c1, "a", "z1.test.");
+    CHECK(w1 && zone_entry_config(c1, e1) == w1);
+    CHECK(atomic_load(&e1->zcfg_token) == c1->zcfg_token && atomic_load(&e1->zcfg) == w1);
+    /* the second query reads the entry, not the index: a pointer put there with the same token is what comes back */
+    zone_config_t probe;
+    memset(&probe, 0, sizeof(probe));
+    atomic_store(&e1->zcfg, &probe);
+    CHECK(zone_entry_config(c1, e1) == &probe);
+    atomic_store(&e1->zcfg, w1);
+    /* the in-view zone of view b: the owner's block; a name the configuration does not have: NULL, remembered too */
+    CHECK(zone_entry_config(c1, eb) == w1 && atomic_load(&eb->zcfg_token) == c1->zcfg_token);
+    CHECK(zone_entry_config(c1, en) == NULL && atomic_load(&en->zcfg_token) == c1->zcfg_token && zone_entry_config(c1, en) == NULL);
+    /* a reload: the new configuration's block (z2 is gone from it: NULL), and the pair is the new one's */
+    const zone_config_t *w2 = find_zone_config_in_view(c2, "a", "z1.test.");
+    CHECK(zone_entry_config(c1, e2) != NULL && zone_entry_config(c2, e2) == NULL && atomic_load(&e2->zcfg_token) == c2->zcfg_token);
+    CHECK(w2 && w2 != w1 && zone_entry_config(c2, e1) == w2 && atomic_load(&e1->zcfg_token) == c2->zcfg_token);
+    /* a reader of the configuration before (during the reload) gets that one's block and does not put it back over the newer pair */
+    CHECK(zone_entry_config(c1, e1) == w1 && atomic_load(&e1->zcfg_token) == c2->zcfg_token && atomic_load(&e1->zcfg) == w2);
+    /* the double buffer: the struct of c1 is freed and parsed again; its new token never matches the pair of the old blocks */
+    uint64_t t1 = c1->zcfg_token;
+    free_server_config_fields(c1);
+    CHECK(c1->zcfg_token == 0);
+    CHECK(parse_named_conf(ZC_CONF(""), c1) == 0 && c1->zcfg_token > c2->zcfg_token && c1->zcfg_token != t1);
+    const zone_config_t *w3 = find_zone_config_in_view(c1, "a", "z1.test.");
+    CHECK(zone_entry_config(c1, e1) == w3 && atomic_load(&e1->zcfg) == w3);
+    CHECK(zone_entry_config(c1, e2) == NULL && zone_entry_config(c1, eb) == w3);
+    /* a parse that fails leaves token 0; a configuration that was not parsed (token 0) is looked up every time and nothing is remembered */
+    server_config_t bad;
+    memset(&bad, 0, sizeof(bad));
+    CHECK(parse_named_conf("view \"a\" { zone ", &bad) != 0 && bad.zcfg_token == 0);
+    zone_config_t hz;
+    memset(&hz, 0, sizeof(hz));
+    hz.domain = (char *)"z1.test.";
+    server_config_t hand;
+    memset(&hand, 0, sizeof(hand));
+    hand.zones = &hz;
+    CHECK(zone_entry_config(&hand, e1) == &hz && atomic_load(&e1->zcfg) == w3);
+    CHECK(zone_entry_config(NULL, e1) == NULL);
+    /* a writer that finds BUSY (another thread is writing the pair) leaves it, and a reader does not take it */
+    atomic_store(&e2->zcfg_token, ZONE_ZCFG_BUSY);
+    CHECK(zone_entry_config(c1, e2) == NULL && atomic_load(&e2->zcfg_token) == ZONE_ZCFG_BUSY);
+    const zone_config_t *got = &probe;
+    CHECK(!zone_zcfg_cached(e2, c1->zcfg_token, &got) && got == &probe);
+    /* received settings are read only when the entry has some (rx_present); a database zone has its own block and remembers nothing */
+    zone_x_t *x = zone_x(e1);
+    CHECK(x != NULL);
+    zone_config_t *rx = db_zone_config_new("z1.test.", NULL);
+    CHECK(rx != NULL);
+    atomic_store(&x->rxcfg, rx);
+    CHECK(zone_entry_config(c1, e1) == w3);                                     /* (rx_present false: the zone's own) */
+    atomic_store(&e1->rx_present, true);
+    CHECK(zone_entry_config(c1, e1) == rx);
+    zone_db_entry_t *d = new_entry("a", "z1.test.");
+    CHECK(zone_entry_config(c1, d) == atomic_load(&d->dbcfg) && atomic_load(&d->zcfg_token) == 0);
+    free_zone_db_entry(d);
+    free_zone_db_entry(e1);                                                     /* (frees rx) */
+    free_zone_db_entry(e2);
+    free_zone_db_entry(eb);
+    free_zone_db_entry(en);
+    free_server_config_fields(c1);
+    free_server_config_fields(c2);
+    free(c1);
+    free(c2);
+    zone_retire_process(true);
+}
+
+/* the same under a reload loop (run under ThreadSanitizer by tests/run_rcu_tsan_units_test.sh): readers in read sections ask zone_entry_config() for a few entries of a
+ * double-buffered configuration that the writer reparses as the server's reload does (wait for the readers of the standby, free it, parse into it, publish); every answer
+ * is the one the index gives for the configuration the reader holds, and its block is alive (the name is read) */
+static _Atomic(server_config_t *) g_zc_active;
+static _Atomic bool g_zc_stop;
+static _Atomic long g_zc_reads, g_zc_wrong;
+static zone_db_entry_t *g_zc_e[4];
+static void *zc_reader(void *arg) {
+    (void)arg;
+    while (!atomic_load(&g_zc_stop)) {
+        rcu_aux_read_lock();
+        server_config_t *cfg = atomic_load_explicit(&g_zc_active, memory_order_acquire);
+        for (int i = 0; i < 4; i++) {
+            const zone_config_t *z = zone_entry_config(cfg, g_zc_e[i]);
+            const zone_config_t *want = find_zone_config_in_view(cfg, zone_vname(g_zc_e[i]), g_zc_e[i]->domain);
+            if (z != want || (z && strcasecmp(z->domain, g_zc_e[i]->domain) != 0 && !(i == 2 && strcasecmp(z->domain, "z1.test.") == 0)))
+                atomic_fetch_add(&g_zc_wrong, 1);
+            atomic_fetch_add_explicit(&g_zc_reads, 1, memory_order_relaxed);
+        }
+        rcu_aux_read_unlock();
+    }
+    return NULL;
+}
+
+static void test_zcfg_cache_reload(void) {
+    printf("[TEST] zone_entry_config() under reloads of a double-buffered configuration...\n");
+    static server_config_t buf[2];
+    CHECK(parse_named_conf(ZC_CONF("zone \"z2.test\" { type master; file \"z2\"; };"), &buf[0]) == 0);
+    atomic_store(&g_zc_active, &buf[0]);
+    g_zc_e[0] = create_new_zone_entry("z1.test.", "a");
+    g_zc_e[1] = create_new_zone_entry("z2.test.", "a");
+    g_zc_e[2] = create_new_zone_entry("z1.test.", "b");
+    g_zc_e[3] = create_new_zone_entry("z3.test.", "b");
+    pthread_t th[4];
+    for (int i = 0; i < 4; i++) CHECK(pthread_create(&th[i], NULL, zc_reader, NULL) == 0);
+    uint64_t retire = 0;
+    int rounds = 0;
+    for (; rounds < 200; rounds++) {
+        server_config_t *active = atomic_load(&g_zc_active), *standby = active == &buf[0] ? &buf[1] : &buf[0];
+        if (rounds > 0 && !rcu_writer_wait_until_safe(retire, 10000)) { CHECK(!"readers of the standby did not leave"); break; }
+        free_server_config_fields(standby);
+        /* z2 is in every other configuration: the remembered NULL and the remembered block change places */
+        CHECK(parse_named_conf(rounds % 2 ? ZC_CONF("") : ZC_CONF("zone \"z2.test\" { type master; file \"z2\"; };"), standby) == 0);
+        retire = rcu_writer_publish(&g_zc_active, standby);
+        for (long y = 0; y < 50000000L && atomic_load_explicit(&g_zc_reads, memory_order_relaxed) < (long)(rounds + 1) * 40; y++) sched_yield();   /* (the readers read every configuration; bounded) */
+    }
+    atomic_store(&g_zc_stop, true);
+    for (int i = 0; i < 4; i++) pthread_join(th[i], NULL);
+    printf("  %d reloads, %ld answers, %ld wrong\n", rounds, atomic_load(&g_zc_reads), atomic_load(&g_zc_wrong));
+    CHECK(rounds == 200 && atomic_load(&g_zc_wrong) == 0);
+    for (int i = 0; i < 4; i++) free_zone_db_entry(g_zc_e[i]);
+    free_server_config_fields(&buf[0]);
+    free_server_config_fields(&buf[1]);
+    zone_retire_process(true);
 }
 
 /* ---------------------------------------------------------------- 4b. interned settings (B7a) */
@@ -3160,6 +3294,8 @@ int main(void) {
     test_shadowing();
     test_catalog_member_wins();
     test_dbcfg();
+    test_zcfg_cache();
+    test_zcfg_cache_reload();
     test_settings_interning();
     test_secondary_entries();
     test_reuse_fast_path();

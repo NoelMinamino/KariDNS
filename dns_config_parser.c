@@ -1240,6 +1240,7 @@ static void logging_config_free(logging_config_t *lc) {
 
 void free_server_config_fields(server_config_t *cfg) {
   if (!cfg) return;
+  cfg->zcfg_token = 0;     /* (its zone { } blocks are freed below: no entry may use a pointer it remembered with this token) */
   for (int j = 0; j < cfg->bind_address_count; j++)
     free(cfg->bind_addresses[j]);
   free(cfg->bind_addresses);
@@ -10162,6 +10163,9 @@ int parse_named_conf_ext(const char *config_str, const char *initial_file_path, 
     free_server_config_fields(config);
     return -1;
   }
+  /* 0.7 (NSD gap 5): the zone { } blocks of this parse are new ones: a token no earlier parse had (the entries' remembered pointers of another token are not used) */
+  static _Atomic uint64_t zcfg_token_last;
+  config->zcfg_token = atomic_fetch_add_explicit(&zcfg_token_last, 1, memory_order_relaxed) + 1;
   return 0;
 }
 

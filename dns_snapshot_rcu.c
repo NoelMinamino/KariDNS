@@ -101,6 +101,19 @@ zone_config_t *find_zone_config_in_view(server_config_t *cfg,
   return NULL;
 }
 
+/* 0.7 (NSD gap 5): remember z as the zone { } of e in the configuration with token tok (zone_zcfg_cached() reads it).  Any thread may call it, with no lock: the one that
+ * moves the token from an older value to ZONE_ZCFG_BUSY writes the pointer, then the token (the release fence orders BUSY before the pointer for a reader that sees the new
+ * pointer, as a seqlock's writer); a thread that finds a token as new as its own, or BUSY, leaves the pair as it is.  The token only grows, so a reader of an older
+ * configuration (during a reload) never puts its pointer back over a newer one, and it never matches a reader of another configuration. */
+void zone_zcfg_remember(zone_db_entry_t *e, uint64_t tok, const zone_config_t *z) {
+  uint64_t cur = atomic_load_explicit(&e->zcfg_token, memory_order_relaxed);
+  if (cur >= tok) return;                       /* (BUSY is UINT64_MAX) */
+  if (!atomic_compare_exchange_strong_explicit(&e->zcfg_token, &cur, ZONE_ZCFG_BUSY, memory_order_relaxed, memory_order_relaxed)) return;
+  atomic_thread_fence(memory_order_release);
+  atomic_store_explicit(&e->zcfg, z, memory_order_relaxed);
+  atomic_store_explicit(&e->zcfg_token, tok, memory_order_release);
+}
+
 /* ------------------------------------------------------------------------------------------------------------- */
 /* The zone directory (D1a): the index of a view, its elements, and what is thrown away when they change         */
 /* ------------------------------------------------------------------------------------------------------------- */

@@ -525,6 +525,12 @@ struct zone_db_entry_s {
   const char *domain;
   /* the name of the view, interned (zone_view_name(): one copy for every zone of the view, never freed); a test's entry points it at a string of its own */
   const char *view_name;
+  /* 0.7 (NSD gap 5): the zone { } that find_zone_config_in_view() gave for this entry in the configuration whose zcfg_token is zcfg_token (0: none remembered yet; ZONE_ZCFG_BUSY: a
+   * thread is writing the pair), so that a query reads it here instead of looking the name up again (zone_entry_config()).  zcfg points into that configuration and is used only by a
+   * reader that holds the same one (the same token): a reload or a failed parse makes the token of the struct a new one or 0, before its blocks are freed.  Written by any reader
+   * (zone_zcfg_remember(): only a newer token replaces an older one), read with zone_zcfg_cached(); never dereferenced here.  Not used for a database zone (dbcfg). */
+  _Atomic uint64_t zcfg_token;
+  _Atomic(const zone_config_t *) zcfg;
   zone_kind_t kind;
   uint8_t source; /* zone_source_t: どこから来たゾーンか。作成時に決まり、変わらない */
   bool is_catalog_member;
@@ -1175,13 +1181,35 @@ static inline void zone_notify_request(zone_db_entry_t *e) {
   atomic_fetch_add_explicit(&g_zone_notify_pending, 1, memory_order_release);
 }
 zone_config_t *find_zone_config_in_view(server_config_t *cfg, const char *view_name, const char *domain);
+/* 0.7 (NSD gap 5): the zone { } an entry remembers for a configuration (zone_db_entry_t.zcfg).  A seqlock whose sequence is the token: true and *out = the pointer when
+ * the pair is that of the configuration with token tok (the token read before and after the pointer is tok: a writer that started in between set ZONE_ZCFG_BUSY, and a later
+ * writer only writes a larger token, so the pointer read is the one written with tok).  zone_zcfg_remember() writes the pair (dns_snapshot_rcu.c). */
+#define ZONE_ZCFG_BUSY UINT64_MAX
+static inline bool zone_zcfg_cached(const zone_db_entry_t *e, uint64_t tok, const zone_config_t **out) {
+  if (atomic_load_explicit(&e->zcfg_token, memory_order_acquire) != tok) return false;
+  const zone_config_t *z = atomic_load_explicit(&e->zcfg, memory_order_relaxed);
+  atomic_thread_fence(memory_order_acquire);
+  if (atomic_load_explicit(&e->zcfg_token, memory_order_relaxed) != tok) return false;
+  *out = z;
+  return true;
+}
+void zone_zcfg_remember(zone_db_entry_t *e, uint64_t tok, const zone_config_t *z);
 /* ゾーンエントリの設定。DB のゾーンは entry->dbcfg、それ以外は cfg の索引 (find_zone_config_in_view)。
- * 無ければ NULL。返した物は cfg を保持している間 (DB のゾーンは読み取り区間の中) だけ有効 */
+ * 無ければ NULL。返した物は cfg を保持している間 (DB のゾーンは読み取り区間の中) だけ有効
+ * 0.7 (NSD gap 5): the received settings are looked at only when the entry has some (rx_present, in the core: a zone without them does not read the extension), and the
+ * zone { } of a parsed configuration is remembered in the entry (zcfg, zcfg_token): the name is looked up once per entry and configuration, not per query. */
 static inline const zone_config_t *zone_entry_config(server_config_t *cfg, const zone_db_entry_t *entry) {
-  const zone_config_t *rx = atomic_load_explicit(&zone_xr(entry)->rxcfg, memory_order_acquire); /* B8t-2 */
-  if (rx) return rx;
+  if (atomic_load_explicit(&entry->rx_present, memory_order_acquire)) {   /* B8t-2 (set before rxcfg is published, and while rx_sh is: rxcfg is NULL without it) */
+    const zone_config_t *rx = atomic_load_explicit(&zone_xr(entry)->rxcfg, memory_order_acquire);
+    if (rx) return rx;
+  }
   if (entry->source == ZONE_SRC_DB) return atomic_load_explicit(&entry->dbcfg, memory_order_acquire);
-  return find_zone_config_in_view(cfg, zone_vname(entry), entry->domain);
+  const uint64_t tok = cfg ? cfg->zcfg_token : 0;
+  const zone_config_t *z;
+  if (tok && zone_zcfg_cached(entry, tok, &z)) return z;
+  z = find_zone_config_in_view(cfg, zone_vname(entry), entry->domain);
+  if (tok) zone_zcfg_remember((zone_db_entry_t *)entry, tok, z);
+  return z;
 }
 /* B8t-2: the settings a primary sent with the zone.  zone_rx_settings_parse() reads the text with the restricted parser (NULL when
  * there is none, or it is not accepted: logged; the text is never trusted).  zone_rx_settings_apply_locked() makes sh (ownership
