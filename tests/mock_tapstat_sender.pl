@@ -156,6 +156,27 @@ if ($cmd eq 'send') {
         die "no FINISH\n" unless defined $fin && $fin eq ctl(5, 0);
         print "OK flood ", length($all), " bytes in ", time - $t0, " s\n";
         exit 0;
+    } elsif ($mode eq 'sneak') {
+        # review of #298: COUNT connections one after another, each READY, START with one copy of the known traffic right behind it, and a close (no
+        # STOP, no wait): the data rides on the handshake.  A connection that is refused or not answered is counted and the loop goes on.  Prints how
+        # many got their ACCEPT and the seconds the loop took.
+        my $count = $ARGV[2] // 40;
+        my ($acc_n, $t0) = (0, time);
+        close $s;
+        for my $i (1 .. $count) {
+            my $c = IO::Socket::UNIX->new(Type => SOCK_STREAM, Peer => $path) or next;
+            $c->autoflush(1);
+            binmode($c);
+            print $c ctl(4, 1);
+            my $acc = read_exact($c, 42, 3);
+            if (defined $acc && $acc eq ctl(1, 1)) {
+                $acc_n++;
+                print $c ctl(2, 1) . join('', map { data($_) } traffic());
+            }
+            close $c;
+        }
+        print "OK sneak $acc_n of $count accepted in ", time - $t0, " s\n";
+        exit 0;
     } elsif ($mode eq 'nofields') {
         # READY without a content type is accepted (ACCEPT without one), then a session
         print $s ctl(4, 0);

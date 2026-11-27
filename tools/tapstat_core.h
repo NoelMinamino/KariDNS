@@ -57,6 +57,11 @@ typedef void (*fstrm_data_cb)(void *ctx, const uint8_t *frame, size_t len);
  * -1 on a protocol error (the stream must be dropped).  r->reply is filled for READY (ACCEPT) and STOP (FINISH). */
 int fstrm_feed(fstrm_reader_t *r, const uint8_t *in, size_t len, fstrm_data_cb cb, void *ctx);
 
+/* The bytes the frame being read still needs before its next step: the rest of the frame header (4, or 8 for a control frame), or the rest of a
+ * control frame's payload.  A receiver that reads the handshake while the sender is over its rate (karidns-tapstat -l) reads no more than this, so
+ * that no data frame behind START comes in with it. */
+size_t fstrm_handshake_need(const fstrm_reader_t *r);
+
 /* ---- aggregator ---- */
 
 #define TAPSTAT_DIMS 5
