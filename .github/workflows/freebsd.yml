@@ -320,7 +320,8 @@ jobs:
   # SQLite3 for parts 4 to 7).  Any ThreadSanitizer report fails the test.  A job of its own: about 10 minutes next to the other test jobs.
   # ---------------------------------------------------------------------------
   tsan:
-    name: ThreadSanitizer RCU tests on FreeBSD ${{ inputs.release }}
+    # a fixed name, as the browser job has: a job skipped by its "if" shows its name unevaluated ("${{ inputs.release }}") in the 14.4 list
+    name: ThreadSanitizer RCU tests (FreeBSD 15.1)
     if: inputs.release == '15.1'
     needs: build
     runs-on: ubuntu-latest
