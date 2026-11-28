@@ -196,6 +196,17 @@ if command -v dig >/dev/null 2>&1 && dig -v 2>&1 | grep -q "DiG 9\.20\."; then
             drc=$?
             "$DAG" @127.0.0.1 -p "$PORT" "$sc.anomaly.test" A $OPTS $mode +nohexdump > "$TMP_DIR/dag.raw" 2>&1
             grc=$?
+            # A client whose TCP source port the kernel made the server's port connects to itself and reads back its own query (QR=0, the query's
+            # flags rd ad, no records): FreeBSD lets a client take the port of the SO_REUSEPORT_LB listeners of the test's server (PORT is in the
+            # ephemeral range; port 53 is not).  CI PR #277 run 45946830406 (flag-no-qr +tcp, dig); on pc101 1 in 1281 and 1 in 55000 dig +tcp,
+            # a capture showed 127.0.0.1.PORT > 127.0.0.1.PORT SYN, SYN-ACK and the query.  Not the server's answer: that pair is asked again, once.
+            if grep -q 'flags: rd ad; QUERY: 1, ANSWER: 0, AUTHORITY: 0, ADDITIONAL: 0' "$TMP_DIR/dig.raw" "$TMP_DIR/dag.raw"; then
+                echo "NOTE [$sc $mode]: a client read back its own query (a self-connect); asked again"
+                dig @127.0.0.1 -p "$PORT" "$sc.anomaly.test" A $OPTS $mode > "$TMP_DIR/dig.raw" 2>&1
+                drc=$?
+                "$DAG" @127.0.0.1 -p "$PORT" "$sc.anomaly.test" A $OPTS $mode +nohexdump > "$TMP_DIR/dag.raw" 2>&1
+                grc=$?
+            fi
             CUR="$sc $mode (vs dig)"
             # Unlike dig, dag prints a truncated UDP answer before the TCP retry and adds the comparison summary
             # (checked with flag-tc above). In the default format the part from ";; Truncated, retrying in TCP mode."
