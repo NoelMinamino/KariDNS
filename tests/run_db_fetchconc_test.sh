@@ -107,9 +107,20 @@ udp_burst() {   # udp_burst N: one query for www.<zone> of N zones, all sent at 
 settle() {   # wait until no fetch is in flight (at most 15 s)
     i=0; while [ $i -lt 150 ] && [ "$(fq in_flight)" != "0" ]; do sleep 0.1; i=$((i + 1)); done
 }
+wq_sum() { $KCTL ipcstats 2>/dev/null | sed -n 's/^ipcworker\.[0-9]*\.queries=//p' | awk '{ s += $1 } END { print s + 0 }'; }   # queries read by the workers
+iqd() { sysctl -n net.inet.ip.intr_queue_drops 2>/dev/null || echo 0; }   # datagrams the loopback netisr IP queue dropped, host-wide
 burst() {   # burst OUTFILE: one query for www.<zone> of every zone, 60 at a time; "name answer" per line
     perl -e 'for $i (0..'"$((NZ - 1))"') { printf "www.c%04d.test\n", $i }' > "$T/names"
+    _bw0=$(wq_sum); _bi0=$(iqd)
     xargs -P 60 -n 1 sh -c 'echo "$0 $(./dag @127.0.0.1 -p '"$PORT"' "$0" A +short +nohexdump +time=6 +tries=1 2>/dev/null | head -1)"' < "$T/names" | sort > "$1"
+    BURST_INFO="the workers read $(( $(wq_sum) - _bw0 )) queries during the burst of $NZ (one try each; a lost try is not asked again), net.inet.ip.intr_queue_drops +$(( $(iqd) - _bi0 ))"
+}
+# burst_diag OUT EXPECTED: what tells a query lost in the kernel (fewer read by the workers than sent, the netisr queue dropped some) from one the
+# server read and did not answer (CI flake row 101: 1 of 400 timed out and was never attached, "attaches 399"; the log said nothing more)
+burst_diag() {
+    echo "  $BURST_INFO"
+    kari_lost_diag "$KCTL" "$PORT" $(diff "$2" "$1" | sed -n 's/^> www\.\(c[0-9]*\.test\) .*/\1/p' | head -10)
+    kari_ipc_diag "$KCTL" "$T/srv.log"
 }
 perl -e 'for $i (0..'"$((NZ - 1))"') { printf "www.c%04d.test 192.0.2.%d\n", $i, $i % 200 + 1 }' | sort > "$T/expected"
 
@@ -154,7 +165,7 @@ if [ "$STORE" = on ]; then
 else
     [ "$(fq waited)" -gt 0 ] 2>/dev/null && [ "$(fq queue_peak)" -ge 1 ] 2>/dev/null && pass "requests waited ($(fq waited), at most $(fq queue_peak) at once): the limit is the one in the configuration" || fail "nothing waited with fetch-concurrency 2: waited='$(fq waited)' queue_peak='$(fq queue_peak)'"
 fi
-if cmp -s "$T/out2" "$T/expected"; then pass "all $NZ queries were answered, and with the right address"; else fail "wrong or missing answers: $(diff "$T/expected" "$T/out2" | head -5 | tr '\n' ' ')"; fi
+if cmp -s "$T/out2" "$T/expected"; then pass "all $NZ queries were answered, and with the right address"; else fail "wrong or missing answers: $(diff "$T/expected" "$T/out2" | head -5 | tr '\n' ' ')"; burst_diag "$T/out2" "$T/expected"; fi
 settle
 FQ=$($KCTL dbstatus 2>/dev/null | grep '^fetchq:')
 case "$FQ" in
@@ -193,7 +204,7 @@ else
 fi
 [ "$(fq places)" = "0" ] && [ "$(fq queued)" = "0" ] && pass "fetchq: places=0 and queued=0 at rest" || fail "fetchq: places='$(fq places)' queued='$(fq queued)' at rest"
 [ "$(fq loader_busy)" = "0" ] && [ "$(fq park_full)" = "0" ] && pass "fetchq: no busy reply, no full park table in a normal burst" || fail "fetchq: loader_busy='$(fq loader_busy)' park_full='$(fq park_full)'"
-if cmp -s "$T/out" "$T/expected"; then pass "all $NZ answers are the right ones (the zones of the loader's workers did not mix)"; else fail "wrong or missing answers: $(diff "$T/expected" "$T/out" | head -5 | tr '\n' ' ')"; fi
+if cmp -s "$T/out" "$T/expected"; then pass "all $NZ answers are the right ones (the zones of the loader's workers did not mix)"; else fail "wrong or missing answers: $(diff "$T/expected" "$T/out" | head -5 | tr '\n' ' ')"; burst_diag "$T/out" "$T/expected"; fi
 grep -q "fetch worker\|protocol error" "$T/srv.log" && fail "the log mentions a worker or a protocol error: $(grep 'fetch worker\|protocol error' "$T/srv.log" | head -2)" || pass "no worker or protocol error in the log"
 grep -q "AddressSanitizer\|runtime error:\|ThreadSanitizer" "$T/srv.log" 2>/dev/null && fail "sanitizer report in the server log" || pass "no sanitizer report in the server log"
 stop_srv
