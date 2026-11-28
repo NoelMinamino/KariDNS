@@ -1,4 +1,3 @@
-[ "$(sf store.zones.nonstore)" = 0 ] && pass "nothing is counted as unstorable after the restart" || fail "store.zones.nonstore=$(sf store.zones.nonstore) after the restart"waitfor 30 ns_chg && pass "a change of the zone shows with the store on and off" || fail "the change of the long zone is not served"waitfor 30 ns_up && pass "the 250-character zone is answered with the store on" || fail "the 250-character zone is not answered"
 #!/bin/sh
 # run_db_store_test.sh - the zone store in the server (0.7 store S2): write-through of installed zones, ATTACH of zones that are out of memory, restart from the store,
 # a damaged record, a stale record.  The real karidns, the real karidns-dbloader and SQLite3.
@@ -157,25 +156,38 @@ waitfor() {   # waitfor SECONDS COMMAND...
 # pass_all FIRST LAST STEP: a www query for each zone, 8 at a time; prints the number that were not answered with 192.0.2.80
 pass_all() {
     z=$1; bad=0; BADZ=""; n=0; pids=""
+    : > "$T/pass.bad"
+    _iqd0=$(sysctl -n net.inet.ip.intr_queue_drops 2>/dev/null)
+    _rc0=$($KA stats 2>/dev/null | grep '^karidns_responses_total{' | tr '\n' ' ')
     while [ "$z" -ge 1 ] && [ "$z" -le "$NZ" ]; do
         k=0
         while [ $k -lt 8 ] && [ "$z" -ge 1 ] && [ "$z" -le "$NZ" ]; do
             zname $z > "$T/q.$k.z"
-            ./dag @127.0.0.1 -p "$PA" "www.$(zname $z)" A +short +nohexdump +time=8 +tries=1 > "$T/q.$k" 2>/dev/null &
+            # (stderr kept apart: a timeout prints a line, an answer without the address, e.g. SERVFAIL, prints nothing)
+            ./dag @127.0.0.1 -p "$PA" "www.$(zname $z)" A +short +nohexdump +time=8 +tries=1 > "$T/q.$k" 2> "$T/q.$k.err" &
             pids="$pids $!"
             z=$((z + $3)); k=$((k + 1))
         done
         wait $pids; pids=""
         j=0
         while [ $j -lt $k ]; do
-            [ "$(head -1 "$T/q.$j")" = "192.0.2.80" ] || { bad=$((bad + 1)); BADZ="$BADZ $(cat "$T/q.$j.z")"; }
+            if [ "$(head -1 "$T/q.$j")" != "192.0.2.80" ]; then
+                bad=$((bad + 1)); BADZ="$BADZ $(cat "$T/q.$j.z")"
+                echo "    $(cat "$T/q.$j.z") (batch ended $(kari_now)): $(cat "$T/q.$j" "$T/q.$j.err" | head -3 | tr '\n' ' ')" >> "$T/pass.bad"
+            fi
             j=$((j + 1))
         done
         n=$((n + k))
     done
     PASS_N=$n
     PASS_BAD=$bad
-    if [ "$bad" != 0 ]; then echo "  $bad queries not answered right: $(park_drops)"; kari_lost_diag "$KA" "$PA" $BADZ; kari_ipc_diag "$KA" "$T/a.log"; fi
+    if [ "$bad" != 0 ]; then
+        echo "  what dag printed for them (nothing: an answer without the address, e.g. SERVFAIL):"; head -10 "$T/pass.bad"
+        echo "  net.inet.ip.intr_queue_drops +$(( $(sysctl -n net.inet.ip.intr_queue_drops 2>/dev/null || echo 0) - ${_iqd0:-0} )) during the pass (the loopback netisr IP queue, maxlen 256: a reply dropped there never reaches dag)"
+        echo "  responses before the pass: $_rc0"
+        echo "  responses after the pass:  $($KA stats 2>/dev/null | grep '^karidns_responses_total{' | tr '\n' ' ')"
+        echo "  $bad queries not answered right: $(park_drops)"; kari_lost_diag "$KA" "$PA" $BADZ; kari_ipc_diag "$KA" "$T/a.log"
+    fi
 }
 # the answers of the subset on a port, normalised, into FILE.  ref: the reference server (every zone in memory, no store): a query of it that got no answer at all (dag: "no servers could
 # be reached", after its own tries) is asked again, up to 5 times, so that one lost datagram of the reference does not show as a difference of the server under test (CI 2026-11-25:
