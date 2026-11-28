@@ -30,7 +30,7 @@ What changes, what it breaks, and what to do. The step-by-step version is [docs/
   cost disk: 10M zones of 100 records took 84 GB instead of 51 GB (+63 %); 20,000 zones of 10 records took 0.15 %
   more. A store written before keeps its layout; zones written again and records the cleaner moves are aligned.
   `store-align no;` keeps the old layout (for a large store on a tight disk).
-- **ZFS: set `logbias=throughput` on the store dataset** (ZFS sync-stall PR; docs/karidns.md "Cold zones while ZFS
+- **ZFS: set `logbias=throughput` on the store dataset** (#318; docs/karidns.md "Cold zones while ZFS
   syncs"). During a first fill on ZFS a read of a cold stored zone waits while a transaction group or a sync of the
   segments runs, and part of the queries for such zones goes unanswered then (dropped, no SERVFAIL). On the build
   host (10M zones from PostgreSQL under load, 3 runs each) `logbias=throughput` lowered that share from about 24 %
