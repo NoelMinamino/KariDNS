@@ -10,6 +10,8 @@
 #   LOST_S (default 3): a query unanswered this long is given up (tests/run_db_warm_test.sh: queries held by warm-before-serve wait longer).
 # Output (one line): "sent=S received=R answered=A unanswered=U bad=B socks=K secs=T senderr=E"
 #   bad = answers that failed a check above; socks = the sockets that were answered at least once.
+#   On stderr: one line per query given up and per bad answer (the first 10), with the check that failed (the source address and port seen and wanted,
+#   the id and the socket), so that one failure says what came.
 #   senderr = sends the kernel refused at first (tried again, every 5 ms, up to 200 times).  The client waits WAIT_S seconds after the last send for the answers (a bound).
 use strict;
 use warnings;
@@ -49,8 +51,10 @@ my %want_ip;                                   # id => the index in @dest of the
 my %sent_at;                                   # id => the time it was sent (a query unanswered for $lost_s seconds is given up)
 my $lost_s = $lost_arg || 3;
 my %given_up;                                  # id => the socket of a query given up
+my $n_given_up = 0;                            # (the first 10 are told on stderr, and the number at the end)
 my ($sent, $received, $answered, $bad, $senderr) = (0, 0, 0, 0, 0);
 my (%seen, %socks_ok);
+my $t0 = time;                                 # (the times in the stderr lines are since here)
 my $buf;
 sub drain {
     my $got = 0;
@@ -66,9 +70,23 @@ sub drain {
             my ($fport, $faddr) = sockaddr_in($from);
             my $want = $pending{$id} // $given_up{$id};       # (a late answer to a query given up is still checked and counted)
             # (the A record 192.0.2.1 is in the answer: RDLENGTH 4 and the address; the datagram comes from the address the query went to, at the server's port)
-            my $ok = ($fl & 0x8000) && ($fl & 0xf) == 0 && $an == 1 && $fport == $port && defined $want && $want == $k
-                && index($buf, pack("nC4", 4, 192, 0, 2, 1)) > 12 && $faddr eq $dest[$want_ip{$id}];
-            $bad++ unless $ok;
+            my @why;
+            push @why, "QR clear" unless $fl & 0x8000;
+            push @why, "rcode " . ($fl & 0xf) if $fl & 0xf;
+            push @why, "ancount $an" if $an != 1;
+            push @why, "no A 192.0.2.1" unless index($buf, pack("nC4", 4, 192, 0, 2, 1)) > 12;
+            push @why, "an id no query has (or had)" unless defined $want;
+            push @why, "the id of a query of socket $want" if defined $want && $want != $k;
+            my $want_from = defined $want_ip{$id} ? inet_ntoa($dest[$want_ip{$id}]) . ":$port" : "?";
+            my $from_s = inet_ntoa($faddr) . ":$fport";
+            push @why, "from $from_s, want $want_from" if $fport != $port || !defined $want_ip{$id} || $faddr ne $dest[$want_ip{$id}];
+            if (@why) {
+                $bad++;
+                # (to stderr, the first 10: which check failed, so that one failure in CI says what came; the summary line stays the last of stdout)
+                printf STDERR "bad answer: id %d on socket %d (port %d) from %s, %d bytes, flags 0x%04x, %s; t=%.2f s%s: %s\n", $id, $k,
+                    (sockaddr_in(getsockname($sock[$k])))[0], $from_s, length($buf), $fl, $seen{$id} ? "a repeat" : "first for this id",
+                    time - $t0, ($given_up{$id} // -1) >= 0 && !defined $pending{$id} ? " (given up before)" : "", join("; ", @why) if $bad <= 10;
+            }
             if (!$seen{$id}++) { $answered++; $socks_ok{$k} = 1; }
             delete $pending{$id};
             delete $sent_at{$id};
@@ -77,7 +95,6 @@ sub drain {
     return $got;
 }
 
-my $t0 = time;
 my $next = 1;
 my $end_sent;
 while (1) {
@@ -96,7 +113,13 @@ while (1) {
         $moved++;
     }
     $moved += drain();
-    for my $id (keys %pending) { next if time - $sent_at{$id} < $lost_s; $given_up{$id} = delete $pending{$id}; delete $sent_at{$id}; $moved++; }   # (given up: counted as unanswered)
+    for my $id (keys %pending) {                 # (given up: counted as unanswered unless its answer comes later)
+        next if time - $sent_at{$id} < $lost_s;
+        $n_given_up++;
+        printf STDERR "given up: id %d (socket %d, to %s) unanswered for %.1f s; t=%.2f s\n", $id, $pending{$id}, inet_ntoa($dest[$want_ip{$id}]),
+            time - $sent_at{$id}, time - $t0 if $n_given_up <= 10;
+        $given_up{$id} = delete $pending{$id}; delete $sent_at{$id}; $moved++;
+    }
     $end_sent = time if $next > $n && !defined $end_sent;
     last if time - $t0 > 120;                    # (a server that does not answer at all: do not run for ever)
     last if $next > $n && !%pending;
@@ -105,5 +128,6 @@ while (1) {
 }
 for (my $q0 = time; time - $q0 < 1; ) { $q0 = time if drain(); sleep(0.01); }
 my $secs = time - $t0;
+printf STDERR "given up: %d queries in all\n", $n_given_up if $n_given_up > 10;
 printf("sent=%d received=%d answered=%d unanswered=%d bad=%d socks=%d secs=%.2f\n", $sent, $received, $answered, $n - $answered, $bad, scalar(keys %socks_ok), $secs);
 exit(0);
