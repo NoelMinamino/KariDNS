@@ -35,7 +35,7 @@ What changes, what it breaks, and what to do. The step-by-step version is [docs/
   segments runs, and part of the queries for such zones goes unanswered then (dropped, no SERVFAIL). On the build
   host (10M zones from PostgreSQL under load, 3 runs each) `logbias=throughput` lowered that share from about 24 %
   to 19 % of the cold queries sent during syncs, at no cost to the fill. UFS does not show the stall.
-- **ZFS: cap the ARC on a host with a large store** (docs/karidns.md "ARC size on a host with a large store"). The
+- **ZFS: cap the ARC on a host with a large store** (#319; docs/karidns.md "ARC size on a host with a large store"). The
   store's tables stay in the Backend's memory (about 12 GB for 100 million zones); an ARC left at its default
   (RAM - 1 GiB) pushes them out during a first fill and queries are lost. On a 16 GB host with 100M zones, an ARC
   capped at 4 GiB lost 5.3 % of the known-zone queries during the fill against 11.3 % uncapped (no swap against
@@ -43,7 +43,7 @@ What changes, what it breaks, and what to do. The step-by-step version is [docs/
 - **`fetch-rate` defaults to unlimited** (was 200 zones/s) and database zones are answered, not refused (#184).
   A query beyond `fetch-concurrency` or a configured rate waits (parked) instead of being shed. Under overload a
   query for a database zone is dropped and counted, not answered REFUSED or SERVFAIL (#194, #195).
-- **No SERVFAIL while data is being loaded** (first-fill latency PR). An ordinary query whose zone or name could not be
+- **No SERVFAIL while data is being loaded** (#279). An ordinary query whose zone or name could not be
   read (the database is down, the loader is gone, a fetch or lookup failed) is dropped and counted
   (`store.park.drop.failed`, `store.lookup.drop.failed`, which replaces `store.lookup.servfail`), not answered
   SERVFAIL + EDE 14; one WARNING a minute says how many were not answered, a NOTICE when the database is read again.
@@ -54,7 +54,7 @@ What changes, what it breaks, and what to do. The step-by-step version is [docs/
   EDE 14 "Zone not ready (empty)") SERVFAIL + EDE 14, as BIND; `drop` counts them in
   `karidns_not_ready_dropped_total` (karictl stats). The responses log says `[DROP:NOT-READY]`, and a TCP
   connection stays open after such a message. A zone whose file failed to load stays SERVFAIL.
-- **The fill of a store has its own limit, outside `fetch-concurrency`** (first-fill latency PR). Its bodies take no
+- **The fill of a store has its own limit, outside `fetch-concurrency`** (#279). Its bodies take no
   place of `fetch-concurrency` (every place is the queries'): 128 for each worker of the fill (`loader-threads` - 1, 256..1024) are in flight while no query waits (32 at most
   while one does), and the loader reads up to 128 zones of the fill a statement (16 for queries) with one worker left
   to the queries. The load on the database is bounded by `loader-threads`. The loader's queue holds 1280 requests (was
@@ -64,7 +64,7 @@ What changes, what it breaks, and what to do. The step-by-step version is [docs/
   by itself; one in which reads of the database fail is counted apart (`store.ingest.fill_failed_windows`). The loader
   drops a request of the fill that waited 30 s (the Backend gave it up), and a request it did not answer in time is
   counted apart (`store.ingest.fetch_timeouts`), not as a failed read of the database. While attaches of queries queue up the fill is held to 32 in flight (`store.ingest.fill_throttled`).
-- **The unlogged first fill begins when the store opens empty** (first-fill latency PR), not at the first pass: under
+- **The unlogged first fill begins when the store opens empty** (#279), not at the first pass: under
   queries from the start the lookups used to make the store non-empty and the whole fill ran with its journal. With
   no pass in 10 minutes it is given up (logged fill). Secondary copies are never written in it (put off to its end).
 - **More threads by default, and different ones** (#220, #226, #227).
@@ -204,6 +204,20 @@ Fixes from the external reviews and audits of the 0.7 cycle. Each has a test tha
   2^31-1 (24 days), so a hung plugin or forwarder could hold an async thread and a reload's reader that long; 0 (which
   meant the default, 2000) and larger values are configuration errors now.
 
+- **Review leftovers, re-checked 2026-11-26** (#280, #281):
+  - a loader that announces a large zone image and sends little no longer makes the Backend allocate the announced
+    size: it is checked against `max-zone-bytes` and the buffer grows by doubling from at most 1 MiB (D-L1);
+  - the general syslog path has a rate limit per call site (200 lines/s, 20/s on the query path, 1000/s while
+    debugging) and says once a second how many lines like one were suppressed (`[Logging] N line(s) like "..."
+    suppressed`) (M-3);
+  - a failed `procctl(PROC_TRAPCAP_CTL)` is logged before `cap_enter()`;
+  - `karicheck zone` run by root reads the file as root, then drops for good to `nobody` (or `-u user`; `-u root`
+    keeps root) before it parses (T4-L4);
+  - `karidns-tapstat -u USER` (repeatable) admits only those senders by their peer credentials (T4-L5);
+  - the reconcile pass state of the store is read and written under its lock;
+  - WebAdmin: the login rate bucket of a user name is per (name, address), so guesses from one address no longer
+    lock the owner out from another (W2-L1, #281).
+
 - **Server core review, group 1** (#248): a TCP client that reads a few bytes now and then no longer holds a worker in
   a send for ever (`tcp-idle-timeout` bounds the send of one answer, RFC 7766 section 6.2.3); a rollback check at
   serial 0 (a secondary at serial 0 accepted an older first SOA); the dnstap socket rights are cut where it is
@@ -278,23 +292,38 @@ Fixes from the external reviews and audits of the 0.7 cycle. Each has a test tha
 
 ### Bug fixes
 
-- **karidns-tapstat: a second connection of a throttled sender was starved** (`-l`): the connections of one sender
+- **karicheck db looked at the default store directory when `zone-store` named another** (#KZS): with
+  `options { zone-store "<dir>"; }` and no `store` in the database block, `karicheck db` took the file system of
+  `/var/db/karidns/store`: the "memory on ZFS" line (ARC + Backend heap) and the COPY / MAP mode of its estimate
+  followed the wrong directory, and the start's existence and owner checks of the store directory were skipped. It now
+  resolves the directory with the server's own function (`db_store_dir_cfg()`, moved to the configuration code). The
+  server's "the zone store was created" line named the default directory in the same case.
+- **Database zones that a reader accepted and the loader could not encode** (#264, found by `fuzz_pdns_content`): an
+  NSEC3 next hashed owner name that decodes to no octet was encoded with hash length 0 (RFC 5155 section 3.1.6: 1 to
+  255), and the zone serial was read from the reference SOA serial cut to 40 characters (a serial with many leading
+  zeros read 0). The encoder refuses the empty hash (the row fails with its record id; zone files too), and one reader
+  takes the serial, the timers and the reference serial with all their digits. No memory-safety issue: the image
+  self-check caught both.
+- **WebAdmin: a screen that needs `GET /version` is drawn once** (#285): after a sign-in it was drawn twice (the
+  forced two-step screen sent `enroll` twice), after a TOTP confirmation or a sign-in in another tab it stayed without
+  the version. It is drawn when the version has come or failed, or after 5 s without it and again when it comes.
+- **karidns-tapstat: a second connection of a throttled sender was starved** (#298; `-l`): the connections of one sender
   share its byte bucket, and the one read first in every round took every refill, so a second connection was not
   read until the first had finished and its handshake went unanswered for seconds (the sender gave up waiting for
   `ACCEPT`; the flake of run_tapstat_test under the -j 4 suite). Each refill now goes to the connection after the one
   that read data last. A handshake is read while the sender is paused, exactly the rest of its current control frame
   and never a data frame behind START. A data frame header before START is refused at the header, before anything is
   allocated for it.
-- **Out of memory while a zone element is retired**: when the retire queue could not take an element (database
+- **Out of memory while a zone element is retired** (#295): when the retire queue could not take an element (database
   zones: a zone taken out of memory, a staged attach), the element was freed after a wait of 60 seconds whether or
   not the readers had left. It is now freed only when they have; a reader that stays past the wait leaves it in
   memory (leaked), with one `[EpochRCU] out of memory retiring ...` error line.
-- **Replies seconds late on FreeBSD 14 under memory pressure**: FreeBSD 14 swaps out a whole process that has
+- **Replies seconds late on FreeBSD 14 under memory pressure** (#297): FreeBSD 14 swaps out a whole process that has
   slept longer than `vm.swap_idle_threshold1` (2 s) when memory is short, and an idle UDP router was swapped out:
   the replies of its workers waited until it was read back from swap (3 to 12 s on the loaded 14.4 CI runners, the
   flake of run_webadmin_versions_test). The routers, the connect broker and the manager now wake once a second. FreeBSD 15 does
   not swap processes out.
-- **NXNAME questions** (RFC 9824 §3.5): a query for type NXNAME is answered FORMERR with EDE 30 from this server's own
+- **NXNAME questions** (#293; RFC 9824 §3.5): a query for type NXNAME is answered FORMERR with EDE 30 from this server's own
   data, and an MQTYPE-Query option that lists NXNAME is FORMERR (RFC 10029 §3.3); before, it was answered NODATA.
   Forward and program zones relay it as before. `KariDNS_RFC_GUIDELINE.md` was checked against the
   RFC texts: titles, section numbers and moved source files corrected.
@@ -310,7 +339,7 @@ Fixes from the external reviews and audits of the 0.7 cycle. Each has a test tha
   `memory-limit` and a quarter of the RAM) the server deactivates the clean file pages of the store's tables, index
   and first-fill runs a slice at a time, so the kernel frees them before it swaps other memory (100M zones on 16 GB
   swapped before).
-- **Stop with a zone store**: the manager gives a backend that is writing the clean checkpoint of its zone store up
+- **Stop with a zone store** (#263): the manager gives a backend that is writing the clean checkpoint of its zone store up
   to 120 seconds (it logs at 10 seconds that it waits; a second SIGTERM still kills at once). Before, a kill at 10
   seconds while the fsync() calls waited for the disk made the next start go back to the last bulk checkpoint of a
   first fill, at worst to an empty store.
@@ -378,7 +407,14 @@ server on pc31 with 8 CPUs and a one-queue em0, or on a VM; the client on anothe
 ### Documentation / tools
 
 - dag prints type 128 as `NXNAME` (RFC 9824), also in NSEC type bit maps; dig 9.20 prints `TYPE128` (an intentional
-  difference, docs/dag.md).
+  difference, docs/dag.md) (#293).
+- `karicheck zone` and `karidns-dbloader --check` (`dns_zone_lint.c`) warn about the NSEC chain (a duplicate NSEC, one
+  below a delegation or outside the zone, the canonical order, closure at the apex, gaps, the type bitmap; RFC 4034
+  4.1, RFC 4035 2.3) and the SOA timers (RFC 1912 2.2, RFC 2308 5): 9 new codes, warnings only (#280).
+- docs/karidns.md: when `worker-threads` at twice the routers pays (many client flows) and why the default stays 4+4
+  on 8 CPUs (#268); outbound transfers are bounded by the server-wide `transfers-out`, there is no limit of 4 per zone
+  (#289); the 0.7 sweep of stale statements in the manuals, docs/UPGRADING.md and the program-zone and ECS guides
+  (#292); the WebAdmin browser tests run firefox or firefox-esr (#273).
 - New manuals: `docs/dnsqps.md`, `docs/UPGRADING.md`; manual pages for every tool (`man/`, generated by `make man`,
   #181); the dnstap consumer stream, the store, secondary zones and the memory limit in `docs/karidns.md`.
 - `karicheck`: new codes (`conf.zone.primary-settings-unsigned`, `conf.alias-max-refresh-time`, `io.nul-byte`,

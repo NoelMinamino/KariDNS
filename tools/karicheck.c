@@ -867,11 +867,13 @@ KARIDNS_TOOL_FN int kc_check_database(const server_config_t *cfg) {
     if (db->warm_before_serve && no_limit)
         kc_warning(&t, DC_CONF_DATABASE_WARM, "database: warm-before-serve only waits for the directory to be loaded without memory-limit (%s: every zone is read at the start)\n", why);
     /* 0.7 store S2: the directory of the zone store: karidns makes the last component of an explicit directory (mode 0700, the user it runs as) and refuses to start when it cannot use it */
-    if (db->store_dir && !db->store_none) {
+    bool sdflt = false;
+    const char *sdir = db_store_dir_cfg(cfg, &sdflt, NULL);        /* (as the server resolves it: database { store }, else options { zone-store }; the default directory is not checked) */
+    if (sdir && !sdflt) {
         struct stat ssb;
-        if (stat(db->store_dir, &ssb) == 0) {
+        if (stat(sdir, &ssb) == 0) {
             if (!S_ISDIR(ssb.st_mode)) {
-                kc_error(&t, DC_CONF_DATABASE, "database store '%s' is not a directory\n", db->store_dir);
+                kc_error(&t, DC_CONF_DATABASE, "database store '%s' is not a directory\n", sdir);
             } else {
                 /* the owner and mode rules of the start (store_dir_owner_ok(), the function db_store_frontend_open() uses): root starts karidns and hands the directory to
                  * `user`, so it must belong to root or to that user and not be writable by group or others; a start by a user needs a directory of that user */
@@ -883,16 +885,16 @@ KARIDNS_TOOL_FN int kc_check_database(const server_config_t *cfg) {
                 bool priv = geteuid() == 0 || run_uid != (uid_t)-1;
                 char own[200];
                 if (!store_dir_owner_ok(&ssb, priv, run_uid, geteuid(), own, sizeof(own)))
-                    kc_error(&t, DC_CONF_DATABASE, "database store '%s' %s; karidns refuses to start\n", db->store_dir, own);
+                    kc_error(&t, DC_CONF_DATABASE, "database store '%s' %s; karidns refuses to start\n", sdir, own);
             }
         } else if (errno == ENOENT) {
             char par[PATH_MAX];
-            const char *sl = strrchr(db->store_dir, '/');
+            const char *sl = strrchr(sdir, '/');
             if (!sl) snprintf(par, sizeof(par), ".");
-            else if (sl == db->store_dir) snprintf(par, sizeof(par), "/");
-            else snprintf(par, sizeof(par), "%.*s", (int)(sl - db->store_dir), db->store_dir);
+            else if (sl == sdir) snprintf(par, sizeof(par), "/");
+            else snprintf(par, sizeof(par), "%.*s", (int)(sl - sdir), sdir);
             if (stat(par, &ssb) != 0 || !S_ISDIR(ssb.st_mode))
-                kc_error(&t, DC_CONF_DATABASE, "database store '%s' does not exist and neither does its parent directory '%s' (karidns makes the last component only)\n", db->store_dir, par);
+                kc_error(&t, DC_CONF_DATABASE, "database store '%s' does not exist and neither does its parent directory '%s' (karidns makes the last component only)\n", sdir, par);
         }
     }
     /* B7a: without acl-ceiling the ACLs a database zone carries (allow-transfer, allow-update from the metadata or a profile)
@@ -1990,26 +1992,20 @@ KARIDNS_TOOL_FN int kc_db_run_source(const server_config_t *cfg, const kc_dbsrc_
  * are asked for, so what it says about memory-limit is the share of zones that fit and the recommendation, as the server says it at its start. */
 /* 0.7 S6 (store design 3.6): when the store is on ZFS (the images are read with pread() and the ARC is their cache), the Backend's heap, vfs.zfs.arc.max, the loader and about a
  * gigabyte for the system have to fit in RAM together.  Said as an information line (a sum that is over RAM says so in its text); the server cannot read these values in its sandbox. */
-/* 0.7.x: will the server put the database zones in the zone store?  As the server decides it (dns_db_store.c, db_store_wanted()): not with `store none` or
+/* 0.7.x: will the server put the database zones in the zone store?  As the server decides it (db_store_wanted(), dns_config_parser.c): not with `store none` or
  * `zone-store none`; a directory that is named is used; the default one only when its parent exists and KARIDNS_NO_DEFAULT_STORE is not 1 (the tests).  The default
  * memory-limit comes with the store only. */
 KARIDNS_TOOL_FN bool kc_db_uses_store(const server_config_t *cfg) {
-    if (!db_uses_store(cfg)) return false;
-    if (cfg->database.store_dir || (cfg->zone_store_set && cfg->zone_store_dir)) return true;
-    const char *nodef = getenv("KARIDNS_NO_DEFAULT_STORE");
-    if (nodef && strcmp(nodef, "1") == 0) return false;
-    char parent[KARIDNS_DB_PATH_MAX + 1];
-    snprintf(parent, sizeof(parent), "%s", KARIDNS_DB_DEFAULT_STORE_DIR);
-    char *sl = strrchr(parent, '/');
-    if (sl && sl != parent) *sl = '\0';
-    struct stat st;
-    return stat(parent, &st) == 0 && S_ISDIR(st.st_mode);
+    return db_uses_store(cfg) && db_store_wanted(cfg);
 }
 
-KARIDNS_TOOL_FN bool kc_db_store_on_zfs(const database_config_t *db) {
+/* is the store directory the server will use (db_store_dir_cfg(): database { store }, else options { zone-store }, else the default) on ZFS? */
+KARIDNS_TOOL_FN bool kc_db_store_on_zfs(const server_config_t *cfg) {
 #if defined(__FreeBSD__)
+    const char *dir = db_store_dir_cfg(cfg, NULL, NULL);
+    if (!dir) return false;
     char path[KARIDNS_DB_PATH_MAX + 1];
-    snprintf(path, sizeof(path), "%s", db->store_dir ? db->store_dir : KARIDNS_DB_DEFAULT_STORE_DIR);
+    snprintf(path, sizeof(path), "%s", dir);
     struct statfs sfs;
     bool have = false;
     for (;;) {                                  /* (the directory may not be made yet: its nearest parent is on the same file system) */
@@ -2020,15 +2016,15 @@ KARIDNS_TOOL_FN bool kc_db_store_on_zfs(const database_config_t *db) {
     }
     return have && strcmp(sfs.f_fstypename, "zfs") == 0;
 #else
-    (void)db;
+    (void)cfg;
     return false;
 #endif
 }
 
-KARIDNS_TOOL_FN void kc_db_zfs_memory(const database_config_t *db, const ma_est_t *e) {
+KARIDNS_TOOL_FN void kc_db_zfs_memory(const server_config_t *cfg, const ma_est_t *e) {
 #if defined(__FreeBSD__)
-    if (db->store_none || db->store_mode == 1) return;           /* (`store-mode map` keeps the images in the page cache: not what this sums) */
-    if (!kc_db_store_on_zfs(db)) return;
+    if (!kc_db_uses_store(cfg) || cfg->database.store_mode == 1) return;     /* (no store; `store-mode map` keeps the images in the page cache: not what this sums) */
+    if (!kc_db_store_on_zfs(cfg)) return;
     uint64_t arc = 0;
     size_t l = sizeof(arc);
     if (sysctlbyname("vfs.zfs.arc.max", &arc, &l, NULL, 0) != 0 || (l != 4 && l != 8)) return;
@@ -2039,7 +2035,7 @@ KARIDNS_TOOL_FN void kc_db_zfs_memory(const database_config_t *db, const ma_est_
     ma_text_arc(t, sizeof(t), &a);
     dns_diag(DIAG_INFO, DC_DB_MEMORY_ESTIMATE, NULL, 0, "%s\n", t);
 #else
-    (void)db;
+    (void)cfg;
     (void)e;
 #endif
 }
@@ -2059,13 +2055,13 @@ KARIDNS_TOOL_FN void kc_db_memory(const server_config_t *cfg, const kc_msum_t *m
         dns_diag(DIAG_INFO, DC_DB_MEMORY_ESTIMATE, NULL, 0, "%s (the RAM of this host)\n", d);
     }
     in.fetch_conc = db->fetch_concurrency ? db->fetch_concurrency : (db->loader_threads ? db->loader_threads : 1) * KARIDNS_DB_FETCH_CONC_PER_THREAD;
-    if (kc_db_uses_store(cfg)) in.store_mode = db->store_mode == 1 ? MA_STORE_MAP : db->store_mode == 2 ? MA_STORE_COPY : kc_db_store_on_zfs(db) ? MA_STORE_COPY : MA_STORE_MAP;      /* (0.7 D6: the store is the directory; the loader keeps no table) */
+    if (kc_db_uses_store(cfg)) in.store_mode = db->store_mode == 1 ? MA_STORE_MAP : db->store_mode == 2 ? MA_STORE_COPY : kc_db_store_on_zfs(cfg) ? MA_STORE_COPY : MA_STORE_MAP;      /* (0.7 D6: the store is the directory; the loader keeps no table) */
     ma_est_t e;
     ma_estimate(&in, &e);
     char t[900];
     ma_text_estimate(t, sizeof(t), &e);
     dns_diag(DIAG_INFO, DC_DB_MEMORY_ESTIMATE, NULL, 0, "%s\n", t);
-    kc_db_zfs_memory(db, &e);
+    kc_db_zfs_memory(cfg, &e);
     if (ma_text_advice(t, sizeof(t), &e) == 0) return;
     if (e.level == MA_LEVEL_ERROR) {
         dns_diag(DIAG_ERROR, DC_DB_MEMORY_LIMIT_TINY, NULL, 0, "%s\n", t);
