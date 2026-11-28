@@ -23,6 +23,7 @@
 #include <sys/wait.h>
 #include <poll.h>
 #include <signal.h>
+#include <sys/mman.h>
 #ifdef __FreeBSD__
 #include <sys/capsicum.h>
 #include <sys/param.h>
@@ -4150,6 +4151,22 @@ static void test_async_io_pool_and_tasks(void) {
 
     init_async_io_pool();
     assert(g_async_io_pool.running == true);
+    {
+        /* 0.7: init must not touch the queue (about 6 MB of BSS that is zero already): a memset of the whole pool made it resident in every Backend.
+         * Nothing has used the queue yet, so only the pages it shares with its neighbours may be resident; the old code made all ~1500 resident. */
+        const uintptr_t pg = (uintptr_t)sysconf(_SC_PAGESIZE);
+        const uintptr_t q0 = (uintptr_t)g_async_io_pool.queue & ~(pg - 1);
+        const uintptr_t q1 = (uintptr_t)g_async_io_pool.queue + sizeof(g_async_io_pool.queue);
+        const size_t npg = (size_t)((q1 - q0 + pg - 1) / pg);
+        char *vec = calloc(npg, 1);
+        assert(vec);
+        assert(mincore((void *)q0, (size_t)(q1 - q0), vec) == 0);
+        size_t res = 0;
+        for (size_t i = 0; i < npg; i++) res += (vec[i] & 1) ? 1 : 0;   /* (bit 0: MINCORE_INCORE) */
+        printf("  async I/O queue: %zu of %zu pages resident after init\n", res, npg);
+        assert(npg > 1000 && res <= 8);
+        free(vec);
+    }
 
     // Setup active zone snapshot for async query resolution
     zone_arena_t arena;
