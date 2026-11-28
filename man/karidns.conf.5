@@ -5950,8 +5950,9 @@ SATA SSD, a first fill of 10 million zones from PostgreSQL under a query load,
 to 19.9 %) with \fBlogbias=throughput\fR, with no cost to the fill (1136 to 1188
 s, against 1149 to 1285 s); outside the syncs under 0.5 % either way. A smaller
 \fBvfs.zfs.dirty_data_max\fR (256 MiB) made no difference, nor did pacing the
-fill while attaches wait, and a larger \fBvfs.zfs.vdev.sync_read_max_active\fR
-(with \fBsync_read_min_active\fR, 32 / 64) made it worse in a first fill (one
+fill while attaches wait or syncing the segments only at checkpoints of a fixed
+size, and a larger \fBvfs.zfs.vdev.sync_read_max_active\fR (with
+\fBsync_read_min_active\fR, 32 / 64) made it worse in a first fill (one
 run). \fBScrub.\fR Every \fBstore\-scrub\-interval\fR the store reads every
 record, at 16 MiB a second at the most: the table record (its CRC), the way the
 name and source indexes lead to the zone, and for a stored zone the whole image:
