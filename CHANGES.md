@@ -292,7 +292,7 @@ Fixes from the external reviews and audits of the 0.7 cycle. Each has a test tha
 
 ### Bug fixes
 
-- **karicheck looked at the default store directory when `zone-store` named another** (#KZS): with
+- **karicheck looked at the default store directory when `zone-store` named another** (#320): with
   `options { zone-store "<dir>"; }` and no `store` in the database block, `karicheck db` took the file system of
   `/var/db/karidns/store`: the "memory on ZFS" line (ARC + Backend heap) and the COPY / MAP mode of its estimate
   followed the wrong directory, and `karicheck conf` skipped the start's existence and owner checks of the store
