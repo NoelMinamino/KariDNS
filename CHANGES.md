@@ -35,6 +35,11 @@ What changes, what it breaks, and what to do. The step-by-step version is [docs/
   segments runs, and part of the queries for such zones goes unanswered then (dropped, no SERVFAIL). On the build
   host (10M zones from PostgreSQL under load, 3 runs each) `logbias=throughput` lowered that share from about 24 %
   to 19 % of the cold queries sent during syncs, at no cost to the fill. UFS does not show the stall.
+- **ZFS: cap the ARC on a host with a large store** (docs/karidns.md "ARC size on a host with a large store"). The
+  store's tables stay in the Backend's memory (about 12 GB for 100 million zones); an ARC left at its default
+  (RAM - 1 GiB) pushes them out during a first fill and queries are lost. On a 16 GB host with 100M zones, an ARC
+  capped at 4 GiB lost 5.3 % of the known-zone queries during the fill against 11.3 % uncapped (no swap against
+  ~60 MB). `primarycache=metadata` on the store's dataset is no substitute (slower attaches, the loss stays).
 - **`fetch-rate` defaults to unlimited** (was 200 zones/s) and database zones are answered, not refused (#184).
   A query beyond `fetch-concurrency` or a configured rate waits (parked) instead of being shed. Under overload a
   query for a database zone is dropped and counted, not answered REFUSED or SERVFAIL (#194, #195).

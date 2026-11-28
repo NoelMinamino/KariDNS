@@ -5953,43 +5953,66 @@ s, against 1149 to 1285 s); outside the syncs under 0.5 % either way. A smaller
 fill while attaches wait or syncing the segments only at checkpoints of a fixed
 size, and a larger \fBvfs.zfs.vdev.sync_read_max_active\fR (with
 \fBsync_read_min_active\fR, 32 / 64) made it worse in a first fill (one
-run). \fBScrub.\fR Every \fBstore\-scrub\-interval\fR the store reads every
-record, at 16 MiB a second at the most: the table record (its CRC), the way the
-name and source indexes lead to the zone, and for a stored zone the whole image:
-its checksum and the structure check that is made at every attach. A zone whose
-image is bad becomes known without an image and is read from the database again
-(the log says which zone; \fBstore.scrub.bad_images\fR); the cleaner does the
-same for a record that fails its checksum when it is to be copied. A zone that
-is in memory with that image (the store is in MAP mode: the zone serves the
-mapped pages) is taken out of memory too, even when it is pinned, so that it is
-read again and does not go on serving damaged pages (when a reader or a transfer
-holds it, the store tries again at the next tick). A table record that is
-damaged or an index entry that does not lead to its zone is repaired at the end
-of the pass: the indexes are built again from the zone table, and a record that
-cannot be read is dropped and comes again with the next pass of the
-loader. \fBkarictl store scrub start\fR starts a pass now, \fBstore scrub
-stop\fR ends it. \fBError ring.\fR \fBerr.ring\fR (14 MB, sparse until used)
-keeps the last 65,536 texts of zones that were refused or failed (which zone id,
-which version, when, why), written in place and wrapped; it is not journaled and
-holds no heap (\fBstore.errors.total\fR). The server keeps the last 512 texts in
-memory as well (\fBzonestatus\fR asks the memory first, then the file): a
-rejected zone of the store has no registry element, so after a text is pushed
-out of memory, or after a restart, the file still has it, by zone id. A text is
-forgotten when a version of the zone is registered. A zone id is reused after a
-delete, so a text is only shown for a zone whose record is still the one it was
-made for. The NOTIFY that is due for a zone is a flag of its record
-(\fBNOTIFY_DUE\fR, journaled, so a NOTIFY that was due at a crash is due after
-the restart). \fBWhat a zone in memory costs.\fR A zone that is attached takes
-one slot of 256 octets of the pool of zone entries (a light entry: name, serial
-and timers, the zone's version, the settings, counters; what a zone seldom
-needs, such as transfer state, an IXFR ring or the full per-zone statistics, is
-made when it is first needed) plus its image: measured, about 739 octets of heap
-for a small attached zone in \fBmap\fR mode (the image is a pointer into the
-mapped segment, and counted by \fBmemory\-limit\fR) and about 1,251 octets in
-\fBcopy\fR mode (the image is a copy). \fBkarictl dbstatus\fR has the line
-\fBzone entries:\fR (slots in use, slabs and their size, the octets of a slot,
-the zones that left memory and kept their counters, the rejection texts in
-memory) and \fBkarictl store\fR the same as \fBstore.entries.*\fR,
+run). \fBARC size on a host with a large store (ZFS, 0.7).\fR The tables of the
+store (zone table, name and source indexes) are mapped into the Backend and stay
+in its memory beside \fBmemory\-limit\fR: with 100 million zones the Backend
+holds about 12 GB (11.8 GB measured with \fBmemory\-limit 2G\fR). FreeBSD lets
+the ARC grow to RAM minus 1 GiB by default, and during a first fill it fills
+with the data the loader reads from the database and with the store's images;
+free memory then runs out, pages of the tables are pushed out, also to swap, and
+every thread that touches them waits, so queries are lost during the fill, also
+those that need no zone. Cap the ARC so that the Backend and the ARC fit in RAM
+with a margin: \fBvfs.zfs.arc_max\fR (bytes, in \fB/etc/sysctl.conf\fR) at most
+the RAM minus the Backend's RSS (\fBkarictl store \-k\fR and \fBps\fR) minus
+about 1 GiB for the system. Measured on the build host (16 GB RAM, ZFS on a SATA
+SSD, 100 million zones of 10 records from SQLite, memory-limit 2G, 2,500 queries
+a second during the fill, up to 30 million zones stored): with the ARC capped at
+4 GiB 5.3 % of the queries for known zones, 10.7 % of those for zones still to
+come and 3.4 % of those for names in no zone went unanswered (no swap); uncapped
+the ARC grew to 10.6 GB, 11.3 / 16.4 / 8.9 % were lost and about 60 MB went to
+swap, at the same speed of the fill. \fBprimarycache=metadata\fR on the store's
+dataset is not a substitute: it keeps the images out of the ARC but not the
+database's data (the ARC still grew to 8.7 GB), and every attach then reads from
+the disk: the attaches took 3 to 4 times longer, about twice as many reads of
+cold zones timed out as with the cap, the fill was 5 to 7 % slower and the loss
+stayed near the uncapped figures (8.7 / 12.5 / 7.4 %). A small store (most
+hosts) needs no cap. \fBScrub.\fR Every \fBstore\-scrub\-interval\fR the store
+reads every record, at 16 MiB a second at the most: the table record (its CRC),
+the way the name and source indexes lead to the zone, and for a stored zone the
+whole image: its checksum and the structure check that is made at every
+attach. A zone whose image is bad becomes known without an image and is read
+from the database again (the log says which zone; \fBstore.scrub.bad_images\fR);
+the cleaner does the same for a record that fails its checksum when it is to be
+copied. A zone that is in memory with that image (the store is in MAP mode: the
+zone serves the mapped pages) is taken out of memory too, even when it is
+pinned, so that it is read again and does not go on serving damaged pages (when
+a reader or a transfer holds it, the store tries again at the next tick). A
+table record that is damaged or an index entry that does not lead to its zone is
+repaired at the end of the pass: the indexes are built again from the zone
+table, and a record that cannot be read is dropped and comes again with the next
+pass of the loader. \fBkarictl store scrub start\fR starts a pass now, \fBstore
+scrub stop\fR ends it. \fBError ring.\fR \fBerr.ring\fR (14 MB, sparse until
+used) keeps the last 65,536 texts of zones that were refused or failed (which
+zone id, which version, when, why), written in place and wrapped; it is not
+journaled and holds no heap (\fBstore.errors.total\fR). The server keeps the
+last 512 texts in memory as well (\fBzonestatus\fR asks the memory first, then
+the file): a rejected zone of the store has no registry element, so after a text
+is pushed out of memory, or after a restart, the file still has it, by zone
+id. A text is forgotten when a version of the zone is registered. A zone id is
+reused after a delete, so a text is only shown for a zone whose record is still
+the one it was made for. The NOTIFY that is due for a zone is a flag of its
+record (\fBNOTIFY_DUE\fR, journaled, so a NOTIFY that was due at a crash is due
+after the restart). \fBWhat a zone in memory costs.\fR A zone that is attached
+takes one slot of 256 octets of the pool of zone entries (a light entry: name,
+serial and timers, the zone's version, the settings, counters; what a zone
+seldom needs, such as transfer state, an IXFR ring or the full per-zone
+statistics, is made when it is first needed) plus its image: measured, about 739
+octets of heap for a small attached zone in \fBmap\fR mode (the image is a
+pointer into the mapped segment, and counted by \fBmemory\-limit\fR) and about
+1,251 octets in \fBcopy\fR mode (the image is a copy). \fBkarictl dbstatus\fR
+has the line \fBzone entries:\fR (slots in use, slabs and their size, the octets
+of a slot, the zones that left memory and kept their counters, the rejection
+texts in memory) and \fBkarictl store\fR the same as \fBstore.entries.*\fR,
 \fBstore.fold.*\fR and \fBstore.errors.memory_*\fR. The statistics of a zone are
 counted \fBsince it was attached\fR (32-bit counters: queries, the answers by
 RCODE, TCP, DO); when a zone is taken out of memory its counters are added to
