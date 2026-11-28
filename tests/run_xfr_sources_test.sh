@@ -310,12 +310,15 @@ EOF
     if wait_soa "$PV" zv1.test 1 5; then pass "T3: the view's transfer-source (127.0.0.2) beats options' (127.0.0.3)"
     else fail "T3: zv1.test (view transfer-source 127.0.0.2) was not transferred"; fi
     sleep 4   # the refused ones have had their first attempts and retries by now
-    if [ -z "$(dag_soa "$PS" zd.test)" ]; then pass "T4: transfer-source * in the zone: the system chooses (127.0.0.1), the primary refuses, the zone stays empty"
-    else fail "T4: zd.test (transfer-source *) was transferred"; fi
-    if [ -z "$(dag_soa "$PS" ze.test)" ]; then pass "T5: the zone's transfer-source (127.0.0.3) beats options' (127.0.0.2): refused by the primary"
-    else fail "T5: ze.test (zone transfer-source 127.0.0.3) was transferred"; fi
-    if [ -z "$(dag_soa "$PV" zv2.test)" ]; then pass "T6: the zone's transfer-source (127.0.0.3) beats the view's (127.0.0.2): refused by the primary"
-    else fail "T6: zv2.test (zone transfer-source 127.0.0.3 in a view with 127.0.0.2) was transferred"; fi
+    st=$(kari_soa_status "$DAG" "$PS" zd.test)
+    if kari_unserved "$st"; then pass "T4: transfer-source * in the zone: the system chooses (127.0.0.1), the primary refuses, the zone stays empty"
+    else fail "T4: zd.test (transfer-source *) was transferred ($st)"; fi
+    st=$(kari_soa_status "$DAG" "$PS" ze.test)
+    if kari_unserved "$st"; then pass "T5: the zone's transfer-source (127.0.0.3) beats options' (127.0.0.2): refused by the primary"
+    else fail "T5: ze.test (zone transfer-source 127.0.0.3) was transferred ($st)"; fi
+    st=$(kari_soa_status "$DAG" "$PV" zv2.test)
+    if kari_unserved "$st"; then pass "T6: the zone's transfer-source (127.0.0.3) beats the view's (127.0.0.2): refused by the primary"
+    else fail "T6: zv2.test (zone transfer-source 127.0.0.3 in a view with 127.0.0.2) was transferred ($st)"; fi
     # the refresh check (IXFR / SOA) leaves from the transfer source too: the new serial only arrives from 127.0.0.2
     zone "$W/tza.zone" za.test 2
     $CP reload >/dev/null 2>&1

@@ -245,8 +245,9 @@ else fail "A3: sk4.test was not transferred: the zone's tsig-key was used instea
 if wait_serial "$S2" sk1.test 5 25; then pass "A4: request-ixfr no in the server statement: the signed SOA check came first, then the AXFR (and 'edns no' left the OPT out)"
 else fail "A4: sk1.test was not transferred by the secondary with request-ixfr no / edns no"; fi
 sleep 3
-if [ -z "$(dag_soa "$S3" sk1.test)" ]; then pass "A5: no server statement, no key: nothing is transferred from the primary that wants a signature"
-else fail "A5: the secondary without a key got the zone"; fi
+st=$(kari_soa_status "$DAG" "$S3" sk1.test)
+if kari_unserved "$st"; then pass "A5: no server statement, no key: nothing is transferred from the primary that wants a signature"
+else fail "A5: the secondary without a key got the zone ($st)"; fi
 zone "$W/sk1.zone" sk1.test 6 2 1 3600
 zone "$W/sk3.zone" sk3.test 6 2 1 3600
 ctl pp reload > /dev/null
@@ -353,8 +354,9 @@ else
     if wait_serial "$SO" o1.test 3 25; then pass "S4: the server statement's transfer-source (127.0.0.2) beats the primaries list's source (127.0.0.3) and options' (127.0.0.4): the primary only answers 127.0.0.2"
     else fail "S4: o1.test was not transferred from 127.0.0.2"; fi
     sleep 3
-    if [ -z "$(dag_soa "$SO" o2.test)" ]; then pass "S5: transfer-source * in the server statement: the system chooses, not the list's 127.0.0.2 (the zone stays empty)"
-    else fail "S5: o2.test was transferred: the list's source was used although the server statement says *"; fi
+    st=$(kari_soa_status "$DAG" "$SO" o2.test)
+    if kari_unserved "$st"; then pass "S5: transfer-source * in the server statement: the system chooses, not the list's 127.0.0.2 (the zone stays empty)"
+    else fail "S5: o2.test was transferred: the list's source was used although the server statement says * ($st)"; fi
 fi
 
 # ------------------------------------------------------------------------------------------------ T: transfers
@@ -445,14 +447,15 @@ else
     } > "$W/sv.conf"
     start sv
     i=0
-    sv_soa() { "$DAG" @127.0.0.1 -p "$SV" -b "$1" vz.test SOA +short +nohexdump +time=1 +tries=1 2>/dev/null | awk '{print $3}'; }
-    want=$("$DAG" @127.0.0.1 -p "$PV" -b 127.0.0.2 vz.test SOA +short +nohexdump +time=1 +tries=1 2>/dev/null | awk '{print $3}')   # 8: the UPDATE of V5 raised 7
+    sv_soa() { kari_soa_status "$DAG" "$SV" vz.test 1 -b "$1" | awk '$2 ~ /^[0-9]+$/ { print $2 }'; }   # (the serial, nothing for a lost try or no SOA)
+    want=$(kari_soa_status "$DAG" "$PV" vz.test 10 -b 127.0.0.2 | awk '$2 ~ /^[0-9]+$/ { print $2 }')   # 8: the UPDATE of V5 raised 7 (read until an answer comes)
     while [ $i -lt 25 ] && [ "$(sv_soa 127.0.0.2)" != "$want" ]; do sleep 1; i=$((i + 1)); done
     if [ -n "$want" ] && [ "$(sv_soa 127.0.0.2)" = "$want" ]; then pass "V9: a secondary's view key signs its transfer: view sv1 (key vk = va's secret, source 127.0.0.2) has vz.test serial $want"
     else fail "V9: view sv1 did not transfer vz.test"; fi
     sleep 3
-    if [ -z "$(sv_soa 127.0.0.3)" ]; then pass "V10: view sv2 has a key vk with the same secret but reaches view vb of the primary (another secret): it gets nothing"
-    else fail "V10: view sv2 transferred vz.test with a key the primary's view vb does not know"; fi
+    st=$(kari_soa_status "$DAG" "$SV" vz.test 10 -b 127.0.0.3)
+    if kari_unserved "$st"; then pass "V10: view sv2 has a key vk with the same secret but reaches view vb of the primary (another secret): it gets nothing"
+    else fail "V10: view sv2 transferred vz.test with a key the primary's view vb does not know ($st)"; fi
 fi
 
 # ------------------------------------------------------------------------------------------------ P: nested primaries ports
