@@ -9788,8 +9788,16 @@ static void test_fb_growth(void) {
   atomic_store(&g_ix_seen, 0);
   atomic_store(&g_ix_hold, 0);
   atomic_store(&store_test_regrow_hook, ix_priv_hook);
+  /* The puts stop once the build has begun, and the test waits for its hook: before, they went on until the hook fired, so on a loaded runner
+   * (the build thread late to reach step 1) the index passed 3/4 and the builder grew it inside the mutex first; the bigger generations were
+   * then private at the hook (CI flake row 82: 57344 bytes at 1154 zones; 16384 at 545 zones when the build runs at once, pc101) */
   uint32_t n = 0;
-  for (; n < 20000 && !atomic_load(&g_ix_seen); n++) CHECK_EQ(known_i(s, 0, n, 1), 0);
+  for (; n < 20000 && !atomic_load(&g_ix_seen); n++) {
+    CHECK_EQ(known_i(s, 0, n, 1), 0);
+    store_stats(s, &st);
+    if (st.index_build_active) { n++; break; }
+  }
+  for (int w = 0; w < 20000 && !atomic_load(&g_ix_seen); w++) usleep(1000);
   for (int w = 0; w < 60000; w++) {
     store_stats(s, &st);
     if (st.index_builds >= 1) break;
