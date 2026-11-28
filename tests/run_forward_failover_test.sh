@@ -56,6 +56,8 @@ use IO::Socket::INET; use IO::Select; use Time::HiRes qw(sleep);
 my ($silent, $wrong, $good) = @ARGV;
 my %s = map { $_ => IO::Socket::INET->new(LocalAddr => '127.0.0.1', LocalPort => $_, Proto => 'udp') || die "bind $_: $!" }
         ($silent, $wrong, $good);
+$| = 1;
+print "READY\n";   # (all three bound: the test waits for this line before it starts the server)
 sub answer { my ($q, $ip) = @_;
     my ($id) = unpack('n', $q); my $qd = substr($q, 12);
     my $end = 0; $end += 1 + ord(substr($qd, $end, 1)) while ord(substr($qd, $end, 1)); $qd = substr($qd, 0, $end + 5);
@@ -79,6 +81,12 @@ while (1) {
 EOF
 perl "$TMP_DIR/mockfwd.pl" "$SILENT" "$WRONG" "$GOOD" > "$TMP_DIR/mock.log" 2>&1 &
 MOCK_PID=$!
+# The forwarders must be bound before the first query: a query sent to a port nobody holds yet fails at once (port unreachable on the
+# connected UDP socket), so both forwarders "timed out or failed" within milliseconds and the answer was SERVFAIL (CI flake row 57:
+# the whole test took 1 s, PR #261 run 45352725855).
+if ! kari_wait_log "$TMP_DIR/mock.log" '^READY$' 15; then
+    echo "FAIL: the mock forwarders did not start:"; cat "$TMP_DIR/mock.log"; exit 1
+fi
 
 cat > "$TMP_DIR/karidns.conf" <<EOF
 options { port $PORT; bind-address { 127.0.0.1; }; pid-file "none"; $USER_OPT };
@@ -90,11 +98,11 @@ chmod 644 "$TMP_DIR"/*
 echo "=== forward failover (D-20) ==="
 "$KARIDNS" -f "$TMP_DIR/karidns.conf" > "$TMP_DIR/karidns.log" 2>&1 &
 SERVER_PID=$!
-i=0
-while [ $i -lt 50 ]; do
-    "$DAG" @127.0.0.1 -p "$PORT" x.f1.test A +time=1 +tries=1 +nohexdump > /dev/null 2>&1 && break
-    sleep 0.1; i=$((i + 1))
-done
+# (a name outside the zones: REFUSED at once.  x.f1.test, asked before, needs more than its 1 s try: the silent forwarder's share comes first,
+# so the loop ran all 50 tries, 55 s, whenever the forwarders were up)
+if ! kari_wait_answer "$DAG" "$PORT" invalid. 30; then
+    echo "FAIL: the server did not answer within 30 s"; sed 's/^/    /' "$TMP_DIR/karidns.log" | tail -20; exit 1
+fi
 
 # 1. silent first forwarder
 start=$(perl -MTime::HiRes=time -e 'printf "%d", time * 1000')
