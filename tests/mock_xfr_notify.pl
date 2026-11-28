@@ -98,6 +98,7 @@ $SIG{PIPE} = 'IGNORE';
 if ($cmd eq 'notify-sink') {
     my $s = IO::Socket::INET->new(LocalAddr => '127.0.0.1', LocalPort => $o{port}, Proto => 'udp', ReuseAddr => 1)
         or die "bind: $!";
+    logline("READY port=$o{port}");   # bound: the test waits for this line, not a fixed sleep
     my $count = 0;
     while (1) {
         my $from = $s->recv(my $p, 65535, 0);
@@ -126,6 +127,7 @@ if ($cmd eq 'notify-sink') {
 } elsif ($cmd eq 'xfr-primary') {
     my $l = IO::Socket::INET->new(LocalAddr => '127.0.0.1', LocalPort => $o{port}, Proto => 'tcp',
                                   Listen => 8, ReuseAddr => 1) or die "listen: $!";
+    logline("READY port=$o{port}");
     my $serial = $o{serial} || 10;
     while (my $c = $l->accept) {
         while (defined(my $q = read_tcp_msg($c))) {

@@ -138,18 +138,36 @@ $M xfr-primary --port $MX1 --zone x1.test --mode refused --log "$W/mx1.log" & PI
 $M xfr-primary --port $MX2 --zone x2.test --mode notimp-ixfr --log "$W/mx2.log" & PIDS="$PIDS $!"
 $M xfr-primary --port $MX3 --zone x3.test --mode badid --log "$W/mx3.log" & PIDS="$PIDS $!"
 $M xfr-primary --port $MX4 --zone x4.test --mode badq --log "$W/mx4.log" & PIDS="$PIDS $!"
+# Every step waits for its condition with a bound (no fixed sleep): on a loaded host (pc31 -j 8, flake row 62) a fixed 2 + 3 s
+# start and a 9 s window from the karictl calls lost NOTIFYs that came later.
+for f in sink1 sink2 sink3 sink4 mx1 mx2 mx3 mx4; do
+    kari_wait_log "$W/$f.log" "READY port=" 15 || { fail "the mock of $f.log did not start"; exit 1; }
+done
 "$KARIDNS" -f "$W/p.conf" > "$W/p.log" 2>&1 & PIDS="$PIDS $!"
-sleep 2
+kari_wait_answer "$DAG" $PP n1.test. 30 || { fail "the primary did not answer within 30 s"; exit 1; }
 "$KARIDNS" -f "$W/s.conf" > "$W/s.log" 2>&1 & PIDS="$PIDS $!"
 "$KARIDNS" -f "$W/w.conf" > "$W/w.log" 2>&1 & PIDS="$PIDS $!"
 "$KARIDNS" -f "$W/k.conf" > "$W/k.log" 2>&1 & PIDS="$PIDS $!"
-sleep 3
+# (a name outside its zones: REFUSED at once; a secondary stays silent for a zone it has not transferred yet)
+for p in $PS $PW $PK; do kari_wait_answer "$DAG" $p invalid. 30 || { fail "the secondary on port $p did not answer within 30 s"; exit 1; }; done
 for f in sink1 sink2 sink3 sink4; do : > "$W/$f.log"; done
 : > "$W/p.log.mark"
 
 # ---------------------------------------------------------------- R-17, D-09: NOTIFY retransmission
-$CP notify n1.test >/dev/null; $CP notify n2.test >/dev/null; $CP notify n3.test >/dev/null; $CP notify s.test >/dev/null
-sleep 9
+for z in n1 n2 n3 s; do $CP notify $z.test > "$W/ctl.out" 2>&1 || { fail "karictl notify $z.test: $(cat "$W/ctl.out")"; exit 1; }; done
+# the end of each schedule: n1 answered at its 3rd NOTIFY (1 s + 2 s), n2 given up after 3, n3's single NOTIFY, s.test's silent receiver given up
+wait_count() { # wait_count PATTERN FILE N SECONDS
+    _wc_i=0
+    while [ "$_wc_i" -lt $(($4 * 10)) ]; do [ "$(count "$1" "$2")" -ge "$3" ] && return 0; sleep 0.1; _wc_i=$((_wc_i + 1)); done
+    return 1
+}
+wait_count NOTIFY "$W/sink1.log" 3 30
+kari_wait_log "$W/p.log" "zone 'n2.test.': no answer from 127.0.0.1 port $SINK2 after 3 NOTIFY message(s)" 30
+wait_count NOTIFY "$W/sink3.log" 1 30
+kari_wait_log "$W/p.log" "zone 's.test.': no answer from 127.0.0.1 port $SINK4" 30
+# what must NOT come keeps its window: n1's 4th NOTIFY would come 4 s after the 3rd, n3 (retries 0) would retransmit 5 s after its
+# first, the KariDNS secondary's answered NOTIFY would have timed out with the silent receiver's
+sleep 5
 n=$(count NOTIFY "$W/sink1.log")
 ids=$(sed -n 's/.* id=\([0-9]*\) .*/\1/p' "$W/sink1.log" | sort -u | wc -l | tr -d ' ')
 if [ "$n" -eq 3 ] && [ "$ids" -eq 1 ]; then
@@ -169,8 +187,8 @@ if grep -q "zone 's.test.': no answer from 127.0.0.1 port $SINK4" "$W/p.log" &&
    ! grep -q "zone 's.test.': no answer from 127.0.0.1 port $PS " "$W/p.log"; then
     pass "D-09: the secondary's signed answer stops the retransmission (silent receiver still times out)"
 else fail "D-09: retransmission to the KariDNS secondary with the right key was not stopped"; fi
-if grep -q "zone 's.test.': ignoring NOTIFY answer from 127.0.0.1 port $PW that fails TSIG verification" "$W/p.log" &&
-   grep -q "zone 's.test.': the answer from 127.0.0.1 port $PW was no good; retrying over TCP" "$W/p.log"; then
+if kari_wait_log "$W/p.log" "zone 's.test.': ignoring NOTIFY answer from 127.0.0.1 port $PW that fails TSIG verification" 15 &&
+   kari_wait_log "$W/p.log" "zone 's.test.': the answer from 127.0.0.1 port $PW was no good; retrying over TCP" 15; then
     pass "D-09: an answer that fails TSIG verification (wrong secret) is logged and not accepted (RFC 8945 §5.4); the NOTIFY is made over TCP (BIND notify_done())"
 else fail "D-09: answer of the secondary with the wrong secret not logged/ignored"; fi
 
@@ -182,20 +200,20 @@ n=$(count NOTIFY "$W/sink3.log")
 if [ "$n" -eq 0 ]; then pass "R-21: reload without a serial change sends no NOTIFY"; else fail "R-21: unchanged reload sent $n NOTIFY(s)"; fi
 zone "$W/n3.test.zone" n3.test 2
 $CP reload n3.test >/dev/null
-if wait_grep NOTIFY "$W/sink3.log" 3; then pass "R-21: reload with a new serial sends NOTIFY"; else fail "R-21: no NOTIFY after the serial changed"; fi
+if wait_grep NOTIFY "$W/sink3.log" 15; then pass "R-21: reload with a new serial sends NOTIFY"; else fail "R-21: no NOTIFY after the serial changed"; fi
 
 # ---------------------------------------------------------------- R-19: transfer client
-if grep -q "zone 'x1.test.': primary answered the AXFR request with REFUSED (5)" "$W/s.log"; then
+if kari_wait_log "$W/s.log" "zone 'x1.test.': primary answered the AXFR request with REFUSED (5)" 15; then
     pass "R-19: REFUSED ends the transfer at once and is logged with the RCODE"
 else fail "R-19: REFUSED answer not recognised"; grep "x1.test" "$W/s.log" | head -3; fi
-if wait_grep "zone x2.test.: 127.0.0.1 does not support IXFR, retrying with AXFR" "$W/s.log" 5 &&
+if wait_grep "zone x2.test.: 127.0.0.1 does not support IXFR, retrying with AXFR" "$W/s.log" 15 &&
    [ "$(sed -n -E 's/REQ qtype=([0-9]*).*/\1/p' "$W/mx2.log" | head -2 | tr '\n' ' ')" = "251 252 " ] &&
    "$DAG" @127.0.0.1 -p $PS www.x2.test A +short +nohexdump | grep -qx 192.0.2.80; then
     pass "R-19: NOTIMP to IXFR -> one AXFR retry, zone served (RFC 1995 §4)"
 else fail "R-19: IXFR -> AXFR fallback"; cat "$W/mx2.log"; grep "x2.test" "$W/s.log" | head -5; fi
-if grep -q "zone 'x3.test.': rejecting AXFR response: ID" "$W/s.log"; then pass "R-19: answer with another message ID rejected"
+if kari_wait_log "$W/s.log" "zone 'x3.test.': rejecting AXFR response: ID" 15; then pass "R-19: answer with another message ID rejected"
 else fail "R-19: wrong-ID answer not rejected"; fi
-if grep -q "zone 'x4.test.': rejecting AXFR response: question 'other.x4.test.'" "$W/s.log"; then
+if kari_wait_log "$W/s.log" "zone 'x4.test.': rejecting AXFR response: question 'other.x4.test.'" 15; then
     pass "R-19: answer with another question rejected"
 else fail "R-19: wrong-question answer not rejected"; fi
 
