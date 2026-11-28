@@ -2669,8 +2669,13 @@ STATIC_TEST void *async_io_worker_func(void *arg) {
 }
 
 /* 1本でも起動できなければ false (起動中止。O-15: 呼び出し側は backend_exit() で終わる) */
+_Static_assert(offsetof(async_io_pool_t, queue) == 0, "the queue is the first member: init_async_io_pool() clears only what follows it");
 bool init_async_io_pool(void) {
-  memset(&g_async_io_pool, 0, sizeof(g_async_io_pool));
+  /* 0.7: only the fields after the queue are cleared. The queue (ASYNC_IO_QUEUE_CAPACITY tasks, about 6 MB) is zero as all BSS is, and no entry is read
+   * before enqueue_async_io_task() has copied a whole task into it (count guards the reads), so it would need no clear even if this ran again.
+   * A memset of the whole pool made all of it resident in every Backend for nothing (about 6 MB of anon memory; checked by
+   * test_async_io_pool_and_tasks() in tests/test_server_core.c).  It runs once, in the Backend before any async I/O thread exists. */
+  memset((char *)&g_async_io_pool + offsetof(async_io_pool_t, head), 0, sizeof(g_async_io_pool) - offsetof(async_io_pool_t, head));
   pthread_mutex_init(&g_async_io_pool.lock, NULL);
   pthread_cond_init(&g_async_io_pool.cond_not_empty, NULL);
   g_async_io_pool.running = true;

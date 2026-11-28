@@ -401,6 +401,9 @@ server on pc31 with 8 CPUs and a one-queue em0, or on a VM; the client on anothe
 - **Clean open** of the store: 9 ms at 1M zones, 23 ms at 10M (#185).
 - **Backend heap**: a small attached zone 739 B (was 1128 B) (#185); `zone_db_entry_t` 1032 to 584 bytes (#184); the
   Backend's virtual size on a 512 MB host 5.9 GB to 1.0 GB (#211).
+- **Small hosts: about 6 MB less resident memory**: the Backend no longer clears its async I/O queue (4096 entries,
+  about 6 MB of BSS that is zero already) at start-up, which made all of it resident; Backend RSS on a minimal
+  configuration 31.9 to 25.8 MB, anonymous resident memory 21.4 to 15.4 MB (pc101 VM).
 - **WebAdmin / karidns-zone**: the RRset page right after a bulk load 124-678 ms to 3-4 ms after the automatic
   `ANALYZE` (PostgreSQL 18, 100k records) (#187).
 

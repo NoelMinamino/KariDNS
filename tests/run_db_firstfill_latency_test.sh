@@ -125,6 +125,15 @@ qloop() {   # qloop CLASS QPS LO HI (LO = 0: nx names)
 }
 jv() { echo "$2" | sed -n "s/.*\"$1\":\([0-9]*\).*/\1/p" | head -1; }
 jrc() { echo "$2" | sed -n "s/.*\"rcodes\":{[^}]*\"$1\":\([0-9]*\).*/\1/p" | head -1; }
+jlat() { echo "$2" | sed -n "s/.*\"latency_s\":{[^}]*\"$1\":\([0-9.]*\).*/\1/p" | head -1; }   # (seconds, a decimal: p50, p90, p99, max)
+# the longest times of the server's own counters (diagnostics of a slow slice, flake row 103): only the ones this build reports
+max_counters() {
+    out=""
+    for k in store.fetch.query.rtt.max_us store.ingest.loop_max_us store.cold.max_us store.attach.max_us store.lock.writer_hold_max_us store.checkpoint.max_us store.bulk.presync_max_us; do
+        v=$(sf "$k"); [ -n "$v" ] && out="$out $k=$v"
+    done
+    echo "  max:${out:- (none reported)}"
+}
 
 fill_run() {   # fill_run LT: a first fill with loader-threads LT under the three loads
     lt=$1
@@ -160,6 +169,10 @@ fill_run() {   # fill_run LT: a first fill with loader-threads LT under the thre
             [ -n "$s" ] || { bad=$((bad + 1)); echo "    $c t=$t: no report: $j"; continue; }
             sent=$((sent + s)); lost=$((lost + ${l:-0})); sfail=$((sfail + ${f:-0})); late=$((late + ${u:-0}))
             if [ "${l:-0}" != 0 ] || [ "${f:-0}" != 0 ] || [ "${u:-0}" != 0 ]; then echo "    $c slice at t=${t}s: $j"; fi
+            p99=$(jlat p99 "$j")      # (output only: a slow slice, p99 above 0.25 s, with its spread; not gated)
+            if [ -n "$p99" ] && awk -v p="$p99" 'BEGIN { exit !(p > 0.25) }'; then
+                echo "    slow $c slice t=${t}s: sent=$s lost=${l:-0} p50=$(jlat p50 "$j") p90=$(jlat p90 "$j") p99=$p99 max=$(jlat max "$j")"
+            fi
         done < "$T/q_$c"
     done
     echo "  queries: $sent sent, $lost lost at 1 s, $late answered after 1 s (unmatched), $sfail SERVFAIL"
@@ -170,9 +183,10 @@ fill_run() {   # fill_run LT: a first fill with loader-threads LT under the thre
     DROPS=$($KA store -k 2>/dev/null | grep -E '^store\.(park|lookup)\.drop\.' | tr '\n' ' ')
     NZD=$(echo "$DROPS" | tr ' ' '\n' | grep -v '=0$' | grep -c .)
     [ "$NZD" = 0 ] && pass "lt=$lt: the server dropped nothing (store.park.drop.*, store.lookup.drop.* all 0)" || fail "lt=$lt: drops: $DROPS"
-    if [ "$lost" != 0 ] || [ "$sfail" != 0 ] || [ "$NZD" != 0 ]; then
+    if [ "$lost" != 0 ] || [ "$late" != 0 ] || [ "$sfail" != 0 ] || [ "$NZD" != 0 ]; then
         echo "  $($KA dbstatus 2>/dev/null | grep -E '^(fetchq|lookup of names)' | sed 's/ hist=.*//')"
         echo "  store.lookup.rtt.p99_us=$(sf store.lookup.rtt.p99_us) store.cold.p99=$(sf store.cold.p99_us) journal_wait_slices=$(sf store.ingest.journal_wait_slices)"
+        max_counters
         kari_log_tail "$T/a.log" 2>/dev/null || tail -20 "$T/a.log"
     fi
     grep 'fetch reads in' "$T/a.log" | tail -3 | sed 's/^/  loader: /'
