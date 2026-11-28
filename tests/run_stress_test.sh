@@ -124,7 +124,7 @@ fi
 LEFT=$(kari_conf_pids "$SERVER_CONF")
 if [ -n "$LEFT" ]; then
     echo "TSan Test FAILED: a karidns-tsan process is still running after shutdown."
-    for p in $LEFT; do ps -ww -o pid=,command= -p "$p"; done
+    for p in $LEFT; do ps -ww -o pid= -o command= -p "$p"; done
     mv "${ZONE_FILE}.orig" "$ZONE_FILE"
     exit 1
 fi
@@ -191,7 +191,7 @@ fi
 LEFT=$(kari_conf_pids "$SERVER_CONF")
 if [ -n "$LEFT" ]; then
     echo "ASan Test FAILED: a karidns-asan process is still running after shutdown."
-    for p in $LEFT; do ps -ww -o pid=,command= -p "$p"; done
+    for p in $LEFT; do ps -ww -o pid= -o command= -p "$p"; done
     exit 1
 fi
 
