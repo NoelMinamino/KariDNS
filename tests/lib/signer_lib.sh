@@ -134,9 +134,15 @@ sg_stop() {
 }
 # SIGKILL to a process and its descendants (children first).  Not kari_kill_tree: that stops each process first, and su(1), the parent of the signer when the
 # test runs as root, stops itself when its child is stopped and never wakes up again.
+# The tree is listed first and the top process killed first: killed children first, the signer saw its signing child die and its finally wiped the
+# work directory before its own SIGKILL came (CI 14.4, flake row 55: "no ex.test in" the work directory 1 s after kill -9).
+sg_tree_pids() {
+    for _c in $(pgrep -P "$1" 2>/dev/null); do echo "$_c"; sg_tree_pids "$_c"; done
+}
 sg_kill_tree() {
-    for _c in $(pgrep -P "$1" 2>/dev/null); do sg_kill_tree "$_c"; done
+    _kt_rest=$(sg_tree_pids "$1")
     kill -KILL "$1" 2>/dev/null
+    for _c in $_kt_rest; do kill -KILL "$_c" 2>/dev/null; done
 }
 sg_hard_kill() { sg_kill_tree "$SG_PID"; wait "$SG_SHELL" 2>/dev/null; SG_PID=""; }
 
