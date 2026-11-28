@@ -126,7 +126,13 @@ GE=$(sf store.recon.group_entries); GR=$(sf store.recon.group_records)
 SM=$(sf store.ingest.stream_max_us); LM=$(sf store.ingest.loop_max_us)
 [ -n "$SM" ] && [ "$SM" -le "$STREAM_US" ] 2>/dev/null && pass "the stream thread was not kept more than ${STREAM_US} us by a frame (store.ingest.stream_max_us=$SM; the loop of the thread: store.ingest.loop_max_us=$LM)" || fail "store.ingest.stream_max_us=$SM (limit $STREAM_US), loop_max_us=$LM"
 WH=$(sf store.lock.writer_hold_max_us); RH=$(sf store.lock.records_hold_max_us); RW=$(sf store.lock.records_wait_max_us)
-[ -n "$WH" ] && [ -n "$RH" ] && [ "$WH" -le "$HOLD_US" ] 2>/dev/null && [ "$RH" -le "$HOLD_US" ] 2>/dev/null && pass "no lock was held more than ${HOLD_US} us (store.lock.writer_hold_max_us=$WH, records_hold_max_us=$RH, records_wait_max_us=$RW, writer holds of 1 ms or more $(sf store.lock.writer_holds_slow))" || fail "store.lock.writer_hold_max_us=$WH records_hold_max_us=$RH (limit $HOLD_US)"
+# what explains a long hold: a store call inside the records lock that waited for room in the journal ring (a disk stall longer than the ring: wr_admit() waits with
+# no store lock held, but the records lock of the caller is), the ring drained inside the writer mutex, and the site of the writer's longest hold
+hold_diag() {
+    for k in store.lock.records_hold_p999_us store.lock.records_holds_slow store.journal.ring_waits store.journal.ring_wait_max_us store.journal.ring_full_in_lock \
+             store.journal.ring_peak_bytes store.journal.ring_bytes store.lock.writer_hold_max_site; do printf '%s=%s ' "$k" "$(sf "$k")"; done
+}
+[ -n "$WH" ] && [ -n "$RH" ] && [ "$WH" -le "$HOLD_US" ] 2>/dev/null && [ "$RH" -le "$HOLD_US" ] 2>/dev/null && pass "no lock was held more than ${HOLD_US} us (store.lock.writer_hold_max_us=$WH, records_hold_max_us=$RH, records_wait_max_us=$RW, writer holds of 1 ms or more $(sf store.lock.writer_holds_slow))" || fail "store.lock.writer_hold_max_us=$WH records_hold_max_us=$RH (limit $HOLD_US; $(hold_diag))"
 DR=0
 for k in store.lookup.drop.room store.lookup.drop.timeout store.lookup.drop.queue store.lookup.servfail store.lookup.reask_suppressed store.lookup.shed store.lookup.expired; do
     v=$(sf "$k"); DR=$((DR + ${v:-0}))
