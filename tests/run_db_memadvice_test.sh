@@ -13,6 +13,9 @@
 #      and the recommended memory-limit; not said again within a minute.
 #   D  karicheck db counts the database (the loader's M line) and says the same about it: INFO with the records counted, the WARNING of a small limit, no
 #      warning of a limit that holds everything, an estimate without a limit.
+#   E  karicheck looks at the directory the store really uses: options { zone-store } without database { store } (the server's db_store_dir_cfg()):
+#      a zone-store whose parent does not exist is the start error (karicheck conf); the "memory on ZFS" line of karicheck db (ARC + heap) comes when the zone-store is on ZFS and not
+#      when it is elsewhere, whatever file system the default directory is on (each half SKIPs when this host has no such file system).
 # Needs root (the loader runs as nobody).  SKIP without karidns, karictl, karidns-dbloader (SQLite3), sqlite3 or perl; D without karicheck.
 . "$(dirname "$0")/lib_proc.sh"
 set -u
@@ -40,7 +43,7 @@ stop_srv() {
     [ -n "$SRV" ] && kill -KILL "$SRV" 2>/dev/null
     SRV=""
 }
-trap 'stop_srv; rm -rf "$T"' EXIT INT TERM
+trap 'stop_srv; umount "$T/zs" 2>/dev/null; rm -rf "$T"' EXIT INT TERM
 PASS=0; FAILS=0
 pass() { PASS=$((PASS + 1)); echo "  [ OK ] $1"; }
 fail() { FAILS=$((FAILS + 1)); echo "  [FAIL] $1"; }
@@ -70,11 +73,11 @@ EOF
 chmod 600 "$T/karictl.conf"
 KCTL="./karictl -c $T/karictl.conf"
 
-# conf EXTRA-DATABASE-OPTIONS
+# conf EXTRA-DATABASE-OPTIONS [EXTRA-OPTIONS]
 conf() {
     cat > "$T/k.conf" <<EOF
 options {
-    user "nobody"; pid-file "none"; listen-on { 127.0.0.1; }; port $PORT;
+    user "nobody"; pid-file "none"; listen-on { 127.0.0.1; }; port $PORT; ${2:-}
     database { driver sqlite3; database-file "$T/db/z.db"; loader-user "nobody"; loader-path "$T/karidns-dbloader"; $1 };
 };
 control-channel { socket "$T/ctl.sock"; secret "$SECRET"; };
@@ -199,6 +202,36 @@ if [ -x ./karicheck ]; then
     conf ""
     ./karicheck db "$T/k.conf" > "$T/kc3.out" 2>&1
     grep -q "no memory-limit" "$T/kc3.out" && ! grep -q "keeps only\|below what every zone needs\|is too small" "$T/kc3.out" && pass "no memory-limit: the estimate only" || fail "no limit: $(grep -i "sizing" "$T/kc3.out" | head -3)"
+
+    echo "== E: karicheck db with options { zone-store } (no database { store })"
+    # fstype_of PATH: the file system type of the mount that holds PATH (FreeBSD df prints the mount point last; mount -p gives its type)
+    fstype_of() { m=$(df "$1" 2>/dev/null | tail -1 | awk '{print $NF}'); mount -p 2>/dev/null | awk -v m="$m" '$2 == m { print $3; exit }'; }
+    conf "" "zone-store \"$T/nope/store\";"
+    ./karicheck conf "$T/k.conf" > "$T/kc4.out" 2>&1; rc=$?
+    grep -q "database store '$T/nope/store' does not exist and neither does its parent directory" "$T/kc4.out" && [ $rc -eq 1 ] && pass "karicheck conf: a zone-store whose parent is missing is the start error (exit 1)" || fail "zone-store parent missing: rc=$rc $(grep -i "store" "$T/kc4.out" | head -3)"
+    mkdir "$T/zs"; chown nobody "$T/zs"; chmod 700 "$T/zs"
+    ZS_TMPFS=0                                          # ($T on ZFS, as on the CI VMs: a tmpfs on $T/zs gives the non-ZFS zone-store, so the case runs instead of a SKIP)
+    if [ "$(fstype_of "$T/zs")" = zfs ] && [ "$(id -u)" -eq 0 ] && mount -t tmpfs -o size=1m tmpfs "$T/zs" 2>/dev/null; then
+        ZS_TMPFS=1; chown nobody "$T/zs"; chmod 700 "$T/zs"
+    fi
+    if [ "$(fstype_of "$T/zs")" != zfs ]; then
+        conf "" "zone-store \"$T/zs\";"
+        ./karicheck db "$T/k.conf" > "$T/kc5.out" 2>&1; rc=$?
+        grep -q "memory sizing" "$T/kc5.out" && ! grep -q "memory on ZFS" "$T/kc5.out" && [ $rc -eq 0 ] && pass "zone-store on $(fstype_of "$T/zs") (the default directory is on $(fstype_of /var/db)): no ZFS line" || fail "zone-store not on ZFS: rc=$rc $(grep "memory on ZFS\|error" "$T/kc5.out" | head -2)"
+    else
+        echo "  (SKIP: $T is on ZFS, no non-ZFS zone-store to check)"
+    fi
+    [ "$ZS_TMPFS" -eq 1 ] && umount "$T/zs"
+    ZM=$(mount -p -t zfs 2>/dev/null | awk '{print $2}' | while read -r m; do [ -d "$m" ] && [ ! -e "$m/karidns_kzs_$$" ] && { echo "$m"; break; }; done)
+    if [ -n "$ZM" ] && sysctl -n vfs.zfs.arc.max >/dev/null 2>&1; then
+        ZS="${ZM%/}/karidns_kzs_$$"                    # (not made: karicheck reads the file system of the nearest parent, as the server makes the last component)
+        conf "" "zone-store \"$ZS\";"
+        ./karicheck db "$T/k.conf" > "$T/kc6.out" 2>&1; rc=$?
+        grep -q "memory on ZFS: Backend heap" "$T/kc6.out" && [ $rc -eq 0 ] && pass "zone-store on ZFS ($ZS; the default directory is on $(fstype_of /var/db)): the ZFS line" || fail "zone-store on ZFS: rc=$rc $(grep "memory\|error" "$T/kc6.out" | head -3)"
+        [ ! -e "$ZS" ] && pass "... and karicheck made nothing there" || { fail "karicheck made $ZS"; rmdir "$ZS" 2>/dev/null; }
+    else
+        echo "  (SKIP: no ZFS file system on this host)"
+    fi
 else
     echo "  (karicheck is not built: not checked)"
 fi

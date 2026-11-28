@@ -6337,6 +6337,59 @@ bool db_acl_ceiling_configured(const server_config_t *cfg) {
   return cfg && cfg->database.enabled && (cfg->database.acl_ceiling_count > 0 || cfg->database.acl_ceiling_keys_count > 0);
 }
 
+/* 0.7: the directory of the zone store (moved from dns_db_store.c so that karicheck, which does not link the server, resolves it the same way: database { store },
+ * options { zone-store } and the default) */
+const char *db_store_dir_of(const database_config_t *db, bool *is_default) {
+  if (is_default) *is_default = false;
+  if (!db || !db->enabled || db->store_none) return NULL;
+  if (db->store_dir) return db->store_dir;
+  if (is_default) *is_default = true;
+  return KARIDNS_DB_DEFAULT_STORE_DIR;
+}
+
+/* 0.7 (secondary store D1): does the configuration have a secondary (a zone { type slave; }, a catalog zone that is one)?  Its copies want a store without a database block. */
+static bool cfg_has_secondary(const server_config_t *cfg) {
+  for (const view_config_t *v = cfg->views; v; v = v->next)
+    for (const zone_config_t *z = v->zones; z; z = z->next)
+      if (z->type && (strcasecmp(z->type, "slave") == 0 || strcasecmp(z->type, "secondary") == 0)) return true;
+  for (const zone_config_t *z = cfg->zones; z; z = z->next)        /* (a configuration made by hand: the zones not moved into a view) */
+    if (z->type && (strcasecmp(z->type, "slave") == 0 || strcasecmp(z->type, "secondary") == 0)) return true;
+  return false;
+}
+
+const char *db_store_dir_cfg(const server_config_t *cfg, bool *is_default, bool *soft) {
+  if (is_default) *is_default = false;
+  if (soft) *soft = false;
+  if (!cfg) return NULL;
+  const database_config_t *db = &cfg->database;
+  if (db->enabled && (db->store_dir || db->store_none)) return db_store_dir_of(db, is_default);     /* (zone-store may say the same; a difference is refused by the parser) */
+  if (cfg->zone_store_set) {
+    if (soft) *soft = !db->enabled;                   /* (D1: an unusable zone-store is a refused start only when a database block uses it) */
+    return cfg->zone_store_none ? NULL : cfg->zone_store_dir;
+  }
+  if (db->enabled) return db_store_dir_of(db, is_default);
+  if (!cfg_has_secondary(cfg)) return NULL;
+  if (is_default) *is_default = true;
+  if (soft) *soft = true;
+  return KARIDNS_DB_DEFAULT_STORE_DIR;
+}
+
+bool db_store_wanted(const server_config_t *cfg) {
+  bool dflt = false;
+  const char *path = db_store_dir_cfg(cfg, &dflt, NULL);
+  if (!path) return false;
+  if (!dflt) return true;
+  const char *nodef = getenv("KARIDNS_NO_DEFAULT_STORE");
+  if (nodef && strcmp(nodef, "1") == 0) return false;
+  char parent[PATH_MAX];
+  struct stat st;
+  const char *slash = strrchr(path, '/');           /* (the parent: "." without a slash, "/" for a name in the root) */
+  if (!slash) snprintf(parent, sizeof(parent), ".");
+  else if (slash == path) snprintf(parent, sizeof(parent), "/");
+  else snprintf(parent, sizeof(parent), "%.*s", (int)(slash - path), path);
+  return stat(parent, &st) == 0 && S_ISDIR(st.st_mode);
+}
+
 /* ---- Batch 7: dnstap in the BIND 9.20 grammar (lib/isccfg/namedconf.c cfg_type_dnstap: a list of `<type> [query | response];` with type all, auth,
  * client, forwarder, resolver or update; dnstap-output, dnstap-identity, dnstap-version, fstrm-set-*; lib/isccfg/check.c: dnstap-output is
  * required with dnstap).  The first word inside dnstap { } tells the two grammars apart; mixing them is an error.  KariDNS sends AUTH_QUERY and

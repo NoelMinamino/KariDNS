@@ -60,13 +60,7 @@ bool db_store_frontend_open(const database_config_t *db, bool privileged, uid_t 
 /* the descriptor of the store directory (-1: no store); closed by db_store_frontend_close() in the process that does not use it (the manager after the fork) */
 int db_store_dir_fd(void);
 void db_store_frontend_close(void);
-/* the directory of the configuration with the default applied; NULL: `store none;` */
-const char *db_store_dir_of(const database_config_t *db, bool *is_default);
-/* 0.7 (secondary store D1, 10): the same for the whole configuration: the database block's store, else options { zone-store }, else the default for a server with a database block or
- * at least one secondary zone.  *soft: a directory that cannot be used is an ERROR and a start without the store (no database block), not a refused start */
-const char *db_store_dir_cfg(const server_config_t *cfg, bool *is_default, bool *soft);
-/* will the start open a store (the default directory only when its parent exists and KARIDNS_NO_DEFAULT_STORE is not 1)?  The supervisor asks before the initial load */
-bool db_store_wanted(const server_config_t *cfg);
+/* (db_store_dir_of(), db_store_dir_cfg(), db_store_wanted(): dns_config_parser.h, shared with karicheck) */
 /* db_store_frontend_open() for the whole configuration (db_store_dir_cfg()); *level: the syslog level of msg (LOG_ERR for a soft failure, the start goes on) */
 bool db_store_frontend_open_cfg(const server_config_t *cfg, bool privileged, uid_t uid, gid_t gid, char *msg, size_t msglen, int *level);
 

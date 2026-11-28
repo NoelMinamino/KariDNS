@@ -1046,10 +1046,18 @@ bool db_acl_ceiling_configured(const server_config_t *cfg);
 static inline const char *db_loader_path(const server_config_t *c) {
   return c->database.loader_path ? c->database.loader_path : KARIDNS_DB_DEFAULT_LOADER_PATH;
 }
+/* the store directory of the database block with the default applied; NULL: no database block, or `store none;` (it ignores options { zone-store }: use db_store_dir_cfg()) */
+const char *db_store_dir_of(const database_config_t *db, bool *is_default);
+/* 0.7 (secondary store D1, 10): the store directory of the whole configuration: the database block's store, else options { zone-store }, else the default for a server with
+ * a database block or at least one secondary zone; NULL: no store (`store none;`, `zone-store none;`, nothing that wants one).  *soft: a directory that cannot be used is an
+ * ERROR and a start without the store (no database block), not a refused start.  The one resolution of the server (dns_db_store.c) and of karicheck. */
+const char *db_store_dir_cfg(const server_config_t *cfg, bool *is_default, bool *soft);
+/* will the start open a store (the default directory only when its parent exists and KARIDNS_NO_DEFAULT_STORE is not 1)?  The supervisor asks before the initial load */
+bool db_store_wanted(const server_config_t *cfg);
 /* 0.7.x: do the database zones go to the zone store?  Not with database { store none; } nor with options { zone-store none; } (the parser refuses the two
- * saying different things): the configuration side of db_store_dir_cfg() of the server, for the tools that do not link it (karicheck adds the check of the default directory) */
+ * saying different things); karicheck adds the check of the default directory (db_store_wanted()) */
 static inline bool db_uses_store(const server_config_t *c) {
-  return c->database.enabled && !c->database.store_none && !(c->zone_store_set && c->zone_store_none && !c->database.store_dir);
+  return c->database.enabled && db_store_dir_cfg(c, NULL, NULL) != NULL;
 }
 
 #define MAX_INCLUDE_DEPTH 16
