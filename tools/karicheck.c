@@ -2010,9 +2010,11 @@ KARIDNS_TOOL_FN bool kc_db_store_on_zfs(const server_config_t *cfg) {
     bool have = false;
     for (;;) {                                  /* (the directory may not be made yet: its nearest parent is on the same file system) */
         if (statfs(path, &sfs) == 0) { have = true; break; }
+        if (strcmp(path, "/") == 0 || strcmp(path, ".") == 0) break;
         char *sl = strrchr(path, '/');
-        if (!sl || sl == path) break;
-        *sl = '\0';
+        if (!sl) snprintf(path, sizeof(path), ".");         /* (as parent_of() in dns_db_store.c: "." without a slash, "/" for a name in the root) */
+        else if (sl == path) path[1] = '\0';
+        else *sl = '\0';
     }
     return have && strcmp(sfs.f_fstypename, "zfs") == 0;
 #else
