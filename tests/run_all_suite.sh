@@ -337,6 +337,19 @@ KARI_MAX_JOBS=29
 # and their PostgreSQL clusters (KARI_PORT_BASE + 999 of a slot: "bind: Address already in use" at -j 4)
 KARI_PORT_EXTRA_BASE=$((KARI_PORT_BASE_MIN + KARI_MAX_JOBS * KARI_PORT_SLOT_SPAN))
 export KARI_PORT_EXTRA_BASE
+# The highest port a test binds: the end of the extra windows (the fixed and PID-derived ports of the scripts stay below 57000 with the
+# default KARI_PORT_BASE_MIN).  An ephemeral range that starts at or below it lets a client's source port be a test server's port: the client
+# connects to itself and reads back its own query (CI flake row 85).  The CI VMs move the range up (tests/ci_portrange.sh); elsewhere it is
+# said here, not changed.
+KARI_TEST_PORT_MAX=$((KARI_PORT_EXTRA_BASE + 8 * KARI_PORT_SLOT_SPAN - 1))
+[ "$KARI_TEST_PORT_MAX" -lt 56999 ] && KARI_TEST_PORT_MAX=56999
+_eph_first=$(sysctl -n net.inet.ip.portrange.first 2>/dev/null || true)
+case "$_eph_first" in
+    ''|*[!0-9]*) ;;
+    *) if [ "$_eph_first" -le "$KARI_TEST_PORT_MAX" ]; then
+           echo "WARNING: net.inet.ip.portrange.first is $_eph_first, at or below the highest test port ($KARI_TEST_PORT_MAX): a client's source port can be a test server's port (a self-connect that reads back its own query, CI flake row 85); the CI VMs set it to 60000 (tests/ci_portrange.sh)" >&2
+       fi ;;
+esac
 
 detect_ncpu() {
     _n=$(sysctl -n hw.ncpu 2>/dev/null) || _n=""

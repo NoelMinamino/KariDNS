@@ -505,6 +505,7 @@ jobs:
 
             # the package cache (tests/ci_cache_env.sh): restored before this step, saved by the build job of main
             . tests/ci_cache_env.sh
+            sh tests/ci_portrange.sh   # the ephemeral ports above every test port (CI flake row 85: a client that connects to itself)
             SHARD=${{ matrix.shard }}
 
             echo "::group::📦 [Setup] perl5 + LLVM tools matching the base clang"
@@ -646,6 +647,7 @@ jobs:
 
             # the package cache (tests/ci_cache_env.sh): restored before this step, saved by the build job of main
             . tests/ci_cache_env.sh
+            sh tests/ci_portrange.sh   # the ephemeral ports above every test port (CI flake row 85: a client that connects to itself)
 
             echo "::group::📦 [Setup] perl5 + LLVM tools matching the base clang"
             # Base llvm-cov on FreeBSD 15 aborts in "show"; the llvmNN-lite package

@@ -238,6 +238,7 @@ jobs:
 
             # the package cache (tests/ci_cache_env.sh): restored before this step, saved by the build job of main
             . tests/ci_cache_env.sh
+            sh tests/ci_portrange.sh   # the ephemeral ports above every test port (CI flake row 85: a client that connects to itself)
 
             echo "::group::📦 [Setup] Install test dependencies (perl5, sqlite3 for karidns-dbloader and its tests)"
             pkg install -y perl5
@@ -356,6 +357,7 @@ jobs:
 
             # the package cache (tests/ci_cache_env.sh): restored before this step, saved by the build job of main
             . tests/ci_cache_env.sh
+            sh tests/ci_portrange.sh   # the ephemeral ports above every test port (CI flake row 85: a client that connects to itself)
 
             echo "::group::📦 [Setup] perl5, sqlite3 (parts 4 to 7 of run_rcu_tsan_test.sh: database zones on SQLite3), the libraries the build linked"
             # libidn2 (dag, --with-idn2=yes) and libpq (karidns-dbloader and karidns-dbloader-tsan have the PostgreSQL driver): the build job has them
@@ -416,6 +418,7 @@ jobs:
 
             # the package cache (tests/ci_cache_env.sh): restored before this step, saved by the build job of main
             . tests/ci_cache_env.sh
+            sh tests/ci_portrange.sh   # the ephemeral ports above every test port (CI flake row 85: a client that connects to itself)
 
             echo "::group::📦 [Setup] Install test dependencies (perl5, sqlite3 for karidns-dbloader and its tests)"
             pkg install -y perl5
@@ -550,6 +553,7 @@ jobs:
 
             # the package cache (tests/ci_cache_env.sh): restored before this step, saved by the build job of main
             . tests/ci_cache_env.sh
+            sh tests/ci_portrange.sh   # the ephemeral ports above every test port (CI flake row 85: a client that connects to itself)
 
             echo "::group::📦 [Setup] perl5, sqlite3, Node.js, PostgreSQL, Firefox and geckodriver"
             # Firefox crashes at the start without a font.  The tests use no network (a profile that talks to nothing, everything on 127.0.0.1): the network is for this step only.
