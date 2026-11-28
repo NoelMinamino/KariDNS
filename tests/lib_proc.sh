@@ -140,6 +140,29 @@ kari_ctl_conf() {
     chmod 0600 "$2"
 }
 
+# kari_soa_status DAG PORT NAME [SECONDS [DAG OPTION...]]: "STATUS SERIAL" of the first answer of 127.0.0.1:PORT to NAME SOA ("SERVFAIL -",
+# "NOERROR 7"; "-" when the answer section has no SOA), tries of 1 s for at most SECONDS (default 10); "none" when no try was answered.  For the
+# checks that a zone is NOT served: a try that timed out is not an answer, and under +short dag (as dig) prints ";; communications error ...
+# timed out" on stdout, so `[ -z "$(dag ... +short)" ]` read one lost answer as a served zone (CI 45941653632, 45959679380).
+kari_soa_status() {
+    _ks_dag=$1; _ks_port=$2; _ks_name=$3; _ks_secs=${4:-10}
+    shift 3; [ $# -gt 0 ] && shift
+    _ks_i=0
+    while [ "$_ks_i" -lt $((_ks_secs * 2)) ]; do
+        _ks_out=$("$_ks_dag" @127.0.0.1 -p "$_ks_port" "$_ks_name" SOA +nohexdump +time=1 +tries=1 +noall +comments +answer "$@" 2>/dev/null)
+        _ks_st=$(printf '%s\n' "$_ks_out" | sed -n 's/.*status: \([A-Z]*\),.*/\1/p' | head -1)
+        if [ -n "$_ks_st" ]; then
+            _ks_ser=$(printf '%s\n' "$_ks_out" | awk '$4 == "SOA" && $7 ~ /^[0-9]+$/ { print $7; exit }')
+            echo "$_ks_st ${_ks_ser:--}"
+            return 0
+        fi
+        sleep 0.5; _ks_i=$((_ks_i + 1))
+    done
+    echo none
+}
+# kari_unserved STATUS: true when STATUS (of kari_soa_status) is an answer without the zone's SOA (SERVFAIL, REFUSED, ...); "none" (no answer) is not
+kari_unserved() { case "$1" in none|"NOERROR "[0-9]*) return 1 ;; *) return 0 ;; esac; }
+
 # kari_wait_answer DAG PORT NAME [SECONDS]: wait until the server on 127.0.0.1:PORT
 # answers NAME SOA, at most SECONDS (default 15).  For a test that starts karidns
 # and queries it at once: a fixed sleep is too short when the host is busy (tests

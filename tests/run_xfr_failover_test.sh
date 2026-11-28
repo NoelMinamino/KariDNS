@@ -233,7 +233,8 @@ if wait_grep "zone 'g1.test.': giving up the transfer: no data for 3 seconds" "$
 else fail "S1: the stalled transfer of g1.test was not given up"; fi
 if wait_grep "zone 'h.test.': giving up the transfer: it took longer than max-transfer-time-in" "$W/sg.log" 15; then pass "S2: max-transfer-time-in gives up a transfer that never ends although data keeps coming"
 else fail "S2: the endless transfer of h.test was not given up"; fi
-[ -z "$(dag_soa "$SG" g1.test)" ] && [ -z "$(dag_soa "$SG" h.test)" ] && pass "S3: nothing of a given-up transfer is served" || fail "S3: a zone of a given-up transfer is served"
+st1=$(kari_soa_status "$DAG" "$SG" g1.test); st2=$(kari_soa_status "$DAG" "$SG" h.test)
+kari_unserved "$st1" && kari_unserved "$st2" && pass "S3: nothing of a given-up transfer is served" || fail "S3: a zone of a given-up transfer is served (g1.test: $st1, h.test: $st2)"
 
 cat > "$W/sq.conf" <<EOF
 options { not-ready-answer servfail; port $SQ; bind-address { 127.0.0.1; }; pid-file "none"; $USER_OPT transfers-in 1; max-transfer-idle-in 1; };

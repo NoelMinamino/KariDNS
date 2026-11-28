@@ -157,19 +157,24 @@ CTP="$KARICTL -s $W/p.sock -f $W/ctl.conf"
 "$KARIDNS" -f "$W/p.conf" > "$W/p.log" 2>&1 & PIDS="$PIDS $!"
 kari_wait_answer "$DAG" "$PP" sx.test 15 || { fail "the primary did not start"; exit 1; }
 "$KARIDNS" -f "$W/s.conf" > "$W/s.log" 2>&1 & PIDS="$PIDS $!"
-serial() { "$DAG" @127.0.0.1 -p "$PS" "$1.test" SOA +short +nohexdump +time=1 +tries=1 2>/dev/null | awk '{print $3}'; }
+# the serial of an SOA answer, nothing for anything else: a try that timed out prints ";; communications error to ...: timed out" on stdout,
+# whose third word ("to") read as a serial (CI 45959679380: "sy.test is served although its key is wrong" after one lost answer)
+serial() { "$DAG" @127.0.0.1 -p "$PS" "$1.test" SOA +short +nohexdump +time=1 +tries=1 2>/dev/null | awk 'NF == 7 && $3 ~ /^[0-9]+$/ { print $3; exit }'; }
 wait_serial() { # wait_serial ZONE SERIAL [SECONDS]
     _i=0
     while [ $_i -lt $(( ${3:-20} * 2 )) ]; do [ "$(serial "$1")" = "$2" ] && return 0; sleep 0.5; _i=$((_i + 1)); done
     return 1
 }
 wait_serial sx 1 && pass "primaries { list name }: the secondary transfers sx.test with the key of the primary in the list" || fail "sx.test was not transferred"
-wait_serial sz 1 2 && pass "primaries without a key: the zone's tsig-key signs the transfer" || fail "sz.test was not transferred"
-wait_serial sw 1 2 && pass "precedence: the key of the primary wins over a wrong zone tsig-key" || fail "sw.test was not transferred"
-wait_serial sv 1 2 || fail "sv.test was not transferred"
-sleep 2
-if [ -z "$(serial sy)" ]; then pass "a key the primary does not know: the transfer fails and the zone is not served"
-else fail "sy.test is served although its key is wrong"; fi
+# (20 s each, as sx: the transfers of the secondary's start can come one after the other on a loaded host; CI 45941653632: sz not there after 2 s)
+wait_serial sz 1 && pass "primaries without a key: the zone's tsig-key signs the transfer" || fail "sz.test was not transferred"
+wait_serial sw 1 && pass "precedence: the key of the primary wins over a wrong zone tsig-key" || fail "sw.test was not transferred"
+wait_serial sv 1 || fail "sv.test was not transferred"
+# sy's transfer fails (the primary does not know wk): with not-ready-answer servfail the zone, which has no data, is answered SERVFAIL
+sleep 2   # (the window in which a transfer of sy.test must not succeed)
+st=$(kari_soa_status "$DAG" "$PS" sy.test)
+if [ "$st" = "SERVFAIL -" ]; then pass "a key the primary does not know: the transfer fails and the zone is not served"
+else fail "sy.test: '$st', want 'SERVFAIL -' (the zone must not be served with a key the primary does not know)"; grep "sy.test" "$W/s.log" | tail -5; fi
 if grep -q "^NOTIFY port=$L9 qname=sx.test " "$W/recv.log"; then pass "a secondary passes a transfer on to its also-notify list (notify yes)"
 else fail "no NOTIFY from the secondary for sx.test"; fi
 if ! grep -q "qname=sv.test " "$W/recv.log"; then pass "notify primary-only: a secondary sends no NOTIFY after a transfer"
