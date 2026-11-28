@@ -101,24 +101,39 @@ stop_srv
 echo "== the flood: $RATE random names a second for $SECS s, memory-limit $ML, one store thread"
 conf "memory-limit $ML; store-hot-list no; store-threads 1;"
 start_srv
-# random names with repeats (a name that is in memory is answered from it; memory-limit holds a small part of the zones)
-awk -v n="$NZ" -v m=$((RATE * SECS + RATE)) 'BEGIN { srand(11); for (i = 0; i < m; i++) printf "www.z%d.test A\n", 1 + int(rand() * n) }' > "$T/q.txt"
 c0() { eval "$1=\$(sf $2)"; }
-c0 A0 store.attach.count; c0 S0 store.attach.shed; c0 L0 store.attach.newest_first; c0 CF0 store.cold.fetch; c0 CA0 store.cold.attach; c0 CT0 store.cold.timeout
-F0=$(fetches); F0=${F0:-0}
-"$DQ" -s 127.0.0.1 -p "$PA" -d "$T/q.txt" -Q "$RATE" -l "$SECS" -t 1 -T 2 -c 4 --json > "$T/flood.json" 2> "$T/flood.err" || { cat "$T/flood.err"; fail "dnsqps: exit status $?"; }
-# the parked queries end within park-timeout (1.5 s) after the last query; the attaches of the queue too (bounded wait)
-waitfor 30 queue_empty && pass "the attach queue is empty after the flood" || fail "the attach queue holds $(sf store.attach.queued) slots 30 s after the flood"
-c0 A1 store.attach.count; c0 S1 store.attach.shed; c0 L1 store.attach.newest_first; c0 CF1 store.cold.fetch; c0 CA1 store.cold.attach; c0 CT1 store.cold.timeout
-F1=$(fetches); F1=${F1:-0}
-SENT=$(jv "$T/flood.json" sent); COMP=$(jv "$T/flood.json" completed); SRVF=$(sed -n 's/.*"SERVFAIL":\([0-9]*\).*/\1/p' "$T/flood.json"); SRVF=${SRVF:-0}
-ATT=$((${A1:-0} - ${A0:-0})); SHED=$((${S1:-0} - ${S0:-0})); NEWF=$((${L1:-0} - ${L0:-0}))
-STATE="sent=$SENT completed=$COMP servfail=$SRVF attaches=$ATT shed=$SHED newest_first=$NEWF cold.attach=$((${CA1:-0} - ${CA0:-0})) cold.timeout=$((${CT1:-0} - ${CT0:-0})) cold.fetch=$((${CF1:-0} - ${CF0:-0})) fetch_issued=$F0->$F1 attach.p50_us=$(sf store.attach.p50_us) zones.attached=$(sf store.zones.attached)"
-echo "  $STATE"
+c0 CFF store.cold.fetch; FF=$(fetches); FF=${FF:-0}   # (the first round's: no round may read a stored zone from the database)
+# One round of the flood at RATE.  Whether RATE overloads one store thread depends on the host: on pc101 (6 vCPU) one thread attaches about 30000 zones
+# a second (p50 29-35 us), so 30000 random names a second never put it behind (flake row 52: shed=0 newest_first=0 every run, also alone).  A round that
+# did not put the thread behind (newest_first 0) is run again at twice the rate, up to 4 rounds (240000 a second); the checks below read the last round.
+# A store thread that never takes the newest first still fails: the last round's counters say so.
+flood_round() {
+    # random names with repeats (a name that is in memory is answered from it; memory-limit holds a small part of the zones)
+    awk -v n="$NZ" -v m=$((RATE * SECS + RATE)) 'BEGIN { srand(11); for (i = 0; i < m; i++) printf "www.z%d.test A\n", 1 + int(rand() * n) }' > "$T/q.txt"
+    c0 A0 store.attach.count; c0 S0 store.attach.shed; c0 L0 store.attach.newest_first; c0 CF0 store.cold.fetch; c0 CA0 store.cold.attach; c0 CT0 store.cold.timeout
+    F0=$(fetches); F0=${F0:-0}
+    "$DQ" -s 127.0.0.1 -p "$PA" -d "$T/q.txt" -Q "$RATE" -l "$SECS" -t 1 -T 2 -c 4 --json > "$T/flood.json" 2> "$T/flood.err" || { cat "$T/flood.err"; fail "dnsqps: exit status $?"; }
+    # the parked queries end within park-timeout (1.5 s) after the last query; the attaches of the queue too (bounded wait)
+    waitfor 30 queue_empty && pass "the attach queue is empty after the flood ($RATE a second)" || fail "the attach queue holds $(sf store.attach.queued) slots 30 s after the flood"
+    c0 A1 store.attach.count; c0 S1 store.attach.shed; c0 L1 store.attach.newest_first; c0 CF1 store.cold.fetch; c0 CA1 store.cold.attach; c0 CT1 store.cold.timeout
+    F1=$(fetches); F1=${F1:-0}
+    SENT=$(jv "$T/flood.json" sent); COMP=$(jv "$T/flood.json" completed); SRVF=$(sed -n 's/.*"SERVFAIL":\([0-9]*\).*/\1/p' "$T/flood.json"); SRVF=${SRVF:-0}; SRVF_ALL=$((${SRVF_ALL:-0} + SRVF))
+    ATT=$((${A1:-0} - ${A0:-0})); SHED=$((${S1:-0} - ${S0:-0})); NEWF=$((${L1:-0} - ${L0:-0}))
+    STATE="rate=$RATE sent=$SENT completed=$COMP servfail=$SRVF attaches=$ATT shed=$SHED newest_first=$NEWF cold.attach=$((${CA1:-0} - ${CA0:-0})) cold.timeout=$((${CT1:-0} - ${CT0:-0})) cold.fetch=$((${CF1:-0} - ${CF0:-0})) fetch_issued=$F0->$F1 attach.p50_us=$(sf store.attach.p50_us) zones.attached=$(sf store.zones.attached)"
+    echo "  $STATE"
+}
+ROUND=1
+flood_round
+while [ "$NEWF" = 0 ] && [ "$ROUND" -lt 4 ]; do
+    RATE=$((RATE * 2)); ROUND=$((ROUND + 1))
+    echo "  the store thread kept up: round $ROUND at $RATE a second"
+    flood_round
+done
+CF0=$CFF; F0=$FF
 [ "$NEWF" -gt 0 ] 2>/dev/null && pass "the store thread was behind and took the newest requests first ($NEWF)" || fail "no request was taken newest first: the flood did not overload the store thread ($STATE)"
 [ "$SHED" -gt 0 ] 2>/dev/null && pass "requests that nobody waited for were dropped unread ($SHED)" || fail "no request was dropped unread ($STATE)"
 [ "$ATT" -gt 0 ] 2>/dev/null && [ $((${COMP:-0} * 100)) -ge $((ATT * MINPCT)) ] && pass "the client got $COMP answers in time for $ATT attaches (at least $MINPCT %)" || fail "the client got ${COMP:-?} answers in time for $ATT attaches (less than $MINPCT %: attaches for queries whose clients had given up; $STATE)"
-[ "$SRVF" = 0 ] && pass "no SERVFAIL" || fail "$SRVF SERVFAIL ($STATE)"
+[ "${SRVF_ALL:-0}" = 0 ] && pass "no SERVFAIL (in any round)" || fail "${SRVF_ALL:-0} SERVFAIL ($STATE)"
 [ "${CF1:-0}" = "${CF0:-0}" ] && [ "$F1" = "$F0" ] && pass "no stored zone was read from the database (cold.fetch ${CF0:-0} -> ${CF1:-0}, fetch issued $F0 -> $F1)" || fail "stored zones were read from the database ($STATE)"
 # after the flood: a query for a stored zone is answered at once (the queue holds no old requests)
 FRESH=$(awk -v n="$NZ" 'BEGIN { print n }')
