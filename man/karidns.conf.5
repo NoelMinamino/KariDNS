@@ -5932,7 +5932,27 @@ longer, and the range a crash makes the fill read again grows with it). The read
 queue of the pool above (\fBvfs.zfs.vdev.sync_read_max_active\fR, and
 \fBvfs.zfs.vdev.sync_read_min_active\fR for the reads the pool serves first)
 stays an operator's choice: KariDNS does not change it, and the defaults are
-kept. \fBScrub.\fR Every \fBstore\-scrub\-interval\fR the store reads every
+kept. \fBCold zones while ZFS syncs (0.7).\fR A read of an image that is not in
+the ARC waits while ZFS writes a transaction group or the store syncs its
+segments, for up to a few seconds while a first fill writes. A query for such a
+zone waits for its attach at most \fBpark\-timeout\fR and is then dropped
+(\fBnot\-ready\-answer drop\fR, the default: no SERVFAIL; the resolver asks
+again), so during a first fill a share of the queries for cold stored zones goes
+unanswered while a sync runs; the zones in memory are not affected, and UFS does
+not show it (presyncs of a few milliseconds, no stall of the attaches, measured
+on a 4-vCPU VM). Set \fBlogbias=throughput\fR on the dataset of the store
+(\fBzfs set logbias=throughput <pool>/<store dataset>\fR; it applies at once,
+also to an existing store): ZFS then writes the data of the store's fsyncs in
+place and only a pointer to it in the ZIL. Measured on the build host (ZFS on a
+SATA SSD, a first fill of 10 million zones from PostgreSQL under a query load,
+100 queries a second for cold stored zones, 3 runs each): 23.9 % (22.9 to 25.7
+%) of those queries were not answered within 1 s while a sync ran, 18.9 % (17.7
+to 19.9 %) with \fBlogbias=throughput\fR, with no cost to the fill (1136 to 1188
+s, against 1149 to 1285 s); outside the syncs under 0.5 % either way. A smaller
+\fBvfs.zfs.dirty_data_max\fR (256 MiB) made no difference, nor did pacing the
+fill while attaches wait, and a larger \fBvfs.zfs.vdev.sync_read_max_active\fR
+(with \fBsync_read_min_active\fR, 32 / 64) made it worse in a first fill (one
+run). \fBScrub.\fR Every \fBstore\-scrub\-interval\fR the store reads every
 record, at 16 MiB a second at the most: the table record (its CRC), the way the
 name and source indexes lead to the zone, and for a stored zone the whole image:
 its checksum and the structure check that is made at every attach. A zone whose
