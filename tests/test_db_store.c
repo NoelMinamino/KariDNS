@@ -329,6 +329,21 @@ static uint64_t settled_versions(void) {
     }
     return c.versions_live;
 }
+/* versions_live once it is at most WANT, at most 5 s: for the checks that a version was given back (none leaked).  settled_versions() stops at 6 ms
+ * of no change, which a retire of a loaded ASan run can come after (CI 15.1 asan, PR #314 run 46098409945: W5b's settled_versions() == vl0 failed); at most, not equal:
+ * the number taken before (with settled_versions() too) can still hold a version an earlier step frees later */
+static uint64_t versions_at_most(uint64_t want) {
+    uint64_t v = settled_versions();
+    for (int i = 0; i < 1000 && v > want; i++) {
+        usleep(5000);
+        zone_retire_process(true);
+        db_store_counters_t c;
+        db_store_counters(&c);
+        v = c.versions_live;
+    }
+    if (v > want) printf("    versions_live %llu, want at most %llu\n", (unsigned long long)v, (unsigned long long)want);
+    return v;
+}
 
 static bool evict_zone(const char *zone) {
     if (!dbreg_test_evict("default", zone)) return false;
@@ -2084,7 +2099,7 @@ static int run_mode(const char *mode) {
                 CHECK(!zref_of("wd.test.", &zd));                                       /* (not in the store, not staged, not in memory) */
                 wait_retired();
                 db_store_counters(&w1);
-                CHECK(settled_versions() == vl0);                             /* (the entry was given back) */
+                CHECK(versions_at_most(vl0) <= vl0);                             /* (the entry was given back) */
             }
 
             /* W5c: the registration of a staged zone finds no view for the store's id (the store is closing, or the id is not one): the staged element leaves the table all the same (it held the zone's slot and its entry for ever) */
@@ -2115,7 +2130,7 @@ static int run_mode(const char *mode) {
                 CHECK(w1.wa_lost == w0.wa_lost + 1 && w1.wa_adopted == w0.wa_adopted);
                 wait_retired();
                 db_store_counters(&w1);
-                CHECK(settled_versions() == vl0);                             /* (the entry was given back) */
+                CHECK(versions_at_most(vl0) <= vl0);                             /* (the entry was given back) */
                 CHECK(stored_only("wn.test."));                                         /* (not in memory, not staged) */
                 rcu_aux_read_lock();
                 snw = acquire_zone_snapshot();
