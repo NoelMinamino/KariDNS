@@ -9632,12 +9632,22 @@ static void test_query_engine_program_zone_reply_bounded_by_buffer(void) {
 /* Review query_engine [1]: after a timeout the reply that comes too late answers the query that failed, not the next
  * one.  The next query drops what the pipe holds and skips frames whose ID / QR / question do not match; other queries
  * pass the plugin's reply on as written (program zones are for testing malformed replies). */
-typedef struct { int fd; int delay_ms; const uint8_t *data; size_t len; } pz_late_t;
+/* The writer gives the plugin's replies once the query is on the plugin's stdin: dispatch_to_program_zone() writes it after it drained the
+ * pipe, so the frames come after the drain and while the query waits.  (It slept 30 ms before: under load it woke before the drain, which
+ * threw the frames away, or after the 150 ms timeout: CI flake row 40, pc31 -j 8.)  pz_drain() empties the stdin pipe of the queries
+ * before, so that only this query wakes the writer. */
+typedef struct { int fd; int in_fd; const uint8_t *data; size_t len; } pz_late_t;
+
+static void pz_drain(int fd) {
+    uint8_t junk[512];
+    struct pollfd p = { .fd = fd, .events = POLLIN, .revents = 0 };
+    while (poll(&p, 1, 0) > 0 && (p.revents & POLLIN) && read(fd, junk, sizeof(junk)) > 0) {}
+}
 
 static void *pz_late_writer(void *arg) {
     pz_late_t *w = arg;
-    struct timespec ts = { 0, (long)w->delay_ms * 1000000L };
-    nanosleep(&ts, NULL);
+    struct pollfd p = { .fd = w->in_fd, .events = POLLIN, .revents = 0 };
+    assert(poll(&p, 1, 10000) == 1);
     assert(write(w->fd, w->data, w->len) == (ssize_t)w->len);
     return NULL;
 }
@@ -9682,13 +9692,16 @@ static void test_query_engine_program_zone_late_reply(void) {
     build_dns_query(q3, &l3, 0x3333, "c.plugtest.example.", 1, false);
 
     /* 1. q1 times out: SERVFAIL */
+    plugin.timeout_ms = 150;
     int n = dispatch_to_program_zone("", "plugtest.example.", q1, l1, res, sizeof(res), sizeof(res), "127.0.0.1", false);
     assert(n >= 12 && (res[3] & 0x0F) == 2 && plugin.resync);
 
     /* 2. the late reply to q1 and then the reply to q2 arrive after q2 was written (after the drain): q2 gets its own */
     size_t fl = pz_frame(frames, q1, l1, 0x1111, 1);
     fl += pz_frame(frames + fl, q2, l2, 0x2222, 2);
-    pz_late_t w = { out_p[1], 30, frames, fl };
+    plugin.timeout_ms = 5000;   /* (an answer comes: the bound is for a loaded host only) */
+    pz_drain(in_p[0]);
+    pz_late_t w = { out_p[1], in_p[0], frames, fl };
     pthread_t t;
     pthread_create(&t, NULL, pz_late_writer, &w);
     n = dispatch_to_program_zone("", "plugtest.example.", q2, l2, res, sizeof(res), sizeof(res), "127.0.0.1", false);
@@ -9698,12 +9711,15 @@ static void test_query_engine_program_zone_late_reply(void) {
     assert(!plugin.resync && atomic_load(&plugin.consecutive_failures) == 0);
 
     /* 3. a stale reply that is already in the pipe is drained before the query */
+    plugin.timeout_ms = 150;
     n = dispatch_to_program_zone("", "plugtest.example.", q1, l1, res, sizeof(res), sizeof(res), "127.0.0.1", false);
     assert(n >= 12 && (res[3] & 0x0F) == 2 && plugin.resync);   /* timeout again */
     fl = pz_frame(frames, q1, l1, 0x1111, 1);
     assert(write(out_p[1], frames, fl) == (ssize_t)fl);
     fl = pz_frame(frames, q3, l3, 0x3333, 3);
-    w = (pz_late_t){ out_p[1], 30, frames, fl };
+    plugin.timeout_ms = 5000;
+    pz_drain(in_p[0]);
+    w = (pz_late_t){ out_p[1], in_p[0], frames, fl };
     pthread_create(&t, NULL, pz_late_writer, &w);
     n = dispatch_to_program_zone("", "plugtest.example.", q3, l3, res, sizeof(res), sizeof(res), "127.0.0.1", false);
     pthread_join(t, NULL);
@@ -9716,11 +9732,14 @@ static void test_query_engine_program_zone_late_reply(void) {
     assert(n > 12 && res[0] == 0xBE && res[1] == 0xEF && res[n - 1] == 4);
 
     /* 5. after a failure, frames that never answer the query: SERVFAIL after PLUGIN_STALE_FRAMES + 1 of them */
+    plugin.timeout_ms = 150;
     n = dispatch_to_program_zone("", "plugtest.example.", q1, l1, res, sizeof(res), sizeof(res), "127.0.0.1", false);
     assert((res[3] & 0x0F) == 2 && plugin.resync);
     fl = 0;
     for (int i = 0; i < 5; i++) fl += pz_frame(frames + fl, q1, l1, 0x1111, 9);
-    w = (pz_late_t){ out_p[1], 30, frames, fl };
+    plugin.timeout_ms = 5000;   /* (the stale frames, not the timeout, end this one) */
+    pz_drain(in_p[0]);
+    w = (pz_late_t){ out_p[1], in_p[0], frames, fl };
     pthread_create(&t, NULL, pz_late_writer, &w);
     n = dispatch_to_program_zone("", "plugtest.example.", q2, l2, res, sizeof(res), sizeof(res), "127.0.0.1", false);
     pthread_join(t, NULL);
