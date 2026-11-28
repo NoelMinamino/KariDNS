@@ -1695,6 +1695,20 @@ static void t_pg_role(void) {
     be_exec("DROP ROLE karidns_writer_t");
 }
 
+/* the sessions of application_name APP in this database, waited for until there are WANT (at most 10 s): a backend whose client has closed
+ * (PQfinish() of the case before) ends on its own and stays in pg_stat_activity until then (CI 14.4, PR #306 run 46093266123: the check
+ * of karidns-zone read once right after the open failed) */
+static long pg_sessions(const char *app, long want) {
+    long n = -1;
+    for (int i = 0; i < 200; i++) {
+        n = qn("SELECT count(*) FROM pg_stat_activity WHERE application_name = '%s' AND datname = current_database()", app);
+        if (n == want) break;
+        usleep(50000);
+    }
+    if (n != want) printf("    pg_stat_activity: %ld session(s) of %s, want %ld\n", n, app, want);
+    return n;
+}
+
 static void t_pg_session(void) {
     printf("  PostgreSQL: the write session\n");
     be_fresh(true);
@@ -1702,8 +1716,8 @@ static void t_pg_session(void) {
     char err[DB_ERRLEN];
     CHECK(g_drv->open_write(&c, &g_src, err, sizeof(err)) == 0 && g_drv->open(&r, &g_src, err, sizeof(err)) == 0);
     if (!c || !r) return;
-    CHECK(qn("SELECT count(*) FROM pg_stat_activity WHERE application_name = 'karidns-zone' AND datname = current_database()") == 1);
-    CHECK(qn("SELECT count(*) FROM pg_stat_activity WHERE application_name = 'karidns-dbloader' AND datname = current_database()") == 1);
+    CHECK(pg_sessions("karidns-zone", 1) == 1);
+    CHECK(pg_sessions("karidns-dbloader", 1) == 1);
     int64_t id;
     CHECK(g_drv->w_begin(r, "x.test") == -1);           /* the loader's connection stays read only: it never writes */
     /* a statement error inside the transaction: w_rollback ends it */
