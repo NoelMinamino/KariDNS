@@ -292,12 +292,12 @@ Fixes from the external reviews and audits of the 0.7 cycle. Each has a test tha
 
 ### Bug fixes
 
-- **karicheck db looked at the default store directory when `zone-store` named another** (#KZS): with
+- **karicheck looked at the default store directory when `zone-store` named another** (#KZS): with
   `options { zone-store "<dir>"; }` and no `store` in the database block, `karicheck db` took the file system of
   `/var/db/karidns/store`: the "memory on ZFS" line (ARC + Backend heap) and the COPY / MAP mode of its estimate
-  followed the wrong directory, and the start's existence and owner checks of the store directory were skipped. It now
-  resolves the directory with the server's own function (`db_store_dir_cfg()`, moved to the configuration code). The
-  server's "the zone store was created" line named the default directory in the same case.
+  followed the wrong directory, and `karicheck conf` skipped the start's existence and owner checks of the store
+  directory. Both now resolve the directory with the server's own function (`db_store_dir_cfg()`, moved to the
+  configuration code). The server's "the zone store was created" line named the default directory in the same case.
 - **Database zones that a reader accepted and the loader could not encode** (#264, found by `fuzz_pdns_content`): an
   NSEC3 next hashed owner name that decodes to no octet was encoded with hash length 0 (RFC 5155 section 3.1.6: 1 to
   255), and the zone serial was read from the reference SOA serial cut to 40 characters (a serial with many leading

@@ -13,8 +13,8 @@
 #      and the recommended memory-limit; not said again within a minute.
 #   D  karicheck db counts the database (the loader's M line) and says the same about it: INFO with the records counted, the WARNING of a small limit, no
 #      warning of a limit that holds everything, an estimate without a limit.
-#   E  karicheck db looks at the directory the store really uses: options { zone-store } without database { store } (the server's db_store_dir_cfg()):
-#      a zone-store whose parent does not exist is the start error; the "memory on ZFS" line (ARC + heap) comes when the zone-store is on ZFS and not
+#   E  karicheck looks at the directory the store really uses: options { zone-store } without database { store } (the server's db_store_dir_cfg()):
+#      a zone-store whose parent does not exist is the start error (karicheck conf); the "memory on ZFS" line of karicheck db (ARC + heap) comes when the zone-store is on ZFS and not
 #      when it is elsewhere, whatever file system the default directory is on (each half SKIPs when this host has no such file system).
 # Needs root (the loader runs as nobody).  SKIP without karidns, karictl, karidns-dbloader (SQLite3), sqlite3 or perl; D without karicheck.
 . "$(dirname "$0")/lib_proc.sh"
@@ -207,8 +207,8 @@ if [ -x ./karicheck ]; then
     # fstype_of PATH: the file system type of the mount that holds PATH (FreeBSD df prints the mount point last; mount -p gives its type)
     fstype_of() { m=$(df "$1" 2>/dev/null | tail -1 | awk '{print $NF}'); mount -p 2>/dev/null | awk -v m="$m" '$2 == m { print $3; exit }'; }
     conf "" "zone-store \"$T/nope/store\";"
-    ./karicheck db "$T/k.conf" > "$T/kc4.out" 2>&1; rc=$?
-    grep -q "database store '$T/nope/store' does not exist and neither does its parent directory" "$T/kc4.out" && [ $rc -ne 0 ] && pass "a zone-store whose parent is missing is the start error (exit $rc)" || fail "zone-store parent missing: rc=$rc $(grep -i "store" "$T/kc4.out" | head -3)"
+    ./karicheck conf "$T/k.conf" > "$T/kc4.out" 2>&1; rc=$?
+    grep -q "database store '$T/nope/store' does not exist and neither does its parent directory" "$T/kc4.out" && [ $rc -eq 1 ] && pass "karicheck conf: a zone-store whose parent is missing is the start error (exit 1)" || fail "zone-store parent missing: rc=$rc $(grep -i "store" "$T/kc4.out" | head -3)"
     mkdir "$T/zs"; chown nobody "$T/zs"; chmod 700 "$T/zs"
     if [ "$(fstype_of "$T/zs")" != zfs ]; then
         conf "" "zone-store \"$T/zs\";"
