@@ -43,7 +43,7 @@ stop_srv() {
     [ -n "$SRV" ] && kill -KILL "$SRV" 2>/dev/null
     SRV=""
 }
-trap 'stop_srv; rm -rf "$T"' EXIT INT TERM
+trap 'stop_srv; umount "$T/zs" 2>/dev/null; rm -rf "$T"' EXIT INT TERM
 PASS=0; FAILS=0
 pass() { PASS=$((PASS + 1)); echo "  [ OK ] $1"; }
 fail() { FAILS=$((FAILS + 1)); echo "  [FAIL] $1"; }
@@ -210,6 +210,10 @@ if [ -x ./karicheck ]; then
     ./karicheck conf "$T/k.conf" > "$T/kc4.out" 2>&1; rc=$?
     grep -q "database store '$T/nope/store' does not exist and neither does its parent directory" "$T/kc4.out" && [ $rc -eq 1 ] && pass "karicheck conf: a zone-store whose parent is missing is the start error (exit 1)" || fail "zone-store parent missing: rc=$rc $(grep -i "store" "$T/kc4.out" | head -3)"
     mkdir "$T/zs"; chown nobody "$T/zs"; chmod 700 "$T/zs"
+    ZS_TMPFS=0                                          # ($T on ZFS, as on the CI VMs: a tmpfs on $T/zs gives the non-ZFS zone-store, so the case runs instead of a SKIP)
+    if [ "$(fstype_of "$T/zs")" = zfs ] && [ "$(id -u)" -eq 0 ] && mount -t tmpfs -o size=1m tmpfs "$T/zs" 2>/dev/null; then
+        ZS_TMPFS=1; chown nobody "$T/zs"; chmod 700 "$T/zs"
+    fi
     if [ "$(fstype_of "$T/zs")" != zfs ]; then
         conf "" "zone-store \"$T/zs\";"
         ./karicheck db "$T/k.conf" > "$T/kc5.out" 2>&1; rc=$?
@@ -217,6 +221,7 @@ if [ -x ./karicheck ]; then
     else
         echo "  (SKIP: $T is on ZFS, no non-ZFS zone-store to check)"
     fi
+    [ "$ZS_TMPFS" -eq 1 ] && umount "$T/zs"
     ZM=$(mount -p -t zfs 2>/dev/null | awk '{print $2}' | while read -r m; do [ -d "$m" ] && [ ! -e "$m/karidns_kzs_$$" ] && { echo "$m"; break; }; done)
     if [ -n "$ZM" ] && sysctl -n vfs.zfs.arc.max >/dev/null 2>&1; then
         ZS="${ZM%/}/karidns_kzs_$$"                    # (not made: karicheck reads the file system of the nearest parent, as the server makes the last component)
