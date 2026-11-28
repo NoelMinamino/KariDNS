@@ -103,8 +103,9 @@ my $port = 10054;
 socket(my $sock, PF_INET, SOCK_DGRAM, getprotobyname("udp")) or die "socket: $!";
 bind($sock, sockaddr_in($port, inet_aton("127.0.0.1"))) or die "bind: $!";
 
-print "LISTENER_READY\n";
-$| = 1;
+open(my $rd, ">", $ARGV[1]) or die $!;   # the socket is bound: the shell waits for this file
+print $rd "LISTENER_READY\n";
+close($rd);
 
 my $buf;
 my $from = recv($sock, $buf, 4096, 0);
@@ -120,10 +121,13 @@ if ($from) {
     print $fh "QDCOUNT=$qd\n";
     close($fh);
 }
-' "$OUT_NOTIFY" > /dev/null 2>&1 &
+' "$OUT_NOTIFY" "$TMP_DIR/listener.ready" > "$TMP_DIR/listener.err" 2>&1 &
 PERL_PID=$!
-
-sleep 1
+if ! kari_wait_log "$TMP_DIR/listener.ready" LISTENER_READY 10; then
+    echo "[FAIL] the NOTIFY listener on 127.0.0.1:10054 did not start:"
+    cat "$TMP_DIR/listener.err"
+    exit 1
+fi
 
 echo "[*] Starting KariDNS on port 10053 (notify-source: $TEST_SRC_IP)..."
 $BIN -f -c "$CONF" > "$DIR/server_notify.log" 2>&1 &
@@ -143,22 +147,32 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-kari_wait_answer "$DAG" 10053 notify.test. || true   # karictl below reports a server that did not start
+if ! kari_wait_answer "$DAG" 10053 notify.test. 30; then
+    echo "[FAIL] the server did not answer notify.test SOA within 30 s"
+    cat "$DIR/server_notify.log"
+    exit 1
+fi
 
-# Send notify command via karictl
+# Send notify command via karictl.  The control socket is bound before the server answers
+# (dns_server_core.c binds it before the Backend fork), so it exists by now.
 echo "[*] Sending NOTIFY via karictl..."
-$KARICTL -f "$CTL_CONF" notify notify.test || true
+if ! $KARICTL -f "$CTL_CONF" notify notify.test > "$TMP_DIR/karictl.out" 2>&1; then
+    echo "[FAIL] karictl notify failed:"
+    cat "$TMP_DIR/karictl.out"
+    ls -l "$TMP_DIR"
+    cat "$DIR/server_notify.log"
+    exit 1
+fi
 
-# Wait for notification capture
-for i in $(seq 1 10); do
-    if [ -f "$OUT_NOTIFY" ] && [ -s "$OUT_NOTIFY" ]; then
-        break
-    fi
-    sleep 0.5
+# Wait for notification capture (the listener exits after one datagram)
+i=0
+while [ ! -s "$OUT_NOTIFY" ] && [ "$i" -lt 200 ]; do
+    sleep 0.1
+    i=$((i + 1))
 done
-
 if [ ! -f "$OUT_NOTIFY" ] || [ ! -s "$OUT_NOTIFY" ]; then
     echo "[FAIL] No NOTIFY packet received by listener on 127.0.0.1:10054"
+    cat "$TMP_DIR/karictl.out" "$TMP_DIR/listener.err"
     cat "$DIR/server_notify.log"
     exit 1
 fi
